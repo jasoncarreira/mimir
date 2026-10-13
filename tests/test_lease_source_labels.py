@@ -8,12 +8,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import ToolMessage
 
 from mimir import access_control as access_control_module
 from mimir.access_control import (
     OperationDecision,
+    ProtectedResultProvenance,
     SinkGate,
     ToolAuthorization,
+    ToolRegistry,
     begin_protected_result_capture,
     classify_protected_result,
     end_protected_result_capture,
@@ -1818,6 +1821,203 @@ def test_active_lease_file_results_use_repository_source_labels(
     assert source.bridge_instance == "forge"
     assert source.integrity == "trusted"
     assert source.integrity_effect == "informational"
+
+
+def test_lease_lookup_resolves_missing_descendants_without_escaping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    checkout, target, _ = _recorded_lease(lease_root)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+
+    assert active_pr_checkout_lease_for_path(target.parent / "missing" / "file.py").path == checkout
+    assert active_pr_checkout_lease_for_path(tmp_path / "outside" / "file.py") is None
+    (checkout / "escape").symlink_to(tmp_path, target_is_directory=True)
+    assert active_pr_checkout_lease_for_path(checkout / "escape" / "missing.py") is None
+
+
+@pytest.mark.parametrize("tool_name", ["read_file", "grep", "glob", "ls"])
+def test_missing_lease_read_does_not_veto_following_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str,
+) -> None:
+    from mimir.readonly_backend import _RootAwareFilesystemBackend
+
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    checkout, target, _ = _recorded_lease(lease_root)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    backend = _RootAwareFilesystemBackend(root_dir=checkout, virtual_mode=True)
+    missing = checkout / "src" / "missing"
+    arguments = {"file_path": str(missing)} if tool_name == "read_file" else {"path": str(missing)}
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{checkout}:rw")
+    auth = replace(_auth(), roles=("admin",))
+    before = ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target),
+        arguments={"file_path": str(target)},
+    )
+    assert before.allowed, before.reason
+
+    capture = begin_protected_result_capture()
+    try:
+        if tool_name == "read_file":
+            result = backend.read(str(missing))
+        elif tool_name == "grep":
+            result = backend.grep("needle", str(missing))
+        elif tool_name == "glob":
+            result = backend.glob("*.py", str(missing))
+        else:
+            result = backend.ls(str(missing))
+    finally:
+        provenance = end_protected_result_capture(capture)
+    if tool_name in {"grep", "glob"}:
+        assert result.error is None and not result.matches
+    else:
+        assert result.error
+    labels = classify_protected_result(
+        tool_name, arguments, auth,
+        ToolAuthorization(tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
+                          allowed=True),
+        result=ToolMessage(content=result.error or "(no matches)", tool_call_id="missing",
+                           status="error" if result.error else "success"),
+        provenance=provenance, failed=bool(result.error),
+    )
+    assert labels is None or not labels.has_untrusted_active_ingest
+    if tool_name in {"grep", "glob"}:
+        # Native backends return an empty successful match set for a missing
+        # search root; an error from another native adapter is non-ingesting too.
+        capture = begin_protected_result_capture()
+        try:
+            access_control_module.publish_protected_result((), content_free_error="path not found")
+        finally:
+            empty_provenance = end_protected_result_capture(capture)
+        assert classify_protected_result(
+            tool_name, arguments, auth,
+            ToolAuthorization(tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
+                              allowed=True),
+            result=ToolMessage(content="path not found", tool_call_id="error", status="error"),
+            provenance=empty_provenance, failed=True,
+        ) is None
+    if labels is not None:
+        auth.ifc_state.merge(labels)
+    after = ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target),
+        arguments={"file_path": str(target)},
+    )
+    assert after.allowed, after.reason
+    assert after.reason != "write_blocked_by_untrusted_ingest"
+
+
+def test_successful_unanchored_read_still_vetoes_edit_but_missing_read_does_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.readonly_backend import _RootAwareFilesystemBackend
+
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    _checkout, target, _ = _recorded_lease(lease_root)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    existing = outside / "input.txt"
+    existing.write_text("untrusted input", encoding="utf-8")
+    backend = _RootAwareFilesystemBackend(root_dir=outside, virtual_mode=True)
+    auth = _auth()
+    authorization = ToolAuthorization(tool_name="read_file", decision=OperationDecision.RESOURCE_SCOPED,
+                                      allowed=True)
+    missing = outside / "missing.txt"
+    capture = begin_protected_result_capture()
+    try:
+        error = backend.read(str(missing))
+    finally:
+        error_provenance = end_protected_result_capture(capture)
+    assert error.error
+    assert classify_protected_result(
+        "read_file", {"file_path": str(missing)}, auth, authorization,
+        result=ToolMessage(content=error.error, tool_call_id="missing", status="error"),
+        provenance=error_provenance, failed=True,
+    ) is None
+
+    capture = begin_protected_result_capture()
+    try:
+        read = backend.read(str(existing))
+    finally:
+        provenance = end_protected_result_capture(capture)
+    assert read.error is None
+    labels = classify_protected_result(
+        "read_file", {"file_path": str(existing)}, auth, authorization,
+        result=ToolMessage(content=read.file_data["content"], tool_call_id="existing"),
+        provenance=provenance,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+    auth.ifc_state.merge(labels)
+    decision = ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target),
+        arguments={"file_path": str(target)},
+    )
+    assert not decision.allowed
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+
+def test_filesystem_error_cannot_erase_content_captured_before_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside content", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    auth = _auth()
+    source = protected_result_source(
+        auth, principal="filesystem", domain="filesystem",
+        resource_id=str(outside), bridge_instance="filesystem",
+    )
+    capture = begin_protected_result_capture()
+    try:
+        access_control_module.publish_protected_result((source,))
+        access_control_module.publish_protected_result((), content_free_error="read failed")
+    finally:
+        provenance = end_protected_result_capture(capture)
+    labels = classify_protected_result(
+        "read_file", {"file_path": str(outside)}, auth,
+        ToolAuthorization(tool_name="read_file", decision=OperationDecision.RESOURCE_SCOPED,
+                          allowed=True),
+        result=ToolMessage(content="read failed", tool_call_id="partial", status="error"),
+        provenance=provenance, failed=True,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+
+
+def test_filesystem_error_requires_exact_nonempty_backend_attestation(tmp_path: Path) -> None:
+    auth = _auth()
+    path = tmp_path / "missing.txt"
+    authorization = ToolAuthorization(
+        tool_name="read_file", decision=OperationDecision.RESOURCE_SCOPED, allowed=True,
+    )
+    for provenance, content in (
+        (ProtectedResultProvenance(()), "not found"),
+        (ProtectedResultProvenance(()), "Error: None"),
+        (ProtectedResultProvenance((), "not found"), "not found\nforeign output"),
+    ):
+        labels = classify_protected_result(
+            "read_file", {"file_path": str(path)}, auth, authorization,
+            result=ToolMessage(content=content, tool_call_id="partial", status="error"),
+            provenance=provenance, failed=True,
+        )
+        assert labels is not None and labels.has_untrusted_active_ingest
+    other = classify_protected_result(
+        "file_search", {"path": str(path)}, auth,
+        ToolAuthorization(tool_name="file_search", decision=OperationDecision.RESOURCE_SCOPED,
+                          allowed=True),
+        result=ToolMessage(content="not found", tool_call_id="other", status="error"),
+        provenance=ProtectedResultProvenance((), "not found"), failed=True,
+    )
+    assert other is not None and other.has_untrusted_active_ingest
+    with pytest.raises(ValueError, match="content-free error provenance"):
+        access_control_module.publish_protected_result((), content_free_error="")
+    with pytest.raises(ValueError, match="content-free error provenance"):
+        access_control_module.publish_protected_result((protected_result_source(
+            auth, principal="filesystem", domain="filesystem",
+            resource_id=str(path), bridge_instance="filesystem",
+        ),), content_free_error="not found")
 
 
 def test_cross_pr_scope_keeps_lease_read_untrusted_filesystem_ingest(

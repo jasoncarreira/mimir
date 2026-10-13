@@ -1590,9 +1590,18 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     def _read_denied_message(reason: str) -> str:
         return _read_denied_message(reason)
 
+    @staticmethod
+    def _publish_empty_read(error: str) -> None:
+        """Attest that a native file-tool error returned no resource content."""
+        from .access_control import publish_protected_result
+
+        publish_protected_result((), content_free_error=error)
+
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
-            return ReadResult(error=self._outside_root_msg(file_path, tool="read_file"))
+            error = self._outside_root_msg(file_path, tool="read_file")
+            self._publish_empty_read(error)
+            return ReadResult(error=error)
         from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
 
         if non_admin_read_filter_enabled():
@@ -1607,6 +1616,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                     )
                     message = self._read_denied_message(reason)
                     record_read_policy_refusal(message)
+                    self._publish_empty_read(message)
                     return ReadResult(error=message)
             except (OSError, RuntimeError, ValueError):
                 from .read_policy import emit_hard_read_denial, record_read_policy_refusal
@@ -1614,18 +1624,25 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                 emit_hard_read_denial("read_file", file_path, "unresolved_read_target")
                 message = "Read denied: unresolved path"
                 record_read_policy_refusal(message)
+                self._publish_empty_read(message)
                 return ReadResult(error=message)
         try:
             result = super().read(file_path, offset, limit)
         except ValueError as e:
-            return ReadResult(error=self._path_value_error_msg(file_path, e))
+            error = self._path_value_error_msg(file_path, e)
+            self._publish_empty_read(error)
+            return ReadResult(error=error)
         if result.error is None:
             self._publish_read_provenance(file_path)
+        else:
+            self._publish_empty_read(result.error)
         return result
 
     async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
-            return ReadResult(error=self._outside_root_msg(file_path, tool="read_file"))
+            error = self._outside_root_msg(file_path, tool="read_file")
+            self._publish_empty_read(error)
+            return ReadResult(error=error)
         from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
 
         if non_admin_read_filter_enabled():
@@ -1640,6 +1657,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                     )
                     message = self._read_denied_message(reason)
                     record_read_policy_refusal(message)
+                    self._publish_empty_read(message)
                     return ReadResult(error=message)
             except (OSError, RuntimeError, ValueError):
                 from .read_policy import emit_hard_read_denial, record_read_policy_refusal
@@ -1647,6 +1665,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                 emit_hard_read_denial("read_file", file_path, "unresolved_read_target")
                 message = "Read denied: unresolved path"
                 record_read_policy_refusal(message)
+                self._publish_empty_read(message)
                 return ReadResult(error=message)
         return await asyncio.to_thread(self.read, file_path, offset, limit)
 
@@ -1695,11 +1714,15 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
     def ls(self, path: str) -> LsResult:
         if self._is_outside_root(path):
-            return LsResult(error=self._outside_root_msg(path, tool="ls"))
+            error = self._outside_root_msg(path, tool="ls")
+            self._publish_empty_read(error)
+            return LsResult(error=error)
         try:
             result = super().ls(path)
         except ValueError as e:
-            return LsResult(error=self._path_value_error_msg(path, e))
+            error = self._path_value_error_msg(path, e)
+            self._publish_empty_read(error)
+            return LsResult(error=error)
         if result.error is None:
             # Ordinary names belong to the listed directory. Resolved symlink
             # targets can disclose names from elsewhere and need their own source.
@@ -1719,11 +1742,15 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                 invalidate_protected_result_capture()
             else:
                 self._publish_read_paths(read_paths)
+        else:
+            self._publish_empty_read(result.error)
         return result
 
     async def als(self, path: str) -> LsResult:
         if self._is_outside_root(path):
-            return LsResult(error=self._outside_root_msg(path, tool="ls"))
+            error = self._outside_root_msg(path, tool="ls")
+            self._publish_empty_read(error)
+            return LsResult(error=error)
         return await asyncio.to_thread(self.ls, path)
 
     def glob(self, pattern: str, path: str | None = None) -> GlobResult:
@@ -1734,6 +1761,8 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                 for match in result.matches or ()
                 if match.get("path")
             ])
+        else:
+            self._publish_empty_read(result.error)
         return result
 
     async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
@@ -1744,6 +1773,8 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                 for match in result.matches or ()
                 if match.get("path")
             ])
+        else:
+            self._publish_empty_read(result.error)
         return result
 
     def grep(
@@ -1761,6 +1792,8 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                 for match in result.matches or ()
                 if match.get("path")
             ])
+        else:
+            self._publish_empty_read(result.error)
         return result
 
     async def agrep(

@@ -850,7 +850,9 @@ class TestWriteGuardBackend:
         assert result.error is not None
         if error_kind == "outside":
             assert "outside_file_tool_roots" in result.error
-        assert provenance is None
+        assert provenance is not None
+        assert provenance.sources == ()
+        assert provenance.content_free_error == result.error
 
     @pytest.mark.parametrize("method", ["glob", "grep"])
     def test_collection_reads_keep_per_match_taint(
