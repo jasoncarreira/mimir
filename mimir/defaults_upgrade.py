@@ -402,6 +402,19 @@ def _apply_defaults_three_way(
     paths = _git_files(worktree, previous_ref) | _git_files(worktree, current_ref)
     changed = False
     conflicts = False
+    if plugin is not None:
+        from .plugins.defaults import safe_destination
+
+        try:
+            for rel in paths:
+                if rel.parts[:2] == ("prompts", plugin) or (
+                    len(rel.parts) >= 2 and rel.parts[0] == "skills"
+                    and rel.parts[1].startswith(f"{plugin}-")
+                ):
+                    safe_destination(worktree, rel)
+            safe_destination(worktree, Path("scheduler.yaml"))
+        except ValueError as exc:
+            return False, False, str(exc)
     for rel in sorted(paths, key=lambda p: p.as_posix()):
         is_surface = (rel.parts[:2] == ("memory", "core") or rel.parts[:1] == ("prompts",)) if plugin is None else (
             rel.parts[:2] == ("prompts", plugin)
@@ -489,7 +502,9 @@ def check_and_open_plugin_defaults_upgrade(
         if manifest is None or not manifest.defaults:
             continue
         version = str(manifest.defaults["version"])
-        state = home / ".mimir" / "upgrade-plugin-defaults" / name
+        from .plugins.defaults import safe_destination
+
+        state = safe_destination(home, Path(".mimir") / "upgrade-plugin-defaults" / name)
         previous_version = state.read_text(encoding="utf-8").strip() if state.is_file() else None
         if previous_version == version:
             results[name] = DefaultsUpgradeResult(True, "already_synced", version)
@@ -502,6 +517,8 @@ def check_and_open_plugin_defaults_upgrade(
             continue
         branch = f"mimir-plugin-defaults-{name}"
         pending = f"refs/mimir/plugin-defaults/{name}/previous"
+        safe_destination(home, VENDOR_WORKTREE_REL)
+        safe_destination(home, Path("scratch") / "proposals" / "upgrade")
         files = plugin_default_files(candidate)
         vendor = _ensure_vendor_branch(home, branch=branch, version=version, files=files)
         if vendor.error:
@@ -530,6 +547,12 @@ def check_and_open_plugin_defaults_upgrade(
         )
         if not opened.ok or opened.worktree is None or vendor.current_ref is None:
             results[name] = DefaultsUpgradeResult(False, "error", version, opened.detail or opened.reason, opened)
+            continue
+        try:
+            safe_destination(opened.worktree, Path("scheduler.yaml"))
+        except ValueError as exc:
+            abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE)
+            results[name] = DefaultsUpgradeResult(False, "error", version, str(exc))
             continue
         changed, conflicts, error = _apply_defaults_three_way(
             opened.worktree, previous_ref=old, current_ref=vendor.current_ref,

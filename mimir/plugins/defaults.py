@@ -10,6 +10,19 @@ import yaml
 from .discovery import PluginCandidate, enabled_plugins
 
 
+def safe_destination(root: Path, rel: Path) -> Path:
+    """Reject symlinks in an operator-controlled destination, including parents."""
+    root = Path(root)
+    if root.is_symlink() or rel.is_absolute() or not rel.parts or any(part in (".", "..") for part in rel.parts):
+        raise ValueError(f"unsafe plugin defaults destination: {root / rel}")
+    path = root
+    for part in rel.parts:
+        path = path / part
+        if path.is_symlink():
+            raise ValueError(f"symlink in plugin defaults destination: {path}")
+    return path
+
+
 def plugin_default_files(candidate: PluginCandidate) -> dict[Path, str]:
     """Read only inventoried package data, never the provider's Python module."""
     manifest = candidate.manifest
@@ -70,7 +83,7 @@ def plugin_default_files(candidate: PluginCandidate) -> dict[Path, str]:
 
 
 def seed_plugin_defaults(home: Path, *, selected: tuple[PluginCandidate, ...] | None = None) -> dict[str, str]:
-    """Seed missing files and jobs; never refresh existing operator files."""
+    """Seed missing files and initial jobs; later jobs go to upgrade proposals."""
     if selected is None:
         selected = enabled_plugins()
     home = Path(home)
@@ -84,14 +97,28 @@ def seed_plugin_defaults(home: Path, *, selected: tuple[PluginCandidate, ...] | 
             if previous != candidate.name:
                 raise ValueError(f"plugin defaults path {rel} claimed by {previous} and {candidate.name}")
         packages.append((candidate, files))
+    # Validate every target before creating any directories or files. In
+    # particular, never follow an operator symlink into core or outside home.
+    for candidate, files in packages:
+        for rel in files:
+            if rel.parts[0] != "plugins":
+                safe_destination(home, rel)
+        if candidate.manifest and candidate.manifest.defaults:
+            for rel in (
+                Path("scheduler.yaml"),
+                Path(".mimir") / "seed-plugin-defaults" / candidate.name,
+                Path(".mimir") / "upgrade-plugin-defaults" / candidate.name,
+            ):
+                safe_destination(home, rel)
     for candidate, files in packages:
         for rel, text in files.items():
             if rel.parts[0] == "plugins":
                 continue
-            dest = home / rel
+            dest = safe_destination(home, rel)
             dest.parent.mkdir(parents=True, exist_ok=True)
+            safe_destination(home, rel)
             try:
-                fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
             except FileExistsError:
                 result[rel.as_posix()] = "existing"
             else:
@@ -99,17 +126,31 @@ def seed_plugin_defaults(home: Path, *, selected: tuple[PluginCandidate, ...] | 
                     stream.write(text)
                 result[rel.as_posix()] = "created"
         jobs = files.get(Path("plugins") / candidate.name / "scheduler.yaml")
-        scheduler = home / "scheduler.yaml"
-        if jobs and scheduler.is_file():
-            from mimir.defaults_upgrade import _merge_scheduler_defaults
+        if candidate.manifest and candidate.manifest.defaults:
+            marker = safe_destination(home, Path(".mimir") / "seed-plugin-defaults" / candidate.name)
+            synced = safe_destination(home, Path(".mimir") / "upgrade-plugin-defaults" / candidate.name)
+            scheduler = safe_destination(home, Path("scheduler.yaml"))
+        if candidate.manifest and candidate.manifest.defaults and scheduler.is_file() and not marker.exists() and not synced.exists():
+            if jobs:
+                from mimir.defaults_upgrade import _merge_scheduler_defaults
 
-            original = scheduler.read_text(encoding="utf-8")
-            merged, added = _merge_scheduler_defaults(
-                base_text="[]\n", their_text=jobs, home_text=original,
-                version=str(candidate.manifest.defaults["version"]),
-            )
-            if merged is not None:
-                scheduler.write_text(merged, encoding="utf-8")
-            for name in added:
-                result[f"scheduler.yaml:{name}"] = "created"
+                original = scheduler.read_text(encoding="utf-8")
+                merged, added = _merge_scheduler_defaults(
+                    base_text="[]\n", their_text=jobs, home_text=original,
+                    version=str(candidate.manifest.defaults["version"]),
+                )
+                if merged is not None:
+                    safe_destination(home, Path("scheduler.yaml"))
+                    scheduler.write_text(merged, encoding="utf-8")
+                for name in added:
+                    result[f"scheduler.yaml:{name}"] = "created"
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            safe_destination(home, Path(".mimir") / "seed-plugin-defaults" / candidate.name)
+            try:
+                fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(str(candidate.manifest.defaults["version"]) + "\n")
     return result
