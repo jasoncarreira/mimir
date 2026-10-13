@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from argparse import Namespace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -9,14 +10,216 @@ from typing import Any
 import pytest
 
 from benchmarks.longmemeval_via_memory import runner
-from mimir.access_control import create_local_operator_auth_context
+from mimir.access_control import create_auth_context, create_local_operator_auth_context
+from mimir._context import reset_current_turn, set_current_turn
+from mimir._deepagents_subagent_auth import _subagent_auth_context, _wrap_task_tool
 from mimir.commitments import cli as commitments_cli
-from mimir.models import TurnInteractivity
+from mimir.models import AgentEvent, InformationFlowLabels, TurnContext, TurnInteractivity
+from mimir.plugins.registry import PolicyRegistry
 from mimir.reflection import most_retrieved
 from mimir import scheduler_dashboard
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_owned_state_slots_follow_live_carriers_without_cross_owner_writes() -> None:
+    @dataclass(frozen=True)
+    class Alpha:
+        value: str
+
+    @dataclass(frozen=True)
+    class Beta:
+        value: int
+
+    policy = PolicyRegistry()
+    alpha = policy.registrar("alpha")
+    beta = policy.registrar("beta")
+    alpha.register_state_slot(Alpha)
+    beta.register_state_slot(Beta)
+    policy.freeze()
+    auth = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="channel", author="user"),
+        policy=policy,
+    )
+    assert auth.plugin_state("alpha") is None
+    with pytest.raises(TypeError, match="registered slot type"):
+        auth.with_plugin_state(alpha, Beta(1))
+    with pytest.raises(ValueError, match="matching owner registrar"):
+        auth.with_plugin_state(PolicyRegistry().registrar("alpha"), Alpha("wrong"))
+
+    bound = auth.with_plugin_state(alpha, Alpha("initial"))
+    assert auth.plugin_state("alpha") is None
+    turn = TurnContext("turn", "channel", "user_message", "channel", 0, auth_context=bound)
+    turn.set_plugin_state(beta, Beta(2))
+    assert turn.plugin_state("alpha") == Alpha("initial")
+    assert turn.plugin_state("beta") == Beta(2)
+    assert bound.plugin_state("beta") is None
+    snapshot = turn.auth_with_plugin_state()
+    assert snapshot.plugin_state("beta") == Beta(2)
+    assert replace(snapshot, trigger="continuation").plugin_state("alpha") == Alpha("initial")
+    other = TurnContext("other", "channel", "user_message", "channel", 0, auth_context=bound)
+    assert other.plugin_state("beta") is None
+
+
+def test_plugin_state_keeps_auth_context_opaque_to_pydantic() -> None:
+    from pydantic import TypeAdapter
+
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_state_slot(State)
+    policy.freeze()
+    auth = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="channel", author="user"),
+        policy=policy,
+    ).with_plugin_state(registrar, State("secret"))
+    assert TypeAdapter(type(auth)).dump_python(auth) == {"audience_provider": None}
+
+
+def test_subagent_task_receives_live_owner_snapshot() -> None:
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_state_slot(State)
+    policy.freeze()
+    auth = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="channel", author="user"),
+        policy=policy,
+    )
+    turn = TurnContext("turn", "channel", "user_message", "channel", 0, auth_context=auth)
+    turn.set_plugin_state(registrar, State("live"))
+    task = _wrap_task_tool(SimpleNamespace(
+        func=lambda **_kwargs: _subagent_auth_context.get(),
+        coroutine=lambda **_kwargs: None,
+    ))
+    token = set_current_turn(turn)
+    try:
+        child = task.func(runtime=SimpleNamespace(context=auth))
+    finally:
+        reset_current_turn(token)
+    assert child.plugin_state("example") == State("live")
+    assert auth.plugin_state("example") is None
+    assert _subagent_auth_context.get() is None
+
+
+@pytest.mark.asyncio
+async def test_real_deepagents_task_and_atask_deliver_only_same_turn_live_slots() -> None:
+    from deepagents.middleware.subagents import _build_task_tool
+    from langchain.tools import ToolRuntime
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.runnables import Runnable
+
+    from mimir._deepagents_subagent_auth import _AuthContextRunnable
+
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    class Child(Runnable):
+        def __init__(self) -> None:
+            self.contexts: list[Any] = []
+
+        def invoke(self, input: Any, config: Any = None, *, context: Any = None, **kwargs: Any) -> Any:
+            self.contexts.append(context)
+            return {"messages": [AIMessage(content="done")]}
+
+        async def ainvoke(self, input: Any, config: Any = None, *, context: Any = None, **kwargs: Any) -> Any:
+            self.contexts.append(context)
+            return {"messages": [AIMessage(content="done")]}
+
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_state_slot(State)
+    policy.freeze()
+    event = AgentEvent(trigger="user_message", channel_id="channel", author="user")
+    ingress = create_auth_context(event, policy=policy)
+    turn = TurnContext("turn", "channel", "user_message", "channel", 0, auth_context=ingress)
+    turn.set_plugin_state(registrar, State("live"))
+    turn.auth_context = replace(ingress, ifc_labels=InformationFlowLabels().with_label("internal"))
+
+    child = Child()
+    tool = _wrap_task_tool(_build_task_tool([{
+        "name": "general-purpose",
+        "description": "Owner state propagation child",
+        "runnable": _AuthContextRunnable(child),
+    }]))
+
+    def runtime(carrier: Any) -> ToolRuntime:
+        return ToolRuntime(
+            state={"messages": [HumanMessage(content="parent prompt")]},
+            context=carrier, config={}, stream_writer=lambda _: None,
+            tool_call_id="owner-task", store=None,
+        )
+
+    token = set_current_turn(turn)
+    try:
+        sync_result = tool.func(
+            description="check state", subagent_type="general-purpose", runtime=runtime(ingress),
+        )
+        async_result = await tool.coroutine(
+            description="check state", subagent_type="general-purpose", runtime=runtime(ingress),
+        )
+        foreign = create_auth_context(event, policy=policy)
+        foreign_result = await tool.coroutine(
+            description="check isolation", subagent_type="general-purpose", runtime=runtime(foreign),
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert sync_result.update["messages"][0].content == "done"
+    assert async_result.update["messages"][0].content == "done"
+    assert foreign_result.update["messages"][0].content == "done"
+    sync_auth, async_auth, foreign_auth = child.contexts
+    assert sync_auth.plugin_state("example") == async_auth.plugin_state("example") == State("live")
+    assert sync_auth is not ingress and async_auth is not ingress
+    assert sync_auth.ifc_state is ingress.ifc_state
+    assert async_auth.ifc_state is ingress.ifc_state
+    assert foreign_auth is foreign
+    assert foreign_auth.plugin_state("example") is None
+    assert ingress.plugin_state("example") is None
+    assert _subagent_auth_context.get() is None
+
+
+@pytest.mark.asyncio
+async def test_async_subagent_task_uses_rescoped_live_state_not_foreign_runtime() -> None:
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_state_slot(State)
+    policy.freeze()
+    event = AgentEvent(trigger="user_message", channel_id="channel", author="user")
+    ingress = create_auth_context(event, policy=policy)
+    turn = TurnContext("turn", "channel", "user_message", "channel", 0, auth_context=ingress)
+    turn.set_plugin_state(registrar, State("live"))
+    turn.auth_context = replace(ingress, ifc_labels=InformationFlowLabels().with_label("internal"))
+
+    async def child(**_kwargs: Any) -> Any:
+        return _subagent_auth_context.get()
+
+    task = _wrap_task_tool(SimpleNamespace(func=lambda **_kwargs: None, coroutine=child))
+    token = set_current_turn(turn)
+    try:
+        inherited = await task.coroutine(runtime=SimpleNamespace(context=ingress))
+        foreign = create_auth_context(event, policy=policy)
+        refused = await task.coroutine(runtime=SimpleNamespace(context=foreign))
+        lookalike = await task.coroutine(runtime=SimpleNamespace(context=object()))
+    finally:
+        reset_current_turn(token)
+    assert inherited.plugin_state("example") == State("live")
+    assert inherited is not ingress
+    assert refused is foreign and refused.plugin_state("example") is None
+    assert lookalike is None
+    assert _subagent_auth_context.get() is None
 
 
 class _AuthContextConstructorVisitor(ast.NodeVisitor):
