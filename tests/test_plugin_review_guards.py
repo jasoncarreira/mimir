@@ -855,3 +855,63 @@ def test_poller_hooks_never_execute_skill_path_python():
         isinstance(node, ast.Attribute) and node.attr == "spec_from_file_location"
         for node in ast.walk(tree)
     )
+
+
+def test_selected_candidate_snapshot_binds_once_before_policy_freeze():
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates(())
+    with pytest.raises(PolicyRegistrationError, match="repeated"):
+        registry.select_plugin_candidates(())
+    policy = registry.freeze()
+    assert policy.selected_plugin_candidates == ()
+    with pytest.raises(PolicyRegistrationError, match="frozen"):
+        policy.select_plugin_candidates(())
+
+
+def test_disabled_provider_module_is_not_imported_on_poller_reload(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    (tmp_path / "enabled_review_provider.py").write_text(
+        "def register(registrar):\n    pass\n", encoding="utf-8",
+    )
+    (tmp_path / "disabled_review_provider.py").write_text(
+        "from pathlib import Path\nPath('disabled-imported').write_text('bad')\n"
+        "def register(registrar):\n    pass\n", encoding="utf-8",
+    )
+    script = '''import importlib
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from mimir.plugins import manager
+from mimir.pollers import discover_pollers
+
+def candidate(name):
+    root = Path(name)
+    root.mkdir()
+    manifest = root / 'mimir-plugin.toml'
+    manifest.write_text('')
+    dist = SimpleNamespace(files=(manifest,), locate_file=lambda item: item)
+    return SimpleNamespace(name=name, distribution=name, manifest=object(), enabled=True,
+                           entry_point=SimpleNamespace(dist=dist, load=lambda: importlib.import_module(name)))
+
+selected = candidate('enabled_review_provider')
+installed_disabled = candidate('disabled_review_provider')
+manager.enabled_plugins = lambda *, enable: (selected,)
+policy = manager.load_plugins(enable='enabled_review_provider').policy
+assert policy.selected_plugin_candidates == (selected,)
+os.environ['MIMIR_PLUGINS'] = 'disabled_review_provider'
+assert not discover_pollers(Path('absent-skills'), policy=policy)
+assert installed_disabled not in policy.selected_plugin_candidates
+assert 'disabled_review_provider' not in sys.modules
+assert not Path('disabled-imported').exists()
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]) + os.pathsep
+             + str(tmp_path)}, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not (tmp_path / "disabled-imported").exists()

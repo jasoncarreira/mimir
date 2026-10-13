@@ -1758,12 +1758,7 @@ def discover_pollers(
     _validate_non_secret_forwarded_env_keys()
     pollers: list[PollerConfig] = []
     if plugin_candidates is None:
-        if policy is not None and os.environ.get("MIMIR_PLUGINS", "").strip():
-            from .plugins.discovery import enabled_plugins
-
-            plugin_candidates = enabled_plugins()
-        else:
-            plugin_candidates = ()
+        plugin_candidates = policy.selected_plugin_candidates if policy is not None else ()
     if policy is not None and set(policy.poller_hooks) & {"github", "worklink"}:
         raise ValueError("plugin poller hooks collide with reserved core profiles")
     if not skills_dir.exists() and not plugin_candidates:

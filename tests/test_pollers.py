@@ -128,6 +128,117 @@ def test_plugin_poller_authority_rejects_foreign_profile(tmp_path):
         )
 
 
+def test_selected_provider_module_poller_authority_and_reloads(tmp_path, monkeypatch):
+    import importlib
+
+    from mimir.plugins import manager
+
+    root = tmp_path / "provider"
+    skill = root / "skills" / "watcher"
+    skill.mkdir(parents=True)
+    (root / "mimir-plugin.toml").write_text("", encoding="utf-8")
+    manifest = skill / "pollers.json"
+
+    def declare(name="example-watch", hooks="example-hook", capabilities=("example_read",)):
+        manifest.write_text(json.dumps({"pollers": [{
+            "name": name, "command": "python3 scripts/watch.py", "cron": "*/10 * * * *",
+            "hooks": hooks,
+            "authority": {"profile": "example-profile", "tier": "scope-contained",
+                          "capabilities": list(capabilities), "scoped_roots": ["state"]},
+        }]}), encoding="utf-8")
+
+    declare()
+    module = tmp_path / "enabled_poller_provider.py"
+    module.write_text('''from mimir.poller_hooks import PollerHooks
+from mimir.tool_descriptors import ResultOriginKind
+
+def register(registrar):
+    registrar.register_tool(
+        name="example_read", factory=lambda: object(), flow="source",
+        tier="scope-contained", operation_class="open", result_domain="web",
+        result_origin=ResultOriginKind.EXTERNAL, sink_category=None,
+        sink_destination=None, sink_target_extractor=None, sink_payload_extractor=None,
+        writes_code_or_state=False, profiles=("example-profile",), read_backend=False,
+    )
+    registrar.register_capability("example_read")
+    registrar.register_authority_profile("example-profile", capabilities=("example_read",))
+    registrar.register_poller_hook("example-hook", lambda: PollerHooks(
+        recovery_relevance=lambda poller: lambda event: poller.name == "example-watch",
+    ))
+''', encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    dist = SimpleNamespace(files=(root / "mimir-plugin.toml", manifest),
+                           locate_file=lambda path: path)
+    candidate = SimpleNamespace(name="example", distribution="example", enabled=True,
+                                manifest=object(), entry_point=SimpleNamespace(
+                                    dist=dist, load=lambda: importlib.import_module("enabled_poller_provider"),
+                                ))
+    monkeypatch.setattr(manager, "enabled_plugins", lambda *, enable: (candidate,))
+    selected = manager.load_plugins(enable="example").policy
+    assert selected.selected_plugin_candidates == (candidate,)
+    assert selected.frozen
+
+    skills = tmp_path / "skills"
+    state = tmp_path / "state" / "pollers"
+    monkeypatch.setenv("MIMIR_PLUGINS", "disabled")
+    for _ in range(2):
+        pollers = discover_pollers(skills, state_root=state, policy=selected)
+        assert len(pollers) == 1
+        poller = pollers[0]
+        assert poller.manifest_path == manifest
+        assert poller.hooks is not None and poller.hooks.recovery_relevance is not None
+        assert poller.hooks.recovery_relevance(poller)(None)
+        assert poller.authority is not None
+        assert poller.authority.canonical == "poller:example-watch"
+        assert poller.authority.authority_profile == "example-profile"
+        assert poller.authority.capabilities == ("example_read",)
+        event = AgentEvent(
+            trigger="poller", channel_id=poller.channel_id(), content="read",
+            service_principal=poller.authority.canonical,
+            service_authority=poller.authority,
+        )
+        auth = create_auth_context(event, enforce=True)
+        verdict = ToolRegistry().authorize_tool("example_read", auth, enforce=True, policy=selected)
+        assert verdict.allowed, verdict.reason
+        assert not ToolRegistry().authorize_tool(
+            "saga_forget", auth, enforce=True, policy=selected,
+        ).allowed
+
+    # An authority-less installed candidate must not be added by a changed
+    # environment. Nor can a changed environment remove the selected one.
+    other_skill = tmp_path / "foreign" / "skills" / "watcher"
+    other_skill.mkdir(parents=True)
+    foreign_manifest = other_skill.parents[1] / "mimir-plugin.toml"
+    foreign_manifest.write_text("", encoding="utf-8")
+    (other_skill / "pollers.json").write_text(json.dumps({"pollers": [{
+        "name": "foreign-watch", "command": "echo", "cron": "0 * * * *",
+    }]}), encoding="utf-8")
+    foreign_dist = SimpleNamespace(files=(foreign_manifest, other_skill / "pollers.json"),
+                                   locate_file=lambda path: path)
+    foreign = SimpleNamespace(name="foreign", distribution="foreign", enabled=True,
+                              manifest=object(), entry_point=SimpleNamespace(dist=foreign_dist))
+    monkeypatch.setattr("mimir.plugins.discovery.enabled_plugins",
+                        lambda: (foreign,))
+    monkeypatch.setenv("MIMIR_PLUGINS", "foreign")
+    assert [p.name for p in discover_pollers(skills, state_root=state, policy=selected)] == ["example-watch"]
+
+    for name, hooks, capabilities, reason in (
+        ("example-watch", "example-hook", ("read_file",), "owned"),
+        ("github-activity", "example-hook", ("example_read",), "reserved"),
+        ("worklink-ready-queue", "example-hook", ("example_read",), "reserved"),
+        ("github-ci-watch", "example-hook", ("example_read",), "reserved"),
+        ("example-watch", "github", ("example_read",), "reserved"),
+        ("example-watch", "worklink", ("example_read",), "reserved"),
+    ):
+        declare(name, hooks, capabilities)
+        invalid = []
+        assert discover_pollers(skills, state_root=state, policy=selected,
+                                invalid_entries=invalid) == []
+        assert reason in invalid[0][2]
+    assert resolve_poller_hooks("github", Path("github-poller/pollers.json")) is not None
+    assert resolve_poller_hooks("worklink", Path("chainlink-orchestrator/pollers.json")) is not None
+
+
 def test_verified_own_push_drops_stale_framework_trigger_before_scope_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
