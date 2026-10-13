@@ -64,7 +64,7 @@ def test_plugin_stage_selection_and_order(tmp_path, monkeypatch):
     a = _provider(tmp_path)
     b = SimpleNamespace(**{**vars(a), "name": "zzz", "enabled": False,
                            "manifest": SimpleNamespace(dockerfile={"system_packages": ["zlib1g"]})})
-    monkeypatch.setattr("mimir.plugin_dockerfile.discover_plugins", lambda: (a, b))
+    monkeypatch.setattr("mimir.plugin_dockerfile.discover_plugins", lambda **kwargs: (a, b))
     assert select_plugins() == (a,)
     assert select_plugins(all_installed=True) == (a, b)
     assert "libmagic1" in render_stage((a,), "base")
@@ -86,10 +86,14 @@ def test_selected_service_is_supervised_and_generated_wrappers_execute(tmp_path,
     assert "s6-overlay-${S6_ARCH}.tar.xz" in dockerfile
     assert "USER root\nENTRYPOINT" in dockerfile
     assert "COPY .mimir-scaffold/plugin-services/" in dockerfile
+    assert render_stage((provider,), "services").split("COPY .mimir-scaffold/", 1)[1] in dockerfile
     if mode == "pypi":
         assert 'pip install --no-cache-dir "example-provider==2.3.0"' in dockerfile
     else:
         assert "uv pip install --python .venv/bin/python" in (home / "start.sh").read_text()
+        assert "uv run --no-sync mimir run" in (home / "start.sh").read_text()
+        assert (home / ".mimir-scaffold/s6-rc.d/mimir-plugin-reset/up").exists()
+        assert (home / ".mimir-scaffold/s6-rc.d/sample-worker/dependencies.d/mimir-plugin-reset").exists()
 
     context = home / ".mimir-scaffold" / "s6-rc.d"
     shim = tmp_path / "bin"
@@ -106,12 +110,26 @@ def test_selected_service_is_supervised_and_generated_wrappers_execute(tmp_path,
     local_wrapper = tmp_path / "run"
     local_wrapper.write_text(wrapper.read_text().replace(
         "/usr/local/libexec/mimir-plugin-services/sample/worker/run",
-        str(home / ".mimir-scaffold/plugin-services/sample/worker/run")))
+        str(home / ".mimir-scaffold/plugin-services/sample/worker/run")).replace(
+        "/run/mimir-plugin-services/ready", str(tmp_path / "ready")))
     local_wrapper.chmod(0o755)
-    completed = subprocess.run([str(local_wrapper)], env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}",
-                          "GREETING": "hello", "USER": "mimir", "RESULT": str(output),
-                          "SHIM_USER": str(shim_user)}, check=False)
-    assert completed.returncode == 17
+    env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}", "GREETING": "hello",
+           "USER": "mimir", "RESULT": str(output), "SHIM_USER": str(shim_user)}
+    if mode == "workspace":
+        process = subprocess.Popen([str(local_wrapper)], env=env)
+        try:
+            with pytest.raises(subprocess.TimeoutExpired):
+                process.wait(timeout=0.2)
+            assert not output.exists(), "plugin ran before Mimir completed provider installation"
+            (tmp_path / "ready").touch()
+            assert process.wait(timeout=5) == 17
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+    else:
+        completed = subprocess.run([str(local_wrapper)], env=env, check=False)
+        assert completed.returncode == 17
     assert shim_user.read_text() == "mimir"
     assert output.read_text() == "hello:mimir"
     assert 'exec s6-setuidgid mimir /usr/local/bin/start.sh' in (context / "mimir/run").read_text()
@@ -134,6 +152,45 @@ def test_selected_service_is_supervised_and_generated_wrappers_execute(tmp_path,
     scaffold(home, mode=mode)
     assert not (home / ".mimir-scaffold").exists()
     assert 'ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]' in (home / "Dockerfile").read_text()
+
+
+def test_workspace_boot_preserves_provider_across_sync_and_run(tmp_path, monkeypatch):
+    provider = _provider(tmp_path)
+    monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kwargs: (provider,))
+    home = tmp_path / "home"
+    home.mkdir()
+    scaffold(home, mode="workspace")
+    script = (home / "start.sh").read_text()
+    boot = script.split('UV_EXTRAS="', 1)[1].split("# ─── home seed", 1)[0]
+    boot = 'UV_EXTRAS="' + boot.replace("/run/mimir-plugin-services/ready", str(tmp_path / "ready"))
+    # The console build is unrelated to dependency retention and must not run
+    # npm against the repository while exercising the generated boot commands.
+    boot = (boot.split("# The workspace volume preserves", 1)[0] +
+            boot.split("# ─── skill-required extras", 1)[1].split("\n", 1)[1])
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    uv = shim / "uv"
+    uv.write_text('''#!/bin/sh
+case "$1" in
+  sync) rm -f "$PROVIDER_INSTALLED" ;;
+  pip) [ "$2" = install ] && touch "$PROVIDER_INSTALLED" ;;
+  run)
+    [ "$2" = --no-sync ] || { rm -f "$PROVIDER_INSTALLED"; exit 90; }
+    case "$3" in
+      python) [ -f "$PROVIDER_INSTALLED" ] || exit 91 ;;
+      mimir) [ "$4" = skills ] || [ -f "$PROVIDER_INSTALLED" ] || exit 92 ;;
+    esac ;;
+esac
+''')
+    uv.chmod(0o755)
+    state = tmp_path / "installed"
+    result = subprocess.run(["bash", "-eu", "-c", boot + "\nuv run --no-sync mimir setup\nuv run --no-sync mimir run\n"],
+                            env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}",
+                                 "PROVIDER_INSTALLED": str(state), "MIMIR_HOME": str(home)},
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert state.exists()
+    assert (tmp_path / "ready").exists()
 
 
 # ── fixtures ────────────────────────────────────────────────────────

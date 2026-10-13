@@ -564,7 +564,8 @@ def render_dockerfile(
             base = base.replace("# Pre-warm the fastembed", install + "\n\n# Pre-warm the fastembed")
         if service_list:
             base = base.replace('ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]',
-                                _S6_SCAFFOLD_BLOCK + '\nENTRYPOINT ["/init"]')
+                                _S6_SCAFFOLD_BLOCK.replace("__PLUGIN_SERVICES__", render_stage(plugins, "services"))
+                                + '\nENTRYPOINT ["/init"]')
     if not fragments:
         body = "# (no skills installed yet ship a dockerfile.fragment)"
     else:
@@ -600,10 +601,7 @@ RUN set -eu; \\
     tar -C / -Jxpf /tmp/s6-noarch.tar.xz; \\
     tar -C / -Jxpf /tmp/s6-arch.tar.xz; \\
     rm -f /tmp/s6-noarch.tar.xz /tmp/s6-arch.tar.xz
-COPY .mimir-scaffold/plugin-services/ /usr/local/libexec/mimir-plugin-services/
-COPY .mimir-scaffold/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
-RUN chown -R root:root /usr/local/libexec/mimir-plugin-services /etc/s6-overlay/s6-rc.d \\
- && chmod -R go-w /usr/local/libexec/mimir-plugin-services /etc/s6-overlay/s6-rc.d
+__PLUGIN_SERVICES__
 USER root'''
 
 
@@ -967,8 +965,10 @@ def render_start_sh(
         boot += "uv run --no-sync python -c 'import importlib.metadata as m; " + "; ".join(
             f'assert m.version("{pin.split("==")[0]}") == "{pin.split("==")[1]}"' for pin in plugin_pins
         ) + "'\n"
+        boot += "touch /run/mimir-plugin-services/ready\n"
     script = _START_SH_TEMPLATE.replace("{UV_EXTRAS}", flags)
     if plugin_pins:
+        script = script.replace("uv run ", "uv run --no-sync ")
         script = script.replace("# ─── home seed (idempotent", boot + "\n# ─── home seed (idempotent")
     return script
 
@@ -1368,12 +1368,33 @@ def scaffold(
         shutil.rmtree(context)
     if selected_services:
         assemble_services(plugins, context / "s6-rc.d", context / "plugin-services")
+        if mode == "workspace":
+            reset = context / "s6-rc.d" / "mimir-plugin-reset"
+            reset.mkdir()
+            (reset / "type").write_text("oneshot\n")
+            up = reset / "up"
+            up.write_text("#!/bin/sh\ninstall -d -o mimir -g mimir -m 0755 /run/mimir-plugin-services\nrm -f /run/mimir-plugin-services/ready\n")
+            up.chmod(0o755)
+            for service in selected_services:
+                definition = context / "s6-rc.d" / f"{service.plugin}-{service.name}"
+                deps = definition / "dependencies.d"
+                deps.mkdir()
+                (deps / "mimir-plugin-reset").touch()
+                wrapper = definition / "run"
+                wrapper.write_text("#!/bin/sh\nwhile [ ! -f /run/mimir-plugin-services/ready ]; do sleep 1; done\n" +
+                                   wrapper.read_text().split("\n", 1)[1])
+            # The Mimir process installs and verifies packages before releasing
+            # dependent plugin longruns; s6 resets the marker before either starts.
         mimir_service = context / "s6-rc.d" / "mimir"
         mimir_service.mkdir(parents=True)
         (mimir_service / "type").write_text("longrun\n")
         run = mimir_service / "run"
         run.write_text("#!/bin/sh\nexec s6-setuidgid mimir /usr/local/bin/start.sh\n")
         run.chmod(0o755)
+        if mode == "workspace":
+            deps = mimir_service / "dependencies.d"
+            deps.mkdir()
+            (deps / "mimir-plugin-reset").touch()
         (context / "s6-rc.d" / "user" / "contents.d" / "mimir").touch()
     fragments = collect_fragments(home)
     required_keys = collect_required_env_vars(home)

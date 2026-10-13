@@ -20,9 +20,9 @@ class Service:
     run: Path
 
 
-def select_plugins(*, all_installed: bool = False) -> tuple[PluginCandidate, ...]:
+def select_plugins(*, all_installed: bool = False, enable: str | None = None) -> tuple[PluginCandidate, ...]:
     """Select metadata without loading any entry point, failing on invalid selections."""
-    candidates = discover_plugins()
+    candidates = discover_plugins(enable=enable)
     selected = tuple(c for c in candidates if all_installed or c.enabled)
     for candidate in selected:
         if candidate.diagnostic or candidate.manifest is None:
@@ -59,7 +59,7 @@ def services(candidates: tuple[PluginCandidate, ...]) -> tuple[Service, ...]:
             if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
                 raise ValueError(f"plugin {candidate.name}: invalid service name {name!r}")
             identifier = f"{candidate.name}-{name}"
-            if identifier in names or identifier in {"mimir", "watchdog", "worklink-execd"}:
+            if identifier in names or identifier in {"mimir", "watchdog", "worklink-execd", "mimir-plugin-reset"}:
                 raise ValueError(f"duplicate s6 service {identifier}")
             names.add(identifier)
             result.append(Service(candidate.name, name, root / relative / "run"))
@@ -88,6 +88,13 @@ def render_stage(candidates: tuple[PluginCandidate, ...], stage: str) -> str:
                             for service in services((candidate,)))
         if fragment:
             lines.append(f"# --- plugin {candidate.name} ---\n" + "\n".join(fragment))
+    if stage == "services" and lines:
+        lines.append(
+            "COPY .mimir-scaffold/plugin-services/ /usr/local/libexec/mimir-plugin-services/\n"
+            "COPY .mimir-scaffold/s6-rc.d/ /etc/s6-overlay/s6-rc.d/\n"
+            "RUN chown -R root:root /usr/local/libexec/mimir-plugin-services /etc/s6-overlay/s6-rc.d \\\n"
+            " && chmod -R go-w /usr/local/libexec/mimir-plugin-services /etc/s6-overlay/s6-rc.d"
+        )
     return "\n\n".join(lines)
 
 
@@ -117,22 +124,38 @@ def verify_pins(pins: tuple[str, ...], candidates: tuple[PluginCandidate, ...]) 
         raise ValueError(f"selected provider packages differ: requested {pins}, installed {actual}")
 
 
+def assemble_image(*, pins: tuple[str, ...], enable: str, all_installed: bool,
+                   destination: Path, scripts: Path) -> None:
+    """Verify the pinned build inputs, then assemble only the selected services."""
+    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*==[A-Za-z0-9][A-Za-z0-9_.!+~-]*", pin)
+           for pin in pins):
+        raise ValueError("plugin package pins must be exact distribution==version pairs")
+    candidates = discover_plugins(enable=enable)
+    pinned = tuple(c for c in candidates if any(
+        canonicalize_name(c.distribution) == canonicalize_name(pin.split("==")[0]) for pin in pins
+    ))
+    verify_pins(pins, pinned)
+    selected = tuple(c for c in candidates if all_installed or c.enabled)
+    missing = [c.name for c in selected if c not in pinned]
+    if missing:
+        raise ValueError(f"selected plugin(s) missing pinned distribution: {', '.join(missing)}")
+    for candidate in selected:
+        if candidate.diagnostic or candidate.manifest is None:
+            raise PluginDiscoveryError(f"plugin {candidate.name}: {candidate.diagnostic or 'missing manifest'}")
+    assemble_services(selected, destination, scripts)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--packages", required=True, help="comma-separated pinned provider distributions")
+    parser.add_argument("--enable", default="", help="build-time MIMIR_PLUGINS selection")
+    parser.add_argument("--all-installed", choices=("0", "1"), default="0")
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--scripts", type=Path, required=True)
     args = parser.parse_args()
     pins = tuple(filter(None, args.packages.split(",")))
-    selected = tuple(c for c in discover_plugins() if any(
-        canonicalize_name(c.distribution) == canonicalize_name(p.split("==")[0])
-        for p in pins
-    ))
-    for candidate in selected:
-        if candidate.diagnostic or candidate.manifest is None:
-            raise PluginDiscoveryError(f"plugin {candidate.name}: {candidate.diagnostic}")
-    verify_pins(pins, selected)
-    assemble_services(selected, args.destination, args.scripts)
+    assemble_image(pins=pins, enable=args.enable, all_installed=args.all_installed == "1",
+                   destination=args.destination, scripts=args.scripts)
 
 
 if __name__ == "__main__":

@@ -180,6 +180,8 @@ RUN pip install --no-cache-dir --upgrade pip \
 # Optional pinned provider packages must be supplied at image build time.
 # Private wheels require an operator-supplied pip index or build context.
 ARG MIMIR_PLUGIN_PACKAGES=""
+ARG MIMIR_PLUGIN_SELECTION=""
+ARG MIMIR_PLUGIN_ALL_INSTALLED=0
 RUN set -eu; old_ifs="$IFS"; IFS=,; \
     for package in $MIMIR_PLUGIN_PACKAGES; do \
         case "$package" in *==*) ;; *) echo >&2 "plugin package must be pinned: $package"; exit 2 ;; esac; \
@@ -310,13 +312,15 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 USER root
 COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
 # Use the assembler from this image build context, not an older published wheel.
+# MIMIR_PLUGIN_SELECTION chooses enabled providers at build time; disabled pinned
+# distributions add no services unless MIMIR_PLUGIN_ALL_INSTALLED=1 is explicit.
 COPY mimir/ /opt/mimir-image-assembly/mimir/
-RUN if [ -n "$MIMIR_PLUGIN_PACKAGES" ]; then \
-        /home/mimir/venv/bin/python -c 'import sys; sys.path.insert(0, "/opt/mimir-image-assembly"); from mimir.plugin_dockerfile import main; main()' \
-            --packages "$MIMIR_PLUGIN_PACKAGES" \
-            --destination /etc/s6-overlay/s6-rc.d \
-            --scripts /usr/local/libexec/mimir-plugin-services; \
-    fi \
+RUN /home/mimir/venv/bin/python -c 'import sys; sys.path.insert(0, "/opt/mimir-image-assembly"); from mimir.plugin_dockerfile import main; main()' \
+        --packages "$MIMIR_PLUGIN_PACKAGES" \
+        --enable "$MIMIR_PLUGIN_SELECTION" \
+        --all-installed "$MIMIR_PLUGIN_ALL_INSTALLED" \
+        --destination /etc/s6-overlay/s6-rc.d \
+        --scripts /usr/local/libexec/mimir-plugin-services \
     && rm -rf /opt/mimir-image-assembly
 RUN install -d -o root -g root -m 0755 /usr/local/libexec \
     && printf '%s\n' '#!/bin/sh' 'exec /opt/mimir-worklink/venv/bin/python -m mimir.worklink.worker_exec "$@"' > /usr/local/libexec/worklink-execd \
