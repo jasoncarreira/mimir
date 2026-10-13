@@ -950,8 +950,8 @@ def test_scheduler_introduction_run_does_not_add(
     _cleanup_upgrade_proposal(home)
 
 
-def _plugin(tmp_path: Path, version: str = "1.0"):
-    root = tmp_path / "package"
+def _plugin(tmp_path: Path, version: str = "1.0", *, name: str = "sample"):
+    root = tmp_path / name
     (root / "skills" / "helper").mkdir(parents=True, exist_ok=True)
     (root / "prompts").mkdir(exist_ok=True)
     (root / "jobs.yaml").write_text(_HEARTBEAT, encoding="utf-8")
@@ -966,7 +966,7 @@ def _plugin(tmp_path: Path, version: str = "1.0"):
             return root / path
 
     return SimpleNamespace(
-        name="sample", entry_point=SimpleNamespace(dist=Distribution()),
+        name=name, entry_point=SimpleNamespace(dist=Distribution()),
         manifest=SimpleNamespace(defaults={
             "version": version, "skills": ("skills/helper",),
             "prompts": ("prompts/heartbeat.md",), "scheduler_jobs": ("jobs.yaml",),
@@ -987,7 +987,7 @@ def test_plugin_defaults_seed_is_namespaced_and_preserves_edits(tmp_path: Path) 
     assert "sample-heartbeat" in (home / "scheduler.yaml").read_text()
     target = home / "prompts" / "sample" / "heartbeat.md"
     target.write_text("operator edit\n", encoding="utf-8")
-    (tmp_path / "package" / "prompts" / "heartbeat.md").write_text("plugin v2\n")
+    (tmp_path / "sample" / "prompts" / "heartbeat.md").write_text("plugin v2\n")
     assert seed_plugin_defaults(home, selected=(plugin,))["prompts/sample/heartbeat.md"] == "existing"
     assert target.read_text() == "operator edit\n"
     assert (home / "prompts" / "heartbeat.md").read_text() == "core prompt\n"
@@ -1007,11 +1007,25 @@ def test_new_plugin_version_only_fills_missing_files(tmp_path: Path) -> None:
     skill = home / "skills/sample-helper/SKILL.md"
     skill.write_text("operator skill\n")
     plugin.entry_point.dist.files += (Path("skills/helper/README.md"),)
-    (tmp_path / "package/skills/helper/README.md").write_text("new file\n")
+    (tmp_path / "sample/skills/helper/README.md").write_text("new file\n")
     plugin.manifest.defaults["version"] = "2.0"
     result = seed_plugin_defaults(home, selected=(plugin,))
     assert result["skills/sample-helper/README.md"] == "created"
     assert skill.read_text() == "operator skill\n"
+
+
+def test_plugin_skill_namespace_collision_fails_before_seeding(tmp_path: Path) -> None:
+    alpha = _plugin(tmp_path, name="alpha")
+    alpha_beta = _plugin(tmp_path, name="alpha-beta")
+    skill = tmp_path / "alpha/skills/helper/SKILL.md"
+    moved = tmp_path / "alpha/skills/beta-helper"
+    moved.mkdir()
+    (moved / "SKILL.md").write_text(skill.read_text())
+    alpha.manifest.defaults["skills"] = ("skills/beta-helper",)
+    alpha.entry_point.dist.files += (Path("skills/beta-helper/SKILL.md"),)
+    with pytest.raises(ValueError, match="claimed by alpha and alpha-beta"):
+        seed_plugin_defaults(tmp_path / "home", selected=(alpha, alpha_beta))
+    assert not (tmp_path / "home").exists()
 
 
 def test_plugin_defaults_upgrade_proposes_without_touching_live_home(
@@ -1033,7 +1047,7 @@ def test_plugin_defaults_upgrade_proposes_without_touching_live_home(
     _git("add", "-f", "prompts/sample/heartbeat.md", cwd=home)
     _git("commit", "-q", "-m", "operator change", cwd=home)
     _git("push", "-q", cwd=home)
-    (tmp_path / "package" / "prompts" / "heartbeat.md").write_text("plugin v2\n")
+    (tmp_path / "sample" / "prompts" / "heartbeat.md").write_text("plugin v2\n")
     plugin.manifest.defaults["version"] = "2.0"
     result = du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"]
     assert result.action == "proposal_opened_conflicts"
@@ -1042,4 +1056,64 @@ def test_plugin_defaults_upgrade_proposes_without_touching_live_home(
     assert "plugin v2" in (result.proposal.worktree / "prompts/sample/heartbeat.md").read_text()
     assert path.read_text() == "operator edit\n"
     assert (home / "memory/core/00-identity.md").read_text() == "identity v1\n"
+    _cleanup_upgrade_proposal(home)
+
+
+def test_plugin_defaults_upgrade_keeps_owners_separate_on_shared_upgrade_lane(
+    home: Path, tmp_path: Path,
+) -> None:
+    alpha = _plugin(tmp_path, name="alpha")
+    beta = _plugin(tmp_path, name="beta")
+    (home / "scheduler.yaml").write_text(_HEARTBEAT, encoding="utf-8")
+    seed_plugin_defaults(home, selected=(alpha, beta))
+    _git("add", "-f", "skills/alpha-helper/SKILL.md", "skills/beta-helper/SKILL.md",
+         "prompts/alpha/heartbeat.md", "prompts/beta/heartbeat.md", "scheduler.yaml", cwd=home)
+    _git("commit", "-q", "-m", "seed two plugins", cwd=home)
+    _git("push", "-q", cwd=home)
+
+    first = du.check_and_open_plugin_defaults_upgrade(home, selected=(alpha, beta))
+    assert {name: result.action for name, result in first.items()} == {
+        "alpha": "baseline_initialized", "beta": "baseline_initialized",
+    }
+    for owner, other in (("alpha", "beta"), ("beta", "alpha")):
+        files = _git("ls-tree", "-r", "--name-only", f"mimir-plugin-defaults-{owner}", cwd=home).stdout
+        assert f"prompts/{owner}/heartbeat.md" in files
+        assert f"prompts/{other}/heartbeat.md" not in files
+        assert (home / ".mimir/upgrade-plugin-defaults" / owner).read_text() == "1.0\n"
+
+    for owner in ("alpha", "beta"):
+        (home / "prompts" / owner / "heartbeat.md").write_text(f"{owner} operator edit\n")
+        (tmp_path / owner / "prompts/heartbeat.md").write_text(f"{owner} v2\n")
+    _git("add", "prompts/alpha/heartbeat.md", "prompts/beta/heartbeat.md", cwd=home)
+    _git("commit", "-q", "-m", "edit both plugin prompts", cwd=home)
+    _git("push", "-q", cwd=home)
+    alpha.manifest.defaults["version"] = "2.0"
+    beta.manifest.defaults["version"] = "2.0"
+
+    opened = du.check_and_open_plugin_defaults_upgrade(home, selected=(alpha, beta))
+    assert opened["alpha"].action == "proposal_opened_conflicts"
+    assert opened["beta"].action == "proposal_exists"
+    assert opened["alpha"].proposal and opened["alpha"].proposal.branch
+    assert "plugin-defaults-alpha-2-0" in opened["alpha"].proposal.branch
+    assert (home / ".mimir/upgrade-plugin-defaults/alpha").read_text() == "2.0\n"
+    assert (home / ".mimir/upgrade-plugin-defaults/beta").read_text() == "1.0\n"
+    assert _git("show", "mimir-plugin-defaults-beta:prompts/beta/heartbeat.md", cwd=home).stdout == "plugin prompt\n"
+    alpha_proposal = opened["alpha"].proposal.worktree
+    assert alpha_proposal is not None
+    assert "alpha v2" in (alpha_proposal / "prompts/alpha/heartbeat.md").read_text()
+    assert "beta v2" not in (alpha_proposal / "prompts/beta/heartbeat.md").read_text()
+    _cleanup_upgrade_proposal(home)
+
+    retried = du.check_and_open_plugin_defaults_upgrade(home, selected=(alpha, beta))
+    assert retried["alpha"].action == "already_synced"
+    assert retried["beta"].action == "proposal_opened_conflicts"
+    assert retried["beta"].proposal and retried["beta"].proposal.branch
+    assert "plugin-defaults-beta-2-0" in retried["beta"].proposal.branch
+    beta_proposal = retried["beta"].proposal.worktree
+    assert beta_proposal is not None
+    assert "beta v2" in (beta_proposal / "prompts/beta/heartbeat.md").read_text()
+    assert "alpha v2" not in (beta_proposal / "prompts/alpha/heartbeat.md").read_text()
+    for owner in ("alpha", "beta"):
+        assert (home / "prompts" / owner / "heartbeat.md").read_text() == f"{owner} operator edit\n"
+        assert (home / ".mimir/upgrade-plugin-defaults" / owner).read_text() == "2.0\n"
     _cleanup_upgrade_proposal(home)

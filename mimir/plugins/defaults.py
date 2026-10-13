@@ -75,8 +75,16 @@ def seed_plugin_defaults(home: Path, *, selected: tuple[PluginCandidate, ...] | 
         selected = enabled_plugins()
     home = Path(home)
     result: dict[str, str] = {}
+    owned_files: dict[Path, str] = {}
+    packages = []
     for candidate in selected:
         files = plugin_default_files(candidate)
+        for rel in files:
+            previous = owned_files.setdefault(rel, candidate.name)
+            if previous != candidate.name:
+                raise ValueError(f"plugin defaults path {rel} claimed by {previous} and {candidate.name}")
+        packages.append((candidate, files))
+    for candidate, files in packages:
         for rel, text in files.items():
             if rel.parts[0] == "plugins":
                 continue
