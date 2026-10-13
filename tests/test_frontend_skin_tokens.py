@@ -25,6 +25,21 @@ def _token_mapping() -> dict[str, str]:
     )
 
 
+def test_plugin_skin_token_inventory_matches_frontend_and_generated_contract():
+    from mimir.plugins.manifest import _SKIN_TOKENS
+    from mimir.web_contracts import render_typescript_contracts
+    from mimir.web_ui import SKIN_TOKEN_NAMES
+
+    mapping = _token_mapping()
+    assert len(mapping) == len(set(mapping.values())) == 66
+    assert set(mapping) == SKIN_TOKEN_NAMES
+    assert set(mapping.values()) == _SKIN_TOKENS
+    contract = render_typescript_contracts()
+    names = re.search(r"export type SkinTokenName =(?P<body>.*?);", contract, re.S)
+    assert names is not None
+    assert set(re.findall(r'"(\w+)"', names.group("body"))) == set(mapping)
+
+
 def _registered_skin_tokens() -> dict[str, dict[str, str]]:
     provider = PROVIDER_PATH.read_text(encoding="utf-8")
     registry = re.search(

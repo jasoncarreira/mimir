@@ -877,6 +877,14 @@ export type SkinTokenName =
   | "colorTimelineToolCallBackground"
   | "colorTimelineToolResult"
   | "colorTimelineToolResultBackground"
+  | "colorTriggerSagaSessionEnd"
+  | "colorTriggerScheduledTick"
+  | "colorTriggerPoller"
+  | "colorTriggerUserMessage"
+  | "colorTriggerSynthesis"
+  | "colorTriggerHeartbeat"
+  | "colorTriggerClaudeCodeSpawn"
+  | "colorTriggerShellJobComplete"
   | "colorCodeBackground"
   | "colorCodeText"
   | "colorFocusRing"
@@ -921,9 +929,23 @@ export interface SkinManifestData {
   fonts?: JsonObject[];
 }
 
+export interface PluginSkinManifestData extends Omit<SkinManifestData, "tokens"> {
+  plugin: string;
+  default?: boolean;
+  tokens: Record<SkinTokenName, string>;
+}
+
 export interface WebSkinsData {
   built_in_ids: string[];
   operator: SkinManifestData[];
+  plugins: PluginSkinManifestData[];
+}
+
+export interface PluginBundleData {
+  plugin: string;
+  apiMajor: number;
+  moduleUrl: string;
+  cssUrl: string | null;
 }
 
 export interface IssueKeyData {
@@ -962,10 +984,12 @@ export interface WebBootstrapData {
   ui?: {
     agent_name: string;
     skin: string;
+    default_skin: string;
   };
   /** Available skins: built-in ids plus full operator-installed manifests. */
   skins?: WebSkinsData;
   dashboard_extensions?: DashboardExtensionManifest[];
+  plugin_bundles?: PluginBundleData[];
 }
 
 export interface ChatPostRequest {

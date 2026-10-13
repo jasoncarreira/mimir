@@ -121,6 +121,7 @@ ENV_CATEGORIES: dict[str, tuple[str, ...]] = {
         "MIMIR_MODEL_REASONING_EFFORT",
         "MIMIR_WEB_HOST",
         "MIMIR_WEB_PORT",
+        "MIMIR_WEB_DEFAULT_SKIN",
         "MIMIR_SCHEDULER_TZ",
     ),
     "model_provider": (
@@ -210,7 +211,7 @@ def _env_rows() -> list[dict[str, Any]]:
             seen.add(name)
     for name in sorted(
         key for key in os.environ
-        if key.startswith("MIMIR_") and key not in seen
+        if key.startswith("MIMIR_") and not key.startswith("MIMIR_PLUGIN_") and key not in seen
     ):
         rows.append(_env_row("mimir_extra", name))
     return rows
@@ -383,6 +384,11 @@ def build_admin_config_payload(
     provider = provider_for_quota(model_spec, anthropic_base_url)
     context_1m = bool(getattr(config, "context_1m", False))
     model_max_tokens = int(getattr(config, "model_max_tokens", 0) or 0)
+    from .plugins.config_api import plugin_config_rows
+
+    manager = getattr(config, "plugin_manager", None)
+    manifests = {loaded.candidate.name: loaded.candidate.manifest for loaded in manager.plugins} if manager else {}
+    plugin_rows = [row for owner in sorted(manifests) for row in plugin_config_rows(owner, manifests)]
 
     return {
         "generated_at": _now_iso(),
@@ -404,7 +410,7 @@ def build_admin_config_payload(
         "schema_sections": _schema_sections(),
         "schedules": _schedules(effective_home),
         "pollers": _pollers(scheduler, effective_home),
-        "env": _env_rows(),
+        "env": _env_rows() + plugin_rows,
         "raw_config": _redacted_config(config) if config is not None else {},
         "mutation_policy": {
             "mode": "read_only_v1",

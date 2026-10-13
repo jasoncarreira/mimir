@@ -19,6 +19,7 @@ from yarl import URL
 from mimir.config import Config
 from mimir.dashboard_extensions import (
     DashboardExtensionManifest,
+    add_plugin_routes,
     first_party_dashboard_extensions,
 )
 from mimir.chainlink_board import build_chainlink_board_payload
@@ -94,6 +95,90 @@ def test_generated_typescript_contracts_are_current():
         encoding="utf-8"
     )
     assert generated == render_typescript_contracts()
+
+
+async def test_plugin_routes_are_owner_scoped_and_admin_checked():
+    from mimir.plugins.registry import PolicyRegistry
+
+    policy = PolicyRegistry()
+
+    async def ok(_request):
+        return web.json_response({"ok": True})
+
+    policy.registrar("sample").register_route("GET", "/api/v1/plugins/sample/status", ok)
+    policy.registrar("sample").register_route("POST", "/api/v1/plugins/sample/admin", ok, role="admin")
+
+    @web.middleware
+    async def authenticated(request, handler):
+        if request.headers.get("X-Identity"):
+            request["auth_identity"] = object()
+            request["auth_is_admin"] = request.headers["X-Identity"] == "admin"
+        return await handler(request)
+
+    app = web.Application(middlewares=[authenticated])
+    add_plugin_routes(app, policy)
+    async with TestClient(TestServer(app)) as client:
+        assert (await client.get("/api/v1/plugins/sample/status")).status == 401
+        assert (await client.get("/api/v1/plugins/sample/status", headers={"X-Identity": "user"})).status == 200
+        assert (await client.post("/api/v1/plugins/sample/admin", headers={"X-Identity": "user"})).status == 403
+        assert (await client.post("/api/v1/plugins/sample/admin", headers={"X-Identity": "admin"})).status == 200
+
+    app = web.Application()
+    app.router.add_get("/api/v1/plugins/sample/status", ok)
+    with pytest.raises(ValueError, match="plugin route collision"):
+        add_plugin_routes(app, policy)
+
+
+async def test_plugin_assets_are_allowlisted_versioned_and_not_escaping(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from mimir.plugins.registry import PolicyRegistry
+
+    asset = tmp_path / "module.js"
+    asset.write_text("export const ready = true;")
+    (tmp_path / "private.txt").write_text("private")
+    manager = SimpleNamespace(policy=PolicyRegistry(), plugins=())
+    monkeypatch.setattr(web_ui, "_plugin_web_resources", lambda _manager: (
+        [], [{"plugin": "sample", "apiMajor": 1,
+              "moduleUrl": "/plugins/sample/assets/module.js?v=2", "cssUrl": None}],
+        {"sample": (tmp_path, frozenset({asset}), "2")},
+    ))
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl")
+    async with TestClient(TestServer(app)) as client:
+        bootstrap = (await (await client.get("/api/v1/web/bootstrap")).json())["data"]
+        assert bootstrap["plugin_bundles"][0]["moduleUrl"] == "/plugins/sample/assets/module.js?v=2"
+        versioned = await client.get("/plugins/sample/assets/module.js?v=2")
+        assert versioned.status == 200
+        assert versioned.headers["Cache-Control"] == "public, max-age=31536000, immutable"
+        assert (await client.get("/plugins/sample/assets/module.js")).headers["Cache-Control"].startswith("no-store")
+        assert (await client.get("/plugins/sample/assets/private.txt?v=2")).status == 404
+        assert (await client.get("/plugins/disabled/assets/module.js?v=2")).status == 404
+
+
+def test_plugin_config_owner_reads_only_declared_keys(monkeypatch):
+    from types import SimpleNamespace
+    from mimir.plugins.config_api import plugin_config_rows, validate_plugin_config_write
+
+    manifests = {
+        "sample": SimpleNamespace(config={
+            "MIMIR_PLUGIN_SAMPLE_TOKEN": {"secret": True, "security": True},
+            "MIMIR_PLUGIN_SAMPLE_LABEL": {"secret": False},
+        }),
+        "other": SimpleNamespace(config={"MIMIR_PLUGIN_OTHER_LABEL": {}}),
+    }
+    monkeypatch.setenv("MIMIR_PLUGIN_SAMPLE_TOKEN", "hidden")
+    monkeypatch.setenv("MIMIR_PLUGIN_SAMPLE_LABEL", "visible")
+    monkeypatch.setenv("MIMIR_PLUGIN_OTHER_LABEL", "foreign")
+    monkeypatch.setenv("MIMIR_API_KEY", "core")
+    rows = plugin_config_rows("sample", manifests)
+    assert {row["name"] for row in rows} == set(manifests["sample"].config)
+    assert next(row for row in rows if row["secret"])["value"] == "[REDACTED]"
+    assert next(row for row in rows if not row["secret"])["value"] == "visible"
+    with pytest.raises(ValueError, match="not writable"):
+        validate_plugin_config_write("sample", "MIMIR_PLUGIN_SAMPLE_TOKEN", manifests)
+    with pytest.raises(ValueError, match="not writable"):
+        validate_plugin_config_write("sample", "MIMIR_PLUGIN_OTHER_LABEL", manifests)
 
 
 def test_server_builtin_skin_ids_match_frontend_registry():
@@ -2711,7 +2796,9 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     # No turns logged in this fixture -> running total is 0.
     assert body["data"]["turns_total"] == 0
     # No home configured -> agent UI config falls back to defaults.
-    assert body["data"]["ui"] == {"agent_name": "Mimir", "skin": "neon-terminal"}
+    assert body["data"]["ui"] == {
+        "agent_name": "Mimir", "skin": "neon-terminal", "default_skin": "neon-terminal",
+    }
     assert body["data"]["auth"]["required"] is True
     assert body["data"]["server"]["public_bind"] is True
     assert [item["id"] for item in body["data"]["dashboard_extensions"]][:4] == [
