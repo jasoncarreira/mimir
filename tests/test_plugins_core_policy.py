@@ -298,6 +298,50 @@ def test_sink_and_taint_views_are_exact_registry_memberships() -> None:
     assert policy._TAINT_INDEPENDENT_EGRESS_TOOLS == {"fetch_url", "web_search"}
 
 
+def test_typed_action_and_retained_views_are_exact_registry_projections() -> None:
+    from mimir.plugins.core import policy_scope
+    from mimir.models import RepoPRAction
+
+    tools = core_policy_registry().tools
+    for membership, view in (
+        ("forge_actions", policy._FORGE_TOOL_ACTIONS),
+        ("repo_actions", policy._REPO_TOOL_ACTIONS),
+    ):
+        assert dict(view) == {
+            name: tool.typed_action for name, tool in tools.items()
+            if membership in tool.memberships
+        }
+        with pytest.raises(TypeError):
+            view["other"] = None
+    assert policy._RETAINED_REPO_TOOLS == frozenset(
+        name for name, tool in tools.items() if "retained_repo_tools" in tool.memberships
+    )
+    assert dict(policy._TYPED_REPO_PR_TOOL_ACTIONS) == {
+        **policy._FORGE_TOOL_ACTIONS, **policy._REPO_TOOL_ACTIONS,
+    }
+    assert policy._FORGE_TOOL_ACTIONS["unsupported_operation"] is None
+
+    # Changing declarations without changing the canonical tool names must
+    # change every consumer. A hard-coded or cached core table fails here.
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+    registry._tools["pr_metadata"] = replace(
+        registry.tools["pr_metadata"], typed_action=RepoPRAction.PR_COMMENT,
+    )
+    registry._tools["repo_status"] = replace(
+        registry.tools["repo_status"], typed_action=RepoPRAction.PR_COMMENT,
+        memberships=registry.tools["repo_status"].memberships - {"retained_repo_tools"},
+    )
+    with policy_scope(registry.freeze()):
+        assert policy._FORGE_TOOL_ACTIONS["pr_metadata"] == RepoPRAction.PR_COMMENT.value
+        assert policy._REPO_TOOL_ACTIONS["repo_status"] == RepoPRAction.PR_COMMENT.value
+        assert policy._TYPED_REPO_PR_TOOL_ACTIONS["pr_metadata"] == RepoPRAction.PR_COMMENT.value
+        assert policy._TYPED_REPO_PR_TOOL_ACTIONS["repo_status"] == RepoPRAction.PR_COMMENT.value
+        assert "repo_status" not in policy._RETAINED_REPO_TOOLS
+    assert policy._FORGE_TOOL_ACTIONS["pr_metadata"] == tools["pr_metadata"].typed_action.value
+    assert "repo_status" in policy._RETAINED_REPO_TOOLS
+
+
 def test_budget_policy_views_are_frozen_core_memberships() -> None:
     tools = core_policy_registry().tools
     for membership, view in (
