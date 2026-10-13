@@ -260,6 +260,8 @@ include = [
 # the cutover, but the exclude prevents accidental re-add from sneaking
 # into a wheel), no smoke-artifact SQLite dumps, no transient bench logs.
 exclude = [
+    # The installable example is a test-only external distribution, not part of mimir-agent.
+    "tests/fixtures/plugins/example/**",
     "mimir/deepagent_poc/**",
     "mimir/**/_smoke_*",
     "mimir/**/_bench_*.log",

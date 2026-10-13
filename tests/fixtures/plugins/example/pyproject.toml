@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mimir-example-plugin"
+version = "0.1.0"
+description = "Test-only installed Mimir provider"
+requires-python = ">=3.11"
+license = "MIT"
+
+[project.entry-points."mimir.plugins"]
+example = "mimir_example_plugin:provider"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mimir_example_plugin"]
+
+[tool.hatch.build.targets.sdist]
+include = ["mimir_example_plugin/**/*", "pyproject.toml"]

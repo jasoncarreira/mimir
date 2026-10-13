@@ -61,6 +61,12 @@ def main() -> None:
     sdist_members = wheel_members(args.sdist_wheel)
     direct_members = wheel_members(args.direct_wheel)
 
+    for members in (sdist_members, direct_members):
+        example_members = [name for name in members if "mimir_example_plugin" in name or
+                           "tests/fixtures/plugins/example/" in name]
+        if example_members:
+            raise SystemExit(f"test-only example provider leaked into mimir-agent wheel: {example_members}")
+
     required_acp = {name for name in REQUIRED_MEMBERS if name.startswith("mimir/acp/")}
     actual_acp = acp_source_members()
     if required_acp != actual_acp:

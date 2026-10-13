@@ -148,6 +148,18 @@ def test_wheel_include_config_covers_critical_runtime_data() -> None:
     )
 
 
+def test_example_distribution_is_not_in_mimir_agent_wheel_allowlist() -> None:
+    include, exclude = _build_include_exclude()
+    fixture = "tests/fixtures/plugins/example/mimir_example_plugin/mimir-plugin.toml"
+    assert (REPO_ROOT / fixture).is_file()
+    assert not any(_gitwildmatch_to_regex(pattern).match(fixture) for pattern in include)
+    assert any(_gitwildmatch_to_regex(pattern).match(fixture) for pattern in exclude)
+    build = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["tool"]["hatch"]["build"]
+    assert build["targets"]["wheel"]["packages"] == ["mimir"]
+    assert not any(source.startswith("tests/fixtures/plugins/example")
+                   for source in _force_include())
+
+
 # ---- Reference docs shipped via force-include (mimir/doc_seed.py) ----------
 # The operator docs live at the repo root but must ALSO ship in the wheel under
 # mimir/bundled_docs/ so `mimir setup` can seed them into <home>/docs/. They're
