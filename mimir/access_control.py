@@ -11759,6 +11759,8 @@ def assert_model_tool_inventory_cataloged(
         model_spec=model_spec,
         coding_enabled=coding_enabled,
         require_coding_available=False,
+        policy=policy,
+        materialize_plugins=False,
     )
     tool_names = {
         *(tool.name for tool in mimir_tools),

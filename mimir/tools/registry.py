@@ -61,6 +61,7 @@ from ..pollers import (
 )
 from ..models import AuthContext, Integrity, IntegrityEffect, RetainedFactoryScope, TurnInteractivity
 from ..scheduler import SchedulerJob
+from ..plugins.core import scoped_policy_call, selected_policy_registry
 
 # Per-task ContextVar for channel_id — isolated across concurrent asyncio
 # Tasks so concurrent turns on different channels don't race (S2-1 fix).
@@ -3100,6 +3101,7 @@ async def worklink_resume(
     )
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def all_mimir_tools(
     model_spec: str | None = None,
     *,
@@ -3130,9 +3132,9 @@ def all_mimir_tools(
     Tavily on top would duplicate the surface. See
     ``mimir.tools.web.web_tools_enabled`` for the gating predicate.
     """
-    from ..plugins.core import core_policy_registry, core_runtime_names
+    from ..plugins.core import core_runtime_names
     from .web import web_tools_enabled
-    registry = policy if policy is not None else core_policy_registry()
+    registry = policy if policy is not None else selected_policy_registry()
     if not registry.frozen:
         raise ValueError("tool assembly requires a frozen policy")
 

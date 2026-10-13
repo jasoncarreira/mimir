@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from .core import register_core_tools
+from .core import register_core_tools, scoped_policy_call
 from .discovery import PluginCandidate, PluginDiscoveryError, enabled_plugins
 from .registry import PolicyRegistry
 
@@ -45,6 +45,7 @@ class PluginManager:
         return tuple(tool.factory for tool in self.policy.tools.values()
                      if tool.owner != "core" and tool.factory is not None)
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"].policy)
     async def startup_preflight(self, bundle: Any) -> None:
         for plugin in self.plugins:
             name = plugin.candidate.name
@@ -60,6 +61,7 @@ class PluginManager:
             except Exception as exc:
                 raise RuntimeError(f"plugin {name!r} startup preflight failed") from exc
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"].policy)
     async def turn_preflight(self, event: Any, auth_context: Any) -> None:
         for plugin in self.plugins:
             name = plugin.candidate.name
@@ -75,6 +77,7 @@ class PluginManager:
             except Exception as exc:
                 raise RuntimeError(f"plugin {name!r} turn preflight failed") from exc
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"].policy)
     async def shutdown(self) -> None:
         if self._shutdown_started:
             return
@@ -95,6 +98,7 @@ class PluginManager:
                 # One plugin cannot prevent later hooks or the server's teardown.
                 log.exception("plugin %s shutdown failed", name)
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"].policy)
     async def health(self) -> dict[str, object]:
         fields: dict[str, object] = {}
         for plugin in self.plugins:

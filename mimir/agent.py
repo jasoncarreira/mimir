@@ -121,6 +121,7 @@ from .session_boundary_log import (
     render_session_summaries,
     validate_unfinished_work,
 )
+from .plugins.core import scoped_policy_call
 from .templates import render_saga_session_end
 from .usage_stats import event_recently_emitted
 
@@ -1730,6 +1731,7 @@ class Agent:
             self._skill_fingerprint_executor, fingerprint,
         )
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
     async def _build_agent_if_needed(self) -> Any:
         # ``create_deep_agent`` freezes ``system_prompt`` at graph
         # construction time. Re-render it on every call and use the
@@ -1951,6 +1953,7 @@ class Agent:
             self._cached_coding_enabled = coding_enabled
             return self._agent
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
     async def run_turn(
         self,
         event: AgentEvent,
@@ -4595,6 +4598,7 @@ class Agent:
             )
         return PromptBlock(content, labels)
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
     async def _build_synthesis_prompt(
         self, ctx: Any, event: AgentEvent,
     ) -> PromptBlock:

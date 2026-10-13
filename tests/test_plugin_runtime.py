@@ -26,7 +26,7 @@ from mimir.tools.service_tool_surface import ServiceToolSurfaceMiddleware
 from mimir.turn_logger import TurnLogger
 
 
-def _policy(factory, *, result_domain="plugin-data", service_constraints=False):
+def _policy(factory, *, result_domain="plugin-data", service_constraints=False, boundary=False):
     registry = PolicyRegistry()
     register_core_tools(registry)
     registry.registrar("sample").register_tool(
@@ -43,6 +43,10 @@ def _policy(factory, *, result_domain="plugin-data", service_constraints=False):
         writes_code_or_state=False, profiles=(), read_backend=False,
         readable_domain="plugin-data" if service_constraints else None,
     )
+    if boundary:
+        registrar = registry.registrar("sample")
+        registrar.register_capability("sample_read")
+        registrar.add_to_profile("session-boundary", "sample_read")
     return registry.freeze()
 
 
@@ -144,3 +148,97 @@ async def test_agent_graph_assembles_selected_policy_for_parent_and_children(tmp
     for child in captured[0]["subagents"]:
         assert next(item for item in child["middleware"]
                     if isinstance(item, ServiceToolSurfaceMiddleware))._policy is policy
+
+
+def test_factory_observes_selected_module_views_and_nested_selection_restores():
+    from mimir.access_control import _TOOL_FLOW_MAP
+    from mimir.plugins.core import core_policy_registry, policy_scope, selected_policy_registry
+    from mimir.tool_descriptors import TOOL_DESCRIPTORS
+
+    seen = []
+    def factory():
+        seen.append(selected_policy_registry())
+        assert _TOOL_FLOW_MAP["sample_read"] == "source"
+        assert "sample_read" in TOOL_DESCRIPTORS
+        assert "sample_read" not in {tool.name for tool in all_mimir_tools(policy=core_policy_registry())}
+        assert selected_policy_registry() is seen[-1]
+        return SimpleNamespace(name="sample_read")
+
+    selected = _policy(factory)
+    with policy_scope(core_policy_registry()):
+        all_mimir_tools(policy=selected)
+        assert selected_policy_registry() is core_policy_registry()
+        assert "sample_read" not in TOOL_DESCRIPTORS
+    assert seen == [selected]
+
+
+@pytest.mark.asyncio
+async def test_production_synthesis_renderer_uses_agent_policy_without_view_monkeypatch(tmp_path, monkeypatch):
+    from mimir.models import AgentEvent, InformationFlowLabels
+    from mimir.plugins.core import core_policy_registry, selected_policy_registry
+    from tests.test_turn_prompt_assembly import _make_agent
+
+    agent = _make_agent(tmp_path)
+    selected = _policy(lambda: SimpleNamespace(name="sample_read"), boundary=True)
+    agent._config.plugin_manager = PluginManager(selected, ())
+    monkeypatch.setattr("mimir.agent._filter_session_turns", lambda *args, **kwargs: [])
+    ctx = SimpleNamespace(saga_session_id="session", ifc_labels=InformationFlowLabels())
+    event = AgentEvent(trigger="saga_session_end", channel_id="channel", content="close")
+    prompt = await agent._build_synthesis_prompt(ctx, event)
+    assert "- `sample_read`\n" in prompt.content
+    assert selected_policy_registry() is core_policy_registry()
+    agent._config.plugin_manager = PluginManager(core_policy_registry(), ())
+    prompt = await agent._build_synthesis_prompt(ctx, event)
+    assert "- `sample_read`\n" not in prompt.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook_name", ["startup_preflight", "turn_preflight", "health", "shutdown"])
+@pytest.mark.parametrize("async_hook", [False, True])
+async def test_lifecycle_hooks_use_manager_policy_and_restore_after_await_or_thread(hook_name, async_hook):
+    from mimir.plugins.core import core_policy_registry, selected_policy_registry
+    from mimir.plugins.manager import LoadedPlugin
+    from mimir.tool_descriptors import TOOL_DESCRIPTORS
+
+    selected = _policy(lambda: SimpleNamespace(name="sample_read"))
+    seen = []
+    def hook(*args):
+        seen.append(selected_policy_registry())
+        assert "sample_read" in TOOL_DESCRIPTORS
+        return {"ready": True} if hook_name == "health" else None
+    async def async_call(*args):
+        import asyncio
+        await asyncio.sleep(0)
+        return hook(*args)
+    contributor = SimpleNamespace(**{hook_name: async_call if async_hook else hook})
+    manager = PluginManager(selected, (LoadedPlugin(SimpleNamespace(name="sample"), contributor),))
+    args = {"startup_preflight": (object(),), "turn_preflight": (object(), object()),
+            "health": (), "shutdown": ()}[hook_name]
+    await getattr(manager, hook_name)(*args)
+    assert seen == [selected]
+    assert selected_policy_registry() is core_policy_registry()
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_selects_policy_before_reply_paths_and_resets_on_exception(tmp_path, monkeypatch):
+    from mimir.models import AgentEvent
+    from mimir.plugins.core import core_policy_registry, selected_policy_registry
+    from mimir.tool_descriptors import TOOL_DESCRIPTORS
+    from tests.test_turn_prompt_assembly import _make_agent
+
+    agent = _make_agent(tmp_path)
+    selected = _policy(lambda: SimpleNamespace(name="sample_read"))
+    agent._config.plugin_manager = PluginManager(selected, ())
+    monkeypatch.setattr("mimir.operator_approval._is_authenticated_operator", lambda *args, **kwargs: True)
+    seen = []
+    def sync_pending(*args):
+        seen.append(selected_policy_registry())
+        assert "sample_read" in TOOL_DESCRIPTORS
+        raise ValueError("test reply path stop")
+    monkeypatch.setattr("mimir.memory_proposals.sync_pending", sync_pending)
+    event = AgentEvent(trigger="user_message", channel_id="ch", content="approve update-abcd")
+    with pytest.raises(ValueError, match="test reply path stop"):
+        await agent.run_turn(event)
+    assert seen == [selected]
+    assert selected_policy_registry() is core_policy_registry()
+    assert "sample_read" not in TOOL_DESCRIPTORS
