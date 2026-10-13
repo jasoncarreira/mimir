@@ -15,6 +15,7 @@ function surface(id: string, requires_role?: string | null): DashboardSurface {
 function manifest(id: string, label = id): DashboardExtensionManifest {
   return {
     id,
+    plugin: null,
     route_path: `/${id}`,
     label,
     icon: null,
@@ -135,7 +136,7 @@ describe("plugin bundle host", () => {
     cssUrl: `/plugins/${plugin}/assets/style.css?v=1`
   });
   const manifests = ["alpha", "beta"].map((plugin) => ({
-    ...manifest(plugin), route_path: `/dashboard/${plugin}`, bundle: `main.js`
+    ...manifest(plugin), plugin, route_path: `/dashboard/${plugin}`, bundle: `main.js`
   }));
 
   it("imports compatible local modules, registers multiple owner-bound pages and shares the renderer", async () => {
@@ -185,6 +186,47 @@ describe("plugin bundle host", () => {
     expect(consoleError).toHaveBeenCalledTimes(1);
     dispose();
     consoleError.mockRestore();
+  });
+
+  it("rejects alpha declaring alpha while claiming beta's route, rolls alpha back and lets beta register", async () => {
+    const updates = vi.fn();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const importer = vi.fn(async (url: string) => {
+      const host = window.mimirPluginHost!;
+      if (url.includes("/alpha/")) {
+        host.registerRoute({ plugin: "alpha", id: "alpha", path: "/dashboard/alpha", component: () => null });
+        host.registerNavEntry({ plugin: "alpha", id: "alpha", label: "Alpha" });
+        host.registerRoute({ plugin: "alpha", id: "beta", path: "/dashboard/beta", component: () => null });
+      } else {
+        host.registerRoute({ plugin: "beta", id: "beta", path: "/dashboard/beta", component: () => null });
+        expect(() => host.registerRoute({ plugin: "beta", id: "beta", path: "/dashboard/beta", component: () => null }))
+          .toThrow("Invalid plugin route: beta");
+        host.registerNavEntry({ plugin: "beta", id: "beta", label: "Beta" });
+      }
+    });
+    const dispose = await loadPluginBundles([bundle("alpha"), bundle("beta")], manifests,
+      {} as never, updates, undefined, importer);
+    expect(importer).toHaveBeenCalledTimes(2);
+    expect(updates.mock.lastCall?.[0].routes.map((route: { id: string }) => route.id)).toEqual(["beta"]);
+    expect(updates.mock.lastCall?.[0].navEntries.map((entry: { id: string }) => entry.id)).toEqual(["beta"]);
+    expect(updates.mock.lastCall?.[0].notices).toEqual(["alpha: dashboard bundle could not be loaded."]);
+    expect(error).toHaveBeenCalledTimes(1);
+    dispose();
+    error.mockRestore();
+  });
+
+  it("does not allow a plugin to claim a core route even when its manifest has a bundle", async () => {
+    const updates = vi.fn();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const dispose = await loadPluginBundles([bundle("alpha")], [
+      { ...manifest("core"), route_path: "/dashboard/core", bundle: "core.js" }
+    ], {} as never, updates, undefined, async () => {
+      window.mimirPluginHost!.registerRoute({ plugin: "alpha", id: "core", path: "/dashboard/core", component: () => null });
+    });
+    expect(updates.mock.lastCall?.[0].routes).toEqual([]);
+    expect(updates.mock.lastCall?.[0].notices).toEqual(["alpha: dashboard bundle could not be loaded."]);
+    dispose();
+    error.mockRestore();
   });
 
   it("uses dynamic import for the actual asset URL, reporting an unavailable asset without failing core", async () => {

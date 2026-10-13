@@ -81,16 +81,16 @@ const protectedBootstrap = {
   plugin_bundles: [] as { plugin: string; apiMajor: number; moduleUrl: string; cssUrl: string | null }[],
   dashboard_extensions: [
     {
-      id: "chat", route_path: "/chat", label: "Chat", icon: null, nav_position: 0,
+      id: "chat", plugin: null, route_path: "/chat", label: "Chat", icon: null, nav_position: 0,
       enabled: true, bundle: null, css: [], api_namespace: null, trusted_first_party: true
     },
     {
-      id: "admin-users", route_path: "/admin/users", label: "Users", icon: null, nav_position: 90,
+      id: "admin-users", plugin: null, route_path: "/admin/users", label: "Users", icon: null, nav_position: 90,
       enabled: true, bundle: null, css: [], api_namespace: null, trusted_first_party: true,
       requires_role: "admin"
     },
     {
-      id: "wiki", route_path: "/wiki", label: "Wiki", icon: null, nav_position: 55,
+      id: "wiki", plugin: null, route_path: "/wiki", label: "Wiki", icon: null, nav_position: 55,
       enabled: true, bundle: null, css: [], api_namespace: "wiki", trusted_first_party: true,
       requires_role: "admin"
     }
@@ -243,7 +243,7 @@ describe("plugin compatibility notices in the dashboard shell", () => {
       plugin_bundles: [{ plugin: "alpha", apiMajor: 1, moduleUrl: "/plugins/alpha/assets/main.js", cssUrl: null }],
       dashboard_extensions: [
         ...protectedBootstrap.dashboard_extensions,
-        { id: "alpha", route_path: "/alpha", label: "Alpha", icon: null, nav_position: 10,
+        { id: "alpha", plugin: "alpha", route_path: "/alpha", label: "Alpha", icon: null, nav_position: 10,
           enabled: true, bundle: "main.js", css: [], api_namespace: "alpha", trusted_first_party: true }
       ]
     } as unknown as typeof protectedBootstrap;
@@ -258,6 +258,46 @@ describe("plugin compatibility notices in the dashboard shell", () => {
     await waitFor(() => expect(screen.getByText("alpha-page")).toBeTruthy());
     expect(screen.getByTestId("nav-alpha").textContent).toContain("Alpha plugin");
     expect(screen.getByTestId("nav-chat")).toBeTruthy();
+  });
+
+  it("rejects alpha claiming beta's id/path and renders beta's own page and navigation", async () => {
+    bootstrapOverride = {
+      ...protectedBootstrap,
+      plugin_bundles: ["alpha", "beta"].map((plugin) => ({
+        plugin, apiMajor: 1, moduleUrl: `/plugins/${plugin}/assets/main.js`, cssUrl: null
+      })),
+      dashboard_extensions: [
+        ...protectedBootstrap.dashboard_extensions,
+        ...["alpha", "beta"].map((plugin) => ({
+          id: plugin, plugin, route_path: `/${plugin}`, label: plugin, icon: null,
+          nav_position: 10, enabled: true, bundle: "main.js", css: [],
+          api_namespace: plugin, trusted_first_party: true
+        }))
+      ]
+    } as unknown as typeof protectedBootstrap;
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    pluginImport.current = async (url) => {
+      const host = window.mimirPluginHost!;
+      if (url.includes("/alpha/")) {
+        host.registerRoute({ plugin: "alpha", id: "alpha", path: "/alpha", component: () => <div>alpha-page</div> });
+        host.registerNavEntry({ plugin: "alpha", id: "alpha", label: "Alpha" });
+        host.registerRoute({ plugin: "alpha", id: "beta", path: "/beta", component: () => <div>imposter</div> });
+      } else {
+        host.registerRoute({ plugin: "beta", id: "beta", path: "/beta", component: () => <div>beta-page</div> });
+        host.registerNavEntry({ plugin: "beta", id: "beta", label: "Beta" });
+      }
+    };
+    sessionKey = "admin-key";
+    useUiState.setState({ apiKeyPresent: true });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/beta"]}><AppFrame /></MemoryRouter></QueryClientProvider>);
+    expect(await screen.findByText("beta-page")).toBeTruthy();
+    expect(screen.getByTestId("nav-beta")).toBeTruthy();
+    expect(screen.queryByTestId("nav-alpha")).toBeNull();
+    expect(screen.queryByText("imposter")).toBeNull();
+    expect(screen.getByTestId("plugin-notices").textContent).toBe("alpha: dashboard bundle could not be loaded.");
+    expect(error).toHaveBeenCalledTimes(1);
+    error.mockRestore();
   });
 });
 
@@ -618,7 +658,7 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
       { ...protectedBootstrap.dashboard_extensions[1], nav_hidden: true },
       protectedBootstrap.dashboard_extensions[2],
       {
-        id: "admin-config", route_path: "/admin", label: "Admin", icon: null, nav_position: 60,
+        id: "admin-config", plugin: null, route_path: "/admin", label: "Admin", icon: null, nav_position: 60,
         enabled: true, bundle: null, css: [] as string[], api_namespace: "admin-config",
         trusted_first_party: true as const, requires_role: "admin", nav_hidden: false
       }

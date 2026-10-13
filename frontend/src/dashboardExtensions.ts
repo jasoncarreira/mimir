@@ -8,7 +8,7 @@ import { authenticatedPluginFetch, localPluginUrl } from "./api/http";
 import type { SkinManifest } from "./skins/types";
 import { sanitizeHref } from "./routeState";
 
-export interface DashboardSurface extends DashboardExtensionManifest {
+export interface DashboardSurface extends Omit<DashboardExtensionManifest, "plugin"> {
   path: `/${string}`;
   title: string;
   detail: string;
@@ -206,7 +206,7 @@ export async function loadPluginBundles(
     registerRoute(route) {
       owned(route.plugin);
       if (typeof route.component !== "function" ||
-          !manifests.some((manifest) => manifest.bundle && manifest.id === route.id &&
+          !manifests.some((manifest) => manifest.bundle && manifest.plugin === activePlugin && manifest.id === route.id &&
             manifest.route_path === route.path && manifest.enabled) ||
           routes.some((existing) => existing.id === route.id || existing.path === route.path)) {
         throw new Error(`Invalid plugin route: ${route.id}`);
