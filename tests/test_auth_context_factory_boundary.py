@@ -110,6 +110,84 @@ def test_subagent_task_receives_live_owner_snapshot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_real_deepagents_task_and_atask_deliver_only_same_turn_live_slots() -> None:
+    from deepagents.middleware.subagents import _build_task_tool
+    from langchain.tools import ToolRuntime
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.runnables import Runnable
+
+    from mimir._deepagents_subagent_auth import _AuthContextRunnable
+
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    class Child(Runnable):
+        def __init__(self) -> None:
+            self.contexts: list[Any] = []
+
+        def invoke(self, input: Any, config: Any = None, *, context: Any = None, **kwargs: Any) -> Any:
+            self.contexts.append(context)
+            return {"messages": [AIMessage(content="done")]}
+
+        async def ainvoke(self, input: Any, config: Any = None, *, context: Any = None, **kwargs: Any) -> Any:
+            self.contexts.append(context)
+            return {"messages": [AIMessage(content="done")]}
+
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_state_slot(State)
+    policy.freeze()
+    event = AgentEvent(trigger="user_message", channel_id="channel", author="user")
+    ingress = create_auth_context(event, policy=policy)
+    turn = TurnContext("turn", "channel", "user_message", "channel", 0, auth_context=ingress)
+    turn.set_plugin_state(registrar, State("live"))
+    turn.auth_context = replace(ingress, ifc_labels=InformationFlowLabels().with_label("internal"))
+
+    child = Child()
+    tool = _wrap_task_tool(_build_task_tool([{
+        "name": "general-purpose",
+        "description": "Owner state propagation child",
+        "runnable": _AuthContextRunnable(child),
+    }]))
+
+    def runtime(carrier: Any) -> ToolRuntime:
+        return ToolRuntime(
+            state={"messages": [HumanMessage(content="parent prompt")]},
+            context=carrier, config={}, stream_writer=lambda _: None,
+            tool_call_id="owner-task", store=None,
+        )
+
+    token = set_current_turn(turn)
+    try:
+        sync_result = tool.func(
+            description="check state", subagent_type="general-purpose", runtime=runtime(ingress),
+        )
+        async_result = await tool.coroutine(
+            description="check state", subagent_type="general-purpose", runtime=runtime(ingress),
+        )
+        foreign = create_auth_context(event, policy=policy)
+        foreign_result = await tool.coroutine(
+            description="check isolation", subagent_type="general-purpose", runtime=runtime(foreign),
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert sync_result.update["messages"][0].content == "done"
+    assert async_result.update["messages"][0].content == "done"
+    assert foreign_result.update["messages"][0].content == "done"
+    sync_auth, async_auth, foreign_auth = child.contexts
+    assert sync_auth.plugin_state("example") == async_auth.plugin_state("example") == State("live")
+    assert sync_auth is not ingress and async_auth is not ingress
+    assert sync_auth.ifc_state is ingress.ifc_state
+    assert async_auth.ifc_state is ingress.ifc_state
+    assert foreign_auth is foreign
+    assert foreign_auth.plugin_state("example") is None
+    assert ingress.plugin_state("example") is None
+    assert _subagent_auth_context.get() is None
+
+
+@pytest.mark.asyncio
 async def test_async_subagent_task_uses_rescoped_live_state_not_foreign_runtime() -> None:
     @dataclass(frozen=True)
     class State:
