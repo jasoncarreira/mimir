@@ -637,8 +637,12 @@ def test_reaper_reclaims_expired_published_lease(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("error_number", [
+    pytest.param(39, id="linux-enotempty"),
+    pytest.param(66, id="darwin-enotempty"),
+])
 def test_reaper_delete_failure_leaves_only_tombstone_and_retries(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_number: int,
 ) -> None:
     from mimir import pr_checkout_lease as leases
 
@@ -649,11 +653,14 @@ def test_reaper_delete_failure_leaves_only_tombstone_and_retries(
     _expire_lease(lease)
     events: list[tuple[str, dict[str, object]]] = []
     real_delete = leases.rmtree_missing_ok
+    # ENOTEMPTY is 39 on Linux and 66 on Darwin. Exercise both renderings
+    # on every host without weakening the exact event-payload assertion.
+    delete_error = OSError(error_number, "Directory not empty")
 
     def fail_delete(path: Path) -> None:
         assert not lease.path.exists(), "deletion must happen after the rename"
         assert path.name.startswith(".reclaiming-")
-        raise OSError(errno.ENOTEMPTY, "Directory not empty")
+        raise delete_error
 
     monkeypatch.setattr(leases, "rmtree_missing_ok", fail_delete)
     result = reclaim_expired_pr_checkout_leases(
@@ -665,7 +672,7 @@ def test_reaper_delete_failure_leaves_only_tombstone_and_retries(
     assert len(tombstones) == 1 and tombstones[0].is_dir()
     assert any(kind == "pr_checkout_lease_reclaim_failed" and fields == {
         "lease": lease.path.name, "recovery_id": lease.recovery_id,
-        "step": "delete", "error": "[Errno 39] Directory not empty",
+        "step": "delete", "error": str(delete_error),
     } for kind, fields in events)
 
     monkeypatch.setattr(leases, "rmtree_missing_ok", real_delete)
