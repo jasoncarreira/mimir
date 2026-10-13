@@ -53,6 +53,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
+import random
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -76,6 +79,38 @@ RECOVERY_STATE_FILE = ".recovery.json"
 #: Mirrors github-poller's ``REVIEW_REQUEST_MAX_ATTEMPTS`` (#516) — same
 #: wedge-guard intent: a persistently-failing item can't re-fire forever.
 DEFAULT_MAX_RECOVERY_ATTEMPTS = 3
+DEFAULT_TURN_TRANSIENT_RETRY_MAX = 5
+DEFAULT_TURN_TRANSIENT_RETRY_BASE_S = 120.0
+DEFAULT_TURN_TRANSIENT_RETRY_MAX_S = 1800.0
+
+
+def _transient_config() -> tuple[int, float, float]:
+    def number(key: str, default: int | float, integer: bool) -> int | float:
+        raw = os.environ.get(key, "")
+        try:
+            value = int(raw) if integer else float(raw)
+            if value < 0 or not math.isfinite(value):
+                raise ValueError(raw)
+            return value
+        except ValueError:
+            if raw:
+                log.warning("invalid %s=%r; using %s", key, raw, default)
+            return default
+
+    return (
+        int(number("MIMIR_TURN_TRANSIENT_RETRY_MAX", DEFAULT_TURN_TRANSIENT_RETRY_MAX, True)),
+        float(number("MIMIR_TURN_TRANSIENT_RETRY_BASE_S", DEFAULT_TURN_TRANSIENT_RETRY_BASE_S, False)),
+        float(number("MIMIR_TURN_TRANSIENT_RETRY_MAX_S", DEFAULT_TURN_TRANSIENT_RETRY_MAX_S, False)),
+    )
+
+
+def _transient_delay(attempt: int, base: float, cap: float, retry_after: Any) -> float:
+    raw = min(base * 2 ** (attempt - 1), cap)
+    delay = min(raw + random.uniform(0, raw * 0.5), cap)
+    if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool):
+        if math.isfinite(retry_after) and retry_after > 0:
+            delay = max(delay, retry_after)
+    return delay
 
 #: Bound head-of-line blocking independently of successful retry attempts.
 DEFAULT_MAX_DEFER_SECONDS = 15 * 60.0
@@ -713,6 +748,7 @@ async def reconcile_failed_turns(
     inflight: dict = state["inflight"]
     now_dt = _utc_now()
     now_iso = now_dt.isoformat()
+    transient_max, transient_base, transient_cap = _transient_config()
 
     # GC abandoned entries first so a vanished turn can't pin the stash
     # forever (#310).
@@ -807,6 +843,37 @@ async def reconcile_failed_turns(
                     if isinstance(ts, str):
                         watermark = max(watermark, ts)
                     continue
+                if disposition == "transient_provider":
+                    transient_attempt = int(entry.get("transient_retries", 0)) + 1
+                    if transient_attempt <= transient_max:
+                        delay = _transient_delay(
+                            transient_attempt, transient_base, transient_cap,
+                            rec.get("retry_after_s"),
+                        )
+                        entry["transient_due_at"] = (now_dt + timedelta(seconds=delay)).isoformat()
+                        entry["transient_reason"] = reason if isinstance(reason, str) else "provider_error_transient"
+                        try:
+                            await log_event(
+                                "turn_transient_retry_scheduled", source_id=source_id,
+                                attempt=transient_attempt, delay_s=delay,
+                                reason=entry["transient_reason"],
+                            )
+                        except Exception as exc:  # noqa: BLE001 — ledger remains authoritative
+                            log.warning("poller recovery: transient schedule emit failed: %s", exc)
+                        if isinstance(ts, str):
+                            watermark = max(watermark, ts)
+                        continue
+                    try:
+                        await log_event(
+                            "turn_transient_retry_exhausted", source_id=source_id,
+                            attempt=transient_attempt,
+                            reason=reason if isinstance(reason, str) else "provider_error_transient",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("poller recovery: transient exhaustion emit failed: %s", exc)
+                    # Charge this failure through the original recovery path.
+                entry.pop("transient_due_at", None)
+                entry.pop("transient_reason", None)
                 if not recover_failed_turns:
                     # Pollers with live-state reconciliation (notably GitHub
                     # review requests) consume this durable count themselves.
@@ -918,6 +985,38 @@ async def reconcile_failed_turns(
             # ``isoformat()`` strings, so lexicographic ``max`` orders
             # them chronologically.
             watermark = max(watermark, ts)
+
+    # Scheduled retries are durable, independent of the outcome watermark.
+    # Do not sleep inside a poll cycle or count an enqueue rejected by headroom.
+    for source_id, entry in list(inflight.items()):
+        if not isinstance(entry, dict):
+            continue
+        due_at = _parse_iso(entry.get("transient_due_at"))
+        if due_at is None or due_at.tzinfo is None or due_at > now_dt:
+            continue
+        event = await _restore_event(
+            entry, poller_name=poller_name, channel_id=channel_id,
+            service_principal=service_principal, service_authority=service_authority,
+            trust_source=trust_source, github_token=github_token,
+            github_self_login=github_self_login,
+        )
+        if event is None or await _is_stale(event, relevance_check):
+            del inflight[source_id]
+            summary["dropped" if event is None else "stale_dropped"] += 1
+            continue
+        try:
+            accepted = await enqueue(event)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("poller recovery: transient enqueue raised (%s)", type(exc).__name__)
+            accepted = False
+        if accepted:
+            entry["transient_retries"] = int(entry.get("transient_retries", 0)) + 1
+            entry.pop("transient_due_at", None)
+            entry.pop("transient_reason", None)
+            entry["enqueued_at"] = _utc_now_iso()
+            summary["reenqueued"] += 1
+        else:
+            summary["deferred"] += 1
 
     # An accepted event whose latest enqueue predates the durable startup
     # marker, with no outcome after that enqueue, was consumed from the poller

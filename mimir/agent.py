@@ -82,6 +82,7 @@ from ._langchain_codex_plus_patches import (
 )
 from ._deepagents_summarization import install_offload_traceback_logging_patch
 from ._jsonl_tail import tail_jsonl_records
+from ._llm_retry import _is_retryable_error
 from ._reasoning_effort import EFFORT_LEVELS as _EFFORT_LEVELS
 from ._reasoning_effort import validate_effort as _validate_effort
 from .jsonl_snapshot import JsonlSnapshot
@@ -165,6 +166,36 @@ from .worklink.continuation import (
 from .worklink.dispatch_failures import is_dispatch_failure_intervention
 
 log = logging.getLogger(__name__)
+
+
+def _transient_provider_failure(exc: BaseException) -> tuple[str | None, float | None]:
+    """Only a raised provider/transport exception can exempt a poller attempt."""
+    name = type(exc).__name__
+    if name in {"Exception", "RuntimeError"} or not (
+        name in {"ReadError", "ConnectError", "RemoteProtocolError", "ReadTimeout",
+                 "ConnectTimeout", "PoolTimeout", "Timeout", "ConnectionError",
+                 "CodexResponseError", "OverloadedError", "RateLimitError"}
+        or name.endswith(("APIError", "APIStatusError", "HTTPStatusError"))
+        or getattr(exc, "status_code", None) is not None
+        or getattr(getattr(exc, "response", None), "status_code", None) is not None
+    ):
+        return None, None
+    retryable, reason = _is_retryable_error(exc)
+    if not retryable:
+        return None, None
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        headers = getattr(exc, "headers", None)
+    raw = headers.get("retry-after") if hasattr(headers, "get") else None
+    from email.utils import parsedate_to_datetime
+    try:
+        retry_after = float(raw)
+    except (TypeError, ValueError):
+        try:
+            retry_after = (parsedate_to_datetime(raw) - datetime.now(timezone.utc)).total_seconds() if raw else 0
+        except (TypeError, ValueError, IndexError, OverflowError):
+            retry_after = 0
+    return reason, retry_after if 0 < retry_after < float("inf") else None
 
 # Reflection is the sole turn whose session summaries are assembled across
 # channels: its own synthetic scheduler channel has no user sessions.
@@ -2343,6 +2374,7 @@ class Agent:
                 ctx, "outcome_emitted", False
             ):
                 try:
+                    transient_reason, retry_after_s = _transient_provider_failure(exc)
                     await log_event(
                         "turn_failed",
                         channel_id=event.channel_id,
@@ -2355,6 +2387,9 @@ class Agent:
                             )
                         )[-4000:],
                         phase="pre_model_loop",
+                        attempt_disposition=("transient_provider" if transient_reason else "charge"),
+                        attempt_reason=transient_reason or f"{type(exc).__name__}: {exc}"[:240],
+                        **({"retry_after_s": retry_after_s} if retry_after_s else {}),
                         **_turn_outcome_identity(event),
                     )
                 except Exception:  # noqa: BLE001 — never mask the original
@@ -3072,6 +3107,8 @@ class Agent:
         # so a content rejection is queryable in events.jsonl. The getattr
         # below keeps this inert on provider versions that don't surface it.
         turn_error_request_summary: dict[str, Any] | None = None
+        transient_reason: str | None = None
+        retry_after_s: float | None = None
         messages: list[Any] = []
         output = ""
         events_truncated = False
@@ -3157,6 +3194,8 @@ class Agent:
         except Exception as exc:
             from .redaction import redact_text
 
+            if event.trigger == "poller":
+                transient_reason, retry_after_s = _transient_provider_failure(exc)
             error = redact_text(f"{type(exc).__name__}: {exc}")[:2048]
             exception_traceback = redact_text("".join(
                 traceback.format_exception(type(exc), exc, exc.__traceback__, limit=16)
@@ -3300,7 +3339,8 @@ class Agent:
             # This is framework-authored from boundary middleware state, never
             # inferred from model text or a tool error message.
             "attempt_disposition": (
-                "exempt_hard_refusal" if refusal_is_exempt else "charge"
+                "exempt_hard_refusal" if refusal_is_exempt else
+                "transient_provider" if transient_reason else "charge"
             ),
             "attempt_reason": (
                 ", ".join(
@@ -3311,7 +3351,7 @@ class Agent:
                     })
                 )
                 if refusal_is_exempt
-                else (error[:240] if error else result_fields["result_subtype"])
+                else (transient_reason or (error[:240] if error else result_fields["result_subtype"]))
             ),
             "hard_refusals": hard_refusals,
             "remediation_effects": remediation_effects,
@@ -3333,6 +3373,7 @@ class Agent:
                 turn_id=turn_id,
                 trigger=event.trigger,
                 error=(error[:240] if error else result_fields["result_subtype"]),
+                **({"retry_after_s": retry_after_s} if transient_reason and retry_after_s else {}),
                 **outcome_fields,
                 **(
                     {"traceback": exception_traceback[-4000:]}
