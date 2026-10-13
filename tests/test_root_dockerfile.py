@@ -17,6 +17,7 @@ import pytest
 
 from mimir.worklink.backends.feature_factory import FACTORY_VERSION
 from mimir.worklink.tool_pins import OPENCODE_VERSION
+from mimir.plugin_dockerfile import verify_pins
 
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
 ROOT = DOCKERFILE.parent
@@ -327,3 +328,22 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
 def test_worklink_service_run_script_is_made_executable() -> None:
     text = _text()
     assert "/etc/s6-overlay/s6-rc.d/worklink-execd/run" in text
+
+
+def test_provider_services_are_build_time_opt_in_and_preserve_core_bundle() -> None:
+    text = _text()
+    assert 'ARG MIMIR_PLUGIN_PACKAGES=""' in text
+    assert 'pip install --no-cache-dir "$package"' in text
+    assert 'if [ -n "$MIMIR_PLUGIN_PACKAGES" ]; then' in text
+    assert 'sys.path.insert(0, "/opt/mimir-image-assembly"); from mimir.plugin_dockerfile import main; main()' in text
+    assert '--destination /etc/s6-overlay/s6-rc.d' in text
+    assert '--scripts /usr/local/libexec/mimir-plugin-services' in text
+    assert text.index('pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"') < text.index('pip install --no-cache-dir "$package"') < text.index('COPY deploy/s6-overlay/s6-rc.d/')
+    assert 'COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/' in text
+    for service in ("mimir", "watchdog", "worklink-execd"):
+        assert f"/etc/s6-overlay/s6-rc.d/{service}/run" in text or service == "mimir" and "deploy/s6-overlay/s6-rc.d/" in text
+
+
+def test_image_assembly_rejects_missing_selected_package() -> None:
+    with pytest.raises(ValueError, match="selected provider packages differ"):
+        verify_pins(("missing-provider==1.0",), ())

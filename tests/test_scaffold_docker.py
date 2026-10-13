@@ -13,10 +13,13 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import re
 import stat
+import subprocess
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,6 +38,102 @@ from mimir.scaffold_docker import (
     render_start_sh,
     scaffold,
 )
+from mimir.plugin_dockerfile import render_stage, select_plugins
+
+
+def _provider(tmp_path: Path):
+    root = tmp_path / "provider"
+    service = root / "services" / "worker"
+    service.mkdir(parents=True)
+    (root / "mimir-plugin.toml").write_text("test")
+    (service / "type").write_text("longrun\n")
+    run = service / "run"
+    run.write_text("#!/bin/sh\nprintf '%s:%s' \"$GREETING\" \"$USER\" > \"$RESULT\"\nexit 17\n")
+    run.chmod(0o755)
+    dist = SimpleNamespace(version="2.3.0", files=[Path("mimir-plugin.toml")],
+                           locate_file=lambda path: root / path)
+    spec = {"system_packages": ["libmagic1"], "build_args": {"TOOL_VERSION": "1.2"},
+            "users": ["worker"], "directories": ["/opt/worker"],
+            "root_run": ["true"], "s6_services": ["services/worker"]}
+    return SimpleNamespace(name="sample", distribution="example-provider",
+                           entry_point=SimpleNamespace(dist=dist),
+                           manifest=SimpleNamespace(dockerfile=spec), enabled=True, diagnostic=None)
+
+
+def test_plugin_stage_selection_and_order(tmp_path, monkeypatch):
+    a = _provider(tmp_path)
+    b = SimpleNamespace(**{**vars(a), "name": "zzz", "enabled": False,
+                           "manifest": SimpleNamespace(dockerfile={"system_packages": ["zlib1g"]})})
+    monkeypatch.setattr("mimir.plugin_dockerfile.discover_plugins", lambda: (a, b))
+    assert select_plugins() == (a,)
+    assert select_plugins(all_installed=True) == (a, b)
+    assert "libmagic1" in render_stage((a,), "base")
+    assert "zlib1g" not in render_stage(select_plugins(), "base")
+    assert render_stage((a,), "build").index("ARG TOOL_VERSION") < render_stage((a,), "build").index("RUN useradd")
+
+
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+def test_selected_service_is_supervised_and_generated_wrappers_execute(tmp_path, monkeypatch, mode):
+    provider = _provider(tmp_path)
+    monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kwargs: (provider,))
+    home = tmp_path / "home"
+    home.mkdir()
+    result = scaffold(home, mode=mode)
+    assert result.plugins_with_services == ["sample-worker"]
+    dockerfile = (home / "Dockerfile").read_text()
+    assert 'ENTRYPOINT ["/init"]' in dockerfile
+    assert "s6-overlay-noarch.tar.xz" in dockerfile
+    assert "s6-overlay-${S6_ARCH}.tar.xz" in dockerfile
+    assert "USER root\nENTRYPOINT" in dockerfile
+    assert "COPY .mimir-scaffold/plugin-services/" in dockerfile
+    if mode == "pypi":
+        assert 'pip install --no-cache-dir "example-provider==2.3.0"' in dockerfile
+    else:
+        assert "uv pip install --python .venv/bin/python" in (home / "start.sh").read_text()
+
+    context = home / ".mimir-scaffold" / "s6-rc.d"
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "s6-setuidgid").write_text(
+        '#!/bin/sh\nprintf "%s" "$1" > "$SHIM_USER"\nshift\nexec "$@"\n'
+    )
+    (shim / "s6-setuidgid").chmod(0o755)
+    output = tmp_path / "output"
+    shim_user = tmp_path / "shim-user"
+    wrapper = context / "sample-worker" / "run"
+    # The image wrapper's absolute path points to its image-owned script;
+    # substitute only that prefix to execute the generated copy locally.
+    local_wrapper = tmp_path / "run"
+    local_wrapper.write_text(wrapper.read_text().replace(
+        "/usr/local/libexec/mimir-plugin-services/sample/worker/run",
+        str(home / ".mimir-scaffold/plugin-services/sample/worker/run")))
+    local_wrapper.chmod(0o755)
+    completed = subprocess.run([str(local_wrapper)], env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}",
+                          "GREETING": "hello", "USER": "mimir", "RESULT": str(output),
+                          "SHIM_USER": str(shim_user)}, check=False)
+    assert completed.returncode == 17
+    assert shim_user.read_text() == "mimir"
+    assert output.read_text() == "hello:mimir"
+    assert 'exec s6-setuidgid mimir /usr/local/bin/start.sh' in (context / "mimir/run").read_text()
+    fake_start = tmp_path / "start.sh"
+    fake_start.write_text('#!/bin/sh\nprintf "%s" "$GREETING" > "$RESULT"\nexit 23\n')
+    fake_start.chmod(0o755)
+    mimir_wrapper = tmp_path / "mimir-wrapper"
+    mimir_wrapper.write_text((context / "mimir/run").read_text().replace(
+        "/usr/local/bin/start.sh", str(fake_start)))
+    mimir_wrapper.chmod(0o755)
+    completed = subprocess.run([str(mimir_wrapper)], env={**os.environ,
+        "PATH": f"{shim}:{os.environ['PATH']}", "GREETING": "mimir-start",
+        "RESULT": str(output), "SHIM_USER": str(shim_user)}, check=False)
+    assert completed.returncode == 23
+    assert shim_user.read_text() == "mimir"
+    assert output.read_text() == "mimir-start"
+    assert (context / "user/contents.d/mimir").exists()
+
+    monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kwargs: ())
+    scaffold(home, mode=mode)
+    assert not (home / ".mimir-scaffold").exists()
+    assert 'ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]' in (home / "Dockerfile").read_text()
 
 
 # ── fixtures ────────────────────────────────────────────────────────

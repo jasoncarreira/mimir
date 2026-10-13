@@ -177,6 +177,15 @@ ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 
+# Optional pinned provider packages must be supplied at image build time.
+# Private wheels require an operator-supplied pip index or build context.
+ARG MIMIR_PLUGIN_PACKAGES=""
+RUN set -eu; old_ifs="$IFS"; IFS=,; \
+    for package in $MIMIR_PLUGIN_PACKAGES; do \
+        case "$package" in *==*) ;; *) echo >&2 "plugin package must be pinned: $package"; exit 2 ;; esac; \
+        pip install --no-cache-dir "$package"; \
+    done; IFS="$old_ifs"
+
 USER root
 ARG MIMIR_GIT_URL=https://github.com/jasoncarreira/mimir.git
 LABEL org.opencontainers.image.revision="${MIMIR_EXECUTOR_COMMIT}"
@@ -300,6 +309,15 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 # bundle defines what runs.
 USER root
 COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+# Use the assembler from this image build context, not an older published wheel.
+COPY mimir/ /opt/mimir-image-assembly/mimir/
+RUN if [ -n "$MIMIR_PLUGIN_PACKAGES" ]; then \
+        /home/mimir/venv/bin/python -c 'import sys; sys.path.insert(0, "/opt/mimir-image-assembly"); from mimir.plugin_dockerfile import main; main()' \
+            --packages "$MIMIR_PLUGIN_PACKAGES" \
+            --destination /etc/s6-overlay/s6-rc.d \
+            --scripts /usr/local/libexec/mimir-plugin-services; \
+    fi \
+    && rm -rf /opt/mimir-image-assembly
 RUN install -d -o root -g root -m 0755 /usr/local/libexec \
     && printf '%s\n' '#!/bin/sh' 'exec /opt/mimir-worklink/venv/bin/python -m mimir.worklink.worker_exec "$@"' > /usr/local/libexec/worklink-execd \
     && chmod 0755 /usr/local/libexec/worklink-execd \
