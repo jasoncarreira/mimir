@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import asyncio
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -47,7 +48,6 @@ def example_distribution(tmp_path_factory):
 
 def test_installed_example_provider_end_to_end(example_distribution, tmp_path, monkeypatch):
     from importlib import metadata
-    import json
 
     from mimir.plugin_dockerfile import pinned_packages, render_stage, services
     from mimir.plugins.config_api import plugin_config_rows, validate_plugin_config_write
@@ -145,13 +145,205 @@ def test_installed_example_provider_end_to_end(example_distribution, tmp_path, m
         validate_plugin_config_write("example", "MIMIR_PLUGIN_EXAMPLE_SECRET", {"example": candidate.manifest})
 
 
-def test_disabled_installed_example_does_not_import_provider(example_distribution):
+@pytest.mark.asyncio
+async def test_installed_example_poller_scheduler_and_live_state(example_distribution, tmp_path, monkeypatch):
+    from mimir.access_control import create_auth_context
+    from mimir.models import AgentEvent, TurnContext
+    from mimir.plugins.manager import load_plugins
+    from mimir.scheduler import Scheduler
+
+    monkeypatch.syspath_prepend(str(example_distribution))
+    policy = load_plugins(enable="example").policy
+    poller_home = tmp_path / "skills"
+    from mimir.pollers import discover_pollers
+    poller, = discover_pollers(poller_home, policy=policy)
+    principal = poller.resolved_authority()
+    assert principal.authority_profile == "example-reader"
+    assert principal.capabilities == ("example_read",)
+    assert poller.hooks is not None and poller.hooks.recovery_relevance is not None
+
+    scheduler_yaml = tmp_path / "scheduler.yaml"
+    scheduler_yaml.write_text("- name: example-cron\n  callable: example-tick\n  cron: '0 6 * * *'\n")
+    sched = Scheduler(scheduler_yaml=scheduler_yaml, enqueue=lambda event: asyncio.sleep(0, result=True),
+                      policy=policy)
+    assert sched.bind_plugin_jobs(policy.scheduler_jobs.values()) == 1
+    job = sched._scheduler.get_job("example-tick")
+    assert job is not None and job.func is policy.scheduler_jobs["example-tick"].callback
+    assert "hour='6'" in str(job.trigger)
+    assert sched.add_poller_jobs(poller_home) == 1
+    assert sched.registered_pollers() == ["example-watch"]
+    assert sched._scheduler.get_job("poller:example-watch") is not None
+    assert sched._pollers["example-watch"].resolved_authority().authority_profile == "example-reader"
+
+    slot = policy.state_slots["example"]
+    # The frozen registry does not issue registrars, but slot writes still
+    # validate a registrar's owner and selected-policy identity.
+    from mimir.plugins.registry import PolicyRegistrar
+    owner = PolicyRegistrar(policy, "example")
+    foreign = PolicyRegistrar(policy, "foreign")
+    event = AgentEvent(trigger="user_message", channel_id="channel", author="user")
+    auth = create_auth_context(event, policy=policy)
+    with pytest.raises(TypeError, match="registered slot type"):
+        auth.with_plugin_state(owner, object())
+    with pytest.raises(TypeError, match="registered slot type"):
+        auth.with_plugin_state(foreign, slot("foreign"))
+    impostor = PolicyRegistrar(PolicyRegistry(), "example")
+    with pytest.raises(ValueError, match="matching owner registrar"):
+        auth.with_plugin_state(impostor, slot("foreign"))
+    bound = auth.with_plugin_state(owner, slot("inbound"))
+    turn = TurnContext("turn", "channel", event.trigger, event.channel_id, 0, auth_context=bound)
+    assert turn.plugin_state("example") == slot("inbound")
+    turn.set_plugin_state(owner, slot("live"))
+    with pytest.raises(TypeError, match="registered slot type"):
+        turn.set_plugin_state(owner, object())
+    with pytest.raises(TypeError, match="registered slot type"):
+        turn.set_plugin_state(foreign, slot("foreign"))
+    assert turn.auth_with_plugin_state().plugin_state("example") == slot("live")
+    assert replace(turn.auth_with_plugin_state(), trigger="continuation").plugin_state("example") == slot("live")
+    assert auth.plugin_state("example") is None
+
+
+@pytest.mark.asyncio
+async def test_installed_example_http_web_and_turn_prompt(example_distribution, tmp_path, monkeypatch):
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from mimir import web_ui
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import issue_web_key
+    from mimir.models import AgentEvent, Integrity
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir.server import _make_auth_middleware
+    from tests.test_turn_prompt_assembly import _make_ctx
+
+    monkeypatch.syspath_prepend(str(example_distribution))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_WEB_DEFAULT_SKIN", raising=False)
+    manager = load_plugins(enable="example")
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    app["api_key"] = "example-master-key"
+    user_key = issue_web_key(tmp_path, "user", roles=["user"])
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    app["identity_resolver"] = resolver
+    app.middlewares.append(_make_auth_middleware("example-master-key"))
+    web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl", home=tmp_path)
+    async with TestClient(TestServer(app)) as client:
+        assert (await client.get("/api/v1/plugins/example/status")).status == 401
+        response = await client.get("/api/v1/plugins/example/status", headers={"X-API-Key": user_key})
+        assert response.status == 200 and await response.json() == {"provider": "example"}
+        headers = {"X-API-Key": "example-master-key"}
+        bootstrap = (await (await client.get("/api/v1/web/bootstrap", headers=headers)).json())["data"]
+        assert bootstrap["ui"]["default_skin"] == "example-skin"
+        skin, = bootstrap["skins"]["plugins"]
+        assert skin["plugin"] == "example" and skin["name"] == "Example"
+        assert set(skin["tokens"]) == web_ui.SKIN_TOKEN_NAMES
+        assert bootstrap["plugin_bundles"] == [{
+            "plugin": "example", "apiMajor": 1,
+            "moduleUrl": "/plugins/example/assets/frontend/example.v1.js?v=0.1.0",
+            "cssUrl": "/plugins/example/assets/frontend/example.v1.css?v=0.1.0",
+        }]
+        assert skin["characterRenderer"]["assets"][0]["href"] == "/plugins/example/assets/skins/character.svg?v=0.1.0"
+        assert skin["fonts"][0]["src"][0]["url"] == "/plugins/example/assets/skins/example.woff2?v=0.1.0"
+        assert any(entry["id"] == "example-page" and entry["plugin"] == "example"
+                   for entry in bootstrap["dashboard_extensions"])
+        for resource in ("skins/character.svg", "skins/example.woff2", "frontend/example.v1.js",
+                         "frontend/example.v1.css"):
+            response = await client.get(f"/plugins/example/assets/{resource}?v=0.1.0", headers=headers)
+            assert response.status == 200
+            assert response.headers["Cache-Control"] == "public, max-age=31536000, immutable"
+            assert await response.read()
+        assert (await client.get("/plugins/example/assets/frontend/example.v1.js?v=wrong", headers=headers)).headers[
+            "Cache-Control"].startswith("no-store")
+
+    memory = tmp_path / "memory/core/00-identity.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("Trusted example identity")
+    cfg = replace(Config.from_env(), plugin_manager=manager)
+    agent = Agent(config=cfg, turn_logger=TurnLogger(cfg.turns_log),
+                  message_buffer=MessageBuffer(history_path=tmp_path / "messages.jsonl"),
+                  index_generator=IndexGenerator(tmp_path))
+    event = AgentEvent(trigger="user_message", channel_id="channel", author="user", content="hello")
+    ctx = _make_ctx(event)
+    with policy_scope(manager.policy):
+        prompt, _ = await agent._build_turn_prompt(ctx, event, None)
+    assert "## Plugin: example_memory\n\nExample memory: Trusted example identity" in prompt
+    sources = [source for source in ctx.ifc_labels.sources if source.domain == "example_memory"]
+    assert len(sources) == 1
+    assert sources[0].resource_id == str(memory)
+    assert sources[0].integrity is Integrity.TRUSTED
+    assert sources[0].integrity_effect.value == "informational"
+
+
+def test_installed_example_scaffold_service_wrapper(example_distribution, tmp_path, monkeypatch):
+    from mimir.plugin_dockerfile import render_stage, select_plugins
+    from mimir.scaffold_docker import scaffold
+
+    monkeypatch.syspath_prepend(str(example_distribution))
+    monkeypatch.setenv("MIMIR_PLUGINS", "example")
+    selected = select_plugins()
+    assert [candidate.name for candidate in selected] == ["example"]
+    assert "ca-certificates" in render_stage(selected, "base")
+    build = render_stage(selected, "build")
+    assert all(item in build for item in ("EXAMPLE_GREETING", "example_service", "/var/lib/example-service",
+                                          "chmod 755 /var/lib/example-service"))
+    assert render_stage(selected, "runtime") == ""
+    assert "example-example-worker" in render_stage(selected, "services")
+    home = tmp_path / "home"
+    home.mkdir()
+    result = scaffold(home, mode="pypi")
+    assert result.plugins_with_services == ["example-example-worker"]
+    dockerfile = (home / "Dockerfile").read_text()
+    assert "mimir-example-plugin==0.1.0" in dockerfile
+    assert "ca-certificates" in dockerfile
+    assert "example_service" in dockerfile
+    assert 'ENTRYPOINT ["/init"]' in dockerfile
+    context = home / ".mimir-scaffold"
+    assert (context / "s6-rc.d/user/contents.d/example-example-worker").is_file()
+    copied = context / "plugin-services/example/example-worker/run"
+    source = example_distribution / "mimir_example_plugin/services/example-worker/run"
+    assert copied.read_bytes() == source.read_bytes()
+    wrapper = context / "s6-rc.d/example-example-worker/run"
+    image_script = "/usr/local/libexec/mimir-plugin-services/example/example-worker/run"
+    assert f"exec s6-setuidgid mimir {image_script}" in wrapper.read_text()
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    shim_script = shim / "s6-setuidgid"
+    shim_script.write_text('#!/bin/sh\nprintf "%s" "$1" > "$SHIM_USER"\nshift\nexec "$@"\n')
+    shim_script.chmod(0o755)
+    local_wrapper = tmp_path / "wrapper"
+    local_wrapper.write_text(wrapper.read_text().replace(image_script, str(copied)))
+    local_wrapper.chmod(0o755)
+    identity = tmp_path / "user"
+    completed = subprocess.run([str(local_wrapper)], env={**os.environ, "EXAMPLE_GREETING": "installed",
+        "SHIM_USER": str(identity), "PATH": f"{shim}:{os.environ['PATH']}"}, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    assert identity.read_text() == "mimir"
+    assert completed.stdout.strip() == "example worker: installed"
+
+
+def test_disabled_installed_example_does_not_import_provider(example_distribution, tmp_path):
     """A fresh interpreter owns the entire import inventory, not the pytest process."""
     script = '''
+import asyncio
+import contextlib
+import io
+from pathlib import Path
 import sys
+from types import SimpleNamespace
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+from mimir import web_ui
+from mimir.cli import main as cli_main
+from mimir.plugins.config_api import plugin_config_rows
+from mimir.plugins.defaults import seed_plugin_defaults
 from mimir.plugins.discovery import discover_plugins
 from mimir.plugins.manager import load_plugins
 from mimir.plugin_dockerfile import select_plugins
+from mimir.pollers import discover_pollers
+from mimir.scheduler import Scheduler
+home = Path(sys.argv[1])
 assert any(c.name == "example" and not c.enabled for c in discover_plugins(enable=""))
 manager = load_plugins(enable="")
 assert not manager.plugins
@@ -163,11 +355,47 @@ assert not manager.policy.prompt_providers
 assert not manager.policy.state_slots
 assert "example-hello" not in manager.policy.cli_commands
 assert not select_plugins(enable="")
+assert select_plugins(enable="", all_installed=True)[0].name == "example"
+assert discover_pollers(home / "skills", policy=manager.policy) == []
+with contextlib.redirect_stderr(io.StringIO()):
+    try:
+        cli_main(["example-hello"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("disabled CLI command dispatched")
+assert seed_plugin_defaults(home, selected=manager.policy.selected_plugin_candidates) == {}
+assert not (home / "skills/example-example-watch").exists()
+try:
+    plugin_config_rows("example", {})
+except ValueError:
+    pass
+else:
+    raise AssertionError("disabled config leaked")
+async def check_host():
+    scheduler = Scheduler(home / "scheduler.yaml", enqueue=lambda event: asyncio.sleep(0, result=True),
+                          policy=manager.policy)
+    assert scheduler.bind_plugin_jobs(manager.policy.scheduler_jobs.values()) == 0
+    assert scheduler.add_poller_jobs(home / "skills") == 0
+    assert scheduler.registered_pollers() == []
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    web_ui.register_routes(app, turns_log=home / "turns.jsonl", events_log=home / "events.jsonl", home=home)
+    async with TestClient(TestServer(app)) as client:
+        assert (await client.get("/api/v1/plugins/example/status")).status == 404
+        bootstrap = (await (await client.get("/api/v1/web/bootstrap")).json())["data"]
+        assert bootstrap["ui"]["default_skin"] == "neon-terminal"
+        assert not bootstrap["skins"]["plugins"]
+        assert not bootstrap["plugin_bundles"]
+        assert "example-page" not in {entry["id"] for entry in bootstrap["dashboard_extensions"]}
+        assert (await client.get("/plugins/example/assets/skins/character.svg?v=0.1.0")).status == 404
+asyncio.run(check_host())
 assert "mimir_example_plugin" not in sys.modules
 '''
     env = {**os.environ, "PYTHONPATH": str(example_distribution),
-           "MIMIR_PLUGINS": ""}
-    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True)
+           "MIMIR_PLUGINS": "", "MIMIR_HOME": str(tmp_path)}
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path)],
+                            env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
 
