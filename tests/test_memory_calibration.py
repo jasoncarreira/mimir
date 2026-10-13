@@ -47,7 +47,7 @@ def _install_stub_provider(monkeypatch: pytest.MonkeyPatch, dim: int = 4,
                             provider_name: str = "openai") -> _StubProvider:
     stub = _StubProvider(dim)
     monkeypatch.setattr(
-        "mimir.saga.calibration.get_provider", lambda: stub,
+        "mimir.saga.embeddings.get_provider", lambda: stub,
     )
 
     def _fake_get_config():
@@ -58,6 +58,8 @@ def _install_stub_provider(monkeypatch: pytest.MonkeyPatch, dim: int = 4,
                 ("embedding", "model"): "stub-model",
             }.get((section, key), default)
         return cfg
+    # Patch the name re_embed reads; calibration binds get_config at import,
+    # so patching _config_io would miss once any earlier test imported it.
     monkeypatch.setattr(
         "mimir.saga.calibration.get_config", _fake_get_config,
     )
@@ -211,7 +213,7 @@ def test_re_embed_stamps_live_provider_provenance(
     stub = _StubProvider(dim=3)
     stub.provider_name = "onnx"  # live provider after the keyless fallback
     stub.model_id = "BAAI/bge-small-en-v1.5"
-    monkeypatch.setattr("mimir.saga.calibration.get_provider", lambda: stub)
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: stub)
 
     def _cfg(section, key, default=None):
         return {
