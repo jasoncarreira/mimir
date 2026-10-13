@@ -24,7 +24,7 @@ from typing import Annotated, Any, Callable, Optional
 from langchain.tools import ToolRuntime
 from langchain_core.tools import InjectedToolArg, ToolException, tool
 
-from ..models import AuthContext
+from ..models import AuthContext, TurnContext
 from ..shell_jobs import (
     SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES,
     ShellJobRegistry,
@@ -312,6 +312,8 @@ async def bash_async(
         )
     if not isinstance(auth_context, AuthContext):
         auth_context = None
+    if isinstance(ctx, TurnContext) and ctx.auth_context is auth_context:
+        auth_context = ctx.auth_with_plugin_state()
 
     # Wait-on-pending guard (chainlink #189 / #192): refuse if a same-intent
     # job is already running on this channel.  Prevents the retry-escalation

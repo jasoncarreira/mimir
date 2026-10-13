@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from argparse import Namespace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -9,14 +10,103 @@ from typing import Any
 import pytest
 
 from benchmarks.longmemeval_via_memory import runner
-from mimir.access_control import create_local_operator_auth_context
+from mimir.access_control import create_auth_context, create_local_operator_auth_context
+from mimir._context import reset_current_turn, set_current_turn
+from mimir._deepagents_subagent_auth import _subagent_auth_context, _wrap_task_tool
 from mimir.commitments import cli as commitments_cli
-from mimir.models import TurnInteractivity
+from mimir.models import AgentEvent, TurnContext, TurnInteractivity
+from mimir.plugins.registry import PolicyRegistry
 from mimir.reflection import most_retrieved
 from mimir import scheduler_dashboard
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_owned_state_slots_follow_live_carriers_without_cross_owner_writes() -> None:
+    @dataclass(frozen=True)
+    class Alpha:
+        value: str
+
+    @dataclass(frozen=True)
+    class Beta:
+        value: int
+
+    policy = PolicyRegistry()
+    alpha = policy.registrar("alpha")
+    beta = policy.registrar("beta")
+    alpha.register_state_slot(Alpha)
+    beta.register_state_slot(Beta)
+    policy.freeze()
+    auth = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="channel", author="user"),
+        policy=policy,
+    )
+    assert auth.plugin_state("alpha") is None
+    with pytest.raises(TypeError, match="registered slot type"):
+        auth.with_plugin_state(alpha, Beta(1))
+    with pytest.raises(ValueError, match="matching owner registrar"):
+        auth.with_plugin_state(PolicyRegistry().registrar("alpha"), Alpha("wrong"))
+
+    bound = auth.with_plugin_state(alpha, Alpha("initial"))
+    assert auth.plugin_state("alpha") is None
+    turn = TurnContext("turn", "channel", "user_message", "channel", 0, auth_context=bound)
+    turn.set_plugin_state(beta, Beta(2))
+    assert turn.plugin_state("alpha") == Alpha("initial")
+    assert turn.plugin_state("beta") == Beta(2)
+    assert bound.plugin_state("beta") is None
+    snapshot = turn.auth_with_plugin_state()
+    assert snapshot.plugin_state("beta") == Beta(2)
+    assert replace(snapshot, trigger="continuation").plugin_state("alpha") == Alpha("initial")
+    other = TurnContext("other", "channel", "user_message", "channel", 0, auth_context=bound)
+    assert other.plugin_state("beta") is None
+
+
+def test_plugin_state_keeps_auth_context_opaque_to_pydantic() -> None:
+    from pydantic import TypeAdapter
+
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_state_slot(State)
+    policy.freeze()
+    auth = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="channel", author="user"),
+        policy=policy,
+    ).with_plugin_state(registrar, State("secret"))
+    assert TypeAdapter(type(auth)).dump_python(auth) == {"audience_provider": None}
+
+
+def test_subagent_task_receives_live_owner_snapshot() -> None:
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_state_slot(State)
+    policy.freeze()
+    auth = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="channel", author="user"),
+        policy=policy,
+    )
+    turn = TurnContext("turn", "channel", "user_message", "channel", 0, auth_context=auth)
+    turn.set_plugin_state(registrar, State("live"))
+    task = _wrap_task_tool(SimpleNamespace(
+        func=lambda **_kwargs: _subagent_auth_context.get(),
+        coroutine=lambda **_kwargs: None,
+    ))
+    token = set_current_turn(turn)
+    try:
+        child = task.func(runtime=SimpleNamespace(context=auth))
+    finally:
+        reset_current_turn(token)
+    assert child.plugin_state("example") == State("live")
+    assert auth.plugin_state("example") is None
+    assert _subagent_auth_context.get() is None
 
 
 class _AuthContextConstructorVisitor(ast.NodeVisitor):

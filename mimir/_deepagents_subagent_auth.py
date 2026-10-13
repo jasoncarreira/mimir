@@ -8,7 +8,8 @@ from typing import Any
 
 from langchain_core.runnables import Runnable, RunnableConfig
 
-from .models import AuthContext
+from .models import AuthContext, TurnContext
+from ._context import get_current_turn
 
 
 _subagent_auth_context: ContextVar[AuthContext | None] = ContextVar(
@@ -59,6 +60,9 @@ def _wrap_task_tool(task_tool: Any) -> Any:
     def task(*task_args: Any, **task_kwargs: Any) -> Any:
         runtime = task_kwargs.get("runtime")
         carrier = getattr(runtime, "context", None)
+        turn = get_current_turn()
+        if isinstance(turn, TurnContext) and turn.auth_context is carrier:
+            carrier = turn.auth_with_plugin_state()
         token = _subagent_auth_context.set(
             carrier if isinstance(carrier, AuthContext) else None
         )
@@ -71,6 +75,9 @@ def _wrap_task_tool(task_tool: Any) -> Any:
     async def atask(*task_args: Any, **task_kwargs: Any) -> Any:
         runtime = task_kwargs.get("runtime")
         carrier = getattr(runtime, "context", None)
+        turn = get_current_turn()
+        if isinstance(turn, TurnContext) and turn.auth_context is carrier:
+            carrier = turn.auth_with_plugin_state()
         token = _subagent_auth_context.set(
             carrier if isinstance(carrier, AuthContext) else None
         )
