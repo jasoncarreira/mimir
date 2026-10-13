@@ -344,3 +344,39 @@ def test_file_search_missing_db_returns_empty_report(tmp_path, patch_provider):
 # layer — saga owns its own test coverage. mimir's tests focus on
 # the delegation contract: provider name passed correctly, return
 # shape mapped to ReindexReport, exception isolation.
+
+
+
+def test_dispatch_uses_patched_provider_after_calibration_import(
+    tmp_path, monkeypatch, patch_provider,
+):
+    # calibration once bound get_provider at import time, so a stub installed
+    # after any earlier import (another test on the same xdist worker) was
+    # ignored and the real provider re-embedded. A distinct dimension makes a
+    # stale binding of either kind visible.
+    import mimir.saga.calibration  # noqa: F401
+
+    patch_provider(dim=7)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text('[embedding]\nprovider = "openai"\n')
+    db = tmp_path / ".mimir" / "saga.db"
+    db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE atoms (id INTEGER PRIMARY KEY, content TEXT, tombstoned INTEGER);"
+        "CREATE TABLE embeddings (atom_id INTEGER PRIMARY KEY, provider TEXT, model TEXT, "
+        "dim INTEGER, vec BLOB, embedded_at TEXT);"
+        "INSERT INTO atoms VALUES (1, 'real memory', 0);"
+        "INSERT INTO embeddings VALUES (1, 'old', 'old', 1, X'00000000', 'old');"
+    )
+    conn.close()
+    args = argparse.Namespace(home=tmp_path, target="atoms", apply=True, batch_size=50)
+    assert dispatch(args) == 0
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("SELECT provider, dim, length(vec) FROM embeddings").fetchone() == (
+            "openai", 7, 28,
+        )
+    finally:
+        conn.close()

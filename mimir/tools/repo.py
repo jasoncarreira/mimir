@@ -179,15 +179,14 @@ def _publish_attested_lease_result(
 
     # The failed command may contain remote server text. Bind that text to our
     # origin and the exact allowed refs before inheriting the lease verdict.
-    from ..repo_tools import _PROTECTED_BRANCH_REFS
-
+    # The lease predicate itself pins the original head independently of the
+    # base branch; local descendants retain their separate lineage checks.
     if (
         scope.head_remote != "origin"
         or scope.head_repo != scope.canonical_repo
         or _github_repo_from_remote(scope.canonical_origin) != scope.canonical_repo
         or not scope.destination_ref.startswith("refs/heads/")
         or scope.destination_ref != f"refs/heads/{scope.head_ref}"
-        or f"refs/heads/{scope.base_ref}" not in _PROTECTED_BRANCH_REFS
         or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
     ):
         return

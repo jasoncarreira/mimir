@@ -58,8 +58,10 @@ def _install_stub_provider(monkeypatch: pytest.MonkeyPatch, dim: int = 4,
                 ("embedding", "model"): "stub-model",
             }.get((section, key), default)
         return cfg
+    # Patch the name re_embed reads; calibration binds get_config at import,
+    # so patching _config_io would miss once any earlier test imported it.
     monkeypatch.setattr(
-        "mimir.saga._config_io.get_config", _fake_get_config,
+        "mimir.saga.calibration.get_config", _fake_get_config,
     )
     return stub
 
@@ -126,6 +128,7 @@ def test_re_embed_apply_writes_embeddings_row(tmp_path: Path,
     assert result["atoms_updated"] == 2
     assert result["dry_run"] is False
     assert result["index_rebuild_needed"] is True
+    assert stub.batch_calls == [(["alpha content", "beta content"], "passage")]
 
     # Each atom should now have an embeddings row at dim=4 / provider=openai.
     conn = sqlite3.connect(str(db))
@@ -210,7 +213,7 @@ def test_re_embed_stamps_live_provider_provenance(
     stub = _StubProvider(dim=3)
     stub.provider_name = "onnx"  # live provider after the keyless fallback
     stub.model_id = "BAAI/bge-small-en-v1.5"
-    monkeypatch.setattr("mimir.saga.calibration.get_provider", lambda: stub)
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: stub)
 
     def _cfg(section, key, default=None):
         return {

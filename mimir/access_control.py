@@ -10697,6 +10697,35 @@ def log_pr_checkout_lease_attestation_refused(
         pass
 
 
+def _log_repository_result_untrusted_default(
+    auth_context: "AuthContext | None", scope: Any, tool: str, reason: str,
+    mismatched_fields: tuple[str, ...] = (),
+) -> None:
+    """Report an exact-scope provenance fallback once per turn/tool/reason."""
+    ifc_state = getattr(auth_context, "ifc_state", None)
+    if ifc_state is not None:
+        with ifc_state._lock:
+            seen = getattr(ifc_state, "_repository_result_fallbacks", None)
+            if seen is None:
+                seen = set()
+                setattr(ifc_state, "_repository_result_fallbacks", seen)
+            if (tool, reason) in seen:
+                return
+            seen.add((tool, reason))
+    from .event_logger import log_event_sync
+
+    try:
+        fields = dict(
+            tool=tool, scope_id=scope.scope_id, pr_number=scope.pr_number,
+            observed_head_sha=scope.observed_head_sha, reason=reason,
+        )
+        if reason == "provenance_field_mismatch":
+            fields["mismatched_fields"] = list(mismatched_fields)
+        log_event_sync("repository_result_untrusted_default", **fields)
+    except RuntimeError:
+        pass
+
+
 def _pr_checkout_lease_attestation(
     auth_context: "AuthContext | None", scope: Any, lease: Any,
 ) -> LeaseAttestation:
@@ -11623,19 +11652,25 @@ def classify_protected_result(
             # publish exact-scope, server-attested provenance for every author.
             integrity_effect="active_ingest",
         )
-        if provenance is not None and provenance.sources:
-            if all(
-                item.domain == source.domain
-                and item.domain_qualifier == source.domain_qualifier
-                and item.resource_id == source.resource_id
-                and item.principal == source.principal
-                and item.bridge_instance == source.bridge_instance
-                and item.sensitivity == source.sensitivity
-                and item.authorized_principals == source.authorized_principals
-                and item.source_kind == source.source_kind
-                and item.integrity_effect == source.integrity_effect
+        if provenance is None or not provenance.sources:
+            _log_repository_result_untrusted_default(
+                auth_context, scope, tool_name, "no_published_provenance",
+            )
+        else:
+            fields = (
+                "domain", "domain_qualifier", "resource_id", "principal",
+                "bridge_instance", "sensitivity", "authorized_principals",
+                "source_kind", "integrity_effect",
+            )
+            mismatched = tuple(field for field in fields if any(
+                getattr(item, field) != getattr(source, field)
                 for item in provenance.sources
-            ):
+            ))
+            if mismatched:
+                _log_repository_result_untrusted_default(
+                    auth_context, scope, tool_name, "provenance_field_mismatch", mismatched,
+                )
+            else:
                 source = replace(
                     source,
                     integrity=(
@@ -11647,6 +11682,10 @@ def classify_protected_result(
                     _log_retained_repository_failure(
                         tool_name, result, scope.canonical_repo, scope.pr_number,
                         scope.observed_head_sha,
+                    )
+                if source.integrity == "untrusted":
+                    _log_repository_result_untrusted_default(
+                        auth_context, scope, tool_name, "published_untrusted",
                     )
         labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
