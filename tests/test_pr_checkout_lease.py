@@ -110,14 +110,81 @@ def test_pr_checkout_lease_checks_out_exact_authorized_head_and_recovers(tmp_pat
     assert state.root == str(lease.path)
     assert state.checkout_lease is lease
     recovered = recover_pr_checkout_lease(
-        lease.path, scope, owner="mimir-bot", lease_root=lease_root,
+        lease.path, scope, owner="mimir-bot", lease_root=lease_root, review_state=state,
     )
     assert recovered.recovered is True
     assert recovered.scope_id == scope.scope_id
 
-    assert cleanup_pr_checkout_lease(lease, review_state=state) is True
-    assert cleanup_pr_checkout_lease(lease, review_state=state) is False
+    assert cleanup_pr_checkout_lease(recovered, review_state=state) is True
+    assert cleanup_pr_checkout_lease(recovered, review_state=state) is False
     assert state.checkout_lease is None
+
+
+@pytest.mark.parametrize("reuse", ["acquire", "recover"])
+def test_unexpired_lease_renews_on_new_turn_with_injected_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reuse: str,
+) -> None:
+    from mimir import pr_checkout_lease as leases
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    ttl = timedelta(hours=2)
+    start = datetime.now(UTC)
+
+    class Clock(datetime):
+        current = start
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current.astimezone(tz) if tz else cls.current.replace(tzinfo=None)
+
+    monkeypatch.setattr(leases, "datetime", Clock)
+    first = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, ttl=ttl)
+    assert first.expires_at == start + ttl
+    Clock.current = start + timedelta(minutes=90)
+    state = RepoReviewState(scope)
+    if reuse == "acquire":
+        renewed, _ = acquire_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=root, ttl=ttl, review_state=state,
+        )
+    else:
+        renewed = recover_pr_checkout_lease(
+            first.path, scope, owner=scope.principal, lease_root=root,
+            ttl=ttl, review_state=state,
+        )
+    assert renewed.expires_at >= Clock.current + ttl
+    assert state.checkout_lease is renewed
+    metadata = json.loads((first.path / ".git" / "mimir-pr-checkout-lease.json").read_text())
+    assert datetime.fromisoformat(metadata["expires_at"]) == renewed.expires_at
+    Clock.current = renewed.expires_at - timedelta(seconds=1)
+    assert renewed.is_active
+    Clock.current = renewed.expires_at
+    assert not renewed.is_active
+
+
+def test_unused_lease_expires_without_renewal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir import pr_checkout_lease as leases
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    start = datetime.now(UTC)
+
+    class Clock(datetime):
+        current = start
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current.astimezone(tz) if tz else cls.current.replace(tzinfo=None)
+
+    monkeypatch.setattr(leases, "datetime", Clock)
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    assert lease.expires_at == start + timedelta(hours=2)
+    Clock.current = lease.expires_at
+    assert not lease.is_active
+    with pytest.raises(RuntimeError, match="expired"):
+        recover_pr_checkout_lease(lease.path, scope, owner=scope.principal, lease_root=root)
 
 
 def test_second_attempt_resumes_unpushed_commit(

@@ -584,12 +584,12 @@ def recover_pr_checkout_lease(
             f"PR head advanced: scoped head {scope.observed_head_sha.lower()} is stale; "
             f"fetched head is {remote_head}"
         )
+    lease = replace_lease_expiry(lease, datetime.now(UTC) + ttl)
     if expired:
-        lease = replace_lease_expiry(lease, datetime.now(UTC) + ttl)
         (path / _RECLAMATION_METADATA).unlink(missing_ok=True)
-        (path / _METADATA).write_text(
-            json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
-        )
+    (path / _METADATA).write_text(
+        json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
+    )
     if review_state is not None:
         review_state.attach_checkout_lease(lease)
         review_state.record_git_head(scope.scope_id, head)

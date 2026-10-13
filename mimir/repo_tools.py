@@ -556,20 +556,20 @@ class RepoGitTools:
             return
         assert isinstance(self._scope, RepoPRActionScope)
         if not _SHA_RE.fullmatch(self._scope.observed_head_sha):
-            raise GitRefusal("invalid_scope", "scope head is not a full commit id")
+            raise GitRefusal("invalid_scope", "scope head is not a full commit id", execution_started=False)
         if not _SHA_RE.fullmatch(self._scope.observed_base_sha):
-            raise GitRefusal("invalid_scope", "scope base is not a full commit id")
+            raise GitRefusal("invalid_scope", "scope base is not a full commit id", execution_started=False)
         if not _REF_RE.fullmatch(self._scope.destination_ref) or any(
             token in self._scope.destination_ref for token in ("..", "//", "@{", "\\")
         ):
-            raise GitRefusal("invalid_scope", "scope destination is not a branch ref")
+            raise GitRefusal("invalid_scope", "scope destination is not a branch ref", execution_started=False)
         base_ref = f"refs/heads/{self._scope.base_ref}"
         if not _REF_RE.fullmatch(base_ref) or any(
             token in base_ref for token in ("..", "//", "@{", "\\")
         ):
-            raise GitRefusal("invalid_scope", "scope base is not a branch ref")
+            raise GitRefusal("invalid_scope", "scope base is not a branch ref", execution_started=False)
         if self._scope.head_remote != "origin" or not self._scope.canonical_origin:
-            raise GitRefusal("invalid_scope", "scope remote is not server-bound origin")
+            raise GitRefusal("invalid_scope", "scope remote is not server-bound origin", execution_started=False)
 
     def _validate_lease(self) -> Path:
         if self._retained:
@@ -581,7 +581,7 @@ class RepoGitTools:
             try:
                 root = path.resolve(strict=True)
             except OSError as exc:
-                raise GitRefusal("invalid_checkout", "retained checkout is unavailable") from exc
+                raise GitRefusal("invalid_checkout", "retained checkout is unavailable", execution_started=False) from exc
             if (
                 root != path
                 or not root.is_dir()
@@ -590,7 +590,7 @@ class RepoGitTools:
                 or binding is None
                 or binding[1:] != (self._scope.issue_id, self._scope.attempt)
             ):
-                raise GitRefusal("invalid_checkout", "retained checkout identity is invalid")
+                raise GitRefusal("invalid_checkout", "retained checkout identity is invalid", execution_started=False)
             return root
         assert self._state is not None
         assert isinstance(self._scope, RepoPRActionScope)
@@ -601,17 +601,17 @@ class RepoGitTools:
             or lease.owner != self._scope.principal
             or not lease.is_active
         ):
-            raise GitRefusal("inactive_checkout", "an active matching checkout lease is required")
+            raise GitRefusal("inactive_checkout", "an active matching checkout lease is required", execution_started=False)
         path = Path(lease.path)
         if path.is_symlink():
-            raise GitRefusal("invalid_checkout", "checkout lease may not be a symlink")
+            raise GitRefusal("invalid_checkout", "checkout lease may not be a symlink", execution_started=False)
         try:
             root = path.resolve(strict=True)
             lease_root = Path(lease.lease_root).resolve(strict=True)
         except OSError as exc:
-            raise GitRefusal("invalid_checkout", "checkout lease path is unavailable") from exc
+            raise GitRefusal("invalid_checkout", "checkout lease path is unavailable", execution_started=False) from exc
         if root.parent != lease_root or root == lease_root:
-            raise GitRefusal("invalid_checkout", "checkout lease escapes its server root")
+            raise GitRefusal("invalid_checkout", "checkout lease escapes its server root", execution_started=False)
         return root
 
     def _require(self, tool_name: str, *actions: RepoPRAction) -> None:
