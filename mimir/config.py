@@ -80,21 +80,22 @@ def _load_home_dotenv(home: Path) -> list[str]:
         return []
 
     before = set(os.environ)
-    process_plugins = os.environ.get("MIMIR_PLUGINS")
+    process_only = {name: os.environ.get(name) for name in ("MIMIR_PLUGINS", "MIMIR_WEB_DEFAULT_SKIN")}
     # Preserve load_dotenv's empty-value and process-first interpolation
     # semantics. Restore process-only selections even if loading fails.
     try:
-        operator_only = _SCOPE_ENV_KEYS | {"MIMIR_PLUGINS"}
+        operator_only = _SCOPE_ENV_KEYS | process_only.keys()
         for key in sorted(dotenv_values(env_path, interpolate=False).keys() & operator_only):
             log.warning("ignoring operator-only scope key %s in %s", key, env_path)
         load_dotenv(env_path, override=False)
     finally:
         for key in _SCOPE_ENV_KEYS - before:
             os.environ.pop(key, None)
-        if process_plugins is None:
-            os.environ.pop("MIMIR_PLUGINS", None)
-        else:
-            os.environ["MIMIR_PLUGINS"] = process_plugins
+        for name, value in process_only.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
     loaded = sorted(
         key for key in set(os.environ) - before
         if os.environ.get(key, "") != ""
