@@ -269,12 +269,15 @@ def test_central_policy_grants_only_five_retained_repo_tools(retained_incident) 
     ).scope
     assert scope is not None
     allowed = {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
-    service = ac.ServicePrincipal(
+    # Exercise the server builder that declares reserved poller properties,
+    # rather than a hand-built principal with the default (False) property.
+    service = ac.build_trigger_service_principal(
         canonical="poller:worklink-ready-queue", trigger="poller",
-        authority_profile="github", capabilities=tuple(sorted(allowed)),
-        readable_domains=("repository",),
-        sink_destinations=("bound_pull_request",),
+        profile="github", tier=ac.CapabilityTier.CODE_EXECUTION,
+        capabilities=tuple(sorted(allowed)), creation_path="test",
+        policy=ac.core_policy_registry(),
     )
+    assert service.worklink_retained_checkout is True
     for tool in ac._REPO_TOOL_ACTIONS:
         decision = ac.authorize_repo_pr_tool(
             tool, scope, service_principal=service, enforce=True,
@@ -284,14 +287,21 @@ def test_central_policy_grants_only_five_retained_repo_tools(retained_incident) 
         assert decision.repo_pr_action_scope is scope
         assert decision.result_integrity == ("trusted" if tool in allowed else "untrusted")
 
-    wrong_service = replace(service, canonical="poller:other")
+    wrong_service = ac.build_trigger_service_principal(
+        canonical="poller:other", trigger="poller",
+        profile="github", tier=ac.CapabilityTier.CODE_EXECUTION,
+        capabilities=tuple(sorted(allowed)), creation_path="test",
+        policy=ac.core_policy_registry(),
+    )
+    assert wrong_service.worklink_retained_checkout is False
+    missing_property = replace(service, worklink_retained_checkout=False)
     wrong_trigger = replace(service, trigger="scheduled_tick")
     wrong_profile = replace(service, authority_profile="custom")
     missing_capability = replace(
         service, capabilities=tuple(sorted(allowed - {"repo_commit"})),
     )
     for principal in (
-        wrong_service, wrong_trigger, wrong_profile, missing_capability,
+        wrong_service, missing_property, wrong_trigger, wrong_profile, missing_capability,
     ):
         assert ac.authorize_repo_pr_tool(
             "repo_commit", scope, service_principal=principal, enforce=True,
