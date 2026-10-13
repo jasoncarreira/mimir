@@ -11,12 +11,15 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from mimir.worklink.backends.feature_factory import FACTORY_VERSION
 from mimir.worklink.tool_pins import OPENCODE_VERSION
+from mimir.plugin_dockerfile import main as assemble_main, verify_pins
 
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
 ROOT = DOCKERFILE.parent
@@ -327,3 +330,98 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
 def test_worklink_service_run_script_is_made_executable() -> None:
     text = _text()
     assert "/etc/s6-overlay/s6-rc.d/worklink-execd/run" in text
+
+
+def test_provider_services_are_build_time_opt_in_and_preserve_core_bundle() -> None:
+    text = _text()
+    assert 'ARG MIMIR_PLUGIN_PACKAGES=""' in text
+    assert 'ARG MIMIR_PLUGIN_SELECTION=""' in text
+    assert 'ARG MIMIR_PLUGIN_ALL_INSTALLED=0' in text
+    assert 'pip install --no-cache-dir "$package"' in text
+    assert '--enable "$MIMIR_PLUGIN_SELECTION"' in text
+    assert '--all-installed "$MIMIR_PLUGIN_ALL_INSTALLED"' in text
+    assert 'sys.path.insert(0, "/opt/mimir-image-assembly"); from mimir.plugin_dockerfile import main; main()' in text
+    assert '--destination /etc/s6-overlay/s6-rc.d' in text
+    assert '--scripts /usr/local/libexec/mimir-plugin-services' in text
+    assert text.index('pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"') < text.index('pip install --no-cache-dir "$package"') < text.index('COPY deploy/s6-overlay/s6-rc.d/')
+    assert 'COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/' in text
+    for service in ("mimir", "watchdog", "worklink-execd"):
+        assert f"/etc/s6-overlay/s6-rc.d/{service}/run" in text or service == "mimir" and "deploy/s6-overlay/s6-rc.d/" in text
+
+
+def test_image_assembly_rejects_missing_selected_package() -> None:
+    with pytest.raises(ValueError, match="selected provider packages differ"):
+        verify_pins(("missing-provider==1.0",), ())
+
+
+def test_production_assembler_selects_verified_services_without_replacing_core(tmp_path, monkeypatch) -> None:
+    import mimir.plugin_dockerfile as assembly
+
+    package = tmp_path / "package"
+    service = package / "services" / "worker"
+    service.mkdir(parents=True)
+    (package / "mimir-plugin.toml").write_text("test")
+    (service / "type").write_text("longrun\n")
+    (service / "run").write_text('#!/bin/sh\nprintf "%s" "$MESSAGE" > "$OUTPUT"\nexit 19\n')
+    (service / "run").chmod(0o755)
+    dist = SimpleNamespace(version="1.4", files=[Path("mimir-plugin.toml")],
+                           locate_file=lambda path: package / path)
+    candidate = SimpleNamespace(name="sample", distribution="example-provider", enabled=False,
+        diagnostic=None, manifest=SimpleNamespace(dockerfile={"s6_services": ["services/worker"]}),
+        entry_point=SimpleNamespace(dist=dist, load=lambda: pytest.fail("disabled provider imported")))
+    monkeypatch.setattr(assembly, "discover_plugins", lambda *, enable: (
+        (SimpleNamespace(**{**vars(candidate), "enabled": enable == "sample"}),)
+    ))
+
+    def run(*, pins="", enable="", all_installed="0", destination=None, scripts=None):
+        destination = destination or tmp_path / "s6-rc.d"
+        scripts = scripts or tmp_path / "scripts"
+        bundle = destination / "user/contents.d"
+        bundle.mkdir(parents=True, exist_ok=True)
+        for name in ("mimir", "watchdog", "worklink-execd"):
+            (destination / name).mkdir(exist_ok=True)
+            (destination / name / "run").write_text(f"core-{name}\n")
+            (bundle / name).touch()
+        monkeypatch.setattr(sys, "argv", ["image-assembler", "--packages", pins,
+            "--enable", enable, "--all-installed", all_installed,
+            "--destination", str(destination), "--scripts", str(scripts)])
+        return assemble_main(), destination, scripts
+
+    _, destination, scripts = run()
+    assert {p.name for p in (destination / "user/contents.d").iterdir()} == {
+        "mimir", "watchdog", "worklink-execd"}
+    _, destination, scripts = run(pins="example-provider==1.4")
+    assert not (destination / "sample-worker").exists(), "disabled pinned plugin must not install services"
+    with pytest.raises(ValueError, match="missing pinned distribution"):
+        run(enable="sample")
+    with pytest.raises(ValueError, match="selected provider packages differ"):
+        run(pins="example-provider==1.5", enable="sample")
+    _, destination, scripts = run(pins="example-provider==1.4", enable="sample")
+    assert (destination / "sample-worker/type").read_text() == "longrun\n"
+    assert (destination / "user/contents.d/sample-worker").exists()
+    for name in ("mimir", "watchdog", "worklink-execd"):
+        assert (destination / name / "run").read_text() == f"core-{name}\n"
+    assert (scripts / "sample/worker/run").stat().st_mode & 0o111
+    wrapper = (destination / "sample-worker/run").read_text()
+    assert "exec s6-setuidgid mimir /usr/local/libexec/mimir-plugin-services/sample/worker/run" in wrapper
+
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "s6-setuidgid").write_text('#!/bin/sh\nprintf "%s" "$1" > "$USER_LOG"\nshift\nexec "$@"\n')
+    (shim / "s6-setuidgid").chmod(0o755)
+    local_wrapper = tmp_path / "wrapper"
+    local_wrapper.write_text(wrapper.replace(
+        "/usr/local/libexec/mimir-plugin-services/sample/worker/run", str(scripts / "sample/worker/run")))
+    local_wrapper.chmod(0o755)
+    output = tmp_path / "output"
+    user_log = tmp_path / "user-log"
+    result = subprocess.run([str(local_wrapper)], env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}",
+        "MESSAGE": "hello", "OUTPUT": str(output), "USER_LOG": str(user_log)}, check=False)
+    assert result.returncode == 19
+    assert output.read_text() == "hello"
+    assert user_log.read_text() == "mimir"
+
+    other_destination = tmp_path / "all/s6-rc.d"
+    _, other_destination, _ = run(pins="example-provider==1.4", all_installed="1",
+                                  destination=other_destination, scripts=tmp_path / "all/scripts")
+    assert (other_destination / "user/contents.d/sample-worker").exists()

@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from .plugin_dockerfile import assemble_services, pinned_packages, render_stage, select_plugins, services
 from .worklink.backends.feature_factory import FACTORY_VERSION
 from .worklink.tool_pins import OPENCODE_VERSION
 
@@ -59,6 +60,7 @@ class ScaffoldResult:
     files_skipped: list[str] = field(default_factory=list)
     env_vars_added: list[str] = field(default_factory=list)
     skills_with_fragments: list[str] = field(default_factory=list)
+    plugins_with_services: list[str] = field(default_factory=list)
 
 
 # ── Collection helpers ──────────────────────────────────────────────
@@ -512,6 +514,7 @@ def render_dockerfile(
     mode: ScaffoldMode = _DEFAULT_MODE,
     mimir_extras: list[str] | None = None,
     install_opencode: bool = False,
+    plugins: tuple = (),
 ) -> str:
     """Stitch fragments into the base template via sentinel split, so
     a fragment that happens to contain the literal sentinel-string
@@ -550,6 +553,19 @@ def render_dockerfile(
     base = base.replace("__USERDEL_BLOCK__", _USERDEL_BLOCK)
     base = base.replace("__OPENCODE_INSTALL__", _opencode_install_block())
     base = base.replace("__OPENCODE_CONFIG__", _opencode_build_config_block(install_opencode))
+    if plugins:
+        base = base.replace("# ===== BEGIN mimir-scaffold-docker: skill fragments =====",
+                            render_stage(plugins, "base") + "\n\n# ===== BEGIN mimir-scaffold-docker: skill fragments =====")
+        base = base.replace("# Non-root user.", render_stage(plugins, "build") + "\n\n# Non-root user.")
+        pins = pinned_packages(plugins)
+        service_list = services(plugins)
+        if mode == "pypi" and pins:
+            install = "RUN pip install --no-cache-dir " + " ".join(f'"{pin}"' for pin in pins)
+            base = base.replace("# Pre-warm the fastembed", install + "\n\n# Pre-warm the fastembed")
+        if service_list:
+            base = base.replace('ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]',
+                                _S6_SCAFFOLD_BLOCK.replace("__PLUGIN_SERVICES__", render_stage(plugins, "services"))
+                                + '\nENTRYPOINT ["/init"]')
     if not fragments:
         body = "# (no skills installed yet ship a dockerfile.fragment)"
     else:
@@ -566,6 +582,27 @@ def render_dockerfile(
             "sentinel — template internal invariant violation."
         )
     return head + body + tail
+
+
+_S6_SCAFFOLD_BLOCK = '''\
+# Selected plugin services require an independent, root-owned supervisor.
+USER root
+ARG S6_OVERLAY_VERSION=3.2.0.2
+ARG TARGETARCH
+RUN set -eu; \\
+    case "${TARGETARCH:-amd64}" in \\
+        amd64) S6_ARCH=x86_64 ;; \\
+        arm64) S6_ARCH=aarch64 ;; \\
+        *) echo >&2 "unsupported s6 architecture: ${TARGETARCH}"; exit 2 ;; \\
+    esac; \\
+    base="https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}"; \\
+    curl -fsSL "${base}/s6-overlay-noarch.tar.xz" -o /tmp/s6-noarch.tar.xz; \\
+    curl -fsSL "${base}/s6-overlay-${S6_ARCH}.tar.xz" -o /tmp/s6-arch.tar.xz; \\
+    tar -C / -Jxpf /tmp/s6-noarch.tar.xz; \\
+    tar -C / -Jxpf /tmp/s6-arch.tar.xz; \\
+    rm -f /tmp/s6-noarch.tar.xz /tmp/s6-arch.tar.xz
+__PLUGIN_SERVICES__
+USER root'''
 
 
 _COMPOSE_YML_TEMPLATE = """\
@@ -892,6 +929,7 @@ def render_start_sh(
     *,
     uv_extras: list[str] | None = None,
     mode: ScaffoldMode = _DEFAULT_MODE,
+    plugin_pins: tuple[str, ...] = (),
 ) -> str:
     """Render start.sh.
 
@@ -916,12 +954,23 @@ def render_start_sh(
     ``test_render_start_sh_uv_sync_line_is_valid_shell_with_no_extras``.
     """
     if mode == "pypi":
-        return _START_SH_TEMPLATE_PYPI
+        return _START_SH_TEMPLATE_PYPI + ("\n# Selected services are supervised separately by s6: " + ", ".join(plugin_pins) + "\n" if plugin_pins else "")
     if mode != "workspace":
         raise ValueError(f"unknown scaffold mode {mode!r}; expected one of {_MODES}")
     extras = uv_extras or []
     flags = " ".join(f"--extra {e}" for e in extras)
-    return _START_SH_TEMPLATE.replace("{UV_EXTRAS}", flags)
+    boot = "# Selected plugin distributions: " + ", ".join(plugin_pins) + "\n"
+    if plugin_pins:
+        boot += "uv pip install --python .venv/bin/python " + " ".join(f'"{pin}"' for pin in plugin_pins) + "\n"
+        boot += "uv run --no-sync python -c 'import importlib.metadata as m; " + "; ".join(
+            f'assert m.version("{pin.split("==")[0]}") == "{pin.split("==")[1]}"' for pin in plugin_pins
+        ) + "'\n"
+        boot += "touch /run/mimir-plugin-services/ready\n"
+    script = _START_SH_TEMPLATE.replace("{UV_EXTRAS}", flags)
+    if plugin_pins:
+        script = script.replace("uv run ", "uv run --no-sync ")
+        script = script.replace("# ─── home seed (idempotent", boot + "\n# ─── home seed (idempotent")
+    return script
 
 
 # ── compose.env idempotent merge ───────────────────────────────────
@@ -1250,6 +1299,7 @@ def scaffold(
     mode: ScaffoldMode | None = None,
     mimir_extras: list[str] | None = None,
     install_opencode: bool | None = None,
+    all_installed: bool = False,
 ) -> ScaffoldResult:
     """Generate / refresh Docker scaffolding for an agent home.
 
@@ -1309,6 +1359,43 @@ def scaffold(
             service_name = sanitized
 
     result = ScaffoldResult()
+    plugins = select_plugins(all_installed=all_installed)
+    selected_services = services(plugins)
+    result.plugins_with_services = [f"{service.plugin}-{service.name}" for service in selected_services]
+    context = home / ".mimir-scaffold"
+    if context.exists():
+        import shutil
+        shutil.rmtree(context)
+    if selected_services:
+        assemble_services(plugins, context / "s6-rc.d", context / "plugin-services")
+        if mode == "workspace":
+            reset = context / "s6-rc.d" / "mimir-plugin-reset"
+            reset.mkdir()
+            (reset / "type").write_text("oneshot\n")
+            up = reset / "up"
+            up.write_text("#!/bin/sh\ninstall -d -o mimir -g mimir -m 0755 /run/mimir-plugin-services\nrm -f /run/mimir-plugin-services/ready\n")
+            up.chmod(0o755)
+            for service in selected_services:
+                definition = context / "s6-rc.d" / f"{service.plugin}-{service.name}"
+                deps = definition / "dependencies.d"
+                deps.mkdir()
+                (deps / "mimir-plugin-reset").touch()
+                wrapper = definition / "run"
+                wrapper.write_text("#!/bin/sh\nwhile [ ! -f /run/mimir-plugin-services/ready ]; do sleep 1; done\n" +
+                                   wrapper.read_text().split("\n", 1)[1])
+            # The Mimir process installs and verifies packages before releasing
+            # dependent plugin longruns; s6 resets the marker before either starts.
+        mimir_service = context / "s6-rc.d" / "mimir"
+        mimir_service.mkdir(parents=True)
+        (mimir_service / "type").write_text("longrun\n")
+        run = mimir_service / "run"
+        run.write_text("#!/bin/sh\nexec s6-setuidgid mimir /usr/local/bin/start.sh\n")
+        run.chmod(0o755)
+        if mode == "workspace":
+            deps = mimir_service / "dependencies.d"
+            deps.mkdir()
+            (deps / "mimir-plugin-reset").touch()
+        (context / "s6-rc.d" / "user" / "contents.d" / "mimir").touch()
     fragments = collect_fragments(home)
     required_keys = collect_required_env_vars(home)
     result.skills_with_fragments = [f.skill_name for f in fragments]
@@ -1327,6 +1414,7 @@ def scaffold(
     df_text = render_dockerfile(
         fragments, mode=mode, mimir_extras=mimir_extras,
         install_opencode=install_opencode,
+        plugins=plugins,
     )
     _write_if_changed(home / "Dockerfile", df_text, "Dockerfile")
 
@@ -1341,7 +1429,8 @@ def scaffold(
     # unchanged.
     ss_path = home / "start.sh"
     _write_if_changed(
-        ss_path, render_start_sh(uv_extras=uv_extras, mode=mode), "start.sh",
+        ss_path, render_start_sh(uv_extras=uv_extras, mode=mode,
+                                  plugin_pins=pinned_packages(plugins)), "start.sh",
     )
     if ss_path.is_file():
         ss_path.chmod(0o755)
@@ -1394,6 +1483,10 @@ def scaffold(
 
 def add_argparse(parser) -> None:
     """Wire ``mimir scaffold-docker``."""
+    parser.add_argument(
+        "--all-installed", action="store_true",
+        help="Include all installed plugin Docker contributions, even disabled providers.",
+    )
     parser.add_argument(
         "--home", type=Path, default=None,
         help="Target mimir home (default: $MIMIR_HOME or cwd).",
@@ -1493,6 +1586,7 @@ def cmd(args) -> int:
             mode=mode,
             mimir_extras=mimir_extras,
             install_opencode=getattr(args, "opencode", None),
+            all_installed=getattr(args, "all_installed", False),
         )
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc))
