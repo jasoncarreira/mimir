@@ -70,6 +70,8 @@ class PluginManager:
                 result = hook(event, auth_context)
                 if inspect.isawaitable(result):
                     result = await result
+                if result is False:
+                    raise ValueError("preflight returned False")
             except Exception as exc:
                 raise RuntimeError(f"plugin {name!r} turn preflight failed") from exc
 

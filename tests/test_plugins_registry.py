@@ -160,6 +160,7 @@ def test_profile_granted_sink_without_executable_adapter_cannot_freeze(category,
     plugin.register_tool(**tool_fields(
         flow="sink", result_origin=ResultOriginKind.NON_INGESTING,
         sink_category=category, sink_destination=destination,
+        sink_payload_extractor=lambda _name, args, _context: (args.get("payload", ""),),
         profiles=("worker",),
     ))
     plugin.register_capability("sample")
@@ -188,9 +189,9 @@ def test_duplicate_registrations_are_named():
     registry.register_authority_profile("research")
     with pytest.raises(PolicyRegistrationError, match="duplicate profile: research"):
         registry.registrar("other").register_authority_profile("research")
-    registry.register_shell_profile_mapping("research", "read_only")
+    registry.register_shell_profile_mapping("research", "scheduler_read_only")
     with pytest.raises(PolicyRegistrationError, match="duplicate shell profile mapping: research"):
-        registry.register_shell_profile_mapping("research", "other")
+        registry.register_shell_profile_mapping("research", "maintenance")
 
 
 def test_plugin_can_only_add_its_own_tool_to_existing_profile():
@@ -236,15 +237,19 @@ def test_unknown_membership_is_not_accepted():
 def test_principal_collisions_and_profile_validation():
     registry = PolicyRegistry()
     plugin = registry.registrar("example")
-    first = ServicePrincipal(trigger="periodic", canonical="worker", authority_profile="missing")
+    first = ServicePrincipal(
+        trigger="plugin:example:periodic", canonical="plugin:example:worker",
+        authority_profile="missing",
+    )
     plugin.register_service_principal(first)
-    with pytest.raises(PolicyRegistrationError, match="duplicate service principal: periodic"):
+    with pytest.raises(PolicyRegistrationError, match="duplicate service principal: plugin:example:periodic"):
         plugin.register_service_principal(first)
-    with pytest.raises(PolicyRegistrationError, match="duplicate service principal: another"):
+    with pytest.raises(PolicyRegistrationError, match="duplicate service principal: plugin:example:another"):
         plugin.register_service_principal(ServicePrincipal(
-            trigger="another", canonical="worker", authority_profile="missing",
+            trigger="plugin:example:another", canonical="plugin:example:worker",
+            authority_profile="missing",
         ))
-    with pytest.raises(PolicyRegistrationError, match="periodic: unknown authority profile missing"):
+    with pytest.raises(PolicyRegistrationError, match="plugin:example:periodic: unknown authority profile missing"):
         registry.freeze()
 
 

@@ -305,7 +305,9 @@ def test_budget_policy_views_are_frozen_core_memberships() -> None:
         ("remediation_effect", budget_gate._REMEDIATION_EFFECT_TOOLS),
         ("typed_error_signal", budget_gate._TYPED_ERROR_SIGNAL_TOOLS),
     ):
-        assert type(view) is frozenset
+        from mimir.plugins.core import PolicySetView
+        assert isinstance(view, PolicySetView)
+        assert not hasattr(view, "add")
         assert view == frozenset(
             name for name, tool in tools.items() if membership in tool.memberships
         ), membership

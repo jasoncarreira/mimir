@@ -131,9 +131,12 @@ def principal_policy():
     )
     registrar.register_capability("example_deliver")
     registrar.add_to_profile("heartbeat", "example_deliver")
+    registrar.register_authority_profile("example-worker")
+    registrar.add_to_profile("example-worker", "example_inspect")
+    registrar.add_to_profile("example-worker", "example_deliver")
     registrar.register_service_principal(ServicePrincipal(
-        canonical="example:worker", trigger="example_worker",
-        authority_profile="heartbeat", capability_tier=CapabilityTier.SCOPE_CONTAINED,
+        canonical="plugin:example:worker", trigger="plugin:example:worker",
+        authority_profile="example-worker",
         capabilities=("example_inspect", "example_deliver"), readable_domains=("repository",),
         sink_destinations=("filesystem",), creation_path="example.worker:run",
     ))
@@ -158,8 +161,8 @@ def test_selected_builtin_issues_only_profile_membership(principal_policy, tmp_p
 
 
 def test_static_plugin_principal_and_explicit_instance_grants(principal_policy, tmp_path):
-    assert get_service_principal("example_worker") is None
-    static = get_service_principal("example_worker", policy=principal_policy)
+    assert get_service_principal("plugin:example:worker") is None
+    static = get_service_principal("plugin:example:worker", policy=principal_policy)
     assert static is not None
     assert service_can_invoke_operation(static, "example_inspect", policy=principal_policy)
     assert not service_can_invoke_operation(static, "read_file", policy=principal_policy)
@@ -188,8 +191,8 @@ def test_static_plugin_event_reaches_agent_ifc_surface_and_tool_gate(principal_p
     from mimir.tools.service_tool_surface import ServiceToolSurfaceMiddleware
 
     event = AgentEvent(
-        trigger="example_worker", channel_id="scheduler:example",
-        service_principal="example:worker", content="run",
+        trigger="plugin:example:worker", channel_id="scheduler:example",
+        service_principal="plugin:example:worker", content="run",
     )
     labels = _initialize_ifc_labels(event, policy=principal_policy)
     auth = _create_turn_auth_context(
@@ -197,9 +200,9 @@ def test_static_plugin_event_reaches_agent_ifc_surface_and_tool_gate(principal_p
         policy=principal_policy,
     )
     assert auth.is_service and auth.service_authority is get_service_principal(
-        "example_worker", policy=principal_policy,
+        "plugin:example:worker", policy=principal_policy,
     )
-    assert any(source.principal == "service:example:worker" for source in labels.sources)
+    assert any(source.principal == "service:plugin:example:worker" for source in labels.sources)
     tool = principal_policy.tools["example_inspect"].factory()
     surface = ServiceToolSurfaceMiddleware(principal_policy)
 
@@ -234,7 +237,7 @@ def test_static_plugin_event_reaches_agent_ifc_surface_and_tool_gate(principal_p
     )
     assert not public.is_service and public.service_authority is None
     assert get_trusted_service_from_auth_context(public, policy=principal_policy) is None
-    assert not any(source.principal == "service:example:worker" for source in ingress_labels.sources)
+    assert not any(source.principal == "service:plugin:example:worker" for source in ingress_labels.sources)
 
 
 @pytest.mark.asyncio
