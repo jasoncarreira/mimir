@@ -104,9 +104,13 @@ def patch_provider(monkeypatch):
     """Inject a stub provider with a chosen dimension."""
     def _install(dim: int, provider_name: str = "openai"):
         import mimir.saga.embeddings as saga_emb
+        import mimir.saga.calibration as saga_cal
         import mimir.saga._config_io as saga_cfg
         stub = _StubProvider(dim)
         monkeypatch.setattr(saga_emb, "get_provider", lambda: stub)
+        # Calibration captures get_provider at import time. Patch its lookup
+        # too, so prior imports cannot route this test to a real provider.
+        monkeypatch.setattr(saga_cal, "get_provider", lambda: stub)
         # Also patch the config read for provider name
         snap = {"embedding": {"provider": provider_name}}
         monkeypatch.setattr(saga_cfg, "_config", snap)
