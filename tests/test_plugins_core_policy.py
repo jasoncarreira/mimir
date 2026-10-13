@@ -342,6 +342,26 @@ def test_typed_action_and_retained_views_are_exact_registry_projections() -> Non
     assert "repo_status" in policy._RETAINED_REPO_TOOLS
 
 
+@pytest.mark.parametrize("name", """
+    write_file edit_file Write Edit upload repo_checkout repo_cleanup repo_fetch
+    repo_test repo_stage repo_commit repo_merge repo_merge_abort repo_rebase
+    repo_rebase_abort repo_revert repo_revert_abort repo_push memory_store
+    saga_end_session commitment_complete commitment_snooze commitment_dismiss
+    open_proposal submit_proposal reload_pollers shell_exec bash_async
+    pr_comment pr_edit_body pr_submit_review pr_rerequest_review
+""".split())
+def test_core_mutating_tools_truthfully_declare_write_potential(name) -> None:
+    assert core_policy_registry().tools[name].writes_code_or_state is True
+
+
+@pytest.mark.parametrize("name", """
+    read_file ls grep glob repo_status repo_diff repo_unmerged pr_metadata pr_diff
+    memory_query memory_get commitment_list
+""".split())
+def test_core_observation_tools_do_not_claim_write_potential(name) -> None:
+    assert core_policy_registry().tools[name].writes_code_or_state is False
+
+
 def test_budget_policy_views_are_frozen_core_memberships() -> None:
     tools = core_policy_registry().tools
     for membership, view in (
