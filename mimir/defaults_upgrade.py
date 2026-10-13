@@ -288,6 +288,7 @@ def _ensure_vendor_branch(
     *,
     branch: str = DEFAULTS_VENDOR_BRANCH,
     version: str,
+    files: dict[Path, str] | None = None,
 ) -> VendorSyncResult:
     """Rewrite ``branch`` to the installed package's shipped defaults."""
     previous_ref = _branch_ref(home, branch)
@@ -298,7 +299,7 @@ def _ensure_vendor_branch(
         err = _wipe_worktree_to_defaults(wt)
         if err:
             return VendorSyncResult(False, previous_ref, previous_ref, err)
-        _write_defaults_tree(wt, _shipped_default_files())
+        _write_defaults_tree(wt, _shipped_default_files() if files is None else files)
         add = _git(["add", "-A"], cwd=wt)
         if add.returncode != 0:
             return VendorSyncResult(
@@ -395,13 +396,17 @@ def _apply_defaults_three_way(
     previous_ref: str,
     current_ref: str,
     label: str = DEFAULTS_VENDOR_BRANCH,
+    plugin: str | None = None,
 ) -> tuple[bool, bool, str | None]:
     """Apply shipped-default changes to ``worktree`` with explicit 3-way bases."""
     paths = _git_files(worktree, previous_ref) | _git_files(worktree, current_ref)
     changed = False
     conflicts = False
     for rel in sorted(paths, key=lambda p: p.as_posix()):
-        is_surface = rel.parts[:2] == ("memory", "core") or rel.parts[:1] == ("prompts",)
+        is_surface = (rel.parts[:2] == ("memory", "core") or rel.parts[:1] == ("prompts",)) if plugin is None else (
+            rel.parts[:2] == ("prompts", plugin)
+            or len(rel.parts) >= 2 and rel.parts[0] == "skills" and rel.parts[1].startswith(f"{plugin}-")
+        )
         if not is_surface:
             continue
         path = worktree / rel
@@ -429,7 +434,7 @@ def _apply_defaults_three_way(
             if ours_text is None:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(their_text, encoding="utf-8")
-                _git(["add", rel.as_posix()], cwd=worktree)
+                _git(["add", "-f", rel.as_posix()], cwd=worktree)
                 changed = True
             elif ours_text != their_text:
                 _write_conflict(path, ours_text, their_text, label=label)
@@ -460,6 +465,105 @@ def _apply_defaults_three_way(
 
     diff = _git(["diff", "--cached", "--quiet"], cwd=worktree)
     return diff.returncode != 0 or changed, conflicts, None
+
+
+def check_and_open_plugin_defaults_upgrade(
+    home: Path, *, selected=None, base: str = "main",
+) -> dict[str, DefaultsUpgradeResult]:
+    """Track package versions independently of core and propose plugin-only updates.
+
+    Proposals use the existing upgrade workflow's protected worktree. Separate
+    per-owner vendor refs and state prevent one provider's version from consuming
+    another's diff. A busy upgrade worktree is retried on the next invocation.
+    """
+    from .plugins.defaults import plugin_default_files
+    from .plugins.discovery import enabled_plugins
+
+    if selected is None:
+        selected = enabled_plugins()
+    home = Path(home).resolve()
+    results: dict[str, DefaultsUpgradeResult] = {}
+    for candidate in selected:
+        name = candidate.name
+        manifest = candidate.manifest
+        if manifest is None or not manifest.defaults:
+            continue
+        version = str(manifest.defaults["version"])
+        state = home / ".mimir" / "upgrade-plugin-defaults" / name
+        previous_version = state.read_text(encoding="utf-8").strip() if state.is_file() else None
+        if previous_version == version:
+            results[name] = DefaultsUpgradeResult(True, "already_synced", version)
+            continue
+        if not (home / ".git").exists() or not _has_origin_remote(home):
+            results[name] = DefaultsUpgradeResult(True, "skip_no_remote", version)
+            continue
+        if list_open_proposals(home, lane=UPGRADE_PROPOSAL_LANE):
+            results[name] = DefaultsUpgradeResult(True, "proposal_exists", version)
+            continue
+        branch = f"mimir-plugin-defaults-{name}"
+        pending = f"refs/mimir/plugin-defaults/{name}/previous"
+        files = plugin_default_files(candidate)
+        vendor = _ensure_vendor_branch(home, branch=branch, version=version, files=files)
+        if vendor.error:
+            results[name] = DefaultsUpgradeResult(False, "error", version, vendor.error)
+            continue
+        old = _branch_ref(home, pending) or vendor.previous_ref
+        if old is None:
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(version + "\n", encoding="utf-8")
+            results[name] = DefaultsUpgradeResult(True, "baseline_initialized", version)
+            continue
+        if not vendor.changed and _branch_ref(home, pending) is None:
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text(version + "\n", encoding="utf-8")
+            results[name] = DefaultsUpgradeResult(True, "no_changes", version)
+            continue
+        if vendor.changed and _branch_ref(home, pending) is None:
+            error = _set_ref(home, pending, old)
+            if error:
+                results[name] = DefaultsUpgradeResult(False, "error", version, error)
+                continue
+        opened = open_proposal(
+            home, base=base,
+            branch=default_branch_name(f"plugin-defaults-{name}-{version}", lane=UPGRADE_PROPOSAL_LANE),
+            lane=UPGRADE_PROPOSAL_LANE,
+        )
+        if not opened.ok or opened.worktree is None or vendor.current_ref is None:
+            results[name] = DefaultsUpgradeResult(False, "error", version, opened.detail or opened.reason, opened)
+            continue
+        changed, conflicts, error = _apply_defaults_three_way(
+            opened.worktree, previous_ref=old, current_ref=vendor.current_ref,
+            label=branch, plugin=name,
+        )
+        if error:
+            abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE)
+            results[name] = DefaultsUpgradeResult(False, "error", version, error)
+            continue
+        # Scheduler entries are append-only: already present names, including
+        # operator-modified jobs, are never rewritten in a proposal.
+        sched_rel = Path("plugins") / name / "scheduler.yaml"
+        sched_text = _git_file(home, vendor.current_ref, sched_rel)
+        old_text = _git_file(home, old, sched_rel)
+        if sched_text and (opened.worktree / "scheduler.yaml").is_file():
+            scheduler = opened.worktree / "scheduler.yaml"
+            merged, added = _merge_scheduler_defaults(
+                base_text=old_text, their_text=sched_text,
+                home_text=scheduler.read_text(encoding="utf-8"), version=version,
+            )
+            if merged is not None and added:
+                scheduler.write_text(merged, encoding="utf-8")
+                _git(["add", "scheduler.yaml"], cwd=opened.worktree)
+                changed = True
+        if not changed:
+            abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE)
+            action = "vendor_updated_no_home_diff"
+        else:
+            action = "proposal_opened_conflicts" if conflicts else "proposal_opened"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(version + "\n", encoding="utf-8")
+        _delete_ref(home, pending)
+        results[name] = DefaultsUpgradeResult(True, action, version, proposal=opened if changed else None, conflicts=conflicts)
+    return results
 
 
 def _merge_scheduler_defaults(
