@@ -39,13 +39,14 @@ function Probe() {
   );
 }
 
-function renderProvider(children: ReactNode) {
+function renderProvider(children: ReactNode, skinId?: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const result = render(
     <QueryClientProvider client={qc}>
-      <SkinProvider>{children}</SkinProvider>
+      <SkinProvider skinId={skinId}>{children}</SkinProvider>
     </QueryClientProvider>,
   );
+  return { ...result, queryClient: qc };
 }
 
 const bootstrap = {
@@ -102,6 +103,23 @@ afterEach(() => {
 });
 
 describe("SkinProvider per-user skin preferences (#562)", () => {
+  it("keeps an explicit plugin skin above the preview, persisted choice and projected default", async () => {
+    window.history.replaceState({}, "", "/app/chat?skin=cosmic-nebula");
+    useUiState.setState({ apiKeyPresent: true });
+    serveBootstrap({ ...bootstrap, ui: { ...bootstrap.ui, default_skin: "neon-terminal" },
+      skins: { built_in_ids: [], operator: [], plugins: [pluginSkin] } });
+    serveUserSkin("default-retro");
+
+    const { queryClient } = renderProvider(<Probe />, "plugin-mint");
+
+    await waitFor(() => {
+      expect(queryClient.getQueryData(["whoami"])).toHaveProperty("prefs.skin", "default-retro");
+      expect(screen.getByTestId("skin-count").textContent).toBe("4");
+    });
+    expect(screen.getByTestId("skin-id").textContent).toBe("plugin-mint");
+    expect(screen.getByTestId("skin-color").textContent).toBe("#eefbf3");
+  });
+
   it("uses the server-projected plugin default instead of the agent skin setting", async () => {
     serveBootstrap({ ...bootstrap, ui: { ...bootstrap.ui, skin: "cosmic-nebula", default_skin: "plugin-mint" },
       skins: { built_in_ids: [], operator: [], plugins: [pluginSkin] } });
