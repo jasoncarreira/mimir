@@ -230,6 +230,220 @@ async def test_plugin_prompt_dynamic_each_turn_static_stable_and_failure_isolate
     assert events.count("plugin_prompt_failed") == 2
 
 
+@pytest.mark.asyncio
+async def test_plugin_prompt_logger_failure_does_not_break_rendering(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    registry = PolicyRegistry()
+    registrar = registry.registrar("example")
+    registrar.register_prompt_provider("large", "feedback", 16, lambda a, e: True,
+                                       lambda a, e, reader: "é" * 30)
+    registrar.register_prompt_provider("refused", "feedback", 80, lambda a, e: True,
+                                       lambda a, e, reader: reader(tmp_path / "absent.md"))
+    registrar.register_prompt_provider("broken", "feedback", 80, lambda a, e: True,
+                                       lambda a, e, reader: 1 / 0)
+    registry.freeze()
+    seen = []
+
+    def unavailable(kind, **fields):
+        seen.append((kind, fields))
+        raise RuntimeError("logger unavailable")
+
+    monkeypatch.setattr(agent_module, "log_event_sync", unavailable)
+    with policy_scope(registry):
+        prompt, _ = await agent._build_turn_prompt(_make_ctx(event), event, None)
+    assert "## Plugin: large" in prompt
+    assert "## Plugin: refused" not in prompt and "## Plugin: broken" not in prompt
+    assert [kind for kind, _ in seen] == [
+        "plugin_prompt_failed", "plugin_prompt_over_cap", "plugin_prompt_read_refused",
+    ]
+    assert all(set(fields) == {"provider"} for _, fields in seen)
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_real_reader_omits_refused_text(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    denied = tmp_path / "attachments" / "inbound" / "payload.md"
+    denied.parent.mkdir(parents=True)
+    denied.write_text("PRIVATE-REFUSED-CONTENT", encoding="utf-8")
+    trusted = tmp_path / "skills" / "example" / "SKILL.md"
+    trusted.parent.mkdir(parents=True)
+    trusted.write_text("TRUSTED-CONTENT", encoding="utf-8")
+    registry = PolicyRegistry()
+
+    def render(auth, inbound, reader):
+        allowed = reader(trusted)
+        try:
+            reader(denied)
+        except ValueError:
+            pass
+        return allowed + " PRIVATE-REFUSED-CONTENT"
+
+    registry.registrar("example").register_prompt_provider(
+        "reader", "feedback", 100, lambda a, e: True, render,
+    )
+    registry.freeze()
+    events = []
+    monkeypatch.setattr(agent_module, "log_event_sync", lambda kind, **fields: events.append((kind, fields)))
+    ctx = _make_ctx(event)
+    with policy_scope(registry):
+        prompt, _ = await agent._build_turn_prompt(ctx, event, None)
+    assert "TRUSTED-CONTENT" not in prompt
+    assert "PRIVATE-REFUSED-CONTENT" not in prompt
+    assert all(source.domain != "reader" for source in ctx.ifc_labels.sources)
+    assert events == [("plugin_prompt_read_refused", {"provider": "reader"})]
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_and_resend_nudge_receive_live_turn_plugin_state(tmp_path, monkeypatch) -> None:
+    from dataclasses import dataclass
+    from langchain_core.messages import AIMessage
+    import mimir.agent as agent_module
+
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    registry = PolicyRegistry()
+    registrar = registry.registrar("example")
+    registrar.register_state_slot(State)
+    registry.freeze()
+    agent = _make_agent(tmp_path)
+    agent._config = replace(
+        agent._config,
+        plugin_manager=SimpleNamespace(policy=registry, plugins=()),
+        resend_nudge_channels=("web:",),
+    )
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    parent = {}
+    original_prompt = agent._build_turn_prompt
+
+    async def update_before_graph(ctx, inbound, *args, **kwargs):
+        parent["turn"] = ctx
+        parent["ingress"] = ctx.auth_context
+        ctx.set_plugin_state(registrar, State("updated"))
+        return await original_prompt(ctx, inbound, *args, **kwargs)
+
+    monkeypatch.setattr(agent, "_build_turn_prompt", update_before_graph)
+
+    class Graph:
+        def __init__(self):
+            self.contexts = []
+
+        async def astream(self, state, *, config, context, stream_mode):
+            self.contexts.append(context)
+            yield {"messages": state["messages"] + [AIMessage(content="model reply")]}
+
+    graph = Graph()
+
+    async def build_graph():
+        return graph
+
+    monkeypatch.setattr(agent, "_build_agent_if_needed", build_graph)
+
+    async def ignore_event(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(agent_module, "log_event", ignore_event)
+    monkeypatch.setattr(agent_module, "safe_log_event", ignore_event)
+    # This test controls the nudge separately, after the regular graph handoff.
+    agent._config = replace(agent._config, resend_nudge_channels=())
+    with policy_scope(registry):
+        record = await agent.run_turn(event)
+    assert record.error is None
+    assert len(graph.contexts) == 1
+    assert graph.contexts[0].plugin_state("example") == State("updated")
+    assert parent["ingress"].plugin_state("example") is None
+    assert parent["turn"].plugin_state("example") == State("updated")
+
+    other = _make_ctx(event)
+    assert other.plugin_state("example") is None
+    agent._config = replace(agent._config, resend_nudge_channels=("web:",))
+    monkeypatch.setattr(agent, "_harness_sink_allowed", lambda *args: True)
+
+    turn = parent["turn"]
+    turn.set_plugin_state(registrar, State("nudge"))
+    turn.delivered_channel_ids.clear()
+    await agent._maybe_resend_nudge(
+        graph, {}, turn, event, turn_id=turn.turn_id,
+        turn_is_interactive=True, messages=[], events=[], output="model reply",
+    )
+    assert len(graph.contexts) == 2
+    assert graph.contexts[1].plugin_state("example") == State("nudge")
+    assert graph.contexts[0].plugin_state("example") == State("updated")
+    assert graph.contexts[1] is not graph.contexts[0]
+    assert parent["ingress"].plugin_state("example") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("section,label", [
+    ("channel_memory", "Channel context"),
+    ("feedback", "Recent feedback signals"),
+    ("core_proposals", "Open change proposals"),
+    ("session_summaries", "Recent session summaries"),
+    ("usage", "Resource usage"),
+    ("upcoming", "Upcoming"),
+    ("commitments", "Upcoming commitments"),
+    ("self_state", "Self-state"),
+])
+async def test_plugin_prompt_inserts_after_each_fixed_section(
+    tmp_path, monkeypatch, section, label, present,
+) -> None:
+    from mimir import core_blocks, proposals
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    ctx = _make_ctx(event)
+    ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
+    fixed = "FIXED-CONTENT" if present else None
+    monkeypatch.setattr(core_blocks, "load_channel_memory", lambda *args: fixed if section == "channel_memory" else None)
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *args: _block(fixed) if fixed and section == "feedback" else None)
+    agent._config = replace(agent._config, feedback_limit_per_polarity=1)
+    monkeypatch.setattr(proposals, "render_open_proposals_block", lambda *args: fixed if section == "core_proposals" else None)
+
+    async def summaries(**kwargs):
+        return _block(fixed) if fixed and section == "session_summaries" else None
+
+    monkeypatch.setattr(agent, "_assemble_session_summaries", summaries)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda *args: (_block(fixed) if fixed and section == "usage" else None, []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda *args: _block(fixed) if fixed and section == "upcoming" else None)
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda **kwargs: _block(fixed) if fixed and section == "commitments" else None)
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda *args, **kwargs: _block(fixed) if fixed and section == "self_state" else None)
+    registry = PolicyRegistry()
+    calls = []
+
+    def render(name):
+        def callback(auth, inbound, reader):
+            calls.append(name)
+            return f"BODY-{name}"
+        return callback
+
+    registrar = registry.registrar("example")
+    for name in ("zeta", "alpha"):
+        registrar.register_prompt_provider(name, section, 80, lambda a, e: True, render(name))
+    registry.freeze()
+    with policy_scope(registry):
+        prompt, _ = await agent._build_turn_prompt(ctx, event, None)
+    assert calls == ["alpha", "zeta"]
+    plugin_start = prompt.index("## Plugin: alpha\n\nBODY-alpha")
+    assert plugin_start < prompt.index("## Plugin: zeta\n\nBODY-zeta")
+    assert ("## " + label + "\n\nFIXED-CONTENT" in prompt) is present
+    if present:
+        assert prompt.index("## " + label + "\n\nFIXED-CONTENT") < plugin_start
+    sources = [source for source in ctx.ifc_labels.sources if source.domain in {"alpha", "zeta"}]
+    assert [(source.domain, source.resource_id, source.integrity, source.integrity_effect)
+            for source in sources] == [
+        (name, f"plugin:example:{name}", Integrity.TRUSTED, "informational")
+        for name in ("alpha", "zeta")
+    ]
+
+
 def _domain_block(content: str, domain: str) -> PromptBlock:
     return PromptBlock(
         content,

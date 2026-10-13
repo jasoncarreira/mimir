@@ -221,6 +221,14 @@ def _cap_plugin_prompt(content: str, limit: int) -> tuple[str, bool]:
     return data[:remaining].decode("utf-8", errors="ignore") + suffix, True
 
 
+def _report_plugin_prompt(kind: str, name: str) -> None:
+    """Prompt telemetry is best effort and never includes provider content."""
+    try:
+        log_event_sync(kind, provider=name)
+    except Exception:  # noqa: BLE001 — logger availability cannot fail prompt assembly
+        log.debug("plugin prompt telemetry unavailable", exc_info=True)
+
+
 def maybe_create_worklink_budget_continuation(**kwargs):
     """Defer Worklink recovery until a turn actually exhausts its budget."""
     from .worklink.continuation import maybe_create_worklink_budget_continuation as create
@@ -4884,7 +4892,7 @@ class Agent:
                     continue
                 content, over_cap = _cap_plugin_prompt(content, provider.max_bytes)
                 if over_cap:
-                    log_event_sync("plugin_prompt_over_cap", provider=provider.name)
+                    _report_plugin_prompt("plugin_prompt_over_cap", provider.name)
                 labels = InformationFlowLabels()
                 for resource in resources or (f"plugin:{provider.owner}:{provider.name}",):
                     labels = _merge_ifc_labels(labels, _prompt_source_labels(
@@ -4895,7 +4903,7 @@ class Agent:
             except Exception as exc:  # noqa: BLE001 — one plugin cannot fail a turn
                 from .core_blocks import PromptReadRefused
                 kind = "plugin_prompt_read_refused" if isinstance(exc, PromptReadRefused) else "plugin_prompt_failed"
-                log_event_sync(kind, provider=provider.name)
+                _report_plugin_prompt(kind, provider.name)
         plugin_blocks: dict[str, tuple[tuple[str, str], ...]] = {}
 
         def use_plugins(section: str) -> None:
