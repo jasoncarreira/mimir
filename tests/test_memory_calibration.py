@@ -47,7 +47,7 @@ def _install_stub_provider(monkeypatch: pytest.MonkeyPatch, dim: int = 4,
                             provider_name: str = "openai") -> _StubProvider:
     stub = _StubProvider(dim)
     monkeypatch.setattr(
-        "mimir.saga.embeddings.get_provider", lambda: stub,
+        "mimir.saga.calibration.get_provider", lambda: stub,
     )
 
     def _fake_get_config():
@@ -59,7 +59,7 @@ def _install_stub_provider(monkeypatch: pytest.MonkeyPatch, dim: int = 4,
             }.get((section, key), default)
         return cfg
     monkeypatch.setattr(
-        "mimir.saga._config_io.get_config", _fake_get_config,
+        "mimir.saga.calibration.get_config", _fake_get_config,
     )
     return stub
 
@@ -126,6 +126,7 @@ def test_re_embed_apply_writes_embeddings_row(tmp_path: Path,
     assert result["atoms_updated"] == 2
     assert result["dry_run"] is False
     assert result["index_rebuild_needed"] is True
+    assert stub.batch_calls == [(["alpha content", "beta content"], "passage")]
 
     # Each atom should now have an embeddings row at dim=4 / provider=openai.
     conn = sqlite3.connect(str(db))
