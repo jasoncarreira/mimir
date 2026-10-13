@@ -72,6 +72,73 @@ def test_closed_core_parser_dispatch_inventory(monkeypatch: pytest.MonkeyPatch) 
     main(["plugins", "list"])
 
 
+CORE_DISPATCH_CASES = (
+    ("setup", ("setup", "--home", "{home}"), "mimir.cli.setup_home"),
+    ("run", ("run", "--home", "{home}"), "mimir.server.main"),
+    ("identities", ("identities", "list", "--home", "{home}"), "mimir.commands.identities.dispatch"),
+    ("reflection", ("reflection", "list-pending"), "mimir.commands.reflection.dispatch"),
+    ("memory", ("memory", "status", "--home", "{home}"), "mimir.commands.memory.dispatch"),
+    ("worklink", ("worklink", "status", "--home", "{home}"), "mimir.commands.worklink.dispatch"),
+    ("regenerate-api-key", ("regenerate-api-key", "--home", "{home}"), "mimir.cli.regenerate_api_key"),
+    ("stats", ("stats", "--home", "{home}", "--egress-shadow"), "mimir.cli._print_egress_shadow_report"),
+    ("verify-cred", ("verify-cred", "GITHUB_TOKEN"), "mimir.cred_verify.run_verify_cred_cmd"),
+    ("verify-creds", ("verify-creds", "--type", "A"), "mimir.cred_verify.run_verify_creds_cmd"),
+    ("viability-report", ("viability-report", "--home", "{home}", "--no-write"), "mimir.viability_metrics.run_viability_report_cmd"),
+    ("verify-index", ("verify-index", "--home", "{home}", "--db", "saga"), "mimir.index_integrity.run_verify_index_cmd"),
+    ("rotate", ("rotate", "--env", "GITHUB_TOKEN", "--from-file", "{home}/token.txt", "--no-recreate"), "mimir.cred_rotate.run_rotate"),
+    ("loops", ("loops", "--home", "{home}"), "mimir.loops_cmd.run_loops_cmd"),
+    ("update", ("update", "--check"), "mimir.commands.update.dispatch"),
+    ("predictions", ("predictions",), "mimir.skills.predictions.scripts.predictions_cli.run"),
+    ("wiki", ("wiki", "backlinks"), "mimir.wiki_backlinks.cmd_backlinks"),
+    ("skills", ("skills", "list"), "mimir.commands.skills.dispatch"),
+    ("scaffold-docker", ("scaffold-docker", "--home", "{home}"), "mimir.scaffold_docker.cmd"),
+    ("opencode-bootstrap", ("opencode-bootstrap", "--home", "{home}"), "mimir.scaffold_docker.ensure_opencode_config"),
+    ("commitments", ("commitments", "list", "--home", "{home}"), "mimir.commitments.cli.dispatch"),
+    ("feedback", ("feedback", "emit", "test-event"), "mimir.commands.feedback.dispatch"),
+    ("reindex", ("reindex",), "mimir.reindex.dispatch"),
+    ("migrate-memory", ("migrate-memory", "--source", "{home}/source.db", "--dest", "{home}/dest.db"), "mimir.saga.migrate.migrate"),
+    ("saga-reembed", ("saga-reembed", "--home", "{home}", "--dry-run"), "mimir.runtime.resolve_saga_config"),
+    ("saga-acl-inventory", ("saga-acl-inventory", "--db", "{home}/saga.db"), "mimir.saga.acl_inventory.inventory_path"),
+    ("saga-enforcement-replay", ("saga-enforcement-replay", "--db", "{home}/saga.db", "--trace", "{home}/trace.jsonl", "--cutover", "2026-01-01T00:00:00Z"), "mimir.saga.enforcement_replay.analyze_paths"),
+    ("saga-migrate-legacy-acl", ("saga-migrate-legacy-acl", "--source", "{home}/saga.db", "--cutover", "2026-01-01T00:00:00Z"), "mimir.saga.legacy_acl_migration.migrate_copy"),
+    ("watchdog", ("watchdog", "--once", "--home", "{home}"), "mimir.liveness.run_watchdog"),
+    ("notify-restart", ("notify-restart", "--unit", "mimir.service"), "mimir.liveness.notify_service_event"),
+)
+
+
+@pytest.mark.parametrize("name,argv,target", CORE_DISPATCH_CASES,
+                         ids=[row[0] for row in CORE_DISPATCH_CASES])
+def test_core_command_reaches_handler(
+    name: str, argv: tuple[str, ...], target: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parse a valid command and prove real registry dispatch reaches its effect."""
+    assert {row[0] for row in CORE_DISPATCH_CASES} | {"plugins"} == CORE_COMMANDS
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("")
+    (tmp_path / "token.txt").write_text("replacement\n")
+
+    class HandlerReached(Exception):
+        pass
+
+    with patch(target, side_effect=HandlerReached) as handler:
+        with pytest.raises(HandlerReached):
+            main([part.replace("{home}", str(tmp_path)) for part in argv])
+    handler.assert_called_once()
+
+
+def test_plugins_list_reaches_metadata_handler(monkeypatch: pytest.MonkeyPatch,
+                                                capsys: pytest.CaptureFixture) -> None:
+    from mimir.commands import plugins
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+    with patch.object(plugins, "discover_plugins", return_value=()) as discover:
+        main(["plugins", "list"])
+    discover.assert_called_once_with(enable="")
+    assert capsys.readouterr().out == "No plugins installed.\n"
+
+
 @pytest.fixture(autouse=True)
 def _clear_ambient_model_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep setup-route tests independent from deployment MIMIR_MODEL_SPEC."""
