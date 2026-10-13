@@ -396,25 +396,51 @@ async def test_plugin_prompt_inserts_after_each_fixed_section(
     tmp_path, monkeypatch, section, label, present,
 ) -> None:
     from mimir import core_blocks, proposals
+    from mimir.history import Message
 
     agent = _make_agent(tmp_path)
     event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
     ctx = _make_ctx(event)
     ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
-    fixed = "FIXED-CONTENT" if present else None
-    monkeypatch.setattr(core_blocks, "load_channel_memory", lambda *args: fixed if section == "channel_memory" else None)
-    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *args: _block(fixed) if fixed and section == "feedback" else None)
+    sections = (
+        ("channel_memory", "Channel context"),
+        ("feedback", "Recent feedback signals"),
+        ("core_proposals", "Open change proposals"),
+        ("session_summaries", "Recent session summaries"),
+        ("usage", "Resource usage"),
+        ("upcoming", "Upcoming"),
+        ("commitments", "Upcoming commitments"),
+        ("self_state", "Self-state"),
+    )
+    fixed = {name: f"FIXED-CONTENT:{name}" for name, _ in sections}
+    if not present:
+        fixed[section] = None
+
+    def fixed_block(name):
+        return _domain_block(fixed[name], name) if fixed[name] else None
+
+    ctx.turn_scratch_path = tmp_path / "scratch" / "turns" / ctx.turn_id
+    monkeypatch.setattr(core_blocks, "load_channel_memory", lambda *args: fixed["channel_memory"])
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *args: fixed_block("feedback"))
     agent._config = replace(agent._config, feedback_limit_per_polarity=1)
-    monkeypatch.setattr(proposals, "render_open_proposals_block", lambda *args: fixed if section == "core_proposals" else None)
+    monkeypatch.setattr(proposals, "render_open_proposals_block", lambda *args: fixed["core_proposals"])
 
     async def summaries(**kwargs):
-        return _block(fixed) if fixed and section == "session_summaries" else None
+        return fixed_block("session_summaries")
 
     monkeypatch.setattr(agent, "_assemble_session_summaries", summaries)
-    monkeypatch.setattr(agent, "_assemble_usage_block", lambda *args: (_block(fixed) if fixed and section == "usage" else None, []))
-    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda *args: _block(fixed) if fixed and section == "upcoming" else None)
-    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda **kwargs: _block(fixed) if fixed and section == "commitments" else None)
-    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda *args, **kwargs: _block(fixed) if fixed and section == "self_state" else None)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda *args: (fixed_block("usage"), []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda *args: fixed_block("upcoming"))
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda **kwargs: fixed_block("commitments"))
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda *args, **kwargs: fixed_block("self_state"))
+    recent = Message(
+        ts="2026-09-25T12:00:00+00:00", msg_id="prior", channel_id="web:one",
+        author="operator", author_display="Operator", kind="user",
+        content="NEXT-RECENT-CONTENT", source="web",
+    )
+    monkeypatch.setattr(agent, "_select_recent_activity", lambda *args: (
+        [recent], (_domain_block("NEXT-RECENT-CONTENT", "recent_activity"),),
+    ))
     registry = PolicyRegistry()
     calls = []
 
@@ -433,13 +459,37 @@ async def test_plugin_prompt_inserts_after_each_fixed_section(
     assert calls == ["alpha", "zeta"]
     plugin_start = prompt.index("## Plugin: alpha\n\nBODY-alpha")
     assert plugin_start < prompt.index("## Plugin: zeta\n\nBODY-zeta")
-    assert ("## " + label + "\n\nFIXED-CONTENT" in prompt) is present
+    target = f"## {label}\n\nFIXED-CONTENT:{section}"
+    assert (target in prompt) is present
     if present:
-        assert prompt.index("## " + label + "\n\nFIXED-CONTENT") < plugin_start
-    sources = [source for source in ctx.ifc_labels.sources if source.domain in {"alpha", "zeta"}]
-    assert [(source.domain, source.resource_id, source.integrity, source.integrity_effect)
-            for source in sources] == [
-        (name, f"plugin:example:{name}", Integrity.TRUSTED, "informational")
+        assert prompt.index(target) < plugin_start
+    position = [name for name, _ in sections].index(section)
+    previous = (
+        f"## {sections[position - 1][1]}\n\nFIXED-CONTENT:{sections[position - 1][0]}"
+        if position else "## Current turn scratch"
+    )
+    following = (
+        f"## {sections[position + 1][1]}\n\nFIXED-CONTENT:{sections[position + 1][0]}"
+        if position < len(sections) - 1 else "## Recent activity\n\n"
+    )
+    assert prompt.index(previous) < plugin_start < prompt.index(following)
+
+    # use() must retain the same ordered provenance as the rendered fixed blocks.
+    # Recent activity is loaded ahead of the fixed sections, so it is not part of
+    # the eight-section use() order even though it renders after self-state.
+    fixed_domains = {name for name, _ in sections} | {"proposals"}
+    sources = [source for source in ctx.ifc_labels.sources
+               if source.domain in fixed_domains | {"alpha", "zeta"}]
+    expected_domains = []
+    for name, _ in sections:
+        if fixed[name]:
+            expected_domains.append("proposals" if name == "core_proposals" else name)
+        if name == section:
+            expected_domains.extend(("alpha", "zeta"))
+    assert [source.domain for source in sources] == expected_domains
+    assert [(source.resource_id, source.integrity, source.integrity_effect)
+            for source in sources if source.domain in {"alpha", "zeta"}] == [
+        (f"plugin:example:{name}", Integrity.TRUSTED, "informational")
         for name in ("alpha", "zeta")
     ]
 
