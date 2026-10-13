@@ -89,6 +89,45 @@ from mimir.worklink.continuation import (
 ALL_LABELS = frozenset({"private", "confidential", "internal", "public"})
 
 
+def test_tainted_write_refusal_and_event_bound_source_identifiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import event_logger
+    from mimir.tools.budget_gate import _authorize_tool_call
+
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **fields: events.append((name, fields)))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    labels = InformationFlowLabels()
+    for index in range(7):
+        labels = labels.with_source(SourceLabel(
+            principal=None, domain="filesystem" if index % 2 else "web",
+            resource_id=f"/source/{index}", bridge_instance=None,
+            sensitivity="internal", authorized_principals=frozenset(),
+            integrity="untrusted", integrity_effect="active_ingest",
+        ))
+    auth = replace(
+        _auth(roles=("admin",)), ifc_labels=InformationFlowLabels(),
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    target = tmp_path / "code.py"
+    decision, refusal = _authorize_tool_call(
+        "edit_file", auth, arguments={"file_path": str(target)},
+    )
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    event = next(fields for name, fields in events if name == decision.reason)
+    assert event["sources"] == [
+        {"domain": "filesystem" if index % 2 else "web", "resource_id": f"/source/{index}"}
+        for index in range(5)
+    ]
+    assert event["remaining_sources"] == 2
+    for source in event["sources"]:
+        assert f"{source['domain']}: {source['resource_id']}" in refusal
+    assert "+2 more" in refusal
+    assert "/source/5" not in refusal and "/source/6" not in refusal
+    assert "secret content" not in refusal and "secret content" not in str(event)
+
+
 @pytest.mark.parametrize("tool", [
     "add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides",
 ])

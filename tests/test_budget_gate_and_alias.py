@@ -3293,7 +3293,8 @@ def test_file_taint_refusal_names_way_forward(
     else:
         from mimir.access_control import _TAINTED_WRITE_REFUSAL
         assert decision.reason == "write_blocked_by_untrusted_ingest"
-        assert message == _TAINTED_WRITE_REFUSAL
+        assert message.startswith(_TAINTED_WRITE_REFUSAL)
+        assert "channel: ch-1" in message
         assert "scratch/" in message and "proposal PR" in message
         assert decision.enforcement_enabled and not decision.is_shadow_decision
     assert not (tmp_path / path).exists()
