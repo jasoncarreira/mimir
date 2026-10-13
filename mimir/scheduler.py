@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
     from .commitments.store import CommitmentsStore
+    from .plugins.registry import PolicyRegistry
 
 import yaml
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED, JobExecutionEvent
@@ -936,6 +937,7 @@ class Scheduler:
         home: Path | None = None,
         scheduler_tz: str = "UTC",
         operator_notice: Callable[[str], Awaitable[None]] | None = None,
+        policy: PolicyRegistry | None = None,
     ) -> None:
         # APScheduler interprets cron expressions in the scheduler's
         # timezone. Default UTC keeps back-compat for mimirbot + bench
@@ -964,6 +966,7 @@ class Scheduler:
         # ``<home>/prompts/<file>`` at fire time. Optional for tests
         # and bench harnesses that construct Scheduler without a home.
         self._home = home
+        self._policy = policy
         self._operator_notice = operator_notice
         # Named-callable registry. Populated by ``register_callable``
         # at startup (server.py wires each non-LLM cron). The yaml
@@ -1354,6 +1357,7 @@ class Scheduler:
                     job.authority_profile,
                     self._home,
                     scheduler_job_name=job.name,
+                    policy=self._policy,
                 )
             except ValueError as exc:
                 log.error("scheduler %r: %s; job not fired", job.name, exc)
@@ -2162,6 +2166,7 @@ class Scheduler:
                     self._home / "pollers-overrides.yaml"
                     if self._home is not None else None
                 ),
+                policy=self._policy,
             )
         )
         return discovered, invalid_manifests, invalid_entries

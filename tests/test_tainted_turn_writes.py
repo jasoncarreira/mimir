@@ -62,6 +62,14 @@ def test_only_scratch_file_writes(path, tmp_path):
     assert not ac.tainted_file_write_target("scratch/turns/a.md", tmp_path)
 
 
+def test_registered_file_aliases_keep_target_aware_veto(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    for tool in ac._TAINTED_FILE_WRITE_TOOLS:
+        assert ac.tainted_write_target(tool, "state/live.md")
+        assert not ac.tainted_write_target(tool, "scratch/draft.md")
+    assert ac.tainted_write_target("repo_stage", "scratch/draft.md")
+
+
 @pytest.mark.parametrize("sibling", ["scratchy", "scratch-old"])
 def test_scratch_lexical_siblings_are_live_write_targets(tmp_path, sibling):
     assert ac.tainted_file_write_target(str(tmp_path / sibling / "x.md"), tmp_path)

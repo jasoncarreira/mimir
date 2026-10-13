@@ -1741,7 +1741,10 @@ def test_middleware_privacy_errors_return_value_free_refusal(
         monkeypatch.setattr(
             budget_gate,
             "get_tool_descriptor",
-            lambda name: failing_descriptor if name == "fetch_url" else get_tool_descriptor(name),
+            lambda name, *, policy=None: (
+                failing_descriptor if name == "fetch_url"
+                else get_tool_descriptor(name, policy=policy)
+            ),
         )
     else:
         monkeypatch.setattr(
@@ -1790,7 +1793,10 @@ def test_claude_code_privacy_errors_return_value_free_denial(
         monkeypatch.setattr(
             budget_gate,
             "get_tool_descriptor",
-            lambda name: failing_descriptor if name == "fetch_url" else get_tool_descriptor(name),
+            lambda name, *, policy=None: (
+                failing_descriptor if name == "fetch_url"
+                else get_tool_descriptor(name, policy=policy)
+            ),
         )
     else:
         monkeypatch.setattr(
@@ -1837,7 +1843,10 @@ async def test_async_middleware_privacy_errors_return_value_free_refusal(
         monkeypatch.setattr(
             budget_gate,
             "get_tool_descriptor",
-            lambda name: failing_descriptor if name == "fetch_url" else get_tool_descriptor(name),
+            lambda name, *, policy=None: (
+                failing_descriptor if name == "fetch_url"
+                else get_tool_descriptor(name, policy=policy)
+            ),
         )
         tool_name = "fetch_url"
         arguments = {"url": f"https://example.test/?value={TOKEN}"}
@@ -1890,7 +1899,10 @@ async def test_async_claude_code_privacy_errors_return_value_free_denial(
         monkeypatch.setattr(
             budget_gate,
             "get_tool_descriptor",
-            lambda name: failing_descriptor if name == "fetch_url" else get_tool_descriptor(name),
+            lambda name, *, policy=None: (
+                failing_descriptor if name == "fetch_url"
+                else get_tool_descriptor(name, policy=policy)
+            ),
         )
         tool_name = "WebFetch"
         tool_input = {"url": f"https://example.test/?value={TOKEN}"}

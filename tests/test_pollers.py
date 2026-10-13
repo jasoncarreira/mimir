@@ -9715,3 +9715,206 @@ for number in (1, 2, 3, 4, 5):
         if source.domain == "channel"
     ]
     assert integrities == ["untrusted"] * 5
+@pytest.mark.parametrize("name", ["github-activity", "github-ci-watch", "worklink-ready-queue"])
+def test_named_pollers_have_no_static_service_grant(name: str, tmp_path: Path) -> None:
+    from mimir.pollers import PollerConfig
+
+    config = PollerConfig(
+        name=name, command="true", cron="* * * * *", env={}, skill_dir=tmp_path,
+    )
+    service = config.resolved_authority()
+    assert service.canonical == f"poller:{name}"
+    assert service.trigger == "poller"
+    assert service.capabilities == ()
+    assert access_control.get_service_principal("poller") is None
+    assert not access_control.service_can_invoke_operation(service, "send_message")
+
+
+def test_poller_instance_issues_only_explicit_capabilities(tmp_path: Path) -> None:
+    service = access_control.build_trigger_service_principal(
+        canonical="poller:github-ci-watch", trigger="poller", profile="github",
+        tier=access_control.CapabilityTier.SCOPE_CONTAINED,
+        capabilities=("read_file",), roots=(tmp_path,),
+        creation_path="mimir.pollers.run_poller:manifest",
+    )
+    assert access_control.service_can_invoke_operation(service, "read_file")
+    assert not access_control.service_can_invoke_operation(service, "send_message")
+    assert not access_control.service_can_invoke_operation(service, "shell_exec")
+
+
+@pytest.mark.asyncio
+async def test_selected_policy_named_pollers_issue_distinct_manifest_grants(
+    tmp_path: Path, home: Path,
+) -> None:
+    from mimir.plugins.core import register_core_tools
+    from mimir.plugins.registry import PolicyRegistry
+    from mimir.scheduler import Scheduler
+    from mimir.tool_descriptors import ResultOriginKind
+
+    policy = PolicyRegistry()
+    register_core_tools(policy)
+    registrar = policy.registrar("sample")
+    for name, tier in (("sample_read", "scope-contained"), ("sample_execute", "code-execution")):
+        registrar.register_tool(
+            name=name, factory=lambda: object(), flow="source", tier=tier,
+            operation_class="admin_required", result_domain="sample",
+            result_origin=ResultOriginKind.EXTERNAL, sink_category=None,
+            sink_destination=None, sink_target_extractor=None,
+            sink_payload_extractor=None, writes_code_or_state=False,
+            profiles=("sample",), read_backend=False, readable_domain="sample",
+        )
+        registrar.register_capability(name)
+    registrar.register_authority_profile(
+        "sample", capabilities=("sample_read", "sample_execute"),
+    )
+    policy.freeze()
+
+    skills = tmp_path / "skills"
+    skill = skills / "sample"
+    _install_script(skill, "emit.py", 'print(\'{"prompt": "sample data"}\')\n')
+    def entry(name, capabilities, tier="scope-contained", profile="sample"):
+        return {
+            "name": name, "command": f"{sys.executable} emit.py", "cron": "* * * * *",
+            "authority": {
+                "profile": profile, "tier": tier, "capabilities": capabilities,
+                "scoped_roots": ["state"],
+            },
+        }
+
+    entries = [
+        entry("first", ["sample_read"]),
+        entry("second", ["sample_execute"], tier="code-execution"),
+        entry("missing", [], profile="custom"),
+        entry("unknown", ["sample_unknown"]),
+        entry("other", ["sample_read"], profile="custom"),
+        entry("too-low", ["sample_execute"]),
+    ]
+    _write_pollers_json(skill, entries)
+    scheduler = Scheduler(
+        home / "scheduler.yaml", lambda event: None, home=home, policy=policy,
+    )
+    scheduler._pollers_dir = skills
+    discovered, _, rejected = scheduler._discover_pollers_io()
+    assert {poller.name for poller in discovered} == {"first", "second", "missing"}
+    assert {name for _, name, _ in rejected} == {"unknown", "other", "too-low"}
+    assert any("exceeds declared tier" in reason for _, name, reason in rejected if name == "too-low")
+    assert {poller.name for poller in discover_pollers(skills, state_root=home / "state" / "pollers")} == {"missing"}
+
+    events = []
+    async def enqueue(event):
+        events.append(event)
+        return True
+
+    for poller in discovered:
+        await run_poller(poller, enqueue=enqueue, home=home)
+    by_name = {event.service_principal: event for event in events}
+    assert set(by_name) == {"poller:first", "poller:second", "poller:missing"}
+    for name, permitted in (("first", "sample_read"), ("second", "sample_execute")):
+        service = by_name[f"poller:{name}"].service_authority
+        assert service.capabilities == (permitted,)
+        assert access_control.service_can_invoke_operation(service, permitted, policy=policy)
+        assert not access_control.service_can_invoke_operation(
+            service, "sample_execute" if name == "first" else "sample_read", policy=policy,
+        )
+    assert by_name["poller:missing"].service_authority.capabilities == ()
+    assert access_control.get_service_principal("poller", policy=policy) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", [False, True])
+async def test_manifest_plugin_file_sink_grants_only_named_poller(
+    tmp_path: Path, home: Path, enforce: bool, monkeypatch,
+) -> None:
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langchain_core.tools import StructuredTool
+    from langgraph.runtime import Runtime
+    from dataclasses import replace
+
+    from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
+    from mimir.models import InformationFlowLabels, InformationFlowState
+    from mimir.plugins.core import register_core_tools
+    from mimir.plugins.registry import PolicyRegistry
+    from mimir.scheduler import Scheduler
+    from mimir.tool_descriptors import ResultOriginKind, SinkCategory
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    def deliver(payload: str) -> str:
+        """Deliver to a scoped file."""
+        return payload
+
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    policy = PolicyRegistry()
+    register_core_tools(policy)
+    plugin = policy.registrar("sample")
+    plugin.register_tool(
+        name="sample_file_sink", factory=lambda: StructuredTool.from_function(
+            deliver, name="sample_file_sink", description="Deliver a file",
+        ),
+        flow="sink", tier="scope-contained", operation_class="admin_required",
+        result_domain=None, result_origin=ResultOriginKind.NON_INGESTING,
+        sink_category=SinkCategory.FILE, sink_destination="filesystem",
+        sink_target_extractor=lambda _name, args, _ctx: (args.get("payload"),),
+        sink_payload_extractor=None, writes_code_or_state=False,
+        profiles=(), read_backend=False,
+        service_sink_adapter="trigger_service_write_roots",
+    )
+    plugin.register_capability("sample_file_sink")
+    plugin.add_to_profile("heartbeat", "sample_file_sink")
+    policy.freeze()
+
+    skill = tmp_path / "skills" / "sample"
+    _install_script(skill, "emit.py", 'print(\'{"prompt": "deliver"}\')\n')
+    _write_pollers_json(skill, [
+        {"name": name, "command": f"{sys.executable} emit.py", "cron": "* * * * *",
+         "authority": {"profile": "heartbeat", "tier": "scope-contained",
+                       "capabilities": grants, "scoped_roots": ["state"]}}
+        for name, grants in (("granted", ["sample_file_sink"]), ("ungranted", []))
+    ])
+    scheduler = Scheduler(home / "scheduler.yaml", lambda event: None, home=home, policy=policy)
+    scheduler._pollers_dir = skill.parent
+    discovered, _, rejected = scheduler._discover_pollers_io()
+    assert not rejected and {poller.name for poller in discovered} == {"granted", "ungranted"}
+    events = []
+
+    async def enqueue(event):
+        events.append(event)
+        return True
+
+    for poller in discovered:
+        await run_poller(poller, enqueue=enqueue, home=home)
+    by_name = {event.service_principal: event for event in events}
+    assert by_name["poller:granted"].service_authority.sink_policy_for("sample_file_sink") is not None
+    assert by_name["poller:ungranted"].service_authority.sink_policy_for("sample_file_sink") is None
+    for name in ("granted", "ungranted"):
+        event = by_name[f"poller:{name}"]
+        auth = _create_turn_auth_context(
+            event, None, policy_version=None, enforce=enforce,
+            ifc_labels=_initialize_ifc_labels(event, policy=policy), policy=policy,
+        )
+        # Poller output is untrusted active ingest; test the destination grant
+        # independently of the always-on tainted-write veto.
+        auth = replace(auth, ifc_labels=InformationFlowLabels(),
+                       ifc_state=InformationFlowState())
+        target = str(home / "state" / "pollers" / "granted" / "output.md")
+        args = {"payload": target}
+        decision = access_control.ToolRegistry().authorize_tool(
+            "sample_file_sink", auth, enforce=True, target_channel=target,
+            arguments=args, policy=policy,
+        )
+        request = ToolCallRequest(
+            tool_call={"name": "sample_file_sink", "args": args, "id": name, "type": "tool_call"},
+            tool=policy.tools["sample_file_sink"].factory(), state=None,
+            runtime=Runtime(context=auth),
+        )
+        called = []
+        result = BudgetGateMiddleware(policy).wrap_tool_call(
+            request, lambda _: called.append(True) or ToolMessage(content="ok", tool_call_id=name),
+        )
+        if name == "granted":
+            assert decision.allowed and not decision.would_block, (decision.reason, decision.refusal_detail)
+            assert result.status != "error" and called == [True]
+        else:
+            assert not decision.allowed and decision.would_block
+            assert result.status == ("error" if enforce else "success")
+            assert called == ([] if enforce else [True])

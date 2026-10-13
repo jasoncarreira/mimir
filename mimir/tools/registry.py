@@ -61,6 +61,7 @@ from ..pollers import (
 )
 from ..models import AuthContext, Integrity, IntegrityEffect, RetainedFactoryScope, TurnInteractivity
 from ..scheduler import SchedulerJob
+from ..plugins.core import scoped_policy_call, selected_policy_registry
 
 # Per-task ContextVar for channel_id — isolated across concurrent asyncio
 # Tasks so concurrent turns on different channels don't race (S2-1 fix).
@@ -3100,18 +3101,20 @@ async def worklink_resume(
     )
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def all_mimir_tools(
     model_spec: str | None = None,
     *,
     coding_enabled: bool = False,
     require_coding_available: bool = True,
+    policy: "PolicyRegistry | None" = None,
+    materialize_plugins: bool = True,
 ) -> list:
     """Return the full mimir tool surface for create_deep_agent.
 
-    Combines tools from memory_tool, store_tool, extra_tools, and
-    this module. Production cutover would wire the dep-injection
-    setters in mimir/server.py:build_app once and let the agent
-    discover them all at construction time.
+    Materializes registered core factories for the selected surfaces and
+    appends dynamically connected MCP tools. Dependency setters are wired
+    by mimir/server.py:build_app.
 
     ``model_spec`` lets startup authorization inspect the same provider-gated
     surface before the agent is constructed. Runtime callers may omit it and
@@ -3129,83 +3132,22 @@ def all_mimir_tools(
     Tavily on top would duplicate the surface. See
     ``mimir.tools.web.web_tools_enabled`` for the gating predicate.
     """
-    from .memory import memory_get, memory_query
-    from .store import memory_store
-    from .memory_propose import memory_propose
-    from .proposals import (
-        abandon_proposal,
-        open_proposal,
-        proposal_diff,
-        submit_proposal,
-    )
-    from .extra import file_search, get_turn, mimir_get_turn, rebuild_index, shell_exec
+    from ..plugins.core import core_runtime_names
     from .web import web_tools_enabled
-    from .shell_async import bash_async, bash_job_output, bash_jobs_list
-    from .client_provider import HANDS_TOOLS
-    from .saga_ops import (
-        saga_end_session,
-        saga_feedback,
-        saga_forget,
-        saga_mark_contributions,
-        saga_record_skill_learning,
-    )
-    from .operator_alert import operator_alert
-    tools = [
-        approve_declassification,
-        request_operator_approval,
-        # Memory (read + write)
-        memory_query, memory_get, memory_store, memory_propose,
-        # Change proposals for protected files (PR-gated; never writes live).
-        # The sanctioned path for the agent to change memory/core/* or
-        # prompts/*: open a worktree sandbox under scratch/, edit it natively,
-        # then submit -> one PR for operator approval (chainlink #337/#339/#344).
-        open_proposal,
-        proposal_diff,
-        submit_proposal,
-        abandon_proposal,
-        # SAGA ops (outcome marker, manual credit, session boundary, forget,
-        # per-skill learning capture)
-        saga_feedback, saga_mark_contributions, saga_end_session, saga_forget,
-        saga_record_skill_learning,
-        # Indexer (file search + mid-turn index rebuild)
-        file_search,
-        rebuild_index,
-        # Turn-history lookup (mimir_get_turn is canonical; get_turn
-        # is a back-compat alias for skill prompts that reference the
-        # pre-rename name)
-        mimir_get_turn, get_turn,
-        # Shell exec (allowlist-scoped, sync — fine for sub-second cmds)
-        shell_exec,
-        # Async shell — long-running jobs that wake the agent via
-        # ``shell_job_complete`` on exit. The companion list/output
-        # tools query the per-process ShellJobRegistry.
-        bash_async, bash_jobs_list, bash_job_output,
-        # Channel ops
-        operator_alert, send_message, react, fetch_channel_history, list_channels,
-        # Mid-turn injection escape hatch (chainlink #384): punt a folded
-        # follow-up to its own turn instead of answering it in this one.
-        defer_injected_message,
-        # Scheduler
-        list_schedules, add_schedule, set_schedule_priority, remove_schedule,
-        set_poller_overrides, reload_pollers,
-        # Commitments
-        commitment_complete, commitment_snooze,
-        commitment_dismiss, commitment_list,
-        # Worklink in-turn dispatch (#444). Core tool (no skill mechanism);
-        # arbiter- + cap-gated autonomous dispatch to the deterministic executor.
-        worklink_run, worklink_resume,
-        # Mimir-package self-update (operator-approved, applied on
-        # next restart). See mimir/update_on_start.py.
-        request_mimir_update,
-        *HANDS_TOOLS,
-    ]
+    registry = policy if policy is not None else selected_policy_registry()
+    if not registry.frozen:
+        raise ValueError("tool assembly requires a frozen policy")
+
+    def materialize(surface: str) -> list:
+        return [registry.tools[name].factory() for name in core_runtime_names(surface)]
+
+    tools = materialize("default")
     web_search_on, fetch_url_on = web_tools_enabled(model_spec)
     if web_search_on or fetch_url_on:
-        from .web import fetch_url, web_search
         if web_search_on:
-            tools.append(web_search)
+            tools.extend(materialize("web_search"))
         if fetch_url_on:
-            tools.append(fetch_url)
+            tools.extend(materialize("fetch_url"))
     if coding_enabled:
         if require_coding_available:
             from ..providers import opencode_available
@@ -3248,10 +3190,17 @@ def all_mimir_tools(
         from .forge import github_identity_is_degraded
         coding_enabled = not github_identity_is_degraded()
     if coding_enabled:
-        from .forge import FORGE_TOOLS
-        from .repo import REPO_TOOLS
-
-        tools.extend((spawn_open_code, *FORGE_TOOLS, *REPO_TOOLS))
+        tools.extend(materialize("coding"))
+    for declared in registry.tools.values() if materialize_plugins else ():
+        if declared.owner == "core" or declared.factory is None:
+            continue
+        tool = declared.factory()
+        if getattr(tool, "name", None) != declared.name:
+            raise ValueError(
+                f"plugin {declared.owner}: factory for {declared.name} returned "
+                f"{getattr(tool, 'name', None)!r}"
+            )
+        tools.append(tool)
     # MCP-bridged tools (populated by server.py:_on_startup after the
     # MCP servers come up; empty when MCP is unconfigured).
     from .mcp import get_mcp_tools

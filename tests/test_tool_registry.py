@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError, replace
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -111,6 +113,55 @@ def test_coding_tool_is_absent_when_gate_is_unset_even_if_cli_exists(
     monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
 
     assert "spawn_open_code" not in {tool.name for tool in all_mimir_tools()}
+
+
+def test_core_runtime_surface_materializes_registered_factories() -> None:
+    from mimir.plugins.core import core_policy_registry, core_runtime_names
+    from mimir.tools import all_mimir_tools
+    from mimir.tools.web import web_tools_enabled
+
+    registry = core_policy_registry()
+    tools = all_mimir_tools(model_spec="openai:test")
+    assert "send_message" in {tool.name for tool in tools}
+    web_search_on, fetch_url_on = web_tools_enabled("openai:test")
+    expected = (*core_runtime_names("default"),)
+    if web_search_on:
+        expected += core_runtime_names("web_search")
+    if fetch_url_on:
+        expected += core_runtime_names("fetch_url")
+    assert tuple(tool.name for tool in tools) == expected
+    assert all(tool is registry.tools[tool.name].factory() for tool in tools)
+
+
+def test_subagent_budget_gates_share_frozen_parent_policy() -> None:
+    from mimir.plugins.core import core_policy_registry
+    from mimir.subagents import build_mimir_subagents
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    policy = core_policy_registry()
+    parent = BudgetGateMiddleware(policy)
+    children = build_mimir_subagents(policy=policy)
+    assert parent._policy is policy
+    assert len(children) == 2
+    for child in children:
+        gates = [item for item in child["middleware"] if isinstance(item, BudgetGateMiddleware)]
+        assert len(gates) == 1
+        assert gates[0]._policy is policy
+
+
+def test_default_surface_does_not_import_coding_modules() -> None:
+    script = """\
+import sys
+from mimir.tools.registry import all_mimir_tools
+all_mimir_tools(model_spec='openai:test')
+for name in ('mimir.tools.forge', 'mimir.tools.repo', 'mimir.forge',
+             'mimir.repo_tools', 'mimir.pr_checkout_lease'):
+    assert name not in sys.modules, name
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_coding_tool_is_registered_only_when_enabled_and_available(
@@ -938,9 +989,9 @@ def test_capability_matrix_rejects_removed_declared_companion(
     import mimir.access_control as access_control
 
     scheduler = access_control._TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
-    monkeypatch.setitem(
-        access_control._TRUSTED_SERVICE_PRINCIPALS,
-        "scheduled_tick",
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        {**access_control._TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick":
         replace(
             scheduler,
             capabilities=tuple(
@@ -948,7 +999,7 @@ def test_capability_matrix_rejects_removed_declared_companion(
                 for capability in scheduler.capabilities
                 if capability != "bash_job_output"
             ),
-        ),
+        )},
     )
 
     is_complete, errors = access_control.check_capability_matrix_complete()
@@ -969,33 +1020,33 @@ def test_capability_matrix_preflight_fails_with_incomplete_matrix(
         check_capability_matrix_complete,
     )
 
-    original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
+    import mimir.access_control as access_control
+
     captured: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(
         "mimir.tools.budget_gate._emit_event_sync",
         lambda kind, **fields: captured.append((kind, fields)),
     )
-    try:
-        _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        {**_TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick": ServicePrincipal(
             canonical="scheduler",
             trigger="scheduled_tick",
             capabilities=(),
             readable_domains=(),
             sink_destinations=(),
-        )
+        )},
+    )
 
-        is_complete, errors = check_capability_matrix_complete(fail_closed=True)
-        assert is_complete is False
-        assert len(errors) > 0
-        assert any("no capabilities" in e for e in errors)
-        hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
-        assert hard["tool"] == "startup"
-        assert hard["boundary"] == "capability_matrix_preflight"
-        assert hard["reason"] == "capability_matrix_incomplete"
-        assert any("no capabilities" in error for error in hard["target"])
-    finally:
-        _TRUSTED_SERVICE_PRINCIPALS.clear()
-        _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+    is_complete, errors = check_capability_matrix_complete(fail_closed=True)
+    assert is_complete is False
+    assert len(errors) > 0
+    assert any("no capabilities" in e for e in errors)
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    assert hard["tool"] == "startup"
+    assert hard["boundary"] == "capability_matrix_preflight"
+    assert hard["reason"] == "capability_matrix_incomplete"
+    assert any("no capabilities" in error for error in hard["target"])
 
 
 def test_capability_matrix_rejects_saga_mutation_without_sink_mapping(
@@ -1079,9 +1130,9 @@ def test_capability_matrix_rejects_service_sink_without_executable_policy(
     from dataclasses import replace
 
     scheduler = access_control._TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
-    monkeypatch.setitem(
-        access_control._TRUSTED_SERVICE_PRINCIPALS,
-        "scheduled_tick",
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        {**access_control._TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick":
         replace(
             scheduler,
             sink_policies=tuple(
@@ -1089,7 +1140,7 @@ def test_capability_matrix_rejects_service_sink_without_executable_policy(
                 for policy in scheduler.sink_policies
                 if policy.operation != "shell_exec"
             ),
-        ),
+        )},
     )
 
     is_complete, errors = access_control.check_capability_matrix_complete()
@@ -1108,13 +1159,13 @@ def test_capability_matrix_rejects_unbacked_sink_category_grant(
     from dataclasses import replace
 
     synthesis = access_control._TRUSTED_SERVICE_PRINCIPALS["saga_session_end"]
-    monkeypatch.setitem(
-        access_control._TRUSTED_SERVICE_PRINCIPALS,
-        "saga_session_end",
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        {**access_control._TRUSTED_SERVICE_PRINCIPALS, "saga_session_end":
         replace(
             synthesis,
             sink_destinations=synthesis.sink_destinations + ("notification",),
-        ),
+        )},
     )
 
     is_complete, errors = access_control.check_capability_matrix_complete()
@@ -1129,34 +1180,31 @@ def test_capability_matrix_rejects_unbacked_sink_category_grant(
 @pytest.mark.parametrize("fail_closed", [True, False])
 def test_capability_matrix_reports_seeded_errors_for_both_modes(
     fail_closed: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import mimir.access_control as access_control
     from mimir.access_control import (
         ServicePrincipal,
         _TRUSTED_SERVICE_PRINCIPALS,
         check_capability_matrix_complete,
     )
 
-    original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
-    try:
-        scheduler = original_principals["scheduled_tick"]
-        _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
+    scheduler = _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
+    monkeypatch.setattr(access_control, "_TRUSTED_SERVICE_PRINCIPALS", {
+        **_TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick": ServicePrincipal(
             canonical=scheduler.canonical,
             trigger=scheduler.trigger,
             capabilities=(),
             readable_domains=scheduler.readable_domains,
             sink_destinations=scheduler.sink_destinations,
             creation_path=scheduler.creation_path,
-        )
+        ),
+    })
 
-        is_complete, errors = check_capability_matrix_complete(
-            fail_closed=fail_closed,
-        )
+    is_complete, errors = check_capability_matrix_complete(fail_closed=fail_closed)
 
-        assert is_complete is False
-        assert any("no capabilities" in error for error in errors)
-    finally:
-        _TRUSTED_SERVICE_PRINCIPALS.clear()
-        _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+    assert is_complete is False
+    assert any("no capabilities" in error for error in errors)
 
 
 @pytest.mark.asyncio
@@ -1200,7 +1248,10 @@ async def test_sink_gate_denial_emits_shadow_decision_when_not_enforced() -> Non
     )
 
 
-def test_enforcement_enablement_fails_closed_with_incomplete_matrix() -> None:
+def test_enforcement_enablement_fails_closed_with_incomplete_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
     from mimir.access_control import (
         CapabilityMatrixError,
         ServicePrincipal,
@@ -1208,10 +1259,9 @@ def test_enforcement_enablement_fails_closed_with_incomplete_matrix() -> None:
         resolve_access_control_enforcement,
     )
 
-    original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
-    try:
-        scheduler = original_principals["scheduled_tick"]
-        _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
+    scheduler = _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
+    monkeypatch.setattr(access_control, "_TRUSTED_SERVICE_PRINCIPALS", {
+        **_TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick": ServicePrincipal(
             canonical=scheduler.canonical,
             trigger=scheduler.trigger,
             capabilities=scheduler.capabilities,
@@ -1221,14 +1271,12 @@ def test_enforcement_enablement_fails_closed_with_incomplete_matrix() -> None:
             ),
             sink_destinations=scheduler.sink_destinations,
             creation_path=scheduler.creation_path,
-        )
+        ),
+    })
 
-        with pytest.raises(CapabilityMatrixError, match="read_file.*filesystem"):
-            resolve_access_control_enforcement(True)
-        assert resolve_access_control_enforcement(False) is False
-    finally:
-        _TRUSTED_SERVICE_PRINCIPALS.clear()
-        _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+    with pytest.raises(CapabilityMatrixError, match="read_file.*filesystem"):
+        resolve_access_control_enforcement(True)
+    assert resolve_access_control_enforcement(False) is False
 
 
 def test_enforcement_enablement_rejects_uncataloged_model_tool(
@@ -1283,10 +1331,12 @@ def test_enforcement_enablement_rejects_read_backend_flow_misclassification(
 ) -> None:
     import mimir.access_control as access_control
 
-    monkeypatch.setitem(
-        access_control._TOOL_FLOW_MAP,
-        "read_file",
-        access_control.ToolFlowDirection.SINK,
+    monkeypatch.setattr(
+        access_control, "_TOOL_FLOW_MAP",
+        MappingProxyType({
+            **access_control._TOOL_FLOW_MAP,
+            "read_file": access_control.ToolFlowDirection.SINK,
+        }),
     )
 
     with pytest.raises(

@@ -438,20 +438,40 @@ class TestRenderSagaSessionEnd:
                 prompt,
             )
 
-    def test_rendered_tool_list_follows_capability_changes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        current = access_control.TRIGGER_AUTHORITY_PROFILES["session-boundary"]
-        monkeypatch.setitem(
-            access_control.TRIGGER_AUTHORITY_PROFILES,
-            "session-boundary",
-            current | {"new_boundary_tool"},
+    def test_rendered_tool_list_follows_registered_capabilities(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mimir.plugins.core import register_core_tools
+        from mimir.plugins.registry import PolicyRegistry
+        from mimir.tool_descriptors import ResultOriginKind
+
+        registry = PolicyRegistry()
+        register_core_tools(registry)
+        registrar = registry.registrar("template-test")
+        registrar.register_capability("new_boundary_tool")
+        registrar.register_tool(
+            name="new_boundary_tool", policy_only=True, flow="neither",
+            tier="scope-contained", operation_class="open",
+            result_domain="template-test", result_origin=ResultOriginKind.NONE,
+            sink_category=None, sink_destination=None,
+            sink_target_extractor=None, sink_payload_extractor=None,
+            writes_code_or_state=False, profiles=(), read_backend=False,
         )
+        registrar.add_to_profile("session-boundary", "new_boundary_tool")
+        registered = registry.freeze().authority_profiles["session-boundary"]
+        monkeypatch.setattr(access_control, "TRIGGER_AUTHORITY_PROFILES", registry.authority_profiles)
+        assert "new_boundary_tool" in registered
+        with pytest.raises(TypeError):
+            access_control.TRIGGER_AUTHORITY_PROFILES["session-boundary"] = (
+                registered | {"unregistered_tool"}
+            )
         for turns in (self._turns_with_atoms(), self._turns_no_atoms()):
             prompt = render_saga_session_end(
                 channel_id="chan-1", saga_session_id="saga-1", idle_minutes=10,
                 turns_window=turns, prompts_dir=None,
             )
             assert "- `new_boundary_tool`\n" in prompt
-            assert all(f"- `{tool}`\n" in prompt for tool in current)
+            assert all(f"- `{tool}`\n" in prompt for tool in registered)
 
 
 # ─── chainlink #388: malformed operator template must not crash synthesis ──

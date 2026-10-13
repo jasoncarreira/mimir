@@ -61,6 +61,7 @@ import yaml
 from ..env import env_bool
 from ..event_logger import emit_event_background as _emit_event_sync
 from ..models import AuthContext, InformationFlowState
+from ..plugins.core import policy_membership, scoped_policy_call, selected_policy_registry
 from ..redaction import redact_text
 from ..tool_descriptors import (
     FetchAuthorizationKind,
@@ -120,13 +121,17 @@ from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
 log = logging.getLogger(__name__)
 
-_STANDING_REVIEW_TOOLS = frozenset({
-    "pr_metadata", "pr_spec", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
-    "pr_comments", "pr_review_requests", "pr_submit_review",
-    "pr_inline_review_comment", "pr_comment", "pr_edit_body", "pr_rerequest_review",
-    "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
-    "repo_diff", "repo_unmerged",
-})
+def _plugin_tool(tool_name: str, policy: Any) -> Any:
+    selected = policy if policy is not None else selected_policy_registry()
+    registered = selected.tools.get(tool_name)
+    return registered if registered is not None and registered.owner != "core" else None
+
+
+def _descriptor_for_policy(tool_name: str, policy: Any = None) -> Any:
+    return get_tool_descriptor(tool_name, policy=policy)
+
+
+_STANDING_REVIEW_TOOLS = policy_membership("standing_review")
 _TOOL_EVENT_ARGUMENT_ALLOWLIST = (
     "command",
     "path",
@@ -153,20 +158,17 @@ _SPAWN_OPEN_CODE_ERROR_STATUSES = frozenset({
     "prompt_refused", "containment_unavailable", "timeout", "output_overflow",
     "authentication_required", "failed", "proposal_unavailable",
 })
-_TYPED_ERROR_SIGNAL_TOOLS = frozenset({
-    "bash_job_output", "fetch_url", "get_turn", "mimir_get_turn",
-    "shell_exec", "web_search", "worklink_run",
-})
-_REMEDIATION_EFFECT_TOOLS = frozenset({
-    "repo_commit", "repo_push", "pr_comment", "pr_edit_body", "pr_inline_review_comment",
-    "pr_rerequest_review", "write_file", "edit_file", "replace_file", "worklink_resume",
-})
+_TYPED_ERROR_SIGNAL_TOOLS = policy_membership("typed_error_signal")
+_REMEDIATION_EFFECT_TOOLS = policy_membership("remediation_effect")
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def _resolve_standing_review(
     tool_name: str,
     auth_context: AuthContext | None,
     arguments: Mapping[str, Any] | None,
+    *,
+    policy: Any = None,
 ) -> str | None:
     """Resolve safe review authority before resource and IFC authorization."""
     if (
@@ -295,11 +297,13 @@ def _emit_hard_boundary_denied(
     )
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def _record_tool_outcome(
     tool_name: str,
     *,
     refused_reason: str = "",
     operator_shell_audit: Mapping[str, str] | None = None,
+    policy: Any = None,
 ) -> None:
     """Attach server-observed remediation evidence to the active turn."""
     if refused_reason:
@@ -367,13 +371,14 @@ def _check_and_increment_or_deny(
     target: Any = None,
     auth_context: AuthContext | None = None,
     operator_shell_audit: Mapping[str, str] | None = None,
+    policy: Any = None,
 ) -> str | None:
     """Returns a denial message (str) if the call should be refused,
     or ``None`` if the call should proceed. Shared between the sync
     and async middleware paths so the bookkeeping stays identical."""
     # Exempt tools (send_message, react) bypass both the count
     # increment AND the cap check. Free passage, no bookkeeping.
-    descriptor = get_tool_descriptor(tool_name)
+    descriptor = _descriptor_for_policy(tool_name, policy)
     if descriptor is not None and descriptor.budget_exempt:
         return None
     state = _resolve_budget_state(ctx)
@@ -441,6 +446,7 @@ def _tool_call_id(request: ToolCallRequest) -> str:
 def _extract_sink_target(
     request: ToolCallRequest,
     auth_context: AuthContext | None = None,
+    policy: Any = None,
 ) -> str | None:
     """Return the concrete operation destination for sink authorization.
 
@@ -451,9 +457,15 @@ def _extract_sink_target(
     tc = getattr(request, "tool_call", None) or {}
     args = tc.get("args") or {}
     tool_name = _tool_name_from_request(request)
-    descriptor = get_tool_descriptor(tool_name)
+    descriptor = _descriptor_for_policy(tool_name, policy)
     extractor = descriptor.sink_target_extractor if descriptor is not None else None
     if callable(extractor):
+        if policy is not None and _plugin_tool(tool_name, policy):
+            try:
+                targets = extractor(tool_name, args, auth_context)
+                return targets[0] if len(targets) == 1 else None
+            except (TypeError, ValueError, KeyError, IndexError):
+                return None
         return extractor(tool_name, args, auth_context)[0]
     if tool_name.startswith("mcp_"):
         return tool_name
@@ -464,15 +476,21 @@ def _extract_sink_target(
 def _extract_sink_targets(
     request: ToolCallRequest,
     auth_context: AuthContext | None = None,
+    policy: Any = None,
 ) -> list[str | None]:
     """Return every independently writable destination in a tool call."""
     tool_name = _tool_name_from_request(request)
     args = (getattr(request, "tool_call", None) or {}).get("args") or {}
-    descriptor = get_tool_descriptor(tool_name)
+    descriptor = _descriptor_for_policy(tool_name, policy)
     extractor = descriptor.sink_target_extractor if descriptor is not None else None
     if callable(extractor):
+        if _plugin_tool(tool_name, policy) is not None:
+            try:
+                return list(extractor(tool_name, args, auth_context))
+            except (TypeError, ValueError, KeyError, IndexError):
+                return []
         return list(extractor(tool_name, args, auth_context))
-    return [_extract_sink_target(request, auth_context)]
+    return [_extract_sink_target(request, auth_context, policy)]
 
 
 def _declared_shell_payloads(
@@ -844,10 +862,11 @@ def _outbound_privacy_refusal(
     include_jev: bool = True,
     jev_candidates: list[str] | None = None,
     findings_override: Sequence[Any] | None = None,
+    policy: Any = None,
 ) -> str | None:
     """Scan an external write and emit value-free shadow or denial evidence."""
     descriptor_name, _ = _outbound_privacy_tool_name(tool_name)
-    descriptor = get_tool_descriptor(descriptor_name)
+    descriptor = _descriptor_for_policy(descriptor_name, policy)
     extractor = descriptor.sink_payload_extractor if descriptor is not None else None
     texts: tuple[str, ...] = ()
     if callable(extractor):
@@ -986,14 +1005,16 @@ def _authorized_fetch_urls_for_tool(
     tool_name: str,
     auth_context: AuthContext | None,
     target: str | None = None,
+    policy: Any = None,
 ) -> frozenset[str] | None:
-    descriptor = get_tool_descriptor(tool_name)
+    descriptor = _descriptor_for_policy(tool_name, policy)
     kind = descriptor.fetch_authorization if descriptor else FetchAuthorizationKind.NONE
     if kind is FetchAuthorizationKind.FETCH_URL:
         approved = set(approved_fetch_urls(auth_context))
         approved.update(
             url for url in ingested_fetch_urls(auth_context)
-            if fetch_url_is_approved(url, auth_context)
+            if _plugin_tool(tool_name, policy) is not None
+            or fetch_url_is_approved(url, auth_context)
         )
         if target is not None and fetch_url_is_approved(target, auth_context):
             normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
@@ -2202,12 +2223,12 @@ def _web_search_external_result_text(result: Any) -> str | None:
 
 
 def _external_result_text(
-    tool_name: str, labels: Any, result: Any, *, failed: bool,
+    tool_name: str, labels: Any, result: Any, *, failed: bool, policy: Any = None,
 ) -> str | None:
     """Extract only server-attested external-origin result content."""
     if failed or not getattr(labels, "has_untrusted_active_ingest", False):
         return None
-    descriptor = get_tool_descriptor(tool_name)
+    descriptor = _descriptor_for_policy(tool_name, policy)
     if descriptor is None or not descriptor.result_origin & ResultOriginKind.EXTERNAL:
         return None
     if descriptor.result_origin & ResultOriginKind.WEB_SEARCH_FORMAT:
@@ -2287,10 +2308,11 @@ def _merge_result_labels_from_result(
     *,
     tool_name: str,
     failed: bool,
+    policy: Any = None,
 ) -> None:
     """Record URLs only from server-attested external result sources, then merge."""
     if auth_context is not None and added is not None:
-        text = _external_result_text(tool_name, added, result, failed=failed)
+        text = _external_result_text(tool_name, added, result, failed=failed, policy=policy)
         if text is not None:
             record_external_ingested_urls(auth_context, text)
     _merge_result_labels(auth_context, added)
@@ -2545,6 +2567,7 @@ def _authorize_tool_call(
     tool_call_id: str | None = None,
     client_authorized_host_execution: ClientAuthorizedHostExecution | None = None,
     request_identity: Any = None,
+    policy: Any = None,
 ) -> tuple[ToolAuthorization, str | None]:
     """Return the exact authorization and any middleware denial text."""
     enforce = (
@@ -2567,6 +2590,7 @@ def _authorize_tool_call(
             "client_authorized_host_execution": client_authorized_host_execution,
             "request_identity": request_identity,
         }
+    policy_parameters = {"policy": policy} if policy is not None else {}
     auth = get_tool_registry().authorize_tool(
         tool_name,
         ctx,
@@ -2575,6 +2599,7 @@ def _authorize_tool_call(
         ifc_labels=ifc_labels,
         mcp_tool=mcp_tool,
         arguments=arguments,
+        **policy_parameters,
         **client_parameters,
         **operator_parameters,
     )
@@ -2737,7 +2762,8 @@ def _execute_declassification_action(
     )
 
 
-def _returned_value_is_error(tool_name: str, content: Any) -> bool:
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
+def _returned_value_is_error(tool_name: str, content: Any, *, policy: Any = None) -> bool:
     """Recognize required typed-result fields for tools not yet returning typed errors."""
     text = content if isinstance(content, str) else str(content)
     if tool_name not in _TYPED_ERROR_SIGNAL_TOOLS and text.startswith(
@@ -2761,7 +2787,7 @@ def _returned_value_is_error(tool_name: str, content: Any) -> bool:
         )
 
     expected_fields: frozenset[str] | None = None
-    descriptor = get_tool_descriptor(tool_name)
+    descriptor = _descriptor_for_policy(tool_name, policy)
     if descriptor is not None and descriptor.git_operation_result:
         expected_fields = _GIT_OPERATION_RESULT_FIELDS
     elif tool_name == "repo_test":
@@ -2779,11 +2805,11 @@ def _returned_value_is_error(tool_name: str, content: Any) -> bool:
     )
 
 
-def _result_is_error(tool_name: str, result: ToolMessage | Command) -> bool:
+def _result_is_error(tool_name: str, result: ToolMessage | Command, *, policy: Any = None) -> bool:
     if isinstance(result, ToolMessage):
         return (
             getattr(result, "status", None) == "error"
-            or _returned_value_is_error(tool_name, getattr(result, "content", ""))
+            or _returned_value_is_error(tool_name, getattr(result, "content", ""), policy=policy)
         )
     update = getattr(result, "update", None)
     messages = update.get("messages", ()) if isinstance(update, dict) else ()
@@ -2791,7 +2817,7 @@ def _result_is_error(tool_name: str, result: ToolMessage | Command) -> bool:
         isinstance(message, ToolMessage)
         and (
             getattr(message, "status", None) == "error"
-            or _returned_value_is_error(tool_name, getattr(message, "content", ""))
+            or _returned_value_is_error(tool_name, getattr(message, "content", ""), policy=policy)
         )
         for message in messages
     )
@@ -3366,6 +3392,7 @@ class _PreparedToolCall:
     operator_shell_audit: dict[str, Any] | None
     host_execution: ClientAuthorizedHostExecution | None
     started: float
+    policy: Any = None
 
 
 @dataclass
@@ -3433,6 +3460,7 @@ def _prepare_tool_call_execution(
     *,
     include_jev: bool = True,
     jev_candidates: list[str] | None = None,
+    policy: Any = None,
 ) -> _PreparedToolCall | ToolMessage | Command:
     request = call.request
     tool_name = call.tool_name
@@ -3447,7 +3475,9 @@ def _prepare_tool_call_execution(
             call, _argument_validation_refusal(request), arguments=None,
             record_outcome=True,
         )
-    target_channels = _extract_sink_targets(request, auth_context)
+    target_channels = _extract_sink_targets(request, auth_context, policy)
+    if not target_channels:
+        target_channels = [None]
     hands_candidate = _admitted_admin_hands_candidate(
         request, tool_name, auth_context, arguments,
     )
@@ -3476,6 +3506,7 @@ def _prepare_tool_call_execution(
             ifc_labels,
             getattr(request, "tool", None),
             arguments,
+            policy=policy,
             operator_shell_binding=(
                 operator_shell_preparation.binding
                 if operator_shell_preparation is not None
@@ -3545,8 +3576,25 @@ def _prepare_tool_call_execution(
             call, _argument_validation_refusal(request), arguments=None,
             operator_shell_audit=operator_shell_audit, record_outcome=True,
         )
+    registered = _plugin_tool(tool_name, policy)
+    if registered is not None and registered.descriptor is not None:
+        fetch_kind = registered.descriptor.fetch_authorization
+        if fetch_kind is not FetchAuthorizationKind.NONE:
+            target = _extract_sink_target(request, auth_context, policy)
+            allowed_urls = _authorized_fetch_urls_for_tool(
+                tool_name, auth_context, target, policy,
+            )
+            normalized = (
+                normalize_sink_destination(SinkCategory.NETWORK, target)
+                if isinstance(target, str) else None
+            )
+            if normalized is None or allowed_urls is None or normalized not in allowed_urls:
+                return _tool_call_refusal(
+                    call, "fetch destination is not approved", arguments=None,
+                    record_outcome=True,
+                )
     if tool_name == "approve_declassification":
-        denial = _check_and_increment_or_deny(tool_name)
+        denial = _check_and_increment_or_deny(tool_name, policy=policy)
         if denial is not None:
             return _tool_call_refusal(call, denial, arguments=arguments)
         return _execute_declassification_action(request, auth_context, arguments)
@@ -3558,6 +3606,7 @@ def _prepare_tool_call_execution(
             auth_context,
             include_jev=include_jev,
             jev_candidates=jev_candidates,
+            policy=policy,
         )
     except Exception as exc:
         exception_type = type(exc).__name__
@@ -3601,7 +3650,7 @@ def _prepare_tool_call_execution(
             target=(
                 None
                 if operator_shell_audit is not None
-                else _extract_sink_target(request, auth_context)
+                else _extract_sink_target(request, auth_context, policy)
             ),
             auth_context=auth_context,
             event_fields=(
@@ -3643,9 +3692,10 @@ def _prepare_tool_call_execution(
 
     denial = _check_and_increment_or_deny(
         tool_name,
-        target=_extract_sink_target(request, auth_context),
+        target=_extract_sink_target(request, auth_context, policy),
         auth_context=auth_context,
         operator_shell_audit=operator_shell_audit,
+        policy=policy,
     )
     if denial is not None:
         return _tool_call_refusal(
@@ -3655,7 +3705,7 @@ def _prepare_tool_call_execution(
 
     # Delegation inherits the monotonic IFC carrier only after all gates admit it.
     active_ctx = _get_current_turn_context()
-    descriptor = get_tool_descriptor(tool_name)
+    descriptor = _descriptor_for_policy(tool_name, policy)
     if active_ctx is not None and descriptor is not None and descriptor.ifc_delegation:
         from ..agent import _propagate_ifc_labels
 
@@ -3720,6 +3770,7 @@ def _prepare_tool_call_execution(
         operator_shell_audit=operator_shell_audit,
         host_execution=host_execution,
         started=started,
+        policy=policy,
     )
 
 
@@ -3776,13 +3827,14 @@ def _begin_tool_execution(
     authorized_fetch_urls = _authorized_fetch_urls_for_tool(
         call.tool_name,
         call.auth_context,
-        _extract_sink_target(call.request, call.auth_context),
+        _extract_sink_target(call.request, call.auth_context, call.policy),
+        call.policy,
     )
     if authorized_fetch_urls is not None:
         from .web import begin_authorized_fetch
 
         capture.fetch_token = begin_authorized_fetch(authorized_fetch_urls)
-    descriptor = get_tool_descriptor(call.tool_name)
+    descriptor = _descriptor_for_policy(call.tool_name, call.policy)
     if (
         descriptor is not None
         and descriptor.fetch_authorization is FetchAuthorizationKind.FETCH_URL
@@ -3893,7 +3945,7 @@ def _finish_tool_exception(
         )
         _merge_result_labels_from_result(
             call.auth_context, result_labels, exc,
-            tool_name=call.tool_name, failed=True,
+            tool_name=call.tool_name, failed=True, policy=call.policy,
         )
     else:
         result_labels = _result_labels_for_call(
@@ -3926,9 +3978,9 @@ def _finish_tool_result(
     capture: _ToolExecutionCapture,
     result: ToolMessage | Command,
 ) -> ToolMessage | Command:
-    is_error = _result_is_error(call.tool_name, result)
+    is_error = _result_is_error(call.tool_name, result, policy=call.policy)
     if not is_error:
-        _record_tool_outcome(call.tool_name)
+        _record_tool_outcome(call.tool_name, policy=call.policy)
     result_labels = _result_labels_for_call(
         call.tool_name,
         call.arguments,
@@ -3942,7 +3994,7 @@ def _finish_tool_result(
     )
     _merge_result_labels_from_result(
         call.auth_context, result_labels, result,
-        tool_name=call.tool_name, failed=is_error,
+        tool_name=call.tool_name, failed=is_error, policy=call.policy,
     )
     _emit_tool_call_sync(
         call.tool_name,
@@ -3958,7 +4010,8 @@ def _finish_tool_result(
 class BudgetGateMiddleware(AgentMiddleware):
     """Intercept model and tool calls at their exact LangGraph boundaries."""
 
-    def __init__(self) -> None:
+    def __init__(self, policy: Any = None) -> None:
+        self._policy = policy
         get_tool_registry().enable_shadow_logging()
 
     def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
@@ -3977,6 +4030,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return await handler(request)
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._policy)
     def wrap_tool_call(
         self,
         request: ToolCallRequest,
@@ -3987,8 +4041,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             return review
         review_denial = _resolve_standing_review(
             review.tool_name, review.auth_context, review.arguments,
+            **({"policy": self._policy} if self._policy is not None else {}),
         )
-        call = _prepare_tool_call_execution(review, review_denial)
+        call = _prepare_tool_call_execution(review, review_denial, policy=self._policy)
         if not isinstance(call, _PreparedToolCall):
             return call
         capture = _ToolExecutionCapture()
@@ -4023,6 +4078,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             _end_tool_execution(capture)
         return _finish_tool_result(call, capture, result)
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._policy)
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
@@ -4036,6 +4092,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             review.tool_name,
             review.auth_context,
             review.arguments,
+            **({"policy": self._policy} if self._policy is not None else {}),
         )
         jev_candidates: list[str] = []
         call = _prepare_tool_call_execution(
@@ -4043,6 +4100,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             review_denial,
             include_jev=False,
             jev_candidates=jev_candidates,
+            policy=self._policy,
         )
         if not isinstance(call, _PreparedToolCall):
             return call
@@ -4062,6 +4120,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                         call.auth_context,
                         include_jev=False,
                         findings_override=findings,
+                        policy=self._policy,
                     )
                     if findings
                     else None

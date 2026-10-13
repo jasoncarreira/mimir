@@ -21,7 +21,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from aiohttp import web
@@ -52,6 +52,9 @@ from .prompt_templates import seed_prompts
 from .subagent_defs import seed_subagent_defs
 from . import web_ui
 from .http_shutdown import HTTP_SHUTDOWN, HTTPShutdown
+
+if TYPE_CHECKING:
+    from .plugins.registry import PolicyRegistry
 
 log = logging.getLogger(__name__)
 
@@ -492,6 +495,7 @@ class _StartupState:
     scheduler_started: bool = False
     liveness_mark_attempted: bool = False
     compensated: bool = False
+    plugin_preflight_begun: bool = False
 
 
 @dataclass(slots=True)
@@ -583,9 +587,11 @@ def _publish_runtime(
     state.runtime_published = True
 
 
-def _session_synthesis_event(session: ChannelSession) -> AgentEvent:
+def _session_synthesis_event(
+    session: ChannelSession, *, policy: PolicyRegistry | None = None,
+) -> AgentEvent:
     """Build the server-owned session synthesis event."""
-    authority = builtin_trigger_service_principal("session-boundary", Path("."))
+    authority = builtin_trigger_service_principal("session-boundary", Path("."), policy=policy)
     return AgentEvent(
         trigger="saga_session_end",
         channel_id=session.channel_id,
@@ -1028,6 +1034,9 @@ async def _handle_health(request: web.Request) -> web.Response:
     from .worklink.worker_client import DEFAULT_EXECUTOR_SOCKET, verify_executor_identity
 
     response: dict[str, object] = {"ok": True}
+    manager = request.app.get("plugin_manager")
+    if manager is not None and manager.plugins:
+        response["plugins"] = await manager.health()
     if not request.app.get("check_worker_executor_health"):
         return web.json_response(response)
 
@@ -1358,7 +1367,12 @@ def build_app(config: Config) -> web.Application:
     # fails loudly before broader server construction when the runtime is absent.
     from .tools import all_mimir_tools
     requested_coding = getattr(config, "coding_enabled", False)
-    all_mimir_tools(coding_enabled=requested_coding)
+    manager = getattr(config, "plugin_manager", None)
+    if manager is None:
+        all_mimir_tools(coding_enabled=requested_coding)
+    else:
+        all_mimir_tools(coding_enabled=requested_coding, policy=manager.policy,
+                        materialize_plugins=False)
 
     process_session_id = make_process_session_id()
 
@@ -1496,6 +1510,7 @@ def build_app(config: Config) -> web.Application:
         home=config.home,
         scheduler_tz=config.scheduler_tz,
         operator_notice=github_outsider_notice,
+        policy=config.plugin_manager.policy,
     )
     set_on_channel_drained = getattr(dispatcher, "set_on_channel_drained", None)
     if set_on_channel_drained is not None:
@@ -1612,6 +1627,7 @@ def build_app(config: Config) -> web.Application:
     )
     runtime_slot = _RuntimeSlot()
     startup_state = _StartupState()
+    app["plugin_manager"] = config.plugin_manager
 
     app["config"] = config
     app["dispatcher"] = dispatcher
@@ -1721,6 +1737,9 @@ def build_app(config: Config) -> web.Application:
         bundle = await create_agent_runtime(config, core, runtime_adapters)
         startup_state.bundle = bundle
         _publish_runtime(app, runtime_slot, startup_state, bundle)
+        startup_state.phase = "plugin_startup_preflight"
+        startup_state.plugin_preflight_begun = True
+        await config.plugin_manager.startup_preflight(bundle)
         from .acp.daemon import (
             AcpDaemon,
             _acp_enablement_from_env,
@@ -2582,6 +2601,9 @@ def build_app(config: Config) -> web.Application:
             except BaseException as exc:
                 errors.append(_cleanup_exception(exc))
 
+        if startup_state.plugin_preflight_begun:
+            await attempt(config.plugin_manager.shutdown)
+
         acp_stopped = True
         if startup_state.acp_daemon is not None:
             acp_stopped = await attempt(startup_state.acp_daemon.stop)
@@ -2718,6 +2740,8 @@ def build_app(config: Config) -> web.Application:
                 errors.append(_cleanup_exception(exc))
         else:
             cleanup_started = time.monotonic()
+            if startup_state.plugin_preflight_begun:
+                await attempt(config.plugin_manager.shutdown)
             from .liveness import mark_clean_shutdown
 
             def persist_clean_shutdown() -> bool:

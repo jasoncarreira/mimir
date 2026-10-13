@@ -30,6 +30,8 @@ class PluginManifest:
 
 def parse_manifest(data: bytes, *, entry_name: str) -> PluginManifest:
     """Parse a provider-owned TOML file without executing provider code."""
+    if entry_name == "core":
+        raise PluginManifestError("plugin name 'core' is reserved")
     if not PLUGIN_NAME.fullmatch(entry_name):
         raise PluginManifestError(f"invalid entry-point name {entry_name!r}")
     try:
@@ -45,6 +47,8 @@ def parse_manifest(data: bytes, *, entry_name: str) -> PluginManifest:
     for key in _FIELDS:
         if not isinstance(raw[key], str) or not raw[key].strip():
             raise PluginManifestError(f"{key} must be a nonempty string")
+    if raw["name"] == "core":
+        raise PluginManifestError("plugin name 'core' is reserved")
     if not PLUGIN_NAME.fullmatch(raw["name"]) or raw["name"] != entry_name:
         raise PluginManifestError(f"manifest name {raw['name']!r} does not match entry point {entry_name!r}")
     try:

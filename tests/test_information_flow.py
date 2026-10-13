@@ -3521,24 +3521,33 @@ def test_github_poller_fetch_allows_only_repo_bounded_read_endpoints(
         "https://patch-diff.githubusercontent.com/raw/acme/widget/pull/7.diff",
     ],
 )
+@pytest.mark.parametrize("integrity", ["trusted", "untrusted"])
 def test_github_poller_fetch_rejects_widening_shapes(
     target: str,
+    integrity: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
-    auth, labels = _trigger_service_context(_github_fetch_service(), integrity="untrusted")
+    auth, labels = _trigger_service_context(_github_fetch_service(), integrity=integrity)
 
     decision = SinkGate.check_sink_flow(
         "fetch_url", target, labels, auth, enforce=True,
     )
 
     assert decision.allowed is False
-    expected_reason = (
-        "service_sink_destination_denied"
-        if fetch_url_is_approved(target, auth)
-        else "egress_destination_not_approved"
-    )
+    # Broad configured-repository approval does not exempt a model-chosen
+    # destination outside the declared adapter from the upstream taint gate.
+    # Clean provenance still reaches (and fails) the destination adapter.
+    if fetch_url_is_approved(target, auth):
+        expected_reason = (
+            "ifc_label_blocked:network"
+            if integrity == "untrusted"
+            else "service_sink_destination_denied"
+        )
+    else:
+        expected_reason = "egress_destination_not_approved"
     assert decision.reason == expected_reason
+    assert decision.would_block is True
 
 
 def test_github_repo_template_does_not_change_exact_url_approval_semantics(

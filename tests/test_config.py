@@ -21,6 +21,7 @@ remaining surface.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 from pathlib import Path
@@ -39,6 +40,60 @@ from mimir.config import (
     _parse_sources,
     _turns_cap,
 )
+
+
+def test_home_dotenv_cannot_grant_plugins_across_loads(tmp_path, monkeypatch):
+    from mimir.config import Config
+
+    (tmp_path / ".env").write_text("MIMIR_PLUGINS=alpha\nMIMIR_MODEL_SPEC=openai:test\n")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    first = Config.from_env()
+    second = Config.from_env()
+    assert first.plugin_manager.policy.frozen and second.plugin_manager.policy.frozen
+    assert first.plugin_manager.plugins == second.plugin_manager.plugins == ()
+    assert "MIMIR_PLUGINS" not in os.environ
+    assert first.model_spec == second.model_spec == "openai:test"
+    assert repr(dataclasses.asdict(first)["plugin_manager"]) == "<plugin runtime policy>"
+
+
+def test_home_dotenv_preserves_process_grant_even_on_failure(tmp_path, monkeypatch):
+    from mimir.config import _load_home_dotenv
+
+    (tmp_path / ".env").write_text("MIMIR_PLUGINS=alpha\n")
+    monkeypatch.setenv("MIMIR_PLUGINS", "beta")
+
+    def fail(*args, **kwargs):
+        os.environ["MIMIR_PLUGINS"] = "alpha"
+        raise RuntimeError("dotenv failed")
+
+    monkeypatch.setattr("mimir.config.load_dotenv", fail)
+    with pytest.raises(RuntimeError, match="dotenv failed"):
+        _load_home_dotenv(tmp_path)
+    assert os.environ["MIMIR_PLUGINS"] == "beta"
+
+
+def test_config_captures_process_plugins_before_dotenv(tmp_path, monkeypatch):
+    from mimir.config import Config
+
+    (tmp_path / ".env").write_text("MIMIR_PLUGINS=alpha\n")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_PLUGINS", "beta")
+    selections = []
+    from mimir.plugins import manager
+
+    original = manager.load_plugins
+
+    def capture(*, enable):
+        selections.append(enable)
+        return original(enable="")
+
+    monkeypatch.setattr(manager, "load_plugins", capture)
+    config = Config.from_env()
+    assert selections == ["beta"]
+    assert config.plugin_manager.policy.frozen
+    assert os.environ["MIMIR_PLUGINS"] == "beta"
 
 
 # ---------------------------------------------------------------------------

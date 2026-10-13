@@ -46,6 +46,7 @@ import traceback
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -120,6 +121,7 @@ from .session_boundary_log import (
     render_session_summaries,
     validate_unfinished_work,
 )
+from .plugins.core import scoped_policy_call
 from .templates import render_saga_session_end
 from .usage_stats import event_recently_emitted
 
@@ -392,6 +394,7 @@ def _initialize_ifc_labels(
     *,
     preloaded_labels: InformationFlowLabels | None = None,
     resolver: Any = None,
+    policy: Any = None,
 ) -> InformationFlowLabels:
     """Initialize monotonic IFC labels before prompt/model construction.
 
@@ -408,7 +411,11 @@ def _initialize_ifc_labels(
     continuation_auth = _shell_continuation_auth_context(event)
     canonical_principal = event.author
     source_kind = "channel"
-    registered_service = get_event_service_principal(event)
+    registered_service = get_event_service_principal(event, policy=policy)
+    if HTTP_EVENT_INGRESS_EXTRA_KEY in (
+        event.extra if isinstance(event.extra, dict) else {}
+    ):
+        registered_service = None
     poller_own_channel = (
         event.trigger == "poller"
         and registered_service is not None
@@ -568,6 +575,7 @@ def _create_turn_auth_context(
     audience_provider: Any = None,
     cross_platform_pull: bool = True,
     server_discovered_pr_scope_store: ServerDiscoveredPRScopeStore | None = None,
+    policy: Any = None,
 ) -> AuthContext:
     inherited = _shell_continuation_auth_context(event)
     if inherited is None:
@@ -579,6 +587,7 @@ def _create_turn_auth_context(
             ifc_labels=ifc_labels,
             audience_provider=audience_provider,
             cross_platform_pull=cross_platform_pull,
+            policy=policy,
         )
     else:
         context = replace(
@@ -1610,6 +1619,7 @@ class Agent:
             event,
             event.attachment_names,
             resolver=getattr(self, "_identity_resolver", None),
+            policy=self._config.plugin_manager.policy,
         )
         await self._append_inbound_to_buffer(event, ifc_labels)
 
@@ -1721,6 +1731,7 @@ class Agent:
             self._skill_fingerprint_executor, fingerprint,
         )
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
     async def _build_agent_if_needed(self) -> Any:
         # ``create_deep_agent`` freezes ``system_prompt`` at graph
         # construction time. Re-render it on every call and use the
@@ -1858,7 +1869,10 @@ class Agent:
                 self._agent_tools is None
                 or coding_enabled != self._cached_coding_enabled
             ):
-                self._agent_tools = all_mimir_tools(coding_enabled=coding_enabled)
+                self._agent_tools = all_mimir_tools(
+                    coding_enabled=coding_enabled,
+                    policy=self._config.plugin_manager.policy,
+                )
 
             # Skills surfaced via SkillsMiddleware: pass operator +
             # bundled source paths as discovery sources. The framework
@@ -1905,8 +1919,8 @@ class Agent:
                 self._agent_middleware = (
                     TodoListMiddleware(),
                     IterationGateMiddleware(),
-                    ServiceToolSurfaceMiddleware(),
-                    BudgetGateMiddleware(),
+                    ServiceToolSurfaceMiddleware(self._config.plugin_manager.policy),
+                    BudgetGateMiddleware(self._config.plugin_manager.policy),
                     FetchedContentReminderMiddleware(self._config.home),
                     SkillMemoryInjectionMiddleware(skill_sources),
                     MidTurnInjectionMiddleware(),
@@ -1929,7 +1943,9 @@ class Agent:
                 backend=self._backend,
                 skills=skill_sources or None,
                 middleware=self._agent_middleware,
-                subagents=build_mimir_subagents(home=self._config.home),
+                subagents=build_mimir_subagents(
+                    home=self._config.home, policy=self._config.plugin_manager.policy,
+                ),
                 context_schema=AuthContext,
             )
             self._cached_system_prompt = system_prompt
@@ -1937,6 +1953,7 @@ class Agent:
             self._cached_coding_enabled = coding_enabled
             return self._agent
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
     async def run_turn(
         self,
         event: AgentEvent,
@@ -1952,6 +1969,92 @@ class Agent:
         from .approval_requests import (
             is_non_turn_bound_reply, pending as pending_approvals, resolve as resolve_approval,
         )
+        async def report_early_failure(exc: Exception, ctx: Any, failed_turn_id: str) -> None:
+            if event.trigger == "poller" and not getattr(ctx, "outcome_emitted", False):
+                try:
+                    await log_event(
+                        "turn_failed", channel_id=event.channel_id,
+                        turn_id=failed_turn_id, trigger=event.trigger,
+                        error=f"{type(exc).__name__}: {exc}"[:240],
+                        traceback="".join(traceback.format_exception(
+                            type(exc), exc, exc.__traceback__, limit=12,
+                        ))[-4000:],
+                        phase="pre_model_loop", **_turn_outcome_identity(event),
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original
+                    log.exception("early-phase turn_failed emit failed")
+            if not getattr(ctx, "outcome_emitted", False):
+                try:
+                    await self._notify_chat_skill_failure(
+                        event, f"{type(exc).__name__}: {exc}", ctx, phase="early_exception",
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original
+                    log.exception("early-phase chat-skill failure notice failed")
+                try:
+                    await self._post_deliver_failure(
+                        event, f"{type(exc).__name__}: {exc}", ctx,
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original
+                    log.exception("early-phase deliver notice failed")
+
+        explicit_session_binding = session_id is not None and saga_session_id is not None
+        def prepare_preflight_context():
+            labels = _initialize_ifc_labels(
+                event, event.attachment_names,
+                resolver=getattr(self, "_identity_resolver", None),
+                policy=self._config.plugin_manager.policy,
+            )
+            if explicit_session_binding:
+                bound = _require_auth_context(event.continuation_auth_context)
+                if not bound.enforcement_enabled:
+                    raise ValueError("bound turns require enforced authorization")
+                acp_state = (bound.ifc_state if bound.origin_trigger == "acp_session" else None)
+                if acp_state is not None:
+                    acp_state.merge(labels)
+                auth = replace(
+                    bound, ifc_labels=labels,
+                    ifc_state=acp_state or InformationFlowState(labels=labels),
+                    ingested_url_state=IngestedURLState(), saga_session_id=saga_session_id,
+                )
+                _seed_trigger_ingested_urls(event, labels, auth)
+            else:
+                auth = _create_turn_auth_context(
+                    event, getattr(self, "_identity_resolver", None),
+                    policy_version=getattr(self._config, "policy_version", None),
+                    enforce=self._config.access_control_enforced,
+                    ifc_labels=labels, audience_provider=self._audience_provider,
+                    cross_platform_pull=self._config.cross_platform_pull,
+                    server_discovered_pr_scope_store=self._server_discovered_pr_scope_store,
+                    policy=self._config.plugin_manager.policy,
+                )
+            return labels, auth
+
+        plugin_manager = self._config.plugin_manager
+        preflight_emitter = None
+        if plugin_manager.plugins:
+            initial_ifc_labels, initial_auth_context = prepare_preflight_context()
+            turn_id = turn_id or make_turn_id()
+            preflight_emitter = TurnEventEmitter(
+                self._turn_event_bus, turn_id=turn_id,
+                channel_id=event.channel_id, ifc_labels=initial_ifc_labels,
+                auth_context=initial_auth_context,
+            )
+            preflight_emitter.turn_started(event)
+            try:
+                await plugin_manager.turn_preflight(event, initial_auth_context)
+            except BaseException as exc:
+                if isinstance(exc, Exception):
+                    notice_context = SimpleNamespace(
+                        auth_context=initial_auth_context, ifc_labels=initial_ifc_labels,
+                    )
+                    await report_early_failure(exc, notice_context, turn_id)
+                try:
+                    preflight_emitter.turn_ended(
+                        status="error", error=f"{type(exc).__name__}: {exc}",
+                    )
+                except Exception:  # noqa: BLE001 — emission must not mask rejection
+                    pass
+                raise
         bare_reply = (event.content or "").strip().lower() in {"approve", "decline"}
         named_reply = is_non_turn_bound_reply(event)
         if _is_authenticated_operator(event, self._identity_resolver, allow_web=named_reply) and (named_reply or bare_reply):
@@ -1994,6 +2097,8 @@ class Agent:
                     await self._dispatcher._send_approval_notice(event.channel_id, notice)
                 elif notice and self._channels is not None:
                     await self._channels.send(event.channel_id, notice, final=True)
+                if preflight_emitter is not None:
+                    preflight_emitter.turn_ended(status="ok")
                 return TurnRecord(
                     ts=datetime.now(timezone.utc).isoformat(), turn_id=turn_id or make_turn_id(),
                     session_id=session_id or event.channel_id or "default",
@@ -2006,52 +2111,21 @@ class Agent:
                     ),
                 )
         turn_id = turn_id or make_turn_id()
-        explicit_session_binding = session_id is not None and saga_session_id is not None
         t_total_start = time.monotonic()
+        if not plugin_manager.plugins:
+            initial_ifc_labels, initial_auth_context = prepare_preflight_context()
         # chainlink #583 slice 1: bracket the whole turn on the live event bus
         # (no-op when unwired). turn_started here pairs with turn_ended in the
         # finally so every turn — even an early-phase crash — is bracketed.
-        initial_ifc_labels = _initialize_ifc_labels(
-            event,
-            event.attachment_names,
-            resolver=getattr(self, "_identity_resolver", None),
-        )
-        if explicit_session_binding:
-            bound_auth_context = _require_auth_context(event.continuation_auth_context)
-            if not bound_auth_context.enforcement_enabled:
-                raise ValueError("bound turns require enforced authorization")
-            acp_state = (bound_auth_context.ifc_state
-                         if bound_auth_context.origin_trigger == "acp_session" else None)
-            if acp_state is not None:
-                acp_state.merge(initial_ifc_labels)
-            initial_auth_context = replace(
-                bound_auth_context,
-                ifc_labels=initial_ifc_labels,
-                ifc_state=acp_state or InformationFlowState(labels=initial_ifc_labels),
-                ingested_url_state=IngestedURLState(),
-                saga_session_id=saga_session_id,
-            )
-        else:
-            initial_auth_context = _create_turn_auth_context(
-                event,
-                getattr(self, "_identity_resolver", None),
-                policy_version=getattr(self._config, "policy_version", None),
-                enforce=self._config.access_control_enforced,
-                ifc_labels=initial_ifc_labels,
-                audience_provider=self._audience_provider,
-                cross_platform_pull=self._config.cross_platform_pull,
-                server_discovered_pr_scope_store=self._server_discovered_pr_scope_store,
-            )
-        if explicit_session_binding:
-            _seed_trigger_ingested_urls(event, initial_ifc_labels, initial_auth_context)
-        emitter = TurnEventEmitter(
+        emitter = preflight_emitter or TurnEventEmitter(
             self._turn_event_bus,
             turn_id=turn_id,
             channel_id=event.channel_id,
             ifc_labels=initial_ifc_labels,
             auth_context=initial_auth_context,
         )
-        emitter.turn_started(event)
+        if preflight_emitter is None:
+            emitter.turn_started(event)
         _turn_record = None
         _turn_exc = None
         # chainlink #383: arm mid-turn injection before any slow setup work
@@ -2198,6 +2272,7 @@ class Agent:
                     ifc_labels=initial_ifc_labels,
                     audience_provider=self._audience_provider,
                     cross_platform_pull=self._config.cross_platform_pull,
+                    policy=self._config.plugin_manager.policy,
                 )
             # Update auth_ctx with the actual interactivity classification
             if auth_ctx is not None:
@@ -2342,48 +2417,13 @@ class Agent:
             # the dispatcher's own error handling is unchanged. Only
             # ``Exception`` (not CancelledError) — a cancelled turn isn't a
             # failure to recover.
-            if event.trigger == "poller" and not getattr(
-                ctx, "outcome_emitted", False
-            ):
-                try:
-                    await log_event(
-                        "turn_failed",
-                        channel_id=event.channel_id,
-                        turn_id=turn_id,
-                        trigger=event.trigger,
-                        error=f"{type(exc).__name__}: {exc}"[:240],
-                        traceback="".join(
-                            traceback.format_exception(
-                                type(exc), exc, exc.__traceback__, limit=12,
-                            )
-                        )[-4000:],
-                        phase="pre_model_loop",
-                        **_turn_outcome_identity(event),
-                    )
-                except Exception:  # noqa: BLE001 — never mask the original
-                    log.exception("early-phase turn_failed emit failed")
             # chainlink #508: an early-phase crash (prompt build, agent
             # construction, model resolution) is exactly "the agent couldn't
             # report" — mirror the deliver: failure notice here so a poller OR
             # scheduled-tick job with deliver: set isn't silently lost before
             # the model loop. Gated on outcome_emitted so it never double-posts
             # with the in-body path (which sets that flag after the loop).
-            if not getattr(ctx, "outcome_emitted", False):
-                try:
-                    await self._notify_chat_skill_failure(
-                        event,
-                        f"{type(exc).__name__}: {exc}",
-                        ctx,
-                        phase="early_exception",
-                    )
-                except Exception:  # noqa: BLE001 — never mask the original
-                    log.exception("early-phase chat-skill failure notice failed")
-                try:
-                    await self._post_deliver_failure(
-                        event, f"{type(exc).__name__}: {exc}", ctx,
-                    )
-                except Exception:  # noqa: BLE001 — never mask the original
-                    log.exception("early-phase deliver notice failed")
+            await report_early_failure(exc, ctx, turn_id)
             raise
         finally:
             # chainlink #583: close the turn bracket on the live bus. Status
@@ -4558,6 +4598,7 @@ class Agent:
             )
         return PromptBlock(content, labels)
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
     async def _build_synthesis_prompt(
         self, ctx: Any, event: AgentEvent,
     ) -> PromptBlock:

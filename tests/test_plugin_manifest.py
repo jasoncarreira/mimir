@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -74,6 +75,38 @@ def test_discovery_reads_only_the_owning_distribution(tmp_path, monkeypatch):
     assert enabled_plugins() == (discover_plugins()[0],)
     monkeypatch.setenv("MIMIR_PLUGINS", "all")
     assert len(enabled_plugins()) == 1
+
+
+def test_locally_installed_distribution_manifest_is_read_without_provider_import(tmp_path, monkeypatch):
+    """Use actual installed-distribution metadata, not a synthetic entry point."""
+    info = tmp_path / "provider_alpha-1.2.3.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Name: provider-alpha\nVersion: 1.2.3\n")
+    (info / "entry_points.txt").write_text(
+        "[mimir.plugins]\nalpha = poison_provider:register\n"
+    )
+    manifest = tmp_path / "pkg" / "mimir-plugin.toml"
+    manifest.parent.mkdir()
+    manifest.write_bytes(_toml())
+    (info / "RECORD").write_text(
+        "provider_alpha-1.2.3.dist-info/METADATA,,\n"
+        "provider_alpha-1.2.3.dist-info/entry_points.txt,,\n"
+        "pkg/mimir-plugin.toml,,\n"
+    )
+    (tmp_path / "poison_provider.py").write_text("raise AssertionError('imported provider')\n")
+    (distribution,) = metadata.distributions(path=[str(tmp_path)])
+    monkeypatch.setattr(
+        "mimir.plugins.discovery.metadata.entry_points",
+        lambda *, group: distribution.entry_points if group == "mimir.plugins" else (),
+    )
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    (candidate,) = discover_plugins()
+    assert (candidate.name, candidate.version, candidate.license, candidate.distribution,
+            candidate.enabled, candidate.diagnostic) == (
+        "alpha", "1.2.3", "MIT", "provider-alpha", False, None,
+    )
+    assert candidate.entry_point.dist is distribution
+    assert enabled_plugins(enable="") == ()
 
 
 @pytest.mark.parametrize("files,diagnostic", [

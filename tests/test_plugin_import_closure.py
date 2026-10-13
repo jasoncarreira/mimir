@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import textwrap
 
 import pytest
 
@@ -41,6 +42,110 @@ assert not loaded, loaded
     env["MIMIR_CODING_ENABLED"] = "0"
     result = subprocess.run(
         [sys.executable, "-c", script, root, *FORBIDDEN],
+        env=env, capture_output=True, text=True, check=False, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("coding_enabled", [False, True])
+def test_runtime_construction_coding_imports(tmp_path, coding_enabled: bool) -> None:
+    script = textwrap.dedent("""
+        import asyncio
+        import sys
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from mimir.runtime import CoreServices, RuntimeAdapters, create_agent_runtime
+        from unittest.mock import patch
+        import mimir.agent
+        import mimir.tools
+
+        class Dispatcher:
+            _run_turn = None
+
+            def __getattr__(self, name):
+                if name.startswith('set_'):
+                    return lambda value: setattr(self, '_' + name.removeprefix('set_'), value)
+                raise AttributeError(name)
+
+            def is_channel_busy(self, channel_id):
+                return False
+
+        class Scheduler:
+            _started = False
+
+            def set_arbiter(self, value):
+                self._arbiter = value
+
+        class Agent:
+            def __init__(self, *args, **kwargs):
+                self._arbiter = object()
+                self._shell_jobs = object()
+                self._handle_shell_job_complete = lambda job: None
+
+            async def run_turn(self, event):
+                pass
+
+            async def on_message_injected(self, event):
+                pass
+
+        async def main():
+            home = Path(sys.argv[1])
+            config = SimpleNamespace(
+                home=home, coding_enabled=sys.argv[2] == '1',
+                turns_log=home / 'logs' / 'turns.jsonl', max_turns_kept=100,
+                history_global_max=50, history_per_channel_max=25,
+                cross_platform_pull=True, saga_session_idle_minutes=10,
+                saga_session_max_turns=10,
+                commitments_log=home / '.mimir' / 'commitments.jsonl',
+                operator_alert_channel='', opencode_config_path=None,
+            )
+            if config.coding_enabled:
+                from mimir.tools import forge
+                initialized = []
+                identity_patch = patch.object(
+                    forge, 'initialize_github_forge_identity',
+                    side_effect=lambda: initialized.append(True) or True,
+                )
+                identity_patch.start()
+            core = CoreServices(
+                identity_resolver=SimpleNamespace(), aliases_loaded=0,
+                saga_db_path=home / '.mimir' / 'saga.db',
+                chat_skill_registry=SimpleNamespace(),
+            )
+            adapters = RuntimeAdapters(
+                dispatcher=Dispatcher(), scheduler=Scheduler(),
+                channels=SimpleNamespace(), pairing_notifier=SimpleNamespace(),
+                spawn_background_task=lambda coro, name: asyncio.create_task(coro, name=name),
+            )
+            with patch.object(mimir.agent, 'Agent', Agent), patch.object(
+                mimir.tools, 'all_mimir_tools', return_value=[],
+            ):
+                bundle = await create_agent_runtime(config, core, adapters)
+            try:
+                forbidden = sys.argv[3:]
+                loaded = sorted(name for name in sys.modules
+                                if any(name == prefix or name.startswith(prefix + '.')
+                                       for prefix in forbidden))
+                if config.coding_enabled:
+                    assert 'mimir.tools.forge' in loaded, loaded
+                    assert initialized == [True]
+                    assert forge._github_identity_degraded_callback is not None
+                else:
+                    assert not loaded, loaded
+            finally:
+                await bundle.aclose()
+                if config.coding_enabled:
+                    identity_patch.stop()
+
+        asyncio.run(main())
+    """)
+    env = os.environ.copy()
+    env.pop("MIMIR_PLUGINS", None)
+    env["MIMIR_HOME"] = str(tmp_path)
+    env["MIMIR_CODING_ENABLED"] = "1" if coding_enabled else "0"
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), str(int(coding_enabled)), *FORBIDDEN],
         env=env, capture_output=True, text=True, check=False, timeout=60,
     )
     assert result.returncode == 0, result.stderr

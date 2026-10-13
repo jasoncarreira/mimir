@@ -37,6 +37,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from .coding import coding_enabled
@@ -67,6 +68,11 @@ from .tool_descriptors import (
     SinkCategory,
     TOOL_DESCRIPTORS,
     get_tool_descriptor,
+)
+from .plugins.core import (
+    CapabilityTier, ServicePrincipal, ServiceSinkPolicy, core_policy_registry,
+    poller_properties, PolicyMappingView, PolicySetView, policy_membership,
+    scoped_policy_call, selected_policy_registry,
 )
 
 HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
@@ -139,15 +145,6 @@ assert set(SinkCategory) == _SINK_CATEGORY_CAPABILITY_ELIGIBLE | {
 }
 
 
-class CapabilityTier(StrEnum):
-    """Blast-radius ceiling for authority declared by autonomous triggers."""
-
-    SCOPE_CONTAINED = "scope-contained"
-    SCOPED_WITH_PROVENANCE = "scoped-with-provenance"
-    CODE_EXECUTION = "code-execution"
-    UNBOUNDED = "unbounded"
-
-
 class ToolFlowDirection(StrEnum):
     """Whether a tool reads protected data, emits data, does both, or neither."""
 
@@ -158,11 +155,10 @@ class ToolFlowDirection(StrEnum):
     UNKNOWN = "unknown"
 
 
-SHELL_PROCESS_TOOL_NAMES: frozenset[str] = frozenset(
-    name
-    for name, descriptor in TOOL_DESCRIPTORS.items()
+SHELL_PROCESS_TOOL_NAMES = PolicySetView(lambda policy: frozenset(
+    name for name, descriptor in policy.descriptors.items()
     if descriptor.sink_category is SinkCategory.SHELL_PROCESS
-)
+))
 
 _GENERIC_SHELL_INGEST_REFUSAL = (
     "Shell execution was refused after untrusted active ingest "
@@ -188,138 +184,9 @@ def _author_attestation_note(auth_context: Any) -> str:
         )
     return ""
 
-_TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
-    # Native model tools. This is intentionally exhaustive rather than derived
-    # from the sink map: startup checks the assembled surface against this map,
-    # so adding a tool without making an IFC decision fails closed.
-    # Declassification mutates the live authorization carrier but does not itself
-    # read protected data or emit it; the subsequent exact sink remains gated.
-    "approve_declassification": ToolFlowDirection.NEITHER,
-    "request_operator_approval": ToolFlowDirection.NEITHER,
-    "memory_query": ToolFlowDirection.SOURCE,
-    "memory_get": ToolFlowDirection.SOURCE,
-    "memory_store": ToolFlowDirection.SINK,
-    "memory_propose": ToolFlowDirection.SINK,
-    "open_proposal": ToolFlowDirection.SINK,
-    "proposal_diff": ToolFlowDirection.SOURCE,
-    "submit_proposal": ToolFlowDirection.SINK,
-    "abandon_proposal": ToolFlowDirection.SINK,
-    "saga_feedback": ToolFlowDirection.SINK,
-    "saga_mark_contributions": ToolFlowDirection.SINK,
-    "saga_end_session": ToolFlowDirection.SINK,
-    "saga_forget": ToolFlowDirection.SINK,
-    "saga_record_skill_learning": ToolFlowDirection.SINK,
-    "file_search": ToolFlowDirection.SOURCE,
-    "rebuild_index": ToolFlowDirection.SINK,
-    "mimir_get_turn": ToolFlowDirection.SOURCE,
-    "get_turn": ToolFlowDirection.SOURCE,
-    "shell_exec": ToolFlowDirection.BOTH,
-    "bash_async": ToolFlowDirection.BOTH,
-    "bash_jobs_list": ToolFlowDirection.SOURCE,
-    "bash_job_output": ToolFlowDirection.SOURCE,
-    "send_message": ToolFlowDirection.SINK,
-    "operator_alert": ToolFlowDirection.SINK,
-    "react": ToolFlowDirection.SINK,
-    "fetch_channel_history": ToolFlowDirection.SOURCE,
-    "list_channels": ToolFlowDirection.SOURCE,
-    "defer_injected_message": ToolFlowDirection.SINK,
-    "list_schedules": ToolFlowDirection.SOURCE,
-    "add_schedule": ToolFlowDirection.SINK,
-    "set_schedule_priority": ToolFlowDirection.SINK,
-    "remove_schedule": ToolFlowDirection.SINK,
-    "set_poller_overrides": ToolFlowDirection.SINK,
-    "reload_pollers": ToolFlowDirection.SINK,
-    "commitment_complete": ToolFlowDirection.SINK,
-    "commitment_snooze": ToolFlowDirection.SINK,
-    "commitment_dismiss": ToolFlowDirection.SINK,
-    "commitment_list": ToolFlowDirection.SOURCE,
-    "worklink_run": ToolFlowDirection.BOTH,
-    "worklink_resume": ToolFlowDirection.BOTH,
-    "request_mimir_update": ToolFlowDirection.SINK,
-    "web_search": ToolFlowDirection.BOTH,
-    "fetch_url": ToolFlowDirection.BOTH,
-    "post_message": ToolFlowDirection.SINK,
-    "webhook": ToolFlowDirection.SINK,
-    "http_request": ToolFlowDirection.BOTH,
-    "ntfy_send": ToolFlowDirection.SINK,
-    "spawn_open_code": ToolFlowDirection.BOTH,
-    # Deepagents model-bound built-ins and their async/compatibility aliases.
-    "read_file": ToolFlowDirection.SOURCE,
-    "aread": ToolFlowDirection.SOURCE,
-    "ls": ToolFlowDirection.SOURCE,
-    "als": ToolFlowDirection.SOURCE,
-    "glob": ToolFlowDirection.SOURCE,
-    "aglob": ToolFlowDirection.SOURCE,
-    "grep": ToolFlowDirection.SOURCE,
-    "agrep": ToolFlowDirection.SOURCE,
-    "write_file": ToolFlowDirection.SINK,
-    "edit_file": ToolFlowDirection.SINK,
-    "replace_file": ToolFlowDirection.SINK,
-    "download_files": ToolFlowDirection.BOTH,
-    "adownload_files": ToolFlowDirection.BOTH,
-    "write_todos": ToolFlowDirection.NEITHER,
-    # Built-in subagents remain inside the current IFC carrier; delegation
-    # propagation is handled separately and is not an external sink itself.
-    "task": ToolFlowDirection.NEITHER,
-    "Bash": ToolFlowDirection.BOTH,
-    "bash": ToolFlowDirection.BOTH,
-    "bash_exec": ToolFlowDirection.BOTH,
-    "execute": ToolFlowDirection.BOTH,
-    "aexecute": ToolFlowDirection.BOTH,
-    "shell": ToolFlowDirection.BOTH,
-    "hands_request_scope": ToolFlowDirection.NEITHER,
-    "hands_read": ToolFlowDirection.SOURCE,
-    "hands_edit": ToolFlowDirection.BOTH,
-    "hands_shell": ToolFlowDirection.BOTH,
-    "hands_python": ToolFlowDirection.BOTH,
-    "Write": ToolFlowDirection.SINK,
-    "Edit": ToolFlowDirection.SINK,
-    "Read": ToolFlowDirection.SOURCE,
-    "Glob": ToolFlowDirection.SOURCE,
-    "Grep": ToolFlowDirection.SOURCE,
-    # Harness egress is not model-bound but shares the same gate.
-    "harness_auto_deliver": ToolFlowDirection.SINK,
-    "harness_resend_nudge": ToolFlowDirection.SINK,
-    "activity_panel_post": ToolFlowDirection.SINK,
-    "activity_panel_edit": ToolFlowDirection.SINK,
-    "pr_metadata": ToolFlowDirection.SOURCE,
-    "pr_spec": ToolFlowDirection.SOURCE,
-    "pr_list": ToolFlowDirection.SOURCE,
-    "pr_files": ToolFlowDirection.SOURCE,
-    "pr_diff": ToolFlowDirection.SOURCE,
-    "pr_file_content": ToolFlowDirection.SOURCE,
-    "pr_checks": ToolFlowDirection.SOURCE,
-    "pr_job_log": ToolFlowDirection.SOURCE,
-    "ci_run_jobs": ToolFlowDirection.SOURCE,
-    "ci_run": ToolFlowDirection.SOURCE,
-    "ci_recent_runs": ToolFlowDirection.SOURCE,
-    "pr_reviews": ToolFlowDirection.SOURCE,
-    "pr_comments": ToolFlowDirection.SOURCE,
-    "pr_review_requests": ToolFlowDirection.SOURCE,
-    "pr_submit_review": ToolFlowDirection.SINK,
-    "pr_inline_review_comment": ToolFlowDirection.SINK,
-    "pr_comment": ToolFlowDirection.SINK,
-    "pr_edit_body": ToolFlowDirection.SINK,
-    "issue_comment": ToolFlowDirection.SINK,
-    "pr_rerequest_review": ToolFlowDirection.SINK,
-    "unsupported_operation": ToolFlowDirection.SINK,
-    "repo_checkout": ToolFlowDirection.BOTH,
-    "repo_cleanup": ToolFlowDirection.SINK,
-    "repo_fetch": ToolFlowDirection.BOTH,
-    "repo_status": ToolFlowDirection.SOURCE,
-    "repo_test": ToolFlowDirection.BOTH,
-    "repo_diff": ToolFlowDirection.SOURCE,
-    "repo_unmerged": ToolFlowDirection.SOURCE,
-    "repo_stage": ToolFlowDirection.SINK,
-    "repo_commit": ToolFlowDirection.SINK,
-    "repo_merge": ToolFlowDirection.SINK,
-    "repo_merge_abort": ToolFlowDirection.SINK,
-    "repo_rebase": ToolFlowDirection.SINK,
-    "repo_rebase_abort": ToolFlowDirection.SINK,
-    "repo_revert": ToolFlowDirection.SINK,
-    "repo_revert_abort": ToolFlowDirection.SINK,
-    "repo_push": ToolFlowDirection.SINK,
-}
+_TOOL_FLOW_MAP: Mapping[str, ToolFlowDirection] = PolicyMappingView(lambda policy: {
+    name: ToolFlowDirection(flow) for name, flow in policy.flow.items()
+})
 
 IFC_POLICY_VERSION = "ifc-v1"
 DECLASSIFICATION_LIFETIME_SECONDS = 30.0
@@ -359,156 +226,18 @@ from .client_file_resources import (
 )
 
 
-@dataclass(frozen=True)
-class ServiceSinkPolicy:
-    """One executable, operation-specific service destination grant."""
+TRIGGER_CAPABILITY_TIERS: Mapping[str, CapabilityTier] = PolicyMappingView(lambda policy: {
+    name: CapabilityTier(tier) for name, tier in policy.tiers.items()
+})
 
-    operation: str
-    adapter: str
-    destination: str
+_CAPABILITY_COMPANIONS: Mapping[str, frozenset[str]] = PolicyMappingView(
+    lambda policy: policy.capability_companions
+)
 
-
-@dataclass(frozen=True)
-class ServicePrincipal:
-    """Trusted autonomous service principal (chainlink #865).
-
-    Defined by server-owned creation path, trigger, capabilities, readable
-    domains, SAGA read breadth, and sink destinations. Unknown synthetic
-    triggers receive no privilege.
-    """
-    canonical: str
-    trigger: str
-    capabilities: tuple[str, ...] = ()
-    readable_domains: tuple[str, ...] = ()
-    sink_destinations: tuple[str, ...] = ()
-    sink_policies: tuple[ServiceSinkPolicy, ...] = ()
-    filesystem_read_roots: tuple[str, ...] = ()
-    owned_skill_directory: str | None = None
-    channel_memory_directory: str | None = None
-    saga_full_corpus_read: bool = False
-    creation_path: str | None = None
-    authority_profile: str | None = None
-    capability_tier: CapabilityTier | None = None
-    #: Per-job shell grants, additive on top of the profile's allowlist. Declared
-    #: in scheduler.yaml or a poller manifest -- neither of which any service
-    #: principal can write -- and validated into this shape before it lands here.
-    declared_shell_commands: tuple["DeclaredShellCommand", ...] = ()
-    # Exact delivery destination nominated by trusted poller/schedule config.
-    # Prompt assembly uses this carrier instead of client-readable event.extra.
-    configured_delivery_channel: str | None = None
-    proposal_surface: str = "wiki"
-
-    def can_read_domain(self, domain: str) -> bool:
-        return domain in self.readable_domains
-
-    def can_write_sink(self, sink: str) -> bool:
-        return sink in self.sink_destinations
-
-    def has_capability(self, capability: str) -> bool:
-        return capability in self.capabilities
-
-    def sink_policy_for(self, operation: str) -> ServiceSinkPolicy | None:
-        return next(
-            (policy for policy in self.sink_policies if policy.operation == operation),
-            None,
-        )
-
-
-# This catalog is the executable tier table for trigger authority. Manifest
-# parsing imports it rather than maintaining a second list of grantable names.
-TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
-    "write_file": CapabilityTier.SCOPE_CONTAINED,
-    "edit_file": CapabilityTier.SCOPE_CONTAINED,
-    "replace_file": CapabilityTier.SCOPE_CONTAINED,
-    "rebuild_index": CapabilityTier.SCOPE_CONTAINED,
-    "shell_exec": CapabilityTier.SCOPE_CONTAINED,
-    "bash_async": CapabilityTier.SCOPE_CONTAINED,
-    "bash_jobs_list": CapabilityTier.SCOPE_CONTAINED,
-    "bash_job_output": CapabilityTier.SCOPE_CONTAINED,
-    "read_file": CapabilityTier.SCOPE_CONTAINED,
-    "proposal_diff": CapabilityTier.SCOPE_CONTAINED,
-    "aread": CapabilityTier.SCOPE_CONTAINED,
-    "ls": CapabilityTier.SCOPE_CONTAINED,
-    "als": CapabilityTier.SCOPE_CONTAINED,
-    "glob": CapabilityTier.SCOPE_CONTAINED,
-    "aglob": CapabilityTier.SCOPE_CONTAINED,
-    "grep": CapabilityTier.SCOPE_CONTAINED,
-    "agrep": CapabilityTier.SCOPE_CONTAINED,
-    "file_search": CapabilityTier.SCOPE_CONTAINED,
-    "get_turn": CapabilityTier.SCOPE_CONTAINED,
-    "mimir_get_turn": CapabilityTier.SCOPE_CONTAINED,
-    "memory_get": CapabilityTier.SCOPE_CONTAINED,
-    "send_message": CapabilityTier.SCOPE_CONTAINED,
-    "operator_alert": CapabilityTier.SCOPE_CONTAINED,
-    "memory_store": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "memory_propose": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "open_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "submit_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "abandon_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "saga_feedback": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "saga_mark_contributions": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "saga_end_session": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "saga_record_skill_learning": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "worklink_run": CapabilityTier.CODE_EXECUTION,
-    "worklink_resume": CapabilityTier.CODE_EXECUTION,
-    "spawn_open_code": CapabilityTier.CODE_EXECUTION,
-    "fetch_url": CapabilityTier.UNBOUNDED,
-    "web_search": CapabilityTier.UNBOUNDED,
-    "webhook": CapabilityTier.UNBOUNDED,
-    "http_request": CapabilityTier.UNBOUNDED,
-    "ntfy_send": CapabilityTier.UNBOUNDED,
-    "task": CapabilityTier.SCOPE_CONTAINED,
-    "list_schedules": CapabilityTier.SCOPE_CONTAINED,
-    "pr_metadata": CapabilityTier.SCOPE_CONTAINED,
-    "pr_spec": CapabilityTier.SCOPE_CONTAINED,
-    "pr_list": CapabilityTier.SCOPE_CONTAINED,
-    "pr_files": CapabilityTier.SCOPE_CONTAINED,
-    "pr_diff": CapabilityTier.SCOPE_CONTAINED,
-    "pr_file_content": CapabilityTier.SCOPE_CONTAINED,
-    "pr_checks": CapabilityTier.SCOPE_CONTAINED,
-    "pr_job_log": CapabilityTier.SCOPE_CONTAINED,
-    "ci_run_jobs": CapabilityTier.SCOPE_CONTAINED,
-    "ci_run": CapabilityTier.SCOPE_CONTAINED,
-    "ci_recent_runs": CapabilityTier.SCOPE_CONTAINED,
-    "pr_reviews": CapabilityTier.SCOPE_CONTAINED,
-    "pr_comments": CapabilityTier.SCOPE_CONTAINED,
-    "pr_review_requests": CapabilityTier.SCOPE_CONTAINED,
-    "pr_review_others": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "pr_submit_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "pr_inline_review_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "pr_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "pr_edit_body": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "issue_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "pr_rerequest_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "unsupported_operation": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_checkout": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_cleanup": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_fetch": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_test": CapabilityTier.CODE_EXECUTION,
-    "repo_status": CapabilityTier.SCOPE_CONTAINED,
-    "repo_diff": CapabilityTier.SCOPE_CONTAINED,
-    "repo_unmerged": CapabilityTier.SCOPE_CONTAINED,
-    "repo_stage": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_commit": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_merge": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_merge_abort": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_rebase": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_rebase_abort": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_revert": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_revert_abort": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_push": CapabilityTier.SCOPED_WITH_PROVENANCE,
-}
-
-_CAPABILITY_COMPANIONS: dict[str, frozenset[str]] = {
-    "shell_exec": frozenset({"bash_jobs_list", "bash_job_output"}),
-    "bash_async": frozenset({"bash_jobs_list", "bash_job_output"}),
-}
-
-_PROFILE_CAPABILITY_COMPANIONS: dict[str, dict[str, frozenset[str]]] = {
-    "heartbeat": {
-        "worklink_run": frozenset({"read_file", "ls", "shell_exec"}),
-    },
-}
+_PROFILE_CAPABILITY_COMPANIONS: Mapping[str, Mapping[str, frozenset[str]]] = PolicyMappingView(lambda policy: {
+    name: profile.capability_companions for name, profile in policy.profiles.items()
+    if profile.capability_companions
+})
 
 
 def _missing_capability_companions(
@@ -526,111 +255,43 @@ def _missing_capability_companions(
 # Built-in services predate manifest-declarable trigger authority. Keep their
 # explicitly declared, review-bounded proposal workflow classified without
 # making those capabilities grantable to custom trigger manifests.
-_LEGACY_SERVICE_SINK_TIERS: dict[str, CapabilityTier] = {
-    "open_proposal": CapabilityTier.SCOPE_CONTAINED,
-    "submit_proposal": CapabilityTier.SCOPE_CONTAINED,
-    "abandon_proposal": CapabilityTier.SCOPE_CONTAINED,
-}
+_LEGACY_SERVICE_SINK_TIERS: Mapping[str, CapabilityTier] = PolicyMappingView(lambda policy: {
+    name: CapabilityTier(tier) for name, tier in policy.legacy_service_sink_tiers.items()
+})
 
-TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
-    "research": frozenset({
-        "write_file", "edit_file", "replace_file", "read_file", "aread", "ls", "als",
-        "glob", "aglob", "grep", "agrep", "file_search", "memory_store",
-        "memory_propose",
-        "saga_feedback", "saga_mark_contributions", "send_message",
-        "saga_record_skill_learning", "operator_alert", "shell_exec",
-        "bash_jobs_list", "bash_job_output", "fetch_url",
-        "open_proposal", "submit_proposal", "abandon_proposal",
-    }),
-    "github": frozenset({
-        "worklink_run", "worklink_resume", "write_file", "edit_file", "replace_file", "shell_exec",
-        "bash_async", "bash_jobs_list", "bash_job_output", "read_file",
-        "aread", "ls", "als", "glob", "aglob", "grep", "agrep",
-        "file_search", "get_turn", "mimir_get_turn", "send_message",
-        "operator_alert", "task", "memory_store", "saga_mark_contributions",
-        "saga_end_session", "saga_record_skill_learning", "fetch_url",
-        "pr_metadata", "pr_spec", "pr_list", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
-        "pr_comments", "pr_review_requests", "pr_submit_review",
-        "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
-        "pr_edit_body", "pr_review_others", "pr_job_log", "ci_run_jobs", "ci_run", "ci_recent_runs",
-        "issue_comment",
-        "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
-        "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
-        "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
-        "repo_revert", "repo_revert_abort", "repo_push",
-    }),
-    # Custom profiles remain tier-validated and cannot request unbounded sinks.
-    "custom": frozenset(TRIGGER_CAPABILITY_TIERS) - {
-        "issue_comment", "open_proposal", "submit_proposal", "abandon_proposal",
-        "proposal_diff",
-    },
-    "heartbeat": frozenset({
-        "write_file", "edit_file", "replace_file", "shell_exec", "bash_async",
-        "bash_jobs_list", "bash_job_output", "read_file", "aread", "ls",
-        "als", "glob", "aglob", "grep", "agrep", "file_search",
-        "get_turn", "mimir_get_turn", "memory_store", "saga_feedback",
-        "saga_mark_contributions", "worklink_run", "send_message",
-        "operator_alert", "fetch_url", "task", "list_schedules",
-        "pr_metadata", "pr_spec", "pr_list", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
-        "pr_comments", "pr_review_requests", "pr_submit_review",
-        "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
-        "pr_edit_body",
-        "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
-        "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
-        "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
-        "repo_revert", "repo_revert_abort", "repo_push",
-    }),
-    "session-boundary": frozenset({
-        "memory_get", "mimir_get_turn", "saga_feedback", "saga_end_session",
-        "write_file",
-    }),
-}
+TRIGGER_AUTHORITY_PROFILES: Mapping[str, frozenset[str]] = PolicyMappingView(
+    lambda policy: policy.authority_profiles
+)
 
 # Scheduler records may opt into these built-in profiles. Keeping this set
 # separate prevents a scheduler entry from selecting a profile whose trigger
 # semantics require additional manifest data (for example a poller profile).
-SCHEDULER_AUTHORITY_PROFILES = frozenset({"heartbeat"})
+SCHEDULER_AUTHORITY_PROFILES = PolicySetView(lambda policy: frozenset(
+    name for name, profile in policy.profiles.items() if profile.scheduler
+))
 
-_BUILTIN_TRIGGER_PROFILE_CONFIG: dict[str, dict[str, Any]] = {
-    "heartbeat": {
-        "canonical": "heartbeat",
-        "trigger": "scheduled_tick",
-        "tier": CapabilityTier.UNBOUNDED,
-        "root_parts": ("state", "triggers", "heartbeat"),
-        "channel_memory_directory": "scheduler:heartbeat",
-        "creation_path": "mimir.scheduler.Scheduler._fire:heartbeat",
-        # Heartbeat is an autonomous agent turn that recalls accumulated memory.
-        # This broadens SAGA reads only; its capabilities and sinks stay profile-bound.
-        "saga_full_corpus_read": True,
-    },
-    "session-boundary": {
-        "canonical": "synthesis",
-        "trigger": "saga_session_end",
-        "tier": CapabilityTier.SCOPED_WITH_PROVENANCE,
-        "root_parts": None,
-        "channel_memory_directory": None,
-        "creation_path": "mimir.server._on_session_idle",
-        "saga_full_corpus_read": True,
-    },
-}
+_BUILTIN_TRIGGER_PROFILE_CONFIG: Mapping[str, Mapping[str, Any]] = PolicyMappingView(lambda policy: {
+    name: MappingProxyType({
+        **profile.builtin_trigger_config,
+        "tier": CapabilityTier(profile.builtin_trigger_config["tier"]),
+    })
+    for name, profile in policy.profiles.items()
+    if profile.builtin_trigger_config is not None
+})
 
-_SHELL_PROFILE_BY_AUTHORITY_PROFILE = {
-    "github": "repo_review",
-    "heartbeat": "maintenance",
-    "session-boundary": "session_boundary",
-}
-OPERATOR_SHELL_PROFILE = "scheduler_read_only"
-_FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = {
-    "heartbeat": ("approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"),
-    "github": ("github_pr_api", "GITHUB_REPOS"),
-    "session-boundary": ("github_pr_api", "GITHUB_REPOS"),
-}
-BOUNDED_PROFILE_CAPABILITIES: dict[str, frozenset[str]] = {
-    "research": frozenset({"fetch_url"}),
-    "github": frozenset({"fetch_url"}),
-    "session-boundary": frozenset({"fetch_url"}),
-}
-_PR_REVIEW_SCOPE_AUTHORITY_PROFILES = frozenset({"heartbeat"})
+_SHELL_PROFILE_BY_AUTHORITY_PROFILE = PolicyMappingView(lambda policy: policy.shell_profile_mappings)
+OPERATOR_SHELL_PROFILE = core_policy_registry().operator_shell_profile
+_FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = PolicyMappingView(lambda policy: {
+    name: profile.fetch_url_policy for name, profile in policy.profiles.items()
+    if profile.fetch_url_policy is not None
+})
+BOUNDED_PROFILE_CAPABILITIES: Mapping[str, frozenset[str]] = PolicyMappingView(lambda policy: {
+    name: profile.bounded_capabilities for name, profile in policy.profiles.items()
+    if profile.bounded_capabilities
+})
+_PR_REVIEW_SCOPE_AUTHORITY_PROFILES = PolicySetView(lambda policy: frozenset(
+    name for name, profile in policy.profiles.items() if profile.pr_review_scope
+))
 
 _CAPABILITY_TIER_RANK = {
     CapabilityTier.SCOPE_CONTAINED: 0,
@@ -640,6 +301,7 @@ _CAPABILITY_TIER_RANK = {
 }
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def build_trigger_service_principal(
     *,
     canonical: str,
@@ -655,14 +317,33 @@ def build_trigger_service_principal(
     approved_urls: tuple[str, ...] = (),
     proposal_surface: str = "wiki",
     creation_path: str,
+    policy: "PolicyRegistry | None" = None,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
+    selected = policy if policy is not None else selected_policy_registry()
+    if not selected.frozen:
+        raise ValueError("service principal requires a frozen policy")
+    if policy is not None and profile not in selected.profiles:
+        raise ValueError(f"unknown authority profile: {profile!r}")
     if profile == "research":
         capabilities = tuple(cap for cap in capabilities if cap != "fetch_url")
         if approved_urls:
             capabilities += ("fetch_url",)
     capability_set = set(capabilities)
-    missing = _missing_capability_companions(capability_set, profile=profile)
+    if policy is not None:
+        outside = capability_set - selected.authority_profiles[profile]
+        if outside:
+            raise ValueError(f"capabilities outside {profile!r} profile: {', '.join(sorted(outside))}")
+        unknown = capability_set - selected.tiers.keys()
+        if unknown:
+            raise ValueError(f"unknown capabilities: {', '.join(sorted(unknown))}")
+    companions = dict(selected.capability_companions)
+    if profile in selected.profiles:
+        companions.update(selected.profiles[profile].capability_companions)
+    missing = {
+        companion for capability in capability_set
+        for companion in companions.get(capability, ()) if companion not in capability_set
+    }
     if missing:
         raise ValueError(
             "capabilities require companions: "
@@ -673,7 +354,8 @@ def build_trigger_service_principal(
     home_data_roots = (
         (Path(home) / "state", Path(home) / "memory", artifact_root) if home else ()
     )
-    is_github_activity = canonical == "poller:github-activity"
+    poller_flags = poller_properties(canonical).principal_fields() if trigger == "poller" else {}
+    is_github_activity = poller_flags.get("github_activity", False)
     repo_roots = tuple(root.resolve() for root in _configured_repo_roots())
     fetch_cache_roots = (
         (Path(home) / "attachments" / "fetch-cache",)
@@ -706,10 +388,11 @@ def build_trigger_service_principal(
     sink_destinations: set[str] = set()
     policies: list[ServiceSinkPolicy] = []
     for operation in operations:
-        domain = _OPERATION_READABLE_DOMAIN.get(operation)
+        tool = selected.tools.get(operation)
+        domain = tool.readable_domain if tool is not None else _OPERATION_READABLE_DOMAIN.get(operation)
         if domain:
             readable_domains.add(domain)
-        descriptor = get_tool_descriptor(operation)
+        descriptor = selected.descriptors.get(operation)
         destination = descriptor.sink_destination if descriptor else None
         if destination:
             sink_destinations.add(destination)
@@ -744,6 +427,21 @@ def build_trigger_service_principal(
                 ]))
             if fetch_policy is not None:
                 policies.append(ServiceSinkPolicy(operation, *fetch_policy))
+        elif tool is not None and tool.owner != "core" and tool.service_sink_adapter is not None:
+            adapter = tool.service_sink_adapter
+            if adapter == "trigger_service_write_roots":
+                bound = json.dumps([str(root) for root in write_roots])
+            elif adapter == "approved_urls":
+                bound = "MIMIR_EGRESS_APPROVED_URLS"
+            elif adapter == "operator_alert":
+                bound = "MIMIR_OPERATOR_ALERT_CHANNEL"
+            elif adapter == "shell_profile":
+                bound = selected.shell_profile_mappings.get(profile, "scheduler_read_only")
+            elif adapter == "spawn_workspace":
+                bound = "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"
+            else:
+                raise ValueError(f"unsupported service sink adapter for {operation}: {adapter}")
+            policies.append(ServiceSinkPolicy(operation, adapter, bound))
     if "operator_alert" in capabilities:
         policies.append(ServiceSinkPolicy(
             "operator_alert", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL",
@@ -773,14 +471,20 @@ def build_trigger_service_principal(
         capability_tier=tier,
         declared_shell_commands=declared_shell_commands,
         proposal_surface=proposal_surface,
+        **poller_flags,
     )
 
 
 def builtin_trigger_service_principal(
     profile: str, home: Path, *, scheduler_job_name: str | None = None,
+    policy: "PolicyRegistry | None" = None,
 ) -> ServicePrincipal:
     """Return the authoritative built-in grant; manifests cannot replace it."""
-    config = _BUILTIN_TRIGGER_PROFILE_CONFIG.get(profile)
+    selected = policy if policy is not None else selected_policy_registry()
+    if not selected.frozen:
+        raise ValueError("built-in principal requires a frozen policy")
+    declared = selected.profiles.get(profile)
+    config = declared.builtin_trigger_config if declared is not None else None
     if config is None:
         raise ValueError(f"unknown built-in authority profile: {profile!r}")
     root_parts = config["root_parts"]
@@ -797,12 +501,13 @@ def builtin_trigger_service_principal(
         canonical=config["canonical"],
         trigger=config["trigger"],
         profile=profile,
-        tier=config["tier"],
-        capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
+        tier=CapabilityTier(config["tier"]),
+        capabilities=tuple(sorted(selected.authority_profiles[profile])),
         roots=roots,
         channel_memory_directory=channel_memory_directory,
         creation_path=config["creation_path"],
         saga_full_corpus_read=config["saga_full_corpus_read"],
+        policy=selected,
     )
 
 
@@ -969,7 +674,7 @@ def _is_worklink_retained_checkout_service(
     """Bind retained-checkout authority to the authenticated reserved poller."""
     return (
         isinstance(service, ServicePrincipal)
-        and service.canonical == "poller:worklink-ready-queue"
+        and service.worklink_retained_checkout
         and service.trigger == "poller"
         and service.authority_profile == "github"
         and service == get_trusted_service_from_auth_context(auth_context)
@@ -1196,46 +901,18 @@ _REPO_PR_REVIEW_ACTIONS = frozenset({
     RepoPRAction.PR_REVIEW.value,
     RepoPRAction.PR_COMMENT.value,
 })
-_FORGE_TOOL_ACTIONS: dict[str, str | None] = {
-    "pr_metadata": RepoPRAction.INSPECT.value,
-    "pr_spec": RepoPRAction.INSPECT.value,
-    "pr_files": RepoPRAction.INSPECT.value,
-    "pr_diff": RepoPRAction.INSPECT.value,
-    "pr_file_content": RepoPRAction.INSPECT.value,
-    "pr_checks": RepoPRAction.INSPECT.value,
-    "pr_job_log": RepoPRAction.INSPECT.value,
-    "pr_reviews": RepoPRAction.INSPECT.value,
-    "pr_comments": RepoPRAction.INSPECT.value,
-    "pr_review_requests": RepoPRAction.INSPECT.value,
-    "pr_submit_review": RepoPRAction.PR_REVIEW.value,
-    "pr_inline_review_comment": RepoPRAction.PR_REVIEW.value,
-    "pr_comment": RepoPRAction.PR_COMMENT.value,
-    "pr_edit_body": RepoPRAction.PR_EDIT.value,
-    "pr_rerequest_review": RepoPRAction.PR_REREQUEST.value,
-    "unsupported_operation": None,
-}
-_REPO_TOOL_ACTIONS: dict[str, str] = {
-    "repo_checkout": RepoPRAction.CHECKOUT.value,
-    "repo_cleanup": RepoPRAction.CHECKOUT.value,
-    "repo_fetch": RepoPRAction.CHECKOUT.value,
-    "repo_status": RepoPRAction.INSPECT.value,
-    "repo_test": RepoPRAction.TEST.value,
-    "repo_diff": RepoPRAction.INSPECT.value,
-    "repo_unmerged": RepoPRAction.INSPECT.value,
-    "repo_stage": RepoPRAction.WRITE.value,
-    "repo_commit": RepoPRAction.COMMIT.value,
-    "repo_merge": RepoPRAction.COMMIT.value,
-    "repo_merge_abort": RepoPRAction.WRITE.value,
-    "repo_rebase": RepoPRAction.COMMIT.value,
-    "repo_rebase_abort": RepoPRAction.WRITE.value,
-    "repo_revert": RepoPRAction.COMMIT.value,
-    "repo_revert_abort": RepoPRAction.WRITE.value,
-    "repo_push": RepoPRAction.PUSH.value,
-}
-_RETAINED_REPO_TOOLS = frozenset({
-    "repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit",
-})
-_TYPED_REPO_PR_TOOL_ACTIONS = {**_FORGE_TOOL_ACTIONS, **_REPO_TOOL_ACTIONS}
+def _typed_action_view(*memberships: str) -> Mapping[str, str | None]:
+    return PolicyMappingView(lambda policy: {
+        name: tool.typed_action.value if tool.typed_action is not None else None
+        for name, tool in policy.tools.items()
+        if tool.memberships.intersection(memberships)
+    })
+
+
+_FORGE_TOOL_ACTIONS = _typed_action_view("forge_actions")
+_REPO_TOOL_ACTIONS = _typed_action_view("repo_actions")
+_RETAINED_REPO_TOOLS = policy_membership("retained_repo_tools")
+_TYPED_REPO_PR_TOOL_ACTIONS = _typed_action_view("forge_actions", "repo_actions")
 _GITHUB_REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _GITHUB_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 
@@ -5917,7 +5594,7 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
         return False
     service = get_trusted_service_from_auth_context(auth_context)
     policy = service.sink_policy_for("fetch_url") if service is not None else None
-    if service is not None and service.canonical == "poller:github-activity":
+    if service is not None and service.github_activity:
         from .models import RepoPRActionScope
 
         # Expanded evidence reads need BOTH manifest authority and the turn's
@@ -6019,7 +5696,7 @@ def _sink_adapter_admits(
     if (
         adapter is _target_matches_approved_url
         and service is not None
-        and service.canonical == "poller:github-activity"
+        and service.github_activity
         and _target_matches_github_pr_api(target, "GITHUB_REPOS")
     ):
         return True
@@ -6072,23 +5749,15 @@ _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
 # Taint gating still applies upstream at the capability-tier gate; membership
 # here bypasses only destination checks. Keep membership narrow: a candidate
 # must accept no caller-selected target and write only fixed derived destinations.
-_FIXED_SERVICE_SINK_OPERATIONS = frozenset({"rebuild_index"})
+_FIXED_SERVICE_SINK_OPERATIONS = policy_membership("fixed_service_sinks")
 
 
-_TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset({
-    "fetch_url",
-    # Deliberate single-operator exception: the model-composed search query is
-    # an accepted outbound channel, permitted on a tainted turn because it goes
-    # to one operator-fixed trusted service. Search results are untrusted active
-    # ingest, so gating this channel would make the first search taint the turn
-    # and cap every research turn at one search.
-    # Unlike a fetch_url ``/*`` scope, there is no model-chosen destination and
-    # thus no exact-URL mitigation analogue. This is unsafe if untrusted
-    # multi-user chat is enabled: induced queries could encode other data. The
-    # trusted-operator shell_exec/file allowance below has the same deployment
-    # condition; neither exception may be carried into that posture unchanged.
-    "web_search",
-})
+# Deliberate single-operator exception: the model-composed web_search query
+# goes to one operator-fixed trusted service. Search results are untrusted
+# active ingest, so gating this channel would cap research at one search.
+# Unlike fetch_url, there is no model-chosen destination or exact-URL mitigation.
+# This and the trusted-operator shell/file allowance require a trusted deployment.
+_TAINT_INDEPENDENT_EGRESS_TOOLS = policy_membership("taint_independent_egress")
 
 
 def _egress_target_requires_taint_gate(
@@ -6220,9 +5889,7 @@ def _has_untrusted_active_ingest(
     )
 
 
-_SCHEDULE_WRITE_TOOLS = frozenset({
-    "add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides",
-})
+_SCHEDULE_WRITE_TOOLS = policy_membership("schedule_writes")
 _SCHEDULE_WRITE_REFUSAL = (
     "Scheduled work and autonomous instruction surfaces cannot be changed after "
     "untrusted ingest; propose this change with open_proposal/submit_proposal; "
@@ -6361,10 +6028,8 @@ def _scheduled_write_denial(tool_name: str, *, skill: bool = False) -> "ToolAuth
     )
 
 
-_WORKLINK_BUILD_TOOLS = frozenset({"worklink_run", "worklink_resume"})
-_REPO_PUBLISH_TOOLS = frozenset({
-    "repo_commit", "repo_merge", "repo_rebase", "repo_revert", "repo_push",
-})
+_WORKLINK_BUILD_TOOLS = policy_membership("worklink_build_tools")
+_REPO_PUBLISH_TOOLS = policy_membership("repo_publish_tools")
 _REPO_PUBLISH_INGEST_REFUSAL = (
     "This turn read untrusted outside content, so it cannot create or publish commits. "
     "Describe the intended change in a PR comment (pr_comment) or a message to the "
@@ -6372,17 +6037,8 @@ _REPO_PUBLISH_INGEST_REFUSAL = (
 )
 
 
-_TAINTED_TURN_WRITE_TOOLS = frozenset({
-    "repo_stage", "repo_commit", "repo_merge", "repo_rebase", "repo_revert",
-    "repo_push", "repo_test", "hands_edit", "hands_shell", "hands_python",
-    "memory_store", "saga_feedback", "saga_mark_contributions", "saga_end_session",
-    "saga_forget", "saga_record_skill_learning",
-})
-_TAINTED_FILE_WRITE_TOOLS = frozenset({
-    "write_file", "edit_file", "replace_file", "upload",
-    "awrite_file", "aedit_file", "areplace_file", "aupload",
-    "write", "edit", "replace", "awrite", "aedit", "areplace",
-})
+_TAINTED_TURN_WRITE_TOOLS = policy_membership("tainted_writes")
+_TAINTED_FILE_WRITE_TOOLS = policy_membership("tainted_file_writes")
 _TAINTED_WRITE_REFUSAL = (
     "This turn read untrusted outside content, so it cannot directly write code "
     "or live state. Use scratch/ and a proposal PR via open_proposal/submit_proposal "
@@ -7672,7 +7328,7 @@ class SinkGate:
             if (
                 not service_target_allowed
                 and sink_category is SinkCategory.FILE
-                and service.canonical == "poller:github-activity"
+                and service.github_activity
             ):
                 service_target_allowed = _target_within_active_pr_checkout_lease(
                     target, review_state,
@@ -8408,11 +8064,7 @@ class ChannelResourceAdapter:
     - Denials are structured and redacted without relying on model-supplied fields
     """
 
-    _CHANNEL_OPERATIONS: frozenset[str] = frozenset({
-        "send_message",
-        "react",
-        "fetch_channel_history",
-    })
+    _CHANNEL_OPERATIONS = policy_membership("channel_operations")
 
     _global_resolver: Any = None
 
@@ -8444,6 +8096,7 @@ class ChannelResourceAdapter:
         auth_context: "AuthContext | None",
         *,
         enforce: bool = False,
+        registered_plugin: bool = False,
     ) -> ToolAuthorization:
         """Authorize a channel operation against the triggering channel.
 
@@ -8459,7 +8112,7 @@ class ChannelResourceAdapter:
         Returns:
             ToolAuthorization with allowed/reason fields populated
         """
-        if tool_name not in cls._CHANNEL_OPERATIONS:  # Misuse guard; never shadow-emitted.
+        if tool_name not in cls._CHANNEL_OPERATIONS and not registered_plugin:
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.UNKNOWN,
@@ -8559,8 +8212,8 @@ class ChannelResourceAdapter:
 class WriteResourceAdapter:
     """Scope write/code operations by the server-authenticated caller axis."""
 
-    _WRITE_OPERATIONS: frozenset[str] = frozenset({"write_file", "edit_file", "replace_file"})
-    _RESOURCE_OPERATIONS: frozenset[str] = _WRITE_OPERATIONS | {"worklink_run", "worklink_resume"}
+    _WRITE_OPERATIONS = policy_membership("write_operations")
+    _RESOURCE_OPERATIONS = policy_membership("write_resource_operations")
     _PROTECTED_NAMES: frozenset[str] = frozenset({
         ".env", ".git", ".mimir", "memory-proposals.jsonl", "compose.env", "rate_limits.json",
         "config", "credentials", "identities", "secrets", "secret",
@@ -8738,91 +8391,23 @@ class OperationCatalog:
     they are denied by default when enforcement is on.
     """
 
-    _OPEN_OPERATIONS: frozenset[str] = frozenset({
-        "commitment_list",
-        "memory_query",
-        "memory_get",
-        # Web research is available to authorized users; calls remain subject
-        # to the NETWORK information-flow sink gate before authorization.
-        "web_search",
-        "fetch_url",
-        "write_todos",
-        "defer_injected_message",
-        "request_operator_approval",
-        "commitment_complete",
-        "commitment_snooze",
-        "commitment_dismiss",
-    })
+    _OPEN_OPERATIONS = PolicySetView(lambda policy: frozenset(
+        name for name, tool in policy.tools.items() if tool.operation_class == "open"
+    ))
 
-    _RESOURCE_SCOPED_OPERATIONS: frozenset[str] = (
-        READ_RESOURCE_OPERATIONS
-        | WriteResourceAdapter._RESOURCE_OPERATIONS
-        | frozenset(_TYPED_REPO_PR_TOOL_ACTIONS)
-        | frozenset({"hands_read", "ci_run_jobs", "ci_run", "ci_recent_runs"})
-    )
+    _RESOURCE_SCOPED_OPERATIONS = PolicySetView(lambda policy: frozenset(
+        name for name, tool in policy.tools.items() if tool.operation_class == "resource_scoped"
+    ))
 
-    _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
-        "pr_list",
-        "issue_comment",
-        "operator_alert",
-        "approve_declassification",
-        "list_channels",
-        "list_schedules",
-        "add_schedule",
-        "set_schedule_priority",
-        "remove_schedule",
-        "reload_pollers",
-        "open_proposal",
-        "proposal_diff",
-        "submit_proposal",
-        "abandon_proposal",
-        "request_mimir_update",
-        "shell_exec",
-        "bash_async",
-        "bash_jobs_list",
-        "bash_job_output",
-        "spawn_open_code",
-        "task",
-        "memory_store",
-        "memory_propose",
-        "saga_feedback",
-        "saga_mark_contributions",
-        "saga_end_session",
-        "saga_record_skill_learning",
-        "saga_forget",
-        "set_poller_overrides",
-        "download_files",
-        "adownload_files",
-        "rebuild_index",
-        "hands_edit",
-        "hands_shell",
-        "hands_python",
-        "hands_request_scope",
-    })
+    _ADMIN_REQUIRED_OPERATIONS = PolicySetView(lambda policy: frozenset(
+        name for name, tool in policy.tools.items() if tool.operation_class == "admin_required"
+    ))
 
     # Global rows from these operations contain protected identities,
     # configuration, or process metadata and must never become OPEN.
-    _PROTECTED_METADATA_OPERATIONS: frozenset[str] = frozenset({
-        "list_channels",
-        "list_schedules",
-        "bash_jobs_list",
-        "bash_job_output",
-    })
+    _PROTECTED_METADATA_OPERATIONS = policy_membership("protected_metadata_operations")
 
-    _ADMIN_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset({
-        "Bash",
-        "bash",
-        "bash_exec",
-        "execute",
-        "aexecute",
-        "shell",
-        "Write",
-        "Edit",
-        "Read",
-        "Glob",
-        "Grep",
-        "download_files",
-    })
+    _ADMIN_BUILTIN_TOOL_NAMES = policy_membership("catalog_admin_builtin")
 
     def __init__(self) -> None:
         self._custom_decisions: dict[str, OperationDecision] = {}
@@ -9330,6 +8915,7 @@ class ToolAuthorization:
     argument_egress: str = "taint_gated"
     repo_pr_action_scope: Any = field(default=None, repr=False)
     forge_scope_mismatch: dict[str, Any] | None = None
+    policy: Any = field(default=None, repr=False, compare=False)
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return fields for audit logging."""
@@ -9361,15 +8947,17 @@ def authorize_repo_pr_tool(
     enforce: bool,
     flow_direction: ToolFlowDirection,
     required_actions: tuple[str, ...] | None = None,
+    registered_plugin: bool = False,
 ) -> ToolAuthorization:
     """Make the sole policy decision for one typed PR/repository action."""
-    if tool_name not in _TYPED_REPO_PR_TOOL_ACTIONS:
+    if tool_name not in _TYPED_REPO_PR_TOOL_ACTIONS and not registered_plugin:
         raise ValueError(f"not a typed pull-request tool: {tool_name}")
     if isinstance(scope, RetainedFactoryScope):
         in_scope = (
-            tool_name in _RETAINED_REPO_TOOLS
+            not registered_plugin
+            and tool_name in _RETAINED_REPO_TOOLS
             and isinstance(service_principal, ServicePrincipal)
-            and service_principal.canonical == "poller:worklink-ready-queue"
+            and service_principal.worklink_retained_checkout
             and service_principal.trigger == "poller"
             and service_principal.authority_profile == "github"
             and service_can_invoke_operation(service_principal, tool_name)
@@ -9392,6 +8980,8 @@ def authorize_repo_pr_tool(
             repo_pr_action_scope=scope,
             result_integrity="trusted" if in_scope else "untrusted",
         )
+    if registered_plugin and (required_actions is None or len(required_actions) != 1):
+        raise ValueError("plugin repo/PR tools require one typed action")
     report_required_actions = required_actions is not None
     if required_actions is None:
         required_action = _TYPED_REPO_PR_TOOL_ACTIONS[tool_name]
@@ -9400,8 +8990,10 @@ def authorize_repo_pr_tool(
     missing_actions = tuple(
         action for action in required_actions if action not in granted_actions
     )
+    from .models import RepoPRActionScope
+
     in_scope = (
-        scope is not None
+        (isinstance(scope, RepoPRActionScope) if registered_plugin else scope is not None)
         and not missing_actions
         and (
             not heartbeat_git_authority_enabled(service_principal)
@@ -9695,6 +9287,7 @@ class ToolRegistry:
         except RuntimeError:
             log.debug("shadow decision logging skipped: no running event loop")
 
+    @scoped_policy_call(lambda bound: bound.arguments.get("policy"))
     def authorize_tool(
         self,
         tool_name: str,
@@ -9712,6 +9305,7 @@ class ToolRegistry:
         tool_call_id: str | None = None,
         client_authorized_host_execution: Any = None,
         request_identity: Any = None,
+        policy: "PolicyRegistry | None" = None,
     ) -> ToolAuthorization:
         """Authorize a tool call using the operation catalog.
 
@@ -9732,6 +9326,7 @@ class ToolRegistry:
         shadow_sink = None
 
         def finish(auth: ToolAuthorization) -> ToolAuthorization:
+            auth.policy = policy if policy is not None else selected_policy_registry()
             # Shadow mode continues past a sink refusal; enforcement would not.
             audit_auth = shadow_sink if shadow_sink is not None else auth
             if not enforce and audit_auth.is_shadow_decision:
@@ -9851,6 +9446,33 @@ class ToolRegistry:
             )
             return finish(auth)
 
+        from .plugins.core import core_policy_registry
+
+        policy = policy if policy is not None else selected_policy_registry()
+        if not policy.frozen:
+            raise ValueError("authorization requires a frozen policy")
+        tool_policy = policy.tools.get(tool_name)
+        plugin_tool = (
+            tool_policy if tool_policy is not None and tool_policy.owner != "core"
+            else None
+        )
+        plugin_channel_target = None
+        plugin_channel_valid = False
+        if plugin_tool is not None and plugin_tool.resource_scope == "channel":
+            extractor = plugin_tool.descriptor.sink_target_extractor
+            try:
+                targets = extractor(tool_name, arguments or {}, auth_context) if extractor else ()
+                plugin_channel_valid = (
+                    len(targets) == 1 and isinstance(targets[0], str)
+                    and bool(targets[0].strip())
+                    and (target_channel is None or target_channel == targets[0])
+                )
+            except (TypeError, ValueError, KeyError, IndexError):
+                plugin_channel_valid = False
+            if plugin_channel_valid:
+                plugin_channel_target = targets[0]
+                if target_channel is None:
+                    target_channel = sink_target = requested_target = plugin_channel_target
         flow_direction = get_tool_flow_direction(tool_name)
         sink_category = get_sink_category(tool_name)
         if ifc_labels is None and auth_context is not None:
@@ -9863,6 +9485,31 @@ class ToolRegistry:
             return finish(_tainted_write_denial(tool_name))
         if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return finish(_scheduled_write_denial(tool_name))
+        if (plugin_tool is not None and plugin_tool.writes_code_or_state
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            return finish(_tainted_write_denial(tool_name))
+        if (plugin_tool is not None and plugin_tool.flow in {"sink", "both"}
+                and plugin_tool.resource_scope != "channel"):
+            extractor = plugin_tool.descriptor.sink_target_extractor
+            try:
+                targets = extractor(tool_name, arguments or {}, auth_context) if extractor else ()
+                valid_target = (
+                    len(targets) == 1 and isinstance(targets[0], str)
+                    and bool(targets[0].strip())
+                    and (target_channel is None or target_channel == targets[0])
+                )
+            except (TypeError, ValueError, KeyError, IndexError):
+                valid_target = False
+            if not valid_target:
+                return finish(ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision(plugin_tool.operation_class),
+                    allowed=not enforce, reason="sink_target_required",
+                    required_tier=AccessTier.ADMIN, enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce, would_block=True,
+                    flow_direction=flow_direction,
+                ))
+            sink_target = target_channel = requested_target = targets[0]
         if tool_name in {"write_file", "edit_file", "replace_file"}:
             home = os.environ.get("MIMIR_HOME", "").strip()
             raw_path = (arguments or {}).get("file_path") or (arguments or {}).get("path") or target_channel
@@ -9902,7 +9549,7 @@ class ToolRegistry:
         catalog = get_operation_catalog()
         preliminary_decision = catalog.get_decision(tool_name, auth_context)
         preliminary_service = (
-            get_trusted_service_from_auth_context(auth_context)
+            get_trusted_service_from_auth_context(auth_context, policy=policy)
             if auth_context is not None
             else None
         )
@@ -9954,11 +9601,20 @@ class ToolRegistry:
                         refusal_detail=str(exc),
                     ))
                 repo_pr_action_scope = issue_target
-            elif tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
+            elif tool_name in _TYPED_REPO_PR_TOOL_ACTIONS or (
+                plugin_tool is not None and plugin_tool.resource_scope == "repo_pr"
+            ):
                 tool_arguments = arguments or {}
+                plugin_repo_target = (
+                    isinstance(tool_arguments.get("repository"), str)
+                    and bool(tool_arguments["repository"].strip())
+                    and type(tool_arguments.get("pull_request")) is int
+                    and tool_arguments["pull_request"] > 0
+                )
                 retained_scope = getattr(auth_context, "retained_factory_scope", None)
                 retained_matches = (
-                    isinstance(retained_scope, RetainedFactoryScope)
+                    plugin_tool is None
+                    and isinstance(retained_scope, RetainedFactoryScope)
                     and _is_worklink_retained_checkout_service(
                         preliminary_service, auth_context=auth_context,
                     )
@@ -9981,6 +9637,7 @@ class ToolRegistry:
                         if discovered is not None
                         and isinstance(tool_arguments.get("repository"), str)
                         and isinstance(tool_arguments.get("pull_request"), int)
+                        and (plugin_tool is None or plugin_repo_target)
                         else None
                     )
                 if state is None and not retained_matches:
@@ -9991,8 +9648,17 @@ class ToolRegistry:
                             tool_arguments.get("pull_request"),
                         )
                         if registry is not None and hasattr(registry, "resolve")
+                        and (plugin_tool is None or plugin_repo_target)
                         else None
                     )
+                if plugin_tool is not None and state is not None:
+                    from .models import RepoReviewState
+
+                    if not isinstance(state, RepoReviewState) or (
+                        state.repo.lower() != tool_arguments["repository"].lower()
+                        or state.pr_number != tool_arguments["pull_request"]
+                    ):
+                        state = None
                 if not retained_matches:
                     repo_pr_action_scope = (
                         state.action_scope if state is not None else None
@@ -10047,10 +9713,10 @@ class ToolRegistry:
         service_capability_denied = (
             preliminary_service is not None
             and preliminary_decision == OperationDecision.ADMIN_REQUIRED
-            and not service_can_invoke_operation(preliminary_service, tool_name)
+            and not service_can_invoke_operation(preliminary_service, tool_name, policy=policy)
         )
         service_allowed_preliminary = (
-            service_can_invoke_operation(preliminary_service, tool_name)
+            service_can_invoke_operation(preliminary_service, tool_name, policy=policy)
         )
         if (
             preliminary_service is not None
@@ -10120,6 +9786,7 @@ class ToolRegistry:
                 requested_cwd=(arguments or {}).get("cwd"),
                 client_authorized_host_execution=client_authorized_host_execution,
                 request_identity=request_identity,
+                sink_category=sink_category,
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
             if (not enforce and sink_category is SinkCategory.SHELL_PROCESS
@@ -10141,14 +9808,14 @@ class ToolRegistry:
         service_principal = None
 
         if auth_context is not None:
-            service_principal = get_trusted_service_from_auth_context(auth_context)
+            service_principal = get_trusted_service_from_auth_context(auth_context, policy=policy)
 
         required_tier = AccessTier.USER
         reason = None
         is_shadow = False
         would_block = False
         service_allowed = (
-            service_can_invoke_operation(service_principal, tool_name)
+            service_can_invoke_operation(service_principal, tool_name, policy=policy)
         )
 
         if decision == OperationDecision.OPEN:
@@ -10176,6 +9843,36 @@ class ToolRegistry:
                 is_shadow = True
                 would_block = True
         elif decision == OperationDecision.RESOURCE_SCOPED:
+            if plugin_tool is not None:
+                scope_kind = plugin_tool.resource_scope
+                if scope_kind == "channel":
+                    if plugin_channel_valid:
+                        channel_auth = ChannelResourceAdapter.authorize_channel_operation(
+                            tool_name, plugin_channel_target, auth_context, enforce=enforce,
+                            registered_plugin=True,
+                        )
+                        channel_auth.flow_direction = flow_direction
+                        return finish(channel_auth)
+                    reason = "channel_target_required"
+                elif scope_kind == "repo_pr" and isinstance(plugin_tool.typed_action, RepoPRAction):
+                    repo_auth = authorize_repo_pr_tool(
+                        tool_name, repo_pr_action_scope,
+                        service_principal=service_principal, enforce=enforce,
+                        flow_direction=flow_direction,
+                        required_actions=(plugin_tool.typed_action.value,),
+                        registered_plugin=True,
+                    )
+                    if shadow_sink is None:
+                        sink_target = requested_target = None
+                    return finish(repo_auth)
+                else:
+                    reason = "resource_scope_unknown"
+                return finish(ToolAuthorization(
+                    tool_name=tool_name, decision=decision, allowed=not enforce,
+                    reason=reason, required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce, is_shadow_decision=not enforce,
+                    would_block=True, flow_direction=flow_direction,
+                ))
             if tool_name == "hands_read":
                 from .tools.client_provider import (
                     MIMIR_HANDS_V1,
@@ -10446,127 +10143,21 @@ class ToolRegistry:
         return finish(auth)
 
 
-_PROTECTED_RESULT_DOMAINS: dict[str, str] = {
-    "fetch_channel_history": "channel_history",
-    "list_channels": "channel_metadata",
-    "list_schedules": "schedule_metadata",
-    "bash_jobs_list": "shell_jobs",
-    "bash_job_output": "shell_jobs",
-    "read_file": "filesystem",
-    "proposal_diff": "filesystem",
-    "aread": "filesystem",
-    "ls": "filesystem",
-    "als": "filesystem",
-    "glob": "filesystem",
-    "aglob": "filesystem",
-    "grep": "filesystem",
-    "agrep": "filesystem",
-    "download_files": "filesystem",
-    "adownload_files": "filesystem",
-    "Read": "filesystem",
-    "Glob": "filesystem",
-    "Grep": "filesystem",
-    "file_search": "filesystem",
-    "get_turn": "turn_history",
-    "mimir_get_turn": "turn_history",
-    "memory_query": "saga",
-    "memory_get": "saga",
-    "saga_forget": "saga",
-    "commitment_list": "commitments",
-    "shell_exec": "shell",
-    "execute": "shell",
-    "web_search": "web",
-    "worklink_run": "worklink",
-    "worklink_resume": "worklink",
-    "spawn_open_code": "coding_worker",
-    "pr_metadata": "repository",
-    "pr_spec": "repository",
-    "pr_list": "repository",
-    "pr_files": "repository",
-    "pr_diff": "repository",
-    "pr_file_content": "repository",
-    "pr_checks": "repository",
-    "pr_job_log": "repository",
-    "ci_run_jobs": "repository",
-    "ci_run": "repository",
-    "ci_recent_runs": "repository",
-    "pr_reviews": "repository",
-    "pr_comments": "repository",
-    "pr_review_requests": "repository",
-    "repo_checkout": "repository",
-    "repo_fetch": "repository",
-    "repo_status": "repository",
-    "repo_test": "repository",
-    "repo_diff": "repository",
-    "repo_unmerged": "repository",
-    "hands_read": "client_provider",
-    # Bytes returned from the client host are content the agent did not author,
-    # so every Hands result is a protected result in the client_provider domain --
-    # not only the read. main's inventory-completeness check (added while this
-    # branch was diverged) is what surfaces the omission.
-    "hands_edit": "client_provider",
-    "hands_shell": "client_provider",
-    "hands_python": "client_provider",
-    "pr_submit_review": "repository",
-    "pr_inline_review_comment": "repository",
-    "pr_comment": "repository",
-    "pr_edit_body": "repository",
-    "issue_comment": "repository",
-    "repo_commit": "repository",
-    "repo_merge": "repository",
-    "repo_merge_abort": "repository",
-    "repo_rebase": "repository",
-    "repo_rebase_abort": "repository",
-    "repo_revert": "repository",
-    "repo_revert_abort": "repository",
-    "repo_push": "repository",
-}
+_PROTECTED_RESULT_DOMAINS: Mapping[str, str] = PolicyMappingView(lambda policy: {
+    name: tool.result_domain for name, tool in policy.tools.items()
+    if tool.result_domain is not None
+})
 
 _ACP_HANDS_RESULT_SOURCE_KIND = "acp_hands_result"
-_ACP_HANDS_RESULT_TOOLS = frozenset({
-    "hands_read", "hands_edit", "hands_shell", "hands_python"
-})
+_ACP_HANDS_RESULT_TOOLS = policy_membership("acp_hands_result_tools")
 
 # Independent semantic inventory for tools whose results come from a read
 # backend. Startup rejects drift toward SINK/NEITHER before it can suppress
 # result taint. MCP reads have equivalent adapter/resource parity checks in
 # MCPResourceAdapter.authorize_call.
-_READ_BACKEND_RESULT_TOOLS = frozenset({
-    "pr_job_log",
-    "ci_run_jobs",
-    "ci_run",
-    "ci_recent_runs",
-    "Read",
-    "Glob",
-    "Grep",
-    "read_file",
-    "proposal_diff",
-    "aread",
-    "ls",
-    "als",
-    "glob",
-    "aglob",
-    "grep",
-    "agrep",
-    "fetch_url",
-    "pr_metadata",
-    "pr_spec",
-    "pr_list",
-    "pr_files",
-    "pr_diff",
-    "pr_file_content",
-    "pr_checks",
-    "pr_reviews",
-    "pr_comments",
-    "pr_review_requests",
-    "repo_checkout",
-    "repo_fetch",
-    "repo_status",
-    "repo_test",
-    "repo_diff",
-    "repo_unmerged",
-    "hands_read",
-})
+_READ_BACKEND_RESULT_TOOLS = PolicySetView(lambda policy: frozenset(
+    name for name, tool in policy.tools.items() if tool.read_backend
+))
 
 _SELF_AUTHORED_FILE_ROOTS = frozenset({
     ".mimir_builtin_skills",
@@ -11464,6 +11055,7 @@ def _log_retained_repository_failure(tool_name: str, result: Any, repository: st
         pass
 
 
+@scoped_policy_call(lambda bound: getattr(bound.arguments["authorization"], "policy", None))
 def classify_protected_result(
     tool_name: str,
     arguments: dict[str, Any] | None,
@@ -11485,6 +11077,15 @@ def classify_protected_result(
     from langchain_core.messages import ToolMessage
 
     from .models import InformationFlowLabels, SourceLabel
+
+    # Plugin responses are provider-controlled even for sink-only tools and
+    # claimed NON_INGESTING results; they never inherit core refusal exemptions.
+    registered = selected_policy_registry().tools.get(tool_name)
+    if registered is not None and registered.owner != "core":
+        return _incomplete_protected_result(
+            registered.result_domain or "unknown", arguments or {},
+            tool_name=tool_name, auth_context=auth_context,
+        )
 
     artifact = getattr(result, "artifact", None)
     if provenance is None and isinstance(artifact, ProtectedResultProvenance):
@@ -11899,215 +11500,19 @@ def get_tool_registry() -> ToolRegistry:
     return _global_tool_registry
 
 
-_TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
-    service.trigger: service
-    for service in (
-        ServicePrincipal(
-            canonical="scheduler",
-            trigger="scheduled_tick",
-            capabilities=(
-                "send_message",
-                "operator_alert",
-                "shell_exec",
-                "bash_async",
-                "bash_jobs_list",
-                "bash_job_output",
-                "spawn_open_code",
-                "task",
-                "saga_forget",
-                "write_file",
-                "edit_file",
-                "replace_file",
-                "open_proposal",
-                "submit_proposal",
-                "abandon_proposal",
-                "worklink_run",
-                "read_file",
-                "aread",
-                "ls",
-                "als",
-                "glob",
-                "aglob",
-                "grep",
-                "agrep",
-                "file_search",
-                "get_turn",
-                "mimir_get_turn",
-                "list_schedules",
-            ),
-            readable_domains=(
-                "configured_inputs",
-                "filesystem",
-                "turn_history",
-                "shell_jobs",
-                "schedule_metadata",
-            ),
-            sink_destinations=(
-                "configured_channel",
-                "message",
-                "notification",
-                "filesystem",
-                "shell_process",
-                "spawn_process",
-                "proposal",
-                "saga",
-                "worklink",
-            ),
-            sink_policies=(
-                ServiceSinkPolicy(
-                    "write_file", "static_service_write_roots",
-                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
-                ),
-                ServiceSinkPolicy(
-                    "edit_file", "static_service_write_roots",
-                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
-                ),
-                ServiceSinkPolicy(
-                    "replace_file", "static_service_write_roots",
-                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
-                ),
-                ServiceSinkPolicy("shell_exec", "shell_profile", "maintenance"),
-                ServiceSinkPolicy("bash_async", "shell_profile", "maintenance"),
-                ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
-                ServiceSinkPolicy("worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"),
-                ServiceSinkPolicy("operator_alert", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL"),
-            ),
-            saga_full_corpus_read=True,
-            creation_path="mimir.scheduler.Scheduler._fire_job",
-        ),
-        ServicePrincipal(
-            canonical="synthesis",
-            trigger="saga_session_end",
-            capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES["session-boundary"])),
-            readable_domains=("session", "saga", "turn_history"),
-            sink_destinations=(
-                "filesystem", "session_boundary", "saga",
-            ),
-            sink_policies=(
-                ServiceSinkPolicy(
-                    "write_file", "static_service_write_roots",
-                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
-                ),
-            ),
-            saga_full_corpus_read=True,
-            creation_path="mimir.server._on_session_idle",
-            authority_profile="session-boundary",
-            capability_tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
-        ),
-        ServicePrincipal(
-            canonical="system",
-            trigger="upgrade",
-            capabilities=(
-                "shell_exec",
-                "bash_async",
-                "bash_jobs_list",
-                "bash_job_output",
-                "write_file",
-                "edit_file",
-                "replace_file",
-                "open_proposal",
-                "submit_proposal",
-                "abandon_proposal",
-                "proposal_diff",
-                "add_schedule",
-                "set_schedule_priority",
-                "list_schedules",
-                "read_file",
-                "aread",
-                "ls",
-                "als",
-                "glob",
-                "aglob",
-                "grep",
-                "agrep",
-                "send_message",
-            ),
-            readable_domains=(
-                "defaults",
-                "proposal",
-                "filesystem",
-                "schedule_metadata",
-                "shell_jobs",
-            ),
-            sink_destinations=(
-                "operator_alert",
-                "filesystem",
-                "shell_process",
-                "proposal",
-                "scheduler",
-                "message",
-            ),
-            sink_policies=(
-                ServiceSinkPolicy(
-                    "write_file", "upgrade_proposals",
-                    "MIMIR_HOME/scratch/proposals",
-                ),
-                ServiceSinkPolicy(
-                    "edit_file", "upgrade_proposals",
-                    "MIMIR_HOME/scratch/proposals",
-                ),
-                ServiceSinkPolicy(
-                    "replace_file", "upgrade_proposals",
-                    "MIMIR_HOME/scratch/proposals",
-                ),
-                ServiceSinkPolicy("shell_exec", "shell_profile", "upgrade_workspace"),
-                ServiceSinkPolicy("bash_async", "shell_profile", "upgrade_workspace"),
-            ),
-            creation_path="mimir.defaults_upgrade.enqueue_upgrade_prompt_turns",
-        ),
-    )
-}
-
-
-_REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset({
-    "scheduled_tick",
-    "saga_session_end",
-    "upgrade",
-})
+_TRUSTED_SERVICE_PRINCIPALS: Mapping[str, ServicePrincipal] = PolicyMappingView(
+    lambda policy: policy.service_principals
+)
+_REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset(core_policy_registry().service_principals)
 
 
 # Executable capabilities and information-flow metadata are one policy.
-_OPERATION_READABLE_DOMAIN: dict[str, str] = {
-    "pr_list": "repository",
-    "list_channels": "channel_metadata",
-    "list_schedules": "schedule_metadata",
-    "bash_jobs_list": "shell_jobs",
-    "bash_job_output": "shell_jobs",
-    "read_file": "filesystem",
-    "proposal_diff": "filesystem",
-    "aread": "filesystem",
-    "ls": "filesystem",
-    "als": "filesystem",
-    "glob": "filesystem",
-    "aglob": "filesystem",
-    "grep": "filesystem",
-    "agrep": "filesystem",
-    "file_search": "filesystem",
-    "get_turn": "turn_history",
-    "mimir_get_turn": "turn_history",
-    "memory_query": "saga",
-    "memory_get": "saga",
-    "ci_run_jobs": "repository",
-    "ci_run": "repository",
-    "ci_recent_runs": "repository",
-    "hands_read": "client_provider",
-    "hands_python": "client_provider",
-    **{
-        operation: "repository"
-        for operation, direction in _TOOL_FLOW_MAP.items()
-        if operation in _TYPED_REPO_PR_TOOL_ACTIONS
-        and direction in {ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH}
-    },
-}
-
-_SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset({
-    "memory_store",
-    "saga_feedback",
-    "saga_mark_contributions",
-    "saga_end_session",
-    "saga_record_skill_learning",
-    "saga_forget",
+_OPERATION_READABLE_DOMAIN: Mapping[str, str] = PolicyMappingView(lambda policy: {
+    name: tool.readable_domain for name, tool in policy.tools.items()
+    if tool.readable_domain is not None
 })
+
+_SAGA_MUTATION_OPERATIONS = policy_membership("saga_mutations")
 
 
 class CapabilityMatrixError(Exception):
@@ -12335,34 +11740,58 @@ def _deepagents_builtin_tool_names() -> tuple[str, ...]:
     return tuple(tool.name for item in middleware for tool in item.tools)
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def assert_model_tool_inventory_cataloged(
     *,
     model_spec: str | None = None,
     coding_enabled: bool = False,
+    policy: "PolicyRegistry | None" = None,
 ) -> None:
     """Raise if the assembled model surface lacks authz or IFC metadata."""
     from .tools.registry import all_mimir_tools
+    from .plugins.core import core_policy_registry
 
+    policy = policy if policy is not None else selected_policy_registry()
+    if not policy.frozen:
+        raise CapabilityMatrixError("model tool inventory requires a frozen policy")
     catalog = get_operation_catalog()
     mimir_tools = all_mimir_tools(
         model_spec=model_spec,
         coding_enabled=coding_enabled,
         require_coding_available=False,
+        policy=policy,
+        materialize_plugins=False,
     )
     tool_names = {
         *(tool.name for tool in mimir_tools),
         *_deepagents_builtin_tool_names(),
     }
+    plugin_tools = {
+        name: tool for name, tool in policy.tools.items()
+        if tool.owner != "core" and tool.factory is not None
+    }
+    for name, tool in plugin_tools.items():
+        if name in tool_names:
+            raise CapabilityMatrixError(f"plugin {tool.owner}: tool {name} collides with model inventory")
+        if (tool.flow is None or tool.operation_class is None or tool.descriptor is None
+                or (tool.flow in {"sink", "both"} and (
+                    tool.descriptor.sink_category is None
+                    or tool.descriptor.sink_destination is None
+                )) or (tool.result_domain is None and not (
+                    tool.descriptor.result_origin & ResultOriginKind.NON_INGESTING
+                ))):
+            raise CapabilityMatrixError(f"plugin {tool.owner}: tool {name} has incomplete model policy")
+    core_names = tool_names
     unknown_tools = sorted({
-        tool_name for tool_name in tool_names
+        tool_name for tool_name in core_names
         if catalog.get_decision(tool_name) == OperationDecision.UNKNOWN
     })
     unknown_flows = sorted({
-        tool_name for tool_name in tool_names
+        tool_name for tool_name in core_names
         if get_tool_flow_direction(tool_name) == ToolFlowDirection.UNKNOWN
     })
     incomplete_sinks = sorted({
-        tool_name for tool_name in tool_names
+        tool_name for tool_name in core_names
         if get_tool_flow_direction(tool_name) in {
             ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
         }
@@ -12373,13 +11802,13 @@ def assert_model_tool_inventory_cataloged(
         )
     })
     misclassified_read_backends = sorted({
-        tool_name for tool_name in tool_names & _READ_BACKEND_RESULT_TOOLS
+        tool_name for tool_name in core_names & _READ_BACKEND_RESULT_TOOLS
         if get_tool_flow_direction(tool_name) not in {
             ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH,
         }
     })
     unclassified_results = sorted({
-        tool_name for tool_name in tool_names
+        tool_name for tool_name in core_names
         # MCP has a total result classifier above, including sink/neither calls
         # and unresolved failures. It needs no per-tool native inventory entry;
         # flow direction never exempts its remote response from provenance.
@@ -12425,11 +11854,13 @@ def assert_model_tool_inventory_cataloged(
         )
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def resolve_access_control_enforcement(
     requested: bool,
     *,
     model_spec: str | None = None,
     coding_enabled: bool = False,
+    policy: "PolicyRegistry | None" = None,
 ) -> bool:
     """Fail closed at the enforcement enablement boundary."""
     if requested:
@@ -12437,6 +11868,7 @@ def resolve_access_control_enforcement(
         assert_model_tool_inventory_cataloged(
             model_spec=model_spec,
             coding_enabled=coding_enabled,
+            policy=policy,
         )
     return requested
 
@@ -12469,12 +11901,19 @@ def get_capability_matrix_report() -> dict[str, dict[str, Any]]:
     return report
 
 
-def get_service_principal(trigger: str) -> ServicePrincipal | None:
+def get_service_principal(
+    trigger: str, *, policy: "PolicyRegistry | None" = None,
+) -> ServicePrincipal | None:
     """Get a service principal by trigger."""
-    return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+    selected = policy if policy is not None else selected_policy_registry()
+    if policy is None:
+        return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+    return selected.service_principals.get(trigger) if selected.frozen else None
 
 
-def get_event_service_principal(event: Any) -> ServicePrincipal | None:
+def get_event_service_principal(
+    event: Any, *, policy: "PolicyRegistry | None" = None,
+) -> ServicePrincipal | None:
     """Resolve static built-ins or an exact per-instance event authority."""
     carried = getattr(event, "service_authority", None)
     if (
@@ -12483,7 +11922,7 @@ def get_event_service_principal(event: Any) -> ServicePrincipal | None:
         and carried.canonical == getattr(event, "service_principal", None)
     ):
         return carried
-    return _TRUSTED_SERVICE_PRINCIPALS.get(getattr(event, "trigger", None))
+    return get_service_principal(getattr(event, "trigger", None), policy=policy)
 
 
 def is_admin(auth_context: Any) -> bool:
@@ -12586,6 +12025,7 @@ def can_resolve_forge_review_scope(
 
 def get_trusted_service_from_auth_context(
     auth_context: Any,
+    *, policy: "PolicyRegistry | None" = None,
 ) -> ServicePrincipal | None:
     """Resolve a registered service from the server-owned auth carrier.
 
@@ -12605,7 +12045,7 @@ def get_trusted_service_from_auth_context(
             trigger = getattr(auth_context, "origin_trigger", None)
         if not isinstance(trigger, str):
             return None
-        service = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+        service = get_service_principal(trigger, policy=policy)
     if service is None or getattr(auth_context, "canonical_principal", None) != service.canonical:
         return None
     return service
@@ -12619,14 +12059,23 @@ def is_trusted_service(auth_context: Any) -> bool:
 def service_can_invoke_operation(
     service: ServicePrincipal | None,
     operation: str,
+    *, policy: "PolicyRegistry | None" = None,
 ) -> bool:
     """Check an exact service capability and its declared flow constraints."""
-    if service is None or not service.has_capability(operation):
+    selected = policy if policy is not None else selected_policy_registry()
+    if not selected.frozen or service is None or not service.has_capability(operation):
         return False
-    required_domain = _OPERATION_READABLE_DOMAIN.get(operation)
+    if (policy is not None and operation not in selected.capabilities
+            and operation not in selected.tools
+            and operation not in _TOOL_FLOW_MAP and operation not in TRIGGER_CAPABILITY_TIERS):
+        return False
+    if policy is None and operation not in _TOOL_FLOW_MAP and operation not in TRIGGER_CAPABILITY_TIERS:
+        return False
+    tool = selected.tools.get(operation)
+    required_domain = tool.readable_domain if tool is not None else None
     if required_domain and not service.can_read_domain(required_domain):
         return False
-    descriptor = get_tool_descriptor(operation)
+    descriptor = selected.descriptors.get(operation)
     required_sink = descriptor.sink_destination if descriptor else None
     if required_sink and not service.can_write_sink(required_sink):
         return False
@@ -12811,6 +12260,7 @@ def create_auth_context(
     ifc_labels: "InformationFlowLabels | None" = None,
     audience_provider: Any = None,
     cross_platform_pull: bool = True,
+    policy: "PolicyRegistry | None" = None,
 ) -> "AuthContext":
     """Create a frozen AuthContext from an inbound event (chainlink #864).
 
@@ -12844,7 +12294,10 @@ def create_auth_context(
         roles = access.roles if event_ingress is None else ()
         is_service = access.is_service
 
-    registered_service = get_event_service_principal(event)
+    registered_service = (
+        get_event_service_principal(event, policy=policy)
+        if policy is not None else get_event_service_principal(event)
+    )
     if (
         registered_service is not None
         and event.service_principal == registered_service.canonical
@@ -12912,7 +12365,8 @@ def create_auth_context(
         and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
         and extra.get("poller_name") == "github-ci-watch"
         and registered_service is not None
-        and event.service_principal == registered_service.canonical == "poller:github-ci-watch"
+        and event.service_principal == registered_service.canonical
+        and registered_service.github_ci_watch
         and any(registered_service.has_capability(name) for name in (
             "ci_run_jobs", "ci_run", "ci_recent_runs",
         ))
