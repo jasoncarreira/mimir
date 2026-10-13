@@ -25,6 +25,7 @@ from mimir.access_control import (
 )
 from mimir.pollers import _CircuitBreakerState, _circuit_breakers
 from mimir.models import AgentEvent
+from mimir.plugins.registry import PolicyRegistry
 from mimir.scheduler import (
     Scheduler,
     SchedulerJob,
@@ -1583,6 +1584,101 @@ def test_register_callable_installs_at_default_cron(tmp_path: Path):
     job = sched._scheduler.get_job("demo")
     assert job is not None
     assert "demo" in sched.registered_callables()
+
+
+@pytest.mark.asyncio
+async def test_plugin_callable_binds_after_core_before_reload_and_start(tmp_path: Path, monkeypatch):
+    path = tmp_path / "scheduler.yaml"
+    path.write_text("- name: plugin-override\n  callable: plugin-job\n  cron: '0 6 * * *'\n")
+    sched = Scheduler(scheduler_yaml=path, enqueue=lambda e: asyncio.sleep(0, result=True))
+
+    async def core():
+        pass
+
+    async def plugin():
+        pass
+
+    sched.register_callable("core-job", core, "0 4 * * *", job_id="core-id")
+    policy = PolicyRegistry()
+    policy.registrar("example").register_scheduler_job("plugin-job", "plugin-id", plugin)
+    policy.freeze()
+    assert sched.bind_plugin_jobs(policy.scheduler_jobs.values()) == 1
+    assert sched._scheduler.get_job("core-id").func is core
+    assert sched._scheduler.get_job("plugin-id").func is plugin
+    assert "hour='6'" in str(sched._scheduler.get_job("plugin-id").trigger)
+
+    path.write_text("- name: plugin-override\n  callable: plugin-job\n  cron: '0 7 * * *'\n")
+    sched.reload()
+    assert "hour='7'" in str(sched._scheduler.get_job("plugin-id").trigger)
+    monkeypatch.setattr(sched, "_start_poller_trigger_listener", lambda: None)
+    monkeypatch.setattr(sched, "_start_loop_lag_monitor", lambda: None)
+    monkeypatch.setattr(sched, "rearm_quota_recovery_on_start", lambda: None)
+    try:
+        sched.start()
+        assert sched._scheduler.get_job("plugin-id") is not None
+    finally:
+        await sched.stop()
+
+
+@pytest.mark.parametrize("collision", ["name", "id", "other-plugin", "existing-job"])
+def test_plugin_callable_collisions_do_not_replace_jobs(tmp_path: Path, collision: str):
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml",
+        enqueue=lambda e: asyncio.sleep(0, result=True),
+    )
+
+    async def core():
+        pass
+
+    async def plugin():
+        pass
+
+    sched.register_callable("core-job", core, "0 4 * * *", job_id="core-id")
+    policy = PolicyRegistry()
+    name, job_id = {
+        "name": ("core-job", "plugin-id"),
+        "id": ("plugin-job", "core-id"),
+        "other-plugin": ("second-job", "plugin-id"),
+        "existing-job": ("plugin-job", "occupied-id"),
+    }[collision]
+    first = PolicyRegistry()
+    if collision == "other-plugin":
+        first.registrar("first").register_scheduler_job("first-job", "plugin-id", plugin)
+    if collision == "existing-job":
+        sched._scheduler.add_job(core, "interval", seconds=3600, id="occupied-id")
+    policy.registrar("second").register_scheduler_job(name, job_id, plugin)
+    policy.freeze()
+    declarations = [*first.scheduler_jobs.values(), *policy.scheduler_jobs.values()]
+    before = {job.id: job for job in sched._scheduler.get_jobs()}
+    with pytest.raises(ValueError, match="duplicate scheduler (callable name|job ID)"):
+        sched.bind_plugin_jobs(declarations)
+    assert {job.id: job for job in sched._scheduler.get_jobs()} == before
+    assert sched.registered_callables() == ["core-job"]
+
+
+def test_plugin_callable_disabled_and_no_plugin_compatibility(tmp_path: Path):
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml",
+        enqueue=lambda e: asyncio.sleep(0, result=True),
+    )
+
+    async def core():
+        pass
+
+    sched.register_callable("core-job", core, "0 4 * * *")
+    assert sched.bind_plugin_jobs(()) == 0
+    assert sched.registered_callables() == ["core-job"]
+    policy = PolicyRegistry()
+    policy.registrar("example").register_scheduler_job("plugin-job", "plugin-id", core)
+    policy.freeze()
+    assert sched.bind_plugin_jobs(policy.scheduler_jobs.values()) == 0
+    assert sched._scheduler.get_job("plugin-id") is None
+    assert "plugin-job" in sched.registered_callables()
+    (tmp_path / "s.yaml").write_text(
+        "- name: plugin-override\n  callable: plugin-job\n  cron: '0 6 * * *'\n"
+    )
+    sched.reload()
+    assert sched._scheduler.get_job("plugin-id").func is core
 
 
 def test_codex_usage_poll_is_named_single_instance_callable(tmp_path: Path):
