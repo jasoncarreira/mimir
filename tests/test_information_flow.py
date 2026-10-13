@@ -6717,6 +6717,85 @@ def test_service_shell_policy_rejects_multicommand_line_breaks(separator: str):
     assert decision.reason == "service_sink_destination_denied"
 
 
+@pytest.mark.parametrize(("kind", "reason", "fields"), [
+    ("none", "no_published_provenance", None),
+    ("mismatch", "provenance_field_mismatch", ["resource_id", "principal"]),
+    ("untrusted", "published_untrusted", None),
+])
+def test_repository_result_fallback_records_closed_reason_once_per_turn(
+    monkeypatch: pytest.MonkeyPatch, kind: str, reason: str, fields: list[str] | None,
+) -> None:
+    from mimir import event_logger
+
+    scope = RepoPRActionScope(
+        provenance="server_discovered", canonical_repo="owner/repo",
+        canonical_root="/srv/repo", canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot", event_type="pr_review",
+        allowed_operations=frozenset({"repo.checkout"}), pr_number=2364,
+        head_repo="owner/repo", head_remote="origin",
+        destination_ref="refs/heads/feature/plugins", observed_head_sha="a" * 40,
+        base_ref="main", observed_base_sha="b" * 40,
+    )
+    auth = replace(_auth(), canonical_principal="poller:github-activity", is_service=True,
+                   ifc_state=InformationFlowState(), repo_pr_action_scope=scope)
+    authorization = ToolAuthorization(
+        tool_name="pr_metadata", decision="resource_scoped", allowed=True,
+        repo_pr_action_scope=scope,
+    )
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **kw: events.append((name, kw)))
+    baseline = classify_protected_result("pr_metadata", {}, auth, authorization)
+    events.clear()
+    auth = replace(auth, ifc_state=InformationFlowState())
+    source, = baseline.sources
+    published = (
+        None if kind == "none" else ProtectedResultProvenance((
+            replace(source, resource_id="other", principal="other") if kind == "mismatch"
+            else source,
+        ))
+    )
+    for _ in range(2):
+        result = classify_protected_result(
+            "pr_metadata", {}, auth, authorization, provenance=published,
+        )
+        assert result.sources[0].integrity == "untrusted"
+    assert events == [("repository_result_untrusted_default", {
+        "tool": "pr_metadata", "scope_id": scope.scope_id, "pr_number": 2364,
+        "observed_head_sha": "a" * 40, "reason": reason,
+        **({"mismatched_fields": fields} if fields is not None else {}),
+    })]
+
+
+@pytest.mark.parametrize("field", ["resource_id", "principal"])
+def test_repository_result_attestation_requires_each_exact_boundary_field(
+    monkeypatch: pytest.MonkeyPatch, field: str,
+) -> None:
+    from mimir import event_logger
+
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *_args, **_kwargs: None)
+    scope = RepoPRActionScope(
+        provenance="server_discovered", canonical_repo="owner/repo",
+        canonical_root="/srv/repo", canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot", event_type="pr_review",
+        allowed_operations=frozenset({"repo.checkout"}), pr_number=7,
+        head_repo="owner/repo", head_remote="origin",
+        destination_ref="refs/heads/feature/plugins", observed_head_sha="a" * 40,
+        base_ref="feature/plugins", observed_base_sha="b" * 40,
+    )
+    auth = replace(_auth(), repo_pr_action_scope=scope, ifc_state=InformationFlowState())
+    authorization = ToolAuthorization(
+        tool_name="pr_metadata", decision="resource_scoped", allowed=True,
+        repo_pr_action_scope=scope,
+    )
+    source, = classify_protected_result("pr_metadata", {}, auth, authorization).sources
+    publication = replace(source, integrity="trusted", **{field: "other"})
+    result = classify_protected_result(
+        "pr_metadata", {}, auth, authorization,
+        provenance=ProtectedResultProvenance((publication,)),
+    )
+    assert result.sources[0].integrity == "untrusted"
+
+
 def test_ordinary_admin_cannot_bypass_or_erase_labels():
     labels = _labels(sources=frozenset({"slack-C-private"}))
     admin = _auth("slack-C-public", roles=("admin",))
