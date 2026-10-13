@@ -2647,3 +2647,32 @@ def test_failed_lease_read_requires_unattributed_error(tmp_path, monkeypatch, pr
     )
     assert labels.has_untrusted_active_ingest
     assert labels.sources[0].principal is None
+
+
+def test_lease_attestation_git_calls_share_the_hang_guard() -> None:
+    """Every Git subprocess in lease attestation uses one named hang guard.
+
+    A refusal fails closed (untrusted, so later writes are vetoed), so the bound
+    is a hang guard sized for loaded hosts, never a per-site literal.
+    """
+    import ast
+    import inspect
+
+    assert access_control_module._LEASE_GIT_TIMEOUT_S == 10
+    # Read the definitions from source: fixtures in this file patch these names.
+    module = ast.parse(inspect.getsource(access_control_module))
+    definitions = {
+        node.name: node for node in module.body if isinstance(node, ast.FunctionDef)
+    }
+    for name in (
+        "_lease_has_clean_lineage", "_observed_checkout_state", "_lease_head_is_author_attested",
+    ):
+        timeouts = [
+            keyword.value for node in ast.walk(definitions[name]) if isinstance(node, ast.Call)
+            for keyword in node.keywords if keyword.arg == "timeout"
+        ]
+        assert timeouts, name
+        assert all(
+            isinstance(value, ast.Name) and value.id == "_LEASE_GIT_TIMEOUT_S"
+            for value in timeouts
+        ), (name, [ast.unparse(value) for value in timeouts])

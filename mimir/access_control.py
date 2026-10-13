@@ -10854,6 +10854,13 @@ def _pr_checkout_lease_attestation(
     return LeaseAttestation(ok, reason)
 
 
+# Lease attestation spawns one Git process per check, and up to two per PR
+# commit (``show`` plus ``patch-id``). Each timeout is a hang guard, not a
+# latency budget: a refusal fails closed and taints the turn, so a loaded host
+# must not turn a slow-but-healthy Git call into ``git_timeout``.
+_LEASE_GIT_TIMEOUT_S = 10
+
+
 def _lease_has_clean_lineage(
     path: Path, lease: Any, scope: Any, expected_head: str, current_head: str,
 ) -> bool:
@@ -10883,13 +10890,14 @@ def _lease_has_clean_lineage(
         )
         if protected and base != getattr(scope, "observed_base_sha", "").lower():
             ancestor = hardened_git_command(
-                path, ("merge-base", "--is-ancestor", scope.observed_base_sha, base), timeout=5,
+                path, ("merge-base", "--is-ancestor", scope.observed_base_sha, base),
+                timeout=_LEASE_GIT_TIMEOUT_S,
             )
             if not _lease_git_ok(ancestor):
                 return False
         result = hardened_git_command(
             path, ("rev-list", "--max-count=501", current_head, "--not", expected_head,
-                   *((base,) if protected else ()), "--"), timeout=5,
+                   *((base,) if protected else ()), "--"), timeout=_LEASE_GIT_TIMEOUT_S,
         )
         if not _lease_git_ok(result):
             return False
@@ -10920,7 +10928,7 @@ def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
         result = hardened_git_command(
             path,
             ("status", "--porcelain=v2", "--branch", "--untracked-files=no"),
-            timeout=5,
+            timeout=_LEASE_GIT_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError) as error:
         _lease_refuse(_lease_exception_reason(error))
@@ -10967,7 +10975,7 @@ def _lease_head_is_author_attested(
     )
 
     def run(*arguments: str):
-        return hardened_git_command(path, arguments, timeout=5)
+        return hardened_git_command(path, arguments, timeout=_LEASE_GIT_TIMEOUT_S)
 
     def patch_id(commit: str) -> str | None:
         # Read only immutable objects with hardened Git; patch-id receives the
@@ -10979,7 +10987,8 @@ def _lease_head_is_author_attested(
             return None
         result = subprocess.run(
             [str(_DEFAULT_GIT), *_BASE_CONFIG, "patch-id", "--verbatim"],
-            input=diff.stdout, capture_output=True, text=True, timeout=5,
+            input=diff.stdout, capture_output=True, text=True,
+            timeout=_LEASE_GIT_TIMEOUT_S,
             env=_sanitized_git_env(),
         )
         fields = result.stdout.split()
