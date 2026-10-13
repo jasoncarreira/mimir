@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .discovery import PluginCandidate
     from mimir.tool_descriptors import (
         FetchAuthorizationKind, ResultOriginKind, SinkCategory,
         SinkPayloadExtractor, SinkTargetExtractor, ToolDescriptor,
@@ -162,11 +163,25 @@ class PolicyRegistry:
         self._dashboard_entries: dict[str, tuple[str, Any]] = {}
         self._prompt_providers: dict[str, PromptBlockProvider] = {}
         self._state_slots: dict[str, type] = {}
+        self._selected_plugin_candidates: tuple[PluginCandidate, ...] = ()
+        self._selection_bound = False
         self._frozen = False
 
     def registrar(self, plugin: str) -> PolicyRegistrar:
         self._writable()
         return PolicyRegistrar(self, _name(plugin, "plugin"))
+
+    @property
+    def selected_plugin_candidates(self) -> tuple[PluginCandidate, ...]:
+        """The process selection captured before provider registration and freeze."""
+        return self._selected_plugin_candidates
+
+    def select_plugin_candidates(self, candidates: tuple[PluginCandidate, ...]) -> None:
+        self._writable()
+        if self._selection_bound or not isinstance(candidates, tuple):
+            raise PolicyRegistrationError("invalid or repeated selected plugin snapshot")
+        self._selected_plugin_candidates = candidates
+        self._selection_bound = True
 
     def _writable(self) -> None:
         if self._frozen:

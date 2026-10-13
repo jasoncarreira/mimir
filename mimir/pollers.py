@@ -1173,10 +1173,14 @@ def _resolve_direct_child(candidate: Path, base: Path, *, label: str) -> Path:
     return resolved
 
 
-def _validate_poller_identity(name: str, manifest_path: Path) -> None:
+def _validate_poller_identity(
+    name: str, manifest_path: Path, *, plugin_owner: str | None = None,
+) -> None:
     """Bind names with special server-side authority to their shipped skill identity."""
     required_skill = reserved_skill_for_name(name)
-    if required_skill is not None and manifest_path.parent.name != required_skill:
+    if required_skill is not None and (
+        plugin_owner is not None or manifest_path.parent.name != required_skill
+    ):
         raise ValueError(
             f"reserved poller name {name!r} may only be declared by "
             f"the {required_skill!r} skill"
@@ -1192,13 +1196,14 @@ def _parse_poller_authority(
     state_root: Path | None,
     manifest_path: Path,
     policy: PolicyRegistry | None = None,
+    plugin_owner: str | None = None,
 ) -> ServicePrincipal:
     """Strictly resolve one manifest authority declaration or raise ValueError."""
     if policy is not None and not policy.frozen:
         raise ValueError("poller authority requires a frozen policy")
     profiles = policy.authority_profiles if policy is not None else TRIGGER_AUTHORITY_PROFILES
     tiers = policy.tiers if policy is not None else TRIGGER_CAPABILITY_TIERS
-    _validate_poller_identity(name, manifest_path)
+    _validate_poller_identity(name, manifest_path, plugin_owner=plugin_owner)
     if not isinstance(raw, dict):
         raise ValueError("authority must be an object")
     unknown = set(raw) - _AUTHORITY_KEYS - _OPTIONAL_AUTHORITY_KEYS
@@ -1211,6 +1216,10 @@ def _parse_poller_authority(
     profile = raw["profile"]
     if not isinstance(profile, str) or profile not in profiles:
         raise ValueError(f"unknown authority profile: {profile!r}")
+    if plugin_owner is not None and (
+        policy is None or policy.profiles[profile].owner != plugin_owner
+    ):
+        raise ValueError(f"poller authority profile {profile!r} is not owned by {plugin_owner!r}")
     proposal_surface = raw.get("proposal_surface", "wiki")
     if not isinstance(proposal_surface, str) or proposal_surface not in ("wiki", "social-outbox"):
         raise ValueError(f"unknown proposal_surface: {proposal_surface!r}")
@@ -1227,6 +1236,13 @@ def _parse_poller_authority(
     ):
         raise ValueError("authority capabilities must be a list of non-empty names")
     capabilities = tuple(dict.fromkeys(capabilities_raw))
+    if plugin_owner is not None and any(
+        policy.capabilities.get(capability) != plugin_owner
+        or capability not in policy.tools
+        or policy.tools[capability].owner != plugin_owner
+        for capability in capabilities
+    ):
+        raise ValueError(f"poller capabilities must be registered tools owned by {plugin_owner!r}")
     approved_urls: list[str] = []
     if "approved_urls" in raw:
         if profile not in {"research", "github"}:
@@ -1301,6 +1317,8 @@ def _parse_poller_authority(
     saga_full_corpus_read = raw.get("saga_full_corpus_read", False)
     if not isinstance(saga_full_corpus_read, bool):
         raise ValueError("authority saga_full_corpus_read must be a boolean")
+    if plugin_owner is not None and saga_full_corpus_read:
+        raise ValueError("plugin pollers cannot request full corpus read")
 
     roots_raw = raw["scoped_roots"]
     if not isinstance(roots_raw, list) or not all(isinstance(item, str) for item in roots_raw):
@@ -1344,6 +1362,8 @@ def _parse_poller_authority(
 
     home_root = state_root.parent.parent if state_root is not None else None
     raw_shell_commands = raw.get("shell_commands")
+    if plugin_owner is not None and raw_shell_commands is not None:
+        raise ValueError("plugin pollers cannot declare shell commands")
     declared_shell_commands = parse_declared_shell_commands(
         raw_shell_commands,
         # The roots only matter to declared commands; skip the lookup otherwise.
@@ -1700,6 +1720,7 @@ def discover_pollers(
     invalid_entries: list[tuple[Path, str, str]] | None = None,
     overrides_path: Path | None = None,
     policy: PolicyRegistry | None = None,
+    plugin_candidates: tuple[object, ...] | None = None,
 ) -> list[PollerConfig]:
     """Walk ``skills_dir/**/pollers.json`` and parse out poller configs.
 
@@ -1736,7 +1757,11 @@ def discover_pollers(
     """
     _validate_non_secret_forwarded_env_keys()
     pollers: list[PollerConfig] = []
-    if not skills_dir.exists():
+    if plugin_candidates is None:
+        plugin_candidates = policy.selected_plugin_candidates if policy is not None else ()
+    if policy is not None and set(policy.poller_hooks) & {"github", "worklink"}:
+        raise ValueError("plugin poller hooks collide with reserved core profiles")
+    if not skills_dir.exists() and not plugin_candidates:
         return pollers
 
     # chainlink #420: poller names are the registry/job/persist_dir/
@@ -1748,7 +1773,34 @@ def discover_pollers(
     # which skill lost.
     seen_names: dict[str, Path] = {}
 
-    for pollers_file in sorted(skills_dir.rglob("pollers.json")):
+    manifests: dict[Path, str | None] = {
+        path: None for path in skills_dir.rglob("pollers.json")
+    } if skills_dir.exists() else {}
+    for candidate in plugin_candidates:
+        if not candidate.enabled or candidate.manifest is None:
+            continue
+        if policy is None or not policy.frozen:
+            raise ValueError("plugin pollers require frozen selected policy")
+        dist = candidate.entry_point.dist
+        if dist is None or dist.files is None:
+            raise ValueError(f"plugin {candidate.name!r} has no package file inventory")
+        manifest_files = [file for file in dist.files if file.name == "mimir-plugin.toml"]
+        if len(manifest_files) != 1:
+            raise ValueError(f"plugin {candidate.name!r} has no unique package root")
+        root = Path(dist.locate_file(manifest_files[0])).parent.resolve()
+        for file in dist.files:
+            if file.name != "pollers.json":
+                continue
+            path = Path(dist.locate_file(file))
+            if (path.is_symlink() or not path.resolve().is_relative_to(root)
+                    or path.parent.parent != root / "skills"
+                    or not path.is_file()):
+                raise ValueError(f"plugin {candidate.name!r}: invalid skill poller resource {path}")
+            if path in manifests:
+                raise ValueError(f"plugin poller resource collision: {path}")
+            manifests[path] = candidate.name
+
+    for pollers_file, plugin_owner in sorted(manifests.items()):
         from ._paths import live_loader_path_allowed
         if not live_loader_path_allowed(pollers_file):
             continue
@@ -1868,7 +1920,7 @@ def discover_pollers(
                 continue
             try:
                 _validate_path_component(name, label="poller name")
-                _validate_poller_identity(name, pollers_file)
+                _validate_poller_identity(name, pollers_file, plugin_owner=plugin_owner)
             except ValueError as exc:
                 log.warning(
                     "poller_invalid_name: %s name=%r — %s; poller not registered",
@@ -1879,7 +1931,9 @@ def discover_pollers(
                 continue
             hooks_raw = entry.get("hooks")
             try:
-                hooks = resolve_poller_hooks(hooks_raw, pollers_file)
+                hooks = resolve_poller_hooks(
+                    hooks_raw, pollers_file, policy=policy, plugin_owner=plugin_owner,
+                )
             except ValueError as exc:
                 log.warning(
                     "poller_hooks_rejected: %s name=%r — %s; poller not registered",
@@ -2073,6 +2127,7 @@ def discover_pollers(
                         state_root=state_root,
                         manifest_path=pollers_file,
                         policy=policy,
+                        plugin_owner=plugin_owner,
                     )
                 except (OSError, ValueError) as exc:
                     log.warning(

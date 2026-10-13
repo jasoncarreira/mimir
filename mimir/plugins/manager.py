@@ -137,6 +137,7 @@ def load_plugins(*, enable: str) -> PluginManager:
                                    ", ".join(f"{owner}:{skin}" for owner, skin in defaults))
     policy = PolicyRegistry()
     register_core_tools(policy)
+    policy.select_plugin_candidates(selected)
     loaded = []
     for candidate in selected:
         try:

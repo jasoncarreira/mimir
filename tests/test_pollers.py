@@ -38,7 +38,7 @@ import yaml
 from mimir import access_control, poller_recovery
 from mimir.event_logger import init_logger
 from mimir.models import AgentEvent
-from mimir.poller_hooks import POLLER_HOOK_PROFILES, PollerHooks
+from mimir.poller_hooks import PollerHooks, resolve_poller_hooks
 from mimir.pollers import (
     POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
     POLLER_CIRCUIT_BREAKER_THRESHOLD,
@@ -66,6 +66,177 @@ from mimir.pollers import (
     run_poller,
     validate_poller_overrides_text,
 )
+
+
+def test_plugin_package_poller_hooks_survive_discovery_and_reload(tmp_path):
+    from mimir.plugins.registry import PolicyRegistry
+
+    root = tmp_path / "provider"
+    skill = root / "skills" / "watcher"
+    skill.mkdir(parents=True)
+    (root / "mimir-plugin.toml").write_text("", encoding="utf-8")
+    manifest = skill / "pollers.json"
+    manifest.write_text(json.dumps({"pollers": [{
+        "name": "example-watch", "command": "python3 scripts/watch.py",
+        "cron": "*/10 * * * *", "hooks": "example-recovery",
+    }]}), encoding="utf-8")
+    paths = (root / "mimir-plugin.toml", manifest)
+    dist = SimpleNamespace(files=paths, locate_file=lambda path: path)
+    candidate = SimpleNamespace(enabled=True, name="example", manifest=object(),
+                                entry_point=SimpleNamespace(dist=dist))
+    hooks = PollerHooks(recovery_relevance=lambda _config: lambda _event: True)
+    registry = PolicyRegistry()
+    registry.registrar("example").register_poller_hook("example-recovery", lambda: hooks)
+    policy = registry.freeze()
+
+    for _ in range(2):
+        pollers = discover_pollers(tmp_path / "empty-skills", policy=policy,
+                                   plugin_candidates=(candidate,))
+        assert len(pollers) == 1
+        assert pollers[0].manifest_path == manifest
+        assert pollers[0].hooks is hooks
+        assert pollers[0].resolved_authority().capabilities == ()
+
+    manifest.write_text(json.dumps({"pollers": [{
+        "name": "example-watch", "command": "python3 scripts/watch.py",
+        "cron": "*/10 * * * *", "hooks": "github",
+    }]}), encoding="utf-8")
+    rejected = []
+    assert discover_pollers(tmp_path / "empty-skills", policy=policy,
+                            plugin_candidates=(candidate,), invalid_entries=rejected) == []
+    assert "reserved" in rejected[0][2]
+    assert discover_pollers(tmp_path / "empty-skills", policy=policy,
+                            plugin_candidates=(SimpleNamespace(**{
+                                **vars(candidate), "enabled": False,
+                            }),)) == []
+
+
+def test_plugin_poller_authority_rejects_foreign_profile(tmp_path):
+    from mimir.plugins.registry import PolicyRegistry
+
+    registry = PolicyRegistry()
+    registry.register_authority_profile("foreign")
+    policy = registry.freeze()
+    skill = tmp_path / "skills" / "watcher"
+    skill.mkdir(parents=True)
+    with pytest.raises(ValueError, match="not owned"):
+        _parse_poller_authority(
+            {"profile": "foreign", "tier": "scope-contained",
+             "capabilities": [], "scoped_roots": []}, name="example-watch",
+            persist_dir=skill, state_root=None, manifest_path=skill / "pollers.json",
+            policy=policy, plugin_owner="example",
+        )
+
+
+def test_selected_provider_module_poller_authority_and_reloads(tmp_path, monkeypatch):
+    import importlib
+
+    from mimir.plugins import manager
+
+    root = tmp_path / "provider"
+    skill = root / "skills" / "watcher"
+    skill.mkdir(parents=True)
+    (root / "mimir-plugin.toml").write_text("", encoding="utf-8")
+    manifest = skill / "pollers.json"
+
+    def declare(name="example-watch", hooks="example-hook", capabilities=("example_read",)):
+        manifest.write_text(json.dumps({"pollers": [{
+            "name": name, "command": "python3 scripts/watch.py", "cron": "*/10 * * * *",
+            "hooks": hooks,
+            "authority": {"profile": "example-profile", "tier": "scope-contained",
+                          "capabilities": list(capabilities), "scoped_roots": ["state"]},
+        }]}), encoding="utf-8")
+
+    declare()
+    module = tmp_path / "enabled_poller_provider.py"
+    module.write_text('''from mimir.poller_hooks import PollerHooks
+from mimir.tool_descriptors import ResultOriginKind
+
+def register(registrar):
+    registrar.register_tool(
+        name="example_read", factory=lambda: object(), flow="source",
+        tier="scope-contained", operation_class="open", result_domain="web",
+        result_origin=ResultOriginKind.EXTERNAL, sink_category=None,
+        sink_destination=None, sink_target_extractor=None, sink_payload_extractor=None,
+        writes_code_or_state=False, profiles=("example-profile",), read_backend=False,
+    )
+    registrar.register_capability("example_read")
+    registrar.register_authority_profile("example-profile", capabilities=("example_read",))
+    registrar.register_poller_hook("example-hook", lambda: PollerHooks(
+        recovery_relevance=lambda poller: lambda event: poller.name == "example-watch",
+    ))
+''', encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    dist = SimpleNamespace(files=(root / "mimir-plugin.toml", manifest),
+                           locate_file=lambda path: path)
+    candidate = SimpleNamespace(name="example", distribution="example", enabled=True,
+                                manifest=object(), entry_point=SimpleNamespace(
+                                    dist=dist, load=lambda: importlib.import_module("enabled_poller_provider"),
+                                ))
+    monkeypatch.setattr(manager, "enabled_plugins", lambda *, enable: (candidate,))
+    selected = manager.load_plugins(enable="example").policy
+    assert selected.selected_plugin_candidates == (candidate,)
+    assert selected.frozen
+
+    skills = tmp_path / "skills"
+    state = tmp_path / "state" / "pollers"
+    monkeypatch.setenv("MIMIR_PLUGINS", "disabled")
+    for _ in range(2):
+        pollers = discover_pollers(skills, state_root=state, policy=selected)
+        assert len(pollers) == 1
+        poller = pollers[0]
+        assert poller.manifest_path == manifest
+        assert poller.hooks is not None and poller.hooks.recovery_relevance is not None
+        assert poller.hooks.recovery_relevance(poller)(None)
+        assert poller.authority is not None
+        assert poller.authority.canonical == "poller:example-watch"
+        assert poller.authority.authority_profile == "example-profile"
+        assert poller.authority.capabilities == ("example_read",)
+        event = AgentEvent(
+            trigger="poller", channel_id=poller.channel_id(), content="read",
+            service_principal=poller.authority.canonical,
+            service_authority=poller.authority,
+        )
+        auth = create_auth_context(event, enforce=True)
+        verdict = ToolRegistry().authorize_tool("example_read", auth, enforce=True, policy=selected)
+        assert verdict.allowed, verdict.reason
+        assert not ToolRegistry().authorize_tool(
+            "saga_forget", auth, enforce=True, policy=selected,
+        ).allowed
+
+    # An authority-less installed candidate must not be added by a changed
+    # environment. Nor can a changed environment remove the selected one.
+    other_skill = tmp_path / "foreign" / "skills" / "watcher"
+    other_skill.mkdir(parents=True)
+    foreign_manifest = other_skill.parents[1] / "mimir-plugin.toml"
+    foreign_manifest.write_text("", encoding="utf-8")
+    (other_skill / "pollers.json").write_text(json.dumps({"pollers": [{
+        "name": "foreign-watch", "command": "echo", "cron": "0 * * * *",
+    }]}), encoding="utf-8")
+    foreign_dist = SimpleNamespace(files=(foreign_manifest, other_skill / "pollers.json"),
+                                   locate_file=lambda path: path)
+    foreign = SimpleNamespace(name="foreign", distribution="foreign", enabled=True,
+                              manifest=object(), entry_point=SimpleNamespace(dist=foreign_dist))
+    monkeypatch.setattr("mimir.plugins.discovery.enabled_plugins",
+                        lambda: (foreign,))
+    monkeypatch.setenv("MIMIR_PLUGINS", "foreign")
+    assert [p.name for p in discover_pollers(skills, state_root=state, policy=selected)] == ["example-watch"]
+
+    for name, hooks, capabilities, reason in (
+        ("example-watch", "example-hook", ("read_file",), "owned"),
+        ("github-activity", "example-hook", ("example_read",), "reserved"),
+        ("worklink-ready-queue", "example-hook", ("example_read",), "reserved"),
+        ("github-ci-watch", "example-hook", ("example_read",), "reserved"),
+        ("example-watch", "github", ("example_read",), "reserved"),
+        ("example-watch", "worklink", ("example_read",), "reserved"),
+    ):
+        declare(name, hooks, capabilities)
+        invalid = []
+        assert discover_pollers(skills, state_root=state, policy=selected,
+                                invalid_entries=invalid) == []
+        assert reason in invalid[0][2]
+    assert resolve_poller_hooks("github", Path("github-poller/pollers.json")) is not None
+    assert resolve_poller_hooks("worklink", Path("chainlink-orchestrator/pollers.json")) is not None
 
 
 def test_verified_own_push_drops_stale_framework_trigger_before_scope_binding(
@@ -290,7 +461,7 @@ def test_declared_hooks_are_selected_independently_of_poller_name(
     [poller] = discover_pollers(skills)
 
     assert poller.name == name
-    assert poller.hooks is POLLER_HOOK_PROFILES[profile].hooks
+    assert poller.hooks is resolve_poller_hooks(profile, poller.manifest_path)
 
 
 def test_reserved_poller_without_hooks_is_registered_and_surfaced(
@@ -4179,7 +4350,7 @@ async def test_run_github_poller_logs_stale_recovery_drop(
         skill_dir=skill_dir,
         persist_dir=persist_dir,
         recover_failed_turns=True,
-        hooks=POLLER_HOOK_PROFILES["github"].hooks,
+        hooks=resolve_poller_hooks("github", Path("github-poller/pollers.json")),
     )
     source_id = "poller:github-activity:stale"
     prior = AgentEvent(
@@ -4244,7 +4415,7 @@ print(json.dumps({
         skill_dir=skill_dir,
         persist_dir=persist_dir,
         recover_failed_turns=True,
-        hooks=POLLER_HOOK_PROFILES["github"].hooks,
+        hooks=resolve_poller_hooks("github", Path("github-poller/pollers.json")),
     )
     prior = AgentEvent(
         trigger="poller",
@@ -9514,8 +9685,12 @@ def test_priority_inventory_reports_effective_values_and_sources(home, caplog):
     skills = home / "skills"
     manifest = skills / "github-poller" / "pollers.json"
     names = ["github-activity", "github-ci-watch", "remediation-ready-queue", "default", "typo"]
+    ci_manifest = _write_pollers_json(skills / "github-ci-watch", [
+        {"name": "github-ci-watch", "command": "echo", "cron": "0 * * * *"},
+    ])
     _write_pollers_json(manifest.parent, [
-        {"name": name, "command": "echo", "cron": "0 * * * *"} for name in names
+        {"name": name, "command": "echo", "cron": "0 * * * *"}
+        for name in names if name != "github-ci-watch"
     ])
     path = _write_overrides(home / "pollers-overrides.yaml", json.dumps({
         **{name: {"priority": " High "} for name in names[:3]},
@@ -9528,9 +9703,10 @@ def test_priority_inventory_reports_effective_values_and_sources(home, caplog):
               if r.getMessage().startswith("poller_priorities: ")]
     assert json.loads(line.removeprefix("poller_priorities: ")) == [
         {"name": name, "priority": "high" if name in names[:3] else "normal",
-         "source": "operator_override" if name in names[:3] else "skill_default",
-         "path": str(path if name in names[:3] else manifest)}
-        for name in names
+          "source": "operator_override" if name in names[:3] else "skill_default",
+          "path": str(path if name in names[:3] else
+                      ci_manifest if name == "github-ci-watch" else manifest)}
+        for name in ["github-ci-watch", "github-activity", *names[2:]]
     ]
 
 
