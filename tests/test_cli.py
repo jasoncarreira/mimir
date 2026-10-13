@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
+import ast
+import inspect
 import os
 import subprocess
 from pathlib import Path
@@ -10,6 +13,130 @@ from unittest.mock import patch
 import pytest
 
 from mimir.cli import _print_setup_report, main, setup_home
+
+
+CORE_COMMANDS = frozenset({
+    "setup", "run", "identities", "reflection", "memory", "worklink",
+    "regenerate-api-key", "stats", "verify-cred", "verify-creds",
+    "viability-report", "verify-index", "rotate", "loops", "update",
+    "predictions", "wiki", "skills", "plugins", "scaffold-docker",
+    "opencode-bootstrap", "commitments", "feedback", "reindex",
+    "migrate-memory", "saga-reembed", "saga-acl-inventory",
+    "saga-enforcement-replay", "saga-migrate-legacy-acl", "watchdog",
+    "notify-restart",
+})
+
+
+def test_closed_core_parser_dispatch_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every core parser has its own handler and no core dispatch chain remains."""
+    from mimir.plugins.cli_registry import CommandRegistry
+
+    source = ast.parse(inspect.getsource(main))
+    registry_nodes = [node for node in ast.walk(source) if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "core_commands"
+                              for target in node.targets)]
+    assert len(registry_nodes) == 1
+    declaration = registry_nodes[0].value
+    assert isinstance(declaration, ast.Dict)
+    assert {ast.literal_eval(key) for key in declaration.keys} == CORE_COMMANDS
+    assert len(declaration.keys) == len(CORE_COMMANDS)
+
+    for node in ast.walk(source):
+        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+            continue
+        comparison = node.test
+        if isinstance(comparison.left, ast.Attribute) and comparison.left.attr == "command":
+            assert not any(isinstance(value, ast.Constant) and isinstance(value.value, str)
+                           for value in comparison.comparators), "legacy core dispatch chain"
+
+    parse_args = argparse.ArgumentParser.parse_args
+    parser_choices = {}
+
+    def capture_parsers(parser, *args, **kwargs):
+        sub = next(action for action in parser._actions
+                   if isinstance(action, argparse._SubParsersAction))
+        parser_choices.update(sub.choices)
+        return parse_args(parser, *args, **kwargs)
+
+    def verify(self, args):
+        commands = self.commands
+        assert set(commands) == set(parser_choices) == CORE_COMMANDS
+        for name, command in commands.items():
+            assert command.owner == "core"
+            assert command.configure(None) is parser_choices[name]
+            assert command.dispatch.__name__ == f"handle_{name.replace('-', '_')}"
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", capture_parsers)
+    monkeypatch.setattr(CommandRegistry, "dispatch", verify)
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    main(["plugins", "list"])
+
+
+CORE_DISPATCH_CASES = (
+    ("setup", ("setup", "--home", "{home}"), "mimir.cli.setup_home"),
+    ("run", ("run", "--home", "{home}"), "mimir.server.main"),
+    ("identities", ("identities", "list", "--home", "{home}"), "mimir.commands.identities.dispatch"),
+    ("reflection", ("reflection", "list-pending"), "mimir.commands.reflection.dispatch"),
+    ("memory", ("memory", "status", "--home", "{home}"), "mimir.commands.memory.dispatch"),
+    ("worklink", ("worklink", "status", "--home", "{home}"), "mimir.commands.worklink.dispatch"),
+    ("regenerate-api-key", ("regenerate-api-key", "--home", "{home}"), "mimir.cli.regenerate_api_key"),
+    ("stats", ("stats", "--home", "{home}", "--egress-shadow"), "mimir.cli._print_egress_shadow_report"),
+    ("verify-cred", ("verify-cred", "GITHUB_TOKEN"), "mimir.cred_verify.run_verify_cred_cmd"),
+    ("verify-creds", ("verify-creds", "--type", "A"), "mimir.cred_verify.run_verify_creds_cmd"),
+    ("viability-report", ("viability-report", "--home", "{home}", "--no-write"), "mimir.viability_metrics.run_viability_report_cmd"),
+    ("verify-index", ("verify-index", "--home", "{home}", "--db", "saga"), "mimir.index_integrity.run_verify_index_cmd"),
+    ("rotate", ("rotate", "--env", "GITHUB_TOKEN", "--from-file", "{home}/token.txt", "--no-recreate"), "mimir.cred_rotate.run_rotate"),
+    ("loops", ("loops", "--home", "{home}"), "mimir.loops_cmd.run_loops_cmd"),
+    ("update", ("update", "--check"), "mimir.commands.update.dispatch"),
+    ("predictions", ("predictions",), "mimir.skills.predictions.scripts.predictions_cli.run"),
+    ("wiki", ("wiki", "backlinks"), "mimir.wiki_backlinks.cmd_backlinks"),
+    ("skills", ("skills", "list"), "mimir.commands.skills.dispatch"),
+    ("scaffold-docker", ("scaffold-docker", "--home", "{home}"), "mimir.scaffold_docker.cmd"),
+    ("opencode-bootstrap", ("opencode-bootstrap", "--home", "{home}"), "mimir.scaffold_docker.ensure_opencode_config"),
+    ("commitments", ("commitments", "list", "--home", "{home}"), "mimir.commitments.cli.dispatch"),
+    ("feedback", ("feedback", "emit", "test-event"), "mimir.commands.feedback.dispatch"),
+    ("reindex", ("reindex",), "mimir.reindex.dispatch"),
+    ("migrate-memory", ("migrate-memory", "--source", "{home}/source.db", "--dest", "{home}/dest.db"), "mimir.saga.migrate.migrate"),
+    ("saga-reembed", ("saga-reembed", "--home", "{home}", "--dry-run"), "mimir.runtime.resolve_saga_config"),
+    ("saga-acl-inventory", ("saga-acl-inventory", "--db", "{home}/saga.db"), "mimir.saga.acl_inventory.inventory_path"),
+    ("saga-enforcement-replay", ("saga-enforcement-replay", "--db", "{home}/saga.db", "--trace", "{home}/trace.jsonl", "--cutover", "2026-01-01T00:00:00Z"), "mimir.saga.enforcement_replay.analyze_paths"),
+    ("saga-migrate-legacy-acl", ("saga-migrate-legacy-acl", "--source", "{home}/saga.db", "--cutover", "2026-01-01T00:00:00Z"), "mimir.saga.legacy_acl_migration.migrate_copy"),
+    ("watchdog", ("watchdog", "--once", "--home", "{home}"), "mimir.liveness.run_watchdog"),
+    ("notify-restart", ("notify-restart", "--unit", "mimir.service"), "mimir.liveness.notify_service_event"),
+)
+
+
+@pytest.mark.parametrize("name,argv,target", CORE_DISPATCH_CASES,
+                         ids=[row[0] for row in CORE_DISPATCH_CASES])
+def test_core_command_reaches_handler(
+    name: str, argv: tuple[str, ...], target: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parse a valid command and prove real registry dispatch reaches its effect."""
+    assert {row[0] for row in CORE_DISPATCH_CASES} | {"plugins"} == CORE_COMMANDS
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("")
+    (tmp_path / "token.txt").write_text("replacement\n")
+
+    class HandlerReached(Exception):
+        pass
+
+    with patch(target, side_effect=HandlerReached) as handler:
+        with pytest.raises(HandlerReached):
+            main([part.replace("{home}", str(tmp_path)) for part in argv])
+    handler.assert_called_once()
+
+
+def test_plugins_list_reaches_metadata_handler(monkeypatch: pytest.MonkeyPatch,
+                                                capsys: pytest.CaptureFixture) -> None:
+    from mimir.commands import plugins
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+    with patch.object(plugins, "discover_plugins", return_value=()) as discover:
+        main(["plugins", "list"])
+    discover.assert_called_once_with(enable="")
+    assert capsys.readouterr().out == "No plugins installed.\n"
 
 
 @pytest.fixture(autouse=True)

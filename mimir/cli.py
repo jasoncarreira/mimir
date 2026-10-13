@@ -112,6 +112,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .tools._shell_env import disable_process_dumpability
 
     disable_process_dumpability()
+    words = list(argv) if argv is not None else sys.argv[1:]
     parser = argparse.ArgumentParser(
         prog="mimir",
         description="Memory-centric agent harness on the Claude Agent SDK.",
@@ -492,9 +493,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     # Dispatch
     # -----------------------------------------------------------------------
 
-    args = parser.parse_args(list(argv) if argv is not None else None)
-
-    if args.command == "setup":
+    def handle_setup(args: argparse.Namespace) -> None:
         home = (args.home or Path.cwd()).resolve()
         if args.home is None and (home / ".git").exists() and not (home / ".mimir").is_dir():
             print(
@@ -513,22 +512,22 @@ def main(argv: Sequence[str] | None = None) -> None:
         _print_setup_report(status)
         return
 
-    if args.command == "identities":
+    def handle_identities(args: argparse.Namespace) -> None:
         code = _identities_cmd.dispatch(args, id_p)
         if code:
             sys.exit(code)
         return
 
-    if args.command == "memory":
+    def handle_memory(args: argparse.Namespace) -> None:
         code = _memory_cmd.dispatch(args, mem_p)
         if code:
             sys.exit(code)
         return
 
-    if args.command == "worklink":
+    def handle_worklink(args: argparse.Namespace) -> None:
         sys.exit(_worklink_cmd.dispatch(args, worklink_p))
 
-    if args.command == "watchdog":
+    def handle_watchdog(args: argparse.Namespace) -> None:
         import asyncio
         from .liveness import run_watchdog
         home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
@@ -546,13 +545,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             sys.exit(1)
         return
 
-    if args.command == "notify-restart":
+    def handle_notify_restart(args: argparse.Namespace) -> None:
         import asyncio
         from .liveness import notify_service_event
         asyncio.run(notify_service_event(unit=args.unit, detail=args.detail))
         return
 
-    if args.command == "stats":
+    def handle_stats(args: argparse.Namespace) -> None:
         if args.since is not None and not args.egress_shadow:
             stats_p.error("--since requires --egress-shadow")
         if args.egress_shadow:
@@ -608,7 +607,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     )
         return
 
-    if args.command == "regenerate-api-key":
+    def handle_regenerate_api_key(args: argparse.Namespace) -> None:
         home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
         home = Path(home_arg).resolve()
         env_path = home / ".env"
@@ -630,20 +629,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         return
 
-    if args.command == "verify-cred":
+    def handle_verify_cred(args: argparse.Namespace) -> None:
         from .cred_verify import run_verify_cred_cmd
         sys.exit(run_verify_cred_cmd(args.name))
 
-    if args.command == "verify-creds":
+    def handle_verify_creds(args: argparse.Namespace) -> None:
         from .cred_verify import run_verify_creds_cmd
         sys.exit(run_verify_creds_cmd(only_type=args.cred_type))
 
-    if args.command == "verify-index":
+    def handle_verify_index(args: argparse.Namespace) -> None:
         from .index_integrity import run_verify_index_cmd
         home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
         sys.exit(run_verify_index_cmd(home=home, db=args.db))
 
-    if args.command == "viability-report":
+    def handle_viability_report(args: argparse.Namespace) -> None:
         from .viability_metrics import run_viability_report_cmd
         home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
         warning_count = run_viability_report_cmd(
@@ -654,7 +653,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         sys.exit(0 if warning_count == 0 else 1)
 
-    if args.command == "rotate":
+    def handle_rotate(args: argparse.Namespace) -> None:
         from .cred_rotate import run_rotate
         new_value: str | None = None
         if args.from_file:
@@ -672,63 +671,63 @@ def main(argv: Sequence[str] | None = None) -> None:
             skip_recreate=args.skip_recreate,
         ))
 
-    if args.command == "loops":
+    def handle_loops(args: argparse.Namespace) -> None:
         from .loops_cmd import run_loops_cmd
         home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
         sys.exit(run_loops_cmd(home))
 
-    if args.command == "update":
+    def handle_update(args: argparse.Namespace) -> None:
         sys.exit(_update_cmd.dispatch(args))
 
-    if args.command == "predictions":
+    def handle_predictions(args: argparse.Namespace) -> None:
         from .skills.predictions.scripts import predictions_cli as _predictions_script
         sys.exit(_predictions_script.run(args))
 
-    if args.command == "wiki":
+    def handle_wiki(args: argparse.Namespace) -> None:
         if args.wiki_action == "backlinks":
             from . import wiki_backlinks as _wiki_backlinks
             sys.exit(_wiki_backlinks.cmd_backlinks(args))
         wiki_p.print_help()
         sys.exit(1)
 
-    if args.command == "skills":
+    def handle_skills(args: argparse.Namespace) -> None:
         sys.exit(_skills_cmd.dispatch(args, skills_p))
 
-    if args.command == "plugins":
+    def handle_plugins(args: argparse.Namespace) -> None:
         code = _plugins_cmd.dispatch(args, plugins_p)
         if code:
             sys.exit(code)
         return
 
-    if args.command == "scaffold-docker":
+    def handle_scaffold_docker(args: argparse.Namespace) -> None:
         # _scaffold_docker was already imported at subparser-registration
         # time (parser.add_argument requires the module to wire ``cmd``).
         # Reuse the existing scaffold_docker_cmd reference set via
         # ``parser.set_defaults`` rather than re-importing here.
         sys.exit(args.scaffold_docker_cmd(args))
 
-    if args.command == "opencode-bootstrap":
+    def handle_opencode_bootstrap(args: argparse.Namespace) -> None:
         user_home = (args.home or Path.home()).expanduser().resolve()
         config_path = _scaffold_docker.opencode_config_path(user_home)
         changed = _scaffold_docker.ensure_opencode_config(config_path)
         print(f"{'updated' if changed else 'unchanged'} {config_path}")
         return
 
-    if args.command == "commitments":
+    def handle_commitments(args: argparse.Namespace) -> None:
         if args.commitments_action is None:
             commitments_p.print_help()
             sys.exit(1)
         from .commitments import cli as _commitments_cli
         sys.exit(_commitments_cli.dispatch(args))
 
-    if args.command == "feedback":
+    def handle_feedback(args: argparse.Namespace) -> None:
         sys.exit(_feedback_cmd.dispatch(args, feedback_p))
 
-    if args.command == "reindex":
+    def handle_reindex(args: argparse.Namespace) -> None:
         from . import reindex as _reindex
         sys.exit(_reindex.dispatch(args))
 
-    if args.command == "migrate-memory":
+    def handle_migrate_memory(args: argparse.Namespace) -> None:
         from .saga.migrate import migrate as _migrate_memory
         try:
             _migrate_memory(
@@ -742,7 +741,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             sys.exit(1)
         sys.exit(0)
 
-    if args.command == "saga-reembed":
+    def handle_saga_reembed(args: argparse.Namespace) -> None:
         import math
         import sqlite3
         from .config import _load_home_dotenv
@@ -778,7 +777,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             sys.exit(1)
         return
 
-    if args.command == "saga-acl-inventory":
+    def handle_saga_acl_inventory(args: argparse.Namespace) -> None:
         from .saga.acl_inventory import inventory_path
         import json
         import sqlite3
@@ -793,7 +792,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(json.dumps(report, indent=2, sort_keys=True))
         return
 
-    if args.command == "saga-enforcement-replay":
+    def handle_saga_enforcement_replay(args: argparse.Namespace) -> None:
         from .saga.enforcement_replay import analyze_paths
         import json
         import sqlite3
@@ -806,7 +805,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(json.dumps(report, indent=2, sort_keys=True))
         return
 
-    if args.command == "saga-migrate-legacy-acl":
+    def handle_saga_migrate_legacy_acl(args: argparse.Namespace) -> None:
         from .saga.legacy_acl_migration import migrate_copy
         import json
         import sqlite3
@@ -827,10 +826,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(json.dumps(report, indent=2, sort_keys=True))
         return
 
-    if args.command == "reflection":
+    def handle_reflection(args: argparse.Namespace) -> None:
         sys.exit(_reflection_cmd.dispatch(args, refl_p))
 
-    if args.command in (None, "run"):
+    def handle_run(args: argparse.Namespace) -> None:
         home_arg = getattr(args, "home", None)
         if home_arg is not None:
             os.environ["MIMIR_HOME"] = str(Path(home_arg).resolve())
@@ -864,8 +863,59 @@ def main(argv: Sequence[str] | None = None) -> None:
         run_server()
         return
 
-    parser.print_help()
-    sys.exit(1)
+    from .plugins.cli_registry import CommandRegistry
+
+    commands = CommandRegistry()
+    core_commands = {
+        "setup": (setup_p, handle_setup),
+        "run": (run_p, handle_run),
+        "identities": (id_p, handle_identities),
+        "reflection": (refl_p, handle_reflection),
+        "memory": (mem_p, handle_memory),
+        "worklink": (worklink_p, handle_worklink),
+        "regenerate-api-key": (regen_p, handle_regenerate_api_key),
+        "stats": (stats_p, handle_stats),
+        "verify-cred": (verify_cred_p, handle_verify_cred),
+        "verify-creds": (verify_creds_p, handle_verify_creds),
+        "viability-report": (viability_p, handle_viability_report),
+        "verify-index": (verify_index_p, handle_verify_index),
+        "rotate": (rotate_p, handle_rotate),
+        "loops": (loops_p, handle_loops),
+        "update": (sub.choices["update"], handle_update),
+        "predictions": (pred_p, handle_predictions),
+        "wiki": (wiki_p, handle_wiki),
+        "skills": (skills_p, handle_skills),
+        "plugins": (plugins_p, handle_plugins),
+        "scaffold-docker": (scaffold_docker_p, handle_scaffold_docker),
+        "opencode-bootstrap": (opencode_bootstrap_p, handle_opencode_bootstrap),
+        "commitments": (commitments_p, handle_commitments),
+        "feedback": (feedback_p, handle_feedback),
+        "reindex": (reindex_p, handle_reindex),
+        "migrate-memory": (migrate_p, handle_migrate_memory),
+        "saga-reembed": (reembed_p, handle_saga_reembed),
+        "saga-acl-inventory": (acl_inventory_p, handle_saga_acl_inventory),
+        "saga-enforcement-replay": (enforcement_replay_p, handle_saga_enforcement_replay),
+        "saga-migrate-legacy-acl": (legacy_migration_p, handle_saga_migrate_legacy_acl),
+        "watchdog": (watchdog_p, handle_watchdog),
+        "notify-restart": (notify_restart_p, handle_notify_restart),
+    }
+    for name, (core_parser, handler) in core_commands.items():
+        commands.add_core(name, core_parser, handler)
+
+    # Inspection paths use installed-distribution metadata only, even if the
+    # operator has selected plugins. In particular, list never imports a provider.
+    if words[:2] not in (["plugins", "list"], ["plugins", "dockerfile"]) and os.environ.get("MIMIR_PLUGINS", "").strip():
+        from .plugins.manager import load_plugins
+
+        manager = load_plugins(enable=os.environ["MIMIR_PLUGINS"])
+        commands.add_selected(manager.policy.cli_commands, sub)
+
+    args = parser.parse_args(words)
+    if args.command is None:
+        args.command = "run"
+    result = commands.dispatch(args)
+    if result:
+        sys.exit(result)
 
 
 if __name__ == "__main__":
