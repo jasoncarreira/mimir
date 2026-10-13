@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ast
 import inspect
 import os
@@ -48,14 +49,24 @@ def test_closed_core_parser_dispatch_inventory(monkeypatch: pytest.MonkeyPatch) 
             assert not any(isinstance(value, ast.Constant) and isinstance(value.value, str)
                            for value in comparison.comparators), "legacy core dispatch chain"
 
+    parse_args = argparse.ArgumentParser.parse_args
+    parser_choices = {}
+
+    def capture_parsers(parser, *args, **kwargs):
+        sub = next(action for action in parser._actions
+                   if isinstance(action, argparse._SubParsersAction))
+        parser_choices.update(sub.choices)
+        return parse_args(parser, *args, **kwargs)
+
     def verify(self, args):
         commands = self.commands
-        assert set(commands) == CORE_COMMANDS
+        assert set(commands) == set(parser_choices) == CORE_COMMANDS
         for name, command in commands.items():
             assert command.owner == "core"
-            assert command.configure(None).prog == f"mimir {name}"
+            assert command.configure(None) is parser_choices[name]
             assert command.dispatch.__name__ == f"handle_{name.replace('-', '_')}"
 
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", capture_parsers)
     monkeypatch.setattr(CommandRegistry, "dispatch", verify)
     monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     main(["plugins", "list"])
