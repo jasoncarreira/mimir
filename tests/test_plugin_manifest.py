@@ -167,7 +167,7 @@ def test_skin_rejects_incomplete_renderer(tmp_path, field):
 @pytest.mark.parametrize("location,key", [
     ("chrome", "layout"), ("panel", "surface"),
     ("characterRenderer", "kind"), ("characterRenderer", "fallbackState"),
-    ("characterRenderer", "stateMap"),
+    ("characterRenderer", "stateMap"), ("skin", "assets"),
 ])
 def test_malformed_skin_nested_values_become_discovery_diagnostics(tmp_path, monkeypatch, location, key):
     root = tmp_path / "pkg"
@@ -175,13 +175,43 @@ def test_malformed_skin_nested_values_become_discovery_diagnostics(tmp_path, mon
     (root / "avatar.png").write_bytes(b"image")
     (root / "mimir-plugin.toml").write_bytes(_toml() + b'themes = ["skin.json"]\n')
     skin = _skin()
-    skin[location][key] = ["invalid"]
+    (skin if location == "skin" else skin[location])[key] = None if location == "skin" else ["invalid"]
     (root / "skin.json").write_text(json.dumps(skin))
     entry = _entry(tmp_path, files=["pkg/mimir-plugin.toml", "pkg/skin.json", "pkg/avatar.png"])
     monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [entry])
     (candidate,) = discover_plugins(enable="")
     assert not candidate.enabled and candidate.diagnostic.startswith("themes:")
     with pytest.raises(PluginDiscoveryError, match="plugin 'alpha' from provider-alpha: themes:"):
+        enabled_plugins(enable="alpha")
+
+
+def test_character_asset_requires_explicit_href(tmp_path, monkeypatch):
+    root = tmp_path / "pkg"
+    root.mkdir()
+    (root / "mimir-plugin.toml").write_bytes(_toml() + b'themes = ["skin.json"]\n')
+    skin = _skin()
+    skin["characterRenderer"]["assets"][0].pop("href")
+    (root / "skin.json").write_text(json.dumps(skin))
+    entry = _entry(tmp_path, files=["pkg/mimir-plugin.toml", "pkg/skin.json"])
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [entry])
+    (candidate,) = discover_plugins(enable="")
+    assert candidate.diagnostic is not None and "invalid character asset" in candidate.diagnostic
+    with pytest.raises(PluginDiscoveryError, match="invalid character asset"):
+        enabled_plugins(enable="alpha")
+
+
+@pytest.mark.parametrize("value", ['["string"]', '{kind = "string"}'])
+def test_malformed_config_type_is_diagnostic_when_disabled_and_rejected_when_selected(tmp_path, monkeypatch, value):
+    root = tmp_path / "pkg"
+    root.mkdir()
+    (root / "mimir-plugin.toml").write_bytes(
+        _toml() + f'[config.MIMIR_PLUGIN_ALPHA_TOKEN]\ntype = {value}\n'.encode()
+    )
+    entry = _entry(tmp_path)
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [entry])
+    (candidate,) = discover_plugins(enable="")
+    assert not candidate.enabled and candidate.diagnostic == "config: invalid schema for MIMIR_PLUGIN_ALPHA_TOKEN"
+    with pytest.raises(PluginDiscoveryError, match="config: invalid schema for MIMIR_PLUGIN_ALPHA_TOKEN"):
         enabled_plugins(enable="alpha")
 
 

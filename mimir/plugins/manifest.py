@@ -130,11 +130,15 @@ def _validate_skin(skin: Any, *, path: str, root: Path | None, files: frozenset[
         for value in tokens.values()
     ):
         raise PluginManifestError(f"themes: complete local --mimir-* token set required: {path}")
-    for asset in skin.get("assets", []):
+    assets = skin.get("assets", [])
+    if not isinstance(assets, list):
+        raise PluginManifestError(f"themes: assets must be an array: {path}")
+    for asset in assets:
         _skin_resource(asset, root=root, files=files)
-    for asset in renderer.get("assets", []):
+    for asset in renderer["assets"]:
         if (not isinstance(asset, dict) or not isinstance(asset.get("id"), str) or not asset["id"]
                 or not _choice(asset.get("type"), {"css", "dotlottie", "image", "json", "sprite"})
+                or "href" not in asset
                 or asset.get("href") is not None and not isinstance(asset["href"], str)):
             raise PluginManifestError(f"themes: invalid character asset: {path}")
         if asset.get("href") is not None:
@@ -267,7 +271,7 @@ def parse_manifest(data: bytes, *, entry_name: str, resource_root: Path | None =
         if not key.startswith(prefix) or not key[len(prefix):] or not re.fullmatch(r"[A-Z0-9_]+", key):
             raise PluginManifestError(f"config: key {key!r} must be under {prefix}")
         if not isinstance(definition, dict) or definition.keys() - {"type", "description", "secret", "security"} \
-                or definition.get("type") not in {"string", "integer", "boolean"} \
+                or not _choice(definition.get("type"), {"string", "integer", "boolean"}) \
                 or any(type(definition.get(flag, False)) is not bool for flag in ("secret", "security")):
             raise PluginManifestError(f"config: invalid schema for {key}")
     return PluginManifest(*(raw[key] for key in ("name", "version", "license", "requires_mimir")),
