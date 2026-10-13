@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -86,6 +87,9 @@ def _table(raw: dict[str, Any], name: str, fields: set[str]) -> dict[str, Any]:
 def _strings(value: Any, key: str) -> tuple[str, ...]:
     if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
         raise PluginManifestError(f"{key}: expected nonempty strings in an array")
+    if key in {"themes", "frontend.assets", "defaults.skills", "defaults.prompts",
+               "defaults.scheduler_jobs", "dockerfile.s6_services"} and len(value) != len(set(value)):
+        raise PluginManifestError(f"{key}: duplicate package resource")
     return tuple(value)
 
 
@@ -135,6 +139,7 @@ def _validate_skin(skin: Any, *, path: str, root: Path | None, files: frozenset[
         raise PluginManifestError(f"themes: assets must be an array: {path}")
     for asset in assets:
         _skin_resource(asset, root=root, files=files)
+    asset_ids: set[str] = set()
     for asset in renderer["assets"]:
         if (not isinstance(asset, dict) or not isinstance(asset.get("id"), str) or not asset["id"]
                 or not _choice(asset.get("type"), {"css", "dotlottie", "image", "json", "sprite"})
@@ -143,12 +148,25 @@ def _validate_skin(skin: Any, *, path: str, root: Path | None, files: frozenset[
             raise PluginManifestError(f"themes: invalid character asset: {path}")
         if asset.get("href") is not None:
             _skin_resource(asset["href"], root=root, files=files)
+        if asset["id"] in asset_ids:
+            raise PluginManifestError(f"themes: duplicate character asset ID {asset['id']!r}: {path}")
+        asset_ids.add(asset["id"])
     fonts = skin.get("fonts", [])
     if not isinstance(fonts, list):
         raise PluginManifestError(f"themes: invalid fonts: {path}")
     for font in fonts:
-        if not isinstance(font, dict) or not isinstance(font.get("family"), str) or not isinstance(font.get("src"), list):
+        if not isinstance(font, dict) or not isinstance(font.get("family"), str) or not font["family"] \
+                or not isinstance(font.get("src"), list):
             raise PluginManifestError(f"themes: invalid font: {path}")
+        weight = font.get("weight")
+        if (("weight" in font and (type(weight) not in {int, float, str}
+                                  or type(weight) is float and not math.isfinite(weight)))
+                or "style" in font and not _choice(font["style"], {"normal", "italic"})
+                or "display" in font and not _choice(font["display"], {
+                    "auto", "block", "swap", "fallback", "optional",
+                })
+                or "unicodeRange" in font and not isinstance(font["unicodeRange"], str)):
+            raise PluginManifestError(f"themes: invalid font descriptor: {path}")
         for source in font["src"]:
             if not isinstance(source, dict) or not _choice(source.get("format"), {"woff2", "woff", "truetype"}):
                 raise PluginManifestError(f"themes: invalid font source: {path}")
@@ -234,6 +252,7 @@ def parse_manifest(data: bytes, *, entry_name: str, resource_root: Path | None =
         raise PluginManifestError("themes: expected an array of package-relative JSON paths")
     themes = _strings(themes, "themes")
     skin_defaults = []
+    skin_ids: set[str] = set()
     for path in themes:
         if not path.endswith(".json"):
             raise PluginManifestError("themes: expected JSON resource")
@@ -244,6 +263,9 @@ def parse_manifest(data: bytes, *, entry_name: str, resource_root: Path | None =
             except (OSError, ValueError) as exc:
                 raise PluginManifestError(f"themes: invalid JSON: {path}") from exc
             default_id = _validate_skin(skin, path=path, root=resource_root, files=distribution_files)
+            if skin["id"] in skin_ids:
+                raise PluginManifestError(f"themes: duplicate skin ID {skin['id']!r}: {path}")
+            skin_ids.add(skin["id"])
             if default_id:
                 skin_defaults.append(default_id)
     if len(skin_defaults) > 1:

@@ -56,6 +56,23 @@ def _skin() -> dict:
     }
 
 
+def _skin_candidate(tmp_path, monkeypatch, skins: dict[str, dict], *, extra_files: tuple[str, ...] = ()):
+    root = tmp_path / "pkg"
+    root.mkdir()
+    (root / "mimir-plugin.toml").write_bytes(
+        _toml() + ("themes = [" + ", ".join(json.dumps(name) for name in skins) + "]\n").encode()
+    )
+    for name, skin in skins.items():
+        (root / name).write_text(json.dumps(skin))
+    for name in extra_files:
+        (root / name).write_bytes(b"asset")
+    files = ["pkg/mimir-plugin.toml", *(f"pkg/{name}" for name in skins),
+             *(f"pkg/{name}" for name in extra_files)]
+    entry = _entry(tmp_path, files=files)
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [entry])
+    return discover_plugins(enable="")[0]
+
+
 def test_manifest_validates_required_fields_and_reserved_keys():
     manifest = parse_manifest(_toml() + b"[dockerfile]\nsystem_packages = ['git']\n", entry_name="alpha")
     assert (manifest.name, manifest.version, manifest.license) == ("alpha", "1.2.3", "MIT")
@@ -197,6 +214,65 @@ def test_character_asset_requires_explicit_href(tmp_path, monkeypatch):
     (candidate,) = discover_plugins(enable="")
     assert candidate.diagnostic is not None and "invalid character asset" in candidate.diagnostic
     with pytest.raises(PluginDiscoveryError, match="invalid character asset"):
+        enabled_plugins(enable="alpha")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("weight", True), ("weight", [400]), ("weight", None),
+    ("style", ["italic"]), ("style", "oblique"), ("display", {"name": "swap"}),
+    ("display", "hidden"), ("unicodeRange", ["U+0-FF"]),
+])
+def test_invalid_font_descriptor_is_diagnostic_and_selected_rejects(tmp_path, monkeypatch, field, value):
+    skin = _skin()
+    skin["fonts"] = [{"family": "Local", "src": [{"url": "local.woff2", "format": "woff2"}], field: value}]
+    candidate = _skin_candidate(tmp_path, monkeypatch, {"skin.json": skin},
+                                extra_files=("avatar.png", "local.woff2"))
+    assert not candidate.enabled and candidate.diagnostic is not None
+    assert "invalid font descriptor" in candidate.diagnostic
+    with pytest.raises(PluginDiscoveryError, match="invalid font descriptor"):
+        enabled_plugins(enable="alpha")
+
+
+@pytest.mark.parametrize("weight", [400, 400.5, "400 700"])
+def test_valid_local_font_descriptors(tmp_path, monkeypatch, weight):
+    skin = _skin()
+    skin["fonts"] = [{
+        "family": "Local", "weight": weight, "style": "italic", "display": "swap",
+        "unicodeRange": "U+0-FF", "src": [{"url": "local.woff2", "format": "woff2"}],
+    }]
+    candidate = _skin_candidate(tmp_path, monkeypatch, {"skin.json": skin},
+                                extra_files=("avatar.png", "local.woff2"))
+    assert candidate.diagnostic is None
+    assert enabled_plugins(enable="alpha")[0].manifest.skin_defaults == ("alpha-skin",)
+
+
+@pytest.mark.parametrize("collision", ["character-asset", "skin-id"])
+def test_duplicate_skin_or_character_asset_ids_fail_discovery(tmp_path, monkeypatch, collision):
+    skin = _skin()
+    if collision == "character-asset":
+        skin["characterRenderer"]["assets"].append(
+            {"id": "avatar", "type": "image", "href": "avatar.png"}
+        )
+        skins = {"skin.json": skin}
+    else:
+        skins = {"skin.json": skin, "other.json": _skin()}
+    candidate = _skin_candidate(tmp_path, monkeypatch, skins, extra_files=("avatar.png",))
+    assert not candidate.enabled and candidate.diagnostic is not None
+    expected = "duplicate character asset ID" if collision == "character-asset" else "duplicate skin ID"
+    assert expected in candidate.diagnostic
+    with pytest.raises(PluginDiscoveryError, match="duplicate character asset ID|duplicate skin ID"):
+        enabled_plugins(enable="alpha")
+
+
+def test_duplicate_listed_theme_resource_is_rejected(tmp_path, monkeypatch):
+    root = tmp_path / "pkg"
+    root.mkdir()
+    (root / "mimir-plugin.toml").write_bytes(_toml() + b'themes = ["skin.json", "skin.json"]\n')
+    entry = _entry(tmp_path)
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [entry])
+    (candidate,) = discover_plugins(enable="")
+    assert candidate.diagnostic == "themes: duplicate package resource"
+    with pytest.raises(PluginDiscoveryError, match="themes: duplicate package resource"):
         enabled_plugins(enable="alpha")
 
 
