@@ -1,0 +1,34 @@
+name = "example"
+version = "0.1.0"
+license = "MIT"
+requires_mimir = ">=0"
+themes = ["skins/example.json"]
+
+[frontend]
+api_major = 1
+module = "frontend/example.v1.js"
+css = "frontend/example.v1.css"
+assets = ["frontend/example.v1.css"]
+
+[dockerfile]
+system_packages = ["ca-certificates"]
+build_args = { EXAMPLE_GREETING = "hello" }
+users = ["example_service"]
+directories = ["/var/lib/example-service"]
+root_run = ["chmod 755 /var/lib/example-service"]
+s6_services = ["services/example-worker"]
+
+[defaults]
+version = "1"
+skills = ["skills/example-watch"]
+prompts = ["prompts/example.md"]
+scheduler_jobs = ["scheduler/jobs.yaml"]
+
+[config.MIMIR_PLUGIN_EXAMPLE_GREETING]
+type = "string"
+description = "Greeting displayed by the example plugin"
+
+[config.MIMIR_PLUGIN_EXAMPLE_SECRET]
+type = "string"
+secret = true
+security = true

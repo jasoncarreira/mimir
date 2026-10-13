@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import asyncio
+import os
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +29,146 @@ from mimir.tool_descriptors import ResultOriginKind, SinkCategory
 from mimir.tools.registry import all_mimir_tools
 from mimir.tools.service_tool_surface import ServiceToolSurfaceMiddleware
 from mimir.turn_logger import TurnLogger
+
+
+EXAMPLE = Path(__file__).parent / "fixtures" / "plugins" / "example"
+
+
+@pytest.fixture(scope="module")
+def example_distribution(tmp_path_factory):
+    """Build and install an actual provider wheel without installing it into Mimir's venv."""
+    root = tmp_path_factory.mktemp("example-distribution")
+    subprocess.run(["uv", "build", "--wheel", str(EXAMPLE), "--out-dir", str(root)], check=True)
+    wheel, = root.glob("*.whl")
+    target = root / "site"
+    subprocess.run(["uv", "pip", "install", "--no-deps", "--target", str(target), str(wheel)], check=True)
+    return target
+
+
+def test_installed_example_provider_end_to_end(example_distribution, tmp_path, monkeypatch):
+    from importlib import metadata
+    import json
+
+    from mimir.plugin_dockerfile import pinned_packages, render_stage, services
+    from mimir.plugins.config_api import plugin_config_rows, validate_plugin_config_write
+    from mimir.plugins.defaults import plugin_default_files, seed_plugin_defaults
+    from mimir.plugins.discovery import enabled_plugins
+    from mimir.pollers import discover_pollers
+    from mimir.poller_hooks import resolve_poller_hooks
+    from mimir.agent import _render_plugin_prompt
+    from mimir.models import AgentEvent
+
+    monkeypatch.syspath_prepend(str(example_distribution))
+    assert metadata.distribution("mimir-example-plugin").files
+    candidate, = enabled_plugins(enable="example")
+    assert candidate.distribution == "mimir-example-plugin"
+    assert candidate.manifest.skin_defaults == ("example-skin",)
+    manager = __import__("mimir.plugins.manager", fromlist=["load_plugins"]).load_plugins(enable="example")
+    policy = manager.policy
+    assert len(manager.plugins) == 1
+    assert policy.frozen
+    tool = next(t for t in all_mimir_tools(policy=policy) if t.name == "example_read")
+    assert tool.invoke({}) == "example-result"
+    assert policy.capabilities["example_read"] == "example"
+    assert policy.profiles["example-reader"].capabilities == frozenset({"example_read"})
+    assert policy.state_slots["example"].__dataclass_params__.frozen
+    assert policy.state_slots["example"]("hi").greeting == "hi"
+
+    skill_manifest = example_distribution / "mimir_example_plugin/skills/example-watch/pollers.json"
+    hooks = resolve_poller_hooks("example-hooks", skill_manifest, policy=policy, plugin_owner="example")
+    assert hooks.recovery_relevance is not None
+    assert json.loads(skill_manifest.read_text())["pollers"][0]["authority"]["profile"] == "example-reader"
+    rejected = []
+    pollers = discover_pollers(tmp_path / "skills", policy=policy, invalid_entries=rejected)
+    assert not rejected
+    assert [poller.name for poller in pollers] == ["example-watch"]
+
+    job = policy.scheduler_jobs["example-tick"]
+    assert (job.owner, job.job_id) == ("example", "example-tick")
+    assert callable(job.callback)
+    asyncio.run(job.callback())
+    command = policy.cli_commands["example-hello"]
+    import argparse
+    parser = argparse.ArgumentParser()
+    command.configure(parser.add_subparsers(dest="command"))
+    assert command.dispatch(parser.parse_args(["example-hello", "--name", "Mimir"])) == 0
+    cli_env = {**os.environ, "PYTHONPATH": str(example_distribution), "MIMIR_PLUGINS": "example"}
+    cli = subprocess.run([sys.executable, "-c", "from mimir.entrypoint import main; main()",
+                          "example-hello", "--name", "Mimir"],
+                         env=cli_env, capture_output=True, text=True)
+    assert cli.returncode == 0, cli.stderr
+    assert "hello, Mimir" in cli.stdout
+    route = policy.routes[("GET", "/api/v1/plugins/example/status")]
+    assert route.owner == "example" and route.role == "user"
+    assert json.loads(asyncio.run(route.handler(None)).text) == {"provider": "example"}
+    assert policy.dashboard_entries["example-page"][1].route_path == "/example"
+    provider = policy.prompt_providers["example_memory"]
+    (tmp_path / "memory/core").mkdir(parents=True)
+    (tmp_path / "memory/core/00-identity.md").write_text("Trusted example identity")
+    text, served = _render_plugin_prompt(provider, object(), AgentEvent(
+        trigger="user_message", channel_id="test", content="hello"), tmp_path)
+    assert "Trusted example identity" in text
+    assert served == (str(tmp_path / "memory/core/00-identity.md"),)
+
+    skin = json.loads((example_distribution / "mimir_example_plugin/skins/example.json").read_text())
+    assert skin["default"] and len(skin["tokens"]) == 66
+    from mimir.plugins.manifest import _SKIN_TOKENS
+    assert set(skin["tokens"]) == _SKIN_TOKENS
+    assert skin["characterRenderer"]["assets"][0]["href"] == "skins/character.svg"
+    assert candidate.manifest.frontend["api_major"] == 1
+    module = example_distribution / "mimir_example_plugin" / candidate.manifest.frontend["module"]
+    assert 'host.registerRoute({ plugin: "example"' in module.read_text()
+    assert (example_distribution / "mimir_example_plugin" / candidate.manifest.frontend["css"]).is_file()
+    assert candidate.manifest.dockerfile["s6_services"] == ["services/example-worker"]
+    assert pinned_packages((candidate,)) == ("mimir-example-plugin==0.1.0",)
+    assert "ca-certificates" in render_stage((candidate,), "base")
+    assert "EXAMPLE_GREETING" in render_stage((candidate,), "build")
+    service, = services((candidate,))
+    assert service.name == "example-worker" and os.access(service.run, os.X_OK)
+    worker = subprocess.run([str(service.run)], env={**os.environ, "EXAMPLE_GREETING": "hello"},
+                            capture_output=True, text=True)
+    assert worker.returncode == 0 and worker.stdout.strip() == "example worker: hello"
+    defaults = plugin_default_files(candidate)
+    assert Path("skills/example-example-watch/SKILL.md") in defaults
+    assert Path("prompts/example/example.md") in defaults
+    (tmp_path / "scheduler.yaml").write_text("[]\n")
+    seed_plugin_defaults(tmp_path, selected=(candidate,))
+    assert (tmp_path / "skills/example-example-watch/SKILL.md").is_file()
+    assert (tmp_path / "prompts/example/example.md").is_file()
+    assert "example-example-daily" in (tmp_path / "scheduler.yaml").read_text()
+    assert candidate.manifest.config["MIMIR_PLUGIN_EXAMPLE_SECRET"]["secret"]
+    monkeypatch.setenv("MIMIR_PLUGIN_EXAMPLE_GREETING", "hello")
+    assert plugin_config_rows("example", {"example": candidate.manifest})[0]["value"] == "hello"
+    monkeypatch.setenv("MIMIR_PLUGIN_EXAMPLE_SECRET", "private")
+    assert plugin_config_rows("example", {"example": candidate.manifest})[1]["value"] == "[REDACTED]"
+    with pytest.raises(ValueError, match="not writable"):
+        validate_plugin_config_write("example", "MIMIR_PLUGIN_EXAMPLE_SECRET", {"example": candidate.manifest})
+
+
+def test_disabled_installed_example_does_not_import_provider(example_distribution):
+    """A fresh interpreter owns the entire import inventory, not the pytest process."""
+    script = '''
+import sys
+from mimir.plugins.discovery import discover_plugins
+from mimir.plugins.manager import load_plugins
+from mimir.plugin_dockerfile import select_plugins
+assert any(c.name == "example" and not c.enabled for c in discover_plugins(enable=""))
+manager = load_plugins(enable="")
+assert not manager.plugins
+assert "example_read" not in manager.policy.tools
+assert not manager.policy.scheduler_jobs
+assert not manager.policy.routes
+assert not manager.policy.dashboard_entries
+assert not manager.policy.prompt_providers
+assert not manager.policy.state_slots
+assert "example-hello" not in manager.policy.cli_commands
+assert not select_plugins(enable="")
+assert "mimir_example_plugin" not in sys.modules
+'''
+    env = {**os.environ, "PYTHONPATH": str(example_distribution),
+           "MIMIR_PLUGINS": ""}
+    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def _policy(factory, *, result_domain="plugin-data", service_constraints=False, boundary=False):
