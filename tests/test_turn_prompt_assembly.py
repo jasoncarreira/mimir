@@ -61,6 +61,8 @@ from mimir.models import (
 )
 from mimir.saga.client import SagaStore
 from mimir.prompts import build_turn_prompt
+from mimir.plugins.core import policy_scope
+from mimir.plugins.registry import PolicyRegistry
 from mimir.turn_logger import TurnLogger
 
 
@@ -122,6 +124,110 @@ def _block(content: str) -> PromptBlock:
             source_kind="protected_prompt",
         )),
     )
+
+
+def test_plugin_prompt_registry_section_inventory_is_closed() -> None:
+    from mimir.plugins.registry import _PROMPT_SECTIONS
+
+    source = ast.parse((Path(__file__).parents[1] / "mimir/prompts.py").read_text())
+    sections = [node.args[0].value for node in ast.walk(source)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_add_plugins" and node.args
+                and isinstance(node.args[0], ast.Constant)]
+    assert sections == [
+        "channel_memory", "feedback", "core_proposals", "session_summaries",
+        "usage", "upcoming", "commitments", "self_state",
+    ]
+    assert set(sections) == _PROMPT_SECTIONS
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_provider_refusal_budget_labels_and_order(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+    from mimir import core_blocks
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    ctx = _make_ctx(event)
+    admitted = tmp_path / "memory" / "allowed.md"
+    admitted.parent.mkdir()
+    admitted.write_text("é" * 20)
+    denied = tmp_path / "memory" / "denied.md"
+    denied.write_text("DENIED-SECRET")
+    monkeypatch.setattr(core_blocks, "_prompt_file_is_trusted", lambda home, path: path == admitted)
+    events = []
+    monkeypatch.setattr(agent_module, "log_event_sync", lambda kind, **fields: events.append((kind, fields)))
+    registry = PolicyRegistry()
+    calls = []
+
+    def render_a(auth, inbound, reader):
+        calls.append("a")
+        return reader(admitted)
+
+    def render_z(auth, inbound, reader):
+        calls.append("z")
+        reader(denied)
+        return "SHOULD-NOT-APPEAR"
+
+    registry.registrar("example").register_prompt_provider(
+        "zeta", "feedback", 128, lambda auth, inbound: True, render_z,
+    )
+    registry.registrar("example").register_prompt_provider(
+        "alpha", "feedback", 19, lambda auth, inbound: True, render_a,
+    )
+    registry.freeze()
+    with policy_scope(registry):
+        prompt, _ = await agent._build_turn_prompt(ctx, event, None)
+    assert calls == ["a", "z"]
+    assert "DENIED-SECRET" not in prompt and "SHOULD-NOT-APPEAR" not in prompt
+    assert "## Plugin: alpha\n\néé" in prompt
+    assert "…[truncated]" in prompt
+    assert len(prompt.split("## Plugin: alpha\n\n", 1)[1].split("\n\n", 1)[0].encode()) <= 19
+    plugin_sources = [source for source in ctx.ifc_labels.sources if source.domain == "alpha"]
+    assert len(plugin_sources) == 1
+    assert plugin_sources[0].resource_id == str(admitted)
+    assert plugin_sources[0].integrity == Integrity.TRUSTED
+    assert plugin_sources[0].integrity_effect.value == "informational"
+    assert events.count(("plugin_prompt_over_cap", {"provider": "alpha"})) == 1
+    assert events.count(("plugin_prompt_read_refused", {"provider": "zeta"})) == 1
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_dynamic_each_turn_static_stable_and_failure_isolated(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    registry = PolicyRegistry()
+    counter = {"dynamic": 0, "static": 0}
+    events = []
+    monkeypatch.setattr(agent_module, "log_event_sync", lambda kind, **fields: events.append(kind))
+
+    def dynamic(auth, inbound, reader):
+        counter["dynamic"] += 1
+        return f"dynamic-{counter['dynamic']}"
+
+    def stable(auth, inbound, reader):
+        counter["static"] += 1
+        return f"stable-{counter['static']}"
+
+    def broken(auth, inbound, reader):
+        raise RuntimeError("secret error text")
+
+    registrar = registry.registrar("example")
+    registrar.register_prompt_provider("dynamic", "self_state", 100, lambda a, e: True, dynamic)
+    registrar.register_prompt_provider("stable", "self_state", 100, lambda a, e: True, stable, static=True)
+    registrar.register_prompt_provider("broken", "self_state", 100, lambda a, e: True, broken)
+    registry.freeze()
+    with policy_scope(registry):
+        first, _ = await agent._build_turn_prompt(_make_ctx(event), event, None)
+        second, _ = await agent._build_turn_prompt(_make_ctx(event), event, None)
+    assert first.index("Plugin: dynamic") < first.index("Plugin: stable")
+    assert "dynamic-1" in first and "dynamic-2" in second
+    assert "stable-1" in first and "stable-1" in second
+    assert counter == {"dynamic": 2, "static": 1}
+    assert "secret error text" not in first
+    assert events.count("plugin_prompt_failed") == 2
 
 
 def _domain_block(content: str, domain: str) -> PromptBlock:
@@ -2204,7 +2310,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("direct_block", "mimir/agent.py", "Agent._assemble_session_summaries", "PromptBlock"): 1,
         ("direct_block", "mimir/agent.py", "Agent._assemble_upcoming_block", "PromptBlock"): 1,
         ("direct_block", "mimir/agent.py", "Agent._assemble_usage_block", "PromptBlock"): 1,
-            ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock"): 4,
+            ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock"): 5,
             ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt.load_open_proposals", "PromptBlock"): 1,
         ("direct_block", "mimir/agent.py", "Agent._select_recent_activity", "PromptBlock"): 1,
         ("direct_block", "mimir/feedback/__init__.py", "FeedbackLog.recent_prompt_block", "PromptBlock"): 1,
@@ -2219,7 +2325,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/agent.py", "Agent._assemble_session_summaries", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_upcoming_block", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_usage_block", "_prompt_source_labels"): 1,
-            ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels"): 5,
+            ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels"): 6,
             ("producer", "mimir/agent.py", "Agent._build_turn_prompt.load_open_proposals", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._select_recent_activity", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "_auto_recall_source_labels", "SourceLabel"): 1,
@@ -2257,6 +2363,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "_source_is_triggering_channel_compatible"): 1,
         ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "_source_is_triggering_channel_compatible"): 1,
         ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use"): 8,
+        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt.use_plugins", "use"): 1,
     })
     assert observed == expected, (
         f"unexpected channel-bearing sources: {observed - expected}; "
