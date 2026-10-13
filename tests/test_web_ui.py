@@ -100,7 +100,7 @@ def _selected_web_manager(tmp_path: Path, monkeypatch, *, plugins: tuple[dict, .
             registrar.register_route("POST", f"/api/v1/plugins/{name}/admin", respond, role="admin")
             registrar.register_dashboard_entry(name, DashboardExtensionManifest(
                 id=name, label=name.title(), route_path=spec.get("route_path", f"/{name}"),
-                requires_role="admin",
+                requires_role="admin", enabled=spec.get("enabled", True),
             ))
 
         def load(register=register, name=name):
@@ -241,8 +241,9 @@ async def test_selected_web_host_bootstrap_assets_and_admin_route(tmp_path, monk
         assert (await client.post("/api/v1/plugins/alpha/admin", headers=headers)).status == 200
         assert (await client.get("/api/v1/plugins/disabled/status", headers=headers)).status == 404
         bootstrap = (await (await client.get("/api/v1/web/bootstrap", headers=headers)).json())["data"]
-        assert "alpha" in {entry["id"] for entry in bootstrap["dashboard_extensions"]}
+        assert next(entry for entry in bootstrap["dashboard_extensions"] if entry["id"] == "alpha")["plugin"] == "alpha"
         assert "disabled" not in {entry["id"] for entry in bootstrap["dashboard_extensions"]}
+        assert all(entry["plugin"] is None for entry in bootstrap["dashboard_extensions"] if entry["id"] != "alpha")
         assert bootstrap["plugin_bundles"] == [{
             "plugin": "alpha", "apiMajor": 1,
             "moduleUrl": "/plugins/alpha/assets/module.js?v=1.2.3",
@@ -265,6 +266,30 @@ async def test_selected_web_host_bootstrap_assets_and_admin_route(tmp_path, monk
         for path in ("private.txt", "escape.js", "%2e%2e%2foutside.js"):
             assert (await client.get(f"/plugins/alpha/assets/{path}?v=1.2.3", headers=headers)).status == 404
         assert (await client.get("/plugins/disabled/assets/module.js?v=1.2.3", headers=headers)).status == 404
+
+
+async def test_selected_dashboard_owners_come_from_policy_not_route_or_manifest(tmp_path, monkeypatch):
+    manager, loaded = _selected_web_manager(tmp_path, monkeypatch, plugins=(
+        {"name": "alpha", "route_path": "/beta-lookalike", "default": False},
+        {"name": "beta", "default": False},
+        {"name": "hidden", "enabled": False, "default": False},
+    ))
+    assert loaded == ["alpha", "beta", "hidden"]
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl")
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/api/v1/web/bootstrap")
+        assert response.status == 200
+        entries = {entry["id"]: entry for entry in (await response.json())["data"]["dashboard_extensions"]}
+
+    assert entries["alpha"]["route_path"] == "/beta-lookalike"
+    assert entries["alpha"]["plugin"] == "alpha"
+    assert entries["beta"]["plugin"] == "beta"
+    assert entries["chat"]["plugin"] is None
+    assert "hidden" not in entries
+    assert all("plugin" in entry for entry in entries.values())
 
 
 @pytest.mark.parametrize("route_paths,expected", [
@@ -3043,6 +3068,7 @@ async def test_api_v1_web_bootstrap_is_enveloped_no_store_and_secret_free(tmp_pa
     assert ops_manifest["label"] == "Ops"
     assert ops_manifest["api_namespace"] == "ops"
     assert ops_manifest["trusted_first_party"] is True
+    assert all(item["plugin"] is None for item in body["data"]["dashboard_extensions"])
 
 
 @pytest.mark.asyncio
