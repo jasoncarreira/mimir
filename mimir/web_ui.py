@@ -47,8 +47,10 @@ from .admin_users import build_users_payload, roles_for_request
 from .config import _env_int
 from .dashboard_extensions import (
     DashboardBackendRoute,
+    DashboardExtensionManifest,
     DashboardExtensionRegistry,
     add_backend_namespace_routes,
+    add_plugin_routes,
     first_party_dashboard_extensions,
 )
 from .event_logger import log_durable_event_sync, safe_log_event
@@ -149,6 +151,14 @@ SKIN_TOKEN_NAMES = frozenset(
         "colorTimelineToolCallBackground",
         "colorTimelineToolResult",
         "colorTimelineToolResultBackground",
+        "colorTriggerSagaSessionEnd",
+        "colorTriggerScheduledTick",
+        "colorTriggerPoller",
+        "colorTriggerUserMessage",
+        "colorTriggerSynthesis",
+        "colorTriggerHeartbeat",
+        "colorTriggerClaudeCodeSpawn",
+        "colorTriggerShellJobComplete",
         "colorCodeBackground",
         "colorCodeText",
         "colorFocusRing",
@@ -495,10 +505,74 @@ def read_operator_skin_manifests(home: Path | None) -> list[dict[str, Any]]:
     return manifests
 
 
-def available_web_skin_ids(home: Path | None) -> set[str]:
+def available_web_skin_ids(home: Path | None, plugin_skins: tuple[dict[str, Any], ...] | list[dict[str, Any]] = ()) -> set[str]:
     return set(BUILT_IN_WEB_SKIN_IDS) | {
         str(manifest["id"]) for manifest in read_operator_skin_manifests(home)
-    }
+    } | {skin["id"] for skin in plugin_skins}
+
+
+def _plugin_web_resources(
+    manager: Any, *, reserved_skin_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, tuple[Path, frozenset[Path], str]]]:
+    skins: list[dict[str, Any]] = []
+    bundles: list[dict[str, Any]] = []
+    roots: dict[str, tuple[Path, frozenset[Path], str]] = {}
+    seen = set(BUILT_IN_WEB_SKIN_IDS) | (reserved_skin_ids or set())
+    for loaded in manager.plugins:
+        candidate = loaded.candidate
+        manifest = candidate.manifest
+        assert manifest is not None
+        dist = candidate.entry_point.dist
+        assert dist is not None and dist.files is not None
+        files = frozenset(Path(dist.locate_file(item)) for item in dist.files)
+        manifest_files = [path for path in files if path.name == "mimir-plugin.toml"]
+        if len(manifest_files) != 1:
+            raise ValueError(f"plugin {candidate.name}: manifest inventory changed")
+        root = manifest_files[0].parent.resolve()
+        allowed: set[Path] = set()
+
+        def asset_url(path: str) -> str:
+            return f"/plugins/{candidate.name}/assets/{path}?v={manifest.version}"
+
+        for path in manifest.themes:
+            skin = json.loads((root / path).read_text(encoding="utf-8"))
+            allowed.add((root / path).resolve())
+            if skin["id"] in seen:
+                raise ValueError(f"duplicate web skin: {skin['id']}")
+            seen.add(skin["id"])
+            tokens = {re.sub(r"-([a-z0-9])", lambda match: match[1].upper(), key.removeprefix("--mimir-")): value
+                      for key, value in skin["tokens"].items()}
+            if set(tokens) != SKIN_TOKEN_NAMES:
+                raise ValueError(f"plugin {candidate.name}: incomplete skin tokens")
+            skin["tokens"] = tokens
+            skin["name"] = skin.pop("label")
+            skin["plugin"] = candidate.name
+            for asset in skin.get("assets", []):
+                allowed.add((root / asset).resolve())
+            for font in skin.get("fonts", []):
+                for source in font["src"]:
+                    allowed.add((root / source["url"]).resolve())
+                    source["url"] = asset_url(source["url"])
+            for asset in skin.get("characterRenderer", {}).get("assets", []):
+                if asset.get("href") is not None:
+                    allowed.add((root / asset["href"]).resolve())
+                    asset["href"] = asset_url(asset["href"])
+            skins.append(skin)
+        frontend = manifest.frontend
+        if frontend:
+            for path in (frontend["module"], frontend.get("css"), *frontend.get("assets", ())):
+                if path:
+                    allowed.add((root / path).resolve())
+            if frontend.get("css") and re.search(
+                r"@import|url\s*\(\s*['\"]?\s*(?:https?:|//|data:)",
+                (root / frontend["css"]).read_text(encoding="utf-8"), re.I,
+            ):
+                raise ValueError(f"plugin {candidate.name}: external CSS reference")
+            bundles.append({"plugin": candidate.name, "apiMajor": frontend["api_major"],
+                            "moduleUrl": asset_url(frontend["module"]),
+                            "cssUrl": asset_url(frontend["css"]) if frontend.get("css") else None})
+        roots[candidate.name] = (root, frozenset(allowed & files), manifest.version)
+    return skins, bundles, roots
 
 
 def read_turns_total(turns_log: Path) -> int:
@@ -957,7 +1031,40 @@ def register_routes(
         or (Path(configured_react_dist) if configured_react_dist else None)
         or (Path(__file__).parent / "react_app" / "dist")
     )
-    _dashboard_extensions = dashboard_extensions or first_party_dashboard_extensions()
+    _dashboard_extensions = DashboardExtensionRegistry(list(
+        (dashboard_extensions or first_party_dashboard_extensions()).manifests
+    ))
+    manager = getattr(app.get("config"), "plugin_manager", None)
+    operator_skin_ids = {skin["id"] for skin in read_operator_skin_manifests(home)}
+    plugin_skins, plugin_bundles, plugin_roots = (
+        _plugin_web_resources(manager, reserved_skin_ids=operator_skin_ids)
+        if manager is not None else ([], [], {})
+    )
+    if manager is not None:
+        used_paths = {entry.route_path for entry in _dashboard_extensions.enabled()}
+        for entry_id, (owner, entry) in manager.policy.dashboard_entries.items():
+            if owner == "core":
+                continue
+            if not any(plugin.candidate.name == owner for plugin in manager.plugins):
+                continue
+            if not isinstance(entry, DashboardExtensionManifest) or entry.id != entry_id:
+                raise ValueError(f"plugin {owner}: invalid dashboard entry {entry_id}")
+            entry.validate()
+            if entry.enabled and entry.route_path in used_paths:
+                raise ValueError(f"plugin {owner}: duplicate dashboard route_path: {entry.route_path}")
+            if entry.enabled:
+                used_paths.add(entry.route_path)
+            _dashboard_extensions.manifests.append(entry)
+        _dashboard_extensions.__post_init__()
+    default_skin = os.environ.get("MIMIR_WEB_DEFAULT_SKIN", "").strip()
+    defaults = [(skin["plugin"], skin["id"]) for skin in plugin_skins if skin.get("default")]
+    if len(defaults) > 1 and not default_skin:
+        raise ValueError("conflicting plugin default skins: " + ", ".join(
+            f"{owner}:{skin}" for owner, skin in defaults
+        ))
+    if default_skin and default_skin not in available_web_skin_ids(home, plugin_skins):
+        raise ValueError(f"unknown MIMIR_WEB_DEFAULT_SKIN: {default_skin}")
+    effective_default = default_skin or (defaults[0][1] if defaults else DEFAULT_WEB_SKIN)
     failed_state_reads: set[Path] = set()
 
     async def _report_state_read(path: Path, status: JsonlReadStatus) -> bool:
@@ -1502,6 +1609,22 @@ def register_routes(
             headers=_no_store_headers(),
         )
 
+    async def plugin_asset(request: web.Request) -> web.StreamResponse:
+        owner = request.match_info["plugin"]
+        resource = request.match_info["path"]
+        selected = plugin_roots.get(owner)
+        if selected is None:
+            raise web.HTTPNotFound()
+        root, files, version = selected
+        target = (root / resource).resolve()
+        if (not resource or "\\" in resource or any(part in {".", "..", ""} for part in resource.split("/"))
+                or not target.is_relative_to(root) or target not in files
+                or not target.is_file() or (root / resource).is_symlink()):
+            raise web.HTTPNotFound()
+        headers = ({"Cache-Control": "public, max-age=31536000, immutable"}
+                   if request.query.get("v") == version else _no_store_headers())
+        return web.FileResponse(target, headers=headers)
+
     async def web_bootstrap_v1(request: web.Request) -> web.Response:
         api_key = str(request.app.get("api_key") or "")
         gate = web_gate_active(api_key, request.app.get("identity_resolver"))
@@ -1540,12 +1663,14 @@ def register_routes(
                     "header": "X-API-Key",
                     "native_eventsource_supported_when_auth_required": False,
                 },
-                "ui": read_web_ui_config(home),
+                "ui": {**read_web_ui_config(home), "default_skin": effective_default},
                 "skins": {
                     "built_in_ids": sorted(BUILT_IN_WEB_SKIN_IDS),
                     "operator": read_operator_skin_manifests(home),
+                    "plugins": plugin_skins,
                 },
                 "dashboard_extensions": _dashboard_extensions.navigation_payload(),
+                "plugin_bundles": plugin_bundles,
             },
             headers=_no_store_headers(),
         )
@@ -2345,7 +2470,7 @@ def register_routes(
                 return json_error("bad_request", "skin must be a string or null", status=400)
             if isinstance(skin, str) and skin.strip():
                 skin = skin.strip()
-                if skin not in await asyncio.to_thread(available_web_skin_ids, home):
+                if skin not in await asyncio.to_thread(available_web_skin_ids, home, plugin_skins):
                     return json_error(
                         "bad_request",
                         f"unknown skin '{skin}'",
@@ -2406,6 +2531,8 @@ def register_routes(
         app.router.add_get("/app/auth.js", web_auth_js)
     if ("GET", "/api/v1/web/bootstrap") not in existing:
         app.router.add_get("/api/v1/web/bootstrap", web_bootstrap_v1)
+    if plugin_roots:
+        app.router.add_get("/plugins/{plugin}/assets/{path:.+}", plugin_asset)
     if ("GET", "/api/v1/whoami") not in existing:
         app.router.add_get("/api/v1/whoami", whoami_v1)
     if ("POST", "/api/v1/user/prefs") not in existing:
@@ -2648,3 +2775,5 @@ def register_routes(
         app.router.add_get("/api/memory", memory_data)
     if ("GET", "/api/v1/memory") not in existing:
         app.router.add_get("/api/v1/memory", memory_data_v1)
+    if manager is not None:
+        add_plugin_routes(app, manager.policy)

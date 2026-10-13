@@ -105,6 +105,33 @@ class DashboardBackendRoute:
 DashboardBackendHook = Callable[[], Sequence[DashboardBackendRoute]]
 
 
+def add_plugin_routes(app: web.Application, policy: Any) -> None:
+    """Mount selected, frozen provider routes after the first-party routes.
+
+    The auth middleware authenticates the API namespace. Admin routes need an
+    additional check because their path is not under /api/v1/admin/.
+    """
+    seen = {(route.method, route.resource.canonical) for route in app.router.routes()}
+    for route in policy.routes.values():
+        key = (route.method, route.path)
+        if key in seen or (route.method == "GET" and ("HEAD", route.path) in seen):
+            raise ValueError(f"plugin route collision: {route.method} {route.path}")
+
+        async def guarded(request: web.Request, *, declaration: Any = route) -> web.StreamResponse:
+            if not request.get("auth_is_master") and request.get("auth_identity") is None:
+                raise web.HTTPUnauthorized()
+            if declaration.role == "admin" and not (
+                request.get("auth_is_master") or request.get("auth_is_admin")
+            ):
+                raise web.HTTPForbidden()
+            return await declaration.handler(request)
+
+        app.router.add_route(route.method, route.path, guarded)
+        seen.add(key)
+        if route.method == "GET":
+            seen.add(("HEAD", route.path))
+
+
 @dataclass
 class DashboardExtensionRegistry:
     manifests: list[DashboardExtensionManifest] = field(default_factory=list)
