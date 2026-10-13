@@ -9,7 +9,6 @@
     "capabilities": {"supportsExpressions": false, "supportsMotion": false}
   },
   "assets": ["skins/character.svg"],
-  "fonts": [{"family": "Example Local", "src": [{"url": "skins/example.woff2", "format": "woff2"}]}],
   "tokens": {
     "--mimir-color-text": "#ebefff",
     "--mimir-color-text-muted": "#aab5cd",

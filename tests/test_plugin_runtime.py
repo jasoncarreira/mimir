@@ -245,11 +245,10 @@ async def test_installed_example_http_web_and_turn_prompt(example_distribution, 
             "cssUrl": "/plugins/example/assets/frontend/example.v1.css?v=0.1.0",
         }]
         assert skin["characterRenderer"]["assets"][0]["href"] == "/plugins/example/assets/skins/character.svg?v=0.1.0"
-        assert skin["fonts"][0]["src"][0]["url"] == "/plugins/example/assets/skins/example.woff2?v=0.1.0"
+        assert "fonts" not in skin
         assert any(entry["id"] == "example-page" and entry["plugin"] == "example"
                    for entry in bootstrap["dashboard_extensions"])
-        for resource in ("skins/character.svg", "skins/example.woff2", "frontend/example.v1.js",
-                         "frontend/example.v1.css"):
+        for resource in ("skins/character.svg", "frontend/example.v1.js", "frontend/example.v1.css"):
             response = await client.get(f"/plugins/example/assets/{resource}?v=0.1.0", headers=headers)
             assert response.status == 200
             assert response.headers["Cache-Control"] == "public, max-age=31536000, immutable"
