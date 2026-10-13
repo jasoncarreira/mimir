@@ -47,6 +47,22 @@ _GIT_BINDING_REFUSAL_CODES = frozenset({
     "invalid_checkout",
     "invalid_scope",
 })
+_CONTENT_FREE_GIT_REFUSALS = {
+    "inactive_checkout": frozenset({"an active matching checkout lease is required"}),
+    "invalid_checkout": frozenset({
+        "retained checkout is unavailable", "retained checkout identity is invalid",
+        "checkout lease may not be a symlink", "checkout lease path is unavailable",
+        "checkout lease escapes its server root",
+    }),
+    "invalid_scope": frozenset({
+        "scope head is not a full commit id", "scope base is not a full commit id",
+        "scope destination is not a branch ref", "scope base is not a branch ref",
+        "scope remote is not server-bound origin",
+    }),
+    "scope_action_denied": frozenset({
+        "retained factory scope does not grant this repository operation",
+    }),
+}
 _REPOSITORY_AUTHORIZATION_REFUSED = "repository_authorization_refused"
 _REPOSITORY_BINDING_INVALID = "repository_binding_invalid"
 _REPOSITORY_GIT_FAILED = "repository_git_failed"
@@ -179,15 +195,14 @@ def _publish_attested_lease_result(
 
     # The failed command may contain remote server text. Bind that text to our
     # origin and the exact allowed refs before inheriting the lease verdict.
-    from ..repo_tools import _PROTECTED_BRANCH_REFS
-
+    # The lease predicate itself pins the original head independently of the
+    # base branch; local descendants retain their separate lineage checks.
     if (
         scope.head_remote != "origin"
         or scope.head_repo != scope.canonical_repo
         or _github_repo_from_remote(scope.canonical_origin) != scope.canonical_repo
         or not scope.destination_ref.startswith("refs/heads/")
         or scope.destination_ref != f"refs/heads/{scope.head_ref}"
-        or f"refs/heads/{scope.base_ref}" not in _PROTECTED_BRANCH_REFS
         or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
     ):
         return
@@ -332,6 +347,14 @@ def _execute(
         message = f"repository operation rejected ({code}){cause}: {detail}"
         if execution_started and state is not None:
             _publish_attested_lease_result(runtime, state)
+        elif (
+            isinstance(exc, GitRefusal)
+            and not execution_started
+            and str(exc) in _CONTENT_FREE_GIT_REFUSALS.get(exc.code, ())
+        ):
+            from ..access_control import publish_protected_result
+
+            publish_protected_result((), content_free_error=message)
         raise _tool_refusal(
             message,
             exc,

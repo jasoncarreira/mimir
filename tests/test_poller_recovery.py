@@ -562,6 +562,176 @@ async def test_reconcile_reenqueues_failed(tmp_path: Path):
     assert st["inflight"]["sid-1"]["attempts"] == 1
 
 
+async def test_transient_poller_retry_backoff_cap_and_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [datetime(2026, 10, 13, tzinfo=timezone.utc)]
+    monkeypatch.setattr(poller_recovery, "_utc_now", lambda: clock[0])
+    monkeypatch.setattr(poller_recovery.random, "uniform", lambda low, high: high)
+    emitted = []
+
+    async def emit(type_, **fields):
+        emitted.append((type_, fields))
+
+    monkeypatch.setattr(poller_recovery, "log_event", emit)
+    events = tmp_path / "events.jsonl"
+    event = _make_event("sid-transient")
+    await poller_recovery.stash_enqueued_event(
+        tmp_path, event, enqueued_at=(clock[0] - timedelta(seconds=1)).isoformat(),
+    )
+    enqueue = _FakeEnqueue()
+
+    async def reconcile():
+        return await poller_recovery.reconcile_failed_turns(
+            poller_name="gmail", channel_id=event.channel_id,
+            persist_dir=tmp_path, events_path=events, enqueue=enqueue,
+            max_attempts=0,
+        )
+
+    for attempt, floor, ceiling in [(1, 120, 180), (2, 240, 360),
+                                    (3, 480, 720), (4, 960, 1440), (5, 1800, 1800)]:
+        clock[0] += timedelta(seconds=1)
+        _write_outcome(
+            events, type_="turn_failed", channel_id=event.channel_id,
+            source_id=event.source_id, ts=clock[0].isoformat(),
+            attempt_disposition="transient_provider",
+            attempt_reason="provider_error_transient:RemoteProtocolError",
+        )
+        summary = await reconcile()
+        entry = poller_recovery._load_state(tmp_path)["inflight"][event.source_id]
+        delay = (datetime.fromisoformat(entry["transient_due_at"]) - clock[0]).total_seconds()
+        assert floor <= delay <= ceiling
+        assert summary["reenqueued"] == 0
+        assert entry["attempts"] == 0
+        clock[0] += timedelta(seconds=delay - 1)
+        assert (await reconcile())["reenqueued"] == 0
+        clock[0] += timedelta(seconds=1)
+        assert (await reconcile())["reenqueued"] == 1
+        assert enqueue.calls[-1].source_id == event.source_id
+        assert poller_recovery._load_state(tmp_path)["inflight"][event.source_id]["transient_retries"] == attempt
+
+    clock[0] += timedelta(seconds=1)
+    _write_outcome(
+        events, type_="turn_failed", channel_id=event.channel_id,
+        source_id=event.source_id, ts=clock[0].isoformat(),
+        attempt_disposition="transient_provider",
+        attempt_reason="provider_error_transient:RemoteProtocolError",
+    )
+    assert (await reconcile())["gave_up"] == 1
+    assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+    assert [fields["attempt"] for kind, fields in emitted if kind == "turn_transient_retry_scheduled"] == [1, 2, 3, 4, 5]
+    assert [kind for kind, _ in emitted if kind == "turn_transient_retry_exhausted"] == ["turn_transient_retry_exhausted"]
+    assert len([kind for kind, _ in emitted if kind == "poller_turn_gave_up"]) == 1
+
+
+async def test_transient_retry_after_and_nontransient_charge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 10, 13, tzinfo=timezone.utc)
+    monkeypatch.setattr(poller_recovery, "_utc_now", lambda: now)
+    for source_id, disposition in (("sid-provider", "transient_provider"), ("sid-tool", "charge")):
+        await poller_recovery.stash_enqueued_event(
+            tmp_path, _make_event(source_id),
+            enqueued_at=(now - timedelta(seconds=2)).isoformat(),
+        )
+        _write_outcome(
+            tmp_path / "events.jsonl", type_="turn_failed", channel_id="poller:gmail",
+            source_id=source_id, ts=(now - timedelta(seconds=1)).isoformat(),
+            attempt_disposition=disposition, retry_after_s=2400,
+        )
+    enqueue = _FakeEnqueue()
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail", channel_id="poller:gmail",
+        persist_dir=tmp_path, events_path=tmp_path / "events.jsonl", enqueue=enqueue,
+    )
+    entries = poller_recovery._load_state(tmp_path)["inflight"]
+    assert (datetime.fromisoformat(entries["sid-provider"]["transient_due_at"]) - now).total_seconds() == 2400
+    assert entries["sid-provider"]["attempts"] == 0
+    assert entries["sid-tool"]["attempts"] == 1
+    assert [event.source_id for event in enqueue.calls] == ["sid-tool"]
+
+
+async def test_transient_live_state_retry_does_not_charge_until_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [datetime(2026, 10, 13, tzinfo=timezone.utc)]
+    monkeypatch.setattr(poller_recovery, "_utc_now", lambda: clock[0])
+    monkeypatch.setenv("MIMIR_TURN_TRANSIENT_RETRY_MAX", "1")
+    monkeypatch.setenv("MIMIR_TURN_TRANSIENT_RETRY_BASE_S", "10")
+    monkeypatch.setenv("MIMIR_TURN_TRANSIENT_RETRY_MAX_S", "10")
+    event = _make_event("sid-review", channel_id="poller:github-activity")
+    await poller_recovery.stash_enqueued_event(
+        tmp_path, event, enqueued_at=(clock[0] - timedelta(seconds=1)).isoformat(),
+    )
+    events = tmp_path / "events.jsonl"
+    enqueue = _FakeEnqueue()
+
+    async def reconcile():
+        return await poller_recovery.reconcile_failed_turns(
+            poller_name="github-activity", channel_id=event.channel_id,
+            persist_dir=tmp_path, events_path=events, enqueue=enqueue,
+            recover_failed_turns=False,
+        )
+
+    clock[0] += timedelta(seconds=1)
+    _write_outcome(
+        events, type_="turn_failed", channel_id=event.channel_id,
+        source_id=event.source_id, ts=clock[0].isoformat(),
+        attempt_disposition="transient_provider", attempt_reason="provider_error_transient:CodexResponseError",
+    )
+    await reconcile()
+    assert poller_recovery._load_state(tmp_path)["inflight"][event.source_id]["attempts"] == 0
+    clock[0] += timedelta(seconds=10)
+    assert (await reconcile())["reenqueued"] == 1
+    assert poller_recovery._load_state(tmp_path)["inflight"][event.source_id]["attempts"] == 0
+    clock[0] += timedelta(seconds=1)
+    _write_outcome(
+        events, type_="turn_failed", channel_id=event.channel_id,
+        source_id=event.source_id, ts=clock[0].isoformat(),
+        attempt_disposition="transient_provider", attempt_reason="provider_error_transient:CodexResponseError",
+    )
+    await reconcile()
+    entry = poller_recovery._load_state(tmp_path)["inflight"][event.source_id]
+    assert entry["attempts"] == 1
+    assert entry["outcome_disposition"] == "charge"
+    assert len(enqueue.calls) == 1
+
+
+async def test_transient_retry_rejected_enqueue_preserves_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [datetime(2026, 10, 13, tzinfo=timezone.utc)]
+    monkeypatch.setattr(poller_recovery, "_utc_now", lambda: clock[0])
+    monkeypatch.setenv("MIMIR_TURN_TRANSIENT_RETRY_BASE_S", "2")
+    monkeypatch.setenv("MIMIR_TURN_TRANSIENT_RETRY_MAX_S", "2")
+    event = _make_event("sid-reject")
+    await poller_recovery.stash_enqueued_event(
+        tmp_path, event, enqueued_at=(clock[0] - timedelta(seconds=1)).isoformat(),
+    )
+    events = tmp_path / "events.jsonl"
+    clock[0] += timedelta(seconds=1)
+    _write_outcome(
+        events, type_="turn_failed", channel_id=event.channel_id,
+        source_id=event.source_id, ts=clock[0].isoformat(),
+        attempt_disposition="transient_provider",
+    )
+    common = dict(poller_name="gmail", channel_id=event.channel_id,
+                  persist_dir=tmp_path, events_path=events)
+    await poller_recovery.reconcile_failed_turns(**common, enqueue=_FakeEnqueue())
+    clock[0] += timedelta(seconds=2)
+    assert (await poller_recovery.reconcile_failed_turns(
+        **common, enqueue=_FullEnqueue(),
+    ))["deferred"] == 1
+    entry = poller_recovery._load_state(tmp_path)["inflight"][event.source_id]
+    assert entry.get("transient_retries", 0) == 0
+    assert "transient_due_at" in entry
+    enqueue = _FakeEnqueue()
+    assert (await poller_recovery.reconcile_failed_turns(
+        **common, enqueue=enqueue,
+    ))["reenqueued"] == 1
+    assert [item.source_id for item in enqueue.calls] == [event.source_id]
+
+
 async def test_reconcile_drops_stale_subject_without_giving_up(tmp_path: Path):
     events = tmp_path / "events.jsonl"
     event_logger._reset_logger_for_tests()

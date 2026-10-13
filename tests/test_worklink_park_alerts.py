@@ -37,9 +37,12 @@ class Channels:
 
 
 @pytest.mark.asyncio
-async def test_park_alerts_once_per_identity_across_restart_and_both_sinks(
+async def test_park_alerts_once_per_identity_to_the_channel_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Parks go to the operator channel only; ntfy is never pushed, even when configured."""
+    import mimir.ntfy as ntfy
+
     channels = Channels()
     pushes: list[dict] = []
     events: list[tuple[str, dict]] = []
@@ -51,7 +54,7 @@ async def test_park_alerts_once_per_identity_across_restart_and_both_sinks(
         events.append((kind, kwargs))
 
     monkeypatch.setenv("NTFY_TOPIC", "operator")
-    monkeypatch.setattr(park_alerts, "post_algedonic_alarm", push)
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", push)
     monkeypatch.setattr(park_alerts, "log_event", event)
     monkeypatch.setattr(park_alerts, "_issue_title", lambda home, issue: "Plugin core")
     first = _record(tmp_path)
@@ -59,23 +62,18 @@ async def test_park_alerts_once_per_identity_across_restart_and_both_sinks(
     await park_alerts.alert_parked_factory_runs(tmp_path, "operator", channels)
     # A fresh invocation reloads the persisted state rather than a process cache.
     await park_alerts.alert_parked_factory_runs(tmp_path, "operator", channels)
-    assert len(channels.messages) == len(pushes) == 1
+    assert len(channels.messages) == 1
+    assert pushes == []
     body = channels.messages[0]
-    assert pushes[0]["body"] == body
-    assert pushes[0]["title"] == "Factory epic #1947: Plugin core"
-    assert pushes[0]["category"] == "worklink-factory-parked"
-    assert pushes[0]["priority"] == 4
-    assert pushes[0]["dedupe_key"] == park_alerts.park_dedupe_key(first)
     assert all(piece in body for piece in ("#1947", "Plugin core", "chainlink-1947",
                                            "attempt: 1", "needs-human", "WORKLINK_BLOCKED",
                                            "mimir worklink status 1947"))
     assert "SECRET_MARKER" not in body and "@everyone" not in body
-    assert "SECRET_MARKER" not in pushes[0]["title"] and "@everyone" not in pushes[0]["title"]
     assert [(kind, data["sinks"]) for kind, data in events if kind.endswith("_alerted")] == [
-        ("worklink_factory_park_alerted", ["channel", "ntfy"])
+        ("worklink_factory_park_alerted", ["channel"])
     ]
     state = json.loads(park_alerts._state_path(tmp_path).read_text())
-    assert state == {park_alerts.park_dedupe_key(first): ["channel", "ntfy"]}
+    assert state == {park_alerts.park_dedupe_key(first): ["channel"]}
 
     second = replace(first, attempt=2)
     save_factory_record(tmp_path, second)
@@ -83,8 +81,25 @@ async def test_park_alerts_once_per_identity_across_restart_and_both_sinks(
     third = replace(second, status=replace(second.status, terminal_result={"reason": "different"}))
     save_factory_record(tmp_path, third)
     await park_alerts.alert_parked_factory_runs(tmp_path, "operator", channels)
-    assert len(channels.messages) == len(pushes) == 3
-    assert len({push["dedupe_key"] for push in pushes}) == 3
+    assert len(channels.messages) == 3
+    assert pushes == []
+    # Not reachable by a direct import either.
+    assert not hasattr(park_alerts, "post_algedonic_alarm")
+
+
+@pytest.mark.asyncio
+async def test_legacy_ntfy_state_entries_still_load_and_are_not_re_sent(tmp_path, monkeypatch) -> None:
+    """State written while ntfy was a sink stays valid; a delivered channel is not repeated."""
+    monkeypatch.setattr(park_alerts, "_issue_title", lambda *_: "Plugin core")
+    record = _record(tmp_path)
+    save_factory_record(tmp_path, record)
+    park_alerts._state_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    park_alerts._state_path(tmp_path).write_text(
+        json.dumps({park_alerts.park_dedupe_key(record): ["channel", "ntfy"]})
+    )
+    channels = Channels()
+    await park_alerts.alert_parked_factory_runs(tmp_path, "operator", channels)
+    assert channels.messages == []
 
 
 @pytest.mark.asyncio
@@ -128,19 +143,13 @@ async def test_unrouted_is_durable_and_bad_record_is_skipped(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_failed_channel_does_not_duplicate_ntfy(tmp_path, monkeypatch) -> None:
-    pushes = []
+async def test_failed_channel_retries_once_on_the_next_scan(tmp_path, monkeypatch) -> None:
     events = []
-    monkeypatch.setenv("NTFY_TOPIC", "operator")
     monkeypatch.setattr(park_alerts, "_issue_title", lambda *_: "Plugin core")
-
-    async def push(**kwargs):
-        pushes.append(kwargs)
 
     async def event(kind, **kwargs):
         events.append(kind)
 
-    monkeypatch.setattr(park_alerts, "post_algedonic_alarm", push)
     monkeypatch.setattr(park_alerts, "log_event", event)
     save_factory_record(tmp_path, _record(tmp_path))
 
@@ -151,7 +160,9 @@ async def test_failed_channel_does_not_duplicate_ntfy(tmp_path, monkeypatch) -> 
     await park_alerts.alert_parked_factory_runs(tmp_path, "operator", FailingChannels())
     channels = Channels()
     await park_alerts.alert_parked_factory_runs(tmp_path, "operator", channels)
-    assert len(pushes) == len(channels.messages) == 1
+    await park_alerts.alert_parked_factory_runs(tmp_path, "operator", channels)
+    assert len(channels.messages) == 1
+    assert events.count("worklink_factory_park_delivery_failed") == 1
     assert events.count("worklink_factory_park_alerted") == 1
 
 

@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from .checkout import _default_runner
 from .control import operator_stop_requested
+from .dispatch_failures import _find_latest_evidence_file_for_issue, record_leaf_transition_best_effort
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
 WORKLINK_EPIC_LABEL = "worklink:epic"
@@ -376,6 +377,7 @@ class ChainlinkClaims:
         active_label: str | None = None,
         exclude_active_label: str | None = None,
         before_claim: Callable[[], None] | None = None,
+        issue_title: str = "",
     ) -> ClaimResult:
         """Claim ``issue_id`` if its lifecycle, evidence, attempts, and cap allow it.
 
@@ -481,7 +483,10 @@ class ChainlinkClaims:
             attempts_used = self.attempts_used(comments)
             if attempts_used >= self.max_attempts:
                 self.release_issue(issue_id)
-                self._attempts_exhausted(issue_id, attempts_used)
+                self._attempts_exhausted(
+                    issue_id, attempts_used, issue_title=issue_title, home=claim_home,
+                    generation=_scan_claim_comments(comments)[1],
+                )
                 return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
 
             if max_active_locks is not None:
@@ -1035,6 +1040,12 @@ class ChainlinkClaims:
                 str(record.issue_id),
                 REAPER_PREFIX + json.dumps(payload, sort_keys=True),
             )
+            self._record_leaf_ending(
+                "leaf_claim_reaped", record.issue_id, record.attempt,
+                reason=(f"stale claim: agent={record.agent_id}; last heartbeat="
+                        f"{payload['last_heartbeat'] or record.claimed_at.isoformat()}; "
+                        f"reaped at={payload['reaped_at']}; resulting label={payload['resulting_label']}"),
+            )
             if self.event_logger is not None:
                 self.event_logger(
                     "worklink_claim_reaped",
@@ -1404,7 +1415,10 @@ class ChainlinkClaims:
             skipped_issue_ids=result.skipped_issue_ids,
         )
 
-    def _attempts_exhausted(self, issue_id: int, attempts: int) -> None:
+    def _attempts_exhausted(
+        self, issue_id: int, attempts: int, *, issue_title: str = "", home: Path | None = None,
+        generation: int = 0,
+    ) -> None:
         self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
         self._run("issue", "unlabel", str(issue_id), "worklink:in-progress", check=False)
         self._run("issue", "label", str(issue_id), "worklink:blocked")
@@ -1422,6 +1436,45 @@ class ChainlinkClaims:
                 },
                 sort_keys=True,
             ),
+        )
+        self._record_leaf_ending(
+            "leaf_attempts_exhausted", issue_id, attempts,
+            reason=f"attempts exhausted: {attempts} of {self.max_attempts} allowed attempts used",
+            issue_title=issue_title, home=home,
+            occurrence_id=f"claim-reset-generation:{generation}",
+        )
+
+    def _record_leaf_ending(
+        self, kind: str, issue_id: int, attempt: int, *, reason: str,
+        issue_title: str = "", home: Path | None = None, occurrence_id: str = "",
+    ) -> None:
+        home = home or self.home_path
+        if home is None:
+            return
+        # Fetch only optional descriptive fields after all authoritative mutations.
+        evidence_path = None
+        evidence: dict[str, Any] = {}
+        try:
+            if not issue_title:
+                shown = self._run("issue", "show", str(issue_id), "--json", check=False)
+                if shown.returncode == 0:
+                    title = json.loads(shown.stdout or "{}").get("title", "")
+                    issue_title = title if isinstance(title, str) else ""
+        except Exception:
+            pass
+        try:
+            found = _find_latest_evidence_file_for_issue(home, issue_id)
+            evidence_path, evidence = found if found else (None, {})
+            if found and kind == "leaf_claim_reaped" and evidence.get("attempt") != attempt:
+                evidence_path, evidence = None, {}
+        except Exception:
+            pass
+        record_leaf_transition_best_effort(
+            home, kind=kind, issue_id=issue_id, issue_title=issue_title,
+            attempt=attempt, reason=reason, occurrence_id=occurrence_id,
+            evidence_path=str(evidence_path) if evidence_path else None,
+            transcript_path=evidence.get("transcript"),
+            checkout=evidence.get("checkout"), branch=evidence.get("branch"),
         )
 
     def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

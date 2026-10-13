@@ -6079,10 +6079,44 @@ def tainted_write_target(tool_name: str, target: Any = None) -> bool:
     ))
 
 
-def _tainted_write_denial(tool_name: str, service: Any = None) -> "ToolAuthorization":
+def _tainted_write_sources(auth_context: Any, ifc_labels: Any) -> dict[str, Any]:
+    """Bound the live taint's identifiers; never forward source content."""
+    from .redaction import redact_text
+
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    sources = []
+    remaining = 0
+    for source in getattr(labels, "sources", ()):
+        if not getattr(source, "has_untrusted_active_ingest", False):
+            continue
+        if len(sources) == 5:
+            remaining += 1
+            continue
+        resource_id = source.resource_id
+        sources.append({
+            "domain": source.domain,
+            "resource_id": (
+                redact_text(resource_id)[:1024] if isinstance(resource_id, str) else None
+            ),
+        })
+    return {"sources": sources, "remaining_sources": remaining}
+
+
+def _tainted_write_denial(
+    tool_name: str, service: Any = None, *, auth_context: Any = None,
+    ifc_labels: Any = None,
+) -> "ToolAuthorization":
     try:
         from .event_logger import log_event_sync
-        log_event_sync("write_blocked_by_untrusted_ingest", tool=tool_name)
+        log_event_sync(
+            "write_blocked_by_untrusted_ingest", tool=tool_name,
+            **_tainted_write_sources(auth_context, ifc_labels),
+        )
     except Exception:
         pass
     return ToolAuthorization(
@@ -6847,7 +6881,9 @@ class SinkGate:
         # This veto precedes both shadow allowances and the generic same-PR rule.
         if (tainted_write_target(tool_name, target)
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            return _tainted_write_denial(tool_name, service)
+            return _tainted_write_denial(
+                tool_name, service, auth_context=auth_context, ifc_labels=ifc_labels,
+            )
         # Enforcement already refuses all tainted tracker mutations with the
         # original reason/detail; only shadow mode needs this narrower veto.
         if (not enforce and tool_name in {"shell_exec", "bash_async"}
@@ -9482,7 +9518,9 @@ class ToolRegistry:
         if (tool_name in _TAINTED_FILE_WRITE_TOOLS
                 and tainted_file_write_target(raw_write_target)
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            return finish(_tainted_write_denial(tool_name))
+            return finish(_tainted_write_denial(
+                tool_name, auth_context=auth_context, ifc_labels=ifc_labels,
+            ))
         if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return finish(_scheduled_write_denial(tool_name))
         if (plugin_tool is not None and plugin_tool.writes_code_or_state
@@ -10288,6 +10326,35 @@ def log_pr_checkout_lease_attestation_refused(
         pass
 
 
+def _log_repository_result_untrusted_default(
+    auth_context: "AuthContext | None", scope: Any, tool: str, reason: str,
+    mismatched_fields: tuple[str, ...] = (),
+) -> None:
+    """Report an exact-scope provenance fallback once per turn/tool/reason."""
+    ifc_state = getattr(auth_context, "ifc_state", None)
+    if ifc_state is not None:
+        with ifc_state._lock:
+            seen = getattr(ifc_state, "_repository_result_fallbacks", None)
+            if seen is None:
+                seen = set()
+                setattr(ifc_state, "_repository_result_fallbacks", seen)
+            if (tool, reason) in seen:
+                return
+            seen.add((tool, reason))
+    from .event_logger import log_event_sync
+
+    try:
+        fields = dict(
+            tool=tool, scope_id=scope.scope_id, pr_number=scope.pr_number,
+            observed_head_sha=scope.observed_head_sha, reason=reason,
+        )
+        if reason == "provenance_field_mismatch":
+            fields["mismatched_fields"] = list(mismatched_fields)
+        log_event_sync("repository_result_untrusted_default", **fields)
+    except RuntimeError:
+        pass
+
+
 def _pr_checkout_lease_attestation(
     auth_context: "AuthContext | None", scope: Any, lease: Any,
 ) -> LeaseAttestation:
@@ -10617,6 +10684,7 @@ class ProtectedResultProvenance:
     """Non-model-visible provenance for the exact resources a native read returned."""
 
     sources: tuple["SourceLabel", ...]
+    content_free_error: str | None = None
 
 
 @dataclass
@@ -10627,6 +10695,7 @@ class _ProtectedResultCapture:
     seen: set["SourceLabel"] = field(default_factory=set)
     published: bool = False
     invalid: bool = False
+    content_free_error: str | None = None
     closed: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -10644,7 +10713,9 @@ def begin_protected_result_capture() -> Token[_ProtectedResultState]:
     return _protected_result_provenance.set(_ProtectedResultCapture())
 
 
-def publish_protected_result(sources: tuple["SourceLabel", ...]) -> None:
+def publish_protected_result(
+    sources: tuple["SourceLabel", ...], *, content_free_error: str | None = None,
+) -> None:
     """Accumulate exact sources in this capture, including authoritative empty."""
     from .models import SourceLabel
 
@@ -10652,18 +10723,22 @@ def publish_protected_result(sources: tuple["SourceLabel", ...]) -> None:
         isinstance(source, SourceLabel) for source in sources
     ):
         raise TypeError("protected result provenance must be a tuple of SourceLabel")
+    if content_free_error is not None and (sources or not content_free_error):
+        raise ValueError("content-free error provenance requires an empty source set and error")
     capture = _protected_result_provenance.get()
     if isinstance(capture, _ProtectedResultCapture):
         with capture.lock:
             if capture.closed:
                 return
             capture.published = True
+            if content_free_error is not None:
+                capture.content_free_error = content_free_error
             for source in sources:
                 if source not in capture.seen:
                     capture.seen.add(source)
                     capture.sources.append(source)
         return
-    _protected_result_provenance.set(ProtectedResultProvenance(sources))
+    _protected_result_provenance.set(ProtectedResultProvenance(sources, content_free_error))
 
 
 def invalidate_protected_result_capture() -> None:
@@ -10686,7 +10761,7 @@ def end_protected_result_capture(
         with captured.lock:
             captured.closed = True
             result = (
-                ProtectedResultProvenance(tuple(captured.sources))
+                ProtectedResultProvenance(tuple(captured.sources), captured.content_free_error)
                 if captured.published and not captured.invalid
                 else None
             )
@@ -10978,6 +11053,29 @@ def _incomplete_protected_result(
     ))
 
 
+def _single_filesystem_result_source(
+    auth_context: "AuthContext | None", args: dict[str, Any], *, existing_file: bool,
+) -> "SourceLabel | None":
+    """Use the same path and lease anchor for successful and failed file reads."""
+    resource = next((
+        args.get(key) for key in ("path", "file_path")
+        if isinstance(args.get(key), str) and args.get(key)
+    ), None)
+    if resource is None:
+        return None
+    try:
+        resolved = Path(resource).resolve(strict=existing_file)
+        if existing_file and not resolved.is_file():
+            return None
+        source = protected_result_source(
+            auth_context, principal="filesystem", domain="filesystem",
+            resource_id=str(resolved), bridge_instance="filesystem",
+        )
+    except Exception:  # noqa: BLE001 — unresolved anchors must fail closed
+        return None
+    return source if source.integrity == "trusted" else None
+
+
 def _acp_failed_tool_error_result(
     result: Any,
     auth_context: "AuthContext | None",
@@ -11088,7 +11186,9 @@ def classify_protected_result(
         )
 
     artifact = getattr(result, "artifact", None)
-    if provenance is None and isinstance(artifact, ProtectedResultProvenance):
+    if isinstance(artifact, ProtectedResultProvenance) and (
+        provenance is None or not provenance.sources and artifact.sources
+    ):
         provenance = artifact
     if (
         policy_refusal is not None
@@ -11188,6 +11288,20 @@ def classify_protected_result(
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels
     if descriptor and descriptor.result_origin & ResultOriginKind.REPOSITORY:
+        if (
+            tool_name.startswith("repo_")
+            and failed
+            and isinstance(result, ToolMessage)
+            and result.status == "error"
+            and provenance is not None
+            and not provenance.sources
+            and provenance.content_free_error is not None
+            and result.content in {
+                provenance.content_free_error,
+                f"Error: {provenance.content_free_error}",
+            }
+        ):
+            return None
         scope = authorization.repo_pr_action_scope
         if scope is None:
             return _incomplete_protected_result(
@@ -11214,19 +11328,25 @@ def classify_protected_result(
             # publish exact-scope, server-attested provenance for every author.
             integrity_effect="active_ingest",
         )
-        if provenance is not None and provenance.sources:
-            if all(
-                item.domain == source.domain
-                and item.domain_qualifier == source.domain_qualifier
-                and item.resource_id == source.resource_id
-                and item.principal == source.principal
-                and item.bridge_instance == source.bridge_instance
-                and item.sensitivity == source.sensitivity
-                and item.authorized_principals == source.authorized_principals
-                and item.source_kind == source.source_kind
-                and item.integrity_effect == source.integrity_effect
+        if provenance is None or not provenance.sources:
+            _log_repository_result_untrusted_default(
+                auth_context, scope, tool_name, "no_published_provenance",
+            )
+        else:
+            fields = (
+                "domain", "domain_qualifier", "resource_id", "principal",
+                "bridge_instance", "sensitivity", "authorized_principals",
+                "source_kind", "integrity_effect",
+            )
+            mismatched = tuple(field for field in fields if any(
+                getattr(item, field) != getattr(source, field)
                 for item in provenance.sources
-            ):
+            ))
+            if mismatched:
+                _log_repository_result_untrusted_default(
+                    auth_context, scope, tool_name, "provenance_field_mismatch", mismatched,
+                )
+            else:
                 source = replace(
                     source,
                     integrity=(
@@ -11238,6 +11358,10 @@ def classify_protected_result(
                     _log_retained_repository_failure(
                         tool_name, result, scope.canonical_repo, scope.pr_number,
                         scope.observed_head_sha,
+                    )
+                if source.integrity == "untrusted":
+                    _log_repository_result_untrusted_default(
+                        auth_context, scope, tool_name, "published_untrusted",
                     )
         labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
@@ -11454,7 +11578,32 @@ def classify_protected_result(
         # turn rather than silently laundering integrity through the tool.
         domain = "unknown"
 
+    if (
+        domain == "filesystem"
+        and tool_name in {"read_file", "aread", "grep", "agrep", "glob", "aglob", "ls", "als"}
+        and failed
+        and isinstance(result, ToolMessage)
+        and result.status == "error"
+        and provenance is not None
+        and not provenance.sources
+        and provenance.content_free_error is not None
+        and result.content in {
+            provenance.content_free_error,
+            f"Error: {provenance.content_free_error}",
+        }
+    ):
+        # Only the native file backend can attest that this error returned no
+        # content. Unknown or partial provenance still fails closed below.
+        return None
     if failed:
+        if (
+            domain == "filesystem" and tool_name in {"read_file", "aread"}
+            and provenance is None and isinstance(result, ToolMessage)
+            and result.status == "error"
+        ):
+            source = _single_filesystem_result_source(auth_context, args, existing_file=True)
+            if source is not None:
+                return InformationFlowLabels().with_source(source)
         return _incomplete_protected_result(
             domain, args, tool_name=tool_name, auth_context=auth_context,
         )
@@ -11468,24 +11617,9 @@ def classify_protected_result(
         return labels
 
     if domain == "filesystem":
-        resource = next(
-            (
-                args.get(key)
-                for key in ("path", "file_path")
-                if isinstance(args.get(key), str) and args.get(key)
-            ),
-            None,
-        )
-        if resource is not None:
-            source = protected_result_source(
-                auth_context,
-                principal="filesystem",
-                domain="filesystem",
-                resource_id=str(Path(resource).resolve(strict=False)),
-                bridge_instance="filesystem",
-            )
-            if source.integrity == "trusted":
-                return InformationFlowLabels().with_source(source)
+        source = _single_filesystem_result_source(auth_context, args, existing_file=False)
+        if source is not None:
+            return InformationFlowLabels().with_source(source)
 
     return _incomplete_protected_result(
         domain, args, tool_name=tool_name, auth_context=auth_context,

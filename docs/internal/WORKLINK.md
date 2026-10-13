@@ -56,8 +56,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.10.14` through the lockstep
-`opencode-feature-factory@0.10.14` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.10.16` through the lockstep
+`opencode-feature-factory@0.10.16` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -118,7 +118,7 @@ executor together by rebuilding the executor image before enabling this layout.
   rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
   variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.10.14 verification and
+  Worklink admits the launcher only after package/adapter 0.10.16 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume uses the retained session, while
   heartbeat uses the newly claimed session after recovery; lock actions use
@@ -169,6 +169,23 @@ executor together by rebuilding the executor image before enabling this layout.
   `needs-human`, then retains the same attempt for recovery. A dead process
   still follows the existing failure path; ongoing transcript writes keep the
   driver active.
+- **Supervision errors and reclamation**: A status command, parse/binding,
+  record-write, heartbeat, or snapshot error during a live factory poll is a
+  missed observation: the controller logs one scrubbed, bounded
+  `worklink_factory_supervision_error` per episode, retains its previous status,
+  and continues polling under the existing startup, idle and budget deadlines.
+  Thirty consecutive failing polls create one non-terminal, agent-facing
+  incident; they do not cancel the driver. Only verified driver death, explicit
+  factory terminal/park, budget/idle park, operator stop, or a proven fresh
+  foreign lock owner ends supervision. The executor supervisor intentionally
+  tears down the driver if its controller socket closes; the controller must
+  therefore keep supervising across errors. Attempt pruning retains a matching
+  factory checkout while its process identity is unverifiable, its process is
+  alive, or its last observed session heartbeat is current. After verified
+  death, even a terminal or status-less record gets at least 900 seconds from
+  its last durable observation before deletion (and resumable runs retain their
+  longer observation window). If no valid stop time exists, the usual checkout
+  mtime TTL applies.
 - **Recovery**: A parked or interrupted run retains its sandbox. The parked report
   includes the `park_snapshot` path when the factory published a complete current
   diagnostic control-plane snapshot at `<operator root>/.factory/.parked/<run-id>`;
@@ -193,8 +210,9 @@ executor together by rebuilding the executor image before enabling this layout.
   terminal. A relaunch never archives, replaces, or removes a retained run.
 - **Park alerts**: The server checks live `factory-runs/*.json` every five minutes,
   independently of the optional TTL reaper. A `parked` / `needs-human` record
-  sends a fixed-field notice to `MIMIR_OPERATOR_ALERT_CHANNEL` and, when
-  `NTFY_TOPIC` is set, a priority-4 ntfy push. The notice names the Chainlink
+  sends a fixed-field notice to `MIMIR_OPERATOR_ALERT_CHANNEL` only. It never
+  sends an ntfy push: parks also reach the agent as stop notices, and a phone
+  push is reserved for decisions the agent escalates. The notice names the Chainlink
   issue, run and attempt, and points to its `WORKLINK_BLOCKED` comment or
   `mimir worklink status <id>` for the decision; it never quotes the factory
   reason. `<home>/state/worklink/factory-park-alerts.json` remembers delivered
@@ -212,6 +230,20 @@ executor together by rebuilding the executor image before enabling this layout.
   the issue. Stop notices are recorded for both autonomous and operator-launched
   runs; unlike `factory_start` and `factory_success`, they are not gated by
   `autonomous`. These prompts complement the independent operator park alerts.
+- **Leaf decision notices**: A blocked leaf result, exhausted attempt budget
+  (leaf or epic), invalid ready-leaf template, and stale leaf claim re-arm each
+  record a best-effort milestone in the same dispatch ledger. The ready-queue
+  poller delivers an acknowledged prompt with issue, attempt, bounded reason,
+  and available evidence, transcript, checkout and branch pointers. Identical
+  occurrences deduplicate; a new reason or attempt prompts again. Exhaustion
+  notices also key on the honoured claim-reset generation; template notices
+  key on the demotion timestamp persisted in the issue comment. Thus a reset
+  followed by re-exhaustion, or a re-armed leaf demoted for the same defect,
+  prompts again even with an unchanged reason and attempt count. The agent
+  inspects the evidence and issue and calls `operator_alert` if a spec repair,
+  unblock or attempt grant is needed; it does not re-arm, reset claims, edit
+  the issue body or start work. Failed leaves already use incident prompts;
+  review-ready PRs, operator stops and scheduled quota holds are exempt.
 - **Completion**: `completed`, `blocked`, and `partial` are terminal, but only
   `completed` can ship. Before `worklink:review`, Worklink runs the configured
   repository test command, requires observed non-skipped exit-zero evidence and
@@ -577,7 +609,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.10.14 controls. |
+| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.10.16 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than
@@ -1014,8 +1046,8 @@ stands, and the script exits 3 naming the command to run.
 A park also reconciles mimir's retained record to `controller_phase=parked` with
 an observed `needs-human` status. That is not bookkeeping: `_attempt_is_active`
 reads mimir's last observed status rather than the factory plane, so a record
-left reading `running` behind a dead process is pruned by the next cleanup pass
-even while the factory itself reports a parked run.
+left reading `running` behind a dead process is eligible for cleanup after the
+resumable retention window, even while the factory itself reports a parked run.
 
 Resume is a preflight plus a dispatch, and deliberately does **not** call
 `factory resume`:
@@ -1219,6 +1251,7 @@ defaults:
   priority: normal          # arbiter priority for autonomous dispatch (low|normal|high)
   max_concurrent: 2         # cap on concurrent autonomous claims (poller + tool); CLI uncapped
   reaper_ttl_s: 86400       # >= 2 * timeout_s; backend + gates heartbeat; lower values warn + clamp
+  factory_resumable_retention_s: 86400 # >= reaper_ttl_s; grace since last durable factory observation
   allow_autonomous_local_subprocess: false  # autonomy policy (#460, #832): autonomous dispatch
                             # refuses the unsandboxed local_subprocess substrate unless this
                             # is true. The operator CLI is never gated. See §6.5.
@@ -1280,6 +1313,16 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454).
                             # at config-load time.
   local-subprocess: {}      # the built-in default; accept-the-risk fallback
 ```
+
+`defaults.factory_resumable_retention_s` is a positive integer. When omitted,
+it defaults to `max(86400, reaper_ttl_s)` using the effective, timeout-clamped
+TTL; an explicit value must be at least that TTL. A checkout with a verified-dead
+factory record and a non-terminal, non-parked status is pruned only after both the checkout TTL and
+this window since `FactoryRunRecord.observed_at` have elapsed. While held, each
+prune pass emits `worklink_attempt_checkout_retained` with its `prunable_after`
+timestamp. A missing or invalid observation falls back to checkout mtime and
+emits `worklink_attempt_retention_clock_fallback`. Archiving the factory record
+releases the hold; live and parked runs remain protected independently.
 
 Invalid or unknown tool-backend and compute-backend fields fail closed during
 registry construction instead of falling back to another backend. Remove any

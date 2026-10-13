@@ -50,9 +50,11 @@ from .dispatch_failures import _find_latest_evidence_file_for_issue
 from .factory_state import (
     LIVE_CONTROLLER_PHASES,
     RETAINED_CONTROLLER_PHASES,
+    FACTORY_STOP_GRACE_S,
     factory_checkout_interlock,
-    factory_process_is_alive,
     factory_process_is_verified_dead,
+    factory_run_still_going,
+    factory_run_stopped_since,
     list_factory_records,
 )
 from .run_state import (
@@ -227,9 +229,16 @@ def check_concurrency(
 
 
 
-def _attempt_is_active(child: Path, records: Sequence[object] = ()) -> bool:
+def _attempt_is_active(
+    child: Path, records: Sequence[object] = (), *, now: datetime | None = None,
+) -> bool:
     resolved = child.resolve()
+    now = now or datetime.now(timezone.utc)
     for candidate in records:
+        matches_attempt = (
+            f"{getattr(candidate, 'issue_id', None)}-"
+            f"{getattr(candidate, 'attempt', None)}" == child.name
+        )
         sandbox = getattr(candidate, "sandbox", None)
         if not isinstance(sandbox, str):
             continue
@@ -241,9 +250,15 @@ def _attempt_is_active(child: Path, records: Sequence[object] = ()) -> bool:
             return True
         if phase not in LIVE_CONTROLLER_PHASES | RETAINED_CONTROLLER_PHASES:
             return True
-        if factory_process_is_alive(candidate):
-            return True
         status = getattr(candidate, "status", None)
+        if factory_run_still_going(candidate, status, now=now):
+            return True
+        stopped = factory_run_stopped_since(candidate, status)
+        if (
+            matches_attempt and stopped is not None
+            and now < stopped + timedelta(seconds=FACTORY_STOP_GRACE_S)
+        ):
+            return True
         if status is not None and status.is_parked:
             return True
         if status is not None and status.is_terminal:
@@ -251,6 +266,74 @@ def _attempt_is_active(child: Path, records: Sequence[object] = ()) -> bool:
         if not factory_process_is_verified_dead(candidate):
             return True
     return False
+
+
+def _attempt_held_by_factory_observation(
+    child: Path,
+    records: Sequence[object],
+    *,
+    now: datetime,
+    retention_s: int,
+) -> bool:
+    """Give a verified-dead, non-parked factory its recovery window after its last write."""
+    resolved = child.resolve()
+    held: tuple[object, datetime] | None = None
+    for record in records:
+        if f"{getattr(record, 'issue_id', None)}-{getattr(record, 'attempt', None)}" != child.name:
+            continue
+        sandbox = getattr(record, "sandbox", None)
+        if not isinstance(sandbox, str):
+            continue
+        resolved_sandbox = Path(sandbox).resolve()
+        if resolved_sandbox != resolved and resolved not in resolved_sandbox.parents:
+            continue
+        phase = getattr(record, "controller_phase", None)
+        status = getattr(record, "status", None)
+        if (
+            phase not in LIVE_CONTROLLER_PHASES | RETAINED_CONTROLLER_PHASES
+            or status is None
+            or status.status is None
+            or status.is_terminal
+            or status.is_parked
+            or not factory_process_is_verified_dead(record)
+        ):
+            continue
+        observed_at = getattr(record, "observed_at", None)
+        try:
+            observed = datetime.fromisoformat(observed_at) if observed_at else None
+            if observed is None or observed.tzinfo is None or observed.utcoffset() is None:
+                raise ValueError("missing or unparseable observation time")
+        except (TypeError, ValueError):
+            # The checkout-age gate has already passed; legacy records retain
+            # the original mtime-only policy rather than inventing a new clock.
+            try:
+                log_event_sync(
+                    "worklink_attempt_retention_clock_fallback",
+                    issue_id=record.issue_id,
+                    run_id=record.run_id,
+                )
+            except RuntimeError:
+                pass
+            continue
+        prunable_after = observed + timedelta(seconds=retention_s)
+        if now < prunable_after and (held is None or prunable_after > held[1]):
+            held = (record, prunable_after)
+    if held is None:
+        return False
+    record, prunable_after = held
+    try:
+        log_event_sync(
+            "worklink_attempt_checkout_retained",
+            issue_id=record.issue_id,
+            run_id=record.run_id,
+            attempt=record.attempt,
+            phase=record.controller_phase,
+            status=record.status.status,
+            prunable_after=prunable_after.isoformat(),
+        )
+    except RuntimeError:
+        pass
+    return True
 
 
 def prune_stale_attempt_checkouts_for_home(
@@ -263,8 +346,9 @@ def prune_stale_attempt_checkouts_for_home(
 
     The claim reaper recovers Chainlink labels/locks, but failed or blocked
     local attempts intentionally leave their checkout on disk for autopsy.  Run
-    the filesystem prune on the same TTL so retained attempts do not grow
-    without bound.  If no Worklink repo is configured, return silently; homes can
+    the filesystem prune on the same TTL; verified-dead resumable factories also
+    receive a retention window from their last observation. If no Worklink repo is
+    configured, return silently; homes can
     opt into claim reaping before they opt into autonomous dispatch.
 
     Factory controllers exclude reclamation through a cross-process interlock;
@@ -289,13 +373,20 @@ def prune_stale_attempt_checkouts_for_home(
             Path(state.checkout).resolve() for state in list_run_states(home) if state.checkout
         }
         records = {Path(record.checkout).resolve(): record for record in list_orphan_block_records(home)}
+        now = datetime.now(timezone.utc)
         pruned = prune_attempt_checkouts(
             Path(repo_raw),
             older_than=timedelta(seconds=defaults.reaper_ttl_s),
-            now=datetime.now(timezone.utc),
+            now=now,
             is_active=lambda child: (
                 child.resolve() in retained_run_paths
-                or _attempt_is_active(child, factory_records)
+                or _attempt_is_active(child, factory_records, now=now)
+                or _attempt_held_by_factory_observation(
+                    child,
+                    factory_records,
+                    now=now,
+                    retention_s=defaults.factory_resumable_retention_s,
+                )
             ),
             can_prune=lambda child: (
                 (record := records.get(child.resolve())) is None

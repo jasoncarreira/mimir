@@ -2515,6 +2515,18 @@ def _deny_admin_tool(
         tool_name, reason, detail, principal_is_admin="admin" in roles,
         target=target,
     )
+    if reason == "write_blocked_by_untrusted_ingest":
+        from ..access_control import _tainted_write_sources
+
+        identifiers = _tainted_write_sources(ctx, _current_ifc_labels(ctx))
+        if identifiers["sources"]:
+            sources = ", ".join(
+                f"{source['domain']}: {source['resource_id']}"
+                for source in identifiers["sources"]
+            )
+            rest = identifiers["remaining_sources"]
+            message += f" Untrusted sources: {sources}"
+            message += f" (+{rest} more)" if rest else "."
     service = get_trusted_service_from_auth_context(ctx) if isinstance(ctx, AuthContext) else None
     if tool_name == "shell_exec" and service is not None and not detail:
         message = f"shell_exec was refused before execution ({reason})."

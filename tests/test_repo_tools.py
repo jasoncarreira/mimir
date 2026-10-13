@@ -248,6 +248,8 @@ def _git(cwd: Path, *args: str) -> str:
 
 def _repo_scope_and_state(
     tmp_path: Path, *, event_type: str = "pr_changes_requested_stale",
+    commit_count: int = 1, pull_request_author: str | None = None,
+    base_ref: str = "main",
 ) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState]:
     origin = tmp_path / "origin.git"
     git_env = _fixture_git_env()
@@ -263,9 +265,14 @@ def _repo_scope_and_state(
     _git(source, "commit", "-q", "-m", "base")
     base = _git(source, "rev-parse", "HEAD")
     _git(source, "push", "-q", "origin", "HEAD:main")
+    if base_ref != "main":
+        _git(source, "push", "-q", "origin", f"HEAD:{base_ref}")
     _git(source, "checkout", "-q", "-b", "worklink/7")
     (source / "tracked.txt").write_text("pull request\n", encoding="utf-8")
     _git(source, "commit", "-qam", "pull request")
+    for number in range(1, commit_count):
+        (source / "tracked.txt").write_text(f"pull request {number}\n", encoding="utf-8")
+        _git(source, "commit", "-qam", f"pull request {number}")
     head = _git(source, "rev-parse", "HEAD")
     _git(source, "push", "-q", "origin", "HEAD:worklink/7")
     assert _git(origin, "rev-parse", "--verify", "refs/heads/main") == base
@@ -283,8 +290,9 @@ def _repo_scope_and_state(
         head_remote="origin",
         destination_ref="refs/heads/worklink/7",
         observed_head_sha=head,
-        base_ref="main",
+        base_ref=base_ref,
         observed_base_sha=base,
+        pull_request_author=pull_request_author,
     )
     leases = tmp_path / "leases"
     leases.mkdir()
@@ -334,6 +342,134 @@ def _lineage_turn(scope, state, *, tainted=False):
         interactivity=TurnInteractivity.NON_INTERACTIVE,
         enforcement_enabled=not tainted, ifc_labels=labels, ifc_state=ifc,
         repo_pr_action_scope=scope, repo_review_state=state,
+    )
+
+
+@pytest.mark.parametrize("case", ["collaborator", "outsider", "head_mismatch", "git_timeout"])
+def test_github_activity_remediation_turn_attests_large_collaborator_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    from mimir import access_control, event_logger, repo_tools
+    from mimir.access_control import CapabilityTier, ToolAuthorization, build_trigger_service_principal
+    from mimir.forge import CommentProjection, PullRequestProjection, ReviewProjection
+    from mimir.models import InformationFlowLabels, InformationFlowState, RepoPRScopeRegistry
+    from mimir.tools import forge, repo
+
+    # This integration proves author/head policy and provenance through the real
+    # Git status proof, not runner latency. As in the taint-precedence test below,
+    # allow a loose test-only hang guard on loaded macOS workers. Keep production's
+    # requested bound pinned and prove timeout still fails closed end-to-end.
+    hardened_git = repo_tools.hardened_git_command
+    status_probes = []
+
+    def policy_test_git(root, arguments, **kwargs):
+        assert arguments == ("status", "--porcelain=v2", "--branch", "--untracked-files=no")
+        assert kwargs["timeout"] == 5
+        status_probes.append(arguments)
+        if case == "git_timeout":
+            return GitProcessResult(-9, timed_out=True)
+        return hardened_git(root, arguments, **{**kwargs, "timeout": 30})
+
+    monkeypatch.setattr(repo_tools, "hardened_git_command", policy_test_git)
+    # Git commit identity is intentionally unrelated to the GitHub PR login.
+    _origin, _source, scope, state = _repo_scope_and_state(
+        tmp_path, commit_count=56 if case == "collaborator" else 1,
+        pull_request_author="collaborator" if case != "outsider" else "outsider",
+        base_ref="feature/plugins",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path / "leases"))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{tmp_path / 'leases'}:rw")
+    monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda _: "owner/repo")
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    metadata = PullRequestProjection(
+        7, "Title", "open", scope.pull_request_author, False, scope.base_ref, "worklink/7",
+        "f" * 40 if case == "head_mismatch" else scope.observed_head_sha,
+        True, "created", "updated",
+    )
+    client = SimpleNamespace(
+        author_is_trusted=lambda _repo, author: author in {"collaborator", "reviewer"},
+        get_pull_request=lambda _: metadata,
+        list_reviews=lambda _: (ReviewProjection("1", "reviewer", "approve", "ok", "now", scope.observed_head_sha),),
+        list_comments=lambda _: (CommentProjection("1", "reviewer", "note", "now", "now"),),
+    )
+    monkeypatch.setattr(forge, "_client", lambda _: client)
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("edit_file",),
+        creation_path="test",
+    )
+    labels = InformationFlowLabels()
+    auth = replace(
+        _lineage_turn(scope, state), principal="service:poller:github-activity",
+        canonical_principal="poller:github-activity", roles=("service",), is_service=True,
+        service_authority=service,
+        ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+    runtime = SimpleNamespace(context=auth)
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **kw: events.append((name, kw)))
+    observed = {}
+    for tool in (forge.pr_reviews, forge.pr_comments, forge.pr_metadata, forge.pr_spec, repo.repo_checkout):
+        token = access_control.begin_protected_result_capture()
+        try:
+            result = tool.func("owner/repo", 7, runtime=runtime)
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        added = access_control.classify_protected_result(
+            tool.name, {"repository": "owner/repo", "pull_request": 7}, auth,
+            ToolAuthorization(tool_name=tool.name, decision="resource_scoped", allowed=True,
+                              repo_pr_action_scope=scope), result=result, provenance=provenance,
+        )
+        observed[tool.name] = added.sources[0].integrity
+        auth.ifc_state.merge(added)
+    # Put fixed attestation reasons first: CI's short summary truncates the
+    # integrity map and full event payload before reaching the useful diagnostic.
+    refusal_reasons = [
+        kw["reason"] for name, kw in events
+        if name == "pr_checkout_lease_attestation_refused"
+    ]
+    assert observed == {
+        "pr_reviews": "trusted", "pr_comments": "trusted",
+        "pr_metadata": "untrusted" if case == "head_mismatch" or case == "outsider" else "trusted",
+        "pr_spec": "trusted",
+        "repo_checkout": "untrusted" if case != "collaborator" else "trusted",
+    }, f"lease_refusals={refusal_reasons}; observed={observed}; events={events}"
+    assert auth.ifc_state.has_untrusted_active_ingest() is (case != "collaborator")
+    if case in {"collaborator", "git_timeout"}:
+        assert status_probes  # The positive/timeout controls reached the real proof boundary.
+    assert refusal_reasons == (
+        [] if case == "collaborator" else
+        ["git_timeout"] if case == "git_timeout" else ["no_author_trust"]
+    )
+    # Read actual lease content before exercising the real edit-file gate.
+    target = state.checkout_lease.path / "tracked.txt"
+    read = access_control.classify_protected_result(
+        "read_file", {"file_path": str(target)}, auth,
+        ToolAuthorization(tool_name="read_file", decision="resource_scoped", allowed=True),
+        result=target.read_text(),
+    )
+    auth.ifc_state.merge(read)
+    assert read.sources[0].integrity == (
+        "trusted" if case == "collaborator" else "untrusted"
+    )
+    decision = access_control.ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target),
+    )
+    assert decision.allowed is (case == "collaborator"), (decision.reason, observed, events)
+    if case != "collaborator":
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+    fallbacks = [kw for name, kw in events if name == "repository_result_untrusted_default"]
+    assert [(kw["tool"], kw["reason"]) for kw in fallbacks] == (
+        [] if case == "collaborator" else (
+            [("repo_checkout", "no_published_provenance")] if case == "git_timeout" else [
+                ("pr_metadata", "published_untrusted"),
+                ("repo_checkout", "no_published_provenance"),
+            ]
+        )
     )
 
 
@@ -4031,6 +4167,50 @@ def test_repo_wrapper_failure_classes_have_distinct_stable_codes(
     assert "repository_operation_failed" not in str(refusal.value)
     if isinstance(failure, GitRefusal) and failure.code == "stale_scope":
         assert "local commit remains unpushed in preserved checkout" in str(refusal.value)
+
+
+def test_inactive_checkout_refusal_does_not_veto_next_lease_write(
+    repo_tools, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+    from langchain_core.messages import ToolMessage
+    from mimir import access_control
+    from mimir.access_control import ToolAuthorization, ToolRegistry
+    from mimir.tools import repo
+
+    _origin, _source, scope, state, _tools = repo_tools
+    lease = state.checkout_lease
+    auth = replace(_lineage_turn(scope, state), roles=("admin",))
+    runtime = SimpleNamespace(context=auth)
+    monkeypatch.setattr(repo, "_state", lambda *_args: state)
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{lease.path}:rw")
+    object.__setattr__(state, "checkout_lease", replace(
+        lease, expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    ))
+    capture = access_control.begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolPolicyRefusal, match="inactive_checkout") as refusal:
+            repo._execute(runtime, "owner/repo", 7, GitStatus())
+    finally:
+        provenance = access_control.end_protected_result_capture(capture)
+    assert provenance is not None and provenance.sources == ()
+    assert provenance.content_free_error == str(refusal.value)
+    labels = access_control.classify_protected_result(
+        "repo_status", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_status", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope),
+        result=ToolMessage(content=f"Error: {refusal.value}", tool_call_id="refusal", status="error"),
+        provenance=provenance, failed=True,
+    )
+    assert labels is None
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    object.__setattr__(state, "checkout_lease", lease)
+    target = lease.path / "tracked.txt"
+    decision = ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target),
+        arguments={"file_path": str(target)},
+    )
+    assert decision.allowed, decision.reason
 
 
 def test_repo_wrapper_git_stderr_redacts_embedded_remote_credential(

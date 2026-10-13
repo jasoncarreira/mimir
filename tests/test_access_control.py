@@ -5864,7 +5864,7 @@ _REPO_PUBLISH_NAMES = (
 def _outsider_repo_publish_auth() -> AuthContext:
     auth = _trusted_operator_write_auth(admin=True)
     outsider = SourceLabel(
-        principal="outside", domain="github", resource_id="outsider-comment-marker secret-commit-message",
+        principal="outside", domain="github", resource_id="github#comment/7",
         bridge_instance="forge", source_kind="protected_tool", sensitivity="public",
         integrity=Integrity.UNTRUSTED, integrity_effect=IntegrityEffect.ACTIVE_INGEST,
     )
@@ -6006,7 +6006,10 @@ def test_repo_publish_refusal_and_event_contain_only_safe_metadata(monkeypatch: 
         assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
         assert not hasattr(decision, "ifc_labels")
         assert decision.protected_source_resources is None
-        assert events[-1] == ("write_blocked_by_untrusted_ingest", {"tool": tool_name})
+        assert events[-1] == ("write_blocked_by_untrusted_ingest", {
+            "tool": tool_name, "sources": [{"domain": "github", "resource_id": "github#comment/7"}],
+            "remaining_sources": 0,
+        })
         for marker in ("outsider-comment-marker", "private-path-marker", "secret-commit-message"):
             assert marker not in decision.refusal_detail
             assert marker not in str(events[-1])
@@ -8353,12 +8356,20 @@ async def test_ifc_shadow_denial_records_one_bounded_redacted_causing_source(
         await asyncio.sleep(0)
 
     if tool_name == "write_file":
-        # The always-on write veto emits only fixed safe metadata, not a shadow
-        # census with an outside-content source or destination identifier.
+        # The always-on write veto emits bounded, redacted source identifiers,
+        # not a shadow census or a destination identifier.
         assert not shadow.allowed and not shadow.is_shadow_decision
         assert shadow.reason == reason
         assert shadow.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
-        assert hard_events == [(reason, {"tool": tool_name})]
+        assert hard_events == [(reason, {
+            "tool": tool_name, "sources": [{
+                "domain": "recent_activity",
+                "resource_id": (
+                    "slack-C2?token=[REDACTED]&padding=" + "x" * 1200
+                )[:1024],
+            }], "remaining_sources": 0,
+        })]
+        assert "secret-value" not in str(hard_events)
         assert captured == []
         for enforce in (False, True):
             denied = SinkGate.check_sink_flow(tool_name, target, labels, auth, enforce=enforce)
@@ -18335,7 +18346,8 @@ async def test_tainted_turn_refuses_native_and_hands_shell_before_permission() -
         "shell_exec was refused before execution (ifc_label_blocked:shell_process)"
     )
     assert hands_result.status == "error"
-    assert hands_result.content == access_control._TAINTED_WRITE_REFUSAL
+    assert str(hands_result.content).startswith(access_control._TAINTED_WRITE_REFUSAL)
+    assert "Untrusted sources:" in str(hands_result.content)
     assert broker.calls == []
 
 

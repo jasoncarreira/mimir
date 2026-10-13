@@ -202,10 +202,12 @@ def configured_pr_checkout_lease_root() -> Path:
 
 
 def active_pr_checkout_lease_for_path(path: str | Path) -> PRCheckoutLease | None:
-    """Return the active recorded lease containing a strictly resolved path."""
+    """Return the active recorded lease containing a path, even if its leaf is missing."""
     try:
         root = configured_pr_checkout_lease_root()
-        resource = Path(path).resolve(strict=True)
+        # Resolve existing ancestors and symlinks, but permit a missing leaf (or
+        # missing descendants). The lease directory and record remain strict.
+        resource = Path(path).resolve(strict=False)
         relative = resource.relative_to(root)
         if not relative.parts:
             return None
@@ -582,12 +584,12 @@ def recover_pr_checkout_lease(
             f"PR head advanced: scoped head {scope.observed_head_sha.lower()} is stale; "
             f"fetched head is {remote_head}"
         )
+    lease = replace_lease_expiry(lease, datetime.now(UTC) + ttl)
     if expired:
-        lease = replace_lease_expiry(lease, datetime.now(UTC) + ttl)
         (path / _RECLAMATION_METADATA).unlink(missing_ok=True)
-        (path / _METADATA).write_text(
-            json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
-        )
+    (path / _METADATA).write_text(
+        json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
+    )
     if review_state is not None:
         review_state.attach_checkout_lease(lease)
         review_state.record_git_head(scope.scope_id, head)

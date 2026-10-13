@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import asyncio
+import getpass
 import json
+import os
+import pwd
 import shlex
 import shutil
 import subprocess
@@ -61,6 +64,54 @@ def base_evidence(**overrides: object) -> WorklinkEvidence:
     )
     values.update(overrides)
     return WorklinkEvidence(**values)  # type: ignore[arg-type]
+
+
+def test_shell_gate_environment_uses_executing_uid_name(monkeypatch):
+    uid = 47231
+    looked_up = []
+    monkeypatch.setattr(os, "getuid", lambda: uid)
+
+    def passwd_entry(requested_uid):
+        looked_up.append(requested_uid)
+        return type("PasswdEntry", (), {"pw_name": "gate-runner"})()
+
+    monkeypatch.setattr(pwd, "getpwuid", passwd_entry)
+    with ev.shell_gate_environment() as env:
+        assert looked_up == [uid]
+        assert env["USER"] == env["LOGNAME"] == "gate-runner"
+
+
+def test_shell_gate_environment_missing_passwd_uses_uid(monkeypatch):
+    uid = 47232
+    monkeypatch.setattr(os, "getuid", lambda: uid)
+
+    def missing(requested_uid):
+        assert requested_uid == uid
+        raise KeyError(requested_uid)
+
+    monkeypatch.setattr(pwd, "getpwuid", missing)
+    with ev.shell_gate_environment() as env:
+        assert env["USER"] == env["LOGNAME"] == f"uid-{uid}"
+
+
+def test_shell_gate_environment_avoids_foreign_pytest_root(tmp_path, monkeypatch):
+    # The other account already created pytest-of-worklink. Simulating its uid
+    # through the env contract avoids needing chown privileges in this test.
+    collision = tmp_path / "pytest-of-worklink"
+    collision.mkdir()
+    uid = 47233
+    monkeypatch.setattr(os, "getuid", lambda: uid)
+
+    def missing(requested_uid):
+        assert requested_uid == uid
+        raise KeyError(requested_uid)
+
+    monkeypatch.setattr(pwd, "getpwuid", missing)
+    with ev.shell_gate_environment() as env:
+        monkeypatch.setenv("USER", env["USER"])
+        monkeypatch.setenv("LOGNAME", env["LOGNAME"])
+        assert getpass.getuser() == f"uid-{uid}"
+        assert tmp_path / f"pytest-of-{getpass.getuser()}" != collision
 
 
 def test_pytest_report_environment_explicit_basetemp_keeps_relative_junit(tmp_path, monkeypatch):

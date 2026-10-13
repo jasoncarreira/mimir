@@ -85,6 +85,7 @@ from .safe_git import ControllerGitPublication, _git_credential_settings
 from .backends.feature_factory import (
     FACTORY_PUBLISHING_IDENTITY_ENV,
     FactoryStatus,
+    FactoryRunLockContended,
     FeatureFactoryBackend,
     epic_run_id,
 )
@@ -154,6 +155,7 @@ _FACTORY_PROGRESS_IGNORED_DIRS = frozenset(
 _FACTORY_PROGRESS_MAX_FILES = 100_000
 _FACTORY_PROGRESS_MAX_BYTES = 256 * 1024 * 1024
 _FACTORY_BUDGET_PARK_LEAD_S = 300.0
+FACTORY_SUPERVISION_ERROR_INCIDENT_POLLS = 30
 
 
 def _epic_run_timeout_s() -> float:
@@ -820,6 +822,7 @@ def validate_leaf(issue: IssueContext) -> None:
 def _demote_template_invalid_ready_leaf(
     issue: IssueContext,
     *,
+    home: Path | None = None,
     reason: str,
     runner: Runner,
     chainlink_bin: str,
@@ -839,10 +842,14 @@ def _demote_template_invalid_ready_leaf(
         return
 
     issue_id = str(issue.issue_id)
+    # Persist the occurrence anchor in the authoritative demotion comment. A
+    # later re-arm can fail with identical text, but is a new demotion.
+    demoted_at = datetime.now(UTC).isoformat()
     comment = (
         "WORKLINK_BLOCKED leaf template validation failed before dispatch; "
         f"{reason}. Re-plan this issue, then remove worklink:blocked and "
-        "re-add worklink:ready when the required checklist is present."
+        "re-add worklink:ready when the required checklist is present. "
+        f"Demoted at: {demoted_at}"
     )
     commands = (
         (chainlink_bin, "issue", "unlabel", issue_id, "worklink:ready"),
@@ -871,6 +878,13 @@ def _demote_template_invalid_ready_leaf(
         "worklink_template_invalid_demoted",
         issue_id=issue.issue_id,
         reason=reason,
+    )
+    from .dispatch_failures import record_leaf_transition_best_effort
+
+    record_leaf_transition_best_effort(
+        home, kind="leaf_template_invalid", issue_id=issue.issue_id,
+        issue_title=issue.title, attempt=0, reason=reason,
+        occurrence_id=f"template-demoted-at:{demoted_at}",
     )
 
 
@@ -954,6 +968,7 @@ class WorklinkRunner:
                         )
                 _demote_template_invalid_ready_leaf(
                     issue,
+                    home=self.home,
                     reason=str(exc),
                     runner=runner,
                     chainlink_bin=self.chainlink_bin,
@@ -1104,6 +1119,7 @@ class WorklinkRunner:
                 issue.issue_id,
                 issue.comments,
                 labels=issue.labels,
+                issue_title=issue.title,
                 max_active_locks=config.defaults.max_concurrent if autonomous else None,
                 exclude_active_label=WORKLINK_EPIC_LABEL,
                 before_claim=record_claiming,
@@ -1885,6 +1901,17 @@ class WorklinkRunner:
                 reason="terminal recovery incomplete: Chainlink lock release failed",
                 incident_recorded=incident_recorded,
             )
+        if transition_status == "blocked":
+            from .dispatch_failures import record_leaf_transition_best_effort
+
+            record_leaf_transition_best_effort(
+                self.home, kind="leaf_blocked", issue_id=issue.issue_id,
+                issue_title=issue.title, attempt=attempt,
+                reason=transition_reason or ", ".join(validation.reasons) or "blocked",
+                evidence_path=str(evidence_path),
+                transcript_path=str(raw.transcript_path) if raw.transcript_path else None,
+                checkout=str(lease.path), branch=lease.branch,
+            )
         cleanup_error = None
         if publication is None:
             cleanup_error = _cleanup_checkout_after_transition(
@@ -2538,6 +2565,7 @@ class WorklinkRunner:
                 issue_id,
                 issue.comments,
                 labels=issue.labels,
+                issue_title=issue.title,
                 max_active_locks=factory_max_concurrent(),
                 active_label=WORKLINK_EPIC_LABEL,
                 before_claim=prepare_factory_claim,
@@ -3033,6 +3061,46 @@ class WorklinkRunner:
             or _opaque_json_bytes(locked.terminal_result) != historical_result
         ):
             raise WorklinkError("factory recovery lock reconciliation failed")
+        if pre.status == "running":
+            park_failure = "factory recovery could not verify the running factory was parked"
+            try:
+                backend.terminal(
+                    retained.run_id, "needs-human",
+                    reason=(
+                        "controller recovery: retained driver verified dead while factory status "
+                        "was running; parked for fresh-session resume"
+                    ),
+                    sandbox=sandbox, launcher=retained.launcher,
+                )
+                parked_status = backend.status(
+                    retained.run_id, sandbox=sandbox, launcher=retained.launcher,
+                )
+                _require_factory_status(parked_status, retained)
+                if (
+                    parked_status.status != "needs-human"
+                    or parked_status.next != pre.next
+                    or parked_status.lock_session != locked.lock_session
+                ):
+                    raise WorklinkError(park_failure)
+            except Exception:
+                parked = replace(
+                    retained.observed(locked, datetime.now(UTC).isoformat()),
+                    controller_phase="parked",
+                    controller_error=_factory_controller_error(park_failure),
+                )
+                save_factory_record(self.home, parked)
+                claims.transition_issue(
+                    issue.issue_id, status="blocked", review_ready=False,
+                    attempt=claim_record.budget_attempt or claim_record.attempt,
+                    reason=f"{park_failure}; retained sandbox: {retained.sandbox}",
+                )
+                return WorklinkRunResult(
+                    issue.issue_id, retained.attempt, "needs-human",
+                    checkout=sandbox, branch=retained.branch, reason=park_failure,
+                )
+            retained = retained.observed(parked_status, datetime.now(UTC).isoformat())
+            save_factory_record(self.home, retained)
+            historical_result = _opaque_json_bytes(parked_status.terminal_result)
         resumed = backend.resume(
             retained.run_id,
             session=session,
@@ -3181,11 +3249,20 @@ class WorklinkRunner:
         last_status: FactoryStatus | None = None
         last_change = loop.time()
         last_change_at = datetime.now(UTC).isoformat()
-        work_snapshot = _factory_work_snapshot(Path(factory_record.sandbox))
+        initial_observation_error: Exception | None = None
+        try:
+            work_snapshot = _factory_work_snapshot(Path(factory_record.sandbox))
+        except Exception as exc:
+            work_snapshot = None
+            initial_observation_error = exc
         transcript_root = self.home / "state" / "worklink" / "transcripts"
-        transcript_snapshot = _factory_transcript_snapshot(
-            transcript_root, issue.issue_id, factory_record.attempt
-        )
+        try:
+            transcript_snapshot = _factory_transcript_snapshot(
+                transcript_root, issue.issue_id, factory_record.attempt
+            )
+        except Exception as exc:
+            transcript_snapshot = {}
+            initial_observation_error = exc
         next_work_check = last_change + stale_after
         dead_windows = 0
         status_changed_in_window = False
@@ -3284,8 +3361,11 @@ class WorklinkRunner:
                         controller_error=_factory_controller_error(reason),
                     )
                     save_factory_record(self.home, factory_record)
+                    snapshot_failure = "factory status reports park_snapshot null"
                     if parked.park_snapshot is not None:
                         break
+                except FactoryRunLockContended:
+                    snapshot_failure = "factory run state stayed locked"
                 except TimeoutError:
                     snapshot_failure = "factory status verification timed out"
                     break
@@ -3358,14 +3438,71 @@ class WorklinkRunner:
                 )
                 stale_failure = None
 
+        status_contended = False
+        error_polls = 0
+        error_incident = False
+
+        async def missed_poll(exc: Exception) -> None:
+            nonlocal error_polls, error_incident, status
+            # Only a verified ending may leave supervision. A control-plane
+            # failure while the driver runs is a missed observation.
+            if not wait_task.done() and compute.job_alive(handle):
+                error_polls += 1
+                message = _factory_controller_error(exc)
+                if error_polls == 1:
+                    _log_event(
+                        "worklink_factory_supervision_error",
+                        issue_id=issue.issue_id, run_id=factory_record.run_id,
+                        attempt=factory_record.attempt, error_class=type(exc).__name__,
+                        message=message,
+                    )
+                if error_polls >= FACTORY_SUPERVISION_ERROR_INCIDENT_POLLS and not error_incident:
+                    error_incident = True
+                    try:
+                        incident_owner.record(
+                            producer="supervision_observation", terminal=False, home=self.home,
+                            issue_id=issue.issue_id, attempt=factory_record.attempt,
+                            error=f"factory supervision {type(exc).__name__}: {message}",
+                            exit_status=None, autonomous=autonomous,
+                            run_id=factory_record.run_id, work_path=factory_record.sandbox,
+                            transcript_path=factory_record.transcript,
+                        )
+                    except Exception:
+                        pass  # A broken incident ledger cannot end supervision either.
+                _heartbeat_claim_best_effort(claims, claim_record)
+                delay = max(0.01, float(backend.poll_interval_s))
+                await asyncio.sleep(min(
+                    delay, max(0, (startup_deadline if last_status is None else park_deadline) - loop.time()),
+                ))
+                status = None
+                return
+            raise exc
+
         try:
             while True:
-                if last_status is not None and loop.time() >= park_deadline:
+                if initial_observation_error is not None:
+                    error = initial_observation_error
+                    initial_observation_error = None
+                    await missed_poll(error)
+                    continue
+                if last_status is not None and (
+                    loop.time() >= park_deadline or (
+                        error_polls and last_status.status == "running"
+                        and loop.time() - last_change >= idle_after
+                        and compute.job_alive(handle)
+                    )
+                ):
+                    if loop.time() < park_deadline:
+                        end_stale_episode("driver_idle")
+                        reason = f"factory driver idle: no progress since {last_change_at}"
+                    else:
+                        reason = _factory_budget_park_reason(last_status, factory_record)
                     return await park_for_reason(
-                        last_status, _factory_budget_park_reason(last_status, factory_record)
+                        last_status, reason
                     )
                 if recovery_session is not None and loop.time() >= startup_deadline:
                     raise WorklinkError("factory driver did not acquire the run lock before startup deadline")
+                observed = True
                 if status is None:
                     remaining = (
                         startup_deadline - loop.time()
@@ -3396,6 +3533,34 @@ class WorklinkRunner:
                         return await park_for_reason(
                             last_status, _factory_budget_park_reason(last_status, factory_record)
                         )
+                    except FactoryRunLockContended:
+                        # A writer holds run state through a whole transition. That is
+                        # no observation: keep the last one so liveness, stall and park
+                        # deadlines still govern. A dead holder's lock reads as stale.
+                        if not status_contended:
+                            status_contended = True
+                            _log_event(
+                                "worklink_factory_status_contended",
+                                issue_id=issue.issue_id,
+                                run_id=factory_record.run_id,
+                                attempt=factory_record.attempt,
+                            )
+                        if last_status is None:
+                            await asyncio.sleep(
+                                min(
+                                    max(0.01, float(backend.poll_interval_s)),
+                                    max(0, startup_deadline - loop.time()),
+                                )
+                            )
+                            continue
+                        status = last_status
+                        observed = False
+                    except Exception as exc:
+                        await missed_poll(exc)
+                        continue
+                    else:
+                        status_contended = False
+                        observed = True
                 pre_manifest = last_status is None and status == FactoryStatus(
                     run_id=factory_record.run_id,
                     valid=False,
@@ -3405,7 +3570,11 @@ class WorklinkRunner:
                     if loop.time() >= startup_deadline:
                         raise WorklinkError("factory never initialised before startup deadline")
                 else:
-                    _require_factory_status(status, factory_record)
+                    try:
+                        _require_factory_status(status, factory_record)
+                    except Exception as exc:
+                        await missed_poll(exc)
+                        continue
                     handoff_claimed = False
                     if recovery_session is not None:
                         if status.lock == "absent" and status.lock_session is None:
@@ -3420,49 +3589,96 @@ class WorklinkRunner:
                             recovery_session = None
                             handoff_claimed = True
                         else:
-                            raise WorklinkError("factory recovery lock handoff changed unexpectedly")
-                    if status != last_status:
-                        status_changed_in_window = last_status is not None
-                        last_status = status
+                            # A fresh foreign owner is a proven safety refusal;
+                            # other handoff anomalies are missed observations.
+                            if status.lock == "fresh" and status.lock_session != recovery_session:
+                                raise WorklinkError("factory recovery lock handoff changed unexpectedly")
+                            await missed_poll(WorklinkError("factory recovery lock handoff changed unexpectedly"))
+                            continue
                     if factory_record.session is not None and status.lock_session not in {
                         None,
                         factory_record.session,
                     } and not handoff_claimed:
-                        raise WorklinkError("factory lock owner changed")
-                    factory_record = factory_record.observed(status, datetime.now(UTC).isoformat())
+                        if status.lock == "fresh" and not status.dead_lock:
+                            raise WorklinkError("factory lock owner changed")
+                        await missed_poll(WorklinkError("factory lock owner changed"))
+                        continue
                     phase = (
                         "parked"
                         if status.is_parked
                         else "terminal" if status.is_terminal else "running"
                     )
-                    factory_record = replace(factory_record, controller_phase=phase)
-                    save_factory_record(self.home, factory_record)
-                    if status.lock == "fresh" and factory_record.session == status.lock_session:
-                        await asyncio.to_thread(
-                            backend.heartbeat,
-                            factory_record.run_id,
-                            session=factory_record.session,
-                            sandbox=Path(factory_record.sandbox),
-                            launcher=factory_record.launcher,
+                    try:
+                        updated = replace(
+                            factory_record.observed(status, datetime.now(UTC).isoformat()),
+                            controller_phase=phase,
                         )
+                        save_factory_record(self.home, updated)
+                        factory_record = updated
+                    except Exception as exc:
+                        await missed_poll(exc)
+                        continue
+                    # A reused observation is no evidence the session is current, and
+                    # the refresh takes the same lock; it can also contend after a
+                    # clean read. Neither is a fault: the driver refreshes it too.
+                    if (
+                        observed
+                        and status.lock == "fresh"
+                        and factory_record.session == status.lock_session
+                    ):
+                        try:
+                            await asyncio.to_thread(
+                                backend.heartbeat,
+                                factory_record.run_id,
+                                session=factory_record.session,
+                                sandbox=Path(factory_record.sandbox),
+                                launcher=factory_record.launcher,
+                            )
+                        except FactoryRunLockContended:
+                            if not status_contended:
+                                status_contended = True
+                                _log_event(
+                                    "worklink_factory_status_contended",
+                                    issue_id=issue.issue_id,
+                                    run_id=factory_record.run_id,
+                                    attempt=factory_record.attempt,
+                                )
+                        except Exception as exc:
+                            await missed_poll(exc)
+                            continue
                     now = loop.time()
                     window_ended = now >= next_work_check
                     if window_ended or stale_failure is not None:
-                        current_work = _factory_work_snapshot(Path(factory_record.sandbox))
-                        current_transcript = _factory_transcript_snapshot(
-                            transcript_root, issue.issue_id, factory_record.attempt
-                        )
-                        work_advanced = (
-                            current_work is not None
-                            and work_snapshot is not None
-                            and current_work != work_snapshot
-                        )
-                        transcript_grew = _factory_transcript_grew(
-                            transcript_snapshot, current_transcript
-                        )
+                        try:
+                            current_work = _factory_work_snapshot(Path(factory_record.sandbox))
+                            current_transcript = _factory_transcript_snapshot(
+                                transcript_root, issue.issue_id, factory_record.attempt
+                            )
+                        except Exception as exc:
+                            await missed_poll(exc)
+                            continue
+                        try:
+                            work_advanced = (
+                                current_work is not None
+                                and work_snapshot is not None
+                                and current_work != work_snapshot
+                            )
+                            transcript_grew = _factory_transcript_grew(
+                                transcript_snapshot, current_transcript
+                            )
+                        except Exception as exc:
+                            await missed_poll(exc)
+                            continue
+                        if status != last_status:
+                            status_changed_in_window = last_status is not None
+                            last_status = status
                         alive = status_changed_in_window or work_advanced or transcript_grew
                         if alive:
-                            end_stale_episode("liveness_observed")
+                            try:
+                                end_stale_episode("liveness_observed")
+                            except Exception as exc:
+                                await missed_poll(exc)
+                                continue
                             dead_windows = 0
                             last_change = now
                             last_change_at = datetime.now(UTC).isoformat()
@@ -3550,6 +3766,11 @@ class WorklinkRunner:
                             runner=runner,
                             started_at=started_at,
                         )
+                    if status != last_status:
+                        status_changed_in_window = last_status is not None
+                        last_status = status
+                    error_polls = 0
+                    error_incident = False
                 if wait_task.done() or not compute.job_alive(handle):
                     try:
                         result = await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 from pathlib import Path
 import subprocess
 from typing import Any
@@ -13,7 +12,6 @@ from typing import Any
 from .._atomic import atomic_write_json
 from ..bridges._mentions import neutralize_display_name
 from ..event_logger import log_event
-from ..ntfy import post_algedonic_alarm
 from .autonomy import chainlink_bin
 from .factory_state import FactoryRunRecord, list_factory_records
 
@@ -45,6 +43,7 @@ def _load_state(home: Path) -> dict[str, list[str]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or any(
         not isinstance(key, str) or not isinstance(value, list)
+        # "ntfy" is a legacy sink: state written before ntfy pushes were dropped.
         or any(sink not in {"channel", "ntfy", "unrouted"} for sink in value)
         for key, value in data.items()
     ):
@@ -85,13 +84,14 @@ async def alert_parked_factory_runs(home: Path, channel: str, channels: Any) -> 
         return
 
     channel = (channel or "").strip()
-    ntfy_enabled = bool(os.environ.get("NTFY_TOPIC", "").strip())
+    # The operator channel only. Parks also reach the agent as stop notices; a
+    # phone push is reserved for decisions the agent escalates (operator_alert).
     for record in listing.records:
         if record.controller_phase != "parked" or record.status is None or not record.status.is_parked:
             continue
         key = park_dedupe_key(record)
         done = set(state.get(key, []))
-        sinks = ({"channel"} if channel else set()) | ({"ntfy"} if ntfy_enabled else set())
+        sinks = {"channel"} if channel else set()
         if not sinks:
             if "unrouted" not in done:
                 await log_event("worklink_factory_park_unrouted", issue_id=record.issue_id,
@@ -123,20 +123,6 @@ async def alert_parked_factory_runs(home: Path, channel: str, channels: Any) -> 
                                 issue_id=record.issue_id)
             else:
                 done.add("channel")
-                state[key] = sorted(done)
-                await asyncio.to_thread(_save_state, home, state)
-        if "ntfy" in sinks - done:
-            try:
-                await post_algedonic_alarm(
-                    category="worklink-factory-parked", title=f"Factory epic #{record.issue_id}: {title}",
-                    body=body, dedupe_key=key, priority=4,
-                )
-            except Exception:  # noqa: BLE001 — keep channel and ntfy independent
-                await log_event("worklink_factory_park_delivery_failed", sink="ntfy",
-                                issue_id=record.issue_id)
-            else:
-                # ntfy is best-effort and reports transport failures in its own events.
-                done.add("ntfy")
                 state[key] = sorted(done)
                 await asyncio.to_thread(_save_state, home, state)
         if sinks <= done:

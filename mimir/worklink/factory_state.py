@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta
 import fcntl
 import json
 import os
@@ -16,6 +17,7 @@ from .run_state import process_is_zombie, process_start_ticks
 
 
 FACTORY_RECORD_VERSION = 2
+FACTORY_STOP_GRACE_S = 900
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
 # Emitted by the factory controller and the operator stop path.
 LIVE_CONTROLLER_PHASES = frozenset({"running"})
@@ -709,3 +711,37 @@ def factory_process_is_verified_dead(
         handle.process_start_ticks is not None
         and observed is not None and observed != handle.process_start_ticks
     )
+
+
+def _factory_observation_time(value: str | None) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value) if value else None
+        if parsed is not None and parsed.tzinfo is not None and parsed.utcoffset() is not None:
+            return parsed
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def factory_run_still_going(
+    record: FactoryRunRecord, status: FactoryStatus | None, *, now: datetime,
+) -> bool:
+    """An unverifiable driver or a current observed session prevents reclamation."""
+    if not factory_process_is_verified_dead(record):
+        return True
+    observed = _factory_observation_time(record.observed_at)
+    return bool(
+        status is not None and status.lock == "fresh" and observed is not None
+        and now < observed + timedelta(seconds=FACTORY_STOP_GRACE_S)
+    )
+
+
+def factory_run_stopped_since(
+    record: FactoryRunRecord, status: FactoryStatus | None,
+) -> datetime | None:
+    """Latest durable observation of this stopped driver (including its session)."""
+    if not factory_process_is_verified_dead(record):
+        return None
+    # There is no separate persisted death timestamp: observed_at is the last
+    # durable death/session observation. Never infer one from checkout mtime.
+    return _factory_observation_time(record.observed_at)

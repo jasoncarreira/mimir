@@ -11,6 +11,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import pwd
 import shlex
 import shutil
 import signal
@@ -1192,6 +1193,11 @@ def shell_gate_environment() -> Iterator[dict[str, str]]:
     """
     with tempfile.TemporaryDirectory(prefix="worklink-gate-home-") as text:
         home = Path(text)
+        uid = os.getuid()
+        try:
+            username = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            username = f"uid-{uid}"
         paths = {
             "XDG_CONFIG_HOME": home / ".config",
             "XDG_DATA_HOME": home / ".local" / "share",
@@ -1200,8 +1206,8 @@ def shell_gate_environment() -> Iterator[dict[str, str]]:
         for path in paths.values():
             path.mkdir(parents=True, mode=0o700)
         yield {
-            "USER": "worklink",
-            "LOGNAME": "worklink",
+            "USER": username,
+            "LOGNAME": username,
             "SHELL": "/bin/sh",
             "PATH": "/usr/local/bin:/usr/bin:/bin",
             "LANG": "C.UTF-8",

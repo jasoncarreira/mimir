@@ -143,6 +143,7 @@ class WorklinkDefaults:
     # steals it back to ready/blocked.
     max_concurrent: int = 2
     reaper_ttl_s: int = 86400
+    factory_resumable_retention_s: int = 86400
     # Autonomy safety posture (#460, #832). local_subprocess runs the backend with
     # full container-filesystem access (no sandbox) — fine for an operator who
     # accepts the blast radius, unsafe as an autonomous default. Autonomous
@@ -178,6 +179,15 @@ class WorklinkDefaults:
                 field="reaper_ttl_s",
                 configured_value=self.reaper_ttl_s,
                 required_value=required_reaper_ttl_s,
+            )
+        if (
+            type(self.factory_resumable_retention_s) is not int
+            or self.factory_resumable_retention_s <= 0
+            or self.factory_resumable_retention_s < self.reaper_ttl_s
+        ):
+            raise ValueError(
+                "worklink factory_resumable_retention_s must be a positive integer "
+                "at least reaper_ttl_s"
             )
 
 
@@ -283,6 +293,10 @@ class WorklinkConfig:
                 default=WorklinkDefaults.max_concurrent,
             ),
             reaper_ttl_s=reaper_ttl_s,
+            factory_resumable_retention_s=defaults_data.get(
+                "factory_resumable_retention_s",
+                max(default_values.factory_resumable_retention_s, reaper_ttl_s),
+            ),
             allow_autonomous_local_subprocess=_coerce_safety_bool(
                 defaults_data.get("allow_autonomous_local_subprocess", False)
             ),

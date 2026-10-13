@@ -797,6 +797,17 @@ def _real_path_outside_root(key: str, cwd: Path) -> Path | None:
     return None
 
 
+def _publish_content_free_error(error: str) -> None:
+    """Attest only at construction sites using fixed text and caller arguments.
+
+    Exception text, resolved targets and traversal state are resource content;
+    those errors must retain the ordinary fail-closed classification.
+    """
+    from .access_control import publish_protected_result
+
+    publish_protected_result((), content_free_error=error)
+
+
 class _BoundedFilesystemBackend(FilesystemBackend):
     """FilesystemBackend with bounded recursive grep/glob traversal.
 
@@ -893,14 +904,15 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         return reason is not None
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
-        self._resolve_read_path(file_path)
-        # Preserve native multimodal payloads, but PDFs now use the extraction hint.
-        if _is_native_media(file_path):
-            return super().read(file_path, offset, limit)
+        resolved = self._resolve_read_path(file_path)
         try:
-            resolved = self._resolve_path(file_path)
             if not resolved.is_file():
-                return ReadResult(error=f"File '{file_path}' not found")
+                error = f"File '{file_path}' not found"
+                _publish_content_free_error(error)
+                return ReadResult(error=error)
+            # Preserve native multimodal payloads, but PDFs use extraction hints.
+            if _is_native_media(file_path):
+                return super().read(file_path, offset, limit)
             fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             with os.fdopen(fd, "rb") as handle:
                 error, raw = _read_probed_text(handle, resolved.suffix.lower())
@@ -1318,6 +1330,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                     emit_hard_read_denial("glob", str(search_path), reason)
                     message = _read_denied_message(reason)
                     record_read_policy_refusal(message)
+                    _publish_content_free_error(message)
                     return GlobResult(error=message, matches=[])
             if not search_path.exists():
                 return GlobResult(matches=[])
@@ -1446,7 +1459,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             protected_read_result_reason,
         )
 
-        self._resolve_read_path(path)
+        requested = self._resolve_read_path(path)
         from .memory_proposals import is_protected_model_path
 
         filtering = non_admin_read_filter_enabled()
@@ -1464,6 +1477,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 emit_hard_read_denial("ls", path, "unresolved_read_target")
                 message = "Read denied: unresolved path"
                 record_read_policy_refusal(message)
+                _publish_content_free_error(message)
                 return LsResult(error=message)
             if reason is not None:
                 from .read_policy import emit_hard_read_denial, record_read_policy_refusal
@@ -1473,8 +1487,13 @@ class _BoundedFilesystemBackend(FilesystemBackend):
                 )
                 message = _read_denied_message(reason)
                 record_read_policy_refusal(message)
+                _publish_content_free_error(message)
                 return LsResult(error=message)
 
+        if not requested.is_dir():
+            error = f"Directory '{path}' not found or not a directory"
+            _publish_content_free_error(error)
+            return LsResult(error=error)
         result = super().ls(path)
         entries = result.entries or []
         filtered = [
@@ -1592,7 +1611,9 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
-            return ReadResult(error=self._outside_root_msg(file_path, tool="read_file"))
+            error = self._outside_root_msg(file_path, tool="read_file")
+            _publish_content_free_error(error)
+            return ReadResult(error=error)
         from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
 
         if non_admin_read_filter_enabled():
@@ -1607,6 +1628,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                     )
                     message = self._read_denied_message(reason)
                     record_read_policy_refusal(message)
+                    _publish_content_free_error(message)
                     return ReadResult(error=message)
             except (OSError, RuntimeError, ValueError):
                 from .read_policy import emit_hard_read_denial, record_read_policy_refusal
@@ -1614,18 +1636,22 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                 emit_hard_read_denial("read_file", file_path, "unresolved_read_target")
                 message = "Read denied: unresolved path"
                 record_read_policy_refusal(message)
+                _publish_content_free_error(message)
                 return ReadResult(error=message)
         try:
             result = super().read(file_path, offset, limit)
         except ValueError as e:
-            return ReadResult(error=self._path_value_error_msg(file_path, e))
+            error = self._path_value_error_msg(file_path, e)
+            return ReadResult(error=error)
         if result.error is None:
             self._publish_read_provenance(file_path)
         return result
 
     async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
-            return ReadResult(error=self._outside_root_msg(file_path, tool="read_file"))
+            error = self._outside_root_msg(file_path, tool="read_file")
+            _publish_content_free_error(error)
+            return ReadResult(error=error)
         from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
 
         if non_admin_read_filter_enabled():
@@ -1640,6 +1666,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                     )
                     message = self._read_denied_message(reason)
                     record_read_policy_refusal(message)
+                    _publish_content_free_error(message)
                     return ReadResult(error=message)
             except (OSError, RuntimeError, ValueError):
                 from .read_policy import emit_hard_read_denial, record_read_policy_refusal
@@ -1647,6 +1674,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
                 emit_hard_read_denial("read_file", file_path, "unresolved_read_target")
                 message = "Read denied: unresolved path"
                 record_read_policy_refusal(message)
+                _publish_content_free_error(message)
                 return ReadResult(error=message)
         return await asyncio.to_thread(self.read, file_path, offset, limit)
 
@@ -1695,11 +1723,14 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
     def ls(self, path: str) -> LsResult:
         if self._is_outside_root(path):
-            return LsResult(error=self._outside_root_msg(path, tool="ls"))
+            error = self._outside_root_msg(path, tool="ls")
+            _publish_content_free_error(error)
+            return LsResult(error=error)
         try:
             result = super().ls(path)
         except ValueError as e:
-            return LsResult(error=self._path_value_error_msg(path, e))
+            error = self._path_value_error_msg(path, e)
+            return LsResult(error=error)
         if result.error is None:
             # Ordinary names belong to the listed directory. Resolved symlink
             # targets can disclose names from elsewhere and need their own source.
@@ -1723,7 +1754,9 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
 
     async def als(self, path: str) -> LsResult:
         if self._is_outside_root(path):
-            return LsResult(error=self._outside_root_msg(path, tool="ls"))
+            error = self._outside_root_msg(path, tool="ls")
+            _publish_content_free_error(error)
+            return LsResult(error=error)
         return await asyncio.to_thread(self.ls, path)
 
     def glob(self, pattern: str, path: str | None = None) -> GlobResult:

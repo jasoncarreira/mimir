@@ -3719,6 +3719,72 @@ async def test_run_turn_emits_turn_failed_event_on_error(tmp_path: Path):
     assert ev["attempt_disposition"] == "charge"
 
 
+@pytest.mark.parametrize("name,message,expected", [
+    ("CodexResponseError", "Our servers are currently overloaded. Please try again later.",
+     "provider_error_transient:CodexResponseError"),
+    ("RemoteProtocolError", "peer closed connection without sending complete message body",
+     "provider_error_transient:RemoteProtocolError"),
+    ("APIStatusError", "rate limited", "provider_error_rate_limit:APIStatusError"),
+    ("InternalServerError", "server down", "provider_error_transient:InternalServerError"),
+    ("AuthenticationError", "unauthorized", None),
+    ("BadRequestError", "context length exceeded", None),
+    ("APIStatusError", "bad request", None),
+    ("RuntimeError", "servers are overloaded", None),
+    ("RuntimeError", "internal server error", None),
+])
+async def test_poller_turn_classifies_only_raised_provider_failure(
+    tmp_path: Path, name: str, message: str, expected: str | None,
+):
+    error_type = type(name, (Exception,), {})
+
+    class Broken:
+        async def astream(self, *args, **kwargs):
+            exc = error_type(message)
+            if name == "APIStatusError":
+                exc.status_code = 400 if message == "bad request" else 429
+            if name == "InternalServerError":
+                exc.status_code = 503
+            raise exc
+            yield
+
+    agent = _build_agent(tmp_path, fake_agent=Broken())
+    await agent.run_turn(AgentEvent(trigger="poller", channel_id="poller:gmail", content="x"))
+    [outcome] = [e for e in _read_events(tmp_path) if e["type"] == "turn_failed"]
+    assert outcome["attempt_disposition"] == ("transient_provider" if expected else "charge")
+    if expected:
+        assert outcome["attempt_reason"] == expected
+
+
+async def test_poller_turn_provider_retry_after_and_interactive_exclusion(tmp_path: Path):
+    error_type = type("CodexResponseError", (Exception,), {})
+
+    class Broken:
+        async def astream(self, *args, **kwargs):
+            exc = error_type("Our servers are currently overloaded")
+            exc.response = type("Response", (), {"headers": {"retry-after": "2400"}})()
+            raise exc
+            yield
+
+    agent = _build_agent(tmp_path, fake_agent=Broken())
+    for trigger in ("poller", "user_message"):
+        await agent.run_turn(AgentEvent(trigger=trigger, channel_id="poller:gmail", content="x"))
+    outcomes = [e for e in _read_events(tmp_path) if e["type"] == "turn_failed"]
+    assert outcomes[0]["attempt_disposition"] == "transient_provider"
+    assert outcomes[0]["retry_after_s"] == 2400
+    assert outcomes[1]["attempt_disposition"] == "charge"
+    assert "retry_after_s" not in outcomes[1]
+
+
+async def test_poller_output_overload_text_does_not_classify_as_provider_error(tmp_path: Path):
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent(response_messages=[
+        AIMessage(content="servers are overloaded", response_metadata={"stop_reason": "error"}),
+    ]))
+    await agent.run_turn(AgentEvent(trigger="poller", channel_id="poller:gmail", content="x"))
+    outcomes = [e for e in _read_events(tmp_path) if e["type"] in {"turn_failed", "turn_completed"}]
+    assert len(outcomes) == 1
+    assert outcomes[0]["attempt_disposition"] == "charge"
+
+
 # ── turn-outcome item identity for poller recovery (chainlink #262) ──
 
 

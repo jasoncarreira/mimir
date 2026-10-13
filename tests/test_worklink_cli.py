@@ -1373,7 +1373,10 @@ def test_reconcile_then_prune_clears_only_checkout_owned_block(
         now=now,
     )
     assert labels == {"worklink:blocked"}
-    monkeypatch.setattr(autonomy, "worklink_defaults", lambda home: type("D", (), {"reaper_ttl_s": 0})())
+    monkeypatch.setattr(
+        autonomy, "worklink_defaults",
+        lambda home: type("D", (), {"reaper_ttl_s": 0, "factory_resumable_retention_s": 86400})(),
+    )
 
     pruned = autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo, runner=runner)
 
@@ -1427,7 +1430,10 @@ def test_pruner_preserves_unpublished_checkout_and_different_block_reason(
         ),
         now=now,
     )
-    monkeypatch.setattr(autonomy, "worklink_defaults", lambda home: type("D", (), {"reaper_ttl_s": 0})())
+    monkeypatch.setattr(
+        autonomy, "worklink_defaults",
+        lambda home: type("D", (), {"reaper_ttl_s": 0, "factory_resumable_retention_s": 86400})(),
+    )
     assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo, runner=runner) == []
     assert checkout.exists()
 

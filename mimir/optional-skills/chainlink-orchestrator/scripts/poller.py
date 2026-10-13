@@ -396,7 +396,21 @@ def _deliver_factory_transitions(state_dir: Path, tick_budget: TickBudget) -> No
                 continue
             if tick_budget.hard_exhausted():
                 return
-            if entry["kind"] in {"factory_needs_human", "factory_blocked", "factory_partial"}:
+            if entry["kind"] in {"leaf_blocked", "leaf_attempts_exhausted", "leaf_template_invalid", "leaf_claim_reaped"}:
+                prompt = (
+                    f"Worklink ending for issue {entry['issue_id']}: "
+                    f"{entry.get('issue_title') or '(title unavailable)'}\n"
+                    f"Kind: {entry['kind']}\nAttempt: {entry['attempt']}\n"
+                    f"Reason: {entry['reason']}\n"
+                    f"Evidence: {entry['evidence_path'] or '(unavailable)'}\n"
+                    f"Transcript: {entry['transcript_path'] or '(unavailable)'}\n"
+                    f"Checkout: {entry['checkout'] or '(unavailable)'}\n"
+                    f"Branch: {entry['branch'] or '(unavailable)'}\n\n"
+                    "Inspect the evidence and issue. If a spec repair, unblock or attempt grant is needed, "
+                    "call operator_alert with the issue, the kind, the reason and the preserved-work pointers. "
+                    "Do not re-arm, reset claims, edit the issue body, or start work yourself."
+                )
+            elif entry["kind"] in {"factory_needs_human", "factory_blocked", "factory_partial"}:
                 reason = entry.get("reason") or "(reason unavailable; inspect retained record)"
                 if len(reason) > 2000:
                     reason = reason[:2000] + " [reason truncated; read retained record]"

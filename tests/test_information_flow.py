@@ -89,6 +89,45 @@ from mimir.worklink.continuation import (
 ALL_LABELS = frozenset({"private", "confidential", "internal", "public"})
 
 
+def test_tainted_write_refusal_and_event_bound_source_identifiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import event_logger
+    from mimir.tools.budget_gate import _authorize_tool_call
+
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **fields: events.append((name, fields)))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    labels = InformationFlowLabels()
+    for index in range(7):
+        labels = labels.with_source(SourceLabel(
+            principal=None, domain="filesystem" if index % 2 else "web",
+            resource_id=f"/source/{index}", bridge_instance=None,
+            sensitivity="internal", authorized_principals=frozenset(),
+            integrity="untrusted", integrity_effect="active_ingest",
+        ))
+    auth = replace(
+        _auth(roles=("admin",)), ifc_labels=InformationFlowLabels(),
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    target = tmp_path / "code.py"
+    decision, refusal = _authorize_tool_call(
+        "edit_file", auth, arguments={"file_path": str(target)},
+    )
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    event = next(fields for name, fields in events if name == decision.reason)
+    assert event["sources"] == [
+        {"domain": "filesystem" if index % 2 else "web", "resource_id": f"/source/{index}"}
+        for index in range(5)
+    ]
+    assert event["remaining_sources"] == 2
+    for source in event["sources"]:
+        assert f"{source['domain']}: {source['resource_id']}" in refusal
+    assert "+2 more" in refusal
+    assert "/source/5" not in refusal and "/source/6" not in refusal
+    assert "secret content" not in refusal and "secret content" not in str(event)
+
+
 @pytest.mark.parametrize("tool", [
     "add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides",
 ])
@@ -1868,7 +1907,7 @@ def test_attested_author_active_lease_is_trusted_but_arbitrary_root_is_not(
         ("trusted", "informational"),
         ("untrusted", "active_ingest"),
         ("untrusted", "active_ingest"),
-        ("untrusted", "active_ingest"),
+        ("trusted", "informational"),  # Lookup uses the attested lease's existing ancestor.
     ]
 
 
@@ -6724,6 +6763,85 @@ def test_service_shell_policy_rejects_multicommand_line_breaks(separator: str):
 
     assert decision.allowed is False
     assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize(("kind", "reason", "fields"), [
+    ("none", "no_published_provenance", None),
+    ("mismatch", "provenance_field_mismatch", ["resource_id", "principal"]),
+    ("untrusted", "published_untrusted", None),
+])
+def test_repository_result_fallback_records_closed_reason_once_per_turn(
+    monkeypatch: pytest.MonkeyPatch, kind: str, reason: str, fields: list[str] | None,
+) -> None:
+    from mimir import event_logger
+
+    scope = RepoPRActionScope(
+        provenance="server_discovered", canonical_repo="owner/repo",
+        canonical_root="/srv/repo", canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot", event_type="pr_review",
+        allowed_operations=frozenset({"repo.checkout"}), pr_number=2364,
+        head_repo="owner/repo", head_remote="origin",
+        destination_ref="refs/heads/feature/plugins", observed_head_sha="a" * 40,
+        base_ref="main", observed_base_sha="b" * 40,
+    )
+    auth = replace(_auth(), canonical_principal="poller:github-activity", is_service=True,
+                   ifc_state=InformationFlowState(), repo_pr_action_scope=scope)
+    authorization = ToolAuthorization(
+        tool_name="pr_metadata", decision="resource_scoped", allowed=True,
+        repo_pr_action_scope=scope,
+    )
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **kw: events.append((name, kw)))
+    baseline = classify_protected_result("pr_metadata", {}, auth, authorization)
+    events.clear()
+    auth = replace(auth, ifc_state=InformationFlowState())
+    source, = baseline.sources
+    published = (
+        None if kind == "none" else ProtectedResultProvenance((
+            replace(source, resource_id="other", principal="other") if kind == "mismatch"
+            else source,
+        ))
+    )
+    for _ in range(2):
+        result = classify_protected_result(
+            "pr_metadata", {}, auth, authorization, provenance=published,
+        )
+        assert result.sources[0].integrity == "untrusted"
+    assert events == [("repository_result_untrusted_default", {
+        "tool": "pr_metadata", "scope_id": scope.scope_id, "pr_number": 2364,
+        "observed_head_sha": "a" * 40, "reason": reason,
+        **({"mismatched_fields": fields} if fields is not None else {}),
+    })]
+
+
+@pytest.mark.parametrize("field", ["resource_id", "principal"])
+def test_repository_result_attestation_requires_each_exact_boundary_field(
+    monkeypatch: pytest.MonkeyPatch, field: str,
+) -> None:
+    from mimir import event_logger
+
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *_args, **_kwargs: None)
+    scope = RepoPRActionScope(
+        provenance="server_discovered", canonical_repo="owner/repo",
+        canonical_root="/srv/repo", canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot", event_type="pr_review",
+        allowed_operations=frozenset({"repo.checkout"}), pr_number=7,
+        head_repo="owner/repo", head_remote="origin",
+        destination_ref="refs/heads/feature/plugins", observed_head_sha="a" * 40,
+        base_ref="feature/plugins", observed_base_sha="b" * 40,
+    )
+    auth = replace(_auth(), repo_pr_action_scope=scope, ifc_state=InformationFlowState())
+    authorization = ToolAuthorization(
+        tool_name="pr_metadata", decision="resource_scoped", allowed=True,
+        repo_pr_action_scope=scope,
+    )
+    source, = classify_protected_result("pr_metadata", {}, auth, authorization).sources
+    publication = replace(source, integrity="trusted", **{field: "other"})
+    result = classify_protected_result(
+        "pr_metadata", {}, auth, authorization,
+        provenance=ProtectedResultProvenance((publication,)),
+    )
+    assert result.sources[0].integrity == "untrusted"
 
 
 def test_ordinary_admin_cannot_bypass_or_erase_labels():
