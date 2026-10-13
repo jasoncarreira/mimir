@@ -487,6 +487,18 @@ textarea {
   background: var(--mimir-color-status-danger-background, #f8e4e4);
 }
 
+.plugin-notices {
+  margin-bottom: var(--mimir-space-md);
+  padding: var(--mimir-space-sm);
+  border: var(--mimir-border-width-hairline) solid var(--mimir-color-status-warning);
+  border-radius: var(--mimir-radius-panel);
+  background: var(--mimir-color-status-warning-background);
+  color: var(--mimir-color-status-warning);
+}
+
+.plugin-notices p { margin: 0; }
+.plugin-notices p + p { margin-top: var(--mimir-space-xs); }
+
 .log-read-warning__message {
   color: var(--mimir-color-text);
 }

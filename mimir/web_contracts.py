@@ -805,6 +805,8 @@ export interface WikiPageData extends WikiPageSummary {
 
 export interface DashboardExtensionManifest {
   id: string;
+  /** Server-selected owner; null for core entries. Not a manifest declaration. */
+  plugin: string | null;
   route_path: string;
   label: string;
   icon: string | null;

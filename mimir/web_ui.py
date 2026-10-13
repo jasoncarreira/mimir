@@ -1034,6 +1034,7 @@ def register_routes(
     _dashboard_extensions = DashboardExtensionRegistry(list(
         (dashboard_extensions or first_party_dashboard_extensions()).manifests
     ))
+    plugin_dashboard_owners: dict[str, str] = {}
     manager = getattr(app.get("config"), "plugin_manager", None)
     operator_skin_ids = {skin["id"] for skin in read_operator_skin_manifests(home)}
     plugin_skins, plugin_bundles, plugin_roots = (
@@ -1054,6 +1055,7 @@ def register_routes(
                 raise ValueError(f"plugin {owner}: duplicate dashboard route_path: {entry.route_path}")
             if entry.enabled:
                 used_paths.add(entry.route_path)
+                plugin_dashboard_owners[entry_id] = owner
             _dashboard_extensions.manifests.append(entry)
         _dashboard_extensions.__post_init__()
     default_skin = os.environ.get("MIMIR_WEB_DEFAULT_SKIN", "").strip()
@@ -1669,7 +1671,10 @@ def register_routes(
                     "operator": read_operator_skin_manifests(home),
                     "plugins": plugin_skins,
                 },
-                "dashboard_extensions": _dashboard_extensions.navigation_payload(),
+                "dashboard_extensions": [
+                    {**entry, "plugin": plugin_dashboard_owners.get(entry["id"])}
+                    for entry in _dashboard_extensions.navigation_payload()
+                ],
                 "plugin_bundles": plugin_bundles,
             },
             headers=_no_store_headers(),

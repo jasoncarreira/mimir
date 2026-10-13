@@ -1,7 +1,14 @@
 import type { DashboardExtensionManifest } from "./api/generated/contracts";
+import type { PluginBundleData } from "./api/generated/contracts";
+import type { ComponentType } from "react";
+import * as React from "react";
+import * as ReactDOM from "react-dom";
+import * as ReactDOMClient from "react-dom/client";
+import { authenticatedPluginFetch, localPluginUrl } from "./api/http";
+import type { SkinManifest } from "./skins/types";
 import { sanitizeHref } from "./routeState";
 
-export interface DashboardSurface extends DashboardExtensionManifest {
+export interface DashboardSurface extends Omit<DashboardExtensionManifest, "plugin"> {
   path: `/${string}`;
   title: string;
   detail: string;
@@ -127,4 +134,135 @@ export function visibleSurfaces(
   return surfaces.filter(
     (surface) => surface.requires_role !== "admin" || isAdmin
   );
+}
+
+export interface PluginRoute {
+  plugin: string;
+  id: string;
+  path: string;
+  component: ComponentType;
+}
+
+export interface PluginNavEntry {
+  plugin: string;
+  id: string;
+  label: string;
+  detail?: string;
+}
+
+export interface PluginHost {
+  apiMajor: 1;
+  react: typeof React;
+  reactDOM: typeof ReactDOM;
+  reactDOMClient: typeof ReactDOMClient;
+  themeTokens: SkinManifest["tokens"];
+  registerRoute: (route: PluginRoute) => void;
+  registerNavEntry: (entry: PluginNavEntry) => void;
+  authenticatedFetch: typeof authenticatedPluginFetch;
+}
+
+declare global {
+  interface Window { mimirPluginHost?: PluginHost }
+}
+
+export interface LoadedPlugins {
+  routes: PluginRoute[];
+  navEntries: PluginNavEntry[];
+  notices: string[];
+}
+
+export async function loadPluginBundles(
+  bundles: PluginBundleData[],
+  manifests: DashboardExtensionManifest[],
+  tokens: SkinManifest["tokens"],
+  onChange: (result: LoadedPlugins) => void,
+  signal?: AbortSignal,
+  importModule: (url: string) => Promise<unknown> = (url) => import(/* @vite-ignore */ url)
+): Promise<() => void> {
+  const routes: PluginRoute[] = [];
+  const navEntries: PluginNavEntry[] = [];
+  const notices: string[] = [];
+  const links: HTMLLinkElement[] = [];
+  let activePlugin: string | null = null;
+  let disposed = false;
+  const dispose = () => {
+    disposed = true;
+    activePlugin = null;
+    for (const link of links) link.remove();
+    if (window.mimirPluginHost === host) delete window.mimirPluginHost;
+  };
+  signal?.addEventListener("abort", dispose, { once: true });
+  const publish = () => { if (!disposed) onChange({ routes: [...routes], navEntries: [...navEntries], notices: [...notices] }); };
+  const owned = (plugin: string) => {
+    if (disposed || !activePlugin || plugin !== activePlugin) throw new Error("Plugin registration owner mismatch");
+  };
+  const host: PluginHost = {
+    apiMajor: 1,
+    react: React,
+    reactDOM: ReactDOM,
+    reactDOMClient: ReactDOMClient,
+    themeTokens: tokens,
+    authenticatedFetch: authenticatedPluginFetch,
+    registerRoute(route) {
+      owned(route.plugin);
+      if (typeof route.component !== "function" ||
+          !manifests.some((manifest) => manifest.bundle && manifest.plugin === activePlugin && manifest.id === route.id &&
+            manifest.route_path === route.path && manifest.enabled) ||
+          routes.some((existing) => existing.id === route.id || existing.path === route.path)) {
+        throw new Error(`Invalid plugin route: ${route.id}`);
+      }
+      routes.push(route);
+    },
+    registerNavEntry(entry) {
+      owned(entry.plugin);
+      if (!routes.some((route) => route.plugin === entry.plugin && route.id === entry.id) ||
+          navEntries.some((existing) => existing.id === entry.id)) {
+        throw new Error(`Invalid plugin navigation entry: ${entry.id}`);
+      }
+      navEntries.push(entry);
+    }
+  };
+  window.mimirPluginHost = host;
+  if (signal?.aborted) dispose();
+  publish();
+  for (const bundle of bundles) {
+    if (disposed) break;
+    if (bundle.apiMajor !== host.apiMajor) {
+      notices.push(`${bundle.plugin}: unsupported dashboard API version ${bundle.apiMajor}.`);
+      publish();
+      continue;
+    }
+    const routeCount = routes.length;
+    const navCount = navEntries.length;
+    const linkCount = links.length;
+    try {
+      const moduleUrl = localPluginUrl(bundle.moduleUrl, bundle.plugin);
+      const cssUrl = bundle.cssUrl ? localPluginUrl(bundle.cssUrl, bundle.plugin) : null;
+      if (cssUrl) {
+        const link = document.createElement("link");
+        link.rel = "stylesheet";
+        link.href = cssUrl;
+        link.addEventListener("error", () => {
+          if (disposed) return;
+          notices.push(`${bundle.plugin}: dashboard stylesheet could not be loaded.`);
+          publish();
+        });
+        document.head.appendChild(link);
+        links.push(link);
+      }
+      activePlugin = bundle.plugin;
+      await importModule(moduleUrl);
+      publish();
+    } catch (error) {
+      routes.splice(routeCount);
+      navEntries.splice(navCount);
+      for (const link of links.splice(linkCount)) link.remove();
+      notices.push(`${bundle.plugin}: dashboard bundle could not be loaded.`);
+      console.error(`Plugin dashboard ${bundle.plugin} failed`, error);
+      publish();
+    } finally {
+      activePlugin = null;
+    }
+  }
+  return () => { signal?.removeEventListener("abort", dispose); dispose(); };
 }
