@@ -894,9 +894,13 @@ class _ServerControl:
     panel_enabled: bool = False
     optional_bridges: bool = False
     scheduler_should_start: bool = True
+    plugin_jobs_installed: int = 0
     bundle: Any | None = None
     app: web.Application | None = None
     route_kwargs: dict[str, Any] = field(default_factory=dict)
+    poller_candidates: tuple[Any, ...] = ()
+    plugin_manager: Any | None = None
+    real_web_routes: bool = False
     core: Any | None = None
     dispatcher: Any | None = None
     scheduler: Any | None = None
@@ -1006,6 +1010,7 @@ def _controlled_server_app(
     class Scheduler:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             control.hit("scheduler")
+            self.policy = kwargs["policy"]
             self._started = False
             self._scheduler = SimpleNamespace(running=False)
             self._arbiter = None
@@ -1020,6 +1025,7 @@ def _controlled_server_app(
                 if name == "add_saga_consolidate_job":
                     return control.scheduler_should_start
                 if name == "add_poller_jobs":
+                    control.poller_candidates = self.policy.selected_plugin_candidates
                     return 0
                 return False
 
@@ -1028,6 +1034,12 @@ def _controlled_server_app(
         def reload(self) -> dict[str, int]:
             control.hit("scheduler:reload")
             return {"registered": 0, "invalid": 0}
+
+        def bind_plugin_jobs(self, jobs: Any) -> int:
+            assert self.policy.frozen
+            assert tuple(jobs) == tuple(self.policy.scheduler_jobs.values())
+            control.hit("scheduler:bind_plugin_jobs")
+            return control.plugin_jobs_installed
 
         def start(self) -> None:
             self._started = True
@@ -1257,7 +1269,8 @@ def _controlled_server_app(
     monkeypatch.setattr("mimir.server.reattach_inflight_worklink_runs", lambda home: [])
     monkeypatch.setattr("mimir.server.cancel_background_tasks", cancel_tasks)
     monkeypatch.setattr("mimir.server._start_mcp_servers", start_mcp)
-    monkeypatch.setattr("mimir.server.web_ui.register_routes", register_routes)
+    if not control.real_web_routes:
+        monkeypatch.setattr("mimir.server.web_ui.register_routes", register_routes)
     monkeypatch.setattr(mimir.runtime, "create_core_services", create_core_services)
     if not control.real_runtime:
         monkeypatch.setattr(mimir.runtime, "create_agent_runtime", create_agent_runtime)
@@ -1318,6 +1331,7 @@ def _controlled_server_app(
         oauth_credentials_path=None,
         commitments_due_check_cron="",
         minimax_usage_poll_cron="",
+        plugin_manager=control.plugin_manager or config.plugin_manager,
     )
     set_global_buffer(None)
     app = build_app(config)
@@ -1404,6 +1418,88 @@ async def _run_cleanup(app: web.Application) -> None:
     ]
     assert len(hooks) == 1
     await hooks[0](app)
+
+
+def _selected_server_manager() -> Any:
+    from mimir.plugins.manager import PluginManager
+    from mimir.plugins.registry import PolicyRegistry
+
+    policy = PolicyRegistry()
+    candidate = SimpleNamespace(name="example", manifest=None)
+    policy.select_plugin_candidates((candidate,))
+    registrar = policy.registrar("example")
+
+    async def job() -> None:
+        return None
+
+    async def handler(request: web.Request) -> web.Response:
+        return web.json_response({"plugin": "example"})
+
+    registrar.register_scheduler_job("example-check", "example-check", job)
+    registrar.register_route("GET", "/api/v1/plugins/example/private", handler, role="admin")
+    policy.freeze()
+    return PluginManager(policy, ())
+
+
+@pytest.mark.asyncio
+async def test_selected_plugin_server_wiring_and_admin_route(tmp_path, monkeypatch):
+    manager = _selected_server_manager()
+    control = _ServerControl(plugin_manager=manager, scheduler_should_start=False,
+                             plugin_jobs_installed=1, real_web_routes=True)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    assert app["plugin_manager"] is manager
+    assert control.poller_candidates == ()
+    assert ("GET", "/api/v1/plugins/example/private") in {
+        (route.method, route.resource.canonical) for route in app.router.routes()
+    }
+    app["check_worker_executor_health"] = False
+    async with TestClient(TestServer(app)) as client:
+        assert (await client.get("/api/v1/plugins/example/private")).status == 401
+        # A valid non-admin identity passes authentication but not route RBAC.
+        identity = SimpleNamespace(canonical="alice", access=SimpleNamespace(
+            is_authorized=True, is_admin=False))
+        app["identity_resolver"].resolve_web_key = lambda key: identity if key == "user-key" else None
+        assert (await client.get("/api/v1/plugins/example/private",
+                                 headers={"X-API-Key": "user-key"})).status == 403
+        response = await client.get("/api/v1/plugins/example/private",
+                                    headers={"X-API-Key": "test-key"})
+        assert response.status == 200
+        assert await response.json() == {"plugin": "example"}
+        assert control.poller_candidates == manager.policy.selected_plugin_candidates
+        assert control.events.index("scheduler:add_scheduler_health_check_job") < control.events.index(
+            "scheduler:bind_plugin_jobs") < control.events.index("scheduler:reload")
+        assert control.events.index("scheduler:reload") < control.events.index("scheduler:add_poller_jobs")
+        assert "scheduler:start" in control.events
+
+
+@pytest.mark.asyncio
+async def test_plugin_defaults_seed_and_upgrade_use_frozen_selection(tmp_path, monkeypatch):
+    from mimir import defaults_upgrade
+    from mimir.plugins import defaults
+
+    manager = _selected_server_manager()
+    selected = manager.policy.selected_plugin_candidates
+    seen = []
+    original_seed = defaults.seed_plugin_defaults
+
+    def seed(home, *, selected):
+        seen.append(("seed", selected))
+        return original_seed(home, selected=selected)
+
+    def upgrade(home, *, selected):
+        seen.append(("upgrade", selected))
+        return {}
+
+    monkeypatch.setattr(defaults, "seed_plugin_defaults", seed)
+    monkeypatch.setattr(defaults_upgrade, "check_and_open_plugin_defaults_upgrade", upgrade)
+    app, control = _controlled_server_app(
+        tmp_path, monkeypatch, _ServerControl(plugin_manager=manager),
+    )
+    try:
+        await _run_startup(app)
+        assert seen == [("seed", selected), ("upgrade", selected)]
+    finally:
+        await _run_cleanup(app)
 
 
 def _fail_mcp_client_import(
