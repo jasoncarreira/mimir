@@ -69,7 +69,11 @@ from .tool_descriptors import (
     TOOL_DESCRIPTORS,
     get_tool_descriptor,
 )
-from .plugins.core import CapabilityTier, ServicePrincipal, ServiceSinkPolicy, core_policy_registry
+from .plugins.core import (
+    CapabilityTier, ServicePrincipal, ServiceSinkPolicy, core_policy_registry,
+    core_poller_flags, PolicyMappingView, PolicySetView, policy_membership,
+    scoped_policy_call, selected_policy_registry,
+)
 
 HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 POLLER_RECOVERY_REPLAY_EXTRA_KEY = "_mimir_poller_recovery_replay"
@@ -151,11 +155,10 @@ class ToolFlowDirection(StrEnum):
     UNKNOWN = "unknown"
 
 
-SHELL_PROCESS_TOOL_NAMES: frozenset[str] = frozenset(
-    name
-    for name, descriptor in TOOL_DESCRIPTORS.items()
+SHELL_PROCESS_TOOL_NAMES = PolicySetView(lambda policy: frozenset(
+    name for name, descriptor in policy.descriptors.items()
     if descriptor.sink_category is SinkCategory.SHELL_PROCESS
-)
+))
 
 _GENERIC_SHELL_INGEST_REFUSAL = (
     "Shell execution was refused after untrusted active ingest "
@@ -181,8 +184,8 @@ def _author_attestation_note(auth_context: Any) -> str:
         )
     return ""
 
-_TOOL_FLOW_MAP: Mapping[str, ToolFlowDirection] = MappingProxyType({
-    name: ToolFlowDirection(flow) for name, flow in core_policy_registry().flow.items()
+_TOOL_FLOW_MAP: Mapping[str, ToolFlowDirection] = PolicyMappingView(lambda policy: {
+    name: ToolFlowDirection(flow) for name, flow in policy.flow.items()
 })
 
 IFC_POLICY_VERSION = "ifc-v1"
@@ -223,15 +226,16 @@ from .client_file_resources import (
 )
 
 
-_core_profiles = core_policy_registry()
-TRIGGER_CAPABILITY_TIERS: Mapping[str, CapabilityTier] = MappingProxyType({
-    name: CapabilityTier(tier) for name, tier in _core_profiles.tiers.items()
+TRIGGER_CAPABILITY_TIERS: Mapping[str, CapabilityTier] = PolicyMappingView(lambda policy: {
+    name: CapabilityTier(tier) for name, tier in policy.tiers.items()
 })
 
-_CAPABILITY_COMPANIONS: Mapping[str, frozenset[str]] = _core_profiles.capability_companions
+_CAPABILITY_COMPANIONS: Mapping[str, frozenset[str]] = PolicyMappingView(
+    lambda policy: policy.capability_companions
+)
 
-_PROFILE_CAPABILITY_COMPANIONS: Mapping[str, Mapping[str, frozenset[str]]] = MappingProxyType({
-    name: profile.capability_companions for name, profile in _core_profiles.profiles.items()
+_PROFILE_CAPABILITY_COMPANIONS: Mapping[str, Mapping[str, frozenset[str]]] = PolicyMappingView(lambda policy: {
+    name: profile.capability_companions for name, profile in policy.profiles.items()
     if profile.capability_companions
 })
 
@@ -251,41 +255,43 @@ def _missing_capability_companions(
 # Built-in services predate manifest-declarable trigger authority. Keep their
 # explicitly declared, review-bounded proposal workflow classified without
 # making those capabilities grantable to custom trigger manifests.
-_LEGACY_SERVICE_SINK_TIERS: Mapping[str, CapabilityTier] = MappingProxyType({
-    name: CapabilityTier(tier) for name, tier in _core_profiles.legacy_service_sink_tiers.items()
+_LEGACY_SERVICE_SINK_TIERS: Mapping[str, CapabilityTier] = PolicyMappingView(lambda policy: {
+    name: CapabilityTier(tier) for name, tier in policy.legacy_service_sink_tiers.items()
 })
 
-TRIGGER_AUTHORITY_PROFILES: Mapping[str, frozenset[str]] = _core_profiles.authority_profiles
+TRIGGER_AUTHORITY_PROFILES: Mapping[str, frozenset[str]] = PolicyMappingView(
+    lambda policy: policy.authority_profiles
+)
 
 # Scheduler records may opt into these built-in profiles. Keeping this set
 # separate prevents a scheduler entry from selecting a profile whose trigger
 # semantics require additional manifest data (for example a poller profile).
-SCHEDULER_AUTHORITY_PROFILES = frozenset(
-    name for name, profile in _core_profiles.profiles.items() if profile.scheduler
-)
+SCHEDULER_AUTHORITY_PROFILES = PolicySetView(lambda policy: frozenset(
+    name for name, profile in policy.profiles.items() if profile.scheduler
+))
 
-_BUILTIN_TRIGGER_PROFILE_CONFIG: Mapping[str, Mapping[str, Any]] = MappingProxyType({
+_BUILTIN_TRIGGER_PROFILE_CONFIG: Mapping[str, Mapping[str, Any]] = PolicyMappingView(lambda policy: {
     name: MappingProxyType({
         **profile.builtin_trigger_config,
         "tier": CapabilityTier(profile.builtin_trigger_config["tier"]),
     })
-    for name, profile in _core_profiles.profiles.items()
+    for name, profile in policy.profiles.items()
     if profile.builtin_trigger_config is not None
 })
 
-_SHELL_PROFILE_BY_AUTHORITY_PROFILE = _core_profiles.shell_profile_mappings
-OPERATOR_SHELL_PROFILE = _core_profiles.operator_shell_profile
-_FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = MappingProxyType({
-    name: profile.fetch_url_policy for name, profile in _core_profiles.profiles.items()
+_SHELL_PROFILE_BY_AUTHORITY_PROFILE = PolicyMappingView(lambda policy: policy.shell_profile_mappings)
+OPERATOR_SHELL_PROFILE = core_policy_registry().operator_shell_profile
+_FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = PolicyMappingView(lambda policy: {
+    name: profile.fetch_url_policy for name, profile in policy.profiles.items()
     if profile.fetch_url_policy is not None
 })
-BOUNDED_PROFILE_CAPABILITIES: Mapping[str, frozenset[str]] = MappingProxyType({
-    name: profile.bounded_capabilities for name, profile in _core_profiles.profiles.items()
+BOUNDED_PROFILE_CAPABILITIES: Mapping[str, frozenset[str]] = PolicyMappingView(lambda policy: {
+    name: profile.bounded_capabilities for name, profile in policy.profiles.items()
     if profile.bounded_capabilities
 })
-_PR_REVIEW_SCOPE_AUTHORITY_PROFILES = frozenset(
-    name for name, profile in _core_profiles.profiles.items() if profile.pr_review_scope
-)
+_PR_REVIEW_SCOPE_AUTHORITY_PROFILES = PolicySetView(lambda policy: frozenset(
+    name for name, profile in policy.profiles.items() if profile.pr_review_scope
+))
 
 _CAPABILITY_TIER_RANK = {
     CapabilityTier.SCOPE_CONTAINED: 0,
@@ -295,6 +301,7 @@ _CAPABILITY_TIER_RANK = {
 }
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def build_trigger_service_principal(
     *,
     canonical: str,
@@ -313,7 +320,7 @@ def build_trigger_service_principal(
     policy: "PolicyRegistry | None" = None,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
-    selected = policy if policy is not None else _core_profiles
+    selected = policy if policy is not None else selected_policy_registry()
     if not selected.frozen:
         raise ValueError("service principal requires a frozen policy")
     if policy is not None and profile not in selected.profiles:
@@ -347,7 +354,8 @@ def build_trigger_service_principal(
     home_data_roots = (
         (Path(home) / "state", Path(home) / "memory", artifact_root) if home else ()
     )
-    is_github_activity = canonical == "poller:github-activity"
+    poller_flags = core_poller_flags(canonical) if trigger == "poller" else {}
+    is_github_activity = poller_flags.get("github_activity", False)
     repo_roots = tuple(root.resolve() for root in _configured_repo_roots())
     fetch_cache_roots = (
         (Path(home) / "attachments" / "fetch-cache",)
@@ -463,6 +471,7 @@ def build_trigger_service_principal(
         capability_tier=tier,
         declared_shell_commands=declared_shell_commands,
         proposal_surface=proposal_surface,
+        **poller_flags,
     )
 
 
@@ -471,7 +480,7 @@ def builtin_trigger_service_principal(
     policy: "PolicyRegistry | None" = None,
 ) -> ServicePrincipal:
     """Return the authoritative built-in grant; manifests cannot replace it."""
-    selected = policy if policy is not None else _core_profiles
+    selected = policy if policy is not None else selected_policy_registry()
     if not selected.frozen:
         raise ValueError("built-in principal requires a frozen policy")
     declared = selected.profiles.get(profile)
@@ -665,7 +674,7 @@ def _is_worklink_retained_checkout_service(
     """Bind retained-checkout authority to the authenticated reserved poller."""
     return (
         isinstance(service, ServicePrincipal)
-        and service.canonical == "poller:worklink-ready-queue"
+        and service.worklink_retained_checkout
         and service.trigger == "poller"
         and service.authority_profile == "github"
         and service == get_trusted_service_from_auth_context(auth_context)
@@ -892,46 +901,18 @@ _REPO_PR_REVIEW_ACTIONS = frozenset({
     RepoPRAction.PR_REVIEW.value,
     RepoPRAction.PR_COMMENT.value,
 })
-_FORGE_TOOL_ACTIONS: dict[str, str | None] = {
-    "pr_metadata": RepoPRAction.INSPECT.value,
-    "pr_spec": RepoPRAction.INSPECT.value,
-    "pr_files": RepoPRAction.INSPECT.value,
-    "pr_diff": RepoPRAction.INSPECT.value,
-    "pr_file_content": RepoPRAction.INSPECT.value,
-    "pr_checks": RepoPRAction.INSPECT.value,
-    "pr_job_log": RepoPRAction.INSPECT.value,
-    "pr_reviews": RepoPRAction.INSPECT.value,
-    "pr_comments": RepoPRAction.INSPECT.value,
-    "pr_review_requests": RepoPRAction.INSPECT.value,
-    "pr_submit_review": RepoPRAction.PR_REVIEW.value,
-    "pr_inline_review_comment": RepoPRAction.PR_REVIEW.value,
-    "pr_comment": RepoPRAction.PR_COMMENT.value,
-    "pr_edit_body": RepoPRAction.PR_EDIT.value,
-    "pr_rerequest_review": RepoPRAction.PR_REREQUEST.value,
-    "unsupported_operation": None,
-}
-_REPO_TOOL_ACTIONS: dict[str, str] = {
-    "repo_checkout": RepoPRAction.CHECKOUT.value,
-    "repo_cleanup": RepoPRAction.CHECKOUT.value,
-    "repo_fetch": RepoPRAction.CHECKOUT.value,
-    "repo_status": RepoPRAction.INSPECT.value,
-    "repo_test": RepoPRAction.TEST.value,
-    "repo_diff": RepoPRAction.INSPECT.value,
-    "repo_unmerged": RepoPRAction.INSPECT.value,
-    "repo_stage": RepoPRAction.WRITE.value,
-    "repo_commit": RepoPRAction.COMMIT.value,
-    "repo_merge": RepoPRAction.COMMIT.value,
-    "repo_merge_abort": RepoPRAction.WRITE.value,
-    "repo_rebase": RepoPRAction.COMMIT.value,
-    "repo_rebase_abort": RepoPRAction.WRITE.value,
-    "repo_revert": RepoPRAction.COMMIT.value,
-    "repo_revert_abort": RepoPRAction.WRITE.value,
-    "repo_push": RepoPRAction.PUSH.value,
-}
-_RETAINED_REPO_TOOLS = frozenset({
-    "repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit",
-})
-_TYPED_REPO_PR_TOOL_ACTIONS = {**_FORGE_TOOL_ACTIONS, **_REPO_TOOL_ACTIONS}
+def _typed_action_view(*memberships: str) -> Mapping[str, str | None]:
+    return PolicyMappingView(lambda policy: {
+        name: tool.typed_action.value if tool.typed_action is not None else None
+        for name, tool in policy.tools.items()
+        if tool.memberships.intersection(memberships)
+    })
+
+
+_FORGE_TOOL_ACTIONS = _typed_action_view("forge_actions")
+_REPO_TOOL_ACTIONS = _typed_action_view("repo_actions")
+_RETAINED_REPO_TOOLS = policy_membership("retained_repo_tools")
+_TYPED_REPO_PR_TOOL_ACTIONS = _typed_action_view("forge_actions", "repo_actions")
 _GITHUB_REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _GITHUB_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
 
@@ -5613,7 +5594,7 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
         return False
     service = get_trusted_service_from_auth_context(auth_context)
     policy = service.sink_policy_for("fetch_url") if service is not None else None
-    if service is not None and service.canonical == "poller:github-activity":
+    if service is not None and service.github_activity:
         from .models import RepoPRActionScope
 
         # Expanded evidence reads need BOTH manifest authority and the turn's
@@ -5715,7 +5696,7 @@ def _sink_adapter_admits(
     if (
         adapter is _target_matches_approved_url
         and service is not None
-        and service.canonical == "poller:github-activity"
+        and service.github_activity
         and _target_matches_github_pr_api(target, "GITHUB_REPOS")
     ):
         return True
@@ -5768,10 +5749,7 @@ _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
 # Taint gating still applies upstream at the capability-tier gate; membership
 # here bypasses only destination checks. Keep membership narrow: a candidate
 # must accept no caller-selected target and write only fixed derived destinations.
-_FIXED_SERVICE_SINK_OPERATIONS = frozenset(
-    name for name, tool in core_policy_registry().tools.items()
-    if "fixed_service_sinks" in tool.memberships
-)
+_FIXED_SERVICE_SINK_OPERATIONS = policy_membership("fixed_service_sinks")
 
 
 # Deliberate single-operator exception: the model-composed web_search query
@@ -5779,10 +5757,7 @@ _FIXED_SERVICE_SINK_OPERATIONS = frozenset(
 # active ingest, so gating this channel would cap research at one search.
 # Unlike fetch_url, there is no model-chosen destination or exact-URL mitigation.
 # This and the trusted-operator shell/file allowance require a trusted deployment.
-_TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset(
-    name for name, tool in core_policy_registry().tools.items()
-    if "taint_independent_egress" in tool.memberships
-)
+_TAINT_INDEPENDENT_EGRESS_TOOLS = policy_membership("taint_independent_egress")
 
 
 def _egress_target_requires_taint_gate(
@@ -5914,10 +5889,7 @@ def _has_untrusted_active_ingest(
     )
 
 
-_SCHEDULE_WRITE_TOOLS = frozenset(
-    name for name, tool in core_policy_registry().tools.items()
-    if "schedule_writes" in tool.memberships
-)
+_SCHEDULE_WRITE_TOOLS = policy_membership("schedule_writes")
 _SCHEDULE_WRITE_REFUSAL = (
     "Scheduled work and autonomous instruction surfaces cannot be changed after "
     "untrusted ingest; propose this change with open_proposal/submit_proposal; "
@@ -6056,14 +6028,8 @@ def _scheduled_write_denial(tool_name: str, *, skill: bool = False) -> "ToolAuth
     )
 
 
-_WORKLINK_BUILD_TOOLS = frozenset(
-    name for name, tool in core_policy_registry().tools.items()
-    if "worklink_build_tools" in tool.memberships
-)
-_REPO_PUBLISH_TOOLS = frozenset(
-    name for name, tool in core_policy_registry().tools.items()
-    if "repo_publish_tools" in tool.memberships
-)
+_WORKLINK_BUILD_TOOLS = policy_membership("worklink_build_tools")
+_REPO_PUBLISH_TOOLS = policy_membership("repo_publish_tools")
 _REPO_PUBLISH_INGEST_REFUSAL = (
     "This turn read untrusted outside content, so it cannot create or publish commits. "
     "Describe the intended change in a PR comment (pr_comment) or a message to the "
@@ -6071,14 +6037,8 @@ _REPO_PUBLISH_INGEST_REFUSAL = (
 )
 
 
-_TAINTED_TURN_WRITE_TOOLS = frozenset(
-    name for name, tool in core_policy_registry().tools.items()
-    if "tainted_writes" in tool.memberships
-)
-_TAINTED_FILE_WRITE_TOOLS = frozenset(
-    name for name, tool in core_policy_registry().tools.items()
-    if "tainted_file_writes" in tool.memberships
-)
+_TAINTED_TURN_WRITE_TOOLS = policy_membership("tainted_writes")
+_TAINTED_FILE_WRITE_TOOLS = policy_membership("tainted_file_writes")
 _TAINTED_WRITE_REFUSAL = (
     "This turn read untrusted outside content, so it cannot directly write code "
     "or live state. Use scratch/ and a proposal PR via open_proposal/submit_proposal "
@@ -7368,7 +7328,7 @@ class SinkGate:
             if (
                 not service_target_allowed
                 and sink_category is SinkCategory.FILE
-                and service.canonical == "poller:github-activity"
+                and service.github_activity
             ):
                 service_target_allowed = _target_within_active_pr_checkout_lease(
                     target, review_state,
@@ -8104,10 +8064,7 @@ class ChannelResourceAdapter:
     - Denials are structured and redacted without relying on model-supplied fields
     """
 
-    _CHANNEL_OPERATIONS: frozenset[str] = frozenset(
-        name for name, tool in core_policy_registry().tools.items()
-        if "channel_operations" in tool.memberships
-    )
+    _CHANNEL_OPERATIONS = policy_membership("channel_operations")
 
     _global_resolver: Any = None
 
@@ -8255,14 +8212,8 @@ class ChannelResourceAdapter:
 class WriteResourceAdapter:
     """Scope write/code operations by the server-authenticated caller axis."""
 
-    _WRITE_OPERATIONS: frozenset[str] = frozenset(
-        name for name, tool in core_policy_registry().tools.items()
-        if "write_operations" in tool.memberships
-    )
-    _RESOURCE_OPERATIONS: frozenset[str] = frozenset(
-        name for name, tool in core_policy_registry().tools.items()
-        if "write_resource_operations" in tool.memberships
-    )
+    _WRITE_OPERATIONS = policy_membership("write_operations")
+    _RESOURCE_OPERATIONS = policy_membership("write_resource_operations")
     _PROTECTED_NAMES: frozenset[str] = frozenset({
         ".env", ".git", ".mimir", "memory-proposals.jsonl", "compose.env", "rate_limits.json",
         "config", "credentials", "identities", "secrets", "secret",
@@ -8440,32 +8391,23 @@ class OperationCatalog:
     they are denied by default when enforcement is on.
     """
 
-    _OPEN_OPERATIONS: frozenset[str] = frozenset(
-        name for name, tool in core_policy_registry().tools.items()
-        if tool.operation_class == "open"
-    )
+    _OPEN_OPERATIONS = PolicySetView(lambda policy: frozenset(
+        name for name, tool in policy.tools.items() if tool.operation_class == "open"
+    ))
 
-    _RESOURCE_SCOPED_OPERATIONS: frozenset[str] = frozenset(
-        name for name, tool in core_policy_registry().tools.items()
-        if tool.operation_class == "resource_scoped"
-    )
+    _RESOURCE_SCOPED_OPERATIONS = PolicySetView(lambda policy: frozenset(
+        name for name, tool in policy.tools.items() if tool.operation_class == "resource_scoped"
+    ))
 
-    _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset(
-        name for name, tool in core_policy_registry().tools.items()
-        if tool.operation_class == "admin_required"
-    )
+    _ADMIN_REQUIRED_OPERATIONS = PolicySetView(lambda policy: frozenset(
+        name for name, tool in policy.tools.items() if tool.operation_class == "admin_required"
+    ))
 
     # Global rows from these operations contain protected identities,
     # configuration, or process metadata and must never become OPEN.
-    _PROTECTED_METADATA_OPERATIONS: frozenset[str] = frozenset(
-        name for name, tool in core_policy_registry().tools.items()
-        if "protected_metadata_operations" in tool.memberships
-    )
+    _PROTECTED_METADATA_OPERATIONS = policy_membership("protected_metadata_operations")
 
-    _ADMIN_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset(
-        name for name, tool in core_policy_registry().tools.items()
-        if "catalog_admin_builtin" in tool.memberships
-    )
+    _ADMIN_BUILTIN_TOOL_NAMES = policy_membership("catalog_admin_builtin")
 
     def __init__(self) -> None:
         self._custom_decisions: dict[str, OperationDecision] = {}
@@ -9015,7 +8957,7 @@ def authorize_repo_pr_tool(
             not registered_plugin
             and tool_name in _RETAINED_REPO_TOOLS
             and isinstance(service_principal, ServicePrincipal)
-            and service_principal.canonical == "poller:worklink-ready-queue"
+            and service_principal.worklink_retained_checkout
             and service_principal.trigger == "poller"
             and service_principal.authority_profile == "github"
             and service_can_invoke_operation(service_principal, tool_name)
@@ -9345,6 +9287,7 @@ class ToolRegistry:
         except RuntimeError:
             log.debug("shadow decision logging skipped: no running event loop")
 
+    @scoped_policy_call(lambda bound: bound.arguments.get("policy"))
     def authorize_tool(
         self,
         tool_name: str,
@@ -9383,8 +9326,7 @@ class ToolRegistry:
         shadow_sink = None
 
         def finish(auth: ToolAuthorization) -> ToolAuthorization:
-            if policy is not None:
-                auth.policy = policy
+            auth.policy = policy if policy is not None else selected_policy_registry()
             # Shadow mode continues past a sink refusal; enforcement would not.
             audit_auth = shadow_sink if shadow_sink is not None else auth
             if not enforce and audit_auth.is_shadow_decision:
@@ -9506,7 +9448,7 @@ class ToolRegistry:
 
         from .plugins.core import core_policy_registry
 
-        policy = policy if policy is not None else core_policy_registry()
+        policy = policy if policy is not None else selected_policy_registry()
         if not policy.frozen:
             raise ValueError("authorization requires a frozen policy")
         tool_policy = policy.tools.get(tool_name)
@@ -9531,15 +9473,8 @@ class ToolRegistry:
                 plugin_channel_target = targets[0]
                 if target_channel is None:
                     target_channel = sink_target = requested_target = plugin_channel_target
-        flow_direction = (
-            ToolFlowDirection(plugin_tool.flow) if plugin_tool is not None
-            else get_tool_flow_direction(tool_name)
-        )
-        sink_category = (
-            plugin_tool.descriptor.sink_category
-            if plugin_tool is not None and plugin_tool.descriptor is not None
-            else get_sink_category(tool_name)
-        )
+        flow_direction = get_tool_flow_direction(tool_name)
+        sink_category = get_sink_category(tool_name)
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)
         raw_write_target = ((arguments or {}).get("file_path")
@@ -9612,10 +9547,7 @@ class ToolRegistry:
             skill_write.flow_direction = flow_direction
             return finish(skill_write)
         catalog = get_operation_catalog()
-        preliminary_decision = (
-            OperationDecision(plugin_tool.operation_class) if plugin_tool is not None
-            else catalog.get_decision(tool_name, auth_context)
-        )
+        preliminary_decision = catalog.get_decision(tool_name, auth_context)
         preliminary_service = (
             get_trusted_service_from_auth_context(auth_context, policy=policy)
             if auth_context is not None
@@ -9824,10 +9756,7 @@ class ToolRegistry:
         ):
             sink_target = getattr(auth_context, "channel_id", None)
         if not sink_target:
-            descriptor = (
-                plugin_tool.descriptor if plugin_tool is not None
-                else get_tool_descriptor(tool_name)
-            )
+            descriptor = get_tool_descriptor(tool_name)
             sink_target = descriptor.sink_destination if descriptor else None
         is_ifc_sink = flow_direction in {
             ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
@@ -10214,24 +10143,21 @@ class ToolRegistry:
         return finish(auth)
 
 
-_PROTECTED_RESULT_DOMAINS: Mapping[str, str] = MappingProxyType({
-    name: tool.result_domain for name, tool in core_policy_registry().tools.items()
+_PROTECTED_RESULT_DOMAINS: Mapping[str, str] = PolicyMappingView(lambda policy: {
+    name: tool.result_domain for name, tool in policy.tools.items()
     if tool.result_domain is not None
 })
 
 _ACP_HANDS_RESULT_SOURCE_KIND = "acp_hands_result"
-_ACP_HANDS_RESULT_TOOLS = frozenset(
-    name for name, tool in core_policy_registry().tools.items()
-    if "acp_hands_result_tools" in tool.memberships
-)
+_ACP_HANDS_RESULT_TOOLS = policy_membership("acp_hands_result_tools")
 
 # Independent semantic inventory for tools whose results come from a read
 # backend. Startup rejects drift toward SINK/NEITHER before it can suppress
 # result taint. MCP reads have equivalent adapter/resource parity checks in
 # MCPResourceAdapter.authorize_call.
-_READ_BACKEND_RESULT_TOOLS = frozenset(
-    name for name, tool in core_policy_registry().tools.items() if tool.read_backend
-)
+_READ_BACKEND_RESULT_TOOLS = PolicySetView(lambda policy: frozenset(
+    name for name, tool in policy.tools.items() if tool.read_backend
+))
 
 _SELF_AUTHORED_FILE_ROOTS = frozenset({
     ".mimir_builtin_skills",
@@ -11129,6 +11055,7 @@ def _log_retained_repository_failure(tool_name: str, result: Any, repository: st
         pass
 
 
+@scoped_policy_call(lambda bound: getattr(bound.arguments["authorization"], "policy", None))
 def classify_protected_result(
     tool_name: str,
     arguments: dict[str, Any] | None,
@@ -11151,6 +11078,15 @@ def classify_protected_result(
 
     from .models import InformationFlowLabels, SourceLabel
 
+    # Plugin responses are provider-controlled even for sink-only tools and
+    # claimed NON_INGESTING results; they never inherit core refusal exemptions.
+    registered = selected_policy_registry().tools.get(tool_name)
+    if registered is not None and registered.owner != "core":
+        return _incomplete_protected_result(
+            registered.result_domain or "unknown", arguments or {},
+            tool_name=tool_name, auth_context=auth_context,
+        )
+
     artifact = getattr(result, "artifact", None)
     if provenance is None and isinstance(artifact, ProtectedResultProvenance):
         provenance = artifact
@@ -11167,15 +11103,6 @@ def classify_protected_result(
         return acp_error_labels
 
     args = arguments or {}
-    registered = getattr(getattr(authorization, "policy", None), "tools", {}).get(tool_name)
-    if registered is not None and registered.owner != "core":
-        descriptor = registered.descriptor
-        if descriptor is not None and descriptor.result_origin & ResultOriginKind.NON_INGESTING:
-            return None
-        domain = registered.result_domain or "unknown"
-        return _incomplete_protected_result(
-            domain, args, tool_name=tool_name, auth_context=auth_context,
-        )
     retained_scope = getattr(auth_context, "retained_factory_scope", None)
     if (
         tool_name in {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
@@ -11573,20 +11500,19 @@ def get_tool_registry() -> ToolRegistry:
     return _global_tool_registry
 
 
-_TRUSTED_SERVICE_PRINCIPALS: Mapping[str, ServicePrincipal] = _core_profiles.service_principals
-_REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset(_TRUSTED_SERVICE_PRINCIPALS)
+_TRUSTED_SERVICE_PRINCIPALS: Mapping[str, ServicePrincipal] = PolicyMappingView(
+    lambda policy: policy.service_principals
+)
+_REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset(core_policy_registry().service_principals)
 
 
 # Executable capabilities and information-flow metadata are one policy.
-_OPERATION_READABLE_DOMAIN: Mapping[str, str] = MappingProxyType({
-    name: tool.readable_domain for name, tool in core_policy_registry().tools.items()
+_OPERATION_READABLE_DOMAIN: Mapping[str, str] = PolicyMappingView(lambda policy: {
+    name: tool.readable_domain for name, tool in policy.tools.items()
     if tool.readable_domain is not None
 })
 
-_SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset(
-    name for name, tool in core_policy_registry().tools.items()
-    if "saga_mutations" in tool.memberships
-)
+_SAGA_MUTATION_OPERATIONS = policy_membership("saga_mutations")
 
 
 class CapabilityMatrixError(Exception):
@@ -11814,6 +11740,7 @@ def _deepagents_builtin_tool_names() -> tuple[str, ...]:
     return tuple(tool.name for item in middleware for tool in item.tools)
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def assert_model_tool_inventory_cataloged(
     *,
     model_spec: str | None = None,
@@ -11824,7 +11751,7 @@ def assert_model_tool_inventory_cataloged(
     from .tools.registry import all_mimir_tools
     from .plugins.core import core_policy_registry
 
-    policy = policy if policy is not None else core_policy_registry()
+    policy = policy if policy is not None else selected_policy_registry()
     if not policy.frozen:
         raise CapabilityMatrixError("model tool inventory requires a frozen policy")
     catalog = get_operation_catalog()
@@ -11925,6 +11852,7 @@ def assert_model_tool_inventory_cataloged(
         )
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def resolve_access_control_enforcement(
     requested: bool,
     *,
@@ -11975,7 +11903,7 @@ def get_service_principal(
     trigger: str, *, policy: "PolicyRegistry | None" = None,
 ) -> ServicePrincipal | None:
     """Get a service principal by trigger."""
-    selected = policy if policy is not None else _core_profiles
+    selected = policy if policy is not None else selected_policy_registry()
     if policy is None:
         return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
     return selected.service_principals.get(trigger) if selected.frozen else None
@@ -12132,7 +12060,7 @@ def service_can_invoke_operation(
     *, policy: "PolicyRegistry | None" = None,
 ) -> bool:
     """Check an exact service capability and its declared flow constraints."""
-    selected = policy if policy is not None else _core_profiles
+    selected = policy if policy is not None else selected_policy_registry()
     if not selected.frozen or service is None or not service.has_capability(operation):
         return False
     if (policy is not None and operation not in selected.capabilities
@@ -12435,7 +12363,8 @@ def create_auth_context(
         and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
         and extra.get("poller_name") == "github-ci-watch"
         and registered_service is not None
-        and event.service_principal == registered_service.canonical == "poller:github-ci-watch"
+        and event.service_principal == registered_service.canonical
+        and registered_service.github_ci_watch
         and any(registered_service.has_capability(name) for name in (
             "ci_run_jobs", "ci_run", "ci_recent_runs",
         ))

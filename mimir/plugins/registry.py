@@ -57,6 +57,12 @@ _FLOW = frozenset({"source", "sink", "both", "neither"})
 _TIERS = frozenset({"scope-contained", "scoped-with-provenance", "code-execution", "unbounded"})
 _OPERATIONS = frozenset({"open", "resource_scoped", "admin_required"})
 _SCOPES = frozenset({"channel", "repo_pr"})
+# The executable profiles in access_control.parse_service_shell_argv_with_diagnostics.
+# Keep this inert: importing access_control here would cycle through core policy.
+_SHELL_PROFILES = frozenset({
+    "scheduler_read_only", "repo_review", "maintenance", "session_boundary",
+    "upgrade_workspace",
+})
 _REQUIRED_TOOL_FIELDS = frozenset({
     "name", "flow", "tier", "operation_class", "result_domain", "result_origin",
     "sink_category", "sink_destination", "sink_target_extractor",
@@ -213,6 +219,11 @@ class PolicyRegistry:
         name = _name(name, "tool")
         if name in self._tools:
             raise PolicyRegistrationError(f"duplicate tool: {name}")
+        if owner != "core" and name.startswith("mcp_"):
+            raise PolicyRegistrationError(f"{owner}: tool {name}: mcp_ prefix is reserved")
+        capability_owner = self._capabilities.get(name)
+        if capability_owner is not None and capability_owner != owner:
+            raise PolicyRegistrationError(f"{owner}: tool {name}: capability owned by {capability_owner}")
         if not isinstance(policy_only, bool) or (factory is None) == (not policy_only):
             raise PolicyRegistrationError(f"{name}: supply a factory or explicit policy_only=True")
         if factory is not None and not callable(factory):
@@ -257,6 +268,16 @@ class PolicyRegistry:
             or not result_origin & (ResultOriginKind.EXTERNAL | ResultOriginKind.REPOSITORY)
         ):
             raise PolicyRegistrationError(f"{owner}: tool {name}: read backend requires a protected ingesting result and source flow")
+        if owner != "core" and result_origin & ResultOriginKind.NON_INGESTING and (
+            flow != "sink"
+            or result_origin & (ResultOriginKind.EXTERNAL | ResultOriginKind.REPOSITORY)
+        ):
+            raise PolicyRegistrationError(f"{owner}: tool {name}: NON_INGESTING requires sink-only flow and no external or repository origin")
+        if owner != "core" and sink_category in {
+            SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK, SinkCategory.NOTIFICATION,
+            SinkCategory.EXTERNAL_MCP, SinkCategory.CROSS_CHANNEL, SinkCategory.FORGE,
+        } and not callable(sink_payload_extractor):
+            raise PolicyRegistrationError(f"{owner}: tool {name}: outbound sink requires a callable payload extractor")
         if service_sink_adapter is not None and not isinstance(service_sink_adapter, str):
             raise PolicyRegistrationError(f"{owner}: tool {name}: invalid service sink adapter")
         if result_domain is not None:
@@ -297,13 +318,13 @@ class PolicyRegistry:
         name = _name(name, "capability")
         if name in self._capabilities:
             raise PolicyRegistrationError(f"duplicate capability: {name}")
+        tool = self._tools.get(name)
+        if tool is not None and tool.owner != owner:
+            raise PolicyRegistrationError(f"{owner}: capability {name}: tool owned by {tool.owner}")
         declared_companions = frozenset(_name(item, "companion") for item in companions)
-        if declared_companions:
-            self._capability_companions[name] = declared_companions
         if legacy_service_sink_tier is not None:
             if owner != "core" or legacy_service_sink_tier not in _TIERS:
                 raise PolicyRegistrationError(f"{owner}: invalid legacy sink tier for {name}")
-            self._legacy_service_sink_tiers[name] = legacy_service_sink_tier
         if tier is not None:
             if tier not in _TIERS or owner != "core":
                 raise PolicyRegistrationError(f"{owner}: capability {name}: invalid core-only tier")
@@ -312,6 +333,13 @@ class PolicyRegistry:
                 raise PolicyRegistrationError(
                     f"{owner}: capability {name}: tier {tier} conflicts with tool tier {tool.tier}"
                 )
+        # Publish only after every check: a rejected collision must not leave
+        # companion or sink-tier grants behind in a still-writable registry.
+        if declared_companions:
+            self._capability_companions[name] = declared_companions
+        if legacy_service_sink_tier is not None:
+            self._legacy_service_sink_tiers[name] = legacy_service_sink_tier
+        if tier is not None:
             self._capability_tiers[name] = tier
         self._capabilities[name] = owner
 
@@ -328,6 +356,14 @@ class PolicyRegistry:
         name = _name(name, "profile")
         if name in self._profiles:
             raise PolicyRegistrationError(f"duplicate profile: {name}")
+        if owner != "core":
+            for field_name, value, default in (
+                ("builtin_trigger_config", builtin_trigger_config, None),
+                ("fetch_url_policy", fetch_url_policy, None),
+                ("pr_review_scope", pr_review_scope, False),
+            ):
+                if value != default:
+                    raise PolicyRegistrationError(f"{owner}: plugin profile cannot declare {field_name}")
         self._profiles[name] = AuthorityProfile(
             name, owner, frozenset(capabilities), frozenset(bounded_capabilities),
             MappingProxyType({key: frozenset(values) for key, values in (capability_companions or {}).items()}),
@@ -340,7 +376,14 @@ class PolicyRegistry:
         profile = _name(profile, "profile")
         if profile in self._shell_profiles:
             raise PolicyRegistrationError(f"duplicate shell profile mapping: {profile}")
-        self._shell_profiles[profile] = _name(shell_profile, "shell profile")
+        if owner != "core" and (
+            profile not in self._profiles or self._profiles[profile].owner != owner
+        ):
+            raise PolicyRegistrationError(f"{owner}: cannot map foreign profile {profile}")
+        shell_profile = _name(shell_profile, "shell profile")
+        if shell_profile not in _SHELL_PROFILES:
+            raise PolicyRegistrationError(f"unknown shell profile: {shell_profile}")
+        self._shell_profiles[profile] = shell_profile
 
     def register_operator_shell_profile(self, shell_profile: str, *, owner: str = "core") -> None:
         self._writable()
@@ -348,7 +391,10 @@ class PolicyRegistry:
             raise PolicyRegistrationError(f"{owner}: operator shell profile is core-only")
         if self._operator_shell_profile is not None:
             raise PolicyRegistrationError("duplicate operator shell profile")
-        self._operator_shell_profile = _name(shell_profile, "operator shell profile")
+        shell_profile = _name(shell_profile, "operator shell profile")
+        if shell_profile not in _SHELL_PROFILES:
+            raise PolicyRegistrationError(f"unknown shell profile: {shell_profile}")
+        self._operator_shell_profile = shell_profile
 
     def register_service_principal(self, principal: Any, *, owner: str = "core") -> None:
         self._writable()
@@ -380,6 +426,33 @@ class PolicyRegistry:
             raise PolicyRegistrationError(f"{owner}: invalid principal read roots")
         trigger = _name(getattr(principal, "trigger", None), "principal trigger")
         canonical = _name(getattr(principal, "canonical", None), "principal canonical")
+        if owner != "core":
+            prefix = f"plugin:{owner}:"
+            if any(not value.startswith(prefix) or not value[len(prefix):]
+                   or ":" in value[len(prefix):]
+                   or value[len(prefix):] != value[len(prefix):].strip()
+                   for value in (trigger, canonical)):
+                raise PolicyRegistrationError(f"{owner}: principal canonical and trigger must use {prefix}<local>")
+            if principal.sink_policies:
+                raise PolicyRegistrationError(f"{owner}: plugin principal cannot declare raw sink_policies")
+            restricted_defaults = {
+                "filesystem_read_roots": (), "declared_shell_commands": (),
+                "owned_skill_directory": None, "channel_memory_directory": None,
+                "configured_delivery_channel": None,
+            }
+            for field_name, default in restricted_defaults.items():
+                if getattr(principal, field_name) != default:
+                    raise PolicyRegistrationError(f"{owner}: plugin principal cannot declare {field_name}")
+            for field_name in (
+                "saga_full_corpus_read", "github_activity",
+                "worklink_retained_checkout", "github_ci_watch",
+            ):
+                if getattr(principal, field_name, False) is not False:
+                    raise PolicyRegistrationError(f"{owner}: plugin principal cannot declare {field_name}")
+            if principal.proposal_surface != "wiki":
+                raise PolicyRegistrationError(f"{owner}: plugin principal cannot declare proposal_surface")
+            if principal.capability_tier is not None:
+                raise PolicyRegistrationError(f"{owner}: plugin principal tier is derived from capabilities")
         if trigger in self._principals or any(p.canonical == canonical for p in self._principals.values()):
             raise PolicyRegistrationError(f"duplicate service principal: {trigger} ({canonical})")
         self._principals[trigger] = principal
@@ -389,6 +462,7 @@ class PolicyRegistry:
         self._writable()
         from mimir.models import RepoPRAction
         from mimir.tool_descriptors import SinkCategory, validate_tool_descriptors
+        from .core import CapabilityTier, ServiceSinkPolicy
 
         service_adapters = {
             SinkCategory.FILE: "trigger_service_write_roots",
@@ -456,17 +530,53 @@ class PolicyRegistry:
         for profile in self._shell_profiles:
             if profile not in self._profiles:
                 raise PolicyRegistrationError(f"unknown shell authority profile: {profile}")
+        derived_principals = {}
         for trigger, principal in self._principals.items():
             profile = getattr(principal, "authority_profile", None)
             if profile is not None and profile not in self._profiles:
                 raise PolicyRegistrationError(f"{trigger}: unknown authority profile {profile}")
-            if self._principal_owners[trigger] != "core":
-                if profile is None or not set(principal.capabilities) <= self._profiles[profile].capabilities:
+            owner = self._principal_owners[trigger]
+            if owner != "core":
+                if profile is None or self._profiles[profile].owner != owner:
+                    raise PolicyRegistrationError(f"{trigger}: plugin principal requires its own authority profile")
+                if not set(principal.capabilities) <= self._profiles[profile].capabilities:
                     raise PolicyRegistrationError(f"{trigger}: principal capabilities outside profile")
                 if not principal.capabilities or not principal.readable_domains or not principal.sink_destinations:
                     raise PolicyRegistrationError(f"{trigger}: incomplete service principal")
                 if not principal.creation_path:
                     raise PolicyRegistrationError(f"{trigger}: missing principal creation path")
+                policies = []
+                tiers = []
+                for capability in principal.capabilities:
+                    tool = self._tools.get(capability)
+                    if tool is None or tool.owner != owner or self._capabilities.get(capability) != owner:
+                        raise PolicyRegistrationError(f"{trigger}: principal capability {capability} is not its own tool")
+                    tiers.append(tool.tier)
+                    descriptor = tool.descriptor
+                    if descriptor is None or descriptor.sink_category is None:
+                        continue
+                    if descriptor.sink_destination not in principal.sink_destinations:
+                        raise PolicyRegistrationError(f"{trigger}: missing declared sink destination for {capability}")
+                    adapter = tool.service_sink_adapter
+                    if adapter is None:
+                        raise PolicyRegistrationError(f"{trigger}: sink {capability} requires a service sink adapter")
+                    bound = {
+                        # Static plugin principals cannot mint filesystem roots.
+                        "trigger_service_write_roots": "[]",
+                        "approved_urls": "MIMIR_EGRESS_APPROVED_URLS",
+                        "operator_alert": "MIMIR_OPERATOR_ALERT_CHANNEL",
+                        "shell_profile": self._shell_profiles.get(profile, "scheduler_read_only"),
+                        "spawn_workspace": "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                    }[adapter]
+                    policies.append(ServiceSinkPolicy(capability, adapter, bound))
+                tier_order = (
+                    "scope-contained", "scoped-with-provenance", "code-execution", "unbounded",
+                )
+                derived_principals[trigger] = replace(
+                    principal, sink_policies=tuple(policies),
+                    capability_tier=CapabilityTier(max(tiers, key=tier_order.index)),
+                )
+        self._principals.update(derived_principals)
         self._frozen = True
         return self
 
@@ -475,6 +585,9 @@ class PolicyRegistrar:
     """A plugin's restricted registration surface; it cannot edit core records."""
 
     def __init__(self, registry: PolicyRegistry, plugin: str) -> None:
+        plugin = _name(plugin, "plugin")
+        if plugin == "core":
+            raise PolicyRegistrationError("plugin name 'core' is reserved")
         self._registry = registry
         self.plugin = plugin
 

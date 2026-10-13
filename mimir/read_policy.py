@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .secret_scan import contains_secret
-from .plugins.core import core_policy_registry
+from .plugins.core import policy_membership
 
 if TYPE_CHECKING:
     from .tools.refusals import ToolPolicyRefusal
@@ -27,10 +27,7 @@ _BASIC_AUTH_URL_PATTERN = re.compile(
 )
 
 
-READ_RESOURCE_OPERATIONS = frozenset(
-    name for name, tool in core_policy_registry().tools.items()
-    if "read_resource_operations" in tool.memberships
-)
+READ_RESOURCE_OPERATIONS = policy_membership("read_resource_operations")
 
 
 @lru_cache(maxsize=1)

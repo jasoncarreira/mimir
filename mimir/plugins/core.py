@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
+from collections.abc import Callable, Iterator, Mapping, Set
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import lru_cache, wraps
+from inspect import iscoroutinefunction, signature
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib import import_module
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:
     from .registry import PolicyRegistry
@@ -51,6 +55,9 @@ class ServicePrincipal:
     declared_shell_commands: tuple[DeclaredShellCommand, ...] = ()
     configured_delivery_channel: str | None = None
     proposal_surface: str = "wiki"
+    github_activity: bool = False
+    worklink_retained_checkout: bool = False
+    github_ci_watch: bool = False
 
     def can_read_domain(self, domain: str) -> bool:
         return domain in self.readable_domains
@@ -63,6 +70,120 @@ class ServicePrincipal:
 
     def sink_policy_for(self, operation: str) -> ServiceSinkPolicy | None:
         return next((policy for policy in self.sink_policies if policy.operation == operation), None)
+
+
+_selected_policy: ContextVar[PolicyRegistry | None] = ContextVar(
+    "selected_runtime_policy", default=None,
+)
+_V = TypeVar("_V")
+
+
+def selected_policy_registry() -> PolicyRegistry:
+    """Read context-local policy; constructing a Config never changes this."""
+    policy = _selected_policy.get()
+    return policy if policy is not None else core_policy_registry()
+
+
+@contextmanager
+def policy_scope(policy: PolicyRegistry | None = None) -> Iterator[PolicyRegistry]:
+    """Select a frozen policy for one operation/turn, restoring it on every exit."""
+    selected = policy if policy is not None else selected_policy_registry()
+    if not selected.frozen:
+        raise ValueError("runtime policy selection requires a frozen policy")
+    token = _selected_policy.set(selected)
+    try:
+        yield selected
+    finally:
+        _selected_policy.reset(token)
+
+
+def scoped_policy_call(select: Callable[..., Any]) -> Callable[..., Any]:
+    """Scope a sync/async API using its bound arguments, resetting on every exit."""
+    def decorate(function: Callable[..., Any]) -> Callable[..., Any]:
+        call_signature = signature(function)
+        if iscoroutinefunction(function):
+            @wraps(function)
+            async def async_call(*args: Any, **kwargs: Any) -> Any:
+                with policy_scope(select(call_signature.bind(*args, **kwargs))):
+                    return await function(*args, **kwargs)
+            return async_call
+
+        @wraps(function)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            with policy_scope(select(call_signature.bind(*args, **kwargs))):
+                return function(*args, **kwargs)
+        return call
+    return decorate
+
+
+class PolicyMappingView(Mapping[str, _V]):
+    """Read-only live projection, safe even when imported before selection."""
+
+    def __init__(self, project: Callable[[PolicyRegistry], Mapping[str, _V]]) -> None:
+        self._project = project
+
+    def __getitem__(self, key: str) -> _V:
+        return self._project(selected_policy_registry())[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._project(selected_policy_registry()))
+
+    def __len__(self) -> int:
+        return len(self._project(selected_policy_registry()))
+
+    def items(self):
+        return self._project(selected_policy_registry()).items()
+
+    def keys(self):
+        return self._project(selected_policy_registry()).keys()
+
+    def values(self):
+        return self._project(selected_policy_registry()).values()
+
+
+class PolicySetView(Set[str]):
+    """Context-local immutable set projection with ordinary set algebra."""
+
+    def __init__(self, project: Callable[[PolicyRegistry], Any]) -> None:
+        self._project = project
+
+    def __contains__(self, value: object) -> bool:
+        return value in self._project(selected_policy_registry())
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._project(selected_policy_registry()))
+
+    def __len__(self) -> int:
+        return len(self._project(selected_policy_registry()))
+
+    @classmethod
+    def _from_iterable(cls, iterable):
+        return frozenset(iterable)
+
+    def union(self, *others):
+        return frozenset(self).union(*others)
+
+    def intersection(self, *others):
+        return frozenset(self).intersection(*others)
+
+    def difference(self, *others):
+        return frozenset(self).difference(*others)
+
+
+def policy_membership(name: str) -> PolicySetView:
+    return PolicySetView(lambda policy: frozenset(
+        tool_name for tool_name, tool in policy.tools.items() if name in tool.memberships
+    ))
+
+
+# Reserved historical poller semantics are server declarations, never manifest
+# input; registry validation must reject these flags on plugin principals.
+def core_poller_flags(canonical: str) -> dict[str, bool]:
+    return {
+        "github_activity": canonical == "poller:github-activity",
+        "worklink_retained_checkout": canonical == "poller:worklink-ready-queue",
+        "github_ci_watch": canonical == "poller:github-ci-watch",
+    }
 
 
 def _names(value: str) -> frozenset[str]:
@@ -281,6 +402,48 @@ _TYPED_ERROR_SIGNAL = _names("""bash_job_output fetch_url get_turn mimir_get_tur
     shell_exec web_search worklink_run""")
 
 
+# Typed actions are inert model values, not imports of the forge/repo tools.
+from mimir.models import RepoPRAction
+
+_FORGE_ACTIONS = {
+    **{name: RepoPRAction.INSPECT for name in _names("""pr_metadata pr_spec pr_files
+        pr_diff pr_file_content pr_checks pr_job_log pr_reviews pr_comments
+        pr_review_requests""")},
+    "pr_submit_review": RepoPRAction.PR_REVIEW,
+    "pr_inline_review_comment": RepoPRAction.PR_REVIEW,
+    "pr_comment": RepoPRAction.PR_COMMENT,
+    "pr_edit_body": RepoPRAction.PR_EDIT,
+    "pr_rerequest_review": RepoPRAction.PR_REREQUEST,
+    "unsupported_operation": None,
+}
+_REPO_ACTIONS = {
+    **{name: RepoPRAction.CHECKOUT for name in _names("repo_checkout repo_cleanup repo_fetch")},
+    **{name: RepoPRAction.INSPECT for name in _names("repo_status repo_diff repo_unmerged")},
+    "repo_test": RepoPRAction.TEST,
+    **{name: RepoPRAction.WRITE for name in _names("repo_stage repo_merge_abort repo_rebase_abort repo_revert_abort")},
+    **{name: RepoPRAction.COMMIT for name in _names("repo_commit repo_merge repo_rebase repo_revert")},
+    "repo_push": RepoPRAction.PUSH,
+}
+_RETAINED_REPO_TOOLS = _names("repo_status repo_diff repo_test repo_stage repo_commit")
+# Mutation potential is descriptive metadata, not a replacement for historical
+# target-aware vetoes (e.g. scratch file writes remain permitted).
+_WRITES_CODE_OR_STATE = (
+    _TAINTED_FILE_WRITES | _SAGA_MUTATIONS | _SCHEDULE_WRITES | _WRITE_RESOURCE_OPERATIONS
+    | _names("""Write Edit repo_checkout repo_cleanup repo_fetch repo_test repo_stage
+        repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort
+        repo_revert repo_revert_abort repo_push memory_propose open_proposal
+        submit_proposal abandon_proposal rebuild_index reload_pollers
+        commitment_complete commitment_snooze commitment_dismiss request_mimir_update
+        shell_exec bash_async spawn_open_code Bash bash bash_exec execute aexecute
+        shell hands_edit hands_shell hands_python download_files adownload_files
+        approve_declassification write_todos defer_injected_message task
+        pr_submit_review pr_inline_review_comment pr_comment pr_edit_body
+        issue_comment pr_rerequest_review hands_request_scope send_message react
+        post_message webhook ntfy_send operator_alert harness_auto_deliver
+        harness_resend_nudge activity_panel_post activity_panel_edit""")
+)
+
+
 # The order is the historical model-bound tool order. A module/collection is
 # resolved only when its surface is selected; in particular the coding modules
 # must not be imported by a core-only policy or tool inventory.
@@ -375,6 +538,9 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             ("standing_review", _STANDING_REVIEW),
             ("remediation_effect", _REMEDIATION_EFFECT),
             ("typed_error_signal", _TYPED_ERROR_SIGNAL),
+            ("forge_actions", _FORGE_ACTIONS),
+            ("repo_actions", _REPO_ACTIONS),
+            ("retained_repo_tools", _RETAINED_REPO_TOOLS),
         ):
             if name in names:
                 memberships.add(member)
@@ -395,11 +561,12 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             git_operation_result=descriptor.git_operation_result,
             ifc_delegation=descriptor.ifc_delegation,
             budget_exempt=descriptor.budget_exempt,
-            writes_code_or_state=False,
+            writes_code_or_state=name in _WRITES_CODE_OR_STATE,
             profiles=tuple(profile for profile, names in _PROFILES.items() if name in names),
             read_backend=name in _READ_BACKEND,
             readable_domain=readable_domains.get(name),
             memberships=memberships,
+            typed_action=_FORGE_ACTIONS.get(name, _REPO_ACTIONS.get(name)),
         )
 
     # Framework aliases and native operations without descriptors still require
@@ -431,6 +598,9 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             ("standing_review", _STANDING_REVIEW),
             ("remediation_effect", _REMEDIATION_EFFECT),
             ("typed_error_signal", _TYPED_ERROR_SIGNAL),
+            ("forge_actions", _FORGE_ACTIONS),
+            ("repo_actions", _REPO_ACTIONS),
+            ("retained_repo_tools", _RETAINED_REPO_TOOLS),
         ):
             if name in names:
                 memberships.add(member)
@@ -441,9 +611,10 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             result_domain=result_domains.get(name), result_origin=ResultOriginKind.NONE,
             sink_category=None, sink_destination=None,
             sink_target_extractor=None, sink_payload_extractor=None,
-            writes_code_or_state=False, profiles=(), read_backend=name in _READ_BACKEND,
+            writes_code_or_state=name in _WRITES_CODE_OR_STATE, profiles=(), read_backend=name in _READ_BACKEND,
             readable_domain=readable_domains.get(name),
             memberships=memberships,
+            typed_action=_FORGE_ACTIONS.get(name, _REPO_ACTIONS.get(name)),
         )
 
     # Native file-write aliases have no core descriptor or flow declaration, but
@@ -454,7 +625,7 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             flow=None, tier=None, operation_class=None, result_domain=None,
             result_origin=ResultOriginKind.NONE, sink_category=None,
             sink_destination=None, sink_target_extractor=None,
-            sink_payload_extractor=None, writes_code_or_state=False,
+            sink_payload_extractor=None, writes_code_or_state=name in _WRITES_CODE_OR_STATE,
             profiles=(), read_backend=False, memberships={"tainted_file_writes"},
         )
 

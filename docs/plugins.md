@@ -45,11 +45,37 @@ membership. Resource-scoped plugin tools declare a channel or repo/PR scope;
 repo/PR tools also need an existing typed action. Missing metadata fails boot.
 Plugins can add their own tools to existing profiles or define new profiles,
 capabilities, shell mappings and trusted service principals; they cannot
-change core tool policy or remove core memberships. No per-tool grant is needed:
-profile eligibility remains subject to the existing authorization checks.
+change core tool policy or remove core memberships. New plugin profiles and
+static plugin principals can grant only that provider's own registered tools.
+A plugin principal's canonical name and trigger must each use
+`plugin:<owner>:<local>` (a nonempty local component without colons), and its
+authority profile must belong to the same provider. Sink policies and capability
+tier are derived from tool declarations: principals cannot supply raw
+`sink_policies`, filesystem roots, tier overrides, or privileged core flags.
+No per-tool grant is needed: profile eligibility remains subject to the existing
+authorization checks.
 
-Startup preflights fail closed by plugin name; per-turn preflights run before
-prompt and tools and also fail closed. Shutdown hooks run in order, isolated
-from one another, before the clean-shutdown marker. Health contributions are
-namespaced and cannot take down `/health`. Coding remains in core in epic 1;
-other contribution points and moving coding to Cultivate are later epics.
+## Lifecycle hooks
+
+The object returned by the entry point may expose these optional **attributes**
+alongside `register(registrar)`; there is no separate lifecycle registration API:
+
+| Attribute / signature | Contract |
+| --- | --- |
+| `startup_preflight(bundle)` | Receives the published agent runtime bundle before bridges and background startup work begin. A raised exception or the literal result `False` rejects startup by plugin name and triggers compensating teardown. |
+| `turn_preflight(event, auth_context)` | Receives the inbound `AgentEvent` and server-prepared authorization context before approval handling, prompt assembly, or the model/tool runner. A raised exception or the literal result `False` rejects the turn by plugin name. |
+| `shutdown()` | Runs in enabled-provider order before the runtime bundle closes and the clean-shutdown marker is written. Called at most once, including startup compensation; failures are logged and do not skip later providers or core teardown. |
+| `health()` | Returns a `dict` of identifier-style string field names to finite JSON-serializable numeric (`int`, `float`) or boolean values. Contributions appear under `/health`'s `plugins[plugin_name]`. Strings, nested objects, non-finite numbers, and other invalid results are rejected. |
+
+Hooks may be synchronous or asynchronous; returned awaitables are awaited.
+Preflights have no manager-level timeout. Only the literal `False` rejects a
+preflight result (`None` is a normal successful return). Shutdown and health
+calls have a **5-second timeout** per invocation/await: synchronous calls run
+in a worker thread, and an awaitable returned by a synchronous call gets its
+own 5-second bound. Timing out a worker does not forcibly stop its thread.
+Health hook lookup, execution, timeout, or validation failures produce only
+`{"error": "health contributor failed"}` in that provider's namespace, without
+exposing exception details or taking down `/health`.
+
+Coding remains in core in epic 1; other contribution points and moving coding
+to Cultivate are later epics.

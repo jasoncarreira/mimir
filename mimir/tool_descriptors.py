@@ -434,9 +434,9 @@ def validate_tool_descriptors(
         )
 
 
-from .plugins.core import core_policy_registry
+from .plugins.core import PolicyMappingView
 
-TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = core_policy_registry().descriptors
+TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = PolicyMappingView(lambda policy: policy.descriptors)
 validate_tool_descriptors()
 
 
@@ -444,7 +444,5 @@ def get_tool_descriptor(tool_name: str, *, policy: Any = None) -> ToolDescriptor
     if policy is not None:
         if not policy.frozen:
             raise ValueError("descriptor lookup requires a frozen policy")
-        declared = policy.tools.get(tool_name)
-        if declared is not None:
-            return declared.descriptor
+        return policy.descriptors.get(tool_name)
     return TOOL_DESCRIPTORS.get(tool_name)

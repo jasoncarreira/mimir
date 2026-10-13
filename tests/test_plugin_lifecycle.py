@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -49,6 +49,44 @@ async def test_startup_preflight_fails_named_and_compensates_before_bundle_close
     assert control.events.index("plugin:shutdown") < control.events.index("bundle:close")
     assert "liveness:clean" not in control.events
     await _run_cleanup(app)
+    assert control.events.count("plugin:shutdown") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook_kind", ["sync", "async"])
+async def test_startup_preflight_false_rejects_and_compensates(tmp_path, monkeypatch, hook_kind):
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    seen = []
+
+    def reject(bundle):
+        seen.append(bundle)
+        control.hit("plugin:preflight")
+        return False
+
+    async def reject_async(bundle):
+        return reject(bundle)
+
+    provider = SimpleNamespace(
+        startup_preflight=reject_async if hook_kind == "async" else reject,
+        shutdown=lambda: control.hit("plugin:shutdown"),
+    )
+    _install(app["plugin_manager"], provider)
+    try:
+        with pytest.raises(RuntimeError, match="provider-0.*startup preflight") as error:
+            await _run_startup(app)
+        assert isinstance(error.value.__cause__, ValueError)
+        assert str(error.value.__cause__) == "preflight returned False"
+        assert seen == [control.bundle]
+        assert control.dispatcher._run_turn is None
+        assert control.turns == []
+        assert "bridges:connect" not in control.events
+        assert "indexer:start" not in control.events
+        assert control.events.count("plugin:shutdown") == 1
+        assert control.events.index("plugin:preflight") < control.events.index("plugin:shutdown")
+        assert control.events.index("plugin:shutdown") < control.events.index("bundle:close")
+        assert "liveness:clean" not in control.events
+    finally:
+        await _run_cleanup(app)
     assert control.events.count("plugin:shutdown") == 1
 
 
@@ -184,6 +222,61 @@ async def test_shared_turn_preflight_blocks_reply_and_prompt(tmp_path, monkeypat
     with pytest.raises(RuntimeError, match="provider-0.*turn preflight"):
         await agent.run_turn(event)
     assert calls == [(content, "ch")]
+    assert [(e["phase"], e.get("status")) for e in panel_events] == [
+        ("start", None), ("end", "error"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook_kind", ["sync", "async"])
+@pytest.mark.parametrize("content", ["approve update-abcd", "ordinary turn"])
+async def test_turn_preflight_false_never_runs_turn_runner(
+    tmp_path, monkeypatch, hook_kind, content,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    agent = _make_agent(tmp_path)
+    agent._config.access_control_enforced = False
+    seen = []
+    panel_events = []
+    agent._turn_event_bus = SimpleNamespace(publish=panel_events.append)
+
+    def reject(event, auth_context):
+        seen.append((event, auth_context))
+        return False
+
+    async def reject_async(event, auth_context):
+        return reject(event, auth_context)
+
+    _install(agent._config.plugin_manager, SimpleNamespace(
+        turn_preflight=reject_async if hook_kind == "async" else reject,
+    ))
+    # Leave run_turn and _run_turn_body intact: observe the actual graph runner
+    # boundary, not a substituted turn body that can fail for unrelated reasons.
+    stream = Mock(side_effect=AssertionError("actual turn runner entered"))
+    build_agent = AsyncMock(return_value=SimpleNamespace(astream=stream))
+    build_prompt = AsyncMock(return_value=("test prompt", []))
+    monkeypatch.setattr(agent, "_build_agent_if_needed", build_agent)
+    monkeypatch.setattr(agent, "_build_turn_prompt", build_prompt)
+    approval_sync = Mock()
+    pairing_sync = Mock()
+    monkeypatch.setattr("mimir.operator_approval._is_authenticated_operator", lambda *a, **kw: True)
+    monkeypatch.setattr("mimir.memory_proposals.sync_pending", approval_sync)
+    monkeypatch.setattr("mimir.pairing_approval.sync_pending", pairing_sync)
+    event = AgentEvent(trigger="user_message", channel_id="ch", content=content)
+    try:
+        with pytest.raises(RuntimeError, match="provider-0.*turn preflight") as error:
+            await agent.run_turn(event)
+        assert isinstance(error.value.__cause__, ValueError)
+        assert str(error.value.__cause__) == "preflight returned False"
+    finally:
+        stream.assert_not_called()
+    build_agent.assert_not_awaited()
+    build_prompt.assert_not_awaited()
+    approval_sync.assert_not_called()
+    pairing_sync.assert_not_called()
+    assert len(seen) == 1
+    assert seen[0][0] is event
+    assert seen[0][1].channel_id == "ch"
     assert [(e["phase"], e.get("status")) for e in panel_events] == [
         ("start", None), ("end", "error"),
     ]

@@ -61,7 +61,7 @@ import yaml
 from ..env import env_bool
 from ..event_logger import emit_event_background as _emit_event_sync
 from ..models import AuthContext, InformationFlowState
-from ..plugins.core import core_policy_registry
+from ..plugins.core import policy_membership, scoped_policy_call, selected_policy_registry
 from ..redaction import redact_text
 from ..tool_descriptors import (
     FetchAuthorizationKind,
@@ -121,25 +121,17 @@ from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
 log = logging.getLogger(__name__)
 
-def _core_membership(name: str) -> frozenset[str]:
-    return frozenset(
-        tool_name for tool_name, tool in core_policy_registry().tools.items()
-        if name in tool.memberships
-    )
-
-
 def _plugin_tool(tool_name: str, policy: Any) -> Any:
-    registered = policy.tools.get(tool_name) if policy is not None else None
+    selected = policy if policy is not None else selected_policy_registry()
+    registered = selected.tools.get(tool_name)
     return registered if registered is not None and registered.owner != "core" else None
 
 
 def _descriptor_for_policy(tool_name: str, policy: Any = None) -> Any:
-    if policy is not None and _plugin_tool(tool_name, policy) is not None:
-        return get_tool_descriptor(tool_name, policy=policy)
-    return get_tool_descriptor(tool_name)
+    return get_tool_descriptor(tool_name, policy=policy)
 
 
-_STANDING_REVIEW_TOOLS = _core_membership("standing_review")
+_STANDING_REVIEW_TOOLS = policy_membership("standing_review")
 _TOOL_EVENT_ARGUMENT_ALLOWLIST = (
     "command",
     "path",
@@ -166,10 +158,11 @@ _SPAWN_OPEN_CODE_ERROR_STATUSES = frozenset({
     "prompt_refused", "containment_unavailable", "timeout", "output_overflow",
     "authentication_required", "failed", "proposal_unavailable",
 })
-_TYPED_ERROR_SIGNAL_TOOLS = _core_membership("typed_error_signal")
-_REMEDIATION_EFFECT_TOOLS = _core_membership("remediation_effect")
+_TYPED_ERROR_SIGNAL_TOOLS = policy_membership("typed_error_signal")
+_REMEDIATION_EFFECT_TOOLS = policy_membership("remediation_effect")
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def _resolve_standing_review(
     tool_name: str,
     auth_context: AuthContext | None,
@@ -179,8 +172,7 @@ def _resolve_standing_review(
 ) -> str | None:
     """Resolve safe review authority before resource and IFC authorization."""
     if (
-        (tool_name not in _STANDING_REVIEW_TOOLS
-         and not _plugin_membership(tool_name, "standing_review", policy))
+        tool_name not in _STANDING_REVIEW_TOOLS
         or auth_context is None
         or not isinstance(arguments, Mapping)
     ):
@@ -305,6 +297,7 @@ def _emit_hard_boundary_denied(
     )
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def _record_tool_outcome(
     tool_name: str,
     *,
@@ -336,9 +329,7 @@ def _record_tool_outcome(
             reason="unsupported_operation",
         )
         return
-    if tool_name not in _REMEDIATION_EFFECT_TOOLS and not _plugin_membership(
-        tool_name, "remediation_effect", policy,
-    ):
+    if tool_name not in _REMEDIATION_EFFECT_TOOLS:
         return
     active_turn = _get_current_turn_context()
     effects = getattr(active_turn, "remediation_effects", None)
@@ -490,14 +481,10 @@ def _extract_sink_targets(
     """Return every independently writable destination in a tool call."""
     tool_name = _tool_name_from_request(request)
     args = (getattr(request, "tool_call", None) or {}).get("args") or {}
-    registered = policy.tools.get(tool_name) if policy is not None else None
-    descriptor = (
-        registered.descriptor if registered is not None and registered.owner != "core"
-        else get_tool_descriptor(tool_name)
-    )
+    descriptor = _descriptor_for_policy(tool_name, policy)
     extractor = descriptor.sink_target_extractor if descriptor is not None else None
     if callable(extractor):
-        if registered is not None and registered.owner != "core":
+        if _plugin_tool(tool_name, policy) is not None:
             try:
                 return list(extractor(tool_name, args, auth_context))
             except (TypeError, ValueError, KeyError, IndexError):
@@ -879,12 +866,7 @@ def _outbound_privacy_refusal(
 ) -> str | None:
     """Scan an external write and emit value-free shadow or denial evidence."""
     descriptor_name, _ = _outbound_privacy_tool_name(tool_name)
-    registered = policy.tools.get(descriptor_name) if policy is not None else None
-    descriptor = (
-        get_tool_descriptor(descriptor_name, policy=policy)
-        if registered is not None and registered.owner != "core"
-        else get_tool_descriptor(descriptor_name)
-    )
+    descriptor = _descriptor_for_policy(descriptor_name, policy)
     extractor = descriptor.sink_payload_extractor if descriptor is not None else None
     texts: tuple[str, ...] = ()
     if callable(extractor):
@@ -2780,16 +2762,11 @@ def _execute_declassification_action(
     )
 
 
-def _plugin_membership(tool_name: str, membership: str, policy: Any) -> bool:
-    registered = _plugin_tool(tool_name, policy)
-    return registered is not None and membership in registered.memberships
-
-
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def _returned_value_is_error(tool_name: str, content: Any, *, policy: Any = None) -> bool:
     """Recognize required typed-result fields for tools not yet returning typed errors."""
     text = content if isinstance(content, str) else str(content)
-    if (tool_name not in _TYPED_ERROR_SIGNAL_TOOLS
-            and not _plugin_membership(tool_name, "typed_error_signal", policy)) and text.startswith(
+    if tool_name not in _TYPED_ERROR_SIGNAL_TOOLS and text.startswith(
         (f"{tool_name} failed", f"{tool_name} refused", f"{tool_name} timed out")
     ):
         return True
@@ -3493,10 +3470,7 @@ def _prepare_tool_call_execution(
         return _tool_call_refusal(
             call, review_denial, arguments=arguments, record_outcome=True,
         )
-    if arguments is None and (
-        tool_name in _STANDING_REVIEW_TOOLS
-        or _plugin_membership(tool_name, "standing_review", policy)
-    ):
+    if arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
         return _tool_call_refusal(
             call, _argument_validation_refusal(request), arguments=None,
             record_outcome=True,
@@ -4056,6 +4030,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return await handler(request)
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._policy)
     def wrap_tool_call(
         self,
         request: ToolCallRequest,
@@ -4103,6 +4078,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             _end_tool_execution(capture)
         return _finish_tool_result(call, capture, result)
 
+    @scoped_policy_call(lambda bound: bound.arguments["self"]._policy)
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,

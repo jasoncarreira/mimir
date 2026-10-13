@@ -54,7 +54,9 @@ class PluginManager:
                     continue
                 result = hook(bundle)
                 if inspect.isawaitable(result):
-                    await result
+                    result = await result
+                if result is False:
+                    raise ValueError("preflight returned False")
             except Exception as exc:
                 raise RuntimeError(f"plugin {name!r} startup preflight failed") from exc
 
@@ -67,7 +69,7 @@ class PluginManager:
                     continue
                 result = hook(event, auth_context)
                 if inspect.isawaitable(result):
-                    await result
+                    result = await result
             except Exception as exc:
                 raise RuntimeError(f"plugin {name!r} turn preflight failed") from exc
 
@@ -139,7 +141,14 @@ def load_plugins(*, enable: str) -> PluginManager:
     try:
         policy.freeze()
     except Exception as exc:
-        subject = str(exc).split(":", 1)[0]
+        # Principal triggers use plugin:<owner>:<local>; splitting at the first
+        # colon loses their identity and wrongly blames every selected provider.
+        message = str(exc)
+        subject = next(
+            (trigger for trigger in policy.service_principals
+             if message.startswith(f"{trigger}:")),
+            message.split(":", 1)[0],
+        )
         tool = policy.tools.get(subject)
         profile = policy.profiles.get(subject)
         owner = (tool.owner if tool is not None else
