@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from .history import Message, render_identity_context, render_recent_activity
 from .core_blocks import CoreBlock, render_core_section
@@ -266,6 +266,7 @@ def build_turn_prompt(
     auto_skill_block: tuple[str, str] | None = None,
     saga_session_id: str | None = None,
     channel_memory_block: str | None = None,
+    plugin_blocks: Mapping[str, tuple[tuple[str, str], ...]] | None = None,
     deliver_channel: str | None = None,
     trigger_authority_profile: str | None = None,
     trigger_capability_tier: str | None = None,
@@ -303,6 +304,10 @@ def build_turn_prompt(
         sections.append(rendered)
         section_sizes[label] = len(rendered)
 
+    def _add_plugins(section: str) -> None:
+        for name, body in (plugin_blocks or {}).get(section, ()):
+            _add_labeled(f"Plugin: {name}", body)
+
     if turn_scratch_path:
         _add_labeled(
             "Current turn scratch",
@@ -333,6 +338,7 @@ def build_turn_prompt(
     # return None from load_channel_memory and this section is suppressed.
     if channel_memory_block:
         _add_labeled("Channel context", channel_memory_block)
+    _add_plugins("channel_memory")
 
     if event.channel_id.lower().startswith(("poller:", "scheduler:")):
         from .channel_registry import OPERATOR_CHANNEL_SENTINEL, resolve_deliver_channel
@@ -432,6 +438,7 @@ def build_turn_prompt(
     # before it reads the conversation it's about to act on.
     if feedback_block:
         _add_labeled("Recent feedback signals", feedback_block)
+    _add_plugins("feedback")
 
     # Open change proposals (chainlink #337/#339/#344): a live nudge right next
     # to the feedback signals so the agent finishes/abandons an in-flight
@@ -439,12 +446,14 @@ def build_turn_prompt(
     # auto-clears the moment the proposal is submitted or abandoned.
     if core_proposals_block:
         _add_labeled("Open change proposals", core_proposals_block)
+    _add_plugins("core_proposals")
 
     # Recent session summaries (v0.4 §3): one rung wider than the message-
     # level recent activity. Placed before Recent activity so the agent
     # reads the session-level context first.
     if session_summaries_block:
         _add_labeled("Recent session summaries", session_summaries_block)
+    _add_plugins("session_summaries")
 
     # Resource usage: cost / cache hit rate / context utilization across
     # rolling windows. Same priority as the algedonic feedback channel —
@@ -456,6 +465,7 @@ def build_turn_prompt(
     # include the breakdown itself.
     if usage_block:
         _add_labeled("Resource usage", usage_block)
+    _add_plugins("usage")
 
     # Upcoming (FUTURE_WORK §12.1): feedforward — predictable events
     # the agent should know are coming (next-N scheduled ticks,
@@ -464,6 +474,7 @@ def build_turn_prompt(
     # agent reads "what's coming" before "what just happened."
     if upcoming_block:
         _add_labeled("Upcoming", upcoming_block)
+    _add_plugins("upcoming")
 
     # Upcoming commitments (Phase 3): active commitment records for
     # this channel (+ unbound). Sits right after `## Upcoming` because
@@ -473,6 +484,7 @@ def build_turn_prompt(
     # is how those hint-only commitments stay visible.
     if commitments_block:
         _add_labeled("Upcoming commitments", commitments_block)
+    _add_plugins("commitments")
 
     # Self-state (FUTURE_WORK §12.4): the homeostat's interpretation of
     # the four constraint layers (plan window / cost rate / S3-S4
@@ -481,6 +493,7 @@ def build_turn_prompt(
     # suppress S4 work.
     if self_state_block:
         _add_labeled("Self-state", self_state_block)
+    _add_plugins("self_state")
 
     if recent_list:
         rendered = render_recent_activity(
