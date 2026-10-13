@@ -4169,6 +4169,50 @@ def test_repo_wrapper_failure_classes_have_distinct_stable_codes(
         assert "local commit remains unpushed in preserved checkout" in str(refusal.value)
 
 
+def test_inactive_checkout_refusal_does_not_veto_next_lease_write(
+    repo_tools, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+    from langchain_core.messages import ToolMessage
+    from mimir import access_control
+    from mimir.access_control import ToolAuthorization, ToolRegistry
+    from mimir.tools import repo
+
+    _origin, _source, scope, state, _tools = repo_tools
+    lease = state.checkout_lease
+    auth = replace(_lineage_turn(scope, state), roles=("admin",))
+    runtime = SimpleNamespace(context=auth)
+    monkeypatch.setattr(repo, "_state", lambda *_args: state)
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{lease.path}:rw")
+    object.__setattr__(state, "checkout_lease", replace(
+        lease, expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    ))
+    capture = access_control.begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolPolicyRefusal, match="inactive_checkout") as refusal:
+            repo._execute(runtime, "owner/repo", 7, GitStatus())
+    finally:
+        provenance = access_control.end_protected_result_capture(capture)
+    assert provenance is not None and provenance.sources == ()
+    assert provenance.content_free_error == str(refusal.value)
+    labels = access_control.classify_protected_result(
+        "repo_status", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_status", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope),
+        result=ToolMessage(content=f"Error: {refusal.value}", tool_call_id="refusal", status="error"),
+        provenance=provenance, failed=True,
+    )
+    assert labels is None
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    object.__setattr__(state, "checkout_lease", lease)
+    target = lease.path / "tracked.txt"
+    decision = ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target),
+        arguments={"file_path": str(target)},
+    )
+    assert decision.allowed, decision.reason
+
+
 def test_repo_wrapper_git_stderr_redacts_embedded_remote_credential(
     repo_tools, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

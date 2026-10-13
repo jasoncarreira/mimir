@@ -2149,6 +2149,160 @@ def test_filesystem_error_requires_exact_nonempty_backend_attestation(tmp_path: 
         ),), content_free_error="not found")
 
 
+def test_repository_refusal_requires_exact_empty_fixed_error_attestation() -> None:
+    auth = _auth()
+    authorization = ToolAuthorization(
+        tool_name="repo_status", decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=True, repo_pr_action_scope=auth.repo_pr_action_scope,
+    )
+    fixed = "repository operation rejected (repository_git_failed) [inactive_checkout]: " \
+            "an active matching checkout lease is required"
+    source = protected_result_source(
+        auth, principal="outside", domain="repository", resource_id="remote",
+        bridge_instance="forge",
+    )
+    for provenance, content in (
+        (None, fixed),
+        (ProtectedResultProvenance(()), fixed),
+        (ProtectedResultProvenance((), fixed), fixed + "\nremote output"),
+        (ProtectedResultProvenance((source,), fixed), fixed),
+    ):
+        labels = classify_protected_result(
+            "repo_status", {"repository": "owner/repo", "pull_request": 7},
+            auth, authorization,
+            result=ToolMessage(content=content, tool_call_id="refusal", status="error"),
+            provenance=provenance, failed=True,
+        )
+        assert labels is not None and labels.has_untrusted_active_ingest
+    assert classify_protected_result(
+        "repo_status", {"repository": "owner/repo", "pull_request": 7},
+        auth, authorization,
+        result=ToolMessage(content=fixed, tool_call_id="refusal", status="error"),
+        provenance=ProtectedResultProvenance((), fixed), failed=True,
+    ) is None
+
+
+def test_interpolated_git_output_cannot_claim_fixed_pre_execution_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.repo_tools import GitRefusal, GitStatus
+    from mimir.tools import repo
+
+    auth, scope, _lease, _target, _ = _real_attested_lease(tmp_path)
+    monkeypatch.setattr(repo, "_state", lambda *_args: auth.repo_review_state)
+
+    class FailingGit:
+        execution_started = False
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def execute(self, _operation):
+            raise GitRefusal(
+                "inactive_checkout", "an active matching checkout lease is required; "
+                "remote says: denied", execution_started=False,
+            )
+
+    monkeypatch.setattr(repo, "RepoGitTools", FailingGit)
+    capture = begin_protected_result_capture()
+    try:
+        with pytest.raises(Exception, match="remote says: denied") as refusal:
+            repo._execute(SimpleNamespace(context=auth), "owner/repo", 7, GitStatus())
+    finally:
+        provenance = end_protected_result_capture(capture)
+    assert provenance is None
+    labels = classify_protected_result(
+        "repo_status", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_status", decision=OperationDecision.RESOURCE_SCOPED,
+                          allowed=True, repo_pr_action_scope=scope),
+        result=ToolMessage(content=f"Error: {refusal.value}", tool_call_id="git", status="error"),
+        provenance=provenance, failed=True,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+
+
+def test_git_started_cannot_publish_fixed_refusal_as_content_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.repo_tools import GitRefusal, GitStatus
+    from mimir.tools import repo
+
+    auth, scope, _lease, _target, _ = _real_attested_lease(tmp_path)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
+    # A failure before _state returns has no lease to attest. The execution
+    # phase alone must never turn even a matching fixed string into no ingest.
+    def failed_state(*_args):
+        raise GitRefusal(
+            "inactive_checkout", "an active matching checkout lease is required",
+            execution_started=True,
+        )
+
+    monkeypatch.setattr(repo, "_state", failed_state)
+    capture = begin_protected_result_capture()
+    try:
+        with pytest.raises(Exception, match="inactive_checkout") as refusal:
+            repo._execute(SimpleNamespace(context=auth), "owner/repo", 7, GitStatus())
+    finally:
+        provenance = end_protected_result_capture(capture)
+    assert provenance is None
+    labels = classify_protected_result(
+        "repo_status", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_status", decision=OperationDecision.RESOURCE_SCOPED,
+                          allowed=True, repo_pr_action_scope=scope),
+        result=ToolMessage(content=f"Error: {refusal.value}", tool_call_id="git", status="error"),
+        provenance=provenance, failed=True,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+
+
+@pytest.mark.parametrize("attested", [False, True])
+def test_git_output_failure_retains_failure_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attested: bool,
+) -> None:
+    from mimir.repo_tools import GitRefusal, GitStatus
+    from mimir.tools import repo
+
+    auth, scope, _lease, target, _ = _real_attested_lease(tmp_path)
+    if not attested:
+        auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
+    monkeypatch.setattr(repo, "_state", lambda *_args: auth.repo_review_state)
+
+    class FailingGit:
+        execution_started = True
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def execute(self, _operation):
+            raise GitRefusal("git_failed", "remote says: rejected", execution_started=True)
+
+    monkeypatch.setattr(repo, "RepoGitTools", FailingGit)
+    capture = begin_protected_result_capture()
+    try:
+        with pytest.raises(Exception, match="remote says: rejected") as refusal:
+            repo._execute(SimpleNamespace(context=auth), "owner/repo", 7, GitStatus())
+    finally:
+        provenance = end_protected_result_capture(capture)
+    assert provenance is None if not attested else provenance is not None
+    labels = classify_protected_result(
+        "repo_status", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_status", decision=OperationDecision.RESOURCE_SCOPED,
+                          allowed=True, repo_pr_action_scope=scope),
+        result=ToolMessage(content=f"Error: {refusal.value}", tool_call_id="git", status="error"),
+        provenance=provenance, failed=True,
+    )
+    assert labels is not None
+    assert labels.sources[0].integrity == ("trusted" if attested else "untrusted")
+    auth.ifc_state.merge(labels)
+    decision = SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
+    )
+    assert decision.allowed is attested
+    if not attested:
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+
 def test_cross_pr_scope_keeps_lease_read_untrusted_filesystem_ingest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -11626,6 +11626,20 @@ def classify_protected_result(
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels
     if descriptor and descriptor.result_origin & ResultOriginKind.REPOSITORY:
+        if (
+            tool_name.startswith("repo_")
+            and failed
+            and isinstance(result, ToolMessage)
+            and result.status == "error"
+            and provenance is not None
+            and not provenance.sources
+            and provenance.content_free_error is not None
+            and result.content in {
+                provenance.content_free_error,
+                f"Error: {provenance.content_free_error}",
+            }
+        ):
+            return None
         scope = authorization.repo_pr_action_scope
         if scope is None:
             return _incomplete_protected_result(
