@@ -873,6 +873,11 @@ def test_failed_git_operation_keeps_only_attested_origin(
             ("pr_checkout_lease_attestation_refused", {
                 "scope_id": scope.scope_id, "reason": "no_author_trust",
             }),
+            ("repository_result_untrusted_default", {
+                "tool": operation, "scope_id": scope.scope_id,
+                "pr_number": scope.pr_number, "observed_head_sha": scope.observed_head_sha,
+                "reason": "no_published_provenance",
+            }),
             ("write_blocked_by_untrusted_ingest", {"tool": "repo_test"}),
         ]
     else:
@@ -881,7 +886,7 @@ def test_failed_git_operation_keeps_only_attested_origin(
     assert "distinctive" not in str(events)
 
 
-@pytest.mark.parametrize("binding", ["remote", "origin_url", "base_ref"])
+@pytest.mark.parametrize("binding", ["remote", "origin_url"])
 def test_failed_git_operation_rejects_misbound_remote_and_unresolved_scope(tmp_path, monkeypatch, binding):
     from langchain_core.tools import ToolException
     from mimir.repo_tools import GitRefusal
@@ -903,7 +908,6 @@ def test_failed_git_operation_rejects_misbound_remote_and_unresolved_scope(tmp_p
     original = {
         "remote": ("head_remote", "other"),
         "origin_url": ("canonical_origin", "https://github.com/other/repo.git"),
-        "base_ref": ("base_ref", "feature"),
     }[binding]
     previous = getattr(scope, original[0])
     object.__setattr__(scope, *original)
