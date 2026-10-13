@@ -1450,6 +1450,11 @@ def build_app(config: Config) -> web.Application:
     # default updates are handled by the startup defaults-upgrade proposal path.
     seed_prompts(config.home)
     seed_scheduler(config.home)
+    from .plugins.defaults import seed_plugin_defaults
+
+    seed_plugin_defaults(
+        config.home, selected=config.plugin_manager.policy.selected_plugin_candidates,
+    )
     # Refresh reference docs on upgrade: rewrite docs still present in
     # <home>/docs/ to the shipped version, seed docs new in this release, and
     # leave operator-deleted ones deleted. No-ops unless the version changed
@@ -1773,6 +1778,21 @@ def build_app(config: Config) -> web.Application:
         for alert in await asyncio.to_thread(repo_binding_startup_alerts):
             await log_event("github_repo_binding_attention_required", **alert)
         startup_state.phase = "startup_preparation"
+        from .defaults_upgrade import check_and_open_plugin_defaults_upgrade
+
+        try:
+            plugin_upgrades = await asyncio.to_thread(
+                check_and_open_plugin_defaults_upgrade,
+                config.home,
+                selected=config.plugin_manager.policy.selected_plugin_candidates,
+            )
+            for owner, result in plugin_upgrades.items():
+                await log_event(
+                    "plugin_defaults_upgrade_checked",
+                    plugin=owner, action=result.action, version=result.version,
+                )
+        except Exception as exc:  # upgrade proposals must not block serving
+            await log_event("plugin_defaults_upgrade_failed", error=str(exc)[:500])
         # PR 4b (docs/internal/MIMIR_HOME_GIT_TRACKING.md): idempotent bootstrap. Runs
         # before the agent starts processing turns so the post-turn
         # commit hook lands on a real repo. Sync function dispatched to
@@ -2421,6 +2441,12 @@ def build_app(config: Config) -> web.Application:
                     fix=f"correct {worklink_config_path} before Worklink dispatch can resume",
                 )
 
+        # Bind only selected, frozen declarations after every core callable.
+        # bind_plugin_jobs rejects both callable-name and APScheduler ID collisions.
+        installed_plugin_jobs = scheduler.bind_plugin_jobs(
+            config.plugin_manager.policy.scheduler_jobs.values(),
+        )
+
         # Load LLM-tick jobs from scheduler.yaml.
         reload_stats = scheduler.reload()
 
@@ -2445,6 +2471,7 @@ def build_app(config: Config) -> web.Application:
             or identities_populate_registered
             or reload_stats["registered"] > 0
             or installed_pollers > 0
+            or installed_plugin_jobs > 0
         ):
             startup_state.phase = "scheduler_start"
             startup_state.scheduler_start_attempted = True
