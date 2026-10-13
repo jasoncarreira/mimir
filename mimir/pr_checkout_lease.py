@@ -202,10 +202,12 @@ def configured_pr_checkout_lease_root() -> Path:
 
 
 def active_pr_checkout_lease_for_path(path: str | Path) -> PRCheckoutLease | None:
-    """Return the active recorded lease containing a strictly resolved path."""
+    """Return the active recorded lease containing a path, even if its leaf is missing."""
     try:
         root = configured_pr_checkout_lease_root()
-        resource = Path(path).resolve(strict=True)
+        # Resolve existing ancestors and symlinks, but permit a missing leaf (or
+        # missing descendants). The lease directory and record remain strict.
+        resource = Path(path).resolve(strict=False)
         relative = resource.relative_to(root)
         if not relative.parts:
             return None

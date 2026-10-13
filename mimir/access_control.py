@@ -11055,6 +11055,7 @@ class ProtectedResultProvenance:
     """Non-model-visible provenance for the exact resources a native read returned."""
 
     sources: tuple["SourceLabel", ...]
+    content_free_error: str | None = None
 
 
 @dataclass
@@ -11065,6 +11066,7 @@ class _ProtectedResultCapture:
     seen: set["SourceLabel"] = field(default_factory=set)
     published: bool = False
     invalid: bool = False
+    content_free_error: str | None = None
     closed: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -11082,7 +11084,9 @@ def begin_protected_result_capture() -> Token[_ProtectedResultState]:
     return _protected_result_provenance.set(_ProtectedResultCapture())
 
 
-def publish_protected_result(sources: tuple["SourceLabel", ...]) -> None:
+def publish_protected_result(
+    sources: tuple["SourceLabel", ...], *, content_free_error: str | None = None,
+) -> None:
     """Accumulate exact sources in this capture, including authoritative empty."""
     from .models import SourceLabel
 
@@ -11090,18 +11094,22 @@ def publish_protected_result(sources: tuple["SourceLabel", ...]) -> None:
         isinstance(source, SourceLabel) for source in sources
     ):
         raise TypeError("protected result provenance must be a tuple of SourceLabel")
+    if content_free_error is not None and (sources or not content_free_error):
+        raise ValueError("content-free error provenance requires an empty source set and error")
     capture = _protected_result_provenance.get()
     if isinstance(capture, _ProtectedResultCapture):
         with capture.lock:
             if capture.closed:
                 return
             capture.published = True
+            if content_free_error is not None:
+                capture.content_free_error = content_free_error
             for source in sources:
                 if source not in capture.seen:
                     capture.seen.add(source)
                     capture.sources.append(source)
         return
-    _protected_result_provenance.set(ProtectedResultProvenance(sources))
+    _protected_result_provenance.set(ProtectedResultProvenance(sources, content_free_error))
 
 
 def invalidate_protected_result_capture() -> None:
@@ -11124,7 +11132,7 @@ def end_protected_result_capture(
         with captured.lock:
             captured.closed = True
             result = (
-                ProtectedResultProvenance(tuple(captured.sources))
+                ProtectedResultProvenance(tuple(captured.sources), captured.content_free_error)
                 if captured.published and not captured.invalid
                 else None
             )
@@ -11516,7 +11524,9 @@ def classify_protected_result(
     from .models import InformationFlowLabels, SourceLabel
 
     artifact = getattr(result, "artifact", None)
-    if provenance is None and isinstance(artifact, ProtectedResultProvenance):
+    if isinstance(artifact, ProtectedResultProvenance) and (
+        provenance is None or not provenance.sources and artifact.sources
+    ):
         provenance = artifact
     if (
         policy_refusal is not None
@@ -11892,6 +11902,23 @@ def classify_protected_result(
         # turn rather than silently laundering integrity through the tool.
         domain = "unknown"
 
+    if (
+        domain == "filesystem"
+        and tool_name in {"read_file", "aread", "grep", "agrep", "glob", "aglob", "ls", "als"}
+        and failed
+        and isinstance(result, ToolMessage)
+        and result.status == "error"
+        and provenance is not None
+        and not provenance.sources
+        and provenance.content_free_error is not None
+        and result.content in {
+            provenance.content_free_error,
+            f"Error: {provenance.content_free_error}",
+        }
+    ):
+        # Only the native file backend can attest that this error returned no
+        # content. Unknown or partial provenance still fails closed below.
+        return None
     if failed:
         return _incomplete_protected_result(
             domain, args, tool_name=tool_name, auth_context=auth_context,

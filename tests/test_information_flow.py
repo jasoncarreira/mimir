@@ -1868,7 +1868,7 @@ def test_attested_author_active_lease_is_trusted_but_arbitrary_root_is_not(
         ("trusted", "informational"),
         ("untrusted", "active_ingest"),
         ("untrusted", "active_ingest"),
-        ("untrusted", "active_ingest"),
+        ("trusted", "informational"),  # Lookup uses the attested lease's existing ancestor.
     ]
 
 

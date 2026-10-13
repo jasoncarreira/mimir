@@ -345,16 +345,32 @@ def _lineage_turn(scope, state, *, tainted=False):
     )
 
 
-@pytest.mark.parametrize("case", ["collaborator", "outsider", "head_mismatch"])
+@pytest.mark.parametrize("case", ["collaborator", "outsider", "head_mismatch", "git_timeout"])
 def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str,
 ) -> None:
-    from mimir import access_control, event_logger
+    from mimir import access_control, event_logger, repo_tools
     from mimir.access_control import CapabilityTier, ToolAuthorization, build_trigger_service_principal
     from mimir.forge import CommentProjection, PullRequestProjection, ReviewProjection
     from mimir.models import InformationFlowLabels, InformationFlowState, RepoPRScopeRegistry
     from mimir.tools import forge, repo
 
+    # This integration proves author/head policy and provenance through the real
+    # Git status proof, not runner latency. As in the taint-precedence test below,
+    # allow a loose test-only hang guard on loaded macOS workers. Keep production's
+    # requested bound pinned and prove timeout still fails closed end-to-end.
+    hardened_git = repo_tools.hardened_git_command
+    status_probes = []
+
+    def policy_test_git(root, arguments, **kwargs):
+        assert arguments == ("status", "--porcelain=v2", "--branch", "--untracked-files=no")
+        assert kwargs["timeout"] == 5
+        status_probes.append(arguments)
+        if case == "git_timeout":
+            return GitProcessResult(-9, timed_out=True)
+        return hardened_git(root, arguments, **{**kwargs, "timeout": 30})
+
+    monkeypatch.setattr(repo_tools, "hardened_git_command", policy_test_git)
     # Git commit identity is intentionally unrelated to the GitHub PR login.
     _origin, _source, scope, state = _repo_scope_and_state(
         tmp_path, commit_count=56 if case == "collaborator" else 1,
@@ -410,13 +426,25 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
         )
         observed[tool.name] = added.sources[0].integrity
         auth.ifc_state.merge(added)
+    # Put fixed attestation reasons first: CI's short summary truncates the
+    # integrity map and full event payload before reaching the useful diagnostic.
+    refusal_reasons = [
+        kw["reason"] for name, kw in events
+        if name == "pr_checkout_lease_attestation_refused"
+    ]
     assert observed == {
         "pr_reviews": "trusted", "pr_comments": "trusted",
         "pr_metadata": "untrusted" if case == "head_mismatch" or case == "outsider" else "trusted",
         "pr_spec": "trusted",
         "repo_checkout": "untrusted" if case != "collaborator" else "trusted",
-    }, (observed, events)
+    }, f"lease_refusals={refusal_reasons}; observed={observed}; events={events}"
     assert auth.ifc_state.has_untrusted_active_ingest() is (case != "collaborator")
+    if case in {"collaborator", "git_timeout"}:
+        assert status_probes  # The positive/timeout controls reached the real proof boundary.
+    assert refusal_reasons == (
+        [] if case == "collaborator" else
+        ["git_timeout"] if case == "git_timeout" else ["no_author_trust"]
+    )
     # Read actual lease content before exercising the real edit-file gate.
     target = state.checkout_lease.path / "tracked.txt"
     read = access_control.classify_protected_result(
@@ -436,10 +464,12 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
         assert decision.reason == "write_blocked_by_untrusted_ingest"
     fallbacks = [kw for name, kw in events if name == "repository_result_untrusted_default"]
     assert [(kw["tool"], kw["reason"]) for kw in fallbacks] == (
-        [] if case == "collaborator" else [
-            ("pr_metadata", "published_untrusted"),
-            ("repo_checkout", "no_published_provenance"),
-        ]
+        [] if case == "collaborator" else (
+            [("repo_checkout", "no_published_provenance")] if case == "git_timeout" else [
+                ("pr_metadata", "published_untrusted"),
+                ("repo_checkout", "no_published_provenance"),
+            ]
+        )
     )
 
 
