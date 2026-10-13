@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -129,6 +130,11 @@ class PluginManager:
 def load_plugins(*, enable: str) -> PluginManager:
     """Resolve metadata before importing only selected providers, then freeze once."""
     selected = enabled_plugins(enable=enable)
+    defaults = [(candidate.name, skin) for candidate in selected
+                for skin in getattr(getattr(candidate, "manifest", None), "skin_defaults", ())]
+    if len(defaults) > 1 and not os.environ.get("MIMIR_WEB_DEFAULT_SKIN"):
+        raise PluginDiscoveryError("conflicting plugin default skins: " +
+                                   ", ".join(f"{owner}:{skin}" for owner, skin in defaults))
     policy = PolicyRegistry()
     register_core_tools(policy)
     loaded = []

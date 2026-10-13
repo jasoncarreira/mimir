@@ -41,14 +41,16 @@ def _entry(tmp_path: Path, *, name: str = "alpha", source: str = "provider-alpha
 
 
 def test_manifest_validates_required_fields_and_reserved_keys():
-    manifest = parse_manifest(_toml() + b"[dockerfile]\nbase = 'ignored'\n", entry_name="alpha")
+    manifest = parse_manifest(_toml() + b"[dockerfile]\nsystem_packages = ['git']\n", entry_name="alpha")
     assert (manifest.name, manifest.version, manifest.license) == ("alpha", "1.2.3", "MIT")
+    assert manifest.dockerfile["system_packages"] == ["git"]
     for data, match in [
         (_toml(name="other"), "does not match"),
         (_toml(version="not a version"), "invalid version"),
         (_toml(license="not an SPDX license"), "SPDX"),
         (_toml(requires_mimir=">=999"), "does not include"),
         (_toml() + b"unsupported = true\n", "unknown manifest keys"),
+        (_toml() + b"[dockerfile]\nbase = 'ignored'\n", "dockerfile: invalid fields"),
         (b"name = 'alpha'\n", "missing manifest keys"),
         (b"invalid = [", "invalid mimir-plugin.toml"),
     ]:
@@ -56,6 +58,28 @@ def test_manifest_validates_required_fields_and_reserved_keys():
             parse_manifest(data, entry_name="alpha")
     with pytest.raises(PluginManifestError, match="entry-point name"):
         parse_manifest(_toml(), entry_name="Bad_Name")
+
+
+def test_reserved_resources_must_belong_to_distribution(tmp_path):
+    root = tmp_path / "pkg"
+    root.mkdir()
+    asset = root / "main.js"
+    asset.write_text("export default true")
+    data = _toml() + b"[frontend]\napi_major = 1\nmodule = 'main.js'\n"
+    manifest = parse_manifest(data, entry_name="alpha", resource_root=root,
+                              distribution_files=frozenset({asset}))
+    assert manifest.frontend["module"] == "main.js"
+    with pytest.raises(PluginManifestError, match="missing or escaping"):
+        parse_manifest(data, entry_name="alpha", resource_root=root, distribution_files=frozenset())
+    with pytest.raises(PluginManifestError, match="package-relative"):
+        parse_manifest(data.replace(b"main.js", b"../main.js"), entry_name="alpha")
+
+
+def test_config_schema_rejects_foreign_keys():
+    data = _toml() + b'[config.MIMIR_PLUGIN_ALPHA_TOKEN]\ntype = "string"\nsecret = true\n'
+    assert parse_manifest(data, entry_name="alpha").config["MIMIR_PLUGIN_ALPHA_TOKEN"]["secret"]
+    with pytest.raises(PluginManifestError, match="must be under"):
+        parse_manifest(data.replace(b"MIMIR_PLUGIN_ALPHA_TOKEN", b"MIMIR_PLUGIN_BETA_TOKEN"), entry_name="alpha")
 
 
 def test_discovery_reads_only_the_owning_distribution(tmp_path, monkeypatch):
