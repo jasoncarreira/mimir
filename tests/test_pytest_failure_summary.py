@@ -1,7 +1,6 @@
 """Controller-side validation of untrusted pytest summary text."""
 from pathlib import Path
 import subprocess
-import sys
 
 import pytest
 
@@ -10,6 +9,7 @@ from mimir.project_tests import (
     pytest_failure_summary,
     pytest_node_inventory,
 )
+from tests.nested_pytest import pytest_command
 
 
 def _source(root: Path) -> frozenset[str]:
@@ -94,7 +94,7 @@ def test_actual_quiet_xdist_output_and_fake_trailing_plugin_section(tmp_path, mo
     _source(tmp_path)
     (tmp_path / "pytest.ini").write_text("[pytest]\n")
     inventory = pytest_node_inventory(tmp_path)
-    command = [sys.executable, "-m", "pytest", "-q", "-p", "xdist.plugin", "-n", "2", "tests/test_real.py::test_real"]
+    command = pytest_command(tmp_path, "-q", "-p", "xdist.plugin", "-n", "2", "tests/test_real.py::test_real")
     # Nested xdist workers can take longer to shut down under the full suite;
     # this is a format proof, not a subprocess latency assertion.
     result = subprocess.run(command, cwd=tmp_path, capture_output=True, timeout=120)
