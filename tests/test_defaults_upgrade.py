@@ -1176,6 +1176,92 @@ def test_initial_plugin_without_jobs_does_not_seed_jobs_on_later_version(
     assert scheduler.read_text() == _HEARTBEAT
 
 
+@pytest.mark.parametrize("scheduler_at_install", [False, True])
+def test_first_plugin_jobs_after_empty_baseline_are_proposed(
+    home: Path, tmp_path: Path, scheduler_at_install: bool,
+) -> None:
+    alpha = _plugin(tmp_path, name="alpha")
+    beta = _plugin(tmp_path, name="beta")
+    alpha.manifest.defaults["scheduler_jobs"] = ()
+    beta.manifest.defaults["scheduler_jobs"] = ()
+    scheduler = home / "scheduler.yaml"
+    if scheduler_at_install:
+        scheduler.write_text(_HEARTBEAT)
+    seed_plugin_defaults(home, selected=(alpha, beta))
+    if scheduler_at_install:
+        assert scheduler.read_text() == _HEARTBEAT
+    else:
+        assert not scheduler.exists()
+    for owner in ("alpha", "beta"):
+        assert (home / ".mimir/seed-plugin-defaults" / owner).read_text() == "1.0\n"
+    _git("add", "-f", "prompts/alpha/heartbeat.md", "prompts/beta/heartbeat.md", cwd=home)
+    if scheduler_at_install:
+        _git("add", "-f", "scheduler.yaml", cwd=home)
+    _git("commit", "-q", "-m", "install plugins without jobs", cwd=home)
+    _git("push", "-q", cwd=home)
+    baseline = du.check_and_open_plugin_defaults_upgrade(home, selected=(alpha, beta))
+    assert {owner: result.action for owner, result in baseline.items()} == {
+        "alpha": "baseline_initialized", "beta": "baseline_initialized",
+    }
+    assert _git("show", "mimir-plugin-defaults-alpha:plugins/alpha/scheduler.yaml",
+                cwd=home, check=False).returncode != 0
+
+    # The operator may create the missing scheduler later or customize the
+    # existing one; neither action opts into live version-bump writes.
+    scheduler.write_text("# operator schedule\n" + _HEARTBEAT.replace("0 * * * *", "30 * * * *"))
+    _git("add", "-f", "scheduler.yaml", cwd=home)
+    _git("commit", "-q", "-m", "operator schedule", cwd=home)
+    _git("push", "-q", cwd=home)
+    live = scheduler.read_bytes()
+    alpha.manifest.defaults["version"] = "2.0"
+    alpha.manifest.defaults["scheduler_jobs"] = ("jobs.yaml",)
+    seeded = seed_plugin_defaults(home, selected=(alpha, beta))
+    assert "scheduler.yaml:alpha-heartbeat" not in seeded
+    assert scheduler.read_bytes() == live
+
+    results = du.check_and_open_plugin_defaults_upgrade(home, selected=(alpha, beta))
+    assert results["alpha"].action == "proposal_opened"
+    assert results["beta"].action == "already_synced"
+    assert results["alpha"].proposal and results["alpha"].proposal.worktree
+    proposed = results["alpha"].proposal.worktree / "scheduler.yaml"
+    body = proposed.read_text()
+    assert "# operator schedule" in body
+    assert "30 * * * *" in body
+    assert "name: alpha-heartbeat" in body
+    assert "name: beta-heartbeat" not in body
+    assert "scheduler.yaml" in _git("diff", "--cached", "--name-only",
+                                    cwd=results["alpha"].proposal.worktree).stdout.splitlines()
+    assert scheduler.read_bytes() == live
+    assert (home / "prompts/heartbeat.md").read_text() == "heartbeat v1\n"
+    assert (home / ".mimir/upgrade-plugin-defaults/alpha").read_text() == "2.0\n"
+    assert (home / ".mimir/upgrade-plugin-defaults/beta").read_text() == "1.0\n"
+    _cleanup_upgrade_proposal(home)
+
+
+def test_missing_scheduler_at_install_never_follows_later_symlink(
+    tmp_path: Path,
+) -> None:
+    plugin = _plugin(tmp_path)
+    plugin.manifest.defaults["scheduler_jobs"] = ()
+    home = tmp_path / "home"
+    seed_plugin_defaults(home, selected=(plugin,))
+    assert (home / ".mimir/seed-plugin-defaults/sample").read_text() == "1.0\n"
+    assert not (home / "scheduler.yaml").exists()
+
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("outside job\n")
+    (home / "scheduler.yaml").symlink_to(outside)
+    core = home / "prompts/sample/heartbeat.md"
+    core.write_text("operator prompt\n")
+    plugin.manifest.defaults["version"] = "2.0"
+    plugin.manifest.defaults["scheduler_jobs"] = ("jobs.yaml",)
+    with pytest.raises(ValueError, match="symlink"):
+        seed_plugin_defaults(home, selected=(plugin,))
+    assert outside.read_text() == "outside job\n"
+    assert core.read_text() == "operator prompt\n"
+    assert (home / ".mimir/seed-plugin-defaults/sample").read_text() == "1.0\n"
+
+
 @pytest.mark.parametrize("symlink", ["skills", "prompts", "scheduler.yaml"])
 def test_seed_rejects_symlinked_destinations_before_writing(
     tmp_path: Path, symlink: str,

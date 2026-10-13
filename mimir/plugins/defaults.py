@@ -130,8 +130,8 @@ def seed_plugin_defaults(home: Path, *, selected: tuple[PluginCandidate, ...] | 
             marker = safe_destination(home, Path(".mimir") / "seed-plugin-defaults" / candidate.name)
             synced = safe_destination(home, Path(".mimir") / "upgrade-plugin-defaults" / candidate.name)
             scheduler = safe_destination(home, Path("scheduler.yaml"))
-        if candidate.manifest and candidate.manifest.defaults and scheduler.is_file() and not marker.exists() and not synced.exists():
-            if jobs:
+        if candidate.manifest and candidate.manifest.defaults and not marker.exists() and not synced.exists():
+            if jobs and scheduler.is_file():
                 from mimir.defaults_upgrade import _merge_scheduler_defaults
 
                 original = scheduler.read_text(encoding="utf-8")

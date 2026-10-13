@@ -570,7 +570,12 @@ def check_and_open_plugin_defaults_upgrade(
         if sched_text and (opened.worktree / "scheduler.yaml").is_file():
             scheduler = opened.worktree / "scheduler.yaml"
             merged, added = _merge_scheduler_defaults(
-                base_text=old_text, their_text=sched_text,
+                # This plugin already has a vendor ref: no job file in that
+                # ref means its previous declared job set was empty. Core's
+                # first-introduction behavior (None means no safe baseline)
+                # remains unchanged.
+                base_text=old_text if old_text is not None else "[]\n",
+                their_text=sched_text,
                 home_text=scheduler.read_text(encoding="utf-8"), version=version,
             )
             if merged is not None and added:
