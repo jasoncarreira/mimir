@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
-import json
 from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +39,21 @@ class _Distribution:
 def _entry(tmp_path: Path, *, name: str = "alpha", source: str = "provider-alpha", files: list[str] | None = None):
     dist = _Distribution(tmp_path, files if files is not None else ["pkg/mimir-plugin.toml"], source)
     return SimpleNamespace(name=name, value="poison_provider:register", dist=dist)
+
+
+def _skin() -> dict:
+    return {
+        "id": "alpha-skin", "label": "Alpha", "version": "1", "default": True,
+        "tokens": {name: "blue" for name in _SKIN_TOKENS},
+        "chrome": {"layout": "sidebar", "density": "compact", "accentPlacement": "side-rule"},
+        "panel": {"surface": "flat", "borderStyle": "solid", "hoverBehavior": "none"},
+        "characterRenderer": {
+            "kind": "static-image", "componentSlot": "agent-character", "variant": "default",
+            "assets": [{"id": "avatar", "type": "image", "href": "avatar.png"}],
+            "stateMap": {"idle": "avatar"}, "fallbackState": "idle",
+            "capabilities": {"supportsExpressions": False, "supportsMotion": False},
+        },
+    }
 
 
 def test_manifest_validates_required_fields_and_reserved_keys():
@@ -76,6 +91,35 @@ def test_reserved_resources_must_belong_to_distribution(tmp_path):
         parse_manifest(data.replace(b"main.js", b"../main.js"), entry_name="alpha")
 
 
+@pytest.mark.parametrize("resource,kind", [
+    ("main.js", "absent"), ("main.js", "directory"),
+    ("skills", "absent"), ("skills", "file"),
+])
+def test_listed_package_resources_require_physical_correct_kind(tmp_path, resource, kind):
+    root = tmp_path / "pkg"
+    root.mkdir()
+    target = root / resource
+    if kind == "directory":
+        target.mkdir()
+        (target / "skill.md").write_text("skill")
+    elif kind == "file":
+        target.write_text("asset")
+    data = (_toml() + b'[defaults]\nversion = "1"\nskills = ["skills"]\n'
+            if resource == "skills" else _toml() + b'[frontend]\napi_major = 1\nmodule = "main.js"\n')
+    files = frozenset({target / "skill.md"} if kind == "directory" else {target})
+    with pytest.raises(PluginManifestError, match="missing or escaping"):
+        parse_manifest(data, entry_name="alpha", resource_root=root, distribution_files=files)
+
+
+def test_existing_but_unlisted_resource_is_rejected(tmp_path):
+    root = tmp_path / "pkg"
+    root.mkdir()
+    (root / "main.js").write_text("asset")
+    with pytest.raises(PluginManifestError, match="missing or escaping"):
+        parse_manifest(_toml() + b'[frontend]\napi_major = 1\nmodule = "main.js"\n',
+                       entry_name="alpha", resource_root=root, distribution_files=frozenset())
+
+
 def test_config_schema_rejects_foreign_keys():
     data = _toml() + b'[config.MIMIR_PLUGIN_ALPHA_TOKEN]\ntype = "string"\nsecret = true\n'
     assert parse_manifest(data, entry_name="alpha").config["MIMIR_PLUGIN_ALPHA_TOKEN"]["secret"]
@@ -88,14 +132,7 @@ def test_skin_requires_complete_tokens_and_local_assets(tmp_path):
     root.mkdir()
     asset = root / "avatar.png"
     asset.write_bytes(b"image")
-    skin = {
-        "id": "alpha-skin", "label": "Alpha", "version": "1", "default": True,
-        "tokens": {name: "blue" for name in _SKIN_TOKENS},
-        "chrome": {"layout": "sidebar", "density": "compact", "accentPlacement": "side-rule"},
-        "panel": {"surface": "flat", "borderStyle": "solid", "hoverBehavior": "none"},
-        "characterRenderer": {"kind": "static-image", "componentSlot": "agent-character",
-                              "assets": [{"id": "avatar", "href": "avatar.png"}]},
-    }
+    skin = _skin()
     path = root / "skin.json"
     inventory = frozenset({asset, path})
     def parse():
@@ -111,6 +148,41 @@ def test_skin_requires_complete_tokens_and_local_assets(tmp_path):
     skin["characterRenderer"]["assets"][0]["href"] = "https://example.org/asset.png"
     with pytest.raises(PluginManifestError, match="package-relative"):
         parse()
+
+
+@pytest.mark.parametrize("field", ["variant", "assets", "stateMap", "fallbackState", "capabilities"])
+def test_skin_rejects_incomplete_renderer(tmp_path, field):
+    root = tmp_path / "pkg"
+    root.mkdir()
+    (root / "avatar.png").write_bytes(b"image")
+    path = root / "skin.json"
+    skin = _skin()
+    skin["characterRenderer"].pop(field)
+    path.write_text(json.dumps(skin))
+    with pytest.raises(PluginManifestError, match="incomplete characterRenderer"):
+        parse_manifest(_toml() + b'themes = ["skin.json"]\n', entry_name="alpha",
+                       resource_root=root, distribution_files=frozenset({root / "avatar.png", path}))
+
+
+@pytest.mark.parametrize("location,key", [
+    ("chrome", "layout"), ("panel", "surface"),
+    ("characterRenderer", "kind"), ("characterRenderer", "fallbackState"),
+    ("characterRenderer", "stateMap"),
+])
+def test_malformed_skin_nested_values_become_discovery_diagnostics(tmp_path, monkeypatch, location, key):
+    root = tmp_path / "pkg"
+    root.mkdir()
+    (root / "avatar.png").write_bytes(b"image")
+    (root / "mimir-plugin.toml").write_bytes(_toml() + b'themes = ["skin.json"]\n')
+    skin = _skin()
+    skin[location][key] = ["invalid"]
+    (root / "skin.json").write_text(json.dumps(skin))
+    entry = _entry(tmp_path, files=["pkg/mimir-plugin.toml", "pkg/skin.json", "pkg/avatar.png"])
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: [entry])
+    (candidate,) = discover_plugins(enable="")
+    assert not candidate.enabled and candidate.diagnostic.startswith("themes:")
+    with pytest.raises(PluginDiscoveryError, match="plugin 'alpha' from provider-alpha: themes:"):
+        enabled_plugins(enable="alpha")
 
 
 def test_discovery_reads_only_the_owning_distribution(tmp_path, monkeypatch):

@@ -36,6 +36,7 @@ _SKIN_TOKENS = frozenset("--mimir-" + token for token in (
     "border-width-chrome interaction-hover-background interaction-active-background "
     "interaction-disabled-opacity motion-duration-fast motion-duration-normal"
 ).split())
+_CHARACTER_STATES = frozenset({"idle", "thinking", "typing", "tool", "error", "bored", "listening"})
 
 
 class PluginManifestError(ValueError):
@@ -65,9 +66,11 @@ def _resource(value: str, *, key: str, root: Path | None, files: frozenset[Path]
         raise PluginManifestError(f"{key}: resource must be package-relative: {value!r}")
     if root is not None and files is not None:
         target = root / value
-        matches = [item for item in files if item == target or directory and target in item.parents]
-        if not matches or any(item.is_symlink() for item in (target, *target.parents, *matches)) or any(
-            not item.resolve().is_relative_to(root.resolve()) for item in matches
+        matches = [item for item in files if target in item.parents] if directory else [target] if target in files else []
+        if (not matches or not (target.is_dir() if directory else target.is_file())
+                or any(not item.is_file() for item in matches)
+                or any(item.is_symlink() for item in (target, *target.parents, *matches))
+                or any(not item.resolve().is_relative_to(root.resolve()) for item in matches)
         ):
             raise PluginManifestError(f"{key}: missing or escaping package resource: {value!r}")
     return value
@@ -90,21 +93,37 @@ def _skin_resource(value: str, *, root: Path | None, files: frozenset[Path] | No
     _resource(value, key="themes asset", root=root, files=files)
 
 
+def _choice(value: Any, options: frozenset[str] | set[str]) -> bool:
+    return isinstance(value, str) and value in options
+
+
 def _validate_skin(skin: Any, *, path: str, root: Path | None, files: frozenset[Path] | None) -> str | None:
     if not isinstance(skin, dict) or any(not isinstance(skin.get(key), str) or not skin[key]
                                              for key in ("id", "label", "version")):
         raise PluginManifestError(f"themes: id, label and version required: {path}")
     chrome, panel, renderer = (skin.get(key) for key in ("chrome", "panel", "characterRenderer"))
-    if (not isinstance(chrome, dict) or chrome.get("layout") not in {"top-nav", "sidebar"}
-            or chrome.get("density") not in {"compact", "comfortable"}
-            or chrome.get("accentPlacement") not in {"top-rule", "side-rule", "none"}
-            or not isinstance(panel, dict) or panel.get("surface") not in {"flat", "raised", "inset"}
-            or panel.get("borderStyle") not in {"solid", "double"}
-            or panel.get("hoverBehavior") not in {"border-accent", "lift", "none"}
-            or not isinstance(renderer, dict) or renderer.get("kind") not in {
+    if (not isinstance(chrome, dict) or not _choice(chrome.get("layout"), {"top-nav", "sidebar"})
+            or not _choice(chrome.get("density"), {"compact", "comfortable"})
+            or not _choice(chrome.get("accentPlacement"), {"top-rule", "side-rule", "none"})
+            or not isinstance(panel, dict) or not _choice(panel.get("surface"), {"flat", "raised", "inset"})
+            or not _choice(panel.get("borderStyle"), {"solid", "double"})
+            or not _choice(panel.get("hoverBehavior"), {"border-accent", "lift", "none"})
+            or not isinstance(renderer, dict) or not _choice(renderer.get("kind"), {
                 "static-image", "sprite-sheet", "dotlottie", "lottie", "react-placeholder",
-            } or renderer.get("componentSlot") != "agent-character"):
+            }) or renderer.get("componentSlot") != "agent-character"):
         raise PluginManifestError(f"themes: invalid chrome, panel or characterRenderer: {path}")
+    capabilities = renderer.get("capabilities")
+    state_map = renderer.get("stateMap")
+    if (not isinstance(renderer.get("variant"), str) or not renderer["variant"]
+            or not isinstance(renderer.get("assets"), list)
+            or not isinstance(state_map, dict)
+            or any(not _choice(state, _CHARACTER_STATES) or not isinstance(asset_id, str)
+                   for state, asset_id in state_map.items())
+            or not _choice(renderer.get("fallbackState"), _CHARACTER_STATES)
+            or not isinstance(capabilities, dict)
+            or type(capabilities.get("supportsExpressions")) is not bool
+            or type(capabilities.get("supportsMotion")) is not bool):
+        raise PluginManifestError(f"themes: incomplete characterRenderer: {path}")
     tokens = skin.get("tokens")
     if not isinstance(tokens, dict) or tokens.keys() != _SKIN_TOKENS or any(
         not isinstance(value, str) or not value or re.search(r"url\s*\(|@import|https?://", value, re.I)
@@ -114,7 +133,9 @@ def _validate_skin(skin: Any, *, path: str, root: Path | None, files: frozenset[
     for asset in skin.get("assets", []):
         _skin_resource(asset, root=root, files=files)
     for asset in renderer.get("assets", []):
-        if not isinstance(asset, dict) or not isinstance(asset.get("id"), str):
+        if (not isinstance(asset, dict) or not isinstance(asset.get("id"), str) or not asset["id"]
+                or not _choice(asset.get("type"), {"css", "dotlottie", "image", "json", "sprite"})
+                or asset.get("href") is not None and not isinstance(asset["href"], str)):
             raise PluginManifestError(f"themes: invalid character asset: {path}")
         if asset.get("href") is not None:
             _skin_resource(asset["href"], root=root, files=files)
@@ -125,7 +146,7 @@ def _validate_skin(skin: Any, *, path: str, root: Path | None, files: frozenset[
         if not isinstance(font, dict) or not isinstance(font.get("family"), str) or not isinstance(font.get("src"), list):
             raise PluginManifestError(f"themes: invalid font: {path}")
         for source in font["src"]:
-            if not isinstance(source, dict) or source.get("format") not in {"woff2", "woff", "truetype"}:
+            if not isinstance(source, dict) or not _choice(source.get("format"), {"woff2", "woff", "truetype"}):
                 raise PluginManifestError(f"themes: invalid font source: {path}")
             _skin_resource(source.get("url"), root=root, files=files)
     if type(skin.get("default", False)) is not bool:
