@@ -156,7 +156,7 @@ def _auth(
     )
 
 
-def _real_attested_lease(tmp_path: Path):
+def _real_attested_lease(tmp_path: Path, *, author: str = "collaborator"):
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
 
     checkout = tmp_path / "checkout"
@@ -175,7 +175,7 @@ def _real_attested_lease(tmp_path: Path):
         ["git", "-C", str(checkout), "rev-parse", "HEAD"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
-    scope = _scope(observed_head_sha=head, author="collaborator")
+    scope = _scope(observed_head_sha=head, author=author)
     lease = SimpleNamespace(
         path=checkout, scope_id=scope.scope_id, canonical_repo=scope.canonical_repo,
         pr_number=scope.pr_number, head_sha=head, owner=scope.principal,
@@ -967,6 +967,10 @@ def test_attested_forge_error_after_scope_resolution(tmp_path, monkeypatch):
     monkeypatch.setattr(forge, "_scope", lambda *_: scope)
     monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace(
         author_is_trusted=lambda *_: True,
+        get_pull_request=lambda *_: SimpleNamespace(
+            number=scope.pr_number, head_sha=scope.observed_head_sha,
+            author=scope.pull_request_author,
+        ),
         get_diff=lambda *_: (_ for _ in ()).throw(ForgeError("server failure")),
     ))
     token = begin_protected_result_capture()
@@ -987,6 +991,65 @@ def test_attested_forge_error_after_scope_resolution(tmp_path, monkeypatch):
         "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
         auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
     ).allowed
+
+
+@pytest.mark.parametrize("author,verdict,moved,allowed", [
+    ("collaborator", True, False, True),
+    ("dependabot[bot]", False, False, True),
+    ("outsider", False, False, False),
+    ("collaborator", True, True, False),
+])
+def test_missing_scoped_pr_file_preserves_edit_decision(
+    tmp_path, monkeypatch, author, verdict, moved, allowed,
+):
+    from langchain_core.tools import ToolException
+    from mimir.forge import ForgeError, PullRequestProjection
+    from mimir.tools import forge
+
+    monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", "dependabot[bot]")
+    auth, scope, lease, target, _ = _real_attested_lease(tmp_path, author=author)
+    auth = replace(auth, roles=("admin",))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{lease.path}:rw")
+    monkeypatch.setattr(forge, "_scope", lambda *_: scope)
+    head = [scope.observed_head_sha]
+
+    def missing(*_):
+        if moved:
+            head[0] = "b" * 40
+        raise ForgeError("file content refused: path not found at scoped head")
+
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace(
+        author_is_trusted=lambda *_: verdict,
+        get_pull_request=lambda *_: PullRequestProjection(
+            7, "Title", "open", author, False, "main", "worklink/7",
+            head[0], True, "created", "updated",
+        ),
+        get_file_content=missing,
+    ))
+    token = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException, match="path not found at scoped head") as raised:
+            forge.pr_file_content.func("owner/repo", 7, ".github/workflows/ci.yml",
+                                       runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(token)
+    labels = classify_protected_result(
+        "pr_file_content", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="pr_file_content", decision="resource_scoped",
+                          allowed=True, repo_pr_action_scope=scope),
+        result=ToolMessage(content=f"Error: {raised.value}", tool_call_id="missing", status="error"),
+        provenance=provenance, failed=True,
+    )
+    assert labels.has_untrusted_active_ingest is not allowed
+    auth.ifc_state.merge(labels)
+    assert auth.ifc_state.has_untrusted_active_ingest() is not allowed
+    decision = ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target),
+        arguments={"file_path": str(target)},
+    )
+    assert decision.allowed is allowed, decision.reason
+    if not allowed:
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
 
 
 @pytest.mark.parametrize("field,value", [
@@ -1013,7 +1076,12 @@ def test_forge_error_rejects_misbound_scope(tmp_path, monkeypatch, field, value)
 
     monkeypatch.setattr(forge, "_scope", lambda *_: scope)
     monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace(
-        author_is_trusted=lambda *_: True, get_diff=fail_diff,
+        author_is_trusted=lambda *_: True,
+        get_pull_request=lambda *_: SimpleNamespace(
+            number=scope.pr_number, head_sha=scope.observed_head_sha,
+            author=scope.pull_request_author,
+        ),
+        get_diff=fail_diff,
     ))
     token = begin_protected_result_capture()
     try:
