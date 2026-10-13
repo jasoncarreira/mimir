@@ -6423,10 +6423,44 @@ def tainted_write_target(tool_name: str, target: Any = None) -> bool:
     ))
 
 
-def _tainted_write_denial(tool_name: str, service: Any = None) -> "ToolAuthorization":
+def _tainted_write_sources(auth_context: Any, ifc_labels: Any) -> dict[str, Any]:
+    """Bound the live taint's identifiers; never forward source content."""
+    from .redaction import redact_text
+
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    sources = []
+    remaining = 0
+    for source in getattr(labels, "sources", ()):
+        if not getattr(source, "has_untrusted_active_ingest", False):
+            continue
+        if len(sources) == 5:
+            remaining += 1
+            continue
+        resource_id = source.resource_id
+        sources.append({
+            "domain": source.domain,
+            "resource_id": (
+                redact_text(resource_id)[:1024] if isinstance(resource_id, str) else None
+            ),
+        })
+    return {"sources": sources, "remaining_sources": remaining}
+
+
+def _tainted_write_denial(
+    tool_name: str, service: Any = None, *, auth_context: Any = None,
+    ifc_labels: Any = None,
+) -> "ToolAuthorization":
     try:
         from .event_logger import log_event_sync
-        log_event_sync("write_blocked_by_untrusted_ingest", tool=tool_name)
+        log_event_sync(
+            "write_blocked_by_untrusted_ingest", tool=tool_name,
+            **_tainted_write_sources(auth_context, ifc_labels),
+        )
     except Exception:
         pass
     return ToolAuthorization(
@@ -7191,7 +7225,9 @@ class SinkGate:
         # This veto precedes both shadow allowances and the generic same-PR rule.
         if (tainted_write_target(tool_name, target)
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            return _tainted_write_denial(tool_name, service)
+            return _tainted_write_denial(
+                tool_name, service, auth_context=auth_context, ifc_labels=ifc_labels,
+            )
         # Enforcement already refuses all tainted tracker mutations with the
         # original reason/detail; only shadow mode needs this narrower veto.
         if (not enforce and tool_name in {"shell_exec", "bash_async"}
@@ -9860,7 +9896,9 @@ class ToolRegistry:
         if (tool_name in _TAINTED_FILE_WRITE_TOOLS
                 and tainted_file_write_target(raw_write_target)
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            return finish(_tainted_write_denial(tool_name))
+            return finish(_tainted_write_denial(
+                tool_name, auth_context=auth_context, ifc_labels=ifc_labels,
+            ))
         if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return finish(_scheduled_write_denial(tool_name))
         if tool_name in {"write_file", "edit_file", "replace_file"}:
@@ -11424,6 +11462,29 @@ def _incomplete_protected_result(
     ))
 
 
+def _single_filesystem_result_source(
+    auth_context: "AuthContext | None", args: dict[str, Any], *, existing_file: bool,
+) -> "SourceLabel | None":
+    """Use the same path and lease anchor for successful and failed file reads."""
+    resource = next((
+        args.get(key) for key in ("path", "file_path")
+        if isinstance(args.get(key), str) and args.get(key)
+    ), None)
+    if resource is None:
+        return None
+    try:
+        resolved = Path(resource).resolve(strict=existing_file)
+        if existing_file and not resolved.is_file():
+            return None
+        source = protected_result_source(
+            auth_context, principal="filesystem", domain="filesystem",
+            resource_id=str(resolved), bridge_instance="filesystem",
+        )
+    except Exception:  # noqa: BLE001 — unresolved anchors must fail closed
+        return None
+    return source if source.integrity == "trusted" else None
+
+
 def _acp_failed_tool_error_result(
     result: Any,
     auth_context: "AuthContext | None",
@@ -11934,6 +11995,14 @@ def classify_protected_result(
         # content. Unknown or partial provenance still fails closed below.
         return None
     if failed:
+        if (
+            domain == "filesystem" and tool_name in {"read_file", "aread"}
+            and provenance is None and isinstance(result, ToolMessage)
+            and result.status == "error"
+        ):
+            source = _single_filesystem_result_source(auth_context, args, existing_file=True)
+            if source is not None:
+                return InformationFlowLabels().with_source(source)
         return _incomplete_protected_result(
             domain, args, tool_name=tool_name, auth_context=auth_context,
         )
@@ -11947,24 +12016,9 @@ def classify_protected_result(
         return labels
 
     if domain == "filesystem":
-        resource = next(
-            (
-                args.get(key)
-                for key in ("path", "file_path")
-                if isinstance(args.get(key), str) and args.get(key)
-            ),
-            None,
-        )
-        if resource is not None:
-            source = protected_result_source(
-                auth_context,
-                principal="filesystem",
-                domain="filesystem",
-                resource_id=str(Path(resource).resolve(strict=False)),
-                bridge_instance="filesystem",
-            )
-            if source.integrity == "trusted":
-                return InformationFlowLabels().with_source(source)
+        source = _single_filesystem_result_source(auth_context, args, existing_file=False)
+        if source is not None:
+            return InformationFlowLabels().with_source(source)
 
     return _incomplete_protected_result(
         domain, args, tool_name=tool_name, auth_context=auth_context,

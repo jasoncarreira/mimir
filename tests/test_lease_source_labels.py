@@ -881,7 +881,12 @@ def test_failed_git_operation_keeps_only_attested_origin(
                 "pr_number": scope.pr_number, "observed_head_sha": scope.observed_head_sha,
                 "reason": "no_published_provenance",
             }),
-            ("write_blocked_by_untrusted_ingest", {"tool": "repo_test"}),
+            ("write_blocked_by_untrusted_ingest", {
+                "tool": "repo_test", "sources": [{
+                    "domain": "repository",
+                    "resource_id": f"owner/repo#pull/7@{scope.observed_head_sha}",
+                }], "remaining_sources": 0,
+            }),
         ]
     else:
         assert len(events) == 1
@@ -2522,3 +2527,123 @@ def test_lease_repository_sources_only_flow_to_their_own_forge_scope(
             tool_name, target, labels, own, enforce=True,
         )
         assert decision.allowed is False
+
+
+@pytest.mark.parametrize("location,head_mismatch,allowed", [
+    ("lease", False, True), ("outside", False, False), ("lease", True, False),
+])
+@pytest.mark.parametrize("tool_name", ["read_file", "aread"])
+def test_failed_single_file_read_uses_lease_anchor_at_write_gate(
+    tmp_path, monkeypatch, location, head_mismatch, allowed, tool_name,
+):
+    from mimir.readonly_backend import _RootAwareFilesystemBackend
+
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    checkout, lease_target, _ = _recorded_lease(lease_root)
+    outside = tmp_path / "external.py"
+    outside.write_text("outside\n")
+    target = lease_target if location == "lease" else outside
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{checkout}:rw")
+    auth = replace(
+        _auth(observed_head_sha="c" * 40 if head_mismatch else "a" * 40),
+        roles=("admin",),
+    )
+    # Exercise the actual backend's out-of-range error, then the real edit gate.
+    backend = _RootAwareFilesystemBackend(root_dir=tmp_path, virtual_mode=False)
+    capture = begin_protected_result_capture()
+    try:
+        response = backend.read(str(target), offset=100)
+    finally:
+        provenance = end_protected_result_capture(capture)
+    assert response.error and "offset" in response.error.lower()
+    result = ToolMessage(content=f"Error: {response.error}", tool_call_id="read", status="error")
+    args = {"file_path": str(target), "offset": 100}
+    labels = classify_protected_result(
+        tool_name, args, auth,
+        ToolAuthorization(tool_name=tool_name, decision="resource_scoped", allowed=True),
+        result=result, provenance=provenance, failed=True,
+    )
+    assert labels is not None
+    if not allowed:
+        assert labels.sources[0].principal is None
+        assert labels.sources[0].integrity == "untrusted"
+    successful = classify_protected_result(
+        tool_name, {"file_path": str(target)}, auth,
+        ToolAuthorization(tool_name=tool_name, decision="resource_scoped", allowed=True),
+    )
+    assert labels.sources == successful.sources
+    auth.ifc_state.merge(labels)
+    assert auth.ifc_state.has_untrusted_active_ingest() is not allowed
+    decision = ToolRegistry().authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(lease_target),
+        arguments={"file_path": str(lease_target)},
+    )
+    assert decision.allowed is allowed, decision.reason
+    if not allowed:
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.parametrize("tool_name", ["grep", "glob"])
+@pytest.mark.parametrize("resource", ["directory", "file"])
+def test_failed_lease_collection_read_remains_untrusted(tmp_path, monkeypatch, tool_name, resource):
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    checkout, target, _ = _recorded_lease(lease_root)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    path = checkout if resource == "directory" else target
+    labels = classify_protected_result(
+        tool_name, {"path": str(path)}, _auth(),
+        ToolAuthorization(tool_name=tool_name, decision="resource_scoped", allowed=True),
+        result=ToolMessage(content="Error: scan failed", tool_call_id="scan", status="error"),
+        failed=True,
+    )
+    assert labels.has_untrusted_active_ingest
+    assert labels.sources[0].domain == "filesystem"
+
+
+@pytest.mark.parametrize("resource", ["missing", "directory"])
+def test_failed_single_file_read_without_existing_file_fails_closed(
+    tmp_path, monkeypatch, resource,
+):
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    checkout, _, _ = _recorded_lease(lease_root)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    target = checkout / "missing.py" if resource == "missing" else checkout / "src"
+    labels = classify_protected_result(
+        "read_file", {"file_path": str(target)}, _auth(),
+        ToolAuthorization(tool_name="read_file", decision="resource_scoped", allowed=True),
+        result=ToolMessage(content="Error: unable to read", tool_call_id="read", status="error"),
+        failed=True,
+    )
+    assert labels.has_untrusted_active_ingest
+    assert labels.sources[0].principal is None
+
+
+@pytest.mark.parametrize("provenance,status", [
+    ("foreign", "error"), ("none", "success"),
+])
+def test_failed_lease_read_requires_unattributed_error(tmp_path, monkeypatch, provenance, status):
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    _, target, _ = _recorded_lease(lease_root)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    foreign = ProtectedResultProvenance((SourceLabel(
+        principal=None, domain="filesystem", resource_id="/foreign/source",
+        bridge_instance="filesystem", sensitivity="internal",
+        authorized_principals=frozenset(), integrity="untrusted",
+        integrity_effect="active_ingest",
+    ),)) if provenance == "foreign" else None
+    labels = classify_protected_result(
+        "read_file", {"file_path": str(target)}, _auth(),
+        ToolAuthorization(tool_name="read_file", decision="resource_scoped", allowed=True),
+        result=ToolMessage(content="read error", tool_call_id="read", status=status),
+        provenance=foreign, failed=True,
+    )
+    assert labels.has_untrusted_active_ingest
+    assert labels.sources[0].principal is None
