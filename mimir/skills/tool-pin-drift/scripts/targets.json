@@ -9,13 +9,13 @@
     "name": "feature-factory",
     "source": "npm",
     "package": "feature-factory",
-    "pinned_version": "0.10.15"
+    "pinned_version": "0.10.16"
   },
   {
     "name": "opencode-feature-factory",
     "source": "npm",
     "package": "opencode-feature-factory",
-    "pinned_version": "0.10.15"
+    "pinned_version": "0.10.16"
   },
   {
     "name": "opencode-project-memory",
