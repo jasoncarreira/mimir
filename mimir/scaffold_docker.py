@@ -930,6 +930,7 @@ def render_start_sh(
     uv_extras: list[str] | None = None,
     mode: ScaffoldMode = _DEFAULT_MODE,
     plugin_pins: tuple[str, ...] = (),
+    plugin_services: bool = False,
 ) -> str:
     """Render start.sh.
 
@@ -965,7 +966,8 @@ def render_start_sh(
         boot += "uv run --no-sync python -c 'import importlib.metadata as m; " + "; ".join(
             f'assert m.version("{pin.split("==")[0]}") == "{pin.split("==")[1]}"' for pin in plugin_pins
         ) + "'\n"
-        boot += "touch /run/mimir-plugin-services/ready\n"
+        if plugin_services:
+            boot += "touch /run/mimir-plugin-services/ready\n"
     script = _START_SH_TEMPLATE.replace("{UV_EXTRAS}", flags)
     if plugin_pins:
         script = script.replace("uv run ", "uv run --no-sync ")
@@ -1430,7 +1432,8 @@ def scaffold(
     ss_path = home / "start.sh"
     _write_if_changed(
         ss_path, render_start_sh(uv_extras=uv_extras, mode=mode,
-                                  plugin_pins=pinned_packages(plugins)), "start.sh",
+                                  plugin_pins=pinned_packages(plugins),
+                                  plugin_services=bool(selected_services)), "start.sh",
     )
     if ss_path.is_file():
         ss_path.chmod(0o755)

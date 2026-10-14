@@ -90,8 +90,10 @@ def test_selected_service_is_supervised_and_generated_wrappers_execute(tmp_path,
     if mode == "pypi":
         assert 'pip install --no-cache-dir "example-provider==2.3.0"' in dockerfile
     else:
-        assert "uv pip install --python .venv/bin/python" in (home / "start.sh").read_text()
-        assert "uv run --no-sync mimir run" in (home / "start.sh").read_text()
+        start = (home / "start.sh").read_text()
+        assert "uv pip install --python .venv/bin/python" in start
+        assert "uv run --no-sync mimir run" in start
+        assert "touch /run/mimir-plugin-services/ready" in start
         assert (home / ".mimir-scaffold/s6-rc.d/mimir-plugin-reset/up").exists()
         assert (home / ".mimir-scaffold/s6-rc.d/sample-worker/dependencies.d/mimir-plugin-reset").exists()
 
@@ -191,6 +193,55 @@ esac
     assert result.returncode == 0, result.stderr
     assert state.exists()
     assert (tmp_path / "ready").exists()
+
+
+def test_workspace_pinned_plugin_without_services_boots_without_readiness_directory(tmp_path, monkeypatch):
+    provider = _provider(tmp_path)
+    provider.manifest.dockerfile["s6_services"] = []
+    monkeypatch.setattr("mimir.scaffold_docker.select_plugins", lambda **kwargs: (provider,))
+    home = tmp_path / "home"
+    home.mkdir()
+    result = scaffold(home, mode="workspace")
+    assert result.plugins_with_services == []
+    assert not (home / ".mimir-scaffold").exists()
+    dockerfile = (home / "Dockerfile").read_text()
+    assert "USER mimir\n\nENTRYPOINT [\"/usr/bin/tini\", \"--\", \"/usr/local/bin/start.sh\"]" in dockerfile
+    assert 'ENTRYPOINT ["/init"]' not in dockerfile
+
+    script = (home / "start.sh").read_text()
+    assert 'touch /run/mimir-plugin-services/ready' not in script
+    assert 'uv pip install --python .venv/bin/python "example-provider==2.3.0"' in script
+    assert 'm.version("example-provider") == "2.3.0"' in script
+    # Exercise the generated boot commands without cloning source or building the UI.
+    boot = 'UV_EXTRAS="' + script.split('UV_EXTRAS="', 1)[1].split("# ─── home seed", 1)[0]
+    boot = (boot.split("# The workspace volume preserves", 1)[0] +
+            boot.split("# ─── skill-required extras", 1)[1].split("\n", 1)[1])
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    uv = shim / "uv"
+    uv.write_text('''#!/bin/sh
+case "$1" in
+  sync) rm -f "$PROVIDER_INSTALLED" ;;
+  pip) [ "$2" = install ] && [ "$5" = "example-provider==2.3.0" ] && touch "$PROVIDER_INSTALLED" ;;
+  run)
+    [ "$2" = --no-sync ] || exit 90
+    [ -f "$PROVIDER_INSTALLED" ] || exit 91
+    case "$3" in
+      python) [ "$4" = -c ] && case "$5" in *'m.version("example-provider") == "2.3.0"'*) ;; *) exit 92 ;; esac ;;
+      mimir) if [ "$4" = skills ]; then printf '%s' '--extra skill'; fi ;;
+    esac ;;
+esac
+''')
+    uv.chmod(0o755)
+    state = tmp_path / "installed"
+    completed = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", boot + "\nuv run --no-sync mimir run\n"],
+        env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}",
+             "PROVIDER_INSTALLED": str(state), "MIMIR_HOME": str(home)},
+        capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert state.exists()
 
 
 # ── fixtures ────────────────────────────────────────────────────────
