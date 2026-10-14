@@ -1,0 +1,63 @@
+name: Prime the root Dockerfile's base image
+description: >-
+  Load the root Dockerfile's base image from the Actions cache so the
+  image-build test (tests/test_root_dockerfile.py) never pulls it anonymously
+  from public.ecr.aws, which rate-limits with 429s. Pulls with backoff only on
+  a cache miss. The key rolls weekly so base-image updates still arrive.
+runs:
+  using: composite
+  steps:
+    - name: Resolve base image and cache key
+      id: ref
+      shell: bash
+      run: |
+        set -euo pipefail
+        image="$(sed -n 's/^ARG BASE_IMAGE=//p' Dockerfile)"
+        if [ -z "$image" ] || [ "$(printf '%s\n' "$image" | wc -l)" -ne 1 ]; then
+          echo "::error::expected exactly one 'ARG BASE_IMAGE=' line in Dockerfile"
+          exit 1
+        fi
+        echo "image=$image" >> "$GITHUB_OUTPUT"
+        echo "key=dockerfile-base-${RUNNER_OS}-${image//[^A-Za-z0-9._-]/_}-$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore cached base image
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ${{ runner.temp }}/dockerfile-base-image.tar
+        key: ${{ steps.ref.outputs.key }}
+
+    - name: Load cached base image
+      if: steps.restore.outputs.cache-hit == 'true'
+      shell: bash
+      run: docker load --input "$RUNNER_TEMP/dockerfile-base-image.tar"
+
+    - name: Pull base image with backoff
+      id: pull
+      if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        IMAGE: ${{ steps.ref.outputs.image }}
+      run: |
+        set -uo pipefail
+        for delay in 15 30 60 120 0; do
+          if docker pull --quiet "$IMAGE"; then
+            docker save --output "$RUNNER_TEMP/dockerfile-base-image.tar" "$IMAGE"
+            echo "pulled=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ "$delay" -eq 0 ] && break
+          echo "pull failed; retrying in ${delay}s"
+          sleep "$delay"
+        done
+        # Not fatal: the image-build test then pulls for itself, exactly as before.
+        echo "::warning::could not pull $IMAGE after 5 attempts; the image-build test will pull it directly"
+
+    - name: Save base image to cache
+      if: steps.pull.outputs.pulled == 'true'
+      # Parallel jobs race to save the same key; losing that race is harmless.
+      continue-on-error: true
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ${{ runner.temp }}/dockerfile-base-image.tar
+        key: ${{ steps.ref.outputs.key }}
