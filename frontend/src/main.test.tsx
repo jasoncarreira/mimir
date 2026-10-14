@@ -44,8 +44,8 @@ vi.mock("./dashboardExtensions", async (original) => {
   const real = await original<typeof import("./dashboardExtensions")>();
   return {
     ...real,
-    loadPluginBundles: (...[bundles, manifests, tokens, onChange, signal]: Parameters<typeof real.loadPluginBundles>) =>
-      real.loadPluginBundles(bundles, manifests, tokens, onChange, signal, pluginImport.current ?? undefined)
+    loadPluginBundles: (...[bundles, manifests, tokens, onChange, signal, , cache]: Parameters<typeof real.loadPluginBundles>) =>
+      real.loadPluginBundles(bundles, manifests, tokens, onChange, signal, pluginImport.current ?? undefined, cache)
   };
 });
 
@@ -102,6 +102,7 @@ let bootstrapOverride: typeof protectedBootstrap | null = null;
 
 // Per-test skin shell layout (the real skin drives this via chrome.layout).
 let skinLayout: "top-nav" | "sidebar" = "top-nav";
+let skinTokens = { colorText: "first" };
 let stubAdmin = false;
 
 vi.mock("./api/whoami", () => ({ getWhoami: (...args: unknown[]) => whoami.getWhoami(...args) }));
@@ -127,7 +128,7 @@ vi.mock("./live-events", () => ({
 vi.mock("./skins/SkinProvider", () => ({
   SkinProvider: ({ children }: { children: ReactNode }) => children,
   useSkin: () => ({
-    skin: { id: "test-skin", name: "Test Skin", version: "0.0.0", chrome: { layout: skinLayout } },
+    skin: { id: "test-skin", name: "Test Skin", version: "0.0.0", chrome: { layout: skinLayout }, tokens: skinTokens },
     availableSkins: [
       { id: "default-retro", name: "Default Retro" },
       { id: "neon-terminal", name: "Neon Terminal" }
@@ -189,6 +190,7 @@ afterEach(() => {
   window.history.replaceState(null, "", "/");
   bootstrapOverride = null;
   skinLayout = "top-nav";
+  skinTokens = { colorText: "first" };
   stubAdmin = false;
   useChatStore.setState({ messages: [] });
   useUiState.setState({
@@ -212,6 +214,58 @@ describe("plugin compatibility notices in the dashboard shell", () => {
   const incompatible = {
     plugin: "old-plugin", apiMajor: 2, moduleUrl: "/plugins/old-plugin/assets/main.js", cssUrl: null
   };
+
+  it("restores cached module registrations after skin and bootstrap refresh but not after removal", async () => {
+    const alpha = {
+      id: "alpha", plugin: "alpha", route_path: "/alpha", label: "Alpha", icon: null, nav_position: 10,
+      enabled: true, bundle: "main.js", css: [], api_namespace: "alpha", trusted_first_party: true
+    };
+    bootstrapOverride = { ...protectedBootstrap,
+      plugin_bundles: [{ plugin: "alpha", apiMajor: 1, moduleUrl: "/plugins/alpha/assets/main.js", cssUrl: null }],
+      dashboard_extensions: [...protectedBootstrap.dashboard_extensions, alpha]
+    } as typeof protectedBootstrap;
+    const evaluated = new Set<string>();
+    let imports = 0;
+    pluginImport.current = async (url) => {
+      imports += 1;
+      if (!evaluated.has(url)) {
+        evaluated.add(url);
+        window.mimirPluginHost!.registerRoute({ plugin: "alpha", id: "alpha", path: "/alpha", component: () => <div>alpha-page</div> });
+        window.mimirPluginHost!.registerNavEntry({ plugin: "alpha", id: "alpha", label: "Alpha plugin" });
+      }
+      return {};
+    };
+    sessionKey = "admin-key";
+    useUiState.setState({ apiKeyPresent: true });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/alpha"]}><AppFrame /></MemoryRouter></QueryClientProvider>);
+    const assertPage = async () => {
+      expect(await screen.findByText("alpha-page")).toBeTruthy();
+      expect(screen.getByTestId("nav-alpha").textContent).toContain("Alpha plugin");
+    };
+    await assertPage();
+    skinTokens = { colorText: "second" };
+    view.rerender(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/alpha"]}><AppFrame /></MemoryRouter></QueryClientProvider>);
+    await waitFor(() => expect(imports).toBe(2));
+    await assertPage();
+    expect(window.mimirPluginHost?.themeTokens).toBe(skinTokens);
+    bootstrapOverride = { ...bootstrapOverride!, server: { ...bootstrapOverride!.server, web_host: "refreshed" } };
+    await act(async () => { await client.invalidateQueries({ queryKey: ["web-bootstrap"] }); });
+    await waitFor(() => expect(imports).toBe(3));
+    await assertPage();
+    sessionKey = "new-admin-key";
+    bootstrapOverride = { ...bootstrapOverride!, server: { ...bootstrapOverride!.server, web_host: "new-session" } };
+    await act(async () => { await client.invalidateQueries({ queryKey: ["web-bootstrap"] }); });
+    await waitFor(() => expect(imports).toBe(4));
+    await assertPage();
+    bootstrapOverride = { ...bootstrapOverride!, dashboard_extensions: protectedBootstrap.dashboard_extensions,
+      plugin_bundles: [incompatible] };
+    await act(async () => { await client.invalidateQueries({ queryKey: ["web-bootstrap"] }); });
+    await waitFor(() => expect(screen.queryByTestId("nav-alpha")).toBeNull());
+    expect(screen.queryByText("alpha-page")).toBeNull();
+    expect(screen.getByTestId("plugin-notices").textContent).toContain("unsupported dashboard API version 2");
+    expect(evaluated.size).toBe(1);
+  });
 
   it("shows a version mismatch to admins without hiding the core dashboard", async () => {
     bootstrapOverride = { ...protectedBootstrap, plugin_bundles: [incompatible] };
