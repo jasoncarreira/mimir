@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 import re
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -40,6 +41,13 @@ class ToolPolicy:
     shell_process: bool = False
     memberships: frozenset[str] = frozenset()
     service_sink_adapter: str | None = None
+
+
+@dataclass(frozen=True)
+class ScopedActionProtocol:
+    owner: str
+    action_type: type[StrEnum]
+    validate_scope: Callable[..., bool]
 
 
 @dataclass(frozen=True)
@@ -166,6 +174,7 @@ class PolicyRegistry:
         self._dashboard_entries: dict[str, tuple[str, Any]] = {}
         self._prompt_providers: dict[str, PromptBlockProvider] = {}
         self._state_slots: dict[str, type] = {}
+        self._scoped_actions: dict[str, ScopedActionProtocol] = {}
         self._selected_plugin_candidates: tuple[PluginCandidate, ...] = ()
         self._selection_bound = False
         self._projected_owner: str | None = None
@@ -303,6 +312,19 @@ class PolicyRegistry:
     @property
     def state_slots(self) -> Mapping[str, type]:
         return MappingProxyType(self._state_slots)
+
+    @property
+    def scoped_actions(self) -> Mapping[str, ScopedActionProtocol]:
+        return MappingProxyType(self._scoped_actions)
+
+    def register_scoped_action(self, action_type: type[StrEnum], validate_scope: Callable[..., bool], *, owner: str = "core") -> None:
+        self._writable()
+        if (owner == "core" or owner in self._scoped_actions
+                or not isinstance(action_type, type) or not issubclass(action_type, StrEnum)
+                or not tuple(action_type) or not callable(validate_scope)
+                or any(protocol.action_type is action_type for protocol in self._scoped_actions.values())):
+            raise PolicyRegistrationError(f"{owner}: invalid or duplicate scoped action protocol")
+        self._scoped_actions[owner] = ScopedActionProtocol(owner, action_type, validate_scope)
 
     def register_poller_hook(self, name: str, hook: Callable[..., Any], *, owner: str = "core") -> None:
         self._writable()
@@ -729,8 +751,15 @@ class PolicyRegistry:
             for profile in tool.profiles:
                 if profile not in self._profiles or name not in self._profiles[profile].capabilities:
                     raise PolicyRegistrationError(f"{name}: missing profile membership {profile}")
-            if tool.typed_action is not None and not isinstance(tool.typed_action, RepoPRAction):
+            protocol = self._scoped_actions.get(tool.owner)
+            if tool.typed_action is not None and not (
+                isinstance(tool.typed_action, RepoPRAction)
+                or protocol is not None and type(tool.typed_action) is protocol.action_type
+            ):
                 raise PolicyRegistrationError(f"{name}: invalid repo/PR action {tool.typed_action!r}")
+            if (protocol is not None and tool.resource_scope == "repo_pr"
+                    and type(tool.typed_action) is not protocol.action_type):
+                raise PolicyRegistrationError(f"{name}: repo/PR action belongs to a different owner")
             if tool.owner != "core" and tool.resource_scope == "repo_pr" and tool.typed_action is None:
                 raise PolicyRegistrationError(f"{name}: repo_pr scope requires typed action")
         for name, profile in self._profiles.items():
@@ -872,3 +901,6 @@ class PolicyRegistrar:
 
     def register_state_slot(self, slot_type: type) -> None:
         self._registry.register_state_slot(slot_type, owner=self.plugin)
+
+    def register_scoped_action(self, action_type: type[StrEnum], validate_scope: Callable[..., bool]) -> None:
+        self._registry.register_scoped_action(action_type, validate_scope, owner=self.plugin)
