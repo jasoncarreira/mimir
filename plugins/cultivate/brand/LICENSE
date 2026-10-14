@@ -1,0 +1,18 @@
+SquashMerge brand assets
+
+Copyright (c) 2026 Jason Carreira. All rights reserved.
+
+This directory holds brand assets: logos, wordmarks and the SquashMerge design
+language document (design.md). These files, and copies of them elsewhere in
+this repository or in packages built from it, are not licensed under the MIT
+License or the Business Source License that cover other parts of this
+repository.
+
+You may redistribute unmodified copies of these files only as part of an
+unmodified distribution of the software in this repository, as permitted by
+that software's own license. No other right to use, copy, modify or distribute
+them is granted.
+
+The SquashMerge, Mimir and Cultivate names and logos are trademarks. Nothing in
+this repository grants any right to use them, except as required to describe
+the origin of the software.

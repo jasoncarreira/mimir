@@ -1036,7 +1036,9 @@ async def _handle_health(request: web.Request) -> web.Response:
     response: dict[str, object] = {"ok": True}
     manager = request.app.get("plugin_manager")
     if manager is not None and manager.plugins:
-        response["plugins"] = await manager.health()
+        plugin_health = await manager.health()
+        if plugin_health:
+            response["plugins"] = plugin_health
     if not request.app.get("check_worker_executor_health"):
         return web.json_response(response)
 

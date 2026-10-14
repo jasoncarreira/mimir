@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -11,6 +11,7 @@ resolution-markers = [
 [manifest]
 members = [
     "mimir-agent",
+    "mimir-cultivate",
     "saga",
 ]
 
@@ -1733,6 +1734,17 @@ dev = [
     { name = "saga", editable = "benchmarks/saga" },
     { name = "slack-bolt", specifier = ">=1.18" },
 ]
+
+[[package]]
+name = "mimir-cultivate"
+version = "0.9.9"
+source = { editable = "plugins/cultivate" }
+dependencies = [
+    { name = "mimir-agent" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "mimir-agent", editable = "." }]
 
 [[package]]
 name = "mmh3"
