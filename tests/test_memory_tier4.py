@@ -252,6 +252,41 @@ def test_forget_by_criteria_dry_run_returns_preview(conn):
     assert count == 0
 
 
+@pytest.mark.parametrize("activation_below", [0.1, float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_forget_by_criteria_rejects_invalid_activation_directly(conn, activation_below, dry_run):
+    """Bypass the tool guard: direct callers must get the inner refusal."""
+    atom_id = store(conn, "must survive invalid activation", embed_fn=_fake_embed).atom_id
+    with pytest.raises(ValueError, match="activation_below must be finite and <= 0"):
+        forget_by_criteria(
+            conn, activation_below=activation_below, dry_run=dry_run,
+            allow_bulk=True,
+        )
+    assert conn.execute(
+        "SELECT tombstoned FROM atoms WHERE id = ?", (atom_id,),
+    ).fetchone()[0] == 0
+    assert not conn.in_transaction
+
+
+@pytest.mark.parametrize("activation_below", [0.0, -1.0])
+def test_forget_by_criteria_accepts_finite_nonpositive_activation(conn, activation_below):
+    atom_id = store(conn, "never accessed", embed_fn=_fake_embed).atom_id
+    # store() records a creation access; explicitly model a never-accessed row.
+    conn.execute(
+        "UPDATE atom_access_summary SET recent_ts_json = '[]', recent_weights_json = '[]', "
+        "old_count = 0, old_weight_sum = 0, old_oldest_ts = NULL WHERE atom_id = ?",
+        (atom_id,),
+    )
+    conn.commit()
+    preview = forget_by_criteria(conn, activation_below=activation_below)
+    assert preview.tombstoned_ids == [atom_id]
+    result = forget_by_criteria(
+        conn, activation_below=activation_below, dry_run=False,
+        preview_token=preview.preview_token, allow_bulk=True,
+    )
+    assert result.tombstoned_ids == [atom_id]
+
+
 def test_forget_requires_binding_preview_and_detects_changed_selection(conn):
     first = store(conn, "first " + "x" * 200, embed_fn=_fake_embed, stream="episodic").atom_id
     preview = forget_by_criteria(conn, stream="episodic")
