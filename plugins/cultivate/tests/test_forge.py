@@ -294,6 +294,7 @@ class RetiredSources(importlib.abc.MetaPathFinder):
         if fullname == 'mimir.forge' or fullname.startswith('mimir.forge.') or fullname == 'mimir.tools.forge':
             raise ImportError(f'retired source imported: {fullname}')
 
+sys.meta_path.insert(0, RetiredSources())
 from mimir_cultivate import forge
 assert len(forge.FORGE_TOOLS) == 21
 assert forge._issue_bound_to_pr is not None
@@ -304,7 +305,10 @@ class Client:
 forge.set_forge_client(Client())
 assert forge.pr_list.func('owner/repo') == []
 """
-    subprocess.run([sys.executable, "-c", program], check=True, env=os.environ.copy())
+    result = subprocess.run(
+        [sys.executable, "-c", program], env=os.environ.copy(), capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_github_identity_binding_and_degraded_latch(monkeypatch) -> None:
