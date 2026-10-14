@@ -263,6 +263,35 @@ async def test_plugin_prompt_logger_failure_does_not_break_rendering(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_plugin_prompt_over_cap_reported_once_per_provider_across_agents(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+
+    events = []
+    monkeypatch.setattr(agent_module, "log_event_sync", lambda kind, **fields: events.append((kind, fields)))
+    registry = PolicyRegistry()
+    registrar = registry.registrar("example")
+    # Distinct names keep the process-global receipt independent of other tests.
+    for name in ("once_dynamic", "once_static"):
+        registrar.register_prompt_provider(name, "feedback", 19, lambda a, e: True,
+                                           lambda a, e, reader: "é" * 30, static=name.endswith("static"))
+    registrar.register_prompt_provider("once_small", "feedback", 100, lambda a, e: True,
+                                       lambda a, e, reader: "short")
+    registry.freeze()
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    with policy_scope(registry):
+        first_agent = _make_agent(tmp_path / "first")
+        first, _ = await first_agent._build_turn_prompt(_make_ctx(event), event, None)
+        second, _ = await first_agent._build_turn_prompt(_make_ctx(event), event, None)
+        second_agent = _make_agent(tmp_path / "second")
+        third, _ = await second_agent._build_turn_prompt(_make_ctx(event), event, None)
+    for prompt in (first, second, third):
+        assert prompt.count("…[truncated]") == 2
+        assert "## Plugin: once_small\n\nshort" in prompt
+    assert events == [("plugin_prompt_over_cap", {"provider": "once_dynamic"}),
+                      ("plugin_prompt_over_cap", {"provider": "once_static"})]
+
+
+@pytest.mark.asyncio
 async def test_plugin_prompt_real_reader_omits_refused_text(tmp_path, monkeypatch) -> None:
     import mimir.agent as agent_module
 

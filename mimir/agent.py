@@ -168,6 +168,8 @@ from .access_control import HTTP_EVENT_INGRESS_EXTRA_KEY
 log = logging.getLogger(__name__)
 
 _STATIC_PROMPT_BLOCKS: dict[int, tuple[Any, str]] = {}
+_PLUGIN_PROMPT_OVER_CAP_REPORTED: set[str] = set()
+_PLUGIN_PROMPT_REPORT_LOCK = threading.Lock()
 _STATIC_PROMPT_LOCK = threading.Lock()
 
 
@@ -223,6 +225,13 @@ def _cap_plugin_prompt(content: str, limit: int) -> tuple[str, bool]:
 
 def _report_plugin_prompt(kind: str, name: str) -> None:
     """Prompt telemetry is best effort and never includes provider content."""
+    if kind == "plugin_prompt_over_cap":
+        # Process-wide, not per Agent or turn. Claim before logging so concurrent
+        # turns (and an unavailable logger) cannot produce a recurring alert.
+        with _PLUGIN_PROMPT_REPORT_LOCK:
+            if name in _PLUGIN_PROMPT_OVER_CAP_REPORTED:
+                return
+            _PLUGIN_PROMPT_OVER_CAP_REPORTED.add(name)
     try:
         log_event_sync(kind, provider=name)
     except Exception:  # noqa: BLE001 — logger availability cannot fail prompt assembly
