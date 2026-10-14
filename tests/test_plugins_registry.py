@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, dataclass
+from types import SimpleNamespace
 
 import pytest
 
 from mimir.access_control import ServicePrincipal
 from mimir.models import RepoPRAction
+from mimir.plugins import manager
+from mimir.plugins.discovery import PluginDiscoveryError
 from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry
 from mimir.tool_descriptors import (
     ResultOriginKind, SinkCategory, _PAYLOAD_EXTRACTOR_UNDECLARED,
@@ -221,12 +224,129 @@ def test_plugin_profile_membership_must_be_declared_on_both_sides():
     assert not registry.frozen
 
 
-@pytest.mark.parametrize("membership", ["retained_repo_tools", "fixed_service_sinks", "worklink_build_tools", "catalog_admin_builtin", "repo_publish_tools"])
+@pytest.mark.parametrize("membership", [
+    "retained_repo_tools", "fixed_service_sinks", "worklink_build_tools",
+    "taint_independent_egress", "catalog_admin_builtin", "acp_hands_result_tools",
+    "repo_publish_tools",
+])
 def test_core_only_memberships_are_not_plugin_grants(membership):
     registry = PolicyRegistry()
     with pytest.raises(PolicyRegistrationError, match=f"example: tool sample: core-only memberships.*{membership}"):
         registry.registrar("example").register_tool(**tool_fields(memberships={membership}))
     assert not registry.tools
+
+
+def selected_candidate(**overrides):
+    ep = SimpleNamespace(
+        group="mimir.plugins", name="cultivate", value="mimir_cultivate:provider",
+        dist=SimpleNamespace(metadata={"Name": "mimir-cultivate"}),
+    )
+    fields = dict(name="cultivate", distribution="mimir-cultivate", entry_point=ep,
+                  manifest=SimpleNamespace(config={}), enabled=True, diagnostic=None)
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def selected_registry(candidate=None):
+    candidate = candidate or selected_candidate()
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((candidate,))
+    registry.registrar("cultivate").register_tool(**tool_fields(name="owned"))
+    return registry, candidate
+
+
+def test_first_party_projection_is_owner_bound_and_frozen():
+    registry, candidate = selected_registry()
+    registry._project_first_party_memberships(candidate, {
+        "retained_repo_tools": ("owned",), "repo_publish_tools": ("owned",),
+    })
+    assert registry.freeze().tools["owned"].memberships == {
+        "retained_repo_tools", "repo_publish_tools",
+    }
+    with pytest.raises(PolicyRegistrationError, match="frozen"):
+        registry._project_first_party_memberships(candidate, {})
+    with pytest.raises(FrozenInstanceError):
+        registry.tools["owned"].memberships = frozenset()
+
+
+@pytest.mark.parametrize("projection", [
+    {"retained_repo_tools": ("missing",)},
+    {"retained_repo_tools": ("foreign",)},
+    {"retained_repo_tools": ("owned", "owned")},
+    {"fixed_service_sinks": ("owned",)},
+    {"acp_hands_result_tools": ("owned",)},
+    {"catalog_admin_builtin": ("owned",)},
+    {"taint_independent_egress": ("owned",)},
+])
+def test_first_party_projection_rejects_invalid_entries_atomically(projection):
+    registry, candidate = selected_registry()
+    registry.register_tool(**tool_fields(name="foreign"))
+    with pytest.raises(PolicyRegistrationError):
+        registry._project_first_party_memberships(candidate, projection)
+    assert registry.tools["owned"].memberships == frozenset()
+
+
+@pytest.mark.parametrize("change", [
+    {"distribution": "foreign"}, {"name": "foreign"}, {"enabled": False},
+    {"manifest": None}, {"diagnostic": "invalid"},
+])
+def test_first_party_projection_requires_selected_installed_identity(change):
+    candidate = selected_candidate(**change)
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((candidate,))
+    with pytest.raises(PolicyRegistrationError, match="invalid selected"):
+        registry._project_first_party_memberships(candidate, {})
+
+
+def test_first_party_projection_rejects_unselected_and_repeated_calls():
+    registry, candidate = selected_registry()
+    with pytest.raises(PolicyRegistrationError, match="invalid selected"):
+        registry._project_first_party_memberships(selected_candidate(), {})
+    registry._project_first_party_memberships(candidate, {})
+    with pytest.raises(PolicyRegistrationError, match="invalid selected"):
+        registry._project_first_party_memberships(candidate, {})
+
+
+def test_first_party_projection_rejects_duplicate_selected_owner():
+    candidate = selected_candidate()
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((candidate, selected_candidate()))
+    with pytest.raises(PolicyRegistrationError, match="invalid selected"):
+        registry._project_first_party_memberships(candidate, {})
+
+
+def test_manager_projects_only_selected_first_party_provider(monkeypatch):
+    candidate = selected_candidate()
+
+    class Contributor:
+        def register(self, registrar):
+            registrar.register_tool(**tool_fields(name="owned"))
+
+        def host_membership_projection(self):
+            return {"worklink_build_tools": ("owned",)}
+
+    candidate.entry_point.load = lambda: Contributor()
+    monkeypatch.setattr(manager, "enabled_plugins", lambda *, enable: (candidate,))
+    policy = manager.load_plugins(enable="cultivate").policy
+    assert policy.tools["owned"].memberships == {"worklink_build_tools"}
+    with pytest.raises(TypeError):
+        policy.tools["new"] = policy.tools["owned"]
+
+
+def test_manager_rejects_invalid_first_party_projection(monkeypatch):
+    candidate = selected_candidate()
+
+    class Contributor:
+        def register(self, registrar):
+            registrar.register_tool(**tool_fields(name="owned"))
+
+        def host_membership_projection(self):
+            return {"retained_repo_tools": ("missing",)}
+
+    candidate.entry_point.load = lambda: Contributor()
+    monkeypatch.setattr(manager, "enabled_plugins", lambda *, enable: (candidate,))
+    with pytest.raises(PluginDiscoveryError, match="membership projection failed.*absent or foreign"):
+        manager.load_plugins(enable="cultivate")
 
 
 def test_unknown_membership_is_not_accepted():

@@ -123,6 +123,9 @@ _CORE_ONLY_MEMBERSHIPS = frozenset({
     "taint_independent_egress", "catalog_admin_builtin", "acp_hands_result_tools",
     "repo_publish_tools",
 })
+_FIRST_PARTY_PROJECTED_MEMBERSHIPS = frozenset({
+    "retained_repo_tools", "worklink_build_tools", "repo_publish_tools",
+})
 
 
 def _name(value: str, kind: str) -> str:
@@ -165,6 +168,7 @@ class PolicyRegistry:
         self._state_slots: dict[str, type] = {}
         self._selected_plugin_candidates: tuple[PluginCandidate, ...] = ()
         self._selection_bound = False
+        self._projected_owner: str | None = None
         self._frozen = False
 
     def registrar(self, plugin: str) -> PolicyRegistrar:
@@ -182,6 +186,51 @@ class PolicyRegistry:
             raise PolicyRegistrationError("invalid or repeated selected plugin snapshot")
         self._selected_plugin_candidates = candidates
         self._selection_bound = True
+
+    def _project_first_party_memberships(
+        self, candidate: PluginCandidate, memberships: Mapping[str, Iterable[str]],
+    ) -> None:
+        """Apply the selected first-party package's host-owned membership projection."""
+        self._writable()
+        ep = candidate.entry_point
+        dist = getattr(ep, "dist", None)
+        if (
+            not self._selection_bound
+            or not any(selected is candidate for selected in self._selected_plugin_candidates)
+            or sum(selected.name == candidate.name for selected in self._selected_plugin_candidates) != 1
+            or self._projected_owner is not None
+            or candidate.name != "cultivate"
+            or candidate.distribution != "mimir-cultivate"
+            or not candidate.enabled or candidate.diagnostic is not None
+            or candidate.manifest is None
+            or ep.group != "mimir.plugins" or ep.name != candidate.name
+            or ep.value != "mimir_cultivate:provider"
+            or dist is None or dist.metadata.get("Name", "").lower().replace("_", "-") != "mimir-cultivate"
+        ):
+            raise PolicyRegistrationError("invalid selected first-party membership owner")
+        if not isinstance(memberships, Mapping) or memberships.keys() - _FIRST_PARTY_PROJECTED_MEMBERSHIPS:
+            raise PolicyRegistrationError("invalid first-party membership projection")
+        updates: dict[str, frozenset[str]] = {}
+        for category, names in memberships.items():
+            if isinstance(names, (str, bytes)):
+                raise PolicyRegistrationError(f"invalid projection for {category}")
+            try:
+                entries = tuple(names)
+            except TypeError as exc:
+                raise PolicyRegistrationError(f"invalid projection for {category}") from exc
+            if any(not isinstance(name, str) for name in entries):
+                raise PolicyRegistrationError(f"invalid projection for {category}")
+            if len(entries) != len(set(entries)):
+                raise PolicyRegistrationError(f"duplicate projected tool in {category}")
+            for name in entries:
+                tool = self._tools.get(name)
+                if tool is None or tool.owner != candidate.name:
+                    raise PolicyRegistrationError(f"{category}: absent or foreign tool {name!r}")
+                updates[name] = updates.get(name, frozenset()) | {category}
+        for name, categories in updates.items():
+            tool = self._tools[name]
+            self._tools[name] = replace(tool, memberships=tool.memberships | categories)
+        self._projected_owner = candidate.name
 
     def _writable(self) -> None:
         if self._frozen:
