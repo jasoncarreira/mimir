@@ -106,6 +106,12 @@ _WRITE_FILE_DESCRIPTION = (
     "or `replace_file` for its full content. Parent "
     "directories are created as needed."
 )
+_EDIT_FILE_DESCRIPTION = (
+    "Change part of an existing file by replacing the specified old_string with "
+    "new_string. Anchor old_string on existing text; content outside the match "
+    "is preserved. This tool does not require a prior read. For a deliberate "
+    "full rewrite, use replace_file and pass the entire new content."
+)
 _REPLACE_FILE_DESCRIPTION = (
     "Atomically replaces the ENTIRE content of an existing regular file with `content`, "
     "preserving its permissions. Any existing text you do not include is deleted. "
@@ -474,6 +480,7 @@ class MimirFilesystemMiddleware(FilesystemMiddleware):
     def __init__(self, **kwargs: Any) -> None:
         descriptions = dict(kwargs.pop("custom_tool_descriptions", None) or {})
         descriptions["write_file"] = _WRITE_FILE_DESCRIPTION
+        descriptions["edit_file"] = _EDIT_FILE_DESCRIPTION
         descriptions["replace_file"] = _REPLACE_FILE_DESCRIPTION
         kwargs["custom_tool_descriptions"] = descriptions
         kwargs["tools"] = [name for name in _FILESYSTEM_TOOLS if name != "replace_file"]

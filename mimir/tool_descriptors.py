@@ -374,6 +374,7 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "send_message": _D(SinkCategory.SAME_CHANNEL, _channel_target, "message", result_origin=_N, budget_exempt=True, sink_payload_extractor=_cross_channel_message_payload),
     "set_poller_overrides": _D(SinkCategory.SCHEDULER, _poller_overrides_target, "scheduler", result_origin=_N),
     "set_schedule_priority": _D(SinkCategory.SCHEDULER, _schedule_target, "scheduler", result_origin=_N),
+    "set_schedule_cron": _D(SinkCategory.SCHEDULER, _schedule_target, "scheduler", result_origin=_N),
     "shell": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
     "shell_exec": _D(SinkCategory.SHELL_PROCESS, _command_target, "shell_process", sink_payload_extractor=_argument_payload("command")),
     "spawn_open_code": _D(SinkCategory.SPAWN, _spawn_target, "spawn_process", ifc_delegation=True),
