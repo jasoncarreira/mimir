@@ -11,9 +11,83 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
-from mimir.worklink.compute import ComputeResult, WorkSpec
+
+@dataclass(frozen=True)
+class WorkSpec:
+    issue_id: int
+    attempt: int
+    repo_url: str
+    base_ref: str
+    branch: str
+    prompt: str
+    rules: str | None
+    test_command: str
+    backend: str
+    timeout_s: int
+    creds_ref: Mapping[str, str] = field(default_factory=dict)
+    env: Mapping[str, str] = field(default_factory=dict)
+    backend_config: Mapping[str, Any] = field(default_factory=dict)
+    local_checkout: Path | None = None
+    local_argv: Sequence[str] | None = None
+    output_root: Path | None = None
+    factory_credential_settings: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+
+
+@dataclass(frozen=True)
+class LaunchHandle:
+    substrate: str
+    identifier: str
+    process_start_ticks: int | None = None
+    shim_pid: int | None = None
+
+
+@dataclass(frozen=True)
+class ComputeResult:
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    output_overflow: bool = False
+    launch_error: str | None = None
+    handle: LaunchHandle | None = None
+    command: tuple[str, ...] = ()
+    stdout_path: Path | None = None
+    stderr_path: Path | None = None
+
+
+class ComputeLaunchError(RuntimeError):
+    pass
+
+
+class ComputeBackend(Protocol):
+    name: str
+
+    async def launch(self, spec: WorkSpec) -> LaunchHandle: ...
+
+    async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult: ...
+
+    async def cancel(self, handle: LaunchHandle) -> None: ...
+
+    async def cleanup(self, handle: LaunchHandle) -> None: ...
+
+
+def with_worker_environment(spec: WorkSpec, additions: Mapping[str, str]) -> WorkSpec:
+    """Add gate settings to both the environment and the worker pass list."""
+    from dataclasses import replace
+
+    if not additions:
+        return spec
+    env = {**spec.env, **additions}
+    if "pass_env" not in spec.backend_config:
+        return replace(spec, env=env)
+    requested = spec.backend_config["pass_env"]
+    if isinstance(requested, (str, bytes)) or not isinstance(requested, Sequence):
+        raise ComputeLaunchError("worker pass_env must be a sequence")
+    return replace(spec, env=env, backend_config={
+        **spec.backend_config, "pass_env": tuple(dict.fromkeys((*requested, *additions))),
+    })
 
 
 @dataclass(frozen=True)

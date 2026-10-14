@@ -7,15 +7,14 @@ from datetime import UTC, datetime
 import os
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 
-from mimir.worklink.backends.feature_factory import parse_factory_status
-from mimir.worklink.compute import (
-    ComputeLaunchError, ComputeResult, LaunchHandle, LocalSubprocessComputeBackend, WorkSpec,
+from mimir_cultivate.worklink.backends.base import (
+    ComputeLaunchError, ComputeResult, LaunchHandle, WorkSpec, blocked_reason_from_output,
 )
-from mimir_cultivate.worklink.backends.base import blocked_reason_from_output
 from mimir_cultivate.worklink import evidence as provider_evidence
 from mimir_cultivate.worklink.evidence import (
     TestResult,
@@ -27,6 +26,7 @@ from mimir_cultivate.worklink.factory_state import (
     FactoryRecordError,
     FactoryRunRecord,
     load_factory_record,
+    parse_factory_status,
     save_factory_record,
 )
 from mimir_cultivate.worklink import identities
@@ -179,6 +179,30 @@ def test_backend_blocked_marker_must_end_the_output() -> None:
     assert blocked_reason_from_output("WORKLINK_BLOCKED: example\ndone", "") is None
 
 
+def test_provider_records_import_without_retiring_core_modules() -> None:
+    script = """
+import importlib.abc
+import sys
+
+retiring = (
+    'mimir.worklink.compute', 'mimir.worklink.dispatch_failures',
+    'mimir.worklink.backends.feature_factory', 'mimir.worklink.backends.registry',
+    'mimir.coding', 'mimir.tools._shell_env',
+)
+class BlockRetired(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if any(fullname == name or fullname.startswith(name + '.') for name in retiring):
+            raise ImportError('retired dependency: ' + fullname)
+        return None
+sys.meta_path.insert(0, BlockRetired())
+import mimir_cultivate.worklink.backends.base
+import mimir_cultivate.worklink.factory_state
+import mimir_cultivate.worklink.evidence
+"""
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_identity_lookup_requires_both_accounts_and_group(monkeypatch: pytest.MonkeyPatch) -> None:
     identities.get_identities.cache_clear()
     monkeypatch.setattr(identities.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid={"mimir": 1001, "worklink": 1002}[name]))
@@ -196,8 +220,9 @@ def test_identity_lookup_requires_both_accounts_and_group(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("authorized", [False, True])
 async def test_selected_provider_gate_never_runs_controller_shell(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, authorized: bool,
 ) -> None:
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
@@ -212,34 +237,53 @@ async def test_selected_provider_gate_never_runs_controller_shell(
         def run(self, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(args, 0, "changed.py\n" if "--name-only" in args else "")
 
+    compute = SimpleNamespace(name="local_subprocess", _authorized_checkout=None)
+    spec = WorkSpec(
+        issue_id=1949, attempt=1, repo_url="repo", base_ref="main",
+        branch="feature/1949", prompt="", rules=None, test_command="pytest -q",
+        backend="opencode", timeout_s=30, local_checkout=tmp_path,
+    )
+    if authorized:
+        compute._authorized_checkout = SimpleNamespace(
+            verify=lambda checkout: None, duplicate_fd=lambda: None, path=tmp_path,
+            issue_id=1949, attempt=1,
+        )
+        compute._launch_contained = lambda *_: called.append("should not launch")
     with pytest.raises(ComputeLaunchError, match="authorized worker checkout"):
         await observe_evidence(
             issue=1949, attempt=1, backend="opencode", branch="feature/1949",
             checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
             backend_status="completed", test_command="touch controller-canary",
-            safe_git=GitObservation(),
+            safe_git=GitObservation(), compute=compute,
+            work_spec=None if authorized else spec,
         )
     assert not called
     assert not (tmp_path / "controller-canary").exists()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("gate_exit", [0, 1])
 async def test_selected_provider_observes_gate_through_authorized_compute(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate_exit: int,
 ) -> None:
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
     calls: list[object] = []
-    compute = LocalSubprocessComputeBackend(_authorized_checkout=object())
+    authorization = SimpleNamespace(
+        verify=lambda checkout: calls.append("verified"), duplicate_fd=lambda: None,
+        path=tmp_path, issue_id=1949, attempt=1,
+    )
+    compute = SimpleNamespace(name="local_subprocess", _authorized_checkout=authorization)
     handle = LaunchHandle("local_subprocess", "worker-handle")
 
-    async def launch(spec: WorkSpec) -> LaunchHandle:
+    async def launch(spec: WorkSpec, command: tuple[str, ...]) -> LaunchHandle:
         calls.append(spec)
+        assert command == ("/bin/sh", "-c", "pytest -q")
         return handle
 
     async def wait(observed: LaunchHandle, timeout: int) -> ComputeResult:
         assert observed == handle
-        return ComputeResult(exit_code=0, stdout="passed", stderr="")
+        return ComputeResult(exit_code=gate_exit, stdout="passed" if not gate_exit else "1 failed: test_worker_gate", stderr="")
 
     async def cleanup(observed: LaunchHandle) -> None:
         assert observed == handle
@@ -251,9 +295,9 @@ async def test_selected_provider_observes_gate_through_authorized_compute(
         def run(self, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(args, 0, "changed.py\n" if "--name-only" in args else "")
 
-    monkeypatch.setattr(compute, "launch", launch)
-    monkeypatch.setattr(compute, "wait", wait)
-    monkeypatch.setattr(compute, "cleanup", cleanup)
+    compute._launch_contained = launch
+    compute.wait = wait
+    compute.cleanup = cleanup
     monkeypatch.setattr(provider_evidence, "_run", forbidden)
     result = await observe_evidence(
         issue=1949, attempt=1, backend="opencode", branch="feature/1949",
@@ -266,7 +310,12 @@ async def test_selected_provider_observes_gate_through_authorized_compute(
             backend="opencode", timeout_s=30, local_checkout=tmp_path,
         ),
     )
-    assert result.review_ready
-    assert result.evidence.tests is not None and result.evidence.tests.exit_code == 0
-    assert len(calls) == 1
-    assert calls[0].local_argv == ("/bin/sh", "-c", "pytest -q")
+    assert result.review_ready is (gate_exit == 0)
+    assert result.evidence.tests is not None and result.evidence.tests.exit_code == gate_exit
+    assert len(calls) == 2
+    assert calls[0] == "verified"
+    assert calls[1].local_argv == ("/bin/sh", "-c", "pytest -q")
+    if gate_exit:
+        assert result.status == result.evidence.status == "failed"
+        assert "tests_failed" in result.reasons
+        assert "test_worker_gate" in result.evidence.failure_reason

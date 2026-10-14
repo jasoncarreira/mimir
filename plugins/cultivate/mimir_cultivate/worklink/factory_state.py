@@ -8,12 +8,199 @@ import json
 import os
 from pathlib import Path
 import stat
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, ClassVar, Iterator, Mapping, Sequence
 
 from mimir._atomic import atomic_write_json
-from mimir.worklink.backends.feature_factory import FactoryStatus, epic_run_id, parse_factory_status
-from mimir.worklink.compute import LaunchHandle
+from .backends.base import LaunchHandle
 from .run_state import process_is_zombie, process_start_ticks
+
+
+class FactoryContractError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class FactoryStatus:
+    run_id: str
+    valid: bool
+    sandbox_path: str
+    issue_key: str | None = None
+    status: str | None = None
+    mode: str | None = None
+    branch: str | None = None
+    pr_base: str | None = None
+    pr_draft: bool | None = None
+    lock: str | None = None
+    dead_lock: bool | None = None
+    lock_session: str | None = None
+    gates: dict[str, Any] | None = None
+    steps: tuple[dict[str, Any], ...] | None = None
+    slices: tuple[dict[str, Any], ...] | None = None
+    validator: dict[str, Any] | None = None
+    next_action: dict[str, Any] | None = None
+    pr_url: str | None = None
+    terminal_result: dict[str, Any] | None = None
+    park_snapshot: str | None = None
+    next: str | None = None
+    next_present: bool = False
+
+    TERMINAL_STATUSES: ClassVar[frozenset[str]] = frozenset({"completed", "blocked", "partial"})
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in self.TERMINAL_STATUSES
+
+    @property
+    def is_parked(self) -> bool:
+        return self.status == "needs-human"
+
+    def require_recovery_next(self) -> str:
+        if not self.next_present or self.next is None:
+            raise FactoryContractError("factory status recovery requires a nonblank next action")
+        return self.next
+
+    def to_json(self) -> dict[str, Any]:
+        payload = {name: list(value) if name in {"steps", "slices"} and value is not None else value
+                   for name, value in vars(self).items() if name not in {"next", "next_present"}}
+        if self.next_present:
+            payload["next"] = self.next
+        return payload
+
+
+_STATUS_MAX_BYTES = 1024 * 1024
+_STATUS_ROW_FIELDS = {
+    "steps": {"agent": "text", "status": "text", "attempts": "count"},
+    "slices": {"id": "text", "status": "text", "attempts": "count",
+               "extra_attempts": "count", "retry_limit": "count"},
+    "gates": {"status": "text", "at": "nullable", "artifact": "nullable", "reviewed_head": "nullable"},
+    "validator": {"verdict": "text", "report": "nullable", "reviewed_head": "nullable", "loops": "count"},
+    "next_action": {"kind": "text", "subject": "nullable"},
+}
+
+
+def _status_text(value: object, name: str, *, nullable: bool = False) -> str | None:
+    if value is None and nullable:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise FactoryContractError(f"factory status {name} must be a nonblank string")
+    text = value.strip()
+    if len(text.encode("utf-8")) > 16 * 1024 or "\x00" in text:
+        raise FactoryContractError(f"factory status {name} is invalid")
+    return text
+
+
+def _status_row(value: object, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or len(json.dumps(value).encode()) > 16 * 1024:
+        raise FactoryContractError(f"factory status {name} must be a bounded object")
+    fields = _STATUS_ROW_FIELDS[name]
+    if set(value) != set(fields):
+        raise FactoryContractError(f"factory status {name} fields are invalid")
+    result = {}
+    for key, kind in fields.items():
+        item = value[key]
+        if kind == "count":
+            if type(item) is not int or item < 0:
+                raise FactoryContractError(f"factory status {name}.{key} must be a nonnegative integer")
+        else:
+            item = _status_text(item, f"{name}.{key}", nullable=kind == "nullable")
+        result[key] = item
+    if name == "validator" and result["verdict"] not in {"GO", "GO-WITH-NITS", "NO-GO"}:
+        raise FactoryContractError("factory status validator.verdict has an unknown verdict")
+    if name == "next_action" and result["kind"] not in {
+        "terminal", "gate", "step", "observe-slice", "blocked-slice", "dispatch-slice",
+        "seed-slices", "pr", "complete",
+    }:
+        raise FactoryContractError("factory status next_action.kind is unknown")
+    return result
+
+
+def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactoryStatus:
+    if isinstance(payload, bytes):
+        if len(payload) > _STATUS_MAX_BYTES or b"\x00" in payload:
+            raise FactoryContractError("factory status output exceeds bounds")
+        payload = payload.decode("utf-8", "strict")
+    if isinstance(payload, str):
+        if len(payload.encode("utf-8")) > _STATUS_MAX_BYTES or "\x00" in payload:
+            raise FactoryContractError("factory status output exceeds bounds")
+        try:
+            payload = json.loads(payload, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise FactoryContractError("factory status output is not one JSON object") from exc
+    if not isinstance(payload, Mapping) or not all(isinstance(key, str) for key in payload):
+        raise FactoryContractError("factory status must be a JSON object")
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise FactoryContractError("factory status output is not one JSON object") from exc
+    if len(encoded) > _STATUS_MAX_BYTES:
+        raise FactoryContractError("factory status output exceeds bounds")
+    if not {"run_id", "valid", "sandbox_path"} <= payload.keys():
+        raise FactoryContractError("factory status missing required field")
+    if type(payload["valid"]) is not bool:
+        raise FactoryContractError("factory status valid must be a boolean")
+    values = {name: _status_text(payload.get(name), name, nullable=name not in {
+        "run_id", "sandbox_path",
+    }) for name in (
+        "run_id", "sandbox_path", "issue_key", "status", "mode", "branch", "pr_base",
+        "lock_session", "pr_url", "park_snapshot",
+    )}
+    for name in ("pr_draft", "dead_lock"):
+        value = payload.get(name)
+        if value is not None and type(value) is not bool:
+            raise FactoryContractError(f"factory status {name} must be a boolean")
+        values[name] = value
+    lock = _status_text(payload.get("lock"), "lock", nullable=True)
+    if lock is not None and lock not in {"fresh", "stale", "absent"}:
+        raise FactoryContractError("factory status lock must be fresh, stale, or absent")
+    values["lock"] = lock
+    for name in ("steps", "slices"):
+        rows = payload.get(name)
+        if rows is not None:
+            if not isinstance(rows, list) or len(rows) > 1000:
+                raise FactoryContractError(f"factory status {name} must be a bounded object list")
+            rows = tuple(_status_row(item, name) for item in rows)
+        values[name] = rows
+    gates = payload.get("gates")
+    if gates is not None:
+        if not isinstance(gates, dict) or len(gates) > 1000:
+            raise FactoryContractError("factory status gates must be a bounded object")
+        gates = {_status_text(key, "gates key"): _status_row(row, "gates") for key, row in gates.items()}
+    values["gates"] = gates
+    for name in ("validator", "next_action"):
+        values[name] = _status_row(payload[name], name) if payload.get(name) is not None else None
+    terminal = payload.get("terminal_result")
+    if terminal is not None and not isinstance(terminal, dict):
+        raise FactoryContractError("factory status terminal_result must be an object")
+    values["terminal_result"] = terminal
+    values["next_present"] = "next" in payload
+    values["next"] = _status_text(payload.get("next"), "next", nullable=True)
+    return FactoryStatus(valid=payload["valid"], **values)
+
+
+def epic_run_id(issue_id: int) -> str:
+    if type(issue_id) is not int or issue_id < 1:
+        raise ValueError("epic issue id must be positive")
+    return f"chainlink-{issue_id}"
+
+
+# Records are available before the executor and factory adapter are installed.
+# Once those provider modules arrive, use their canonical types so a record
+# created by the controller compares equal to one recovered from disk.
+try:
+    from .compute import LaunchHandle as LaunchHandle
+except ModuleNotFoundError as exc:
+    if exc.name != "mimir_cultivate.worklink.compute":
+        raise
+
+try:
+    from .backends.feature_factory import (
+        FactoryStatus as FactoryStatus,
+        epic_run_id as epic_run_id,
+        parse_factory_status as parse_factory_status,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "mimir_cultivate.worklink.backends.feature_factory":
+        raise
 
 
 FACTORY_RECORD_VERSION = 2

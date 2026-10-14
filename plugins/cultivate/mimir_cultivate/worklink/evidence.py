@@ -23,19 +23,24 @@ import uuid
 import xml.etree.ElementTree as ET
 
 from mimir.redaction import redact_text
-from mimir.worklink.compute import (
+from .backends.base import (
     ComputeBackend,
     ComputeLaunchError,
     ComputeResult,
     LaunchHandle,
-    LocalSubprocessComputeBackend,
     WorkSpec,
     with_worker_environment,
 )
-from mimir.worklink.dispatch_failures import terminal_error
 
 
 log = logging.getLogger(__name__)
+
+
+def terminal_error(value: BaseException | str) -> str:
+    """Return a bounded, redacted final line for durable failure records."""
+    text = f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else value
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    return redact_text(lines[-1] if lines else "Worklink run failed")[:1000]
 
 
 @dataclass(frozen=True)
@@ -638,22 +643,26 @@ async def _observe_evidence_from_ref(
     gate_rerun_max_failures: int = 10,
 ) -> EvidenceValidation:
     runner = runner or _run
-    # Until the provider-owned compute substrate lands, the core local backend
-    # can still launch directly as the controller when the legacy flag is off.
-    # Never allow a selected provider's checkout command onto that path.
-    from mimir.coding import coding_enabled
-
-    worker_uid_drop = backend == "opencode"
+    worker_uid_drop = True
     if test_command and not skip_test_reason:
+        authorization = getattr(compute, "_authorized_checkout", None)
         if (
-            not worker_uid_drop
-            or not coding_enabled()
-            or type(compute) is not LocalSubprocessComputeBackend
-            or compute._authorized_checkout is None
+            getattr(compute, "name", None) != "local_subprocess"
+            or authorization is None
+            or not all(hasattr(authorization, member) for member in ("verify", "duplicate_fd", "path"))
+            or not callable(getattr(compute, "_launch_contained", None))
             or work_spec is None
             or work_spec.local_checkout != checkout
+            or authorization.path != checkout
+            or authorization.issue_id != issue
+            or authorization.attempt != attempt
+            or work_spec.issue_id != issue
+            or work_spec.attempt != attempt
+            or work_spec.branch != branch
+            or work_spec.backend != backend
         ):
             raise ComputeLaunchError("Cultivate evidence gate requires an authorized worker checkout")
+        authorization.verify(checkout)
     range_ref = f"{base_ref}...{head_ref}"
     def git_run(*args: str) -> subprocess.CompletedProcess[str]:
         if safe_git is not None:
@@ -731,9 +740,7 @@ async def _observe_evidence_from_ref(
                     )
                 else:
                     observed_command = _command_with_pytest_report(command, report_dir)
-                    from mimir.worklink.backends.registry import WorklinkDefaults
-
-                    timeout_s = work_spec.timeout_s if work_spec is not None else WorklinkDefaults().timeout_s
+                    timeout_s = work_spec.timeout_s if work_spec is not None else 1800
                     try:
                         test = await asyncio.to_thread(
                             runner, observed_command, cwd=checkout, timeout=timeout_s,
@@ -931,7 +938,10 @@ async def _run_compute_gate(
                 basetemp=_gate_tmp_directory(report_dir),
             ),
         )
-    handle = await compute.launch(gate_spec)
+    # The legacy local_subprocess launch() chooses a controller subprocess when
+    # MIMIR_CODING_ENABLED is absent. Enter the contained worker path explicitly;
+    # never let a provider gate choose launch()'s controller fallback.
+    handle = await compute._launch_contained(gate_spec, tuple(gate_spec.local_argv))
     try:
         if on_launch is not None:
             try:
@@ -1164,9 +1174,11 @@ def _command_with_pytest_report(command: str, report_dir: Path) -> str:
 def _gate_failure_reason(tests: TestResult) -> str:
     counts = tests.counts
     if counts is None:
+        detail = terminal_error(tests.summary) if tests.summary else None
         return terminal_error(
             f"test gate failed (exit {tests.exit_code}); structured counts unavailable"
             + (f" ({tests.report_error})" if tests.report_error else "")
+            + (f"; output: {detail}" if detail else "")
         )
     count_text = (
         f"{counts.failed} failed, {counts.errors} errors, {counts.passed} passed, "
@@ -1236,10 +1248,8 @@ def _run(
     args: Sequence[str] | str, *, cwd: Path | None = None, timeout: float = 1800,
     text: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    from mimir.tools._shell_env import scrub_model_selection_env
-
     env = os.environ.copy()
-    scrub_model_selection_env(env)
+    env.pop("MIMIR_MODEL_SPEC", None)
     if isinstance(args, str):
         # Shell syntax supports configured commands and the report env prefix.
         # Configuration must be trusted; checkout code still gets a bounded env.
