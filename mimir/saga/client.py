@@ -2465,18 +2465,20 @@ class SagaStore:
         min_retrievals: int | None = None,
         contribution_threshold: float | None = None,
         contradiction_threshold: float | None = None,
-        confidence_floor: float | None = None,
+        activation_below: float | None = None,
         grace_days: int | None = None,
+        preview_token: str | None = None,
+        allow_bulk: bool = False,
         auth_context: Any = None,
     ) -> dict[str, Any]:
         scope = _saga_mutation_scope(auth_context, "saga_forget")
         # Unsupported thresholds and authorization scope are not selection criteria.
         if not dry_run and all(
-            value is None for value in (min_retrievals, confidence_floor, grace_days)
+            value is None for value in (min_retrievals, activation_below, grace_days)
         ):
             raise ValueError(
                 "Destructive forget requires a narrowing criterion: supply "
-                "min_retrievals, confidence_floor, or grace_days; "
+                "min_retrievals, activation_below, or grace_days; "
                 "use dry_run=True for a broad preview."
             )
 
@@ -2520,8 +2522,6 @@ class SagaStore:
         from .forget import forget_by_criteria
 
         def _do():
-            from .forget import forget as forget_atoms
-
             conn = self._ensure_conn()
             if scope is None:
                 return _mutation_refused_result(
@@ -2540,7 +2540,7 @@ class SagaStore:
                 agent_id=self._agent_id,
                 min_age_days=grace_days,
                 min_retrievals=min_retrievals,
-                activation_below=confidence_floor,
+                activation_below=activation_below,
                 dry_run=True,
                 owner_principal=(
                     scope.owner_principal
@@ -2578,9 +2578,19 @@ class SagaStore:
                 return {
                     "tombstoned_count": len(candidate_ids),
                     "preview_ids": candidate_ids,
+                    "candidates": preview.candidates,
+                    "preview_token": preview.preview_token,
                     "dry_run": True,
                 }
-            result = forget_atoms(conn, candidate_ids, reason="bulk_criteria")
+            if not preview_token or preview_token != preview.preview_token:
+                raise ValueError("Preview token missing or selection changed; run dry_run=True again and review the candidates")
+            result = forget_by_criteria(
+                conn, agent_id=self._agent_id, min_age_days=grace_days,
+                min_retrievals=min_retrievals, activation_below=activation_below,
+                owner_principal=(scope.owner_principal if isinstance(scope, _ServiceMutationScope)
+                                 else scope if isinstance(scope, str) else None),
+                dry_run=False, preview_token=preview_token, allow_bulk=allow_bulk,
+            )
             authorized_ids = result.tombstoned_ids
 
             # Remove tombstoned atoms from the FAISS index (not a dry-run,
@@ -2611,8 +2621,30 @@ class SagaStore:
             return {
                 "tombstoned_count": len(authorized_ids),
                 "preview_ids": authorized_ids if dry_run else [],
+                "tombstoned_ids": authorized_ids,
                 "dry_run": dry_run,
             }
+
+        return await self._write_locked(_do)
+
+    async def unforget(self, *, ids: list[str] | None = None,
+                       reason: str | None = None, auth_context: Any = None) -> dict[str, Any]:
+        """Admin-only restoration of explicit/bulk forget tombstones."""
+        if _saga_mutation_scope(auth_context, "saga_unforget") is not _ALL_SAGA_ATOMS:
+            raise PermissionError("unforget requires server-provided admin authority")
+
+        def _do():
+            from .forget import unforget
+
+            conn = self._ensure_conn()
+            restored = unforget(conn, ids=ids, reason=reason)
+            # Rebuild even a previously built index: soft-removed IDs need to
+            # be admitted again, not merely retained in SQLite.
+            if restored:
+                with self._index_lock:
+                    self._index_built = False
+                    self._ensure_index(conn)
+            return {"restored_ids": restored, "restored_count": len(restored)}
 
         return await self._write_locked(_do)
 

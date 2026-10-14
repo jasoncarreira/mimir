@@ -143,8 +143,9 @@ class _StubStore:
         min_retrievals=None,
         contribution_threshold=None,
         contradiction_threshold=None,
-        confidence_floor=None,
+        activation_below=None,
         grace_days=None,
+        preview_token=None,
         auth_context=None,
     ):
         if self.raise_on == "forget":
@@ -155,8 +156,9 @@ class _StubStore:
                 "min_retrievals": min_retrievals,
                 "contribution_threshold": contribution_threshold,
                 "contradiction_threshold": contradiction_threshold,
-                "confidence_floor": confidence_floor,
+                "activation_below": activation_below,
                 "grace_days": grace_days,
+                "preview_token": preview_token,
                 "auth_context": auth_context,
             }
         )
@@ -489,8 +491,9 @@ async def test_forget_defaults_to_dry_run(
             "min_retrievals": None,
             "contribution_threshold": None,
             "contradiction_threshold": None,
-            "confidence_floor": None,
+            "activation_below": None,
             "grace_days": None,
+            "preview_token": None,
             "auth_context": turn_with_session.auth_context,
         }
     ]
@@ -511,15 +514,17 @@ async def test_forget_threads_optional_args(
             "dry_run": False,
             "min_retrievals": 3,
             "contribution_threshold": -0.5,
-            "confidence_floor": 0.2,
+            "activation_below": -0.2,
             "grace_days": 30,
+            "preview_token": "reviewed",
             "runtime": _runtime(turn_with_session),
         }
     )
     call = store.forget_calls[0]
     assert call["dry_run"] is False
     assert call["min_retrievals"] == 3
-    assert call["confidence_floor"] == 0.2
+    assert call["activation_below"] == -0.2
+    assert call["preview_token"] == "reviewed"
     assert call["grace_days"] == 30
 
 

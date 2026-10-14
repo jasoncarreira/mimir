@@ -811,7 +811,7 @@ async def test_forget_silent_when_only_implemented_params_passed(
 ):
     """Regression guard: a forget call that only uses the supported
     params (agent_id is injected automatically, plus min_retrievals /
-    grace_days / confidence_floor) must NOT emit a warning."""
+    grace_days / activation_below) must NOT emit a warning."""
     import logging
     from mimir.saga.client import SagaStore
 

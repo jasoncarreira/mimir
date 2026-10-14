@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from typing import Annotated, Any, Optional
 
 from langchain.tools import ToolRuntime
@@ -352,19 +353,24 @@ async def saga_forget(
     min_retrievals: Optional[int] = None,
     contribution_threshold: Optional[float] = None,
     contradiction_threshold: Optional[float] = None,
-    confidence_floor: Optional[float] = None,
+    activation_below: Optional[float] = None,
     grace_days: Optional[int] = None,
+    preview_token: Optional[str] = None,
+    allow_bulk: bool = False,
+    acknowledge: Optional[str] = None,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
     """Run SAGA's intentional-forgetting engine.
 
     PREVIEW FIRST: keep ``dry_run=True`` (default) to inspect the
     candidate list before acting. Set ``dry_run=False`` only after
-    reviewing — forgetting is irreversible. Use this when ``## Self-
-    state`` reports pending forget candidates; a successful non-dry-
-    run call clears that line until the next decay cycle.
+    reviewing. Pass the returned preview_token on a destructive call;
+    pass it as acknowledge on another dry run to mark candidates reviewed
+    without deleting them. Selections at the cap or over 10% of live atoms
+    require allow_bulk=True. Activation is a log value, typically below 0;
+    -inf means never accessed. activation_below must be finite and <= 0.
 
-    Destructive calls require min_retrievals, confidence_floor, or grace_days.
+    Destructive calls require min_retrievals, activation_below, or grace_days.
     Contribution and contradiction thresholds are unsupported by the in-process
     backend and are rejected, including in previews and mixed criteria calls.
     Broad dry-run previews remain available.
@@ -397,25 +403,46 @@ async def saga_forget(
         return (
             "saga_forget failed: contribution_threshold and contradiction_threshold "
             "are unsupported by the in-process backend; remove them and supply "
-            "min_retrievals, confidence_floor, or grace_days. Preview with "
+            "min_retrievals, activation_below, or grace_days. Preview with "
             "dry_run=True before forgetting."
         )
 
     kwargs: dict[str, Any] = {"dry_run": bool(dry_run), "auth_context": auth_context}
+    if activation_below is not None and (not math.isfinite(activation_below) or activation_below > 0):
+        return "saga_forget failed: activation_below must be finite and <= 0 (log activation; -inf means never accessed)"
     if min_retrievals is not None:
         kwargs["min_retrievals"] = min_retrievals
     if contribution_threshold is not None:
         kwargs["contribution_threshold"] = contribution_threshold
     if contradiction_threshold is not None:
         kwargs["contradiction_threshold"] = contradiction_threshold
-    if confidence_floor is not None:
-        kwargs["confidence_floor"] = confidence_floor
+    if activation_below is not None:
+        kwargs["activation_below"] = activation_below
     if grace_days is not None:
         kwargs["grace_days"] = grace_days
+    if not dry_run and all(value is None for value in (min_retrievals, activation_below, grace_days)):
+        return ("saga_forget failed: supply min_retrievals, activation_below, or grace_days "
+                "as a narrowing criterion; preview with dry_run=True")
+    if not dry_run and not preview_token:
+        return "saga_forget failed: preview_token required; run dry_run=True and review the candidates first"
+    if preview_token is not None and not dry_run:
+        kwargs["preview_token"] = preview_token
+    if allow_bulk:
+        kwargs["allow_bulk"] = True
     try:
         payload = await client.forget(**kwargs)
     except Exception as exc:  # noqa: BLE001
         return f"saga_forget failed: {exc}"
+    if dry_run and acknowledge is not None and acknowledge != payload.get("preview_token"):
+        return "saga_forget failed: acknowledgement token does not match current selection; review a new preview"
+    if (dry_run and acknowledge is not None) or (not dry_run and payload.get("tombstoned_count", 0) > 0):
+        from ..event_logger import log_event
+
+        try:
+            await log_event("saga_forget_reviewed" if dry_run else "saga_forget_ok",
+                            result=payload)
+        except Exception:  # noqa: BLE001 — logging must not turn a completed write into an error
+            log.exception("Unable to record saga_forget review event")
     return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
 
 

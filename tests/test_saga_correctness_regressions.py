@@ -121,6 +121,8 @@ async def test_saga_forget_removes_tombstoned_atoms_from_faiss_index(
         grace_days=1,
         dry_run=False,
         auth_context=ADMIN_AUTH,
+        preview_token=(await store.forget(grace_days=1, auth_context=ADMIN_AUTH))["preview_token"],
+        allow_bulk=True,
     )
     assert result["tombstoned_count"] == 3, f"expected 3 tombstoned; got {result}"
 
@@ -1246,6 +1248,8 @@ async def test_forget_triggers_index_rebuild_past_removal_threshold(
         dry_run=False,
         min_retrievals=1,
         auth_context=ADMIN_AUTH,
+        preview_token=(await store.forget(min_retrievals=1, auth_context=ADMIN_AUTH))["preview_token"],
+        allow_bulk=True,
     )
 
     assert result["tombstoned_count"] == 1

@@ -7,8 +7,8 @@ Two entry points:
 - ``forget_by_criteria(criteria, dry_run)`` — bulk by predicate.
   Periodic cleanup pass; preview by default.
 
-Tombstoning is one-way: sets ``tombstoned=1``, records timestamp +
-reason, no un-tombstone API. Tombstoned atoms are excluded from
+Tombstoning sets ``tombstoned=1`` and records timestamp + reason.
+Operator restore is available for explicit/bulk forget tombstones. Tombstoned atoms are excluded from
 recall/consolidate/reflect candidate pools by construction (the
 ``WHERE tombstoned=0`` clauses everywhere).
 
@@ -38,6 +38,9 @@ What's NOT removed when an atom is tombstoned:
 from __future__ import annotations
 
 import sqlite3
+import hashlib
+import json
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -50,6 +53,79 @@ class ForgetResult:
     tombstoned_ids: list[str] = field(default_factory=list)
     observations_affected: list[str] = field(default_factory=list)
     dry_run: bool = False
+    candidates: list[dict] = field(default_factory=list)
+    preview_token: str | None = None
+
+
+def _preview_token(ids: list[str], criteria: dict) -> str:
+    payload = json.dumps([sorted(ids), criteria], sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def unforget(conn: sqlite3.Connection, *, ids: list[str] | None = None,
+             reason: str | None = None) -> list[str]:
+    """Restore explicitly forgotten rows, preserving an audit trail in the DB."""
+    if (ids is None) == (reason is None) or (ids is not None and not ids):
+        raise ValueError("Specify exactly one of nonempty ids or reason")
+    if ids is not None:
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT id FROM atoms WHERE id IN ({placeholders}) AND tombstoned = 1 "
+            "AND tombstoned_reason IN ('bulk_criteria', 'explicit_forget')", ids,
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id FROM atoms WHERE tombstoned = 1 AND tombstoned_reason = ? "
+            "AND tombstoned_reason IN ('bulk_criteria', 'explicit_forget')", (reason,),
+        ).fetchall()
+    restored = [row[0] for row in rows]
+    previous_reasons = dict(conn.execute(
+        f"SELECT id, tombstoned_reason FROM atoms WHERE id IN ({','.join('?' for _ in restored)})", restored,
+    ).fetchall()) if restored else {}
+    if not restored:
+        return []
+    placeholders = ",".join("?" for _ in restored)
+    now = _utc_now_iso()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            f"UPDATE atoms SET tombstoned = 0, tombstoned_at = NULL, "
+            f"tombstoned_reason = NULL WHERE id IN ({placeholders})", restored,
+        )
+        conn.execute(
+            f"UPDATE triples SET tombstoned = 0 WHERE source_atom_id IN ({placeholders})", restored,
+        )
+        conn.execute(
+            "UPDATE world_state SET is_current = 1, valid_until = NULL, updated_at = ? "
+            "WHERE source_triple_id IN (SELECT id FROM triples WHERE source_atom_id IN ("
+            f"{placeholders})) AND NOT EXISTS (SELECT 1 FROM world_state newer "
+            "WHERE newer.subject = world_state.subject AND newer.predicate = world_state.predicate "
+            "AND newer.is_current = 1)", (now, *restored),
+        )
+        for obs_id, in conn.execute(
+            "SELECT DISTINCT source_id FROM atom_relations WHERE relation_type = 'evidenced_by' "
+            f"AND target_id IN ({placeholders})", restored,
+        ).fetchall():
+            refresh_trend(conn, obs_id, manage_transaction=False)
+            conn.execute(
+                "UPDATE observations_metadata SET evidence_count = (SELECT COUNT(*) FROM atom_relations ar "
+                "JOIN atoms a ON a.id = ar.target_id WHERE ar.source_id = ? "
+                "AND ar.relation_type = 'evidenced_by' AND a.tombstoned = 0) WHERE atom_id = ?",
+                (obs_id, obs_id),
+            )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS forget_restore_audit ("
+            "atom_id TEXT NOT NULL, restored_at TEXT NOT NULL, previous_reason TEXT NOT NULL)"
+        )
+        conn.executemany(
+            "INSERT INTO forget_restore_audit VALUES (?, ?, ?)",
+            [(aid, now, previous_reasons[aid]) for aid in restored],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return restored
 
 
 def _utc_now_iso() -> str:
@@ -162,6 +238,8 @@ def forget_by_criteria(
     reference_date: datetime | None = None,
     owner_principal: str | None = None,
     origin_domains: tuple[str, ...] | None = None,
+    preview_token: str | None = None,
+    allow_bulk: bool = False,
 ) -> ForgetResult:
     """Bulk forget by predicate. Dry-run by default (preview the set
     without writing).
@@ -192,6 +270,8 @@ def forget_by_criteria(
     cost on N atoms is O(N) compute and we're cleaning up here, not
     serving live retrievals.
     """
+    if activation_below is not None and (not math.isfinite(activation_below) or activation_below > 0):
+        raise ValueError("activation_below must be finite and <= 0 (log activation; -inf means never accessed)")
     where = ["a.agent_id = ?", "a.tombstoned = 0"]
     params: list = [agent_id]
 
@@ -299,11 +379,33 @@ def forget_by_criteria(
                 below.append(atom_id)
         candidate_ids = below
 
+    criteria = dict(min_age_days=min_age_days, activation_below=activation_below,
+                    min_retrievals=min_retrievals, stream=stream, memory_type=memory_type,
+                    source_type=source_type, agent_id=agent_id, owner_principal=owner_principal,
+                    origin_domains=origin_domains, max_atoms=max_atoms)
+    token = _preview_token(candidate_ids, criteria)
     if dry_run:
+        candidates = []
+        if candidate_ids:
+            placeholders = ",".join("?" for _ in candidate_ids)
+            details = {r[0]: r for r in conn.execute(
+                f"SELECT id, created_at, stream, memory_type, content FROM atoms WHERE id IN ({placeholders})",
+                candidate_ids,
+            )}
+            candidates = [dict(id=aid, created_at=details[aid][1], stream=details[aid][2],
+                               memory_type=details[aid][3], snippet=(details[aid][4] or "")[:160])
+                          for aid in candidate_ids]
         return ForgetResult(
             tombstoned_count=0,
             tombstoned_ids=candidate_ids,  # preview
             dry_run=True,
+            candidates=candidates,
+            preview_token=token,
         )
 
+    if not preview_token or preview_token != token:
+        raise ValueError("Preview token missing or selection changed; run dry_run=True again and review the candidates")
+    live = conn.execute("SELECT COUNT(*) FROM atoms WHERE agent_id = ? AND tombstoned = 0", (agent_id,)).fetchone()[0]
+    if candidate_ids and not allow_bulk and (len(candidate_ids) >= max_atoms or len(candidate_ids) > live * .10):
+        raise ValueError(f"Bulk forget refused: {len(candidate_ids)} of {live} live atoms ({len(candidate_ids) / live:.1%}); pass allow_bulk=True after reviewing the preview")
     return forget(conn, candidate_ids, reason=reason or "bulk_criteria")
