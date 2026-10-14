@@ -1549,6 +1549,41 @@ async def test_schedule_existing_refusal_cron_only_and_explicit_replace(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_set_schedule_cron_refuses_real_time_of_day_job(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+    from mimir.scheduler import Scheduler, load_jobs
+
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(
+        "# operator note\n- name: daily\n  time_of_day: '08:30'\n"
+        "  prompt: hello\n  priority: high\n  channel_id: operator\n",
+        encoding="utf-8",
+    )
+    scheduler = Scheduler(scheduler_yaml=path, enqueue=lambda e: asyncio.sleep(0, result=True))
+    monkeypatch.setitem(_STATE, "scheduler", scheduler)
+    before = path.read_bytes()
+    original, errors = load_jobs(path)
+    assert not errors
+    add = AsyncMock(wraps=scheduler.add_job)
+    monkeypatch.setattr(scheduler, "add_job", add)
+    result = await set_schedule_cron.ainvoke({"name": "daily", "cron": "0 9 * * *"})
+    assert "this job uses time_of_day" in result
+    assert "add_schedule replace=true" in result
+    add.assert_not_called()
+    assert path.read_bytes() == before
+    assert await scheduler.list_jobs() == original
+
+    # Positive control exercises the same real scheduler and wrapped writer.
+    cron_job = SchedulerJob(name="cron-job", cron="0 7 * * *", prompt="cron prompt")
+    await scheduler.add_job(cron_job)
+    add.reset_mock()
+    result = await set_schedule_cron.ainvoke({"name": "cron-job", "cron": "0 9 * * *"})
+    assert "set_schedule_cron ok" in result
+    add.assert_awaited_once()
+    assert await scheduler.list_jobs() == [*original, replace(cron_job, cron="0 9 * * *")]
+
+
+@pytest.mark.asyncio
 async def test_remove_callable_disable_reports_reenable(tmp_path: Path) -> None:
     scheduler = _StubScheduler(home=tmp_path)
     scheduler._jobs = [SchedulerJob(name="worker", callable_name="worker", cron="")]

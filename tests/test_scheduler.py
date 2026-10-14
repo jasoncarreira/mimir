@@ -99,6 +99,61 @@ def test_schedule_writes_preserve_comments_and_callable_disable(tmp_path: Path) 
     assert "cron: ''" in path.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("text", [
+    "# operator header\noperator_shell_commands: []\njobs:\n",
+    "# operator header\noperator_shell_commands: []\n",
+    "# operator header\noperator_shell_commands: []\njobs: []\n",
+])
+def test_write_jobs_attaches_sequence_to_empty_mapping(tmp_path: Path, text: str) -> None:
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(text, encoding="utf-8")
+    job = SchedulerJob(name="t1", cron="0 8 * * *", prompt="hello")
+    write_jobs(path, [job])
+    reloaded, rejections = load_jobs(path)
+    assert rejections == []
+    assert reloaded == [job]
+    parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert parsed["operator_shell_commands"] == []
+    assert parsed["jobs"][0]["name"] == "t1"
+    assert "# operator header" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("entries", ["[null]", "[stray]", "{}", "42"])
+def test_write_jobs_refuses_non_mapping_entries_without_writing(tmp_path: Path, entries: str) -> None:
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(f"operator_shell_commands: []\njobs: {entries}\n", encoding="utf-8")
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="sequence of mappings"):
+        write_jobs(path, [SchedulerJob(name="t1", cron="0 8 * * *", prompt="hello")])
+    assert path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_real_scheduler_duplicate_refusal_preserves_yaml(tmp_path: Path) -> None:
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(
+        "# keep formatting\n- name: daily\n  cron: '0 8 * * *' # note\n"
+        "  prompt: hello\n  priority: high\n", encoding="utf-8",
+    )
+    scheduler = Scheduler(scheduler_yaml=path, enqueue=lambda e: asyncio.sleep(0, result=True))
+    before = path.read_bytes()
+    original, errors = load_jobs(path)
+    assert not errors
+    with pytest.raises(ValueError, match="already exists.*replace=true"):
+        await scheduler.add_job(
+            SchedulerJob(name="daily", cron="0 9 * * *", prompt="replacement"),
+            replace_existing=False,
+        )
+    assert path.read_bytes() == before
+    assert await scheduler.list_jobs() == original
+    new = SchedulerJob(name="new", cron="0 10 * * *", prompt="new job")
+    assert await scheduler.add_job(new, replace_existing=False) == new
+    assert await scheduler.list_jobs() == [*original, new]
+    replacement = SchedulerJob(name="daily", cron="0 9 * * *", prompt="replacement")
+    await scheduler.add_job(replacement, replace_existing=True)
+    assert await scheduler.list_jobs() == [replacement, new]
+
+
 def test_load_jobs_skips_invalid_entries(tmp_path: Path):
     path = tmp_path / "scheduler.yaml"
     path.write_text(

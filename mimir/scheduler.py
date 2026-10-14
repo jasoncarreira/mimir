@@ -565,9 +565,13 @@ def write_jobs(path: Path, jobs: list[SchedulerJob]) -> None:
             raise ValueError("unknown scheduler.yaml top-level keys")
         grants = existing.get("operator_shell_commands")
         parse_operator_shell_commands(grants, writable_roots=agent_writable_roots(path.parent))
-    entries = existing["jobs"] if isinstance(existing, dict) else existing
+    entries = existing.setdefault("jobs", []) if isinstance(existing, dict) else existing
     if entries is None:
         entries = []
+        if isinstance(existing, dict):
+            existing["jobs"] = entries
+    if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+        raise ValueError("scheduler.yaml jobs must be a sequence of mappings")
     wanted = {job.name: job.to_yaml_entry() for job in jobs}
     for job in jobs:
         if "priority" in wanted[job.name]:
