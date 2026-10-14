@@ -264,7 +264,8 @@ def test_shell_exec_valid_direct_executable_and_cwd(tmp_path):
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
 @pytest.mark.parametrize("direct", [False, True], ids=["login-shell", "direct-argv"])
-def test_shell_exec_timeout_reaps_spawned_child(tmp_path, monkeypatch, direct):
+@pytest.mark.parametrize("isolated", [True, False], ids=["isolated", "mutation-control"])
+def test_shell_exec_timeout_reaps_spawned_child(tmp_path, monkeypatch, direct, isolated):
     """The wrapper and a child it spawned must both stop before a retry."""
     script = tmp_path / "spawn.py"
     pidfile = tmp_path / "child.pid"
@@ -288,17 +289,32 @@ def test_shell_exec_timeout_reaps_spawned_child(tmp_path, monkeypatch, direct):
     args = {"command": command}
     if direct:
         args["mimir_direct_argv"] = [sys.executable, str(script), str(pidfile)]
+    if not isolated:
+        popen = subprocess.Popen
+
+        def without_session(*args, **kwargs):
+            kwargs["start_new_session"] = False
+            return popen(*args, **kwargs)
+
+        monkeypatch.setattr(extra.subprocess, "Popen", without_session)
     result = shell_exec.invoke(args)
     assert pidfile.exists(), "child must have started before the timeout"
     pid = int(pidfile.read_text())
     try:
+        if not isolated:
+            # Prove the same disappearance predicate detects the original bug.
+            os.kill(pid, 0)
+            assert "wrapper-only" in result
+            assert "not isolated" in result
+            assert "its process group was killed" not in result
+            return
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
         assert result == (
             "shell_exec timed out after 1.0s; its process group was killed and "
             "partial side effects may have occurred. Check state before retrying, "
             "or use bash_async for long jobs."
         )
-        status = Path(f"/proc/{pid}/status")
-        assert not status.exists(), status.read_text() if status.exists() else ""
     finally:
         # Keep a failed regression test from leaving a live sleep behind.
         try:
