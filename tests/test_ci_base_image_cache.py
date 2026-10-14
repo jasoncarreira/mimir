@@ -63,31 +63,53 @@ def _may_build_root_image(args: list[str]) -> bool:
     return any(p == "tests" or p.startswith("tests/test_root_dockerfile.py") for p in positionals)
 
 
+_DOCKER_BUILD = re.compile(r'"docker",\s*"build(?:x)?"|docker build')
+
+
+def _runs_a_building_script(script: str) -> bool:
+    """True when the step runs a repository script that invokes ``docker build``."""
+    for match in re.finditer(r"scripts/[\w./-]+\.(?:py|sh)", script):
+        path = ROOT / match[0]
+        if path.is_file() and _DOCKER_BUILD.search(path.read_text(encoding="utf-8")):
+            return True
+    return False
+
+
+def _step_builds_root_image(step: dict) -> bool:
+    # Comments describe commands (e.g. "the deselected tests run docker buildx");
+    # only executable lines count.
+    script = "\n".join(
+        line for line in step.get("run", "").splitlines() if not line.lstrip().startswith("#")
+    )
+    return (
+        bool(_DOCKER_BUILD.search(script))
+        or _runs_a_building_script(script)
+        or any(_may_build_root_image(args) for args in _pytest_commands(script))
+    )
+
+
 def _jobs_that_build_root_image() -> dict[str, dict]:
     workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     selected = {}
     for name, job in workflow["jobs"].items():
         if "ubuntu" not in str(job.get("runs-on", "")):
             continue  # the macOS legs have no Docker, so the build test skips
-        for step in job.get("steps", []):
-            if any(_may_build_root_image(args) for args in _pytest_commands(step.get("run", ""))):
-                selected[name] = job
-                break
+        if any(_step_builds_root_image(step) for step in job.get("steps", [])):
+            selected[name] = job
     return selected
 
 
 def test_every_linux_job_that_builds_the_root_image_primes_its_base_image() -> None:
     jobs = _jobs_that_build_root_image()
-    assert {"pytest", "pytest-fresh-resolve", "pytest-enforced"} <= set(jobs)
+    # worklink-image-identity builds the root image through
+    # scripts/worklink_image_identity.py rather than pytest.
+    assert {"pytest", "pytest-fresh-resolve", "pytest-enforced", "worklink-image-identity"} <= set(jobs)
     for name, job in jobs.items():
         steps = job["steps"]
         prime = next((i for i, step in enumerate(steps) if step.get("uses") == PRIME_USES), None)
         assert prime is not None, f"{name} builds the root image without priming its base image"
-        first_pytest = next(
-            i for i, step in enumerate(steps)
-            if any(_may_build_root_image(args) for args in _pytest_commands(step.get("run", "")))
-        )
-        assert prime < first_pytest, f"{name} primes the base image after its test run"
+        first_build = next(i for i, step in enumerate(steps) if _step_builds_root_image(step))
+        assert prime < first_build, f"{name} primes the base image after it builds"
 
 
 def test_deselecting_the_build_test_exempts_a_job() -> None:
