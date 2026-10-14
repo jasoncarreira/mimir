@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
+import re
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .discovery import PluginCandidate
     from mimir.tool_descriptors import (
         FetchAuthorizationKind, ResultOriginKind, SinkCategory,
         SinkPayloadExtractor, SinkTargetExtractor, ToolDescriptor,
@@ -53,10 +55,50 @@ class AuthorityProfile:
     builtin_trigger_config: Mapping[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class SchedulerJob:
+    owner: str
+    name: str
+    job_id: str
+    callback: Callable[..., Any]
+
+
+@dataclass(frozen=True)
+class CliCommand:
+    owner: str
+    name: str
+    configure: Callable[..., Any]
+    dispatch: Callable[..., Any]
+
+
+@dataclass(frozen=True)
+class PluginRoute:
+    owner: str
+    method: str
+    path: str
+    handler: Callable[..., Any]
+    role: str
+
+
+@dataclass(frozen=True)
+class PromptBlockProvider:
+    owner: str
+    name: str
+    section: str
+    max_bytes: int
+    applies: Callable[..., bool]
+    render: Callable[..., str]
+    static: bool = False
+
+
 _FLOW = frozenset({"source", "sink", "both", "neither"})
 _TIERS = frozenset({"scope-contained", "scoped-with-provenance", "code-execution", "unbounded"})
 _OPERATIONS = frozenset({"open", "resource_scoped", "admin_required"})
 _SCOPES = frozenset({"channel", "repo_pr"})
+_PROMPT_SECTIONS = frozenset({
+    "channel_memory", "feedback", "core_proposals", "session_summaries",
+    "usage", "upcoming", "commitments", "self_state",
+})
 # The executable profiles in access_control.parse_service_shell_argv_with_diagnostics.
 # Keep this inert: importing access_control here would cycle through core policy.
 _SHELL_PROFILES = frozenset({
@@ -114,11 +156,32 @@ class PolicyRegistry:
         self._principals: dict[str, Any] = {}
         self._principal_owners: dict[str, str] = {}
         self._poller_properties: dict[str, Any] = {}
+        self._poller_hooks: dict[str, tuple[str, Callable[..., Any]]] = {}
+        self._scheduler_jobs: dict[str, SchedulerJob] = {}
+        self._cli_commands: dict[str, CliCommand] = {}
+        self._routes: dict[tuple[str, str], PluginRoute] = {}
+        self._dashboard_entries: dict[str, tuple[str, Any]] = {}
+        self._prompt_providers: dict[str, PromptBlockProvider] = {}
+        self._state_slots: dict[str, type] = {}
+        self._selected_plugin_candidates: tuple[PluginCandidate, ...] = ()
+        self._selection_bound = False
         self._frozen = False
 
     def registrar(self, plugin: str) -> PolicyRegistrar:
         self._writable()
         return PolicyRegistrar(self, _name(plugin, "plugin"))
+
+    @property
+    def selected_plugin_candidates(self) -> tuple[PluginCandidate, ...]:
+        """The process selection captured before provider registration and freeze."""
+        return self._selected_plugin_candidates
+
+    def select_plugin_candidates(self, candidates: tuple[PluginCandidate, ...]) -> None:
+        self._writable()
+        if self._selection_bound or not isinstance(candidates, tuple):
+            raise PolicyRegistrationError("invalid or repeated selected plugin snapshot")
+        self._selected_plugin_candidates = candidates
+        self._selection_bound = True
 
     def _writable(self) -> None:
         if self._frozen:
@@ -163,6 +226,99 @@ class PolicyRegistry:
     @property
     def poller_properties(self) -> Mapping[str, Any]:
         return MappingProxyType(self._poller_properties)
+
+    @property
+    def poller_hooks(self) -> Mapping[str, tuple[str, Callable[..., Any]]]:
+        return MappingProxyType(self._poller_hooks)
+
+    @property
+    def scheduler_jobs(self) -> Mapping[str, SchedulerJob]:
+        return MappingProxyType(self._scheduler_jobs)
+
+    @property
+    def cli_commands(self) -> Mapping[str, CliCommand]:
+        return MappingProxyType(self._cli_commands)
+
+    @property
+    def routes(self) -> Mapping[tuple[str, str], PluginRoute]:
+        return MappingProxyType(self._routes)
+
+    @property
+    def dashboard_entries(self) -> Mapping[str, tuple[str, Any]]:
+        return MappingProxyType(self._dashboard_entries)
+
+    @property
+    def prompt_providers(self) -> Mapping[str, PromptBlockProvider]:
+        return MappingProxyType(self._prompt_providers)
+
+    @property
+    def state_slots(self) -> Mapping[str, type]:
+        return MappingProxyType(self._state_slots)
+
+    def register_poller_hook(self, name: str, hook: Callable[..., Any], *, owner: str = "core") -> None:
+        self._writable()
+        name = _name(name, "poller hook")
+        if not callable(hook) or name in self._poller_hooks:
+            raise PolicyRegistrationError(f"{owner}: invalid or duplicate poller hook: {name}")
+        self._poller_hooks[name] = (owner, hook)
+
+    def register_scheduler_job(self, name: str, job_id: str, callback: Callable[..., Any], *, owner: str = "core") -> None:
+        self._writable()
+        name, job_id = _name(name, "scheduler job"), _name(job_id, "scheduler job ID")
+        if name in self._scheduler_jobs or any(job.job_id == job_id for job in self._scheduler_jobs.values()):
+            raise PolicyRegistrationError(f"{owner}: duplicate scheduler job name or ID: {name} ({job_id})")
+        if not callable(callback):
+            raise PolicyRegistrationError(f"{owner}: scheduler job {name} requires a callable")
+        self._scheduler_jobs[name] = SchedulerJob(owner, name, job_id, callback)
+
+    def register_cli_command(self, name: str, configure: Callable[..., Any], dispatch: Callable[..., Any], *, owner: str = "core") -> None:
+        self._writable()
+        name = _name(name, "CLI command")
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", name) or name in self._cli_commands:
+            raise PolicyRegistrationError(f"{owner}: invalid or duplicate CLI command: {name}")
+        if not callable(configure) or not callable(dispatch):
+            raise PolicyRegistrationError(f"{owner}: CLI command {name} requires parser and handler")
+        self._cli_commands[name] = CliCommand(owner, name, configure, dispatch)
+
+    def register_route(self, method: str, path: str, handler: Callable[..., Any], *, role: str = "user", owner: str = "core") -> None:
+        self._writable()
+        method = _name(method, "route method").upper()
+        path = _name(path, "route path")
+        if not re.fullmatch(r"/[a-zA-Z0-9/_-]+", path) or "//" in path or path.endswith("/"):
+            raise PolicyRegistrationError(f"{owner}: invalid route path: {path}")
+        if owner != "core" and not path.startswith(f"/api/v1/plugins/{owner}/"):
+            raise PolicyRegistrationError(f"{owner}: route must be under /api/v1/plugins/{owner}/")
+        key = (method, path)
+        if key in self._routes or not callable(handler) or role not in {"user", "admin"}:
+            raise PolicyRegistrationError(f"{owner}: invalid or duplicate route: {method} {path}")
+        self._routes[key] = PluginRoute(owner, method, path, handler, role)
+
+    def register_dashboard_entry(self, entry_id: str, entry: Any, *, owner: str = "core") -> None:
+        self._writable()
+        entry_id = _name(entry_id, "dashboard entry ID")
+        if entry_id in self._dashboard_entries:
+            raise PolicyRegistrationError(f"duplicate dashboard entry: {entry_id}")
+        self._dashboard_entries[entry_id] = (owner, entry)
+
+    def register_prompt_provider(self, name: str, section: str, max_bytes: int,
+                                 applies: Callable[..., bool], render: Callable[..., str],
+                                 *, static: bool = False, owner: str = "core") -> None:
+        self._writable()
+        name = _name(name, "prompt provider")
+        if ":" in name or not re.fullmatch(r"[a-z][a-z0-9_-]*", name) or name in self._prompt_providers:
+            raise PolicyRegistrationError(f"{owner}: invalid or duplicate prompt provider: {name}")
+        if section not in _PROMPT_SECTIONS or type(max_bytes) is not int or max_bytes <= 0:
+            raise PolicyRegistrationError(f"{owner}: invalid prompt section or byte budget")
+        if not callable(applies) or not callable(render) or type(static) is not bool:
+            raise PolicyRegistrationError(f"{owner}: invalid prompt provider callbacks or static declaration")
+        self._prompt_providers[name] = PromptBlockProvider(owner, name, section, max_bytes, applies, render, static)
+
+    def register_state_slot(self, slot_type: type, *, owner: str = "core") -> None:
+        self._writable()
+        if owner in self._state_slots or not isinstance(slot_type, type) or not hasattr(slot_type, "__dataclass_fields__") \
+                or not getattr(slot_type, "__dataclass_params__").frozen:
+            raise PolicyRegistrationError(f"{owner}: state slot must be a unique frozen dataclass type")
+        self._state_slots[owner] = slot_type
 
     def register_poller_properties(self, canonical: str, properties: Any, *, owner: str = "core") -> None:
         self._writable()
@@ -645,3 +801,25 @@ class PolicyRegistrar:
 
     def register_service_principal(self, principal: Any) -> None:
         self._registry.register_service_principal(principal, owner=self.plugin)
+
+    def register_poller_hook(self, name: str, hook: Callable[..., Any]) -> None:
+        self._registry.register_poller_hook(name, hook, owner=self.plugin)
+
+    def register_scheduler_job(self, name: str, job_id: str, callback: Callable[..., Any]) -> None:
+        self._registry.register_scheduler_job(name, job_id, callback, owner=self.plugin)
+
+    def register_cli_command(self, name: str, configure: Callable[..., Any], dispatch: Callable[..., Any]) -> None:
+        self._registry.register_cli_command(name, configure, dispatch, owner=self.plugin)
+
+    def register_route(self, method: str, path: str, handler: Callable[..., Any], *, role: str = "user") -> None:
+        self._registry.register_route(method, path, handler, role=role, owner=self.plugin)
+
+    def register_dashboard_entry(self, entry_id: str, entry: Any) -> None:
+        self._registry.register_dashboard_entry(entry_id, entry, owner=self.plugin)
+
+    def register_prompt_provider(self, name: str, section: str, max_bytes: int,
+                                 applies: Callable[..., bool], render: Callable[..., str], *, static: bool = False) -> None:
+        self._registry.register_prompt_provider(name, section, max_bytes, applies, render, static=static, owner=self.plugin)
+
+    def register_state_slot(self, slot_type: type) -> None:
+        self._registry.register_state_slot(slot_type, owner=self.plugin)

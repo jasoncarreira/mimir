@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+from dataclasses import dataclass
 import gc
 import json
 import time
@@ -26,6 +27,7 @@ from mimir.agent import _initialize_ifc_labels
 from mimir.acp.journal import JournalLease
 from mimir.acp.updates import UpdateDispatcher
 from mimir.models import InformationFlowLabels, InformationFlowState, SourceLabel, TurnContext, TurnInteractivity
+from mimir.plugins.registry import PolicyRegistry
 from mimir.tools.registry import send_message
 from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context, hands_edit, hands_shell
 from mimir.channel_registry import ChannelRegistry
@@ -3443,6 +3445,53 @@ async def test_acp_ingest_acknowledgement_is_not_shared_between_sessions(tmp_pat
         )
         assert not first_auth.ifc_state.has_untrusted_active_ingest()
         assert second_auth.ifc_state.has_untrusted_active_ingest()
+    finally:
+        await agent.on_transport_closed(generation)
+
+
+async def test_acp_plugin_slots_rescope_without_sharing_session_or_connection_state(
+    tmp_path: Path,
+) -> None:
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_state_slot(State)
+    policy.freeze()
+    bundle, core = _bundle(tmp_path)
+    bundle.config.plugin_manager = SimpleNamespace(policy=policy)
+    agent = MimirAcpAgent(bundle)
+    generation = agent.on_connect(Client())
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    first = (await agent.new_session(str(tmp_path))).session_id
+    second = (await agent.new_session(str(tmp_path))).session_id
+    try:
+        connection = agent._connections[generation]
+        ingress = connection.auth_context
+        connection.auth_context = ingress.with_plugin_state(registrar, State("connection"))
+        first_auth = agent._auth_context_for(agent._sessions[first])
+        second_auth = agent._auth_context_for(agent._sessions[second])
+        assert first_auth.plugin_state("example") == State("connection")
+        assert first_auth.channel_id == agent._sessions[first].record.thread_id
+        assert second_auth.channel_id == agent._sessions[second].record.thread_id
+        assert first_auth.ifc_state is not second_auth.ifc_state
+        first_turn = TurnContext("turn", first_auth.channel_id, "user_message", first_auth.channel_id, 0,
+                                 auth_context=first_auth)
+        first_turn.set_plugin_state(registrar, State("first-only"))
+        assert first_turn.auth_with_plugin_state().plugin_state("example") == State("first-only")
+        assert agent._auth_context_for(agent._sessions[first]).plugin_state("example") == State("connection")
+        assert second_auth.plugin_state("example") == State("connection")
+        assert connection.auth_context.plugin_state("example") == State("connection")
+        assert ingress.plugin_state("example") is None
+        await agent.prompt(first, [sdk.TextContentBlock(type="text", text="first")])
+        await agent.prompt(second, [sdk.TextContentBlock(type="text", text="second")])
+        first_event, second_event = (call[0] for call in core.calls[-2:])
+        assert first_event.continuation_auth_context.plugin_state("example") == State("connection")
+        assert second_event.continuation_auth_context.plugin_state("example") == State("connection")
+        assert first_event.continuation_auth_context.channel_id != second_event.continuation_auth_context.channel_id
+        assert first_event.continuation_auth_context.ifc_state is not second_event.continuation_auth_context.ifc_state
     finally:
         await agent.on_transport_closed(generation)
 

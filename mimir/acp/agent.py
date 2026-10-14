@@ -619,6 +619,10 @@ class MimirAcpAgent:
                     "cross_platform_pull",
                     True,
                 ),
+                policy=getattr(
+                    getattr(getattr(self._bundle, "config", None), "plugin_manager", None),
+                    "policy", None,
+                ),
             )
             if auth_context.principal != identity.canonical or auth_context.canonical_principal != identity.canonical or "admin" not in auth_context.roles or auth_context.is_service or not auth_context.enforcement_enabled:
                 raise ValueError

@@ -1,7 +1,12 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as React from "react";
+import * as ReactDOM from "react-dom";
+import * as ReactDOMClient from "react-dom/client";
 
-import { getDashboardSurfaces, visibleSurfaces, type DashboardSurface } from "./dashboardExtensions";
-import type { DashboardExtensionManifest } from "./api/generated/contracts";
+import { getDashboardSurfaces, loadPluginBundles, visibleSurfaces, type DashboardSurface } from "./dashboardExtensions";
+import { authenticatedPluginFetch } from "./api/http";
+import type { DashboardExtensionManifest, PluginBundleData } from "./api/generated/contracts";
 
 function surface(id: string, requires_role?: string | null): DashboardSurface {
   return { id, requires_role } as unknown as DashboardSurface;
@@ -10,6 +15,7 @@ function surface(id: string, requires_role?: string | null): DashboardSurface {
 function manifest(id: string, label = id): DashboardExtensionManifest {
   return {
     id,
+    plugin: null,
     route_path: `/${id}`,
     label,
     icon: null,
@@ -115,5 +121,194 @@ describe("visibleSurfaces role-gating (#563)", () => {
       "admin-config",
       "admin-users"
     ]);
+  });
+});
+
+afterEach(() => {
+  delete window.mimirPluginHost;
+  document.head.querySelectorAll('link[href^="/plugins/"]').forEach((link) => link.remove());
+  vi.unstubAllGlobals();
+});
+
+describe("plugin bundle host", () => {
+  const bundle = (plugin: string, apiMajor = 1): PluginBundleData => ({
+    plugin, apiMajor, moduleUrl: `/plugins/${plugin}/assets/main.js?v=1`,
+    cssUrl: `/plugins/${plugin}/assets/style.css?v=1`
+  });
+  const manifests = ["alpha", "beta"].map((plugin) => ({
+    ...manifest(plugin), plugin, route_path: `/dashboard/${plugin}`, bundle: `main.js`
+  }));
+
+  it("revalidates cached registrations against the current owner and manifest", async () => {
+    const cache = new Map();
+    const seen = new Set<string>();
+    const updates = vi.fn();
+    const importer = async (url: string) => {
+      if (seen.has(url)) return {};
+      seen.add(url);
+      const plugin = url.includes("/alpha/") ? "alpha" : "beta";
+      window.mimirPluginHost!.registerRoute({ plugin, id: plugin, path: `/dashboard/${plugin}`, component: () => null });
+      window.mimirPluginHost!.registerNavEntry({ plugin, id: plugin, label: plugin });
+      return {};
+    };
+    const load = (active: typeof manifests) => loadPluginBundles([bundle("alpha"), bundle("beta")], active,
+      {} as never, updates, undefined, importer, cache);
+    const first = await load(manifests);
+    first();
+    const second = await load(manifests);
+    expect(updates.mock.lastCall?.[0].routes.map((route: { id: string }) => route.id)).toEqual(["alpha", "beta"]);
+    second();
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const changed = await load([{ ...manifests[0], enabled: false }, { ...manifests[1], route_path: "/changed" }]);
+    expect(updates.mock.lastCall?.[0].routes).toEqual([]);
+    expect(updates.mock.lastCall?.[0].navEntries).toEqual([]);
+    expect(updates.mock.lastCall?.[0].notices).toEqual([
+      "alpha: dashboard bundle could not be loaded.", "beta: dashboard bundle could not be loaded."
+    ]);
+    changed();
+    log.mockRestore();
+  });
+
+  it("imports compatible local modules, registers multiple owner-bound pages and shares the renderer", async () => {
+    const updates = vi.fn();
+    const importer = vi.fn(async (url: string) => {
+      const plugin = url.includes("/alpha/") ? "alpha" : "beta";
+      const host = window.mimirPluginHost!;
+      expect(host.react).toBe(React);
+      expect(host.reactDOM).toBe(ReactDOM);
+      expect(host.reactDOMClient).toBe(ReactDOMClient);
+      expect(host.themeTokens).toEqual({ colorText: "skin text" });
+      expect(host.authenticatedFetch).toBe(authenticatedPluginFetch);
+      host.registerRoute({ plugin, id: plugin, path: `/dashboard/${plugin}`, component: () => React.createElement("p", null, plugin) });
+      host.registerNavEntry({ plugin, id: plugin, label: `${plugin} dashboard` });
+    });
+    const dispose = await loadPluginBundles([bundle("alpha"), bundle("beta")], manifests,
+      { colorText: "skin text" } as never, updates, undefined, importer);
+    expect(importer.mock.calls.map(([url]) => url)).toEqual([
+      "/plugins/alpha/assets/main.js?v=1", "/plugins/beta/assets/main.js?v=1"
+    ]);
+    expect(updates.mock.lastCall?.[0].routes.map((route: { id: string }) => route.id)).toEqual(["alpha", "beta"]);
+    expect(updates.mock.lastCall?.[0].navEntries).toHaveLength(2);
+    expect(document.head.querySelectorAll('link[rel="stylesheet"]')).toHaveLength(2);
+    dispose();
+    expect(window.mimirPluginHost).toBeUndefined();
+    expect(document.head.querySelectorAll('link[rel="stylesheet"]')).toHaveLength(0);
+  });
+
+  it("skips a mismatched major and isolates a failed registration from another plugin", async () => {
+    const updates = vi.fn();
+    const importer = vi.fn(async (url: string) => {
+      if (url.includes("alpha")) {
+        window.mimirPluginHost!.registerRoute({ plugin: "beta", id: "beta", path: "/dashboard/beta", component: () => null });
+      } else {
+        window.mimirPluginHost!.registerRoute({ plugin: "beta", id: "beta", path: "/dashboard/beta", component: () => null });
+        window.mimirPluginHost!.registerNavEntry({ plugin: "beta", id: "beta", label: "Beta" });
+      }
+    });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const dispose = await loadPluginBundles([bundle("old", 2), bundle("alpha"), bundle("beta")], manifests,
+      {} as never, updates, undefined, importer);
+    expect(importer).toHaveBeenCalledTimes(2);
+    expect(updates.mock.lastCall?.[0].routes.map((route: { id: string }) => route.id)).toEqual(["beta"]);
+    expect(updates.mock.lastCall?.[0].notices).toEqual([
+      "old: unsupported dashboard API version 2.", "alpha: dashboard bundle could not be loaded."
+    ]);
+    expect(consoleError).toHaveBeenCalledTimes(1);
+    dispose();
+    consoleError.mockRestore();
+  });
+
+  it("rejects alpha declaring alpha while claiming beta's route, rolls alpha back and lets beta register", async () => {
+    const updates = vi.fn();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const importer = vi.fn(async (url: string) => {
+      const host = window.mimirPluginHost!;
+      if (url.includes("/alpha/")) {
+        host.registerRoute({ plugin: "alpha", id: "alpha", path: "/dashboard/alpha", component: () => null });
+        host.registerNavEntry({ plugin: "alpha", id: "alpha", label: "Alpha" });
+        host.registerRoute({ plugin: "alpha", id: "beta", path: "/dashboard/beta", component: () => null });
+      } else {
+        host.registerRoute({ plugin: "beta", id: "beta", path: "/dashboard/beta", component: () => null });
+        expect(() => host.registerRoute({ plugin: "beta", id: "beta", path: "/dashboard/beta", component: () => null }))
+          .toThrow("Invalid plugin route: beta");
+        host.registerNavEntry({ plugin: "beta", id: "beta", label: "Beta" });
+      }
+    });
+    const dispose = await loadPluginBundles([bundle("alpha"), bundle("beta")], manifests,
+      {} as never, updates, undefined, importer);
+    expect(importer).toHaveBeenCalledTimes(2);
+    expect(updates.mock.lastCall?.[0].routes.map((route: { id: string }) => route.id)).toEqual(["beta"]);
+    expect(updates.mock.lastCall?.[0].navEntries.map((entry: { id: string }) => entry.id)).toEqual(["beta"]);
+    expect(updates.mock.lastCall?.[0].notices).toEqual(["alpha: dashboard bundle could not be loaded."]);
+    expect(error).toHaveBeenCalledTimes(1);
+    dispose();
+    error.mockRestore();
+  });
+
+  it("does not allow a plugin to claim a core route even when its manifest has a bundle", async () => {
+    const updates = vi.fn();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const dispose = await loadPluginBundles([bundle("alpha")], [
+      { ...manifest("core"), route_path: "/dashboard/core", bundle: "core.js" }
+    ], {} as never, updates, undefined, async () => {
+      window.mimirPluginHost!.registerRoute({ plugin: "alpha", id: "core", path: "/dashboard/core", component: () => null });
+    });
+    expect(updates.mock.lastCall?.[0].routes).toEqual([]);
+    expect(updates.mock.lastCall?.[0].notices).toEqual(["alpha: dashboard bundle could not be loaded."]);
+    dispose();
+    error.mockRestore();
+  });
+
+  it("uses dynamic import for the actual asset URL, reporting an unavailable asset without failing core", async () => {
+    const updates = vi.fn();
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const dispose = await loadPluginBundles([{ ...bundle("missing"), cssUrl: null }], [], {} as never, updates);
+    expect(updates.mock.lastCall?.[0]).toEqual({
+      routes: [], navEntries: [], notices: ["missing: dashboard bundle could not be loaded."]
+    });
+    expect(log).toHaveBeenCalledTimes(1);
+    dispose();
+    log.mockRestore();
+  });
+
+  it("reports a failed stylesheet without blocking another plugin", async () => {
+    const updates = vi.fn();
+    const dispose = await loadPluginBundles([bundle("alpha"), bundle("beta")], manifests,
+      {} as never, updates, undefined, async (url) => {
+        const plugin = url.includes("alpha") ? "alpha" : "beta";
+        window.mimirPluginHost!.registerRoute({ plugin, id: plugin, path: `/dashboard/${plugin}`, component: () => null });
+        window.mimirPluginHost!.registerNavEntry({ plugin, id: plugin, label: plugin });
+      });
+    document.head.querySelector('link[href*="/alpha/"]')!.dispatchEvent(new Event("error"));
+    expect(updates.mock.lastCall?.[0].notices).toEqual(["alpha: dashboard stylesheet could not be loaded."]);
+    expect(updates.mock.lastCall?.[0].routes).toHaveLength(2);
+    dispose();
+  });
+
+  it("rejects remote, traversal and foreign plugin asset URLs before import", async () => {
+    const updates = vi.fn();
+    const importer = vi.fn();
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const dispose = await loadPluginBundles([
+      { ...bundle("alpha"), moduleUrl: "https://evil.example/bundle.js" },
+      { ...bundle("alpha"), moduleUrl: "/plugins/beta/assets/main.js" },
+      { ...bundle("alpha"), moduleUrl: "/plugins/alpha/assets/%2e%2e/secret.js" }
+    ], manifests, {} as never, updates, undefined, importer);
+    expect(importer).not.toHaveBeenCalled();
+    expect(updates.mock.lastCall?.[0].notices).toHaveLength(3);
+    dispose();
+    log.mockRestore();
+  });
+
+  it("sends authenticated same-origin requests using the browser session and rejects remote URLs", async () => {
+    const fetcher = vi.fn(async () => new Response("ok"));
+    vi.stubGlobal("fetch", fetcher);
+    await authenticatedPluginFetch("/api/v1/plugins/alpha/items", { method: "POST", credentials: "omit" });
+    expect(fetcher).toHaveBeenCalledWith("/api/v1/plugins/alpha/items", {
+      method: "POST", credentials: "same-origin"
+    });
+    await expect(authenticatedPluginFetch("//evil.example/steal")).rejects.toThrow(/local/);
+    await expect(authenticatedPluginFetch("https://evil.example/steal")).rejects.toThrow(/local/);
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });

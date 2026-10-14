@@ -14,10 +14,25 @@ def add_argparse(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
     plugins_sub = plugins_p.add_subparsers(dest="plugins_action")
     list_p = plugins_sub.add_parser("list", help="List installed plugin metadata.")
     list_p.add_argument("--json", action="store_true", dest="as_json", help="Emit JSON instead of text.")
+    docker_p = plugins_sub.add_parser("dockerfile", help="Print installed plugin Dockerfile fragments.")
+    docker_p.add_argument("--stage", choices=("base", "build", "runtime", "services"))
+    docker_p.add_argument("--all-installed", action="store_true",
+                          help="Include disabled installed plugins as well as enabled ones.")
     return plugins_p
 
 
 def dispatch(args: argparse.Namespace, plugins_p: argparse.ArgumentParser) -> int:
+    if args.plugins_action == "dockerfile":
+        from ..plugin_dockerfile import render_stage, select_plugins
+
+        candidates = select_plugins(all_installed=args.all_installed,
+                                    enable=os.environ.get("MIMIR_PLUGINS", ""))
+        stages = (args.stage,) if args.stage else ("base", "build", "runtime", "services")
+        output = "\n\n".join(fragment for stage in stages
+                             if (fragment := render_stage(candidates, stage)))
+        if output:
+            print(output)
+        return 0
     if args.plugins_action != "list":
         plugins_p.print_help()
         return 1

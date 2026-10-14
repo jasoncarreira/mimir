@@ -8,12 +8,13 @@ import {
 } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useBootstrap } from "../api/bootstrap";
+import type { PluginSkinManifestData } from "../api/generated/contracts";
 import { getWhoami, updateUserPrefs } from "../api/whoami";
 import { useUiState } from "../uiState";
 import { cosmicNebulaSkin } from "./cosmic-nebula";
 import { defaultRetroSkin } from "./default-retro";
 import { neonTerminalSkin } from "./neon-terminal";
-import type { SkinCssVariables, SkinId, SkinManifest } from "./types";
+import type { PluginSkinTokens, SkinCssVariables, SkinId, SkinManifest } from "./types";
 
 export const localSkins = {
   "default-retro": defaultRetroSkin,
@@ -23,8 +24,7 @@ export const localSkins = {
 
 const localSkinRegistry: Record<string, SkinManifest> = localSkins;
 
-// Active skin until per-user skin selection ships (#562). neon-terminal is the
-// current dark-retro theme; default-retro remains registered as a fallback.
+// neon-terminal remains the fallback when no server-selected default is present.
 const DEFAULT_SKIN_ID: SkinId = "neon-terminal";
 
 const tokenCssVariableNames = {
@@ -134,15 +134,71 @@ function isSkinManifest(value: unknown): value is SkinManifest {
   );
 }
 
+function isLocalPluginAsset(url: unknown, plugin: string): url is string {
+  if (typeof url !== "string" || !url.startsWith(`/plugins/${plugin}/assets/`))
+    return false;
+  try {
+    const parsed = new URL(url, "http://localhost");
+    return (
+      parsed.origin === "http://localhost" &&
+      parsed.pathname.startsWith(`/plugins/${plugin}/assets/`) &&
+      !parsed.pathname.split("/").includes("..") &&
+      !url.includes("\\") &&
+      !url.includes("#")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isPluginSkinManifest(value: unknown): value is PluginSkinManifestData & SkinManifest {
+  if (!isSkinManifest(value) || !isRecord(value)) return false;
+  const plugin = value.plugin;
+  if (typeof plugin !== "string" || !/^[a-z0-9][a-z0-9_-]*$/.test(plugin))
+    return false;
+  if (value.default !== undefined && typeof value.default !== "boolean") return false;
+  const tokens = value.tokens as PluginSkinTokens;
+  if (
+    Object.keys(tokens).length !== Object.keys(tokenCssVariableNames).length ||
+    !Object.keys(tokenCssVariableNames).every(
+      (key) => Object.prototype.hasOwnProperty.call(tokens, key) &&
+        typeof tokens[key as keyof PluginSkinTokens] === "string",
+    )
+  ) return false;
+  if (!isRecord(value.characterRenderer) || !Array.isArray(value.characterRenderer.assets))
+    return false;
+  if (!value.characterRenderer.assets.every((asset: unknown) =>
+    isRecord(asset) && (asset.href === null || isLocalPluginAsset(asset.href, plugin))
+  )) return false;
+  if (value.fonts !== undefined && !value.fonts.every((font: unknown) =>
+    isRecord(font) && typeof font.family === "string" &&
+    Array.isArray(font.src) && font.src.length > 0 &&
+    font.src.every((source: unknown) =>
+      isRecord(source) && isLocalPluginAsset(source.url, plugin) &&
+      ["woff2", "woff", "truetype"].includes(String(source.format))
+    )
+  )) return false;
+  return !Object.values(tokens).some((token) => /@import|url\s*\(/i.test(token));
+}
+
 function skinRegistry(
   operatorSkins: unknown = [],
+  pluginSkins: unknown = [],
 ): Record<string, SkinManifest> {
   const registry: Record<string, SkinManifest> = { ...localSkins };
-  if (!Array.isArray(operatorSkins)) return registry;
-  for (const skin of operatorSkins) {
-    if (!isSkinManifest(skin)) continue;
-    if (Object.prototype.hasOwnProperty.call(localSkins, skin.id)) continue;
-    registry[skin.id] = skin;
+  if (Array.isArray(operatorSkins)) {
+    for (const skin of operatorSkins) {
+      if (!isSkinManifest(skin)) continue;
+      if (Object.prototype.hasOwnProperty.call(registry, skin.id)) continue;
+      registry[skin.id] = skin;
+    }
+  }
+  if (Array.isArray(pluginSkins)) {
+    for (const skin of pluginSkins) {
+      if (!isPluginSkinManifest(skin)) continue;
+      if (Object.prototype.hasOwnProperty.call(registry, skin.id)) continue;
+      registry[skin.id] = skin;
+    }
   }
   return registry;
 }
@@ -259,7 +315,7 @@ interface SkinProviderProps extends PropsWithChildren {
 
 export function SkinProvider({ children, skinId }: SkinProviderProps) {
   // Precedence: explicit prop (tests/embeds) > an in-page picker choice > the
-  // initial ?skin= preview > user preference > configured skin > default.
+  // initial ?skin= preview > user preference > server-projected default > neon.
   const queryClient = useQueryClient();
   const [userSelection, setUserSelection] = useState<SkinId | null>(null);
   const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
@@ -273,11 +329,13 @@ export function SkinProvider({ children, skinId }: SkinProviderProps) {
     enabled: signedIn,
   });
   const registry = useMemo(
-    () => skinRegistry(bootstrap?.skins?.operator),
-    [bootstrap?.skins?.operator],
+    () => skinRegistry(bootstrap?.skins?.operator, bootstrap?.skins?.plugins),
+    [bootstrap?.skins?.operator, bootstrap?.skins?.plugins],
   );
   const userSkin = skinIdFromPrefs(whoami?.prefs, registry);
-  const configured = bootstrap?.ui?.skin;
+  // The server projects the operator override and the unique plugin default
+  // into one effective value; ui.skin is agent-editable and is not that policy.
+  const configured = bootstrap?.ui?.default_skin;
   const fallback = isSkinId(configured, registry)
     ? configured
     : DEFAULT_SKIN_ID;

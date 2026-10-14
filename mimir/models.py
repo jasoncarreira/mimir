@@ -1637,6 +1637,19 @@ class _AuthContextAuthoritySlot:
 _MISSING_AUTH_VALUE: Any = object()
 
 
+def _validate_plugin_slot(policy: Any, registrar: Any, value: Any) -> str:
+    from .plugins.registry import PolicyRegistrar
+
+    if (policy is None or not policy.frozen or not isinstance(registrar, PolicyRegistrar)
+            or registrar._registry is not policy):
+        raise ValueError("plugin state requires a frozen, matching owner registrar")
+    owner = registrar.plugin
+    slot_type = policy.state_slots.get(owner)
+    if slot_type is None or type(value) is not slot_type:
+        raise TypeError(f"{owner}: plugin state must have its registered slot type")
+    return owner
+
+
 @dataclass(frozen=True, eq=False)
 class AuthContext(_AuthContextAuthoritySlot):
     """Frozen, server-created authorization context (chainlink #864).
@@ -1732,6 +1745,20 @@ class AuthContext(_AuthContextAuthoritySlot):
     audience_provider: InitVar[_RedactedAudienceProvider] = None
     cross_platform_pull: bool = True
     domain_qualifier: str | None = None
+    plugin_slots: tuple[tuple[str, Any], ...] = field(default=(), repr=False, compare=False)
+    _plugin_slot_policy: Any = field(default=None, repr=False, compare=False)
+
+    def plugin_state(self, owner: str) -> Any | None:
+        return dict(self.plugin_slots).get(owner)
+
+    def with_plugin_state(self, registrar: Any, value: Any) -> "AuthContext":
+        """Set only the calling registrar's declared slot on this live carrier."""
+        owner = _validate_plugin_slot(self._plugin_slot_policy, registrar, value)
+        from dataclasses import replace
+
+        slots = dict(self.plugin_slots)
+        slots[owner] = value
+        return replace(self, plugin_slots=tuple(sorted(slots.items())))
 
     def __post_init__(
         self,
@@ -1936,6 +1963,33 @@ class TurnContext:
     # this carrier, NOT from model session_id, ContextVar fallback, or
     # single-active-turn heuristics.
     auth_context: AuthContext | None = None
+    plugin_slots: tuple[tuple[str, Any], ...] = field(default=(), repr=False)
+
+    def __post_init__(self) -> None:
+        if self.auth_context is not None:
+            if self.plugin_slots:
+                raise ValueError("turn plugin state must originate from its auth context")
+            self.plugin_slots = self.auth_context.plugin_slots
+
+    def plugin_state(self, owner: str) -> Any | None:
+        return dict(self.plugin_slots).get(owner)
+
+    def set_plugin_state(self, registrar: Any, value: Any) -> None:
+        """Replace this turn's immutable owner slot after host validation."""
+        policy = self.auth_context._plugin_slot_policy if self.auth_context else None
+        owner = _validate_plugin_slot(policy, registrar, value)
+        slots = dict(self.plugin_slots)
+        slots[owner] = value
+        self.plugin_slots = tuple(sorted(slots.items()))
+
+    def auth_with_plugin_state(self) -> AuthContext | None:
+        """Snapshot live turn slots for a child or continuation carrier."""
+        auth = self.auth_context
+        if auth is None or not self.plugin_slots:
+            return auth
+        from dataclasses import replace
+
+        return replace(auth, plugin_slots=self.plugin_slots)
     # Server-owned chat trust delivery and ingress binding (never model arguments).
     operator_ingress_event: AgentEvent | None = None
     trust_notice_sender: Any = None

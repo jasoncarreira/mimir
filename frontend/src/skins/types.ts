@@ -82,6 +82,10 @@ export type SkinTokenName =
 
 export type SkinTokens = Partial<Record<SkinTokenName, string>>;
 
+// Plugin skins must supply every token; built-in and legacy operator skins may
+// continue to use partial manifests.
+export type PluginSkinTokens = Required<SkinTokens>;
+
 export interface SkinChromeMetadata {
   // Drives the app shell AppFrame renders: "top-nav" is a header strip over a
   // horizontal tab bar (Neon Terminal / default); "sidebar" is a left rail with

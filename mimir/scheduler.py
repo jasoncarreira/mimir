@@ -35,11 +35,11 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable
 
 if TYPE_CHECKING:
     from .commitments.store import CommitmentsStore
-    from .plugins.registry import PolicyRegistry
+    from .plugins.registry import PolicyRegistry, SchedulerJob as PluginSchedulerJob
 
 import yaml
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED, JobExecutionEvent
@@ -1860,6 +1860,39 @@ class Scheduler:
         return jobs
 
     # ---- Named-callable registry -------------------------------------
+
+    def bind_plugin_jobs(self, jobs: Iterable[PluginSchedulerJob]) -> int:
+        """Bind selected, pre-freeze declarations after core jobs are registered.
+
+        Return the number installed (not merely declared) for the server's
+        start predicate. A declared job without a YAML cron stays registered
+        for later reloads, just like a disabled built-in callable.
+        """
+        declarations = list(jobs)
+        names = set(self._callables)
+        job_ids = {cdef.job_id for cdef in self._callables.values()}
+        job_ids.update(job.id for job in self._scheduler.get_jobs())
+        for job in declarations:
+            if job.owner == "core":
+                raise ValueError(f"scheduler job {job.name!r} must have a plugin owner")
+            if (
+                job.job_id.startswith((SCHEDULER_CHANNEL_PREFIX, POLLER_CHANNEL_PREFIX))
+                or job.job_id in {_QUOTA_RECOVERY_JOB_ID, _QUOTA_RECHECK_JOB_ID}
+            ):
+                raise ValueError(f"reserved scheduler job ID: {job.job_id!r}")
+            if job.name in names:
+                raise ValueError(f"duplicate scheduler callable name: {job.name!r}")
+            if job.job_id in job_ids:
+                raise ValueError(f"duplicate scheduler job ID: {job.job_id!r}")
+            names.add(job.name)
+            job_ids.add(job.job_id)
+
+        installed = 0
+        for job in declarations:
+            installed += self.register_callable(
+                job.name, job.callback, default_cron="", job_id=job.job_id,
+            )
+        return installed
 
     def register_callable(
         self,

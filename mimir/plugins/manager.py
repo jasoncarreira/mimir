@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -129,8 +130,29 @@ class PluginManager:
 def load_plugins(*, enable: str) -> PluginManager:
     """Resolve metadata before importing only selected providers, then freeze once."""
     selected = enabled_plugins(enable=enable)
+    # Selection resolves ambiguous nested environment prefixes before any provider
+    # is imported. The most specific selected prefix owns a key, whether or not
+    # that plugin declares the key itself (foo must not claim foo-bar's secrets).
+    prefixes = sorted(
+        ((f"MIMIR_PLUGIN_{candidate.name.upper().replace('-', '_')}_", candidate.name)
+         for candidate in selected),
+        key=lambda item: len(item[0]), reverse=True,
+    )
+    for candidate in selected:
+        for key in getattr(getattr(candidate, "manifest", None), "config", {}):
+            owner = next((owner for prefix, owner in prefixes if key.startswith(prefix)), None)
+            if owner != candidate.name:
+                raise PluginDiscoveryError(
+                    f"plugin {candidate.name!r}: config key {key!r} belongs to selected plugin {owner!r}"
+                )
+    defaults = [(candidate.name, skin) for candidate in selected
+                for skin in getattr(getattr(candidate, "manifest", None), "skin_defaults", ())]
+    if len(defaults) > 1 and not os.environ.get("MIMIR_WEB_DEFAULT_SKIN"):
+        raise PluginDiscoveryError("conflicting plugin default skins: " +
+                                   ", ".join(f"{owner}:{skin}" for owner, skin in defaults))
     policy = PolicyRegistry()
     register_core_tools(policy)
+    policy.select_plugin_candidates(selected)
     loaded = []
     for candidate in selected:
         try:

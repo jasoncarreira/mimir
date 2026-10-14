@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import pytest
 
 from mimir.core_blocks import (
     _CHANNEL_MEMORY_OVER_CAP_REPORTED,
@@ -14,8 +15,49 @@ from mimir.core_blocks import (
     load_channel_memory,
     load_core,
     read_text_lossy,
+    read_plugin_prompt_file,
+    PromptReadRefused,
     render_core_section,
 )
+
+
+def test_plugin_prompt_reader_admits_trusted_home_and_server_owned(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    skill = home / "skills" / "example" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("TRUSTED-SKILL", encoding="utf-8")
+    assert read_plugin_prompt_file(home, "skills/example/SKILL.md") == (
+        "TRUSTED-SKILL", str(skill.resolve()),
+    )
+    import mimir.core_blocks as core_blocks
+
+    server_owned = Path(core_blocks.__file__).resolve()
+    body, resource = read_plugin_prompt_file(home, server_owned)
+    assert "def read_plugin_prompt_file" in body
+    assert resource == str(server_owned)
+
+
+@pytest.mark.parametrize("kind", ["untrusted", "outside", "scratch", "alias", "escape"])
+def test_plugin_prompt_reader_refuses_untrusted_resources(tmp_path: Path, kind: str) -> None:
+    home = tmp_path / "home"
+    (home / "skills" / "example").mkdir(parents=True)
+    outside = tmp_path / "private.md"
+    outside.write_text("OUTSIDE-SECRET", encoding="utf-8")
+    untrusted = home / "attachments" / "inbound" / "payload.md"
+    untrusted.parent.mkdir(parents=True)
+    untrusted.write_text("UNTRUSTED-SECRET", encoding="utf-8")
+    scratch = home / "scratch" / "turns" / "other" / "draft.md"
+    scratch.parent.mkdir(parents=True)
+    scratch.write_text("SCRATCH-SECRET", encoding="utf-8")
+    alias = home / "skills" / "example" / "alias.md"
+    alias.symlink_to(outside)
+    requested = {
+        "untrusted": untrusted, "outside": outside, "scratch": scratch,
+        "alias": alias, "escape": home / "skills" / "example" / "../../../private.md",
+    }[kind]
+    with pytest.raises(PromptReadRefused, match="prompt resource refused") as error:
+        read_plugin_prompt_file(home, requested)
+    assert "SECRET" not in str(error.value)
 
 
 def test_extract_desc_comment_present():

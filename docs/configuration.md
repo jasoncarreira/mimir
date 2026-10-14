@@ -24,8 +24,9 @@ their own skill subprocesses.
 - **Process environment wins.** Anything exported into the process (your shell,
   a Docker `compose.env`, a systemd unit) takes precedence.
 - **`<MIMIR_HOME>/.env` supplies defaults** for anything not already in the
-  process environment, except channel scope keys and `MIMIR_PLUGINS`
-  (operator-only). It's loaded once at startup; the process env overrides it.
+  process environment, except channel scope keys, `MIMIR_PLUGINS`, and
+  `MIMIR_WEB_DEFAULT_SKIN` (operator-only). It's loaded once at startup; the
+  process env overrides it.
 - **Unset optional flags fall back to the defaults below.**
 
 To confirm what a running agent actually resolved, read `Config.from_env()` or
@@ -140,6 +141,8 @@ reports disabled-manifest diagnostics. See [plugins](plugins.md).
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `MIMIR_PLUGINS` | comma-separated plugin names or `all` | `""` (off) | Operator-owned process enable list for installed `mimir.plugins` providers; does not disable core tools. |
+| `MIMIR_PLUGIN_` | per-plugin key prefix | no keys | Manifest-declared plugin config keys must start with `MIMIR_PLUGIN_<NAME>_`, where `<NAME>` is the owning plugin name uppercased with hyphens replaced by underscores. This is a namespace prefix, not a variable to set. It does not grant access to core or other plugins' keys. |
+| `MIMIR_WEB_DEFAULT_SKIN` | skin id | unset | Operator process override for the dashboard's default skin. When unset, more than one selected plugin declaring a default skin fails startup; a saved user choice or explicit skin preview takes precedence over the default. This is not a plugin-writable setting. |
 
 All channel-list flags take a comma-separated prefix allow-list (e.g.
 `discord-,slack-`); `*` means all interactive channels; empty means off.

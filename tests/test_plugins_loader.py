@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from mimir.plugins.discovery import PluginDiscoveryError
 from mimir.plugins.manager import load_plugins
 from mimir.plugins.core import ServicePrincipal
+from mimir.config import _load_home_dotenv
 from mimir.tool_descriptors import ResultOriginKind
 
 
@@ -41,6 +43,88 @@ def test_named_load_and_registration_errors(monkeypatch):
     monkeypatch.setattr("mimir.plugins.manager.enabled_plugins", lambda *, enable: (candidate,))
     with pytest.raises(PluginDiscoveryError, match="plugin 'alpha' from provider-alpha: registration failed: import broke"):
         load_plugins(enable="alpha")
+
+
+def test_selected_skin_defaults_conflict_only_without_operator_override(monkeypatch):
+    def candidate(name):
+        return SimpleNamespace(
+            name=name, distribution=f"provider-{name}",
+            manifest=SimpleNamespace(skin_defaults=(f"{name}-skin",)),
+            entry_point=SimpleNamespace(load=lambda: SimpleNamespace(register=lambda registrar: None)),
+        )
+
+    monkeypatch.setattr("mimir.plugins.manager.enabled_plugins",
+                        lambda *, enable: (candidate("alpha"), candidate("beta")))
+    monkeypatch.delenv("MIMIR_WEB_DEFAULT_SKIN", raising=False)
+    with pytest.raises(PluginDiscoveryError, match="alpha:alpha-skin, beta:beta-skin"):
+        load_plugins(enable="alpha,beta")
+    monkeypatch.setenv("MIMIR_WEB_DEFAULT_SKIN", "neon-terminal")
+    assert load_plugins(enable="alpha,beta").policy.frozen
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_nested_config_namespace_rejected_before_provider_import(monkeypatch, reverse):
+    from mimir.plugins.manifest import parse_manifest
+
+    imported = []
+
+    def candidate(name, key):
+        manifest = parse_manifest((
+            f'name = "{name}"\nversion = "1.0"\nlicense = "MIT"\n'
+            'requires_mimir = ">=0.9,<1"\n'
+            f'[config.{key}]\ntype = "string"\n'
+        ).encode(), entry_name=name)
+        return SimpleNamespace(
+            name=name, distribution=f"provider-{name}", manifest=manifest,
+            entry_point=SimpleNamespace(load=lambda: imported.append(name)),
+        )
+
+    selected = [candidate("foo", "MIMIR_PLUGIN_FOO_BAR_TOKEN"),
+                candidate("foo-bar", "MIMIR_PLUGIN_FOO_BAR_OTHER")]
+    if reverse:
+        selected.reverse()
+    monkeypatch.setattr("mimir.plugins.manager.enabled_plugins", lambda *, enable: tuple(selected))
+    with pytest.raises(PluginDiscoveryError, match="config key.*MIMIR_PLUGIN_FOO_BAR_TOKEN.*foo-bar"):
+        load_plugins(enable="foo,foo-bar")
+    assert imported == []
+
+
+@pytest.mark.parametrize("nested_selected", [False, True])
+def test_config_namespace_longest_selected_prefix_owns_key(monkeypatch, nested_selected):
+    from mimir.plugins.config_api import plugin_config_rows
+    from mimir.plugins.manifest import parse_manifest
+
+    def candidate(name, key):
+        manifest = parse_manifest((
+            f'name = "{name}"\nversion = "1.0"\nlicense = "MIT"\n'
+            'requires_mimir = ">=0.9,<1"\n'
+            f'[config.{key}]\ntype = "string"\n'
+        ).encode(), entry_name=name)
+        return SimpleNamespace(
+            name=name, distribution=f"provider-{name}", manifest=manifest,
+            entry_point=SimpleNamespace(load=lambda: SimpleNamespace(register=lambda registrar: None)),
+        )
+
+    key = "MIMIR_PLUGIN_FOO_TOKEN" if nested_selected else "MIMIR_PLUGIN_FOO_BAR_TOKEN"
+    selected = [candidate("foo", key)]
+    if nested_selected:
+        selected.append(candidate("foo-bar", "MIMIR_PLUGIN_FOO_BAR_TOKEN"))
+    monkeypatch.setattr("mimir.plugins.manager.enabled_plugins", lambda *, enable: tuple(selected))
+    manager = load_plugins(enable="foo,foo-bar" if nested_selected else "foo")
+    manifests = {plugin.candidate.name: plugin.candidate.manifest for plugin in manager.plugins}
+    assert [row["name"] for row in plugin_config_rows("foo", manifests)] == [key]
+    if nested_selected:
+        assert [row["name"] for row in plugin_config_rows("foo-bar", manifests)] == ["MIMIR_PLUGIN_FOO_BAR_TOKEN"]
+
+
+def test_home_dotenv_cannot_set_operator_skin_override(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("MIMIR_WEB_DEFAULT_SKIN=home-skin\n")
+    monkeypatch.delenv("MIMIR_WEB_DEFAULT_SKIN", raising=False)
+    _load_home_dotenv(tmp_path)
+    assert "MIMIR_WEB_DEFAULT_SKIN" not in os.environ
+    monkeypatch.setenv("MIMIR_WEB_DEFAULT_SKIN", "operator-skin")
+    _load_home_dotenv(tmp_path)
+    assert os.environ["MIMIR_WEB_DEFAULT_SKIN"] == "operator-skin"
 
 
 @pytest.mark.parametrize("registration,cause", [

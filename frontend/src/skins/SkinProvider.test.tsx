@@ -21,6 +21,7 @@ vi.mock("../api/whoami", () => ({
 
 const { SkinProvider, useSkin, skinIdFromPrefs } =
   await import("./SkinProvider");
+const { neonTerminalSkin } = await import("./neon-terminal");
 const { useUiState } = await import("../uiState");
 
 function Probe() {
@@ -38,13 +39,14 @@ function Probe() {
   );
 }
 
-function renderProvider(children: ReactNode) {
+function renderProvider(children: ReactNode, skinId?: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const result = render(
     <QueryClientProvider client={qc}>
-      <SkinProvider>{children}</SkinProvider>
+      <SkinProvider skinId={skinId}>{children}</SkinProvider>
     </QueryClientProvider>,
   );
+  return { ...result, queryClient: qc };
 }
 
 const bootstrap = {
@@ -67,6 +69,32 @@ const bootstrap = {
   dashboard_extensions: [],
 };
 
+const pluginSkin = {
+  ...neonTerminalSkin,
+  id: "plugin-mint",
+  name: "Plugin Mint",
+  plugin: "mint",
+  default: true,
+  tokens: { ...neonTerminalSkin.tokens, colorText: "#eefbf3" },
+  fonts: [{ family: "Mint", src: [{ url: "/plugins/mint/assets/mint.woff2?v=1", format: "woff2" }] }],
+  characterRenderer: {
+    ...neonTerminalSkin.characterRenderer,
+    assets: [{ id: "idle", type: "image", href: "/plugins/mint/assets/idle.png?v=1" }],
+  },
+};
+
+function serveBootstrap(data: object) {
+  bootstrapApi.apiFetchEnvelope.mockResolvedValue({ ok: true, version: "v1", data });
+}
+
+function serveUserSkin(skin: string) {
+  whoamiApi.getWhoami.mockResolvedValue({
+    ok: true, version: "v1",
+    data: { canonical: "alice", display_name: "Alice", roles: ["user"],
+      is_admin: false, is_master: false, prefs: { skin } },
+  });
+}
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -75,6 +103,96 @@ afterEach(() => {
 });
 
 describe("SkinProvider per-user skin preferences (#562)", () => {
+  it("keeps an explicit plugin skin above the preview, persisted choice and projected default", async () => {
+    window.history.replaceState({}, "", "/app/chat?skin=cosmic-nebula");
+    useUiState.setState({ apiKeyPresent: true });
+    serveBootstrap({ ...bootstrap, ui: { ...bootstrap.ui, default_skin: "neon-terminal" },
+      skins: { built_in_ids: [], operator: [], plugins: [pluginSkin] } });
+    serveUserSkin("default-retro");
+
+    const { queryClient } = renderProvider(<Probe />, "plugin-mint");
+
+    await waitFor(() => {
+      expect(queryClient.getQueryData(["whoami"])).toHaveProperty("prefs.skin", "default-retro");
+      expect(screen.getByTestId("skin-count").textContent).toBe("4");
+    });
+    expect(screen.getByTestId("skin-id").textContent).toBe("plugin-mint");
+    expect(screen.getByTestId("skin-color").textContent).toBe("#eefbf3");
+  });
+
+  it("uses the server-projected plugin default instead of the agent skin setting", async () => {
+    serveBootstrap({ ...bootstrap, ui: { ...bootstrap.ui, skin: "cosmic-nebula", default_skin: "plugin-mint" },
+      skins: { built_in_ids: [], operator: [], plugins: [pluginSkin] } });
+    renderProvider(<Probe />);
+    await waitFor(() => expect(screen.getByTestId("skin-id")).toHaveProperty("textContent", "plugin-mint"));
+    expect(screen.getByTestId("skin-count").textContent).toBe("4");
+    expect(screen.getByTestId("skin-color").textContent).toBe("#eefbf3");
+    expect(document.querySelector(".skin-root")?.getAttribute("data-chrome-layout")).toBe("top-nav");
+  });
+
+  it("uses an operator-selected built-in over a plugin default, but not over persisted user choice", async () => {
+    useUiState.setState({ apiKeyPresent: true });
+    serveBootstrap({ ...bootstrap, ui: { ...bootstrap.ui, default_skin: "cosmic-nebula" },
+      skins: { built_in_ids: [], operator: [], plugins: [pluginSkin] } });
+    serveUserSkin("plugin-mint");
+    renderProvider(<Probe />);
+    await waitFor(() => expect(screen.getByTestId("skin-id").textContent).toBe("plugin-mint"));
+  });
+
+  it("uses an operator-selected skin when there is no persisted selection", async () => {
+    serveBootstrap({ ...bootstrap, ui: { ...bootstrap.ui, default_skin: "cosmic-nebula" },
+      skins: { built_in_ids: [], operator: [], plugins: [pluginSkin] } });
+    renderProvider(<Probe />);
+    await waitFor(() => expect(screen.getByTestId("skin-id").textContent).toBe("cosmic-nebula"));
+  });
+
+  it("keeps a plugin query preview above the persisted preference", async () => {
+    window.history.replaceState({}, "", "/app/chat?skin=plugin-mint");
+    useUiState.setState({ apiKeyPresent: true });
+    serveBootstrap({ ...bootstrap, ui: { ...bootstrap.ui, default_skin: "cosmic-nebula" },
+      skins: { built_in_ids: [], operator: [], plugins: [pluginSkin] } });
+    serveUserSkin("default-retro");
+    renderProvider(<Probe />);
+    await waitFor(() => expect(screen.getByTestId("skin-id").textContent).toBe("plugin-mint"));
+  });
+
+  it("rejects incomplete plugin tokens and falls back to neon without plugins", async () => {
+    const { colorTriggerPoller: _omitted, ...incomplete } = pluginSkin.tokens;
+    serveBootstrap({ ...bootstrap, ui: { ...bootstrap.ui, default_skin: "plugin-mint" },
+      skins: { built_in_ids: [], operator: [], plugins: [{ ...pluginSkin, tokens: incomplete }] } });
+    renderProvider(<Probe />);
+    await waitFor(() => expect(screen.getByTestId("skin-id").textContent).toBe("neon-terminal"));
+    expect(screen.getByTestId("skin-count").textContent).toBe("3");
+  });
+
+  it("rejects external fonts and character assets independently", async () => {
+    serveBootstrap({ ...bootstrap, skins: { built_in_ids: [], operator: [], plugins: [
+      { ...pluginSkin, fonts: [{ family: "Bad", src: [{ url: "https://example.com/font.woff2", format: "woff2" }] }] },
+      { ...pluginSkin, id: "bad-art", characterRenderer: { ...pluginSkin.characterRenderer,
+        assets: [{ id: "idle", href: "//example.com/idle.png" }] } },
+    ] } });
+    renderProvider(<Probe />);
+    await waitFor(() => expect(screen.getByTestId("skin-count").textContent).toBe("3"));
+  });
+
+  it("does not allow a plugin to replace a built-in or a previously registered plugin", async () => {
+    serveBootstrap({ ...bootstrap, skins: { built_in_ids: [], operator: [], plugins: [
+      pluginSkin, { ...pluginSkin, tokens: { ...pluginSkin.tokens, colorText: "#abc" } },
+      { ...pluginSkin, id: "neon-terminal" },
+    ] }, ui: { ...bootstrap.ui, default_skin: "plugin-mint" } });
+    renderProvider(<Probe />);
+    await waitFor(() => expect(screen.getByTestId("skin-id").textContent).toBe("plugin-mint"));
+    expect(screen.getByTestId("skin-count").textContent).toBe("4");
+    expect(screen.getByTestId("skin-color").textContent).toBe("#eefbf3");
+  });
+
+  it("preserves the no-plugin neon fallback even when the agent skin differs", async () => {
+    serveBootstrap({ ...bootstrap, ui: { ...bootstrap.ui, skin: "cosmic-nebula" } });
+    renderProvider(<Probe />);
+    await waitFor(() => expect(screen.getByTestId("skin-id").textContent).toBe("neon-terminal"));
+    expect(screen.getByTestId("skin-count").textContent).toBe("3");
+  });
+
   it("uses a valid user skin from whoami prefs over server UI fallback", async () => {
     useUiState.setState({ apiKeyPresent: true });
     bootstrapApi.apiFetchEnvelope.mockResolvedValue({

@@ -20,7 +20,7 @@ import { useChatStore } from "./chatStore";
 import { clearChunkReloadMarkerAfterStart, isChunkLoadError, reloadOnceForStaleChunk } from "./chunkReload";
 import { ChainlinkBoardRoute } from "./routes/ChainlinkBoardRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
-import { getDashboardSurfaces, visibleSurfaces, type DashboardSurface } from "./dashboardExtensions";
+import { getDashboardSurfaces, loadPluginBundles, visibleSurfaces, type DashboardSurface, type LoadedPlugins, type PluginRegistrationCache } from "./dashboardExtensions";
 import { getWhoami } from "./api/whoami";
 import { ApiError } from "./api/http";
 import { AdminRoute } from "./routes/AdminRoute";
@@ -314,6 +314,7 @@ function AppNavigation({ surfaces }: { surfaces: DashboardSurface[] }) {
         <NavLink
           className={({ isActive }) => `app-nav__link${isActive ? " app-nav__link--active" : ""}`}
           key={surface.id}
+          data-testid={`nav-${surface.id}`}
           to={surface.path}
         >
           <span>{surface.label}</span>
@@ -639,6 +640,9 @@ const AGENT_STATE_LABELS: Record<AgentCharacterState, string> = {
 
 interface ShellProps {
   surfaces: DashboardSurface[];
+  pendingSurfaces: DashboardSurface[];
+  plugins: LoadedPlugins;
+  isAdmin: boolean;
   firstRoute: string;
   agentState: AgentCharacterState;
   bootstrap?: WebBootstrapData;
@@ -648,8 +652,9 @@ interface ShellProps {
 }
 
 // Routed surfaces — identical across shells; only the surrounding chrome differs.
-function DashboardRouteElement({ surface }: { surface: DashboardSurface }) {
-  const content = surface.id === "saga"
+function DashboardRouteElement({ surface, plugins }: { surface: DashboardSurface; plugins: LoadedPlugins }) {
+  const PluginPage = plugins.routes.find((route) => route.id === surface.id && route.path === surface.path)?.component;
+  const content = PluginPage ? <PluginPage /> : surface.id === "saga"
     ? <SagaDashboard />
     : surface.id === "usage"
       ? <UsageRoute />
@@ -675,7 +680,12 @@ function DashboardRouteElement({ surface }: { surface: DashboardSurface }) {
   return <AppErrorBoundary title={`${surface.label} could not be rendered`}>{content}</AppErrorBoundary>;
 }
 
-function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[]; firstRoute: string }) {
+function DashboardRoutes({ surfaces, firstRoute, plugins, pendingSurfaces }: {
+  surfaces: DashboardSurface[];
+  firstRoute: string;
+  plugins: LoadedPlugins;
+  pendingSurfaces: DashboardSurface[];
+}) {
   return (
     <Routes>
       <Route element={<Navigate replace to={firstRoute} />} path="/" />
@@ -690,7 +700,14 @@ function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[
       <Route element={<Navigate replace to="/admin?tab=mcp" />} path="/admin/mcp" />
       {surfaces.map((surface) => (
         <Route
-          element={<DashboardRouteElement surface={surface} />}
+          element={<DashboardRouteElement surface={surface} plugins={plugins} />}
+          key={surface.id}
+          path={surface.path}
+        />
+      ))}
+      {pendingSurfaces.map((surface) => (
+        <Route
+          element={<LoadingState label={`Loading ${surface.label} plugin dashboard`} />}
           key={surface.id}
           path={surface.path}
         />
@@ -700,8 +717,15 @@ function DashboardRoutes({ surfaces, firstRoute }: { surfaces: DashboardSurface[
   );
 }
 
+function PluginNotices({ plugins, isAdmin }: { plugins: LoadedPlugins; isAdmin: boolean }) {
+  if (!isAdmin || !plugins.notices.length) return null;
+  return <div className="plugin-notices" data-testid="plugin-notices" role="status">
+    {plugins.notices.map((notice) => <p key={notice}>{notice}</p>)}
+  </div>;
+}
+
 // github #577: header strip over a horizontal tab bar (Neon Terminal / default).
-function TopNavShell({ surfaces, firstRoute, bootstrap }: ShellProps) {
+function TopNavShell({ surfaces, firstRoute, bootstrap, plugins, isAdmin, pendingSurfaces }: ShellProps) {
   const buildVersion = bootstrap?.version || APP_BUILD_VERSION;
   const setApiKey = useSetApiKey();
   const requiresKey = bootstrap?.auth.required ?? false;
@@ -739,7 +763,8 @@ function TopNavShell({ surfaces, firstRoute, bootstrap }: ShellProps) {
       </div>
       <main className="app-main" id="main-content">
         <LiveEventsWarning />
-        <DashboardRoutes surfaces={surfaces} firstRoute={firstRoute} />
+        <PluginNotices plugins={plugins} isAdmin={isAdmin} />
+        <DashboardRoutes surfaces={surfaces} firstRoute={firstRoute} plugins={plugins} pendingSurfaces={pendingSurfaces} />
       </main>
       <AppStatus />
     </div>
@@ -749,7 +774,7 @@ function TopNavShell({ surfaces, firstRoute, bootstrap }: ShellProps) {
 // Skin-driven sidebar console (Cosmic Nebula): a left rail holds the brand, the
 // agent character card, and a vertical nav; the server/status panel sits in a
 // bar above the routed content.
-function SidebarShell({ surfaces, firstRoute, agentState, bootstrap, error, isError, isLoading }: ShellProps) {
+function SidebarShell({ surfaces, firstRoute, agentState, bootstrap, error, isError, isLoading, plugins, isAdmin, pendingSurfaces }: ShellProps) {
   const { skin } = useSkin();
   const agentName = bootstrap?.ui?.agent_name || AGENT_NAME;
   return (
@@ -776,7 +801,8 @@ function SidebarShell({ surfaces, firstRoute, agentState, bootstrap, error, isEr
         </div>
         <main className="app-main" id="main-content">
           <LiveEventsWarning />
-          <DashboardRoutes surfaces={surfaces} firstRoute={firstRoute} />
+          <PluginNotices plugins={plugins} isAdmin={isAdmin} />
+          <DashboardRoutes surfaces={surfaces} firstRoute={firstRoute} plugins={plugins} pendingSurfaces={pendingSurfaces} />
         </main>
       </div>
     </div>
@@ -806,11 +832,39 @@ function AppFrameContent() {
   // so surface admin sections there; in a gated server, hide them unless the
   // resolved identity is an admin (server still 403s either way — this is UX).
   const isAdmin = (whoami?.is_admin ?? false) || !(bootstrap?.auth.required ?? false);
+  const { skin } = useSkin();
+  const pluginRegistrations = React.useRef<PluginRegistrationCache>(new Map());
+  const [plugins, setPlugins] = React.useState<LoadedPlugins>({ routes: [], navEntries: [], notices: [] });
+  const [loadedBootstrap, setLoadedBootstrap] = React.useState<WebBootstrapData>();
+  const canLoadPlugins = signedIn && !apiKeyRejected && (!bootstrap?.auth.required || identity.isSuccess);
+  React.useEffect(() => {
+    setPlugins({ routes: [], navEntries: [], notices: [] });
+    setLoadedBootstrap(undefined);
+    if (!canLoadPlugins || !bootstrap?.plugin_bundles?.length) return;
+    const controller = new AbortController();
+    void loadPluginBundles(bootstrap.plugin_bundles, bootstrap.dashboard_extensions ?? [], skin.tokens,
+      setPlugins, controller.signal, undefined, pluginRegistrations.current).then(() => {
+        if (!controller.signal.aborted) setLoadedBootstrap(bootstrap);
+      }).catch((error) => console.error("Plugin dashboard loader failed", error));
+    return () => controller.abort();
+  }, [bootstrap, canLoadPlugins, skin.tokens]);
+  const pendingSurfaces = React.useMemo(() =>
+    canLoadPlugins && bootstrap?.plugin_bundles?.length && loadedBootstrap !== bootstrap
+      ? visibleSurfaces(getDashboardSurfaces((bootstrap.dashboard_extensions ?? []).filter((manifest) =>
+          Boolean(manifest.bundle) && !plugins.routes.some((route) => route.id === manifest.id)
+        )), isAdmin)
+      : [], [bootstrap, canLoadPlugins, isAdmin, loadedBootstrap, plugins.routes]);
   const surfaces = React.useMemo(
     () => (bootstrap
-      ? visibleSurfaces(getDashboardSurfaces(bootstrap.dashboard_extensions ?? []), isAdmin)
+      ? visibleSurfaces(getDashboardSurfaces((bootstrap.dashboard_extensions ?? []).filter((manifest) =>
+          !manifest.bundle || (plugins.routes.some((route) => route.id === manifest.id && route.path === manifest.route_path) &&
+            plugins.navEntries.some((entry) => entry.id === manifest.id))
+        )).map((surface) => {
+          const entry = plugins.navEntries.find((nav) => nav.id === surface.id);
+          return entry ? { ...surface, label: entry.label, detail: entry.detail ?? surface.detail } : surface;
+        }), isAdmin)
       : []),
-    [bootstrap, isAdmin]
+    [bootstrap, isAdmin, plugins]
   );
   const firstRoute = surfaces[0]?.path ?? "/chat";
   // github #580: while the user is engaging the composer and the agent isn't
@@ -823,7 +877,6 @@ function AppFrameContent() {
   const agentState = withComposerListening(eventState, composerActive);
   // The active skin picks the shell layout (top-nav vs sidebar). useSkin runs
   // before the gate's early return to keep hook order stable.
-  const { skin } = useSkin();
 
   // Protected + not signed in (or still resolving the policy): show a focused
   // login screen instead of a dashboard full of 401 error panels.
@@ -857,6 +910,9 @@ function AppFrameContent() {
 
   const shellProps: ShellProps = {
     surfaces,
+    pendingSurfaces,
+    plugins,
+    isAdmin,
     firstRoute,
     agentState,
     bootstrap,

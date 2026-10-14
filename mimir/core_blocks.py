@@ -175,6 +175,27 @@ def _prompt_file_is_trusted(home: Path, path: Path) -> bool:
     return True
 
 
+class PromptReadRefused(ValueError):
+    """A provider requested a resource the host cannot put in a prompt."""
+
+
+def read_plugin_prompt_file(home: Path, requested: str | Path) -> tuple[str, str]:
+    """Read an admitted resource and return its text and canonical source path."""
+    path = Path(requested)
+    if not path.is_absolute():
+        path = home / path
+    try:
+        canonical = path.resolve(strict=True)
+        package_root = Path(__file__).parent.resolve(strict=True)
+        if canonical.is_relative_to(package_root) and path == canonical and canonical.is_file():
+            pass  # Server-owned installed resources are not home-writable.
+        elif not _prompt_file_is_trusted(home, path) or not canonical.is_file():
+            raise PromptReadRefused("prompt resource refused")
+        return canonical.read_text(encoding="utf-8"), str(canonical)
+    except (OSError, UnicodeError, RuntimeError, ValueError) as exc:
+        raise PromptReadRefused("prompt resource refused") from exc
+
+
 # Core files are read every turn; report each unreadable path once per process.
 _UNREADABLE_CORE_REPORTED: set[str] = set()
 

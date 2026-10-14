@@ -1,0 +1,1 @@
+{"pollers": [{"name": "example-watch", "description": "Example poller", "command": "python3 scripts/poller.py", "cron": "0 6 * * *", "priority": "low", "batch_size": 1, "hooks": "example-hooks", "authority": {"profile": "example-reader", "tier": "scope-contained", "capabilities": ["example_read"], "scoped_roots": []}}]}

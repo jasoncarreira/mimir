@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, replace
 from importlib import metadata
+from pathlib import Path
 
 from .manifest import PluginManifest, PluginManifestError, parse_manifest
 
@@ -57,16 +58,23 @@ def discover_plugins(*, enable: str | None = None) -> tuple[PluginCandidate, ...
             files = [file for file in dist.files if file.name == "mimir-plugin.toml"]
             if len(files) != 1:
                 raise PluginManifestError(f"expected exactly one mimir-plugin.toml, found {len(files)}")
-            manifest = parse_manifest(dist.locate_file(files[0]).read_bytes(), entry_name=ep.name)
+            manifest_path = Path(dist.locate_file(files[0]))
+            inventory = frozenset(Path(dist.locate_file(item)) for item in dist.files)
+            manifest = parse_manifest(manifest_path.read_bytes(), entry_name=ep.name,
+                                      resource_root=manifest_path.parent, distribution_files=inventory)
         except (PluginManifestError, OSError) as exc:
             diagnostic = str(exc)
         candidates.append(PluginCandidate(ep.name, source, ep, manifest, all_enabled or ep.name in names, diagnostic))
 
     counts: dict[str, int] = {}
+    normalized: dict[str, set[str]] = {}
     for candidate in candidates:
         counts[candidate.name] = counts.get(candidate.name, 0) + 1
+        normalized.setdefault(candidate.name.upper().replace("-", "_"), set()).add(candidate.name)
     candidates = [
-        replace(candidate, diagnostic="duplicate entry-point name" if counts[candidate.name] > 1 else candidate.diagnostic)
+        replace(candidate, diagnostic=("duplicate entry-point name" if counts[candidate.name] > 1
+                else "normalized plugin name collision" if len(normalized[candidate.name.upper().replace('-', '_')]) > 1
+                else candidate.diagnostic))
         for candidate in candidates
     ]
     candidates.sort(key=lambda item: (item.name, item.distribution, item.entry_point.value))

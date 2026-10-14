@@ -43,6 +43,7 @@ import re
 import subprocess
 import time
 import traceback
+import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -101,6 +102,7 @@ from .models import (
     SourceLabel,
     ServerDiscoveredPRScopeStore,
     TurnInteractivity,
+    TurnContext,
     TurnRecord,
 )
 from .access_control import (
@@ -122,7 +124,7 @@ from .session_boundary_log import (
     render_session_summaries,
     validate_unfinished_work,
 )
-from .plugins.core import scoped_policy_call
+from .plugins.core import scoped_policy_call, selected_policy_registry
 from .templates import render_saga_session_end
 from .usage_stats import event_recently_emitted
 
@@ -164,6 +166,76 @@ from .turn_logger import (
 from .access_control import HTTP_EVENT_INGRESS_EXTRA_KEY
 
 log = logging.getLogger(__name__)
+
+_STATIC_PROMPT_BLOCKS: dict[int, tuple[Any, str]] = {}
+_PLUGIN_PROMPT_OVER_CAP_REPORTED: set[str] = set()
+_PLUGIN_PROMPT_REPORT_LOCK = threading.Lock()
+_STATIC_PROMPT_LOCK = threading.Lock()
+
+
+def _render_plugin_prompt(provider: Any, auth: AuthContext, event: AgentEvent,
+                          home: Path) -> tuple[str, tuple[str, ...]]:
+    """Run a provider with a host-controlled read surface on a worker thread."""
+    from .core_blocks import PromptReadRefused, read_plugin_prompt_file
+
+    served: list[str] = []
+    refused = False
+
+    def reader(requested: str | Path) -> str:
+        nonlocal refused
+        if provider.static:
+            refused = True
+            raise PromptReadRefused("static prompt cannot read turn resources")
+        try:
+            text, resource = read_plugin_prompt_file(home, requested)
+        except PromptReadRefused:
+            refused = True
+            raise
+        served.append(resource)
+        return text
+
+    if provider.static:
+        with _STATIC_PROMPT_LOCK:
+            cached = _STATIC_PROMPT_BLOCKS.get(id(provider))
+            if cached is not None and cached[0] is provider:
+                return cached[1], ()
+            content = provider.render(auth, event, reader)
+            if refused:
+                raise PromptReadRefused("prompt resource refused")
+            if not isinstance(content, str):
+                raise TypeError("prompt renderer must return text")
+            _STATIC_PROMPT_BLOCKS[id(provider)] = (provider, content)
+            return content, ()
+    content = provider.render(auth, event, reader)
+    if refused:
+        raise PromptReadRefused("prompt resource refused")
+    if not isinstance(content, str):
+        raise TypeError("prompt renderer must return text")
+    return content, tuple(dict.fromkeys(served))
+
+
+def _cap_plugin_prompt(content: str, limit: int) -> tuple[str, bool]:
+    data = content.encode("utf-8")
+    if len(data) <= limit:
+        return content, False
+    suffix = "…[truncated]" if limit >= len("…[truncated]".encode()) else ("…" if limit >= 3 else "?")
+    remaining = limit - len(suffix.encode())
+    return data[:remaining].decode("utf-8", errors="ignore") + suffix, True
+
+
+def _report_plugin_prompt(kind: str, name: str) -> None:
+    """Prompt telemetry is best effort and never includes provider content."""
+    if kind == "plugin_prompt_over_cap":
+        # Process-wide, not per Agent or turn. Claim before logging so concurrent
+        # turns (and an unavailable logger) cannot produce a recurring alert.
+        with _PLUGIN_PROMPT_REPORT_LOCK:
+            if name in _PLUGIN_PROMPT_OVER_CAP_REPORTED:
+                return
+            _PLUGIN_PROMPT_OVER_CAP_REPORTED.add(name)
+    try:
+        log_event_sync(kind, provider=name)
+    except Exception:  # noqa: BLE001 — logger availability cannot fail prompt assembly
+        log.debug("plugin prompt telemetry unavailable", exc_info=True)
 
 
 def maybe_create_worklink_budget_continuation(**kwargs):
@@ -2818,7 +2890,7 @@ class Agent:
             async for chunk in agent.astream(
                 {"messages": [HumanMessage(content=build_nudge_text(event.channel_id, count))]},
                 config=invoke_config,
-                context=ctx.auth_context,
+                context=ctx.auth_with_plugin_state() if isinstance(ctx, TurnContext) else ctx.auth_context,
                 stream_mode="values",
             ):
                 messages = list(chunk.get("messages", []))
@@ -3201,7 +3273,7 @@ class Agent:
                 async for item in agent.astream(
                     {"messages": [HumanMessage(content=turn_prompt)]},
                     config=invoke_config,
-                    context=ctx.auth_context,
+                    context=ctx.auth_with_plugin_state(),
                     stream_mode=["values", "messages"],
                 ):
                     if isinstance(item, tuple) and len(item) == 2:
@@ -4817,6 +4889,36 @@ class Agent:
             return scratch_section + synthesis_prompt, []
 
         auth_context = _require_auth_context(initial_auth_context or ctx.auth_context)
+        pending_plugins: dict[str, list[tuple[str, PromptBlock]]] = {}
+        for provider in sorted(selected_policy_registry().prompt_providers.values(), key=lambda item: item.name):
+            try:
+                if not await asyncio.to_thread(provider.applies, auth_context, event):
+                    continue
+                content, resources = await asyncio.to_thread(
+                    _render_plugin_prompt, provider, auth_context, event, self._config.home,
+                )
+                if not content:
+                    continue
+                content, over_cap = _cap_plugin_prompt(content, provider.max_bytes)
+                if over_cap:
+                    _report_plugin_prompt("plugin_prompt_over_cap", provider.name)
+                labels = InformationFlowLabels()
+                for resource in resources or (f"plugin:{provider.owner}:{provider.name}",):
+                    labels = _merge_ifc_labels(labels, _prompt_source_labels(
+                        auth_context, domain=provider.name, resource=resource,
+                        self_authored=True,
+                    ))
+                pending_plugins.setdefault(provider.section, []).append((provider.name, PromptBlock(content, labels)))
+            except Exception as exc:  # noqa: BLE001 — one plugin cannot fail a turn
+                from .core_blocks import PromptReadRefused
+                kind = "plugin_prompt_read_refused" if isinstance(exc, PromptReadRefused) else "plugin_prompt_failed"
+                _report_plugin_prompt(kind, provider.name)
+        plugin_blocks: dict[str, tuple[tuple[str, str], ...]] = {}
+
+        def use_plugins(section: str) -> None:
+            plugin_blocks[section] = tuple(
+                (name, use(block)) for name, block in pending_plugins.get(section, ())
+            )
         recent, recent_blocks = self._select_recent_activity(event, auth_context)
         source_blocks.extend(recent_blocks)
         # Channel memory injection (chainlink #187): load per-channel fact
@@ -4846,6 +4948,7 @@ class Agent:
                 ),
             ) if channel_memory_content and channel_memory_owner else None
         )
+        use_plugins("channel_memory")
         # Open change-proposal nudge (chainlink #337/#339/#344), rendered next
         # to the feedback signals so the agent finishes/abandons an in-flight
         # proposal. Sync git call off the loop; a prompt section must never
@@ -4924,10 +5027,14 @@ class Agent:
 
         # Completion order must not affect prompt or provenance order.
         feedback_block = use(feedback_source)
+        use_plugins("feedback")
         core_proposals_block = use(core_proposals_source)
+        use_plugins("core_proposals")
         session_summaries_block = use(session_summaries_source)
+        use_plugins("session_summaries")
         usage_source, deferred_usage_events = usage_result
         usage_block = use(usage_source)
+        use_plugins("usage")
         # Flush deferred events on the running loop.
         from .ntfy import fire_cost_runaway_alarm_if_warranted
         for event_kind, event_kwargs in deferred_usage_events:
@@ -4939,8 +5046,11 @@ class Agent:
                 fire_cost_runaway_alarm_if_warranted(event_kind, event_kwargs)
             )
         upcoming_block = use(self._assemble_upcoming_block(auth_context))
+        use_plugins("upcoming")
         commitments_block = use(commitments_source)
+        use_plugins("commitments")
         self_state_block = use(self_state_source)
+        use_plugins("self_state")
         saga_block, saga_labels = saga_result
         # Auto-surface the relevant SKILL.md when this turn is on a
         # ``poller:<name>`` channel — the agent gets the skill's
@@ -5116,6 +5226,7 @@ class Agent:
             auto_skill_block=auto_skill_block,
             saga_session_id=ctx.saga_session_id,
             channel_memory_block=channel_memory_block,
+            plugin_blocks=plugin_blocks,
             deliver_channel=deliver_channel,
             trigger_authority_profile=(
                 trigger_authority.authority_profile if trigger_authority else None

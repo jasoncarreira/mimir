@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, dataclass
 
 import pytest
 
@@ -331,3 +331,51 @@ def test_only_core_can_preserve_targetless_sink_destination():
         PolicyRegistry().registrar("example").register_tool(**tool_fields(
             sink_category=SinkCategory.SAME_CHANNEL,
         ))
+
+
+def test_extension_declarations_are_owner_scoped_and_frozen():
+    registry = PolicyRegistry()
+    alpha = registry.registrar("alpha")
+    beta = registry.registrar("beta")
+    callback = lambda *args: None
+    alpha.register_poller_hook("alpha-hook", callback)
+    alpha.register_scheduler_job("tick", "tick-id", callback)
+    alpha.register_cli_command("alpha", callback, callback)
+    alpha.register_route("get", "/api/v1/plugins/alpha/status", callback, role="admin")
+    alpha.register_dashboard_entry("alpha-page", {"path": "/alpha"})
+    alpha.register_prompt_provider("alpha_memory", "channel_memory", 512, callback, callback)
+
+    @dataclass(frozen=True)
+    class Slot:
+        value: str
+
+    alpha.register_state_slot(Slot)
+    with pytest.raises(PolicyRegistrationError, match="duplicate scheduler job"):
+        beta.register_scheduler_job("other", "tick-id", callback)
+    with pytest.raises(PolicyRegistrationError, match="duplicate CLI command"):
+        beta.register_cli_command("alpha", callback, callback)
+    with pytest.raises(PolicyRegistrationError, match="route must be under"):
+        beta.register_route("GET", "/api/v1/plugins/alpha/status", callback)
+    with pytest.raises(PolicyRegistrationError, match="duplicate prompt provider"):
+        beta.register_prompt_provider("alpha_memory", "feedback", 10, callback, callback)
+    with pytest.raises(PolicyRegistrationError, match="unique frozen dataclass"):
+        alpha.register_state_slot(Slot)
+    policy = registry.freeze()
+    assert policy.routes[("GET", "/api/v1/plugins/alpha/status")].role == "admin"
+    assert policy.scheduler_jobs["tick"].owner == "alpha"
+    assert policy.state_slots["alpha"] is Slot
+    with pytest.raises(TypeError):
+        policy.prompt_providers["new"] = policy.prompt_providers["alpha_memory"]
+    with pytest.raises(PolicyRegistrationError, match="frozen"):
+        alpha.register_poller_hook("late", callback)
+
+
+@pytest.mark.parametrize("section,budget,name", [
+    ("unknown", 10, "block"), ("feedback", 0, "block"),
+    ("feedback", True, "block"), ("feedback", 10, "domain:block"),
+])
+def test_prompt_registration_rejects_invalid_contract(section, budget, name):
+    registry = PolicyRegistry()
+    with pytest.raises(PolicyRegistrationError):
+        registry.registrar("alpha").register_prompt_provider(name, section, budget, lambda *_: True, lambda *_: "text")
+    assert not registry.prompt_providers

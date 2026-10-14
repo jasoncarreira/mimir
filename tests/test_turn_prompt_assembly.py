@@ -61,6 +61,8 @@ from mimir.models import (
 )
 from mimir.saga.client import SagaStore
 from mimir.prompts import build_turn_prompt
+from mimir.plugins.core import policy_scope
+from mimir.plugins.registry import PolicyRegistry
 from mimir.turn_logger import TurnLogger
 
 
@@ -122,6 +124,403 @@ def _block(content: str) -> PromptBlock:
             source_kind="protected_prompt",
         )),
     )
+
+
+def test_plugin_prompt_registry_section_inventory_is_closed() -> None:
+    from mimir.plugins.registry import _PROMPT_SECTIONS
+
+    source = ast.parse((Path(__file__).parents[1] / "mimir/prompts.py").read_text())
+    sections = [node.args[0].value for node in ast.walk(source)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_add_plugins" and node.args
+                and isinstance(node.args[0], ast.Constant)]
+    assert sections == [
+        "channel_memory", "feedback", "core_proposals", "session_summaries",
+        "usage", "upcoming", "commitments", "self_state",
+    ]
+    assert set(sections) == _PROMPT_SECTIONS
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_provider_refusal_budget_labels_and_order(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+    from mimir import core_blocks
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    ctx = _make_ctx(event)
+    admitted = tmp_path / "memory" / "allowed.md"
+    admitted.parent.mkdir()
+    admitted.write_text("é" * 20)
+    denied = tmp_path / "memory" / "denied.md"
+    denied.write_text("DENIED-SECRET")
+    monkeypatch.setattr(core_blocks, "_prompt_file_is_trusted", lambda home, path: path == admitted)
+    events = []
+    monkeypatch.setattr(agent_module, "log_event_sync", lambda kind, **fields: events.append((kind, fields)))
+    registry = PolicyRegistry()
+    calls = []
+
+    def render_a(auth, inbound, reader):
+        calls.append("a")
+        return reader(admitted)
+
+    def render_z(auth, inbound, reader):
+        calls.append("z")
+        reader(denied)
+        return "SHOULD-NOT-APPEAR"
+
+    registry.registrar("example").register_prompt_provider(
+        "zeta", "feedback", 128, lambda auth, inbound: True, render_z,
+    )
+    registry.registrar("example").register_prompt_provider(
+        "alpha", "feedback", 19, lambda auth, inbound: True, render_a,
+    )
+    registry.freeze()
+    with policy_scope(registry):
+        prompt, _ = await agent._build_turn_prompt(ctx, event, None)
+    assert calls == ["a", "z"]
+    assert "DENIED-SECRET" not in prompt and "SHOULD-NOT-APPEAR" not in prompt
+    assert "## Plugin: alpha\n\néé" in prompt
+    assert "…[truncated]" in prompt
+    assert len(prompt.split("## Plugin: alpha\n\n", 1)[1].split("\n\n", 1)[0].encode()) <= 19
+    plugin_sources = [source for source in ctx.ifc_labels.sources if source.domain == "alpha"]
+    assert len(plugin_sources) == 1
+    assert plugin_sources[0].resource_id == str(admitted)
+    assert plugin_sources[0].integrity == Integrity.TRUSTED
+    assert plugin_sources[0].integrity_effect.value == "informational"
+    assert events.count(("plugin_prompt_over_cap", {"provider": "alpha"})) == 1
+    assert events.count(("plugin_prompt_read_refused", {"provider": "zeta"})) == 1
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_dynamic_each_turn_static_stable_and_failure_isolated(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    registry = PolicyRegistry()
+    counter = {"dynamic": 0, "static": 0}
+    events = []
+    monkeypatch.setattr(agent_module, "log_event_sync", lambda kind, **fields: events.append(kind))
+
+    def dynamic(auth, inbound, reader):
+        counter["dynamic"] += 1
+        return f"dynamic-{counter['dynamic']}"
+
+    def stable(auth, inbound, reader):
+        counter["static"] += 1
+        return f"stable-{counter['static']}"
+
+    def broken(auth, inbound, reader):
+        raise RuntimeError("secret error text")
+
+    registrar = registry.registrar("example")
+    registrar.register_prompt_provider("dynamic", "self_state", 100, lambda a, e: True, dynamic)
+    registrar.register_prompt_provider("stable", "self_state", 100, lambda a, e: True, stable, static=True)
+    registrar.register_prompt_provider("broken", "self_state", 100, lambda a, e: True, broken)
+    registry.freeze()
+    with policy_scope(registry):
+        first, _ = await agent._build_turn_prompt(_make_ctx(event), event, None)
+        second, _ = await agent._build_turn_prompt(_make_ctx(event), event, None)
+    assert first.index("Plugin: dynamic") < first.index("Plugin: stable")
+    assert "dynamic-1" in first and "dynamic-2" in second
+    assert "stable-1" in first and "stable-1" in second
+    assert counter == {"dynamic": 2, "static": 1}
+    assert "secret error text" not in first
+    assert events.count("plugin_prompt_failed") == 2
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_logger_failure_does_not_break_rendering(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    registry = PolicyRegistry()
+    registrar = registry.registrar("example")
+    registrar.register_prompt_provider("large", "feedback", 16, lambda a, e: True,
+                                       lambda a, e, reader: "é" * 30)
+    registrar.register_prompt_provider("refused", "feedback", 80, lambda a, e: True,
+                                       lambda a, e, reader: reader(tmp_path / "absent.md"))
+    registrar.register_prompt_provider("broken", "feedback", 80, lambda a, e: True,
+                                       lambda a, e, reader: 1 / 0)
+    registry.freeze()
+    seen = []
+
+    def unavailable(kind, **fields):
+        seen.append((kind, fields))
+        raise RuntimeError("logger unavailable")
+
+    monkeypatch.setattr(agent_module, "log_event_sync", unavailable)
+    with policy_scope(registry):
+        prompt, _ = await agent._build_turn_prompt(_make_ctx(event), event, None)
+    assert "## Plugin: large" in prompt
+    assert "## Plugin: refused" not in prompt and "## Plugin: broken" not in prompt
+    assert [kind for kind, _ in seen] == [
+        "plugin_prompt_failed", "plugin_prompt_over_cap", "plugin_prompt_read_refused",
+    ]
+    assert all(set(fields) == {"provider"} for _, fields in seen)
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_over_cap_reported_once_per_provider_across_agents(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+
+    events = []
+    monkeypatch.setattr(agent_module, "log_event_sync", lambda kind, **fields: events.append((kind, fields)))
+    registry = PolicyRegistry()
+    registrar = registry.registrar("example")
+    # Distinct names keep the process-global receipt independent of other tests.
+    for name in ("once_dynamic", "once_static"):
+        registrar.register_prompt_provider(name, "feedback", 19, lambda a, e: True,
+                                           lambda a, e, reader: "é" * 30, static=name.endswith("static"))
+    registrar.register_prompt_provider("once_small", "feedback", 100, lambda a, e: True,
+                                       lambda a, e, reader: "short")
+    registry.freeze()
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    with policy_scope(registry):
+        first_agent = _make_agent(tmp_path / "first")
+        first, _ = await first_agent._build_turn_prompt(_make_ctx(event), event, None)
+        second, _ = await first_agent._build_turn_prompt(_make_ctx(event), event, None)
+        second_agent = _make_agent(tmp_path / "second")
+        third, _ = await second_agent._build_turn_prompt(_make_ctx(event), event, None)
+    for prompt in (first, second, third):
+        assert prompt.count("…[truncated]") == 2
+        assert "## Plugin: once_small\n\nshort" in prompt
+    assert events == [("plugin_prompt_over_cap", {"provider": "once_dynamic"}),
+                      ("plugin_prompt_over_cap", {"provider": "once_static"})]
+
+
+@pytest.mark.asyncio
+async def test_plugin_prompt_real_reader_omits_refused_text(tmp_path, monkeypatch) -> None:
+    import mimir.agent as agent_module
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    denied = tmp_path / "attachments" / "inbound" / "payload.md"
+    denied.parent.mkdir(parents=True)
+    denied.write_text("PRIVATE-REFUSED-CONTENT", encoding="utf-8")
+    trusted = tmp_path / "skills" / "example" / "SKILL.md"
+    trusted.parent.mkdir(parents=True)
+    trusted.write_text("TRUSTED-CONTENT", encoding="utf-8")
+    registry = PolicyRegistry()
+
+    def render(auth, inbound, reader):
+        allowed = reader(trusted)
+        try:
+            reader(denied)
+        except ValueError:
+            pass
+        return allowed + " PRIVATE-REFUSED-CONTENT"
+
+    registry.registrar("example").register_prompt_provider(
+        "reader", "feedback", 100, lambda a, e: True, render,
+    )
+    registry.freeze()
+    events = []
+    monkeypatch.setattr(agent_module, "log_event_sync", lambda kind, **fields: events.append((kind, fields)))
+    ctx = _make_ctx(event)
+    with policy_scope(registry):
+        prompt, _ = await agent._build_turn_prompt(ctx, event, None)
+    assert "TRUSTED-CONTENT" not in prompt
+    assert "PRIVATE-REFUSED-CONTENT" not in prompt
+    assert all(source.domain != "reader" for source in ctx.ifc_labels.sources)
+    assert events == [("plugin_prompt_read_refused", {"provider": "reader"})]
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_and_resend_nudge_receive_live_turn_plugin_state(tmp_path, monkeypatch) -> None:
+    from dataclasses import dataclass
+    from langchain_core.messages import AIMessage
+    import mimir.agent as agent_module
+
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    registry = PolicyRegistry()
+    registrar = registry.registrar("example")
+    registrar.register_state_slot(State)
+    registry.freeze()
+    agent = _make_agent(tmp_path)
+    agent._config = replace(
+        agent._config,
+        plugin_manager=SimpleNamespace(policy=registry, plugins=()),
+        resend_nudge_channels=("web:",),
+    )
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    parent = {}
+    original_prompt = agent._build_turn_prompt
+
+    async def update_before_graph(ctx, inbound, *args, **kwargs):
+        parent["turn"] = ctx
+        parent["ingress"] = ctx.auth_context
+        ctx.set_plugin_state(registrar, State("updated"))
+        return await original_prompt(ctx, inbound, *args, **kwargs)
+
+    monkeypatch.setattr(agent, "_build_turn_prompt", update_before_graph)
+
+    class Graph:
+        def __init__(self):
+            self.contexts = []
+
+        async def astream(self, state, *, config, context, stream_mode):
+            self.contexts.append(context)
+            yield {"messages": state["messages"] + [AIMessage(content="model reply")]}
+
+    graph = Graph()
+
+    async def build_graph():
+        return graph
+
+    monkeypatch.setattr(agent, "_build_agent_if_needed", build_graph)
+
+    async def ignore_event(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(agent_module, "log_event", ignore_event)
+    monkeypatch.setattr(agent_module, "safe_log_event", ignore_event)
+    # This test controls the nudge separately, after the regular graph handoff.
+    agent._config = replace(agent._config, resend_nudge_channels=())
+    with policy_scope(registry):
+        record = await agent.run_turn(event)
+    assert record.error is None
+    assert len(graph.contexts) == 1
+    assert graph.contexts[0].plugin_state("example") == State("updated")
+    assert parent["ingress"].plugin_state("example") is None
+    assert parent["turn"].plugin_state("example") == State("updated")
+
+    other = _make_ctx(event)
+    assert other.plugin_state("example") is None
+    agent._config = replace(agent._config, resend_nudge_channels=("web:",))
+    monkeypatch.setattr(agent, "_harness_sink_allowed", lambda *args: True)
+
+    turn = parent["turn"]
+    turn.set_plugin_state(registrar, State("nudge"))
+    turn.delivered_channel_ids.clear()
+    await agent._maybe_resend_nudge(
+        graph, {}, turn, event, turn_id=turn.turn_id,
+        turn_is_interactive=True, messages=[], events=[], output="model reply",
+    )
+    assert len(graph.contexts) == 2
+    assert graph.contexts[1].plugin_state("example") == State("nudge")
+    assert graph.contexts[0].plugin_state("example") == State("updated")
+    assert graph.contexts[1] is not graph.contexts[0]
+    assert parent["ingress"].plugin_state("example") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("section,label", [
+    ("channel_memory", "Channel context"),
+    ("feedback", "Recent feedback signals"),
+    ("core_proposals", "Open change proposals"),
+    ("session_summaries", "Recent session summaries"),
+    ("usage", "Resource usage"),
+    ("upcoming", "Upcoming"),
+    ("commitments", "Upcoming commitments"),
+    ("self_state", "Self-state"),
+])
+async def test_plugin_prompt_inserts_after_each_fixed_section(
+    tmp_path, monkeypatch, section, label, present,
+) -> None:
+    from mimir import core_blocks, proposals
+    from mimir.history import Message
+
+    agent = _make_agent(tmp_path)
+    event = AgentEvent(trigger="user_message", channel_id="web:one", author="operator", content="hello")
+    ctx = _make_ctx(event)
+    ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
+    sections = (
+        ("channel_memory", "Channel context"),
+        ("feedback", "Recent feedback signals"),
+        ("core_proposals", "Open change proposals"),
+        ("session_summaries", "Recent session summaries"),
+        ("usage", "Resource usage"),
+        ("upcoming", "Upcoming"),
+        ("commitments", "Upcoming commitments"),
+        ("self_state", "Self-state"),
+    )
+    fixed = {name: f"FIXED-CONTENT:{name}" for name, _ in sections}
+    if not present:
+        fixed[section] = None
+
+    def fixed_block(name):
+        return _domain_block(fixed[name], name) if fixed[name] else None
+
+    ctx.turn_scratch_path = tmp_path / "scratch" / "turns" / ctx.turn_id
+    monkeypatch.setattr(core_blocks, "load_channel_memory", lambda *args: fixed["channel_memory"])
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *args: fixed_block("feedback"))
+    agent._config = replace(agent._config, feedback_limit_per_polarity=1)
+    monkeypatch.setattr(proposals, "render_open_proposals_block", lambda *args: fixed["core_proposals"])
+
+    async def summaries(**kwargs):
+        return fixed_block("session_summaries")
+
+    monkeypatch.setattr(agent, "_assemble_session_summaries", summaries)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda *args: (fixed_block("usage"), []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda *args: fixed_block("upcoming"))
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda **kwargs: fixed_block("commitments"))
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda *args, **kwargs: fixed_block("self_state"))
+    recent = Message(
+        ts="2026-09-25T12:00:00+00:00", msg_id="prior", channel_id="web:one",
+        author="operator", author_display="Operator", kind="user",
+        content="NEXT-RECENT-CONTENT", source="web",
+    )
+    monkeypatch.setattr(agent, "_select_recent_activity", lambda *args: (
+        [recent], (_domain_block("NEXT-RECENT-CONTENT", "recent_activity"),),
+    ))
+    registry = PolicyRegistry()
+    calls = []
+
+    def render(name):
+        def callback(auth, inbound, reader):
+            calls.append(name)
+            return f"BODY-{name}"
+        return callback
+
+    registrar = registry.registrar("example")
+    for name in ("zeta", "alpha"):
+        registrar.register_prompt_provider(name, section, 80, lambda a, e: True, render(name))
+    registry.freeze()
+    with policy_scope(registry):
+        prompt, _ = await agent._build_turn_prompt(ctx, event, None)
+    assert calls == ["alpha", "zeta"]
+    plugin_start = prompt.index("## Plugin: alpha\n\nBODY-alpha")
+    assert plugin_start < prompt.index("## Plugin: zeta\n\nBODY-zeta")
+    target = f"## {label}\n\nFIXED-CONTENT:{section}"
+    assert (target in prompt) is present
+    if present:
+        assert prompt.index(target) < plugin_start
+    position = [name for name, _ in sections].index(section)
+    previous = (
+        f"## {sections[position - 1][1]}\n\nFIXED-CONTENT:{sections[position - 1][0]}"
+        if position else "## Current turn scratch"
+    )
+    following = (
+        f"## {sections[position + 1][1]}\n\nFIXED-CONTENT:{sections[position + 1][0]}"
+        if position < len(sections) - 1 else "## Recent activity\n\n"
+    )
+    assert prompt.index(previous) < plugin_start < prompt.index(following)
+
+    # use() must retain the same ordered provenance as the rendered fixed blocks.
+    # Recent activity is loaded ahead of the fixed sections, so it is not part of
+    # the eight-section use() order even though it renders after self-state.
+    fixed_domains = {name for name, _ in sections} | {"proposals"}
+    sources = [source for source in ctx.ifc_labels.sources
+               if source.domain in fixed_domains | {"alpha", "zeta"}]
+    expected_domains = []
+    for name, _ in sections:
+        if fixed[name]:
+            expected_domains.append("proposals" if name == "core_proposals" else name)
+        if name == section:
+            expected_domains.extend(("alpha", "zeta"))
+    assert [source.domain for source in sources] == expected_domains
+    assert [(source.resource_id, source.integrity, source.integrity_effect)
+            for source in sources if source.domain in {"alpha", "zeta"}] == [
+        (f"plugin:example:{name}", Integrity.TRUSTED, "informational")
+        for name in ("alpha", "zeta")
+    ]
 
 
 def _domain_block(content: str, domain: str) -> PromptBlock:
@@ -2204,7 +2603,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("direct_block", "mimir/agent.py", "Agent._assemble_session_summaries", "PromptBlock"): 1,
         ("direct_block", "mimir/agent.py", "Agent._assemble_upcoming_block", "PromptBlock"): 1,
         ("direct_block", "mimir/agent.py", "Agent._assemble_usage_block", "PromptBlock"): 1,
-            ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock"): 4,
+            ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock"): 5,
             ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt.load_open_proposals", "PromptBlock"): 1,
         ("direct_block", "mimir/agent.py", "Agent._select_recent_activity", "PromptBlock"): 1,
         ("direct_block", "mimir/feedback/__init__.py", "FeedbackLog.recent_prompt_block", "PromptBlock"): 1,
@@ -2219,7 +2618,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/agent.py", "Agent._assemble_session_summaries", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_upcoming_block", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_usage_block", "_prompt_source_labels"): 1,
-            ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels"): 5,
+            ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels"): 6,
             ("producer", "mimir/agent.py", "Agent._build_turn_prompt.load_open_proposals", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._select_recent_activity", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "_auto_recall_source_labels", "SourceLabel"): 1,
@@ -2257,6 +2656,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "_source_is_triggering_channel_compatible"): 1,
         ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "_source_is_triggering_channel_compatible"): 1,
         ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use"): 8,
+        ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt.use_plugins", "use"): 1,
     })
     assert observed == expected, (
         f"unexpected channel-bearing sources: {observed - expected}; "

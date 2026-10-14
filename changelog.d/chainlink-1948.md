@@ -1,0 +1,1 @@
+- Extend trusted plugins with host, prompt, UI, Docker service, defaults, configuration and typed-state contributions while preserving process-only selection and core policy checks.
