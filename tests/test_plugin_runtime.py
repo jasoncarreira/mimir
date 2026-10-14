@@ -322,6 +322,39 @@ def test_installed_example_scaffold_service_wrapper(example_distribution, tmp_pa
     assert completed.stdout.strip() == "example worker: installed"
 
 
+@pytest.mark.asyncio
+async def test_process_selected_installed_example_reaches_server_startup(example_distribution, tmp_path, monkeypatch):
+    """Process selection, not a hand-built policy, reaches real server route and scheduler wiring."""
+    from aiohttp.test_utils import TestClient, TestServer
+    from mimir.pollers import discover_pollers
+    from tests.test_server import _ServerControl, _controlled_server_app, _run_cleanup
+
+    monkeypatch.syspath_prepend(str(example_distribution))
+    monkeypatch.setenv("MIMIR_PLUGINS", "example")
+    control = _ServerControl(real_web_routes=True, plugin_jobs_installed=1,
+                             scheduler_should_start=False)
+    app, control = _controlled_server_app(tmp_path, monkeypatch, control)
+    manager = app["plugin_manager"]
+    assert [plugin.candidate.name for plugin in manager.plugins] == ["example"]
+    assert "example-tick" in manager.policy.scheduler_jobs
+    assert "example-watch" in [poller.name for poller in discover_pollers(
+        tmp_path / "skills", policy=manager.policy)]
+    try:
+        async with TestClient(TestServer(app)) as client:
+            response = await client.get("/api/v1/plugins/example/status", headers={"X-API-Key": "test-key"})
+            assert response.status == 200
+            assert await response.json() == {"provider": "example"}
+            bootstrap = (await (await client.get("/api/v1/web/bootstrap",
+                                           headers={"X-API-Key": "test-key"})).json())["data"]
+            assert bootstrap["ui"]["default_skin"] == "example-skin"
+            assert bootstrap["plugin_bundles"][0]["plugin"] == "example"
+            assert "scheduler:bind_plugin_jobs" in control.events
+            assert "scheduler:start" in control.events
+            assert control.poller_candidates == manager.policy.selected_plugin_candidates
+    finally:
+        await _run_cleanup(app)
+
+
 def test_disabled_installed_example_does_not_import_provider(example_distribution, tmp_path):
     """A fresh interpreter owns the entire import inventory, not the pytest process."""
     script = '''
