@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import signal
 import shlex
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -350,6 +352,82 @@ _SHELL_STATE: dict[str, Any] = {
 }
 _SHELL_STATE_LOCK = threading.Lock()
 _PROJECT_TEST_CAPTURE_BYTES = 64 * 1024
+_SHELL_TERM_GRACE_S = 0.2
+
+
+def _kill_shell_process_group(proc: subprocess.Popen[bytes]) -> str:
+    """Stop an isolated group, or report that only the wrapper could be stopped."""
+    def wrapper_only(reason: str) -> str:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return f"wrapper kill denied; {reason}; descendants may still be running"
+        return f"wrapper-only cleanup; {reason}; descendants may still be running"
+
+    if os.name == "nt":
+        return wrapper_only("process-group cleanup unavailable")
+    # Compare the actual group, not the pid: a non-isolated child has a different
+    # pid but shares our group. An exited isolated leader can still leave children.
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = proc.pid
+    except PermissionError:
+        return wrapper_only("process-group lookup denied")
+    if pgid == os.getpgrp():
+        return wrapper_only("process group was not isolated from the server")
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "its process group was killed"
+    except PermissionError:
+        return wrapper_only("process-group signalling denied")
+    # wait() can return as soon as bash exits, while its children are still alive.
+    time.sleep(_SHELL_TERM_GRACE_S)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        return wrapper_only("process-group signalling denied")
+    return "its process group was killed"
+
+
+def _run_shell_command(
+    argv: list[str], *, cwd: Path | None, timeout: float, env: dict[str, str],
+) -> subprocess.CompletedProcess[bytes]:
+    proc = subprocess.Popen(  # noqa: S603 - trusted shell wrapper or server-authorized argv
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, cwd=cwd, env=env,
+        start_new_session=os.name != "nt",
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            exc.cleanup_message = _kill_shell_process_group(proc)
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except (ProcessLookupError, PermissionError):
+                    pass
+            # Descendants may retain pipe fds when group signalling was refused.
+            # Never let cleanup turn a bounded command into an unbounded wait.
+            try:
+                proc.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                for stream in (proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
 def _remember_shell_cwd(session_id: str, cwd: Path) -> None:
@@ -386,14 +464,27 @@ def _run_bounded_project_test(
         start_new_session=os.name != "nt",
     )
     captured = {"stdout": bytearray(), "stderr": bytearray()}
+    stop_draining = threading.Event()
 
     def drain(name: str, stream: Any) -> None:
-        while True:
-            chunk = stream.read(8192)
-            if not chunk:
-                return
-            captured[name].extend(chunk)
-            del captured[name][:-_PROJECT_TEST_CAPTURE_BYTES]
+        try:
+            fd = stream.fileno() if os.name != "nt" else None
+        except (OSError, ValueError):
+            fd = None
+        try:
+            while not stop_draining.is_set():
+                if fd is not None:
+                    if not select.select([fd], [], [], 0.1)[0]:
+                        continue
+                    chunk = os.read(fd, 8192)
+                else:
+                    chunk = stream.read(8192)
+                if not chunk:
+                    return
+                captured[name].extend(chunk)
+                del captured[name][:-_PROJECT_TEST_CAPTURE_BYTES]
+        finally:
+            stream.close()
 
     threads = [
         threading.Thread(target=drain, args=(name, stream), daemon=True)
@@ -403,22 +494,28 @@ def _run_bounded_project_test(
         thread.start()
     try:
         returncode = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        if os.name != "nt":
+    except subprocess.TimeoutExpired as exc:
+        try:
+            exc.cleanup_message = _kill_shell_process_group(proc)
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except (ProcessLookupError, PermissionError):
+                    pass
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
                 pass
-        else:
-            proc.kill()
-        proc.wait()
         raise
     finally:
         for thread in threads:
             thread.join(timeout=1)
-        for stream in (proc.stdout, proc.stderr):
-            if stream is not None:
-                stream.close()
+        stop_draining.set()
+        for thread in threads:
+            thread.join(timeout=1)
+        # Readers own their streams: closing a BufferedReader from here can
+        # block on its lock while a surviving descendant holds the pipe open.
     return subprocess.CompletedProcess(
         argv, returncode, bytes(captured["stdout"]), bytes(captured["stderr"]),
     )
@@ -544,21 +641,23 @@ def shell_exec(
                 env=child_env,
             )
         else:
-            proc = subprocess.run(  # noqa: S603 — argv is either the trusted shell wrapper or server-authorized direct argv
+            proc = _run_shell_command(
                 argv,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
                 timeout=_SHELL_STATE["timeout_s"],
                 cwd=effective_cwd,
                 env=child_env,
             )
-    except subprocess.TimeoutExpired:
-        if is_project_test:
-            raise ToolException(
-                "shell_exec refused: project_test_timeout after "
-                f"{_SHELL_STATE['timeout_s']}s"
-            )
-        raise ToolException(f"shell_exec timed out after {_SHELL_STATE['timeout_s']}s")
+    except subprocess.TimeoutExpired as exc:
+        cleanup = getattr(exc, "cleanup_message", "process-group cleanup unconfirmed")
+        prefix = (
+            "shell_exec refused: project_test_timeout after "
+            if is_project_test else "shell_exec timed out after "
+        )
+        raise ToolException(
+            f"{prefix}{_SHELL_STATE['timeout_s']}s; {cleanup} and "
+            "partial side effects may have occurred. Check state before retrying, "
+            "or use bash_async for long jobs."
+        )
     except (FileNotFoundError, NotADirectoryError) as exc:
         # Use launch-time evidence, not a racy filesystem probe. Do not expose
         # paths or raw exception text, or guess when both targets match.
