@@ -20,7 +20,7 @@ import { useChatStore } from "./chatStore";
 import { clearChunkReloadMarkerAfterStart, isChunkLoadError, reloadOnceForStaleChunk } from "./chunkReload";
 import { ChainlinkBoardRoute } from "./routes/ChainlinkBoardRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
-import { getDashboardSurfaces, loadPluginBundles, visibleSurfaces, type DashboardSurface, type LoadedPlugins } from "./dashboardExtensions";
+import { getDashboardSurfaces, loadPluginBundles, visibleSurfaces, type DashboardSurface, type LoadedPlugins, type PluginRegistrationCache } from "./dashboardExtensions";
 import { getWhoami } from "./api/whoami";
 import { ApiError } from "./api/http";
 import { AdminRoute } from "./routes/AdminRoute";
@@ -833,6 +833,7 @@ function AppFrameContent() {
   // resolved identity is an admin (server still 403s either way — this is UX).
   const isAdmin = (whoami?.is_admin ?? false) || !(bootstrap?.auth.required ?? false);
   const { skin } = useSkin();
+  const pluginRegistrations = React.useRef<PluginRegistrationCache>(new Map());
   const [plugins, setPlugins] = React.useState<LoadedPlugins>({ routes: [], navEntries: [], notices: [] });
   const [loadedBootstrap, setLoadedBootstrap] = React.useState<WebBootstrapData>();
   const canLoadPlugins = signedIn && !apiKeyRejected && (!bootstrap?.auth.required || identity.isSuccess);
@@ -842,7 +843,7 @@ function AppFrameContent() {
     if (!canLoadPlugins || !bootstrap?.plugin_bundles?.length) return;
     const controller = new AbortController();
     void loadPluginBundles(bootstrap.plugin_bundles, bootstrap.dashboard_extensions ?? [], skin.tokens,
-      setPlugins, controller.signal).then(() => {
+      setPlugins, controller.signal, undefined, pluginRegistrations.current).then(() => {
         if (!controller.signal.aborted) setLoadedBootstrap(bootstrap);
       }).catch((error) => console.error("Plugin dashboard loader failed", error));
     return () => controller.abort();

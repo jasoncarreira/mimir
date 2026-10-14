@@ -171,13 +171,18 @@ export interface LoadedPlugins {
   notices: string[];
 }
 
+// Scoped to a mounted dashboard rather than shared globally between dashboard instances.
+// Replay across session refreshes still passes through the current host's owner checks.
+export type PluginRegistrationCache = Map<string, Pick<LoadedPlugins, "routes" | "navEntries">>;
+
 export async function loadPluginBundles(
   bundles: PluginBundleData[],
   manifests: DashboardExtensionManifest[],
   tokens: SkinManifest["tokens"],
   onChange: (result: LoadedPlugins) => void,
   signal?: AbortSignal,
-  importModule: (url: string) => Promise<unknown> = (url) => import(/* @vite-ignore */ url)
+  importModule: (url: string) => Promise<unknown> = (url) => import(/* @vite-ignore */ url),
+  cache: PluginRegistrationCache = new Map()
 ): Promise<() => void> {
   const routes: PluginRoute[] = [];
   const navEntries: PluginNavEntry[] = [];
@@ -252,6 +257,20 @@ export async function loadPluginBundles(
       }
       activePlugin = bundle.plugin;
       await importModule(moduleUrl);
+      // A second import of an unchanged ES module returns its cached namespace:
+      // its top-level registration code does not run again.
+      if (!disposed && routes.length === routeCount && navEntries.length === navCount) {
+        const saved = cache.get(`${bundle.plugin}:${moduleUrl}`);
+        if (saved) {
+          for (const route of saved.routes) host.registerRoute(route);
+          for (const entry of saved.navEntries) host.registerNavEntry(entry);
+        }
+      }
+      if (!disposed && (routes.length !== routeCount || navEntries.length !== navCount)) {
+        cache.set(`${bundle.plugin}:${moduleUrl}`, {
+          routes: routes.slice(routeCount), navEntries: navEntries.slice(navCount)
+        });
+      }
       publish();
     } catch (error) {
       routes.splice(routeCount);

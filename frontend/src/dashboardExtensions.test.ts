@@ -139,6 +139,36 @@ describe("plugin bundle host", () => {
     ...manifest(plugin), plugin, route_path: `/dashboard/${plugin}`, bundle: `main.js`
   }));
 
+  it("revalidates cached registrations against the current owner and manifest", async () => {
+    const cache = new Map();
+    const seen = new Set<string>();
+    const updates = vi.fn();
+    const importer = async (url: string) => {
+      if (seen.has(url)) return {};
+      seen.add(url);
+      const plugin = url.includes("/alpha/") ? "alpha" : "beta";
+      window.mimirPluginHost!.registerRoute({ plugin, id: plugin, path: `/dashboard/${plugin}`, component: () => null });
+      window.mimirPluginHost!.registerNavEntry({ plugin, id: plugin, label: plugin });
+      return {};
+    };
+    const load = (active: typeof manifests) => loadPluginBundles([bundle("alpha"), bundle("beta")], active,
+      {} as never, updates, undefined, importer, cache);
+    const first = await load(manifests);
+    first();
+    const second = await load(manifests);
+    expect(updates.mock.lastCall?.[0].routes.map((route: { id: string }) => route.id)).toEqual(["alpha", "beta"]);
+    second();
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const changed = await load([{ ...manifests[0], enabled: false }, { ...manifests[1], route_path: "/changed" }]);
+    expect(updates.mock.lastCall?.[0].routes).toEqual([]);
+    expect(updates.mock.lastCall?.[0].navEntries).toEqual([]);
+    expect(updates.mock.lastCall?.[0].notices).toEqual([
+      "alpha: dashboard bundle could not be loaded.", "beta: dashboard bundle could not be loaded."
+    ]);
+    changed();
+    log.mockRestore();
+  });
+
   it("imports compatible local modules, registers multiple owner-bound pages and shares the renderer", async () => {
     const updates = vi.fn();
     const importer = vi.fn(async (url: string) => {
