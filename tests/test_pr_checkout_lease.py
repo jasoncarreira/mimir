@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import subprocess
 import tarfile
@@ -31,6 +32,7 @@ from mimir.pr_checkout_lease import (
     _preserve_checkout_head,
     _preserve_dirty_worktree,
     _recover_retained_checkout,
+    active_pr_checkout_lease_for_path,
     acquire_pr_checkout_lease,
     cleanup_pr_checkout_lease,
     create_pr_checkout_lease,
@@ -633,6 +635,200 @@ def test_reaper_reclaims_expired_published_lease(tmp_path: Path) -> None:
         "pr_checkout_lease_reaper_sweep",
         {"expired_count": 1, "reclaimed_count": 1, "retained_count": 0},
     )
+
+
+@pytest.mark.parametrize("error_number", [
+    pytest.param(39, id="linux-enotempty"),
+    pytest.param(66, id="darwin-enotempty"),
+])
+def test_reaper_delete_failure_leaves_only_tombstone_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_number: int,
+) -> None:
+    from mimir import pr_checkout_lease as leases
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    _expire_lease(lease)
+    events: list[tuple[str, dict[str, object]]] = []
+    real_delete = leases.rmtree_missing_ok
+    # ENOTEMPTY is 39 on Linux and 66 on Darwin. Exercise both renderings
+    # on every host without weakening the exact event-payload assertion.
+    delete_error = OSError(error_number, "Directory not empty")
+
+    def fail_delete(path: Path) -> None:
+        assert not lease.path.exists(), "deletion must happen after the rename"
+        assert path.name.startswith(".reclaiming-")
+        raise delete_error
+
+    monkeypatch.setattr(leases, "rmtree_missing_ok", fail_delete)
+    result = reclaim_expired_pr_checkout_leases(
+        root, event_logger=lambda kind, **fields: events.append((kind, fields)),
+    )
+    assert len(result) == 1 and not result[0].reclaimed
+    assert not lease.path.exists()
+    tombstones = list(root.glob(".reclaiming-*"))
+    assert len(tombstones) == 1 and tombstones[0].is_dir()
+    assert any(kind == "pr_checkout_lease_reclaim_failed" and fields == {
+        "lease": lease.path.name, "recovery_id": lease.recovery_id,
+        "step": "delete", "error": str(delete_error),
+    } for kind, fields in events)
+
+    monkeypatch.setattr(leases, "rmtree_missing_ok", real_delete)
+    assert reclaim_expired_pr_checkout_leases(root, event_logger=lambda *_a, **_k: None) == []
+    assert not tombstones[0].exists()
+
+
+def test_reaper_failure_on_first_lease_does_not_block_second(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import pr_checkout_lease as leases
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    first = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    second = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    for lease in (first, second):
+        _expire_lease(lease)
+    sorted_leases = sorted((first, second), key=lambda lease: lease.path)
+    real_delete = leases.rmtree_missing_ok
+
+    def fail_first(path: Path) -> None:
+        if sorted_leases[0].path.name in path.name:
+            raise OSError(errno.ENOTEMPTY, "Directory not empty")
+        real_delete(path)
+
+    monkeypatch.setattr(leases, "rmtree_missing_ok", fail_first)
+    results = reclaim_expired_pr_checkout_leases(root, event_logger=lambda *_a, **_k: None)
+    assert [result.reclaimed for result in results] == [False, True]
+    assert not sorted_leases[0].path.exists()
+    assert not sorted_leases[1].path.exists()
+
+
+def test_reaper_rechecks_live_paths_immediately_before_rename(tmp_path: Path) -> None:
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    _expire_lease(lease)
+    calls = 0
+
+    def active() -> set[Path]:
+        nonlocal calls
+        calls += 1
+        return {lease.path} if calls > 1 else set()
+
+    assert reclaim_expired_pr_checkout_leases(
+        root, active_paths=active, event_logger=lambda *_a, **_k: None,
+    ) == []
+    assert calls >= 2
+    assert lease.path.is_dir()
+    assert not list(root.glob(".reclaiming-*"))
+
+
+@pytest.mark.parametrize("broken", ["marker", "missing_objects"])
+def test_broken_lease_is_never_recovered_and_fresh_checkout_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broken: str,
+) -> None:
+    from mimir import pr_checkout_lease as leases
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    old = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    if broken == "marker":
+        (old.path / leases._RECLAMATION_METADATA).write_text('{"classification":"unreclaimable"}')
+    else:
+        import shutil
+
+        shutil.rmtree(old.path / ".git/objects")
+        assert subprocess.run(
+            ["git", "-C", str(old.path), "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+        ).returncode != 0
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    with pytest.raises(RuntimeError):
+        recover_pr_checkout_lease(old.path, scope, owner=scope.principal, lease_root=root)
+
+    state = RepoReviewState(scope)
+    fresh, candidates = acquire_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=root, review_state=state,
+    )
+    assert candidates == ()
+    assert fresh.path != old.path and old.path.is_dir()
+    assert state.checkout_lease is fresh
+    assert _git(fresh.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    assert any(kind == "pr_checkout_lease_retained" and fields["candidates"] == [
+        {"commit": "<unverifiable>", "path": str(old.path)},
+    ] for kind, fields in events)
+
+
+def test_marked_unpublished_head_is_preserved_and_alerted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.pr_checkout_lease import _RECLAMATION_METADATA
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    old = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    (old.path / "fix.txt").write_text("unpublished\n")
+    _git(old.path, "add", "fix.txt")
+    _git(old.path, "commit", "-qm", "local fix")
+    head = _git(old.path, "rev-parse", "HEAD")
+    (old.path / _RECLAMATION_METADATA).write_text('{"classification":"unreclaimable"}')
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    assert active_pr_checkout_lease_for_path(old.path / "fix.txt") is None
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    fresh, _ = acquire_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    assert fresh.path != old.path
+    assert _git(old.path, "rev-parse", "HEAD") == head
+    assert any(kind == "pr_checkout_lease_retained" for kind, _ in events)
+
+
+def test_repo_checkout_after_half_reclaimed_lease_uses_fresh_git_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.models import InformationFlowState
+    from mimir.tools.repo import repo_checkout
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    old = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root)
+    import shutil
+
+    shutil.rmtree(old.path / ".git/objects")
+    state = RepoReviewState(scope)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    monkeypatch.setattr(
+        "mimir.tools.forge.remediation_checkout_preflight",
+        lambda *_args: (state, None),
+    )
+    monkeypatch.setattr(
+        "mimir.tools.forge._client",
+        lambda *_args: SimpleNamespace(author_is_trusted=None),
+    )
+    monkeypatch.setattr("mimir.tools.repo._publish_attested_lease_result", lambda *_args: None)
+
+    result = repo_checkout.func(
+        repository=scope.canonical_repo, pull_request=scope.pr_number,
+        runtime=SimpleNamespace(context=SimpleNamespace(ifc_state=InformationFlowState())),
+    )
+    assert result["status"] == "checked_out"
+    assert result["path"] != str(old.path)
+    assert _git(Path(result["path"]), "rev-parse", "HEAD") == scope.observed_head_sha
+    assert old.path.is_dir()
 
 
 def test_reaper_preserves_and_reclaims_expired_unpublished_work(tmp_path: Path) -> None:
