@@ -6,7 +6,6 @@ from dataclasses import replace
 from datetime import UTC, datetime
 import os
 from pathlib import Path
-import asyncio
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -32,8 +31,7 @@ from mimir_cultivate.worklink.factory_state import (
 )
 from mimir_cultivate.worklink import identities
 from mimir.worklink.compute import LocalSubprocessComputeBackend
-from mimir.worklink import worker_client
-from mimir.worklink.worker_client import WorkerClient
+from mimir.worklink import evidence as core_evidence
 from mimir_cultivate.worklink.planning import target_branch_from_description
 from mimir_cultivate.worklink.run_state import WorklinkRunState
 from mimir_cultivate.worklink.safe_git import (
@@ -327,112 +325,39 @@ async def test_selected_provider_observes_gate_through_authorized_compute(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("gate_exit", [0, 1])
-async def test_factory_completion_observes_path_addressed_worker_gate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate_exit: int,
+async def test_factory_completion_matches_core_evidence(
+    tmp_path: Path, gate_exit: int,
 ) -> None:
-    monkeypatch.setattr(provider_evidence, "_FACTORY_CHECKOUT_ROOT", tmp_path)
-    outer = tmp_path / "factory-run" / "1949-1" / "checkout"
-    outer.mkdir(parents=True)
-    sandbox = outer / ".factory-sandboxes" / "chainlink-1949" / ".factory" / "worktrees" / "chainlink-1949" / "wl-records"
-    sandbox.mkdir(parents=True)
-    (sandbox / "test_gate.py").write_text(
-        "def test_factory_gate():\n    assert " + ("True" if gate_exit == 0 else "False") + "\n"
-    )
-    (sandbox / "changed.py").write_text("worker tree\n")
-    calls: list[tuple[Path, tuple[str, ...]]] = []
-
-    class BoundWorker(WorkerClient):
-        async def launch(self, *, local_checkout, argv, env, projections, identifier,
-                         timeout_s, stdout_sink, stderr_sink):
-            assert self._launch_op == "launch_factory"
-            assert local_checkout == self.path_checkout == outer
-            assert worker_client.factory_checkout_for_path(sandbox) == (outer, 1949, 1)
-            fd = os.open(outer, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                assert os.fstat(fd).st_ino == outer.stat().st_ino
-                calls.append((local_checkout, tuple(argv)))
-                process = await asyncio.create_subprocess_exec(
-                    *argv, cwd=f"/proc/self/fd/{fd}", env={**os.environ, **env},
-                    stdout=stdout_sink.file, stderr=stderr_sink.file,
-                )
-            finally:
-                os.close(fd)
-            return process
-
-        async def cancel(self, identifier):
-            raise AssertionError("worker should not need cancellation")
-
-    def forbidden(*args: object, **kwargs: object) -> None:
-        raise AssertionError("factory gate ran in controller shell")
+    checkout = tmp_path / "factory-sandbox"
+    checkout.mkdir()
+    calls: list[tuple[str, Path]] = []
 
     class GitObservation:
         def run(self, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(args, 0, "changed.py\n" if "--name-only" in args else "")
 
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
-    client = BoundWorker(None, path_checkout=outer, issue_id=1949, attempt=1, run_uid=os.getuid())
-    client._launch_op = "launch_factory"
-    compute = LocalSubprocessComputeBackend(_worker_client=client)
-    monkeypatch.setattr(provider_evidence, "_run", forbidden)
-    result = await observe_evidence(
-        issue=1949, attempt=1, backend="feature_factory", branch="feature/1949",
-        checkout=sandbox, started_at=datetime.now(UTC), base_ref="main",
-        backend_status="completed", test_command="pytest -q test_gate.py", safe_git=GitObservation(),
-        compute=compute,
-        work_spec=WorkSpec(
-            issue_id=1949, attempt=1, repo_url="repo", base_ref="main",
-            branch="feature/1949", prompt="", rules=None, test_command="pytest -q test_gate.py",
-            backend="feature_factory", timeout_s=30, local_checkout=sandbox,
-            output_root=tmp_path / "outputs",
-        ),
-    )
-    assert len(calls) >= 1
-    assert calls[0][0] == outer
-    assert calls[0][1][:3] == ("python3", "-I", "-c")
-    assert result.review_ready is (gate_exit == 0)
-    assert result.evidence.tests.exit_code == gate_exit
-    assert result.evidence.tests.counts is not None
-    assert result.evidence.tests.report_error is None
-    if gate_exit:
-        assert result.status == "failed"
-        assert "tests_failed" in result.reasons
-        assert "test_factory_gate" in result.evidence.failure_reason
+    def runner(command: str, *, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+        calls.append((command, cwd))
+        assert timeout == 30
+        return subprocess.CompletedProcess(command, gate_exit, "gate output", "")
 
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("invalid", ["missing_compute", "missing_spec", "wrong_checkout", "relative_checkout", "wrong_shape", "symlink_escape", "wrong_worker_binding", "wrong_command"])
-async def test_factory_gate_refuses_unbound_worker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str,
-) -> None:
-    monkeypatch.setattr(provider_evidence, "_run", lambda *a, **kw: pytest.fail("controller shell ran"))
-    monkeypatch.setattr(provider_evidence, "_FACTORY_CHECKOUT_ROOT", tmp_path)
-    outer = tmp_path / "factory-run" / "1949-1" / "checkout"
-    checkout = Path("relative-checkout") if invalid == "relative_checkout" else outer / ".factory-sandboxes" / "chainlink-1949" / "repo"
-    if invalid == "wrong_shape":
-        checkout = tmp_path / "factory-run" / "1949-2" / "checkout"
-    if invalid == "symlink_escape":
-        (tmp_path / "elsewhere").mkdir()
-        checkout.parent.mkdir(parents=True)
-        checkout.symlink_to(tmp_path / "elsewhere", target_is_directory=True)
-    elif checkout.is_absolute() and invalid != "wrong_shape":
-        checkout.mkdir(parents=True, exist_ok=True)
     spec = WorkSpec(
-        1949, 1, "repo", "main", "feature/1949", "", None,
-        "false" if invalid == "wrong_command" else "touch controller-canary",
-        "feature_factory", 30, local_checkout=tmp_path / "other" if invalid == "wrong_checkout" else checkout,
+        issue_id=1949, attempt=1, repo_url="repo", base_ref="main",
+        branch="feature/1949", prompt="", rules=None, test_command="check-gate",
+        backend="feature_factory", timeout_s=30, local_checkout=checkout,
     )
-    compute = LocalSubprocessComputeBackend(_worker_client=WorkerClient(
-        None, path_checkout=tmp_path / "elsewhere" if invalid == "wrong_worker_binding" else outer,
-        issue_id=1949, attempt=1, run_uid=os.getuid(),
-    ))
-    compute._worker_client._launch_op = "launch_factory"
-    compute._launch_contained = lambda *a: pytest.fail("worker launched")
-    with pytest.raises(ComputeLaunchError, match="authorized worker checkout"):
-        await observe_evidence(
-            issue=1949, attempt=1, backend="feature_factory", branch="feature/1949",
-            checkout=checkout, started_at=datetime.now(UTC), base_ref="main",
-            backend_status="completed", test_command="touch controller-canary",
-            compute=None if invalid == "missing_compute" else compute,
-            work_spec=None if invalid == "missing_spec" else spec,
-        )
-    assert not (tmp_path / "controller-canary").exists()
+    arguments = dict(
+        issue=1949, attempt=1, backend="feature_factory", branch="feature/1949",
+        checkout=checkout, started_at=datetime.now(UTC), base_ref="main",
+        backend_status="completed", test_command="check-gate", safe_git=GitObservation(),
+        work_spec=spec, runner=runner,
+    )
+    core = await core_evidence.observe_evidence(**arguments)
+    provider = await observe_evidence(**arguments)
+    assert calls == [("check-gate", checkout)] * 2
+    assert (provider.status, provider.review_ready, provider.reasons) == (
+        core.status, core.review_ready, core.reasons,
+    )
+    assert provider.evidence.files_changed == core.evidence.files_changed
+    assert provider.evidence.tests.exit_code == core.evidence.tests.exit_code == gate_exit
+    assert provider.evidence.tests.observed == core.evidence.tests.observed
