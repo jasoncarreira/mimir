@@ -42,8 +42,13 @@ runs:
         set -uo pipefail
         for delay in 15 30 60 120 0; do
           if docker pull --quiet "$IMAGE"; then
-            docker save --output "$RUNNER_TEMP/dockerfile-base-image.tar" "$IMAGE"
-            echo "pulled=true" >> "$GITHUB_OUTPUT"
+            # Advertise the archive for caching only after a complete export.
+            if docker save --output "$RUNNER_TEMP/dockerfile-base-image.tar" "$IMAGE"; then
+              echo "pulled=true" >> "$GITHUB_OUTPUT"
+            else
+              rm -f "$RUNNER_TEMP/dockerfile-base-image.tar"
+              echo "::warning::could not export $IMAGE; it is loaded locally but will not be cached"
+            fi
             exit 0
           fi
           [ "$delay" -eq 0 ] && break

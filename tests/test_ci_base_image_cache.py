@@ -111,3 +111,58 @@ def test_action_resolves_the_dockerfile_base_image(tmp_path: Path) -> None:
     assert values["image"] == declared[0]
     assert values["key"].startswith("dockerfile-base-Linux-")
     assert re.search(r"-\d{4}-W\d{2}$", values["key"]), "the cache key must roll weekly"
+
+
+def _run_pull_step(tmp_path: Path, *, pull_failures: int, save_ok: bool = True) -> tuple[dict, str, Path]:
+    """Run the action's pull step against a fake docker and a no-op sleep."""
+    action = yaml.safe_load(ACTION.read_text(encoding="utf-8"))
+    pull = next(step for step in action["runs"]["steps"] if step.get("id") == "pull")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "calls"
+    (bin_dir / "docker").write_text(
+        "#!/bin/bash\n"
+        f'echo "$1" >> "{calls}"\n'
+        'if [ "$1" = pull ]; then\n'
+        f'  n=$(grep -c "^pull$" "{calls}"); [ "$n" -gt {pull_failures} ]; exit $?\n'
+        "fi\n"
+        'if [ "$1" = save ]; then\n'
+        '  out="$3"; echo partial > "$out"\n'
+        f"  exit {0 if save_ok else 1}\n"
+        "fi\n"
+        "exit 2\n"
+    )
+    (bin_dir / "sleep").write_text("#!/bin/sh\nexit 0\n")
+    for tool in ("docker", "sleep"):
+        (bin_dir / tool).chmod(0o755)
+    output = tmp_path / "github-output"
+    output.touch()
+    result = subprocess.run(
+        ["bash", "-c", pull["run"]], text=True, capture_output=True, check=False,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "GITHUB_OUTPUT": str(output),
+             "RUNNER_TEMP": str(tmp_path), "IMAGE": "example/base:1"},
+    )
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    return values, calls.read_text(), tmp_path / "dockerfile-base-image.tar"
+
+
+def test_pull_step_retries_then_exports_for_the_cache(tmp_path: Path) -> None:
+    values, calls, archive = _run_pull_step(tmp_path, pull_failures=2)
+    assert calls.split() == ["pull", "pull", "pull", "save"]
+    assert values == {"pulled": "true"}
+    assert archive.exists()
+
+
+def test_pull_step_never_advertises_a_failed_export(tmp_path: Path) -> None:
+    values, calls, archive = _run_pull_step(tmp_path, pull_failures=0, save_ok=False)
+    assert calls.split() == ["pull", "save"]
+    assert "pulled" not in values, "a partial archive must not be saved to the cache"
+    assert not archive.exists()
+
+
+def test_pull_step_gives_up_after_five_attempts_without_failing(tmp_path: Path) -> None:
+    values, calls, archive = _run_pull_step(tmp_path, pull_failures=99)
+    assert calls.split() == ["pull"] * 5
+    assert "pulled" not in values
+    assert not archive.exists()
