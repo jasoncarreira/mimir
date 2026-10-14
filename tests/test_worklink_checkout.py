@@ -159,7 +159,15 @@ def test_prune_attempt_checkouts_skips_active(tmp_path: Path) -> None:
     )
 
     assert pruned == [dead]  # only the inactive attempt is reaped
-    assert all("840-1" not in " ".join(c) for c in calls)  # live attempt untouched
+    # Live attempt untouched. Compare whole paths, not the bare "840-1" name:
+    # tmp_path can itself contain that substring (CI's evidence root embeds the
+    # run id, e.g. ...-38597961840-1), which also appears in the dead path.
+    assert calls, "the inactive attempt should have been removed through git"
+    live_prefix = str(live) + os.sep
+    assert all(
+        arg != str(live) and not arg.startswith(live_prefix)
+        for call in calls for arg in call
+    )
 
 
 def test_prune_attempt_checkouts_covers_relocated_isolated_checkouts(tmp_path: Path) -> None:
