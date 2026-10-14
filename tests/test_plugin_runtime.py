@@ -35,15 +35,43 @@ from mimir.turn_logger import TurnLogger
 EXAMPLE = Path(__file__).parent / "fixtures" / "plugins" / "example"
 
 
-@pytest.fixture(scope="module")
-def example_distribution(tmp_path_factory):
-    """Build and install an actual provider wheel without installing it into Mimir's venv."""
-    root = tmp_path_factory.mktemp("example-distribution")
-    subprocess.run(["uv", "build", "--wheel", str(EXAMPLE), "--out-dir", str(root)], check=True)
+def _install_example_distribution(root):
+    """Build a real wheel with all uv writes confined to worker-owned fixture state."""
+    root.mkdir(parents=True, exist_ok=True)
+    # CI's non-owning worker has HOME=/nonexistent and a read-only checkout.
+    # Both subprocesses need a private cache, not HOME or an inherited uv cache.
+    env = {**os.environ, "UV_CACHE_DIR": str(root / "uv-cache"),
+           "UV_PYTHON": sys.executable}
+    subprocess.run(["uv", "build", "--wheel", str(EXAMPLE), "--out-dir", str(root)],
+                   env=env, check=True)
     wheel, = root.glob("*.whl")
     target = root / "site"
-    subprocess.run(["uv", "pip", "install", "--no-deps", "--target", str(target), str(wheel)], check=True)
+    subprocess.run(["uv", "pip", "install", "--no-deps", "--target", str(target), str(wheel)],
+                   env=env, check=True)
     return target
+
+
+@pytest.fixture(scope="module")
+def example_distribution(tmp_path_factory):
+    return _install_example_distribution(tmp_path_factory.mktemp("example-distribution"))
+
+
+@pytest.mark.parametrize("inherited_cache", [False, True])
+def test_example_distribution_build_with_unusable_home(tmp_path, monkeypatch, inherited_cache):
+    # A file cannot serve as a cache parent, even when pytest runs as root.
+    # This reproduces the worker-UID job's unwritable HOME without changing uid.
+    home = tmp_path / "unusable-home"
+    home.write_text("not a directory")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    if inherited_cache:
+        monkeypatch.setenv("UV_CACHE_DIR", str(home / "controller-cache"))
+    else:
+        monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    target = _install_example_distribution(tmp_path / "distribution")
+    assert (target / "mimir_example_plugin" / "__init__.py").is_file()
+    assert list(target.glob("mimir_example_plugin-*.dist-info/METADATA"))
+    assert home.read_text() == "not a directory"
 
 
 def test_installed_example_provider_end_to_end(example_distribution, tmp_path, monkeypatch):
