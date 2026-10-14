@@ -13021,16 +13021,13 @@ def test_operator_arm2_direct_execution_binds_stdin_away_from_the_agent(
 
     recorded: list[dict[str, object]] = []
 
-    class _Completed:
-        returncode = 0
-        stdout = b""
-        stderr = b""
+    original_popen = tools_extra.subprocess.Popen
 
-    def recording_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+    def recording_popen(argv, **kwargs):  # type: ignore[no-untyped-def]
         recorded.append({"argv": list(argv), **kwargs})
-        return _Completed()
+        return original_popen(argv, **kwargs)
 
-    monkeypatch.setattr(tools_extra.subprocess, "run", recording_run)
+    monkeypatch.setattr(tools_extra.subprocess, "Popen", recording_popen)
     runner = getattr(tools_extra.shell_exec, "func", tools_extra.shell_exec)
     runner("echo bound", cwd=str(tmp_path))
 

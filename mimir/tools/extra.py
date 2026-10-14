@@ -21,6 +21,7 @@ import signal
 import shlex
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -350,6 +351,48 @@ _SHELL_STATE: dict[str, Any] = {
 }
 _SHELL_STATE_LOCK = threading.Lock()
 _PROJECT_TEST_CAPTURE_BYTES = 64 * 1024
+_SHELL_TERM_GRACE_S = 0.2
+
+
+def _kill_shell_process_group(proc: subprocess.Popen[bytes]) -> None:
+    """Stop the session, including children left behind by an exited wrapper."""
+    if os.name == "nt":
+        proc.kill()
+        return
+    # Never signal the server's group, even if a caller forgot to isolate the child.
+    if proc.pid == os.getpgrp():
+        raise RuntimeError("shell process group was not isolated from the server")
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    # wait() can return as soon as bash exits, while its children are still alive.
+    time.sleep(_SHELL_TERM_GRACE_S)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _run_shell_command(
+    argv: list[str], *, cwd: Path | None, timeout: float, env: dict[str, str],
+) -> subprocess.CompletedProcess[bytes]:
+    proc = subprocess.Popen(  # noqa: S603 - trusted shell wrapper or server-authorized argv
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, cwd=cwd, env=env,
+        start_new_session=os.name != "nt",
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            _kill_shell_process_group(proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()  # drain pipes and reap the wrapper before returning
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
 def _remember_shell_cwd(session_id: str, cwd: Path) -> None:
@@ -404,14 +447,12 @@ def _run_bounded_project_test(
     try:
         returncode = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        if os.name != "nt":
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-        else:
-            proc.kill()
-        proc.wait()
+        try:
+            _kill_shell_process_group(proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
         raise
     finally:
         for thread in threads:
@@ -544,10 +585,8 @@ def shell_exec(
                 env=child_env,
             )
         else:
-            proc = subprocess.run(  # noqa: S603 — argv is either the trusted shell wrapper or server-authorized direct argv
+            proc = _run_shell_command(
                 argv,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
                 timeout=_SHELL_STATE["timeout_s"],
                 cwd=effective_cwd,
                 env=child_env,
@@ -556,9 +595,15 @@ def shell_exec(
         if is_project_test:
             raise ToolException(
                 "shell_exec refused: project_test_timeout after "
-                f"{_SHELL_STATE['timeout_s']}s"
+                f"{_SHELL_STATE['timeout_s']}s; its process group was killed and "
+                "partial side effects may have occurred. Check state before retrying, "
+                "or use bash_async for long jobs."
             )
-        raise ToolException(f"shell_exec timed out after {_SHELL_STATE['timeout_s']}s")
+        raise ToolException(
+            f"shell_exec timed out after {_SHELL_STATE['timeout_s']}s; its process group "
+            "was killed and partial side effects may have occurred. Check state before "
+            "retrying, or use bash_async for long jobs."
+        )
     except (FileNotFoundError, NotADirectoryError) as exc:
         # Use launch-time evidence, not a racy filesystem probe. Do not expose
         # paths or raw exception text, or guess when both targets match.

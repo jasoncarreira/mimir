@@ -90,7 +90,7 @@ def test_protected_shell_operands_refuse_without_spawning(command, monkeypatch, 
     if "$MIMIR_CLAUDE_OAUTH_CREDENTIALS" in command:
         command = f"cat {tmp_path / 'oauth.json'}"
     calls = []
-    monkeypatch.setattr(extra.subprocess, "run", lambda *a, **kw: calls.append(a))
+    monkeypatch.setattr(extra, "_run_shell_command", lambda *a, **kw: calls.append(a))
     events = []
     monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", lambda *a, **kw: events.append((a, kw)))
     result = shell_exec.invoke({"command": command})
@@ -262,6 +262,51 @@ def test_shell_exec_valid_direct_executable_and_cwd(tmp_path):
     assert result == f"exit=0\n\nstdout:\n{tmp_path}\n"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+@pytest.mark.parametrize("direct", [False, True], ids=["login-shell", "direct-argv"])
+def test_shell_exec_timeout_reaps_spawned_child(tmp_path, monkeypatch, direct):
+    """The wrapper and a child it spawned must both stop before a retry."""
+    script = tmp_path / "spawn.py"
+    pidfile = tmp_path / "child.pid"
+    script.write_text(
+        "import signal, subprocess, sys, time\n"
+        # Make child PID disappearance observable even in a container whose
+        # PID 1 does not reap orphaned zombies.
+        "signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n"
+        "child = subprocess.Popen(['sleep', '30'], stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL)\n"
+        "def stop(*_):\n"
+        "    time.sleep(30)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "open(sys.argv[1], 'w').write(str(child.pid))\n"
+        "time.sleep(30)\n",
+    )
+    # Let the command itself wait for the child to start, rather than relying
+    # on a sleep in the test before the short timeout fires.
+    monkeypatch.setitem(extra._SHELL_STATE, "timeout_s", 1.0)
+    command = f"{sys.executable} {script} {pidfile}"
+    args = {"command": command}
+    if direct:
+        args["mimir_direct_argv"] = [sys.executable, str(script), str(pidfile)]
+    result = shell_exec.invoke(args)
+    assert pidfile.exists(), "child must have started before the timeout"
+    pid = int(pidfile.read_text())
+    try:
+        assert result == (
+            "shell_exec timed out after 1.0s; its process group was killed and "
+            "partial side effects may have occurred. Check state before retrying, "
+            "or use bash_async for long jobs."
+        )
+        status = Path(f"/proc/{pid}/status")
+        assert not status.exists(), status.read_text() if status.exists() else ""
+    finally:
+        # Keep a failed regression test from leaving a live sleep behind.
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass
+
+
 @pytest.mark.parametrize("filename", [None, "private-unrelated-path", "same-target"])
 @pytest.mark.parametrize("error_type", [FileNotFoundError, NotADirectoryError])
 def test_shell_exec_ambiguous_launch_error_is_redacted(monkeypatch, filename, error_type):
@@ -269,7 +314,7 @@ def test_shell_exec_ambiguous_launch_error_is_redacted(monkeypatch, filename, er
         code = errno.ENOENT if error_type is FileNotFoundError else errno.ENOTDIR
         raise error_type(code, "private exception detail", filename)
 
-    monkeypatch.setattr(extra.subprocess, "run", fail)
+    monkeypatch.setattr(extra, "_run_shell_command", fail)
     result = shell_exec.invoke({
         "command": "pwd", "cwd": "same-target",
         "mimir_direct_argv": ["same-target"],
@@ -337,7 +382,7 @@ def test_authorized_direct_argv_never_inherits_session_cwd(tmp_path, monkeypatch
         calls.append(kwargs)
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
-    monkeypatch.setattr(extra.subprocess, "run", _run)
+    monkeypatch.setattr(extra, "_run_shell_command", _run)
     monkeypatch.setattr(
         extra, "_run_bounded_project_test",
         lambda *args, **kwargs: pytest.fail("unconfigured command used project-test runner"),
@@ -552,7 +597,7 @@ async def test_service_shell_exec_graph_executes_server_bound_argv(
         calls.append((list(argv), kwargs))
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
-    monkeypatch.setattr(extra.subprocess, "run", _run)
+    monkeypatch.setattr(extra, "_run_shell_command", _run)
     monkeypatch.setattr(
         "mimir.tools.budget_gate._emit_event_sync", lambda *_args, **_kwargs: None,
     )

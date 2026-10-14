@@ -24,12 +24,41 @@ def test_bounded_project_test_killpg_guard(monkeypatch, error):
                 errno.EPERM if error is PermissionError else errno.ESRCH, "signal failed")
     killpg = Mock(side_effect=exc)
     monkeypatch.setattr(extra.os, "killpg", killpg)
+    monkeypatch.setattr(extra.time, "sleep", lambda _seconds: None)
 
-    expected = exc if error is OSError else timeout
+    expected = timeout if error is ProcessLookupError else exc
     with pytest.raises(type(expected)) as caught:
         extra._run_bounded_project_test(["pytest"], cwd=None, timeout=1, env={})
     assert caught.value is expected
-    assert proc.wait.call_args_list == ([call(timeout=1)] if error is OSError else
-                                       [call(timeout=1), call()])
-    killpg.assert_called_once_with(proc.pid, signal.SIGKILL)
+    assert proc.wait.call_args_list == [call(timeout=1), call()]
+    if error is OSError:
+        killpg.assert_called_once_with(proc.pid, signal.SIGTERM)
+    else:
+        assert killpg.call_args_list == [call(proc.pid, signal.SIGTERM)]
     assert proc.stdout.closed and proc.stderr.closed
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+def test_shell_timeout_never_signals_server_process_group(monkeypatch):
+    killpg = Mock()
+    monkeypatch.setattr(extra.os, "killpg", killpg)
+    proc = Mock(pid=os.getpgrp())
+
+    with pytest.raises(RuntimeError, match="not isolated"):
+        extra._kill_shell_process_group(proc)
+
+    killpg.assert_not_called()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+def test_shell_timeout_sends_term_then_kill_even_if_wrapper_exited(monkeypatch):
+    proc = Mock(pid=os.getpgrp() + 100000)
+    killpg = Mock()
+    monkeypatch.setattr(extra.os, "killpg", killpg)
+    monkeypatch.setattr(extra.time, "sleep", lambda _seconds: None)
+
+    extra._kill_shell_process_group(proc)
+
+    assert killpg.call_args_list == [
+        call(proc.pid, signal.SIGTERM), call(proc.pid, signal.SIGKILL),
+    ]
