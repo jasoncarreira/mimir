@@ -66,6 +66,39 @@ def test_job_yaml_round_trip(tmp_path: Path):
     assert reloaded[1].channel_id == "bench-1"
 
 
+def test_schedule_writes_preserve_comments_and_callable_disable(tmp_path: Path) -> None:
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(
+        "# operator header\n- name: daily # job note\n  cron: '0 8 * * *' # cron note\n"
+        "  prompt_file: daily.md # source note\n  priority: high\n"
+        "- name: worker\n  callable: worker\n  cron: '' # disable note\n",
+        encoding="utf-8",
+    )
+    jobs, errors = load_jobs(path)
+    assert not errors
+    daily, worker = jobs
+    from dataclasses import replace
+
+    for updated in (
+        [replace(daily, priority="low"), worker],
+        [replace(daily, cron="0 9 * * *", priority="low"), worker],
+        [replace(daily, cron="0 9 * * *", priority="low"), worker,
+         SchedulerJob(name="new", cron="0 7 * * *", prompt="hi")],
+        [replace(daily, cron="0 9 * * *", priority="low"), worker],
+    ):
+        write_jobs(path, updated)
+        text = path.read_text(encoding="utf-8")
+        assert all(note in text for note in (
+            "# operator header", "# job note", "# cron note", "# source note", "# disable note",
+        ))
+        assert "cron: '' # disable note" in text
+    assert [j.name for j in load_jobs(path)[0]] == ["daily", "worker"]
+    write_jobs(path, [replace(daily, cron="0 9 * * *"), replace(worker, cron="0 1 * * *")])
+    write_jobs(path, [replace(daily, cron="0 9 * * *"), replace(worker, cron="")])
+    assert load_jobs(path)[0][1].cron is None
+    assert "cron: ''" in path.read_text(encoding="utf-8")
+
+
 def test_load_jobs_skips_invalid_entries(tmp_path: Path):
     path = tmp_path / "scheduler.yaml"
     path.write_text(

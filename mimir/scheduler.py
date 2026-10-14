@@ -552,22 +552,59 @@ def bundled_scheduler_template_text() -> str:
 
 
 def write_jobs(path: Path, jobs: list[SchedulerJob]) -> None:
+    from io import StringIO
+    from ruamel.yaml import YAML
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else None
+    roundtrip = YAML()
+    roundtrip.preserve_quotes = True
+    existing = roundtrip.load(path.read_text(encoding="utf-8")) if path.is_file() else None
     grants = None
     if isinstance(existing, dict):
         if set(existing) - {"jobs", "operator_shell_commands"}:
             raise ValueError("unknown scheduler.yaml top-level keys")
         grants = existing.get("operator_shell_commands")
         parse_operator_shell_commands(grants, writable_roots=agent_writable_roots(path.parent))
-    body = yaml.safe_dump(
-        ({"operator_shell_commands": grants, "jobs": [j.to_yaml_entry() for j in jobs]}
-         if isinstance(existing, dict) and "operator_shell_commands" in existing
-         else [j.to_yaml_entry() for j in jobs]),
-        sort_keys=False,
-        default_flow_style=False,
-        allow_unicode=True,
-    )
+    entries = existing["jobs"] if isinstance(existing, dict) else existing
+    if entries is None:
+        entries = []
+    wanted = {job.name: job.to_yaml_entry() for job in jobs}
+    for job in jobs:
+        if "priority" in wanted[job.name]:
+            wanted[job.name]["priority"] = getattr(job.priority, "value", job.priority)
+        if job.callable_name and not job.cron:
+            wanted[job.name]["cron"] = ""  # explicit-disable must survive serialization
+    for index in range(len(entries) - 1, -1, -1):
+        entry = entries[index]
+        if entry.get("name") not in wanted:
+            del entries[index]
+            continue
+        updated = wanted.pop(entry["name"])
+        # Edit only changed values; ruamel retains comments, quoting and
+        # unrelated fields (including explicit cron: '' callable disables).
+        for key in list(entry):
+            if key not in updated:
+                # Remove only fields that changed semantically; keep explicit
+                # defaults, nulls and existing formatting otherwise.
+                if key in {"cron", "time_of_day", "priority", "prompt", "prompt_file"}:
+                    if key == "cron" and entry.get("callable") and entry[key] == "":
+                        continue
+                    if key == "priority" and entry[key] == "normal":
+                        continue
+                    del entry[key]
+            elif entry[key] != updated[key]:
+                entry[key] = updated[key]
+        for key, value in updated.items():
+            if key not in entry:
+                entry[key] = value
+    for job in jobs:
+        if job.name in wanted:
+            entries.append(wanted.pop(job.name))
+    if existing is None:
+        existing = entries
+    output = StringIO()
+    roundtrip.dump(existing, output)
+    body = output.getvalue()
     tmp = path.with_suffix(".yaml.tmp")
     tmp.write_text(body or "[]\n", encoding="utf-8")
     tmp.replace(path)
@@ -1794,7 +1831,7 @@ class Scheduler:
         except Exception:  # noqa: BLE001
             log.exception("rearm_quota_recovery_on_start failed")
 
-    async def add_job(self, job: SchedulerJob) -> SchedulerJob:
+    async def add_job(self, job: SchedulerJob, *, replace_existing: bool = True) -> SchedulerJob:
         """Atomic add-or-replace by name. Validates the trigger before
         persisting; raises ``ValueError`` on bad cron/time_of_day or
         unregistered callable references."""
@@ -1827,6 +1864,12 @@ class Scheduler:
                 raise ValueError(
                     "refusing to rewrite scheduler.yaml; fix rejected entries: "
                     + ", ".join(str(item["job"]) for item in rejections)
+                )
+            if not replace_existing and any(j.name == job.name for j in current):
+                raise ValueError(
+                    f"job {job.name!r} already exists; use set_schedule_cron or "
+                    "set_schedule_priority for a partial change, or replace=true "
+                    "to replace the entire entry"
                 )
             current = [j for j in current if j.name != job.name]
             current.append(job)
