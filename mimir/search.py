@@ -852,7 +852,7 @@ class Indexer:
 
 def _to_fts_query(text: str) -> str:
     """Sanitize a free-form query for FTS5 MATCH. Operators and parens are
-    stripped; tokens are OR-joined. Empty input → empty string.
+    stripped; quoted tokens are OR-joined. Empty input → empty string.
 
     Dashes are dropped from tokens (not just trimmed) because FTS5
     parses ``-attention`` as the unary NOT operator on the
@@ -876,7 +876,9 @@ def _to_fts_query(text: str) -> str:
             clean = "".join(ch for ch in sub if ch.isalnum() or ch == "_")
             if clean:
                 safe.append(clean)
-    return " OR ".join(safe)
+    # FTS5 treats OR (and other reserved words) as syntax even when the
+    # punctuation surrounding a user term has been stripped.
+    return " OR ".join('"' + term.replace('"', '""') + '"' for term in safe)
 
 
 def _make_snippet(text: str, query: str, window: int = 200) -> str:

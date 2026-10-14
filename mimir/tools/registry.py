@@ -2872,7 +2872,8 @@ async def worklink_run(
     Autonomous-dispatch guards apply here but NOT to the operator CLI:
       * Sheds under resource pressure — if the HomeostaticArbiter says the
         worklink priority can't fire (e.g. severity TIGHT), the dispatch is
-        refused and you should try later. Use ``mimir worklink run`` to force.
+         refused and you should try later. Ask the operator to run the CLI
+         if manual dispatch is needed.
        * Respects the concurrent-claim cap (``defaults.max_concurrent`` in
          worklink.yaml, default 2) across all in-flight Worklink workers.
       * Refuses fresh work while an unresolved incident or retained run exists.
@@ -2924,7 +2925,7 @@ async def worklink_run(
             raise ToolException(
                 f"worklink_run shed: resource pressure {decision.severity.name} "
                 f"(priority={decision.priority}) — {decision.reason}. "
-                "Try again later, or run `mimir worklink run` to force."
+                "Try again later, or ask the operator to run `mimir worklink run`."
             )
 
     # 2) Concurrency cap (chainlink query): bound total in-flight workers.

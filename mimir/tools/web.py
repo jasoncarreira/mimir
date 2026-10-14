@@ -35,7 +35,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlsplit
+from http import HTTPStatus
 from urllib.request import (
     HTTPRedirectHandler,
     HTTPHandler,
@@ -452,7 +453,8 @@ class _SSRFCheckingRedirectHandler(HTTPRedirectHandler):
             normalized = normalize_sink_destination(SinkCategory.NETWORK, newurl)
             if normalized not in allowed:
                 raise SSRFBlocked(
-                    f"redirect target exact URL {newurl!r} is not approved"
+                    f"redirect target host {urlsplit(newurl).hostname!r} needs approval "
+                    f"for exact URL {newurl!r}"
                 )
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -763,8 +765,11 @@ async def fetch_url(
             timeout_seconds=timeout_seconds,
             max_bytes=max_bytes,
         )
-    except HTTPError:
-        raise ToolException("fetch_url failed: HTTP request failed.") from None
+    except HTTPError as exc:
+        # The server controls exc.reason; use the local status table rather
+        # than echoing potentially adversarial response text into the turn.
+        reason = HTTPStatus(exc.code).phrase if exc.code in HTTPStatus._value2member_map_ else "HTTP error"
+        raise ToolException(f"fetch_url failed: HTTP {exc.code} {reason}.") from None
     except URLError:
         raise ToolException("fetch_url failed: URL request failed.") from None
     except ValueError as exc:

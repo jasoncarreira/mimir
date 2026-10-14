@@ -33,3 +33,17 @@ def test_bounded_project_test_killpg_guard(monkeypatch, error):
                                        [call(timeout=1), call()])
     killpg.assert_called_once_with(proc.pid, signal.SIGKILL)
     assert proc.stdout.closed and proc.stderr.closed
+@pytest.mark.asyncio
+async def test_file_search_fts_error_is_tool_result(monkeypatch):
+    import sqlite3
+    from mimir.tools import extra
+
+    class FailingIndexer:
+        async def search(self, query, **kwargs):
+            assert query == "worklink-1978 OR timeout"
+            raise sqlite3.OperationalError('fts5: syntax error near "OR"')
+
+    monkeypatch.setitem(extra._SEARCH_STATE, "indexer", FailingIndexer())
+    result = await extra.file_search.coroutine(query="worklink-1978 OR timeout")
+    assert "file_search failed: invalid search query" in result
+    assert "try simpler terms" in result

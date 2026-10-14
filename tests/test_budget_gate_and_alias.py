@@ -7747,3 +7747,36 @@ async def test_exact_shell_grant_admits_only_one_shadow_operator_command(
         "binding_rule": ServiceShellBindingRule.PROFILE_ALLOWLIST.value,
     }]
     assert command not in json.dumps(captured)
+@pytest.mark.asyncio
+async def test_exhausted_budget_removes_spendable_tools_before_next_model_step():
+    from types import SimpleNamespace
+
+    ctx = _make_ctx(budget=1)
+    request = SimpleNamespace(tools=[SimpleNamespace(name=name) for name in (
+        "read_file", "shell_exec", "send_message", "react",
+    )])
+
+    def override(**updates):
+        return SimpleNamespace(**{**vars(request), **updates})
+
+    request.override = override
+    middleware = BudgetGateMiddleware()
+    token = set_current_turn(ctx)
+    try:
+        assert [t.name for t in middleware._available_after_budget(request).tools] == [
+            "read_file", "shell_exec", "send_message", "react",
+        ]
+        assert _check_and_increment_or_deny("read_file") is None
+        available = middleware._available_after_budget(request)
+        assert [t.name for t in available.tools] == ["send_message", "react"]
+        assert [t.name for t in middleware.wrap_model_call(request, lambda req: req).tools] == [
+            "send_message", "react",
+        ]
+        async def handler(req):
+            return req
+        assert [t.name for t in (await middleware.awrap_model_call(request, handler)).tools] == [
+            "send_message", "react",
+        ]
+        assert ctx.tool_call_budget_denied_count == 0
+    finally:
+        reset_current_turn(token)

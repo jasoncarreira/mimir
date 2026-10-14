@@ -333,8 +333,13 @@ class GitHubForgeClient:
                 if len(collected) >= limit:
                     break
         except requests.RequestException as exc:
+            warning = (
+                "; the write may have been applied; check pr_reviews / pr_comments "
+                "before retrying"
+                if method.upper() != "GET" else ""
+            )
             raise _GitHubRequestError(
-                f"forge transport failed: {type(exc).__name__}", retryable=True,
+                f"forge transport failed: {type(exc).__name__}{warning}", retryable=True,
             ) from exc
         finally:
             if response is not None:

@@ -4572,6 +4572,13 @@ def test_service_shell_redirect_is_bounded_and_service_only(
     refusal = budget_gate._service_shell_refusal_guidance(message, "shell_exec", no_roots)
     _assert_service_shell_redirect(refusal)
     assert "Allowed read roots" not in refusal
+    metacharacters = budget_gate._service_shell_refusal_guidance(
+        f"shell_exec was refused: shell metacharacters in the {no_roots.sink_policy_for('shell_exec').destination} "
+        "trusted-service shell profile never admits pipes", "shell_exec", no_roots,
+    )
+    assert "Profile allows bounded file" in metacharacters
+    assert "Pipes, redirections and command chaining are not allowed" in metacharacters
+    assert "read_file" in metacharacters and "grep" in metacharacters
     auth = _service_auth(no_roots, InformationFlowLabels())
     refusal = budget_gate._deny_admin_tool(
         "shell_exec", "service_capability_denied", ctx=auth, enforcement_enabled=True,
@@ -5124,7 +5131,7 @@ async def test_refused_service_shell_returns_the_reason_and_executes_nothing(
     assert "one command per call" in result.content
     assert "shell=False" in result.content
     _assert_service_shell_redirect(result.content)
-    assert "Pipes, redirections and command chaining are not available on this turn" in result.content
+    assert "Pipes, redirections and command chaining are not allowed on this turn" in result.content
     assert "a single plain command is available if the profile admits it" in result.content
     # The fail-closed argv must never be what the caller reads instead.
     assert "/usr/bin/false" not in result.content
