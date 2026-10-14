@@ -1593,6 +1593,84 @@ def test_replace_file_tool_dispatches_through_guard(home: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("async_path", [False, True], ids=["sync", "async"])
+async def test_replace_file_tool_refuses_incident_shrink_and_accepts_override(
+    home: Path, async_path: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.readonly_backend as filesystem
+
+    target = home / "state" / "heartbeat-backlog.md"
+    original = b"a" * 112_545
+    content = "é" * 1_952  # 3,904 UTF-8 bytes
+    target.write_bytes(original)
+    tool = next(tool for tool in MimirFilesystemMiddleware(
+        backend=WriteGuardBackend(home, ["state"]),
+    ).tools if tool.name == "replace_file")
+    assert tool.args_schema.model_fields["allow_shrink"].default is False
+    runtime = SimpleNamespace(tool_call_id="replace-call")
+
+    real_open = os.open
+
+    def no_temporary_write(path, flags, *args, **kwargs):
+        if isinstance(path, str) and path.startswith(".mimir-"):
+            pytest.fail("shrink refusal must happen before opening a temporary file")
+        return real_open(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(filesystem.os, "open", no_temporary_write)
+        if async_path:
+            refusal = await tool.coroutine(
+                file_path="/state/heartbeat-backlog.md", content=content, runtime=runtime,
+            )
+        else:
+            refusal = tool.func(
+                file_path="/state/heartbeat-backlog.md", content=content, runtime=runtime,
+            )
+    assert refusal.status == "error"
+    assert refusal.content == (
+        "replace_file refused: new content (3904 bytes) is under 10% of the existing "
+        "file (112545 bytes) and would delete most of it. Use edit_file for a partial "
+        "change, or pass allow_shrink=true if replacing the whole file is intended."
+    )
+    assert target.read_bytes() == original
+    assert not list(target.parent.glob(".mimir-*.tmp"))
+
+    if async_path:
+        success = await tool.coroutine(
+            file_path="/state/heartbeat-backlog.md", content=content, runtime=runtime,
+            allow_shrink=True,
+        )
+    else:
+        success = tool.func(
+            file_path="/state/heartbeat-backlog.md", content=content, runtime=runtime,
+            allow_shrink=True,
+        )
+    assert success.status == "success"
+    assert target.read_bytes() == content.encode("utf-8")
+
+
+@pytest.mark.parametrize("existing,new,refused", [
+    (1023, 0, False),
+    (1024, 102, True),
+    (1024, 103, False),
+    (2000, 200, False),
+    (2000, 199, True),
+])
+def test_replace_file_shrink_boundaries(
+    home: Path, existing: int, new: int, refused: bool,
+) -> None:
+    target = home / "state" / "boundary.txt"
+    target.write_bytes(b"a" * existing)
+    result = WriteGuardBackend(home, ["state"]).replace("/state/boundary.txt", "b" * new)
+    if refused:
+        assert result.error is not None and "under 10%" in result.error
+        assert target.read_bytes() == b"a" * existing
+    else:
+        assert result.error is None
+        assert target.read_bytes() == b"b" * new
+
+
+@pytest.mark.asyncio
 async def test_replace_file_routes_and_refuses_unsafe_targets(home: Path, tmp_path: Path) -> None:
     route = tmp_path / "mounted"
     route.mkdir()
@@ -1684,6 +1762,9 @@ class TestCreateOnlyWrites:
         )
         replacement = next(tool for tool in middleware.tools if tool.name == "replace_file")
         assert "existing regular file" in replacement.description
+        assert "Any existing text you do not include is deleted" in replacement.description
+        assert "prepend, append or change part of a file, use `edit_file`" in replacement.description
+        assert "allow_shrink=true" in replacement.description
 
 
     def test_home_collision_uses_canonical_virtual_path_without_audit(
@@ -1713,7 +1794,7 @@ class TestCreateOnlyWrites:
             reset_current_turn(token)
 
         assert result.error == (
-            "File '/state/existing.txt' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
+            "File '/state/existing.txt' already exists. To add lines or make a partial change, use edit_file anchored on existing text. replace_file discards all content not passed."
         )
         assert target.read_text(encoding="utf-8") == "original"
         assert backend.drain_denials() == []
@@ -1728,8 +1809,8 @@ class TestCreateOnlyWrites:
         result = await backend.awrite(str(target), "replacement")
 
         assert result.error == (
-            "File '/state/existing-async.txt' already exists. Use edit_file for a targeted change "
-            "or replace_file to replace its full content."
+            "File '/state/existing-async.txt' already exists. To add lines or make a partial change, "
+            "use edit_file anchored on existing text. replace_file discards all content not passed."
         )
         assert target.read_text(encoding="utf-8") == "original"
         assert backend.drain_denials() == []
@@ -1754,16 +1835,16 @@ class TestCreateOnlyWrites:
         async_result = await router.awrite(async_path, "changed")
 
         assert sync_result.error == (
-            f"File '{sync_path}' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
+            f"File '{sync_path}' already exists. To add lines or make a partial change, use edit_file anchored on existing text. replace_file discards all content not passed."
         )
         assert async_result.error == (
-            f"File '{async_path}' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
+            f"File '{async_path}' already exists. To add lines or make a partial change, use edit_file anchored on existing text. replace_file discards all content not passed."
         )
         assert sync_result.error != (
-            "File '/sync.txt' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
+            "File '/sync.txt' already exists. To add lines or make a partial change, use edit_file anchored on existing text. replace_file discards all content not passed."
         )
         assert async_result.error != (
-            "File '/async.txt' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
+            "File '/async.txt' already exists. To add lines or make a partial change, use edit_file anchored on existing text. replace_file discards all content not passed."
         )
         assert (route / "sync.txt").read_text(encoding="utf-8") == "sync"
         assert (route / "async.txt").read_text(encoding="utf-8") == "async"
@@ -2016,7 +2097,7 @@ class TestCreateOnlyWrites:
     ) -> None:
         backend = WriteGuardBackend(home, ["state"])
         expected = (
-            "File '/state/race.txt' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
+            "File '/state/race.txt' already exists. To add lines or make a partial change, use edit_file anchored on existing text. replace_file discards all content not passed."
         )
 
         with ThreadPoolExecutor(max_workers=8) as pool:

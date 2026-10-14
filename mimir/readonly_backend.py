@@ -107,9 +107,12 @@ _WRITE_FILE_DESCRIPTION = (
     "directories are created as needed."
 )
 _REPLACE_FILE_DESCRIPTION = (
-    "Atomically replaces the full content of an existing regular file, preserving its "
-    "permissions. Use `write_file` to create a missing file, or `edit_file` for a "
-    "targeted change. Symlinks and directories are refused."
+    "Atomically replaces the ENTIRE content of an existing regular file with `content`, "
+    "preserving its permissions. Any existing text you do not include is deleted. "
+    "To add, prepend, append or change part of a file, use `edit_file` instead. "
+    "Use `write_file` to create a missing file. Symlinks and directories are refused. "
+    "Replacing a file of at least 1,024 bytes with under 10% of its size is refused "
+    "unless `allow_shrink=true`."
 )
 _UNSUPPORTED_CREATE_ERROR = (
     "Write failed: descriptor-relative file creation is unsupported on this platform."
@@ -327,15 +330,29 @@ def _exclusive_write(
 
 
 def _collision_error(file_path: str) -> str:
-    return (f"File '{file_path}' already exists. Use edit_file for a targeted change "
-            "or replace_file to replace its full content.")
+    return (f"File '{file_path}' already exists. To add lines or make a partial change, "
+            "use edit_file anchored on existing text. replace_file discards all content not passed.")
 
 
 def _missing_replace_error(file_path: str) -> str:
     return f"File '{file_path}' does not exist. Use write_file to create new files."
 
 
-def _atomic_replace(root: Path, file_path: str, content: str, max_bytes: int) -> WriteResult:
+def _replace_shrink_error(existing_bytes: int, new_bytes: int, allow_shrink: bool) -> str | None:
+    """Use UTF-8 byte sizes and one threshold/message across replacement routes."""
+    if not allow_shrink and existing_bytes >= 1024 and new_bytes * 10 < existing_bytes:
+        return (
+            f"replace_file refused: new content ({new_bytes} bytes) is under 10% "
+            f"of the existing file ({existing_bytes} bytes) and would delete most of it. "
+            "Use edit_file for a partial change, or pass allow_shrink=true if replacing "
+            "the whole file is intended."
+        )
+    return None
+
+
+def _atomic_replace(
+    root: Path, file_path: str, content: str, max_bytes: int, allow_shrink: bool = False,
+) -> WriteResult:
     """Publish through an anchored parent; never open the destination for writing."""
     if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
             or _OS_OPEN not in os.supports_dir_fd or _OS_STAT not in os.supports_dir_fd
@@ -375,6 +392,9 @@ def _atomic_replace(root: Path, file_path: str, content: str, max_bytes: int) ->
         encoded = content.encode("utf-8")
         if len(encoded) > max_bytes:
             return WriteResult(error=f"File '{file_path}' exceeds size limit.")
+        shrink_error = _replace_shrink_error(metadata.st_size, len(encoded), allow_shrink)
+        if shrink_error:
+            return WriteResult(error=shrink_error)
         temporary = f".mimir-{os.getpid()}-{os.urandom(8).hex()}.tmp"
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      stat.S_IMODE(metadata.st_mode), dir_fd=parent)
@@ -463,6 +483,12 @@ class MimirFilesystemMiddleware(FilesystemMiddleware):
     def _create_replace_file_tool(self) -> BaseTool:
         from deepagents.middleware.filesystem import WriteFileSchema, _check_fs_permission, validate_path
 
+        class ReplaceFileSchema(WriteFileSchema):
+            allow_shrink: bool = Field(
+                default=False,
+                description="Set true to intentionally replace a large file with under 10% of its size.",
+            )
+
         def result(path: str, response: WriteResult, runtime: ToolRuntime) -> ToolMessage:
             return ToolMessage(
                 content=response.error or f"Updated file {response.path}",
@@ -470,30 +496,34 @@ class MimirFilesystemMiddleware(FilesystemMiddleware):
                 status="error" if response.error else "success",
             )
 
-        def sync_replace(file_path: str, content: str, runtime: ToolRuntime) -> ToolMessage:
+        def sync_replace(
+            file_path: str, content: str, runtime: ToolRuntime, allow_shrink: bool = False,
+        ) -> ToolMessage:
             try:
                 path = validate_path(file_path)
             except ValueError as exc:
                 return result(file_path, WriteResult(error=f"Error: {exc}"), runtime)
             if _check_fs_permission(self._permissions, "write", path) == "deny":
                 return result(path, WriteResult(error=f"Error: permission denied for write on {path}"), runtime)
-            return result(path, self.backend.replace(path, content), runtime)
+            return result(path, self.backend.replace(path, content, allow_shrink=allow_shrink), runtime)
 
-        async def async_replace(file_path: str, content: str, runtime: ToolRuntime) -> ToolMessage:
+        async def async_replace(
+            file_path: str, content: str, runtime: ToolRuntime, allow_shrink: bool = False,
+        ) -> ToolMessage:
             try:
                 path = validate_path(file_path)
             except ValueError as exc:
                 return result(file_path, WriteResult(error=f"Error: {exc}"), runtime)
             if _check_fs_permission(self._permissions, "write", path) == "deny":
                 return result(path, WriteResult(error=f"Error: permission denied for write on {path}"), runtime)
-            return result(path, await self.backend.areplace(path, content), runtime)
+            return result(path, await self.backend.areplace(path, content, allow_shrink=allow_shrink), runtime)
 
         for wrapper in (sync_replace, async_replace):
             wrapper.__annotations__["runtime"] = ToolRuntime
         return StructuredTool.from_function(
             name="replace_file", description=_REPLACE_FILE_DESCRIPTION,
             func=sync_replace, coroutine=async_replace, infer_schema=False,
-            args_schema=WriteFileSchema,
+            args_schema=ReplaceFileSchema,
         )
 
     @staticmethod
@@ -1849,13 +1879,13 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         return await asyncio.to_thread(self.write, file_path, content)
 
-    def replace(self, file_path: str, content: str) -> WriteResult:
+    def replace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
         if self._git_metadata_write_denied(file_path):
             return WriteResult(error="Write denied: git_metadata_readonly")
-        return _atomic_replace(self.cwd, file_path, content, self.max_file_size_bytes)
+        return _atomic_replace(self.cwd, file_path, content, self.max_file_size_bytes, allow_shrink)
 
-    async def areplace(self, file_path: str, content: str) -> WriteResult:
-        return await asyncio.to_thread(self.replace, file_path, content)
+    async def areplace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content, allow_shrink)
 
     def edit(
         self,
@@ -2297,7 +2327,7 @@ class WriteGuardBackend:
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         return await asyncio.to_thread(self.write, file_path, content)
 
-    def replace(self, file_path: str, content: str) -> WriteResult:
+    def replace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
         if self._is_scheduler_write(file_path):
             self._record_denial("replace_scheduled_instruction_veto", file_path)
             return WriteResult(error=self._SCHEDULED_INSTRUCTION_DENY_REASON)
@@ -2316,10 +2346,10 @@ class WriteGuardBackend:
         canonical_path = self._canonicalize_path(file_path)
         if not canonical_path.startswith("/"):
             canonical_path = "/" + canonical_path
-        return self._fs.replace(canonical_path, content)
+        return self._fs.replace(canonical_path, content, allow_shrink=allow_shrink)
 
-    async def areplace(self, file_path: str, content: str) -> WriteResult:
-        return await asyncio.to_thread(self.replace, file_path, content)
+    async def areplace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content, allow_shrink)
 
     def edit(
         self,
@@ -2442,7 +2472,7 @@ class ReadOnlyFilesystemBackend:
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         return self.write(file_path=file_path, content=content)
 
-    def replace(self, file_path: str, content: str) -> WriteResult:
+    def replace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
         from .tools.budget_gate import _emit_hard_boundary_denied
 
         _emit_hard_boundary_denied(
@@ -2451,8 +2481,8 @@ class ReadOnlyFilesystemBackend:
         )
         return WriteResult(error=f"Write blocked. '{file_path}' is read-only.")
 
-    async def areplace(self, file_path: str, content: str) -> WriteResult:
-        return await asyncio.to_thread(self.replace, file_path, content)
+    async def areplace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content, allow_shrink)
 
     def edit(
         self,
@@ -2536,6 +2566,26 @@ class RetainedCheckoutFilesystemBackend(ReadOnlyFilesystemBackend):
             if lease.scope is None:
                 return {"error": lease.refusal_reason or "retained factory lease refused"}
             relative = absolute.relative_to(checkout).as_posix()
+            if operation == "replace_file":
+                # Controller-only option: keep the executor's exact-key protocol
+                # unchanged. Inspect the target while the retained effect lease
+                # is held, before dispatching any mutating worker operation.
+                allow_shrink = arguments.pop("allow_shrink", False)
+                try:
+                    metadata = absolute.stat(follow_symlinks=False)
+                    if not stat.S_ISREG(metadata.st_mode):
+                        return {"error": f"File '{file_path}' is not a regular file."}
+                    content = arguments["content"]
+                    if not isinstance(content, str):
+                        return {"error": "factory replace content is invalid"}
+                    new_bytes = len(content.encode("utf-8"))
+                except FileNotFoundError:
+                    return {"error": "file does not exist"}
+                except (OSError, UnicodeEncodeError) as exc:
+                    return {"error": _write_failure_error(file_path, str(exc))}
+                shrink_error = _replace_shrink_error(metadata.st_size, new_bytes, allow_shrink)
+                if shrink_error:
+                    return {"error": shrink_error}
             client = WorkerClient.for_factory_checkout(
                 checkout, issue_id=issue_id, attempt=attempt,
             )
@@ -2555,8 +2605,10 @@ class RetainedCheckoutFilesystemBackend(ReadOnlyFilesystemBackend):
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         return await asyncio.to_thread(self.write, file_path, content)
 
-    def replace(self, file_path: str, content: str) -> WriteResult:
-        result = self._operate("replace_file", file_path, content=content)
+    def replace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        result = self._operate(
+            "replace_file", file_path, content=content, allow_shrink=allow_shrink,
+        )
         if result.get("status") == "ok":
             return WriteResult(path=file_path)
         error = str(result.get("error") or "retained factory replace failed")
@@ -2564,8 +2616,8 @@ class RetainedCheckoutFilesystemBackend(ReadOnlyFilesystemBackend):
             error = _missing_replace_error(str(self._root / file_path.lstrip("/")))
         return WriteResult(error=error)
 
-    async def areplace(self, file_path: str, content: str) -> WriteResult:
-        return await asyncio.to_thread(self.replace, file_path, content)
+    async def areplace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content, allow_shrink)
 
     def edit(
         self, file_path: str, old_string: str, new_string: str, replace_all: bool = False,
@@ -2641,15 +2693,15 @@ class FileToolRouter(CompositeBackend):
             return WriteResult(error=_write_failure_error(file_path, result.error))
         return result
 
-    def replace(self, file_path: str, content: str) -> WriteResult:
+    def replace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
         backend, backend_path = self._get_backend_and_key(file_path)
-        result = backend.replace(backend_path, content)
+        result = backend.replace(backend_path, content, allow_shrink=allow_shrink)
         if result.path is not None:
             result.path = file_path
         return result
 
-    async def areplace(self, file_path: str, content: str) -> WriteResult:
-        return await asyncio.to_thread(self.replace, file_path, content)
+    async def areplace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content, allow_shrink)
 
     def grep(
         self,
