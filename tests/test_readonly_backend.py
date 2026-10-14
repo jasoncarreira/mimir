@@ -1794,7 +1794,7 @@ class TestCreateOnlyWrites:
             reset_current_turn(token)
 
         assert result.error == (
-            "File '/state/existing.txt' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
+            "File '/state/existing.txt' already exists. To add lines or make a partial change, use edit_file anchored on existing text. replace_file discards all content not passed."
         )
         assert target.read_text(encoding="utf-8") == "original"
         assert backend.drain_denials() == []
@@ -1809,8 +1809,8 @@ class TestCreateOnlyWrites:
         result = await backend.awrite(str(target), "replacement")
 
         assert result.error == (
-            "File '/state/existing-async.txt' already exists. Use edit_file for a targeted change "
-            "or replace_file to replace its full content."
+            "File '/state/existing-async.txt' already exists. To add lines or make a partial change, "
+            "use edit_file anchored on existing text. replace_file discards all content not passed."
         )
         assert target.read_text(encoding="utf-8") == "original"
         assert backend.drain_denials() == []
@@ -1835,16 +1835,16 @@ class TestCreateOnlyWrites:
         async_result = await router.awrite(async_path, "changed")
 
         assert sync_result.error == (
-            f"File '{sync_path}' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
+            f"File '{sync_path}' already exists. To add lines or make a partial change, use edit_file anchored on existing text. replace_file discards all content not passed."
         )
         assert async_result.error == (
-            f"File '{async_path}' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
+            f"File '{async_path}' already exists. To add lines or make a partial change, use edit_file anchored on existing text. replace_file discards all content not passed."
         )
         assert sync_result.error != (
-            "File '/sync.txt' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
+            "File '/sync.txt' already exists. To add lines or make a partial change, use edit_file anchored on existing text. replace_file discards all content not passed."
         )
         assert async_result.error != (
-            "File '/async.txt' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
+            "File '/async.txt' already exists. To add lines or make a partial change, use edit_file anchored on existing text. replace_file discards all content not passed."
         )
         assert (route / "sync.txt").read_text(encoding="utf-8") == "sync"
         assert (route / "async.txt").read_text(encoding="utf-8") == "async"
@@ -2097,7 +2097,7 @@ class TestCreateOnlyWrites:
     ) -> None:
         backend = WriteGuardBackend(home, ["state"])
         expected = (
-            "File '/state/race.txt' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
+            "File '/state/race.txt' already exists. To add lines or make a partial change, use edit_file anchored on existing text. replace_file discards all content not passed."
         )
 
         with ThreadPoolExecutor(max_workers=8) as pool:

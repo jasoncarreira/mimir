@@ -330,12 +330,24 @@ def _exclusive_write(
 
 
 def _collision_error(file_path: str) -> str:
-    return (f"File '{file_path}' already exists. Use edit_file for a targeted change "
-            "or replace_file to replace its full content.")
+    return (f"File '{file_path}' already exists. To add lines or make a partial change, "
+            "use edit_file anchored on existing text. replace_file discards all content not passed.")
 
 
 def _missing_replace_error(file_path: str) -> str:
     return f"File '{file_path}' does not exist. Use write_file to create new files."
+
+
+def _replace_shrink_error(existing_bytes: int, new_bytes: int, allow_shrink: bool) -> str | None:
+    """Use UTF-8 byte sizes and one threshold/message across replacement routes."""
+    if not allow_shrink and existing_bytes >= 1024 and new_bytes * 10 < existing_bytes:
+        return (
+            f"replace_file refused: new content ({new_bytes} bytes) is under 10% "
+            f"of the existing file ({existing_bytes} bytes) and would delete most of it. "
+            "Use edit_file for a partial change, or pass allow_shrink=true if replacing "
+            "the whole file is intended."
+        )
+    return None
 
 
 def _atomic_replace(
@@ -380,13 +392,9 @@ def _atomic_replace(
         encoded = content.encode("utf-8")
         if len(encoded) > max_bytes:
             return WriteResult(error=f"File '{file_path}' exceeds size limit.")
-        if not allow_shrink and metadata.st_size >= 1024 and len(encoded) * 10 < metadata.st_size:
-            return WriteResult(error=(
-                f"replace_file refused: new content ({len(encoded)} bytes) is under 10% "
-                f"of the existing file ({metadata.st_size} bytes) and would delete most of it. "
-                "Use edit_file for a partial change, or pass allow_shrink=true if replacing "
-                "the whole file is intended."
-            ))
+        shrink_error = _replace_shrink_error(metadata.st_size, len(encoded), allow_shrink)
+        if shrink_error:
+            return WriteResult(error=shrink_error)
         temporary = f".mimir-{os.getpid()}-{os.urandom(8).hex()}.tmp"
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      stat.S_IMODE(metadata.st_mode), dir_fd=parent)
@@ -2558,6 +2566,26 @@ class RetainedCheckoutFilesystemBackend(ReadOnlyFilesystemBackend):
             if lease.scope is None:
                 return {"error": lease.refusal_reason or "retained factory lease refused"}
             relative = absolute.relative_to(checkout).as_posix()
+            if operation == "replace_file":
+                # Controller-only option: keep the executor's exact-key protocol
+                # unchanged. Inspect the target while the retained effect lease
+                # is held, before dispatching any mutating worker operation.
+                allow_shrink = arguments.pop("allow_shrink", False)
+                try:
+                    metadata = absolute.stat(follow_symlinks=False)
+                    if not stat.S_ISREG(metadata.st_mode):
+                        return {"error": f"File '{file_path}' is not a regular file."}
+                    content = arguments["content"]
+                    if not isinstance(content, str):
+                        return {"error": "factory replace content is invalid"}
+                    new_bytes = len(content.encode("utf-8"))
+                except FileNotFoundError:
+                    return {"error": "file does not exist"}
+                except (OSError, UnicodeEncodeError) as exc:
+                    return {"error": _write_failure_error(file_path, str(exc))}
+                shrink_error = _replace_shrink_error(metadata.st_size, new_bytes, allow_shrink)
+                if shrink_error:
+                    return {"error": shrink_error}
             client = WorkerClient.for_factory_checkout(
                 checkout, issue_id=issue_id, attempt=attempt,
             )
@@ -2578,7 +2606,9 @@ class RetainedCheckoutFilesystemBackend(ReadOnlyFilesystemBackend):
         return await asyncio.to_thread(self.write, file_path, content)
 
     def replace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
-        result = self._operate("replace_file", file_path, content=content)
+        result = self._operate(
+            "replace_file", file_path, content=content, allow_shrink=allow_shrink,
+        )
         if result.get("status") == "ok":
             return WriteResult(path=file_path)
         error = str(result.get("error") or "retained factory replace failed")
