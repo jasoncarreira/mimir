@@ -1,4 +1,4 @@
-"""Forge compatibility surface until the host's coding registration is retired."""
+"""Cultivate's independently owned, scoped forge tool surface."""
 
 from __future__ import annotations
 
@@ -6,12 +6,13 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 from langchain.tools import ToolRuntime
 
 from mimir import access_control
-from mimir.forge import (
+from mimir_cultivate.forge import (
     CheckProjection, CommentProjection, FileProjection, IssueTarget,
     PullRequestProjection, PullRequestSummary, ReviewProjection,
     ReviewRequestProjection, ReviewVerdict,
@@ -20,7 +21,6 @@ from mimir.models import (
     AuthContext, InformationFlowLabels, RepoPRAction, RepoPRActionScope,
     RepoPRScopeRegistry, RepoReviewState,
 )
-from mimir.tools import forge as legacy
 from mimir.tools.refusals import ToolPolicyRefusal
 from mimir_cultivate import forge
 
@@ -145,16 +145,16 @@ class _Forge:
         self.calls.append(("rerequest", (scope, reviewer)))
 
 
-def test_forge_surface_matches_all_legacy_call_contracts() -> None:
-    assert len(forge.FORGE_TOOLS) == 21
-    assert [item.name for item in forge.FORGE_TOOLS] == [item.name for item in legacy.FORGE_TOOLS]
-    for wrapped, original in zip(forge.FORGE_TOOLS, legacy.FORGE_TOOLS):
-        assert wrapped is not original
-        assert wrapped.func is not original.func
-        assert wrapped.args_schema is original.args_schema
-        assert wrapped.response_format == original.response_format
-        assert wrapped.return_direct == original.return_direct
-        assert callable(wrapped.coroutine)
+def test_forge_surface_has_all_scoped_tools() -> None:
+    assert [item.name for item in forge.FORGE_TOOLS] == [
+        "pr_list", "pr_metadata", "pr_spec", "pr_files", "pr_diff",
+        "pr_file_content", "pr_checks", "pr_job_log", "ci_run_jobs", "ci_run",
+        "ci_recent_runs", "pr_reviews", "pr_comments", "pr_review_requests",
+        "pr_submit_review", "pr_inline_review_comment", "pr_comment",
+        "pr_edit_body", "issue_comment", "pr_rerequest_review",
+        "unsupported_operation",
+    ]
+    assert all(callable(item.func) and callable(item.coroutine) for item in forge.FORGE_TOOLS)
 
 
 @pytest.mark.parametrize("name,arguments,operation,expected", [
@@ -187,7 +187,7 @@ def test_every_plugin_forge_tool_executes_scoped_behavior(
     monkeypatch.delenv("MIMIR_HOME", raising=False)
     client = _Forge()
     runtime = _runtime()
-    legacy.set_forge_client(client)
+    forge.set_forge_client(client)
     tool = next(item for item in forge.FORGE_TOOLS if item.name == name)
     inputs = {"repository": "owner/repo", **arguments, "runtime": runtime}
     try:
@@ -230,13 +230,13 @@ def test_every_plugin_forge_tool_executes_scoped_behavior(
                           {**inputs, "branch": "other"})
         assert client.calls == before
     finally:
-        legacy.set_forge_client(None)
+        forge.set_forge_client(None)
 
 
 @pytest.mark.asyncio
 async def test_plugin_call_site_preserves_scope_head_and_untrusted_taint() -> None:
     client = _Forge()
-    legacy.set_forge_client(client)
+    forge.set_forge_client(client)
     runtime = _runtime()
     metadata = next(tool for tool in forge.FORGE_TOOLS if tool.name == "pr_metadata")
     comment = next(tool for tool in forge.FORGE_TOOLS if tool.name == "pr_comment")
@@ -260,7 +260,7 @@ async def test_plugin_call_site_preserves_scope_head_and_untrusted_taint() -> No
             ("comment", (runtime.context.repo_pr_action_scope, "posted")),
         ]
     finally:
-        legacy.set_forge_client(None)
+        forge.set_forge_client(None)
 
 
 def test_disabled_provider_is_not_imported_by_host() -> None:
@@ -279,3 +279,126 @@ def test_disabled_provider_is_not_imported_by_host() -> None:
         actual_names, actual_imported = result.stdout.strip().splitlines()
         assert json.loads(actual_names) == names
         assert (actual_imported == "True") is imported
+
+
+def test_forge_provider_loads_without_retired_forge_sources() -> None:
+    program = """
+import importlib.abc
+import os
+import sys
+os.environ.pop('MIMIR_HOME', None)
+os.environ['GITHUB_REPOS'] = 'owner/repo'
+
+class RetiredSources(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'mimir.forge' or fullname.startswith('mimir.forge.') or fullname == 'mimir.tools.forge':
+            raise ImportError(f'retired source imported: {fullname}')
+
+from mimir_cultivate import forge
+assert len(forge.FORGE_TOOLS) == 21
+assert forge._issue_bound_to_pr is not None
+class Client:
+    def list_pull_requests(self, repository, **filters):
+        assert repository == 'owner/repo'
+        return ()
+forge.set_forge_client(Client())
+assert forge.pr_list.func('owner/repo') == []
+"""
+    subprocess.run([sys.executable, "-c", program], check=True, env=os.environ.copy())
+
+
+def test_github_identity_binding_and_degraded_latch(monkeypatch) -> None:
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge, "_github_identity_degraded_error", None)
+    monkeypatch.setattr(forge, "_github_identity_degraded_callback", None)
+    monkeypatch.setattr(forge, "_default_client", None)
+    verified = []
+
+    class IdentityClient:
+        def verify_identity(self, login):
+            verified.append(login)
+
+    monkeypatch.setattr(forge, "GitHubForgeClient", IdentityClient)
+    assert forge.initialize_github_forge_identity()
+    assert verified == ["reviewer"]
+    assert isinstance(forge._client_for_repository("owner/repo"), IdentityClient)
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "")
+    failures = []
+    forge.set_github_identity_degraded_callback(failures.append)
+    assert not forge.initialize_github_forge_identity()
+    assert forge.github_identity_is_degraded()
+    assert isinstance(failures[0], forge.GitHubIdentityVerificationError)
+    with pytest.raises(ToolPolicyRefusal, match="disabled"):
+        forge.confirm_github_tool_identity("reviewer")
+
+
+def test_armed_spec_is_bound_to_server_evidence_and_scoped_head(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    evidence = tmp_path / "state" / "worklink" / "evidence"
+    evidence.mkdir(parents=True)
+    (evidence / "1949-run.json").write_text(json.dumps({
+        "pr_url": "https://github.com/owner/repo/pull/17",
+    }), encoding="utf-8")
+    payload = {
+        "id": 1949, "title": "Build safely", "status": "open",
+        "labels": ["worklink:armed"], "description": "Authoritative spec",
+    }
+
+    def show_issue(args, *, cwd, stdout, **kwargs):
+        assert args[1:] == ["issue", "show", "1949", "--json"]
+        assert cwd == str(tmp_path)
+        stdout.write(json.dumps(payload).encode())
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(forge.subprocess, "run", show_issue)
+    runtime = _runtime()
+    tool = forge.pr_spec
+    token = access_control.begin_protected_result_capture()
+    try:
+        assert tool.func("owner/repo", 17, runtime=runtime) == payload
+    finally:
+        provenance = access_control.end_protected_result_capture(token)
+    assert provenance.sources[0].resource_id == "owner/repo#pull/17@" + "a" * 40
+    with pytest.raises(ToolPolicyRefusal, match="outside this turn's scope"):
+        tool.func("owner/repo", 18, runtime=runtime)
+    (evidence / "1949-run.json").write_text(json.dumps({
+        "pr_url": "https://github.com/other/repo/pull/17",
+    }), encoding="utf-8")
+    assert tool.func("owner/repo", 17, runtime=runtime) == {"error": "no_bound_spec"}
+
+
+def test_unsupported_operation_escalates_once_and_persists(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    events = []
+    import mimir.event_logger as event_logger
+
+    monkeypatch.setattr(event_logger, "log_durable_event_sync", lambda *a, **kw: events.append((a, kw)))
+    runtime = _runtime()
+    arguments = {
+        "repository": "owner/repo", "pull_request": 17,
+        "description": "Need a new operation", "attempted_operations": ["Checked review"],
+        "runtime": runtime,
+    }
+    result = forge.unsupported_operation.func(**arguments)
+    assert result["status"] == "unsupported_operation"
+    assert result["escalated"] is True
+    assert result["attempted_operations"] == ["Checked review"]
+    assert events == [(('unsupported_operation',), {
+        "repository": "owner/repo", "pull_request": 17,
+        "operation": result["operation"], "description": "Need a new operation",
+        "attempted_operations": ["Checked review"],
+        "scope_id": runtime.context.repo_pr_action_scope.scope_id,
+        "operator_visible": True,
+    })]
+    persisted = tmp_path / "state" / "unsupported_operations.json"
+    assert json.loads(persisted.read_text(encoding="utf-8")) == [
+        runtime.context.repo_pr_action_scope.scope_id + ":" + result["operation"]
+    ]
+    assert forge.unsupported_operation.func(**arguments)["escalated"] is False
+    assert len(events) == 1
+    with pytest.raises(ToolPolicyRefusal, match="outside this turn's scope"):
+        forge.unsupported_operation.func(**{**arguments, "pull_request": 18})
+    assert len(events) == 1
