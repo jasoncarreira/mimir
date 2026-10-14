@@ -12,6 +12,7 @@ Fills gaps NOT already in test_saga_ops_wiring.py:
 from __future__ import annotations
 
 import subprocess
+import json
 import sys
 import textwrap
 import time
@@ -719,7 +720,8 @@ async def test_forget_preserves_supported_backend_arguments(
     client = Mock(spec=SagaStore) if in_process else _StubStore()
     client.forget = AsyncMock(return_value={"tombstoned_count": 0})
     monkeypatch.setitem(_MEMORY_STATE, "client", client)
-    args = {"dry_run": False, "min_retrievals": 1, "confidence_floor": 0.0, "grace_days": 0}
+    args = {"dry_run": False, "min_retrievals": 1, "activation_below": 0.0,
+            "grace_days": 0, "preview_token": "reviewed"}
     if not in_process:
         args.update(contribution_threshold=0.0, contradiction_threshold=0.0)
     result = await saga_ops.saga_forget.coroutine(
@@ -729,3 +731,45 @@ async def test_forget_preserves_supported_backend_arguments(
         **args, auth_context=turn_with_session.auth_context,
     )
     assert '"tombstoned_count": 0' in result
+
+
+def test_forget_schema_documents_log_activation_not_confidence():
+    fields = saga_ops.saga_forget.args_schema.model_fields
+    assert "confidence_floor" not in fields
+    assert "activation_below" in fields
+    description = saga_ops.saga_forget.description
+    assert "log value" in description and "-inf means never accessed" in description
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0.1, float("nan"), float("inf"), -float("inf")])
+async def test_forget_rejects_invalid_activation(store, turn_with_session, value):
+    result = await saga_ops.saga_forget.coroutine(
+        activation_below=value, runtime=_runtime(turn_with_session))
+    assert "finite and <= 0" in result
+    assert store.forget_calls == []
+
+
+@pytest.mark.asyncio
+async def test_forget_acknowledged_review_emits_clear_without_delete(
+    store, turn_with_session, monkeypatch,
+):
+    import mimir.event_logger as events
+
+    store.forget = AsyncMock(return_value={"dry_run": True, "preview_token": "binding",
+                                           "candidates": [{"id": "one"}]})
+    emitted = []
+
+    async def capture(kind, **kwargs):
+        emitted.append(kind)
+
+    monkeypatch.setattr(events, "log_event", capture)
+    wrong = await saga_ops.saga_forget.coroutine(
+        acknowledge="wrong", runtime=_runtime(turn_with_session))
+    assert "does not match" in wrong
+    assert emitted == []
+    result = await saga_ops.saga_forget.coroutine(
+        acknowledge="binding", runtime=_runtime(turn_with_session))
+    assert json.loads(result)["preview_token"] == "binding"
+    assert emitted == ["saga_forget_reviewed"]
+    assert all(call.kwargs["dry_run"] for call in store.forget.await_args_list)

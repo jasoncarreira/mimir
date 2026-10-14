@@ -2361,6 +2361,16 @@ def test_pending_forget_clears_when_forget_after_decay(tmp_path: Path):
     assert pending_forget_candidates_count(events) is None
 
 
+def test_pending_forget_clears_on_acknowledged_review_without_delete(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    _write_jsonl(events, [
+        {"timestamp": _ts(2), "type": "saga_decay_ok",
+         "result": {"forgetting_candidates": 7}},
+        {"timestamp": _ts(1), "type": "saga_forget_reviewed"},
+    ])
+    assert pending_forget_candidates_count(events) is None
+
+
 def test_pending_forget_persists_when_forget_predates_decay(tmp_path: Path):
     """A forget from BEFORE the most recent decay doesn't clear the
     block — the new decay's count is the source of truth."""

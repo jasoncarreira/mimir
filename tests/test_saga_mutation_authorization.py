@@ -563,7 +563,7 @@ async def test_admin_forget_requires_implemented_criterion(client: SagaStore, mo
         await client.forget(dry_run=False, auth_context=auth, **criteria)
     result = await saga_forget.coroutine(dry_run=False, runtime=runtime, **criteria)
     assert "saga_forget failed:" in result
-    assert "supply min_retrievals, confidence_floor, or grace_days" in result
+    assert "supply min_retrievals, activation_below, or grace_days" in result
     assert client._ensure_conn().execute(
         "SELECT COUNT(*) FROM atoms WHERE tombstoned = 1"
     ).fetchone()[0] == 0
@@ -583,7 +583,8 @@ async def test_admin_tool_narrowed_forget_preserves_nonmatching_atom(client: Sag
     runtime = SimpleNamespace(context=_auth("admin", admin=True))
     preview = json.loads(await saga_forget.coroutine(grace_days=14, runtime=runtime))
     assert preview["preview_ids"] == [old]
-    result = json.loads(await saga_forget.coroutine(dry_run=False, grace_days=14, runtime=runtime))
+    result = json.loads(await saga_forget.coroutine(dry_run=False, grace_days=14,
+        preview_token=preview["preview_token"], allow_bulk=True, runtime=runtime))
     assert result["tombstoned_count"] == 1
     assert conn.execute("SELECT tombstoned FROM atoms WHERE id = ?", (old,)).fetchone()[0] == 1
     assert conn.execute("SELECT tombstoned FROM atoms WHERE id = ?", (young,)).fetchone()[0] == 0
@@ -605,6 +606,47 @@ async def test_forget_preview_contains_only_authorized_ids(client: SagaStore):
 
     assert result["preview_ids"] == [own]
     assert result["dry_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_store_forget_binding_bulk_and_admin_unforget_round_trip(client: SagaStore):
+    atom_id = await _atom(client, "restorable atom", owner="alice")
+    admin = _auth("admin", admin=True)
+    preview = await client.forget(min_retrievals=1, auth_context=admin)
+    assert preview["candidates"][0]["id"] == atom_id
+    with pytest.raises(ValueError, match="Preview token"):
+        await client.forget(dry_run=False, min_retrievals=1, auth_context=admin)
+    with pytest.raises(ValueError, match="Bulk forget refused"):
+        await client.forget(dry_run=False, min_retrievals=1, auth_context=admin,
+                            preview_token=preview["preview_token"])
+    deleted = await client.forget(dry_run=False, min_retrievals=1, auth_context=admin,
+                                  preview_token=preview["preview_token"], allow_bulk=True)
+    assert deleted["tombstoned_ids"] == [atom_id]
+    assert (await client.get_atoms([atom_id], auth_context=admin))["atoms"] == []
+    with pytest.raises(PermissionError, match="admin authority"):
+        await client.unforget(ids=[atom_id], auth_context=_auth("alice"))
+    assert (await client.get_atoms([atom_id], auth_context=admin))["atoms"] == []
+    restored = await client.unforget(ids=[atom_id], auth_context=admin)
+    assert restored["restored_ids"] == [atom_id]
+    assert [a["id"] for a in (await client.get_atoms([atom_id], auth_context=admin))["atoms"]] == [atom_id]
+
+
+@pytest.mark.asyncio
+async def test_operator_cli_unforget_by_reason(client: SagaStore, capsys):
+    import argparse
+    import asyncio
+    from mimir.commands.memory import _run_unforget
+
+    atom_id = await _atom(client, "operator restoration", owner="alice")
+    admin = _auth("admin", admin=True)
+    preview = await client.forget(min_retrievals=1, auth_context=admin)
+    await client.forget(dry_run=False, min_retrievals=1, auth_context=admin,
+                        preview_token=preview["preview_token"], allow_bulk=True)
+    args = argparse.Namespace(db=client._db_path, ids=None, reason="bulk_criteria")
+    # The CLI uses asyncio.run, so execute its synchronous dispatch off-loop.
+    assert await asyncio.to_thread(_run_unforget, args) == 0
+    assert atom_id in json.loads(capsys.readouterr().out)["restored_ids"]
+    assert [a["id"] for a in (await client.get_atoms([atom_id], auth_context=admin))["atoms"]] == [atom_id]
 
 
 @pytest.mark.asyncio
@@ -632,7 +674,11 @@ async def test_forget_denies_unauthorized_dependent_observation_before_write(
     )
     conn.commit()
 
-    result = await client.forget(dry_run=False, min_retrievals=1, auth_context=_auth("alice"))
+    from mimir.saga.forget import forget_by_criteria
+    token = forget_by_criteria(conn, min_retrievals=1,
+                               owner_principal="alice").preview_token
+    result = await client.forget(dry_run=False, min_retrievals=1, auth_context=_auth("alice"),
+                                 preview_token=token, allow_bulk=True)
 
     assert result == {
         "tombstoned_count": 0,
@@ -693,7 +739,9 @@ async def test_forget_updates_only_authorized_dependents_and_index(
     client._index = index
     monkeypatch.setattr(client, "_rebuild_index_if_needed", lambda _conn: None)
 
-    result = await client.forget(dry_run=False, min_retrievals=1, auth_context=_auth("alice"))
+    result = await client.forget(dry_run=False, min_retrievals=1, auth_context=_auth("alice"),
+                                 preview_token=(await client.forget(dry_run=True, min_retrievals=1,
+                                     auth_context=_auth("alice")))["preview_token"], allow_bulk=True)
 
     assert result["tombstoned_count"] == 1
     assert index.removed == [own]
@@ -745,7 +793,9 @@ async def test_forget_rolls_back_tombstones_when_dependent_refresh_fails(
     monkeypatch.setattr(forget_module, "refresh_trend", fail_refresh)
 
     with pytest.raises(RuntimeError, match="injected dependent refresh failure"):
-        await client.forget(dry_run=False, min_retrievals=1, auth_context=_auth("alice"))
+        await client.forget(dry_run=False, min_retrievals=1, auth_context=_auth("alice"),
+                            preview_token=(await client.forget(dry_run=True, min_retrievals=1,
+                                auth_context=_auth("alice")))["preview_token"], allow_bulk=True)
 
     assert (
         conn.execute(
@@ -773,7 +823,9 @@ async def test_forgotten_source_atom_hides_derived_triples(client: SagaStore):
         auth_context=_auth("admin", admin=True),
     )
 
-    result = await client.forget(dry_run=False, min_retrievals=1, auth_context=_auth("alice"))
+    result = await client.forget(dry_run=False, min_retrievals=1, auth_context=_auth("alice"),
+                                 preview_token=(await client.forget(dry_run=True, min_retrievals=1,
+                                     auth_context=_auth("alice")))["preview_token"], allow_bulk=True)
 
     assert result["tombstoned_count"] == 1
     assert (
@@ -928,6 +980,8 @@ async def test_non_platform_service_can_read_and_forget_own_domainless_write(
             dry_run=False,
             min_retrievals=1,
             auth_context=auth_context,
+            preview_token=(await client.forget(dry_run=True, min_retrievals=1,
+                auth_context=auth_context))["preview_token"], allow_bulk=True,
         )
     finally:
         if original is None:
