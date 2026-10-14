@@ -15,6 +15,7 @@ import pytest
 from mimir import access_control as policy
 from mimir import read_policy
 from mimir.plugins.core import core_policy_registry
+from mimir.plugins.core import policy_membership
 from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel, TurnInteractivity
 from mimir.tool_descriptors import (
     TOOL_DESCRIPTORS,
@@ -329,6 +330,7 @@ def _snapshot(home: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
             "forge_actions": dict(sorted(policy._FORGE_TOOL_ACTIONS.items())),
             "repo_actions": dict(sorted(policy._REPO_TOOL_ACTIONS.items())),
             "retained_repo_tools": sorted(policy._RETAINED_REPO_TOOLS),
+            "repo_publish_tools": sorted(policy_membership("repo_publish_tools")),
             "protected_domains": dict(sorted(policy._PROTECTED_RESULT_DOMAINS.items())),
             "readable_domains": dict(sorted(policy._OPERATION_READABLE_DOMAIN.items())),
             "read_resource_operations": sorted(read_policy.READ_RESOURCE_OPERATIONS),
@@ -413,6 +415,11 @@ def test_pre_extraction_coding_policy_is_frozen(
     assert CODING_TOOLS <= frozen["authorization"].keys()
     assert CODING_TOOLS <= frozen["extractor_results"].keys()
     assert CODING_TOOLS <= registry.tools.keys()
+    required_memberships = (
+        "retained_repo_tools", "worklink_build_tools", "repo_publish_tools",
+        "tainted_writes",
+    )
+    assert set(required_memberships) <= tables.keys()
     for name in sorted(CODING_TOOLS):
         tool = registry.tools[name]
         descriptor = frozen["descriptors"][name]
@@ -428,14 +435,8 @@ def test_pre_extraction_coding_policy_is_frozen(
         assert tool.profiles == frozenset(
             profile for profile, names in tables["profiles"].items() if name in names
         )
-        for membership, table in (
-            ("retained_repo_tools", "retained_repo_tools"),
-            ("worklink_build_tools", "worklink_build_tools"),
-            ("repo_publish_tools", "repo_publish_tools"),
-            ("tainted_writes", "tainted_writes"),
-        ):
-            if table in tables:
-                assert (membership in tool.memberships) == (name in tables[table])
+        for membership in required_memberships:
+            assert (membership in tool.memberships) == (name in tables[membership])
         assert len(frozen["authorization"][name]) == 18
     observed = _outcomes(home)
     for name in CODING_TOOLS:
