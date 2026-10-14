@@ -364,7 +364,7 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
 
     def policy_test_git(root, arguments, **kwargs):
         assert arguments == ("status", "--porcelain=v2", "--branch", "--untracked-files=no")
-        assert kwargs["timeout"] == 5
+        assert kwargs["timeout"] == access_control._LEASE_GIT_TIMEOUT_S
         status_probes.append(arguments)
         if case == "git_timeout":
             return GitProcessResult(-9, timed_out=True)
@@ -511,7 +511,7 @@ def test_clean_attested_lease_cannot_relax_tainted_commit_or_push(
 
     def policy_test_git(root, arguments, **kwargs):
         assert arguments == ("status", "--porcelain=v2", "--branch", "--untracked-files=no")
-        assert kwargs["timeout"] == 5
+        assert kwargs["timeout"] == access_control._LEASE_GIT_TIMEOUT_S
         return hardened_git(root, arguments, **{**kwargs, "timeout": 30})
 
     monkeypatch.setattr(repo_tools, "hardened_git_command", policy_test_git)
