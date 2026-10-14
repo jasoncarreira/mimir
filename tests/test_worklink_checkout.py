@@ -134,7 +134,10 @@ def test_prune_attempt_checkouts_skips_active(tmp_path: Path) -> None:
     # while it works in deep subdirs (the #840 worktree-loss race).
     import os
 
-    root = tmp_path / ".worklink"
+    # Nest under a parent whose name contains the live attempt's name, so every
+    # path (including the dead one) carries "840-1"; CI's run-id evidence root
+    # did this by accident (...-38597961840-1). Only whole-path checks pass here.
+    root = tmp_path / "evidence-38597961840-1" / ".worklink"
     live = root / "840-1"
     dead = root / "841-1"
     live.mkdir(parents=True)
@@ -151,7 +154,7 @@ def test_prune_attempt_checkouts_skips_active(tmp_path: Path) -> None:
         os.utime(path, (old_mtime, old_mtime))
 
     pruned = prune_attempt_checkouts(
-        tmp_path,
+        root.parent,
         older_than=timedelta(days=3),
         now=now,
         runner=runner,
