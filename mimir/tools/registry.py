@@ -45,6 +45,7 @@ log = logging.getLogger(__name__)
 
 from langchain_core.runnables import RunnableConfig
 from langchain.tools import ToolRuntime
+from .refusals import ToolPolicyRefusal
 
 from ..bridges._directives import (
     Directive,
@@ -1962,7 +1963,7 @@ async def commitment_complete(
         return "commitment_complete failed: no commitments store"
     refusal = _commitment_taint_refusal(runtime, "commitment_complete")
     if refusal is not None:
-        return f"commitment_complete failed: {refusal}"
+        raise ToolPolicyRefusal(f"commitment_complete failed: {refusal}")
     actor = _commitment_actor(runtime)
     if actor is None:
         return "commitment_complete failed: authorization context unavailable"
@@ -2000,7 +2001,7 @@ async def commitment_snooze(
         return "commitment_snooze failed: no commitments store"
     refusal = _commitment_taint_refusal(runtime, "commitment_snooze")
     if refusal is not None:
-        return f"commitment_snooze failed: {refusal}"
+        raise ToolPolicyRefusal(f"commitment_snooze failed: {refusal}")
     actor = _commitment_actor(runtime)
     if actor is None:
         return "commitment_snooze failed: authorization context unavailable"
@@ -2045,7 +2046,7 @@ async def commitment_dismiss(
         return "commitment_dismiss failed: no commitments store"
     refusal = _commitment_taint_refusal(runtime, "commitment_dismiss")
     if refusal is not None:
-        return f"commitment_dismiss failed: {refusal}"
+        raise ToolPolicyRefusal(f"commitment_dismiss failed: {refusal}")
     actor = _commitment_actor(runtime)
     if actor is None:
         return "commitment_dismiss failed: authorization context unavailable"

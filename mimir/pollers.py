@@ -126,6 +126,7 @@ from .poller_budget import (
     parse_poller_budget_config,
     validate_poller_usage_signal,
 )
+from .poller_write_paths import refused_poller_write_paths
 
 log = logging.getLogger(__name__)
 
@@ -2176,6 +2177,14 @@ def discover_pollers(
                     ))
                 trust_source = "external"
             seen_names[name] = pollers_file
+            if state_root is not None:
+                home = state_root.parent.parent
+                for path in refused_poller_write_paths(skill_dir, entry, home):
+                    log.warning(
+                        "poller_agent_write_vetoed: poller=%s path=%s; "
+                        "use this turn's scratch directory or a proposal worktree",
+                        name, path,
+                    )
             pollers.append(
                 PollerConfig(
                     name=name,

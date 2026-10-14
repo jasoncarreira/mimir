@@ -14,6 +14,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,6 +31,125 @@ from mimir.commitments.poller import (
     check_due_and_expired,
 )
 from mimir.event_logger import FEEDBACK_EVENT_VERSION, init_logger
+
+
+@pytest.mark.asyncio
+async def test_scheduled_review_alert_then_fresh_operator_completes(tmp_path: Path, monkeypatch):
+    """The review hands off an ID, not authority; a new operator turn closes it."""
+    from mimir._context import set_current_turn, reset_current_turn
+    from mimir.models import (
+        AuthContext, InformationFlowLabels, InformationFlowState, Integrity,
+        SourceLabel, TurnContext,
+    )
+    import importlib
+    alert_module = importlib.import_module("mimir.tools.operator_alert")
+    from mimir.tools.registry import _STATE, commitment_complete, commitment_list
+    from mimir.tools.refusals import ToolPolicyRefusal
+    from mimir.prompt_templates import bundled_defaults
+    from mimir.access_control import ToolRegistry
+
+    prompt = bundled_defaults()["commitments-review.md"]
+    prose = " ".join(prompt.split())
+    assert "commitment_list(due_within_days=0)" in prose
+    assert "operator_alert" in prose and "new user turn" in prose
+    assert "another fresh user turn" in prose
+    assert "commitment_complete(commitment_id=...)" in prompt
+
+    store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
+    rec = await store.add(CommitmentRecord(
+        id=make_commitment_id(), channel_id="review-channel", text="Ship verified fix",
+        owner_principal="user:operator",
+    ))
+    monkeypatch.setitem(_STATE, "commitments_store", store)
+    external = SourceLabel(
+        principal="external", domain="web", resource_id="review-evidence",
+        bridge_instance="test", sensitivity="public",
+        authorized_principals=frozenset({"external"}),
+    )
+    tainted_labels = InformationFlowLabels(sources=(external,))
+    tainted = AuthContext(
+        principal="user:operator", canonical_principal="user:operator",
+        roles=("admin",), event_ingress=None, trigger="scheduled_tick",
+        channel_id="scheduler:commitments-review", interactivity=None,
+        ifc_labels=tainted_labels, ifc_state=InformationFlowState(labels=tainted_labels),
+    )
+    with pytest.raises(ToolPolicyRefusal, match="durable memory mutation refused"):
+        await commitment_complete.coroutine(
+            commitment_id=rec.id, runtime=SimpleNamespace(context=tainted),
+        )
+    assert store.current_state()[rec.id].status == CommitmentStatus.PENDING.value
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    live_write = ToolRegistry().authorize_tool(
+        "write_file", tainted, enforce=False, ifc_labels=tainted_labels,
+        target_channel=str(tmp_path / "state" / "pollers" / "review" / "draft.md"),
+    )
+    assert live_write.allowed is False
+    assert live_write.reason == "write_blocked_by_untrusted_ingest"
+
+    sent = []
+
+    async def send(channel, text, *, final):
+        sent.append((channel, text, final))
+        return SimpleNamespace(sent=True, message_id="review-alert")
+
+    monkeypatch.setattr(alert_module, "_channel_registry", SimpleNamespace(send=send))
+    monkeypatch.setattr(alert_module, "_config", SimpleNamespace(operator_alert_channel="operator-alerts"))
+    turn = TurnContext(
+        turn_id="review", session_id="review", trigger="scheduled_tick",
+        channel_id="scheduler:commitments-review", started_at=time.monotonic(),
+        auth_context=tainted,
+    )
+    token = set_current_turn(turn)
+    try:
+        result = await alert_module.operator_alert.coroutine(
+            text="Weekly commitments review: open a user turn to list and inspect commitments. "
+                 "Approve IDs in a separate clean user turn."
+        )
+    finally:
+        reset_current_turn(token)
+    assert "message_id=review-alert" in result
+    assert sent == [(
+        "operator-alerts",
+        "Weekly commitments review: open a user turn to list and inspect commitments. "
+        "Approve IDs in a separate clean user turn.",
+        False,
+    )]
+    assert store.current_state()[rec.id].status == CommitmentStatus.PENDING.value
+
+    # The review (and any supporting external read) belongs to a different
+    # turn. Its result is not authority to close the record in that turn.
+    review = AuthContext(
+        principal="user:operator", canonical_principal="user:operator",
+        roles=("admin",), event_ingress=None, trigger="user_message",
+        channel_id="operator-review", interactivity=None,
+        ifc_labels=tainted_labels, ifc_state=InformationFlowState(labels=tainted_labels),
+    )
+    listed = await commitment_list.coroutine(
+        due_within_days=0, runtime=SimpleNamespace(context=review),
+    )
+    assert rec.id in listed
+    with pytest.raises(ToolPolicyRefusal, match="durable memory mutation refused"):
+        await commitment_complete.coroutine(
+            commitment_id=rec.id, runtime=SimpleNamespace(context=review),
+        )
+
+    approved = SourceLabel(
+        principal="user:operator", domain="channel", resource_id="operator-reply",
+        bridge_instance="test", sensitivity="private", integrity=Integrity.TRUSTED,
+        authorized_principals=frozenset({"user:operator"}),
+    )
+    clean_labels = InformationFlowLabels(sources=(approved,))
+    clean = AuthContext(
+        principal="user:operator", canonical_principal="user:operator",
+        roles=("admin",), event_ingress=None, trigger="user_message",
+        channel_id="operator-reply", interactivity=None,
+        ifc_labels=clean_labels, ifc_state=InformationFlowState(labels=clean_labels),
+    )
+    result = await commitment_complete.coroutine(
+        commitment_id=rec.id, runtime=SimpleNamespace(context=clean),
+    )
+    assert result == f"commitment_complete ok: id={rec.id}"
+    assert store.current_state()[rec.id].status == CommitmentStatus.COMPLETED.value
 
 
 def _events(home: Path) -> list[dict]:

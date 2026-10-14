@@ -24,11 +24,20 @@ from typing_extensions import NotRequired
 
 from mimir.access_control import (
     OperationDecision,
+    _live_untrusted_active_ingest,
     get_operation_catalog,
     get_trusted_service_from_auth_context,
     service_can_invoke_operation,
 )
 from mimir.models import AuthContext
+
+# These operations have no scratch/proposal destination argument. Unlike file
+# writes (which can target turn scratch), they cannot succeed after ingest.
+_TAINTED_DURABLE_TOOLS = frozenset({
+    "memory_store", "saga_feedback", "saga_mark_contributions",
+    "saga_end_session", "saga_forget", "saga_record_skill_learning",
+    "commitment_complete", "commitment_snooze", "commitment_dismiss",
+})
 
 
 def _latest_surface(_current: list[str], update: list[str]) -> list[str]:
@@ -69,9 +78,16 @@ class ServiceToolSurfaceMiddleware(AgentMiddleware):
             if isinstance(context, AuthContext) else None
         )
         catalog = get_operation_catalog()
+        poller_tainted = (
+            isinstance(context, AuthContext)
+            and context.trigger == "poller"
+            and _live_untrusted_active_ingest(context, context.ifc_labels) is True
+        )
         tools = [
             tool for tool in request.tools
-            if service is not None and _tool_name(tool) and (
+            if service is not None and _tool_name(tool)
+            and not (poller_tainted and _tool_name(tool) in _TAINTED_DURABLE_TOOLS)
+            and (
                 (
                     _tool_name(tool) == "read_file"
                     or (

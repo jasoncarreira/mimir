@@ -30,6 +30,7 @@ from dataclasses import asdict, fields, replace
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -76,6 +77,44 @@ from mimir.tools.budget_gate import (
 from tests.auth_helpers import attach_middleware_auth_context
 
 pytestmark = pytest.mark.usefixtures("middleware_event_logger")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,args", [
+    ("commitment_complete", {"commitment_id": "c-pending"}),
+    ("memory_store", {"content": "fact", "stream": "semantic"}),
+])
+async def test_durable_taint_refusal_is_error_shaped(name, args, monkeypatch):
+    from mimir.tools.registry import _STATE, commitment_complete
+    from mimir.tools.memory import _MEMORY_STATE
+    from mimir.tools.store import memory_store
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    monkeypatch.setitem(_STATE, "commitments_store", object())
+    monkeypatch.setitem(_MEMORY_STATE, "client", object())
+    label = SourceLabel(
+        principal="external", domain="web", resource_id="poller:response",
+        bridge_instance="test", sensitivity="public",
+        authorized_principals=frozenset({"external"}),
+    )
+    labels = InformationFlowLabels(sources=(label,))
+    auth = replace(_untainted_ifc_auth(), ifc_labels=labels,
+                   ifc_state=InformationFlowState(labels=labels))
+    tool = {"commitment_complete": commitment_complete, "memory_store": memory_store}[name]
+    # Pin the tool's refusal as well as the middleware result: a pre-execution
+    # gate denial alone would not catch a success-shaped tool implementation.
+    with pytest.raises(ToolPolicyRefusal, match="durable memory mutation refused"):
+        await tool.coroutine(**args, runtime=SimpleNamespace(context=auth))
+
+    async def handler(request):
+        await tool.coroutine(**args, runtime=SimpleNamespace(context=auth))
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    result = await BudgetGateMiddleware().awrap_tool_call(
+        _make_request(name, "taint-refusal", auth, args), handler,
+    )
+    assert result.status == "error"
+    assert "refused" in result.content.lower() or "untrusted" in result.content.lower()
 
 
 def test_replace_file_outbox_payload_control_and_effect_inventory(tmp_path, monkeypatch):

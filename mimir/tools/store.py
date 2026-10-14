@@ -32,6 +32,7 @@ from ..access_control import (
 )
 from ..models import AuthContext
 from .memory import _MEMORY_STATE
+from .refusals import ToolPolicyRefusal
 
 
 @tool
@@ -86,7 +87,7 @@ async def memory_store(
     )
     taint_refusal = saga_mutation_taint_refusal(auth_context)
     if taint_refusal is not None:
-        return f"memory_store failed: {taint_refusal}"
+        raise ToolPolicyRefusal(f"memory_store failed: {taint_refusal}")
     if not can_write_saga(auth_context, "memory_store"):
         return (
             "memory_store failed: write access denied. "

@@ -1626,8 +1626,8 @@ async def test_commitment_mutation_tools_pass_runtime_actor(
 async def test_commitment_mutation_tools_fail_closed_without_runtime() -> None:
     store = _StubCommitmentsStore()
     set_commitments_store(store)
-    out = await commitment_complete.ainvoke({"commitment_id": "c-owned"})
-    assert out == "commitment_complete failed: authorization context unavailable"
+    with pytest.raises(ToolException, match="authorization context unavailable"):
+        await commitment_complete.ainvoke({"commitment_id": "c-owned"})
     assert store.complete_calls == []
 
 

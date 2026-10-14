@@ -300,17 +300,22 @@ async def test_memory_store_uses_active_ingest_only_integrity_boundary(
         ifc_state=InformationFlowState(labels=labels),
     )
 
-    out = await memory_store.coroutine(
-        content="restated recalled fact", stream="semantic",
-        runtime=_runtime(context, f"{integrity_effect}-recall-store"),
-    )
-
-    assert ("stored" in out) is stored
+    from mimir.tools.refusals import ToolPolicyRefusal
+    if stored:
+        out = await memory_store.coroutine(
+            content="restated recalled fact", stream="semantic",
+            runtime=_runtime(context, f"{integrity_effect}-recall-store"),
+        )
+        assert "stored" in out
+    else:
+        with pytest.raises(ToolPolicyRefusal, match="tainted"):
+            await memory_store.coroutine(
+                content="restated recalled fact", stream="semantic",
+                runtime=_runtime(context, f"{integrity_effect}-recall-store"),
+            )
     assert bool(write_store.atom_calls) is stored
     if stored:
         assert "integrity" not in write_store.atom_calls[-1]
-    else:
-        assert "tainted" in out
 
 
 @pytest.mark.asyncio
@@ -374,11 +379,12 @@ async def test_real_store_rejects_write_after_turn_becomes_tainted(
             authorized_principals=frozenset({"alice"}),
             integrity="untrusted", integrity_effect="active_ingest",
         )))
-        out = await tool.ainvoke({
-            **args, "content": "untrusted injected instruction",
-            "runtime": _runtime(context, "after-taint"),
-        })
-        assert "tainted" in out
+        from mimir.tools.refusals import ToolPolicyRefusal
+        with pytest.raises(ToolPolicyRefusal, match="tainted"):
+            await tool.ainvoke({
+                **args, "content": "untrusted injected instruction",
+                "runtime": _runtime(context, "after-taint"),
+            })
         assert [row[0] for row in conn.execute("SELECT content FROM atoms")] == [
             "trusted operator fact",
         ]
@@ -398,12 +404,12 @@ async def test_memory_store_empty_labels_are_refused(
         ifc_state=InformationFlowState(labels=labels),
     )
 
-    out = await memory_store.coroutine(
-        content="missing provenance", stream="semantic",
-        runtime=_runtime(context, "empty-label-store"),
-    )
-
-    assert "tainted" in out
+    from mimir.tools.refusals import ToolPolicyRefusal
+    with pytest.raises(ToolPolicyRefusal, match="tainted"):
+        await memory_store.coroutine(
+            content="missing provenance", stream="semantic",
+            runtime=_runtime(context, "empty-label-store"),
+        )
     assert write_store.atom_calls == []
 
 
@@ -433,12 +439,12 @@ async def test_research_poller_untrusted_write_is_refused(
         extra={"poller_name": "hn-ai"},
     ), enforce=True, ifc_labels=labels)
 
-    out = await memory_store.coroutine(
-        content="untrusted finding", stream="semantic",
-        runtime=_runtime(context, "poller-store"),
-    )
-
-    assert "tainted" in out
+    from mimir.tools.refusals import ToolPolicyRefusal
+    with pytest.raises(ToolPolicyRefusal, match="tainted"):
+        await memory_store.coroutine(
+            content="untrusted finding", stream="semantic",
+            runtime=_runtime(context, "poller-store"),
+        )
     assert write_store.atom_calls == []
     assert {"integrity", "origin_trigger", "origin_ref"}.isdisjoint(
         memory_store.args_schema.model_fields
