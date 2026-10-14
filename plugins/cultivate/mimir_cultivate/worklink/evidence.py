@@ -144,20 +144,36 @@ EVIDENCE_SAFE_GIT_OPERATIONS = frozenset({
 _FACTORY_CHECKOUT_ROOT = Path("/workspace/.worklink")
 
 
-def _factory_gate_checkout(checkout: Path, issue: int, attempt: int) -> bool:
-    """Accept only the factory executor's path-addressed checkout shape."""
+def _factory_gate_checkout(checkout: Path, issue: int, attempt: int) -> Path | None:
+    """Return the authorized outer checkout for a no-follow factory sandbox."""
     if not checkout.is_absolute() or ".." in checkout.parts or checkout != Path(os.path.abspath(checkout)):
-        return False
+        return None
     try:
         parts = checkout.relative_to(_FACTORY_CHECKOUT_ROOT).parts
     except ValueError:
-        return False
-    return (
-        len(parts) == 3
-        and re.fullmatch(r"[A-Za-z0-9._-]+", parts[0]) is not None
-        and parts[0] not in {".", ".."}
-        and parts[1:] == (f"{issue}-{attempt}", "checkout")
-    )
+        return None
+    if (
+        len(parts) < 6
+        or re.fullmatch(r"[A-Za-z0-9._-]+", parts[0]) is None
+        or parts[0] in {".", ".."}
+        or parts[1:4] != (f"{issue}-{attempt}", "checkout", ".factory-sandboxes")
+        or parts[4] not in {str(issue), f"chainlink-{issue}"}
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        return None
+    # Do not resolve through a symlink and then treat the resulting path as an
+    # authorized checkout. The worker will independently revalidate the outer FD.
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in checkout.parts[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return _FACTORY_CHECKOUT_ROOT.joinpath(*parts[:3])
 
 
 def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
@@ -665,6 +681,7 @@ async def _observe_evidence_from_ref(
     worker_uid_drop = True
     if test_command and not skip_test_reason:
         authorization = getattr(compute, "_authorized_checkout", None)
+        factory_outer = _factory_gate_checkout(checkout, issue, attempt) if backend == "feature_factory" else None
         worker_bound = (
             getattr(compute, "name", None) != "local_subprocess"
             or not callable(getattr(compute, "_launch_contained", None))
@@ -674,15 +691,19 @@ async def _observe_evidence_from_ref(
             or work_spec.attempt != attempt
             or work_spec.branch != branch
             or work_spec.backend != backend
+            or work_spec.test_command != test_command
         )
         if backend == "feature_factory":
-            # Factory sandboxes use the worker's path-addressed launch_factory
-            # operation, not the leaf checkout FD capability. The executor
-            # verifies the path boundary and runs as the worklink uid. Refuse
-            # implicit compute construction or controller-shell fallback.
+            client = getattr(compute, "_worker_client", None)
             worker_bound = worker_bound or (
-                not _factory_gate_checkout(checkout, issue, attempt)
+                factory_outer is None
                 or authorization is not None
+                or (client is not None and (
+                    getattr(client, "path_checkout", None) != factory_outer
+                    or getattr(client, "issue_id", None) != issue
+                    or getattr(client, "attempt", None) != attempt
+                    or getattr(client, "_launch_op", None) != "launch_factory"
+                ))
             )
         else:
             worker_bound = worker_bound or (
@@ -949,16 +970,35 @@ async def _run_compute_gate(
     # the worker-side timeout must agree with that supervisor too.
     gate_spec = replace(
         work_spec,
-        local_checkout=checkout,
+        local_checkout=_factory_gate_checkout(checkout, work_spec.issue_id, work_spec.attempt)
+        if work_spec.backend == "feature_factory" else checkout,
         local_argv=("/bin/sh", "-c", command),
         timeout_s=min(work_spec.timeout_s, 60) if diagnostic else work_spec.timeout_s,
     )
+    if work_spec.backend == "feature_factory":
+        outer = gate_spec.local_checkout
+        if outer is None:
+            raise ComputeLaunchError("Cultivate evidence gate requires an authorized worker checkout")
+        # The executor starts at the outer FD. Walk from that FD again *inside*
+        # the worker before entering the sandbox, so a replaced symlink cannot
+        # redirect the gate even between the controller check and launch.
+        enter_sandbox = """import os, sys
+fd = os.open('.', os.O_RDONLY | os.O_DIRECTORY)
+for part in sys.argv[1].split('/'):
+    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+    os.close(fd)
+    fd = child
+os.fchdir(fd)
+os.execv('/bin/sh', ['/bin/sh', '-c', sys.argv[2]])
+"""
+        relative = checkout.relative_to(outer).as_posix()
+        gate_spec = replace(gate_spec, local_argv=("python3", "-I", "-c", enter_sandbox, relative, command))
     if report_dir is not None:
         report_option_dir = report_dir
         try:
             # Contained workers enter the checkout through an authorized fd and
             # may not be able to traverse the controller's absolute parent path.
-            report_option_dir = report_dir.relative_to(checkout.resolve())
+            report_option_dir = report_dir.relative_to(checkout)
         except ValueError:
             pass
         gate_spec = with_worker_environment(
