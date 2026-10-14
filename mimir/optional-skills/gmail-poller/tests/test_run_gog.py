@@ -60,8 +60,13 @@ def test_documented_commands_are_admitted_by_service_gate(tmp_path: Path) -> Non
         assert "GOG_ACCOUNT" not in " ".join(argv)
 
 
-@pytest.fixture
-def gog_stub(tmp_path: Path):
+@pytest.fixture(params=["bash", "/bin/bash"], ids=["path-bash", "system-bash"])
+def gog_stub(tmp_path: Path, request):
+    # On macOS /bin/bash is Bash 3.2 even when PATH selects a newer Bash.
+    # Exercise both so empty-array/nounset regressions cannot hide behind PATH.
+    shell = shutil.which(request.param)
+    if shell is None:
+        pytest.skip(f"{request.param} is unavailable")
     binary_dir = tmp_path / "bin"
     binary_dir.mkdir()
     binary = binary_dir / "gog"
@@ -108,7 +113,7 @@ def gog_stub(tmp_path: Path):
         if state_dir is not None:
             command_env["STATE_DIR"] = str(state_dir)
         result = subprocess.run(
-            ["bash", str(wrapper), *args], env=command_env,
+            [shell, str(wrapper), *args], env=command_env,
             capture_output=True, text=True, check=False,
         )
         assert not hijacked.exists(), "agent-writable PATH gog was executed"
@@ -188,11 +193,25 @@ def test_refuses_unsafe_or_malformed_invocations(gog_stub, arguments: tuple[str,
     assert invocation is None
 
 
-def test_refuses_missing_config_and_account(gog_stub) -> None:
-    result, invocation = gog_stub("gmail", "get", "msg1", account=None)
-    assert result.returncode == 2
-    assert "configured account name: (none)" in result.stderr
+@pytest.mark.parametrize("arguments", [
+    ("gmail", "get", "msg1"),
+    ("gmail", "messages", "get", "msg1"),
+    ("gmail", "thread", "get", "thread1"),
+    ("gmail", "messages", "search", "in:inbox"),
+])
+def test_refuses_missing_config_and_account(gog_stub, arguments) -> None:
+    result, invocation = gog_stub(*arguments, account=None)
+    assert result.returncode == 2, result.stderr
+    assert result.stderr == "run-gog.sh: pass --account for a configured account name: (none)\n"
     assert invocation is None
+
+
+def test_auth_list_without_account_does_not_expand_empty_account_array(gog_stub) -> None:
+    result, invocation = gog_stub("auth", "list", account=None)
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert invocation["args"] == ["--readonly", "--gmail-no-send", "auth", "list"]
+    assert invocation["account"] is None
 
 
 @pytest.mark.parametrize("email", ["home@example.test", "work@example.test"])

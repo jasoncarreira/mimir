@@ -85,7 +85,9 @@ if [[ "${SUBCOMMAND[0]}" == gmail ]]; then
     # The poller stores account config in STATE_DIR; turns use the same
     # persistent location under MIMIR_HOME when STATE_DIR is not injected.
     CONFIG_DIR="${STATE_DIR:-${MIMIR_HOME:-}/state/pollers/gmail-inbox}"
-    /usr/bin/python3 - "$CONFIG_DIR/config.json" "${ACCOUNT_VALUES[@]}" <<'PY' || exit 2
+    # Bash 3.2 treats an empty array as unset under nounset. Preserve zero
+    # arguments when absent, and each quoted account argument when present.
+    /usr/bin/python3 - "$CONFIG_DIR/config.json" ${ACCOUNT_VALUES[@]+"${ACCOUNT_VALUES[@]}"} <<'PY' || exit 2
 import json
 import sys
 
