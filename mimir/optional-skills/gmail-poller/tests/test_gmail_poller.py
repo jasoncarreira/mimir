@@ -289,12 +289,16 @@ def test_config_json_multi_account_each_uses_own_prompt(
     assert "alice@example.com" in by_id["home-msg-1"]["prompt"]
     assert by_id["home-msg-1"]["account"] == "me@gmail.com"
     assert by_id["home-msg-1"]["account_name"] == "home"
+    assert "Source account: home (me@gmail.com)" in by_id["home-msg-1"]["prompt"]
+    assert "Pass --account me@gmail.com" in by_id["home-msg-1"]["prompt"]
 
     assert by_id["work-msg-1"]["batch_context"] == "WORK ACCOUNT PROMPT"
     assert "WORK ACCOUNT PROMPT" not in by_id["work-msg-1"]["prompt"]
     assert "bob@employer.com" in by_id["work-msg-1"]["prompt"]
     assert by_id["work-msg-1"]["account"] == "me@employer.com"
     assert by_id["work-msg-1"]["account_name"] == "work"
+    assert "Source account: work (me@employer.com)" in by_id["work-msg-1"]["prompt"]
+    assert "Pass --account me@employer.com" in by_id["work-msg-1"]["prompt"]
 
 
 def test_config_json_inline_prompt(fresh_poller, tmp_path, monkeypatch, capsys):

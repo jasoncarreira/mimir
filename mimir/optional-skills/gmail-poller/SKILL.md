@@ -1,6 +1,6 @@
 ---
 name: gmail-poller
-description: "Watch a Gmail inbox for new messages via the `gog` Google Workspace CLI — emits one turn per new message ID since the last poll. Cursor is a SET of message IDs (not a timestamp), so reordered or backdated deliveries don't double-emit. Opt-in: copy this directory into `<home>/skills/gmail-poller/`, install `gog`, run the OAuth setup once, set `GOG_ACCOUNT`, then arrange an operator-managed reload or restart. Companion to the `pollers` framework skill and the `world-scanning` skill (catalog of what's worth polling). For a sender-allowlist / label-filter, use a Gmail search query in `MIMIR_GMAIL_QUERY` — the Gmail search language IS the filter mechanism, this poller doesn't reimplement it."
+description: "Watch a Gmail inbox for new messages via the `gog` Google Workspace CLI — emits one turn per new message ID since the last poll. Cursor is a SET of message IDs (not a timestamp), so reordered or backdated deliveries don't double-emit. Opt-in: copy this directory into `<home>/skills/gmail-poller/`, install `gog`, run the OAuth setup once, configure accounts in state/pollers/gmail-inbox/config.json or set legacy `GOG_ACCOUNT`, then arrange an operator-managed reload or restart. Companion to the `pollers` framework skill and the `world-scanning` skill (catalog of what's worth polling). For a sender-allowlist / label-filter, use a Gmail search query in `MIMIR_GMAIL_QUERY` — the Gmail search language IS the filter mechanism, this poller doesn't reimplement it."
 ---
 
 # gmail-poller — watch a Gmail inbox
@@ -44,8 +44,8 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
 
    ### Mode A: Multi-account with per-account prompt routing (preferred)
 
-   Drop `config.json` in the skill directory that contains `scripts/poller.py`
-   (i.e. `<home>/skills/gmail-poller/config.json`):
+   Drop `config.json` at `<home>/state/pollers/gmail-inbox/config.json`
+   (the poller's `STATE_DIR/config.json`):
 
    ```json
    {
@@ -108,13 +108,14 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
    | `MIMIR_GMAIL_QUERY` | no | Gmail search override. Default: `in:inbox newer_than:1d`. Use Gmail's search language: `is:unread`, `from:`, `to:`, `subject:`, `label:`, `-from:` (exclude), `category:primary`, etc. Applies to every account. |
    | `MIMIR_GMAIL_MAX_FETCH` | no | Per-account fetch cap. Default 50, clamp 1–200. |
     | `MIMIR_HOME` | no (yes if any `prompt-file` is set) | Agent home root. Used to resolve `prompt-file` entries against `<MIMIR_HOME>/prompts/`. |
-    | `GOG_ACCOUNT` | Mode B and agent-turn reads | Gmail address for single-account legacy mode. The poller ignores it when `config.json` is present, but the declared agent-turn wrapper still requires it and restricts reads to that account. |
+    | `GOG_ACCOUNT` | Mode B only | Gmail address for single-account legacy mode. Leave unset for multi-account agent-turn reads; the wrapper then requires an explicit configured `--account`. |
     | `GOG_KEYRING_PASSWORD` | if gog's keyring needs it | Passed only to the declared agent-turn command; the poller script's `pass_env` is unchanged. |
     | `JEV_KEY` | only when `triage` is enabled | TypeSafe API key used by the optional Jev pre-turn triage. |
 
     The poller script's env vars (including `MIMIR_HOME` and `JEV_KEY`) are
     declared in the poller's `pass_env`. The agent-turn command separately
-    passes `GOG_ACCOUNT` and `GOG_KEYRING_PASSWORD`. `MIMIR_*`-prefixed keys
+    passes `GOG_ACCOUNT`, `GOG_KEYRING_PASSWORD`, `MIMIR_HOME`, and `STATE_DIR`
+    (when set). `MIMIR_*`-prefixed keys
     would otherwise be stripped by the env filter — explicit `pass_env`
     bypasses both gates.
 
@@ -229,7 +230,8 @@ One JSONL line per never-before-seen message ID:
 `account` and `account_name` reflect the matched entry from `config.json`
 (or `legacy@x.com` / `"default"` in single-account mode).
 When no account instructions are configured, `batch_context` is omitted.
-The per-message `prompt` contains the sender, subject, snippet, URL and ID,
+The per-message `prompt` contains the sender, subject, snippet, URL, ID, source
+account name and address, and an instruction to pass `--account` for reads,
 followed by Jev triage answers and the NOTIFY line when applicable. Shared
 account instructions render once before the numbered items in a batch; emails
 from accounts with different instructions are batched separately.
@@ -242,16 +244,20 @@ In agent turns, inspect your state with `read_file`, `ls`, `glob` and `grep`.
 The shell is only for `run-gog.sh`, which supports exactly these commands:
 
 ```sh
-bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail messages search 'in:inbox is:unread' --max 5 --json --no-input
-bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail get 19483abc --full --json --no-input
-bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail thread get 19483abc --full --json --no-input
+bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail messages search 'in:inbox is:unread' --account you@gmail.com --max 5 --json --no-input
+bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail messages get 19483abc --account you@gmail.com --full --json --no-input
+bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail thread get 19483abc --account you@gmail.com --full --json --no-input
 ```
 
 It also supports `auth list` for checking authentication. Message and thread
 reads require one ID; search requires one query. Do not expand environment
 variables in these commands: the service gate executes a literal argv, not a
-shell. The wrapper adds `--account` from its passed `GOG_ACCOUNT` environment
-when omitted and rejects any explicit account that does not match. It invokes
+shell. In multi-account mode, use the address in the event's source account line
+as the literal `--account` value; the wrapper accepts only exact emails listed in
+`STATE_DIR/config.json` (default `<MIMIR_HOME>/state/pollers/gmail-inbox/config.json`).
+Refusals list account names only. `gmail messages get` maps to `gmail get`.
+In legacy mode, the wrapper adds `--account` from `GOG_ACCOUNT` when omitted
+and rejects any explicit account that does not match. It invokes
 the pinned `/usr/local/bin/gog`, restricts options and accounts, and always
 passes gog's `--readonly` and `--gmail-no-send` runtime
 blocks on mutating requests and sends. Attachment downloads are not permitted.
@@ -301,9 +307,9 @@ already gives us a better one — duplicating it would be net loss.
 
 If the poller isn't emitting:
 
-1. **Verify gog is authed**: `bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh auth list` should show `GOG_ACCOUNT`.
+1. **Verify gog is authed**: `bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh auth list` should show the configured accounts.
    In container: `docker exec mimirbot gog auth list`.
-2. **Run the search manually**: `bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail messages search 'in:inbox newer_than:1d' --max 5 --json --no-input` — if this returns zero hits, the query is wrong.
+2. **Run the search manually**: `bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail messages search 'in:inbox newer_than:1d' --account you@gmail.com --max 5 --json --no-input` — if this returns zero hits, the query is wrong.
 3. **Check `events.jsonl`** for `poller_stderr` entries from
    `gmail-inbox` — these surface gog's stderr (auth errors,
    rate-limit hits) verbatim.
