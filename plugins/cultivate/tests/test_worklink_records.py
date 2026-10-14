@@ -319,3 +319,87 @@ async def test_selected_provider_observes_gate_through_authorized_compute(
         assert result.status == result.evidence.status == "failed"
         assert "tests_failed" in result.reasons
         assert "test_worker_gate" in result.evidence.failure_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate_exit", [0, 1])
+async def test_factory_completion_observes_path_addressed_worker_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate_exit: int,
+) -> None:
+    monkeypatch.setattr(provider_evidence, "_FACTORY_CHECKOUT_ROOT", tmp_path)
+    sandbox = tmp_path / "factory-run" / "1949-1" / "checkout"
+    sandbox.mkdir(parents=True)
+    calls: list[object] = []
+    handle = LaunchHandle("local_subprocess", "factory-gate")
+
+    async def launch(spec: WorkSpec, command: tuple[str, ...]) -> LaunchHandle:
+        calls.append(spec)
+        assert spec.backend == "feature_factory"
+        assert spec.local_checkout == sandbox
+        assert command == ("/bin/sh", "-c", "pytest -q")
+        return handle
+
+    async def wait(observed: LaunchHandle, timeout: int) -> ComputeResult:
+        assert observed == handle and timeout == 30
+        return ComputeResult(gate_exit, "passed" if gate_exit == 0 else "1 failed: test_factory_gate", "")
+
+    async def cleanup(observed: LaunchHandle) -> None:
+        assert observed == handle
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("factory gate ran in controller shell")
+
+    class GitObservation:
+        def run(self, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args, 0, "changed.py\n" if "--name-only" in args else "")
+
+    compute = SimpleNamespace(
+        name="local_subprocess", _authorized_checkout=None,
+        _launch_contained=launch, wait=wait, cleanup=cleanup,
+    )
+    monkeypatch.setattr(provider_evidence, "_run", forbidden)
+    result = await observe_evidence(
+        issue=1949, attempt=1, backend="feature_factory", branch="feature/1949",
+        checkout=sandbox, started_at=datetime.now(UTC), base_ref="main",
+        backend_status="completed", test_command="pytest -q", safe_git=GitObservation(),
+        compute=compute,
+        work_spec=WorkSpec(
+            issue_id=1949, attempt=1, repo_url="repo", base_ref="main",
+            branch="feature/1949", prompt="", rules=None, test_command="pytest -q",
+            backend="feature_factory", timeout_s=30, local_checkout=sandbox,
+        ),
+    )
+    assert len(calls) == 1
+    assert result.review_ready is (gate_exit == 0)
+    assert result.evidence.tests.exit_code == gate_exit
+    if gate_exit:
+        assert result.status == "failed"
+        assert "tests_failed" in result.reasons
+        assert "test_factory_gate" in result.evidence.failure_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["missing_compute", "missing_spec", "wrong_checkout", "relative_checkout", "wrong_shape"])
+async def test_factory_gate_refuses_unbound_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str,
+) -> None:
+    monkeypatch.setattr(provider_evidence, "_run", lambda *a, **kw: pytest.fail("controller shell ran"))
+    monkeypatch.setattr(provider_evidence, "_FACTORY_CHECKOUT_ROOT", tmp_path)
+    checkout = Path("relative-checkout") if invalid == "relative_checkout" else tmp_path / "factory-run" / "1949-1" / "checkout"
+    if invalid == "wrong_shape":
+        checkout = tmp_path / "factory-run" / "1949-2" / "checkout"
+    spec = WorkSpec(
+        1949, 1, "repo", "main", "feature/1949", "", None, "touch controller-canary",
+        "feature_factory", 30, local_checkout=tmp_path / "other" if invalid == "wrong_checkout" else checkout,
+    )
+    compute = SimpleNamespace(name="local_subprocess", _authorized_checkout=None,
+                              _launch_contained=lambda *a: pytest.fail("worker launched"))
+    with pytest.raises(ComputeLaunchError, match="authorized worker checkout"):
+        await observe_evidence(
+            issue=1949, attempt=1, backend="feature_factory", branch="feature/1949",
+            checkout=checkout, started_at=datetime.now(UTC), base_ref="main",
+            backend_status="completed", test_command="touch controller-canary",
+            compute=None if invalid == "missing_compute" else compute,
+            work_spec=None if invalid == "missing_spec" else spec,
+        )
+    assert not (tmp_path / "controller-canary").exists()

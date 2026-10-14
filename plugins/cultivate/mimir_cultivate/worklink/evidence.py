@@ -12,6 +12,7 @@ import logging
 import os
 from pathlib import Path
 import pwd
+import re
 import shlex
 import shutil
 import signal
@@ -139,6 +140,24 @@ EVIDENCE_SAFE_GIT_OPERATIONS = frozenset({
     "status",
     "checkout_detach",
 })
+
+_FACTORY_CHECKOUT_ROOT = Path("/workspace/.worklink")
+
+
+def _factory_gate_checkout(checkout: Path, issue: int, attempt: int) -> bool:
+    """Accept only the factory executor's path-addressed checkout shape."""
+    if not checkout.is_absolute() or ".." in checkout.parts or checkout != Path(os.path.abspath(checkout)):
+        return False
+    try:
+        parts = checkout.relative_to(_FACTORY_CHECKOUT_ROOT).parts
+    except ValueError:
+        return False
+    return (
+        len(parts) == 3
+        and re.fullmatch(r"[A-Za-z0-9._-]+", parts[0]) is not None
+        and parts[0] not in {".", ".."}
+        and parts[1:] == (f"{issue}-{attempt}", "checkout")
+    )
 
 
 def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
@@ -646,23 +665,37 @@ async def _observe_evidence_from_ref(
     worker_uid_drop = True
     if test_command and not skip_test_reason:
         authorization = getattr(compute, "_authorized_checkout", None)
-        if (
+        worker_bound = (
             getattr(compute, "name", None) != "local_subprocess"
-            or authorization is None
-            or not all(hasattr(authorization, member) for member in ("verify", "duplicate_fd", "path"))
             or not callable(getattr(compute, "_launch_contained", None))
             or work_spec is None
             or work_spec.local_checkout != checkout
-            or authorization.path != checkout
-            or authorization.issue_id != issue
-            or authorization.attempt != attempt
             or work_spec.issue_id != issue
             or work_spec.attempt != attempt
             or work_spec.branch != branch
             or work_spec.backend != backend
-        ):
+        )
+        if backend == "feature_factory":
+            # Factory sandboxes use the worker's path-addressed launch_factory
+            # operation, not the leaf checkout FD capability. The executor
+            # verifies the path boundary and runs as the worklink uid. Refuse
+            # implicit compute construction or controller-shell fallback.
+            worker_bound = worker_bound or (
+                not _factory_gate_checkout(checkout, issue, attempt)
+                or authorization is not None
+            )
+        else:
+            worker_bound = worker_bound or (
+                authorization is None
+                or not all(hasattr(authorization, member) for member in ("verify", "duplicate_fd", "path"))
+                or authorization.path != checkout
+                or authorization.issue_id != issue
+                or authorization.attempt != attempt
+            )
+        if worker_bound:
             raise ComputeLaunchError("Cultivate evidence gate requires an authorized worker checkout")
-        authorization.verify(checkout)
+        if backend != "feature_factory":
+            authorization.verify(checkout)
     range_ref = f"{base_ref}...{head_ref}"
     def git_run(*args: str) -> subprocess.CompletedProcess[str]:
         if safe_git is not None:
