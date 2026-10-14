@@ -1768,6 +1768,10 @@ class TestCreateOnlyWrites:
         assert "Any existing text you do not include is deleted" in replacement.description
         assert "prepend, append or change part of a file, use `edit_file`" in replacement.description
         assert "allow_shrink=true" in replacement.description
+        editor = next(tool for tool in middleware.tools if tool.name == "edit_file")
+        assert "does not require a prior read" in editor.description
+        assert "For a deliberate full rewrite, use replace_file" in editor.description
+        assert "must read" not in editor.description.lower()
 
 
     def test_home_collision_uses_canonical_virtual_path_without_audit(

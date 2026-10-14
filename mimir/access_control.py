@@ -226,6 +226,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "list_schedules": ToolFlowDirection.SOURCE,
     "add_schedule": ToolFlowDirection.SINK,
     "set_schedule_priority": ToolFlowDirection.SINK,
+    "set_schedule_cron": ToolFlowDirection.SINK,
     "remove_schedule": ToolFlowDirection.SINK,
     "set_poller_overrides": ToolFlowDirection.SINK,
     "reload_pollers": ToolFlowDirection.SINK,
@@ -6221,7 +6222,7 @@ def _has_untrusted_active_ingest(
 
 
 _SCHEDULE_WRITE_TOOLS = frozenset({
-    "add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides",
+    "add_schedule", "set_schedule_priority", "set_schedule_cron", "remove_schedule", "set_poller_overrides",
 })
 _SCHEDULE_WRITE_REFUSAL = (
     "Scheduled work and autonomous instruction surfaces cannot be changed after "
@@ -8806,6 +8807,7 @@ class OperationCatalog:
         "list_schedules",
         "add_schedule",
         "set_schedule_priority",
+        "set_schedule_cron",
         "remove_schedule",
         "reload_pollers",
         "open_proposal",
@@ -12154,6 +12156,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "proposal_diff",
                 "add_schedule",
                 "set_schedule_priority",
+                "set_schedule_cron",
                 "list_schedules",
                 "read_file",
                 "aread",

@@ -68,6 +68,7 @@ from mimir.tools.registry import (
     set_dispatcher,
     set_poller_overrides,
     set_schedule_priority,
+    set_schedule_cron,
     set_scheduler,
 )
 
@@ -213,9 +214,11 @@ class _StubScheduler:
         self._jobs: list[SchedulerJob] = []  # for list_jobs / set_schedule_priority
         self._home = home
 
-    async def add_job(self, job: SchedulerJob) -> SchedulerJob:
+    async def add_job(self, job: SchedulerJob, *, replace_existing: bool = True) -> SchedulerJob:
         if self.raise_on == "add":
             raise RuntimeError("add boom")
+        if not replace_existing and any(j.name == job.name for j in self._jobs):
+            raise ValueError(f"job {job.name!r} already exists; use replace=true")
         self.add_calls.append(
             {
                 "name": job.name,
@@ -1436,13 +1439,39 @@ class TestSetPollerOverrides:
                 },
             },
         )
-        assert "set_poller_overrides ok: updated gmail-inbox" in out
+        assert "set_poller_overrides ok: merged gmail-inbox" in out
         body = (tmp_path / "pollers-overrides.yaml").read_text(encoding="utf-8")
         assert "gmail-inbox:" in body
         assert "pass_env:" in body
         assert "GOG_ACCOUNT" in body
         assert "priority: high" in body
         assert "batch_size: 3" in body
+
+    @pytest.mark.asyncio
+    async def test_override_merge_delete_and_explicit_replace(self, tmp_path: Path) -> None:
+        import yaml
+
+        path = tmp_path / "pollers-overrides.yaml"
+        original = {"cron": "0 * * * *", "pass_env": ["GOG_ACCOUNT"],
+                    "env": {"MIMIR_GMAIL_MAX_FETCH": "20"},
+                    "budget": {"windows": {"1h": {"max_agent_turns": 10}}}}
+        path.write_text(yaml.safe_dump({"p": original}), encoding="utf-8")
+        _STATE["scheduler"] = _StubScheduler(home=tmp_path)
+        out = await set_poller_overrides.ainvoke({
+            "poller_name": "p", "overrides": {"cron": "*/5 * * * *"},
+        })
+        assert "preserved=['budget', 'env', 'pass_env']" in out
+        assert yaml.safe_load(path.read_text())["p"] == {**original, "cron": "*/5 * * * *"}
+        out = await set_poller_overrides.ainvoke({
+            "poller_name": "p", "overrides": {"pass_env": None},
+        })
+        assert "deleted=['pass_env']" in out
+        assert "pass_env" not in yaml.safe_load(path.read_text())["p"]
+        out = await set_poller_overrides.ainvoke({
+            "poller_name": "p", "overrides": {"cron": "0 9 * * *"}, "replace": True,
+        })
+        assert "replaced" in out and "deleted=['budget', 'env']" in out
+        assert yaml.safe_load(path.read_text())["p"] == {"cron": "0 9 * * *"}
 
     @pytest.mark.asyncio
     async def test_rejects_process_environment_hijack_without_changing_file(
@@ -1495,6 +1524,72 @@ class TestSetPollerOverrides:
 # ────────────────────────────────────────────────────────────────────
 # Commitment tools
 # ────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_schedule_existing_refusal_cron_only_and_explicit_replace(tmp_path: Path) -> None:
+    scheduler = _StubScheduler(home=tmp_path)
+    original = SchedulerJob(name="daily", cron="0 8 * * *", prompt_file="daily.md",
+                            priority="high", channel_id="operator")
+    scheduler._jobs = [original]
+    _STATE["scheduler"] = scheduler
+    refused = await add_schedule.ainvoke({
+        "name": "daily", "cron": "0 9 * * *", "prompt": "new prompt",
+    })
+    assert "already exists" in refused and "replace=true" in refused
+    assert scheduler._jobs == [original]
+    changed = await set_schedule_cron.ainvoke({"name": "daily", "cron": "0 9 * * *"})
+    assert "other fields preserved" in changed
+    assert scheduler._jobs == [replace(original, cron="0 9 * * *")]
+    replaced = await add_schedule.ainvoke({
+        "name": "daily", "cron": "0 10 * * *", "prompt": "new prompt", "replace": True,
+    })
+    assert "replaced previous values" in replaced and "daily.md" in replaced
+    assert scheduler._jobs[0].prompt == "new prompt"
+
+
+@pytest.mark.asyncio
+async def test_set_schedule_cron_refuses_real_time_of_day_job(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+    from mimir.scheduler import Scheduler, load_jobs
+
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(
+        "# operator note\n- name: daily\n  time_of_day: '08:30'\n"
+        "  prompt: hello\n  priority: high\n  channel_id: operator\n",
+        encoding="utf-8",
+    )
+    scheduler = Scheduler(scheduler_yaml=path, enqueue=lambda e: asyncio.sleep(0, result=True))
+    monkeypatch.setitem(_STATE, "scheduler", scheduler)
+    before = path.read_bytes()
+    original, errors = load_jobs(path)
+    assert not errors
+    add = AsyncMock(wraps=scheduler.add_job)
+    monkeypatch.setattr(scheduler, "add_job", add)
+    result = await set_schedule_cron.ainvoke({"name": "daily", "cron": "0 9 * * *"})
+    assert "this job uses time_of_day" in result
+    assert "add_schedule replace=true" in result
+    add.assert_not_called()
+    assert path.read_bytes() == before
+    assert await scheduler.list_jobs() == original
+
+    # Positive control exercises the same real scheduler and wrapped writer.
+    cron_job = SchedulerJob(name="cron-job", cron="0 7 * * *", prompt="cron prompt")
+    await scheduler.add_job(cron_job)
+    add.reset_mock()
+    result = await set_schedule_cron.ainvoke({"name": "cron-job", "cron": "0 9 * * *"})
+    assert "set_schedule_cron ok" in result
+    add.assert_awaited_once()
+    assert await scheduler.list_jobs() == [*original, replace(cron_job, cron="0 9 * * *")]
+
+
+@pytest.mark.asyncio
+async def test_remove_callable_disable_reports_reenable(tmp_path: Path) -> None:
+    scheduler = _StubScheduler(home=tmp_path)
+    scheduler._jobs = [SchedulerJob(name="worker", callable_name="worker", cron="")]
+    _STATE["scheduler"] = scheduler
+    result = await remove_schedule.ainvoke({"name": "worker"})
+    assert "type=callable" in result and "default cron is re-enabled" in result
 
 
 @pytest.mark.asyncio

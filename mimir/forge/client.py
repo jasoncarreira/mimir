@@ -44,6 +44,7 @@ class PullRequestProjection:
     mergeable: bool | None
     created_at: str
     updated_at: str
+    body: str = ""
 
 
 @dataclass(frozen=True)

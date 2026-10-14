@@ -1606,8 +1606,12 @@ async def add_schedule(
     channel_id: Optional[str] = None,
     priority: Optional[str] = None,
     prompt_file: Optional[str] = None,
+    replace: bool = False,
 ) -> str:
-    """Add a new scheduled tick (add-or-replace by name).
+    """Add a scheduled tick. An existing name is refused unless replace=true.
+
+    Replacing overwrites the ENTIRE job entry. For partial changes use
+    set_schedule_cron or set_schedule_priority instead.
 
     Provide exactly one of ``prompt`` or ``prompt_file``. Prefer ``prompt_file``
     for anything beyond a one-liner — it's the canonical shape used by the
@@ -1629,6 +1633,7 @@ async def add_schedule(
         prompt_file: Basename of a prompt file under ``<home>/prompts/`` (e.g.
             ``"memory-hygiene.md"``) to fire on the tick. Mutually exclusive
             with ``prompt``; persisted as ``prompt_file:`` in scheduler.yaml.
+        replace: Explicitly replace an existing entry and report its old values.
     """
     scheduler = _STATE["scheduler"]
     if scheduler is None:
@@ -1668,6 +1673,7 @@ async def add_schedule(
                     f"'..', absolute paths, or symlinks; create the file first)"
                 )
     try:
+        previous = next((j for j in await scheduler.list_jobs() if j.name == name), None)
         if pfile:
             job = SchedulerJob(
                 name=name, cron=cron, prompt_file=pfile, channel_id=channel_id,
@@ -1678,14 +1684,42 @@ async def add_schedule(
                 name=name, cron=cron, prompt=inline, channel_id=channel_id,
                 priority=resolved_priority,
             )
-        job = await scheduler.add_job(job)
+        job = await scheduler.add_job(job, replace_existing=replace)
     except Exception as exc:
         return f"add_schedule failed: {exc}"
     source = f"prompt_file={job.prompt_file}" if job.prompt_file else "prompt=inline"
     return (
         f"add_schedule ok: name={job.name} cron={job.cron} "
         f"priority={job.priority} {source}"
+        + (f"; replaced previous values: {previous.to_yaml_entry()!r}" if previous else "")
     )
+
+
+@tool
+async def set_schedule_cron(name: str, cron: str) -> str:
+    """Change only an existing job's cron; preserve prompt, priority, channel and other fields.
+
+    For callable jobs, cron='' explicitly disables the default cron.
+    A prompt job must have a nonempty five-field cron expression.
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "set_schedule_cron failed: no scheduler configured"
+    try:
+        match = next((j for j in await scheduler.list_jobs() if j.name == name), None)
+        if match is None:
+            return f"set_schedule_cron failed: no job named {name!r}"
+        if match.time_of_day:
+            return (
+                "set_schedule_cron failed: this job uses time_of_day; "
+                "changing it to cron requires an explicit add_schedule replace=true"
+            )
+        if not isinstance(cron, str) or (not cron.strip() and not match.callable_name):
+            return "set_schedule_cron failed: cron must be nonempty for a prompt job"
+        await scheduler.add_job(replace(match, cron=cron.strip()))
+    except Exception as exc:
+        return f"set_schedule_cron failed: {exc}"
+    return f"set_schedule_cron ok: name={name} cron={cron.strip()!r}; other fields preserved"
 
 
 @tool
@@ -1727,17 +1761,23 @@ async def set_schedule_priority(name: str, priority: str) -> str:
 
 @tool
 async def remove_schedule(name: str) -> str:
-    """Remove a scheduled tick by name."""
+    """Remove a scheduled entry by name. Removing a callable's cron='' disable entry re-enables its default cron."""
     scheduler = _STATE["scheduler"]
     if scheduler is None:
         return "remove_schedule failed: no scheduler configured"
     try:
+        previous = next((j for j in await scheduler.list_jobs() if j.name == name), None)
         removed = await scheduler.remove_job(name)
     except Exception as exc:
         return f"remove_schedule failed: {exc}"
     if not removed:
         return f"remove_schedule: no job named {name!r}"
-    return f"remove_schedule ok: name={name}"
+    kind = "callable" if previous and previous.callable_name else "scheduled tick"
+    warning = (
+        "; warning: removed callable disable entry (cron=''); its default cron is re-enabled"
+        if previous and previous.callable_name and not previous.cron else ""
+    )
+    return f"remove_schedule ok: name={name} type={kind}{warning}"
 
 
 def _atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
@@ -1774,14 +1814,15 @@ def _atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
 
 
 @tool
-async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> str:
-    """Create or replace one poller's operator overrides.
+async def set_poller_overrides(poller_name: str, overrides: dict[str, Any], replace: bool = False) -> str:
+    """Merge one poller's operator overrides; null deletes an individual key.
 
     Writes ``<home>/pollers-overrides.yaml`` through a narrow validated path.
     ``overrides`` may contain only poller override keys such as ``cron``,
     ``priority``, ``batch_size``, ``env``, ``pass_env``, and ``budget``. Environment
     names are restricted to non-secret poller tuning variables. Passing an empty
-    dict removes that poller's override entry. Call ``reload_pollers`` after a
+    dict changes nothing; replace=true replaces the entire entry (an empty dict
+    then removes it). Call ``reload_pollers`` after a
     successful write to apply the new values to the running scheduler.
     """
     scheduler = _STATE["scheduler"]
@@ -1799,14 +1840,22 @@ async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> s
     path = Path(home) / "pollers-overrides.yaml"
     try:
         current_text = path.read_text(encoding="utf-8") if path.exists() else ""
-        current = validate_poller_overrides_text(current_text, path=path)
+        validate_poller_overrides_text(current_text, path=path)
+        import yaml
+        current = yaml.safe_load(current_text) or {}
         proposed = dict(current)
-        if overrides:
-            proposed[name] = dict(overrides)
+        before = dict(current.get(name, {}))
+        updated = {} if replace else dict(before)
+        for key, value in overrides.items():
+            if value is None:
+                updated.pop(key, None)
+            else:
+                updated[key] = value
+        if updated:
+            proposed[name] = updated
         else:
             proposed.pop(name, None)
 
-        import yaml
         body = yaml.safe_dump(
             proposed,
             allow_unicode=True,
@@ -1823,9 +1872,13 @@ async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> s
         return f"set_poller_overrides failed: {exc}"
     except Exception as exc:
         return f"set_poller_overrides failed: {exc}"
-    action = "removed" if not overrides else "updated"
+    action = "replaced" if replace else "merged"
+    set_keys = sorted(key for key, value in overrides.items() if value is not None)
+    deleted = sorted(set(before) - set(updated))
+    preserved = sorted(key for key in before if key in updated and key not in set_keys)
     return (
         f"set_poller_overrides ok: {action} {name} in {path.name}; "
+        f"set={set_keys}, deleted={deleted}, preserved={preserved}; "
         "call reload_pollers to apply"
     )
 
@@ -3187,7 +3240,7 @@ def all_mimir_tools(
         # follow-up to its own turn instead of answering it in this one.
         defer_injected_message,
         # Scheduler
-        list_schedules, add_schedule, set_schedule_priority, remove_schedule,
+        list_schedules, add_schedule, set_schedule_cron, set_schedule_priority, remove_schedule,
         set_poller_overrides, reload_pollers,
         # Commitments
         commitment_complete, commitment_snooze,

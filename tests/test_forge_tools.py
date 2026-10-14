@@ -337,6 +337,11 @@ def test_successful_write_survives_failed_attestation_without_trust(
         monkeypatch.setattr(
             client, "get_pull_request" if failure_phase == "metadata" else "author_is_trusted", fail,
         )
+        if selected is pr_edit_body and failure_phase == "metadata":
+            with pytest.raises(ToolException, match="attestation transport failed"):
+                selected.func("owner/repo", 17, runtime=runtime, **kwargs)
+            assert not any(call[0] == "edit_body" for call in client.calls)
+            return
         token = access_control.begin_protected_result_capture()
         try:
             result = selected.func("owner/repo", 17, runtime=runtime, **kwargs)
@@ -2444,7 +2449,7 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
 
     assert [call[0] for call in client.calls] == [
         "pr_list", "metadata", "files", "diff", "checks", "reviews", "comments",
-        "review_requests", "review", "inline", "comment", "edit_body", "issue_target",
+        "review_requests", "review", "inline", "comment", "metadata", "edit_body", "issue_target",
         "issue_comment", "rerequest",
     ]
 
@@ -2473,7 +2478,7 @@ def test_pr_checks_exposes_failure_details_url(monkeypatch) -> None:
 
 def test_pr_edit_body_schema_exposes_only_repository_pull_request_body() -> None:
     schema = pr_edit_body.tool_call_schema.model_json_schema()
-    assert set(schema["properties"]) == {"repository", "pull_request", "body"}
+    assert set(schema["properties"]) == {"repository", "pull_request", "body", "allow_shrink"}
     assert set(schema["required"]) == {"repository", "pull_request", "body"}
 
 
@@ -2509,7 +2514,7 @@ def test_pr_edit_body_middleware_action_guard(monkeypatch, remediation: bool) ->
     if remediation:
         assert result.status != "error"
         assert json.loads(result.content) == {"status": "body_updated"}
-        assert client.calls == [("edit_body", scope, "Updated")]
+        assert client.calls == [("metadata", scope), ("edit_body", scope, "Updated")]
     else:
         assert result.status == "error"
         assert "repo_pr_scope_denied" in str(result.content)
@@ -2600,7 +2605,27 @@ def test_pr_edit_body_preserves_bounded_literal_body_without_path_lookup(tmp_pat
     })
 
     assert result == {"status": "body_updated"}
-    assert client.calls == [("edit_body", scope, body)]
+    assert client.calls == [("metadata", scope), ("edit_body", scope, body)]
+
+
+def test_pr_edit_body_refuses_short_body_without_explicit_shrink(monkeypatch) -> None:
+    from dataclasses import replace
+
+    client = FakeForge()
+    original_get = client.get_pull_request
+    monkeypatch.setattr(client, "get_pull_request", lambda scope: replace(
+        original_get(scope), body="Closes chainlink #1976\n" + "context\n" * 15,
+    ))
+    set_forge_client(client)
+    scope = _scope(RepoPRAction.PR_EDIT)
+    args = {"repository": "owner/repo", "pull_request": 17, "body": "new section",
+            "runtime": _runtime(scope)}
+    with pytest.raises(ToolException, match="under 50%"):
+        pr_edit_body.invoke(args)
+    assert client.calls == [("metadata", scope)]
+    assert pr_edit_body.invoke({**args, "allow_shrink": True}) == {"status": "body_updated"}
+    assert client.calls[-1] == ("edit_body", scope, "new section")
+    assert "ENTIRE" in pr_edit_body.description and "pr_metadata" in pr_edit_body.description
 
 
 def test_read_uses_only_immutable_scope_target() -> None:

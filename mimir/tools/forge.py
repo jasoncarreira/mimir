@@ -1627,12 +1627,24 @@ def pr_edit_body(
     repository: str,
     pull_request: int,
     body: str,
+    allow_shrink: bool = False,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Replace only the bound pull request description with bounded literal text."""
+    """Overwrite the ENTIRE bound PR description. Read pr_metadata first and pass
+    the full body including existing sections and Closes lines. A body under 50%
+    of the current body's length is refused unless allow_shrink=true.
+    """
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
-    _call(lambda: _client(scope).edit_pull_request_body(scope, safe_body))
+    client = _client(scope)
+    current = _call(lambda: client.get_pull_request(scope))
+    if not allow_shrink and len(safe_body.encode("utf-8")) * 2 < len(current.body.encode("utf-8")):
+        raise ToolPolicyRefusal(
+            "pr_edit_body refused: new body is under 50% of the current description; "
+            "read pr_metadata and pass the full body, or set allow_shrink=true "
+            "for a deliberate full rewrite"
+        )
+    _call(lambda: client.edit_pull_request_body(scope, safe_body))
     _publish_write_projection(runtime, scope)
     return {"status": "body_updated"}
 

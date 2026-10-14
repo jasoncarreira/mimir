@@ -3885,7 +3885,7 @@ def test_non_shell_server_args_are_stripped_before_nested_shell_exec(
             run_shell,
         )
 
-    monkeypatch.setattr(extra.subprocess, "run", run)
+    monkeypatch.setattr(extra, "_run_shell_command", run)
     token = set_current_turn(ctx)
     try:
         middleware.wrap_tool_call(
@@ -5014,7 +5014,7 @@ async def test_tainted_operator_bound_command_reaches_real_direct_process_path(
     async def async_handler(request: ToolCallRequest) -> ToolMessage:
         return sync_handler(request)
 
-    monkeypatch.setattr(extra.subprocess, "run", run)
+    monkeypatch.setattr(extra, "_run_shell_command", run)
     request = _make_request(
         "shell_exec", f"real-direct-{middleware_path}", auth,
         {"command": "pwd -P", "cwd": str(root)},
@@ -5122,7 +5122,7 @@ async def test_pre_ingest_soft_operator_uses_actual_bash_lc_path(
         return sync_handler(request)
 
     monkeypatch.setattr(budget_gate, "parse_service_shell_argv_with_diagnostics", parser)
-    monkeypatch.setattr(extra.subprocess, "run", run)
+    monkeypatch.setattr(extra, "_run_shell_command", run)
     command = "printf pre-ingest-soft"
     request = _make_request(
         "shell_exec", f"soft-bash-{middleware_path}", auth, {"command": command},
@@ -6674,7 +6674,7 @@ async def test_shell_exec_timeout_event_contains_bounded_command(
         raise subprocess.TimeoutExpired(cmd="bash", timeout=900)
 
     monkeypatch.setattr("mimir.event_logger.log_event", _capture)
-    monkeypatch.setattr("mimir.tools.extra.subprocess.run", _timeout)
+    monkeypatch.setattr("mimir.tools.extra._run_shell_command", _timeout)
     mw = BudgetGateMiddleware()
 
     async def handler(req: ToolCallRequest) -> ToolMessage:

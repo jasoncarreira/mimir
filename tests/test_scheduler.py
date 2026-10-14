@@ -66,6 +66,94 @@ def test_job_yaml_round_trip(tmp_path: Path):
     assert reloaded[1].channel_id == "bench-1"
 
 
+def test_schedule_writes_preserve_comments_and_callable_disable(tmp_path: Path) -> None:
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(
+        "# operator header\n- name: daily # job note\n  cron: '0 8 * * *' # cron note\n"
+        "  prompt_file: daily.md # source note\n  priority: high\n"
+        "- name: worker\n  callable: worker\n  cron: '' # disable note\n",
+        encoding="utf-8",
+    )
+    jobs, errors = load_jobs(path)
+    assert not errors
+    daily, worker = jobs
+    from dataclasses import replace
+
+    for updated in (
+        [replace(daily, priority="low"), worker],
+        [replace(daily, cron="0 9 * * *", priority="low"), worker],
+        [replace(daily, cron="0 9 * * *", priority="low"), worker,
+         SchedulerJob(name="new", cron="0 7 * * *", prompt="hi")],
+        [replace(daily, cron="0 9 * * *", priority="low"), worker],
+    ):
+        write_jobs(path, updated)
+        text = path.read_text(encoding="utf-8")
+        assert all(note in text for note in (
+            "# operator header", "# job note", "# cron note", "# source note", "# disable note",
+        ))
+        assert "cron: '' # disable note" in text
+    assert [j.name for j in load_jobs(path)[0]] == ["daily", "worker"]
+    write_jobs(path, [replace(daily, cron="0 9 * * *"), replace(worker, cron="0 1 * * *")])
+    write_jobs(path, [replace(daily, cron="0 9 * * *"), replace(worker, cron="")])
+    assert load_jobs(path)[0][1].cron is None
+    assert "cron: ''" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("text", [
+    "# operator header\noperator_shell_commands: []\njobs:\n",
+    "# operator header\noperator_shell_commands: []\n",
+    "# operator header\noperator_shell_commands: []\njobs: []\n",
+])
+def test_write_jobs_attaches_sequence_to_empty_mapping(tmp_path: Path, text: str) -> None:
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(text, encoding="utf-8")
+    job = SchedulerJob(name="t1", cron="0 8 * * *", prompt="hello")
+    write_jobs(path, [job])
+    reloaded, rejections = load_jobs(path)
+    assert rejections == []
+    assert reloaded == [job]
+    parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert parsed["operator_shell_commands"] == []
+    assert parsed["jobs"][0]["name"] == "t1"
+    assert "# operator header" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("entries", ["[null]", "[stray]", "{}", "42"])
+def test_write_jobs_refuses_non_mapping_entries_without_writing(tmp_path: Path, entries: str) -> None:
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(f"operator_shell_commands: []\njobs: {entries}\n", encoding="utf-8")
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="sequence of mappings"):
+        write_jobs(path, [SchedulerJob(name="t1", cron="0 8 * * *", prompt="hello")])
+    assert path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_real_scheduler_duplicate_refusal_preserves_yaml(tmp_path: Path) -> None:
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(
+        "# keep formatting\n- name: daily\n  cron: '0 8 * * *' # note\n"
+        "  prompt: hello\n  priority: high\n", encoding="utf-8",
+    )
+    scheduler = Scheduler(scheduler_yaml=path, enqueue=lambda e: asyncio.sleep(0, result=True))
+    before = path.read_bytes()
+    original, errors = load_jobs(path)
+    assert not errors
+    with pytest.raises(ValueError, match="already exists.*replace=true"):
+        await scheduler.add_job(
+            SchedulerJob(name="daily", cron="0 9 * * *", prompt="replacement"),
+            replace_existing=False,
+        )
+    assert path.read_bytes() == before
+    assert await scheduler.list_jobs() == original
+    new = SchedulerJob(name="new", cron="0 10 * * *", prompt="new job")
+    assert await scheduler.add_job(new, replace_existing=False) == new
+    assert await scheduler.list_jobs() == [*original, new]
+    replacement = SchedulerJob(name="daily", cron="0 9 * * *", prompt="replacement")
+    await scheduler.add_job(replacement, replace_existing=True)
+    assert await scheduler.list_jobs() == [replacement, new]
+
+
 def test_load_jobs_skips_invalid_entries(tmp_path: Path):
     path = tmp_path / "scheduler.yaml"
     path.write_text(
