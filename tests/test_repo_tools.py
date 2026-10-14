@@ -3104,6 +3104,42 @@ async def test_project_test_retains_builtin_hang_dump_after_stderr_truncation(
     assert "in blocked_worker" in result.stderr
     assert "in test_synthetic_hang" in result.stderr
     assert "credential-value-must-not-appear" not in result.stderr
+    assert result.output_limited is True
+    assert result.stderr_dropped_bytes == 0
+    assert result.stderr_return_dropped_bytes > 0
+
+
+@pytest.mark.parametrize(
+    "noise", ["", "noise\n" + "ø" * 5_000 + "\n"], ids=["no-prefix", "utf8-prefix"],
+)
+@pytest.mark.parametrize("long_dump", [False, True])
+def test_stderr_hang_dump_keeps_contiguous_leading_frames_and_counts_dropped_bytes(
+    noise: str, long_dump: bool,
+) -> None:
+    scrubber = SensitiveMaterialScrubber(home=None)
+    dump = (
+        "Timeout (0:05:00)!\n"
+        + "  File worker_context.py, line 1\n" * 50
+        + "  File test_hang.py, line 7, in blocked_worker\n"
+        + "  File test_hang.py, line 10, in test_synthetic_hang\n"
+        + ("  File later_context.py, line 20\n" * 200 if long_dump else "")
+    )
+    source = noise + dump
+    excerpt, dropped = _safe_stderr_output(source.encode(), scrubber, 4_000)
+    prefix_bytes = len(noise.encode())
+    prefix = f"…[{prefix_bytes} bytes omitted]…" if noise else ""
+    if len(source) <= 4_000:
+        assert excerpt == source
+        assert dropped == 0
+    else:
+        expected_dump = dump[:4_000 - len(prefix)]
+        assert excerpt == prefix + expected_dump
+        assert dropped == prefix_bytes + len(dump[len(expected_dump):].encode())
+    assert len(excerpt) <= 4_000
+    # These frames occur past the ordinary excerpt's 1,000-character head.
+    assert dump.index("in blocked_worker") > 1_000
+    assert "in blocked_worker" in excerpt
+    assert "in test_synthetic_hang" in excerpt
 
 
 def test_stderr_without_hang_dump_keeps_existing_positional_policy() -> None:

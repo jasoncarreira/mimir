@@ -599,14 +599,10 @@ def _safe_output(
     return _bounded_scrubbed_output(scrubbed, limit)
 
 
-def _bounded_scrubbed_output(scrubbed: str, limit: int, *, head_start: int = 0) -> tuple[str, int]:
+def _bounded_scrubbed_output(scrubbed: str, limit: int) -> tuple[str, int]:
     if len(scrubbed) <= limit:
         return scrubbed, 0
-    omitted_prefix = len(scrubbed[:head_start].encode("utf-8"))
-    suffix = scrubbed[head_start:]
-    prefix_marker = f"…[{omitted_prefix} bytes omitted]…"
-    if head_start and len(suffix) + len(prefix_marker) <= limit:
-        return prefix_marker + suffix, omitted_prefix
+    suffix = scrubbed
     # Reserve a short opening for context and keep the terminal diagnostics.
     # Count UTF-8 bytes in the *scrubbed* text that the returned excerpt omits.
     head_size = min(limit // 4, len(suffix))
@@ -616,7 +612,7 @@ def _bounded_scrubbed_output(scrubbed: str, limit: int, *, head_start: int = 0) 
     marker_budget = len(f"…[{len(scrubbed.encode('utf-8'))} bytes omitted]…")
     tail_size = min(max(0, limit - head_size - marker_budget), len(suffix) - head_size)
     tail = suffix[-tail_size:] if tail_size else ""
-    dropped = omitted_prefix + len(suffix[head_size:len(suffix) - tail_size].encode("utf-8"))
+    dropped = len(suffix[head_size:len(suffix) - tail_size].encode("utf-8"))
     return prefix + f"…[{dropped} bytes omitted]…" + tail, dropped
 
 
@@ -629,7 +625,15 @@ def _safe_stderr_output(
     scrubbed = redact_text(scrubber.scrub_text(value))
     marker = re.search(r"Timeout \([^\r\n]+\)!", scrubbed)
     if marker is not None and len(scrubbed) > limit:
-        return _bounded_scrubbed_output(scrubbed, limit, head_start=marker.start())
+        # Faulthandler lists stuck-thread frames first: unlike ordinary output,
+        # keep a contiguous dump opening, not a head/tail excerpt of the dump.
+        start = marker.start()
+        omitted_prefix = len(scrubbed[:start].encode("utf-8"))
+        prefix = f"…[{omitted_prefix} bytes omitted]…" if start else ""
+        dump = scrubbed[start:]
+        kept_chars = max(0, limit - len(prefix))
+        dropped = omitted_prefix + len(dump[kept_chars:].encode("utf-8"))
+        return prefix + dump[:kept_chars], dropped
     return _bounded_scrubbed_output(scrubbed, limit)
 
 
