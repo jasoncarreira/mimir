@@ -14,6 +14,8 @@ import pytest
 
 from mimir import access_control as policy
 from mimir import read_policy
+from mimir.plugins.core import core_policy_registry
+from mimir.plugins.core import policy_membership
 from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel, TurnInteractivity
 from mimir.tool_descriptors import (
     TOOL_DESCRIPTORS,
@@ -36,6 +38,23 @@ SERVICE_CASES = {
 SERVICE_READABLE = ("filesystem", "repository", "schedule_metadata")
 SERVICE_SINKS = ("message", "filesystem", "network", "bound_pull_request")
 HOME_TOKEN = "<oracle-home>"
+# Explicitly pin the entire coding-enabled runtime inventory, including the
+# Worklink tools exposed on the default surface rather than the coding surface.
+CODING_TOOLS = frozenset("""spawn_open_code pr_list pr_metadata pr_spec pr_files pr_diff
+    pr_file_content pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews
+    pr_comments pr_review_requests pr_submit_review pr_inline_review_comment
+    pr_comment pr_edit_body issue_comment pr_rerequest_review unsupported_operation
+    repo_checkout repo_cleanup repo_fetch repo_status repo_test repo_diff
+    repo_unmerged repo_stage repo_commit repo_merge repo_merge_abort repo_rebase
+    repo_rebase_abort repo_revert repo_revert_abort repo_push worklink_run
+    worklink_resume""".split())
+# This flag is a separate declaration from the target-aware tainted-write
+# membership: both must survive migration to the selected plugin registry.
+CODING_WRITES_CODE_OR_STATE = frozenset("""spawn_open_code worklink_run
+    worklink_resume repo_checkout repo_cleanup repo_fetch repo_test repo_stage
+    repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort repo_revert
+    repo_revert_abort repo_push pr_submit_review pr_inline_review_comment pr_comment
+    pr_edit_body issue_comment pr_rerequest_review""".split())
 
 
 def _canonical(value: object, home: Path) -> bytes:
@@ -311,6 +330,7 @@ def _snapshot(home: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
             "forge_actions": dict(sorted(policy._FORGE_TOOL_ACTIONS.items())),
             "repo_actions": dict(sorted(policy._REPO_TOOL_ACTIONS.items())),
             "retained_repo_tools": sorted(policy._RETAINED_REPO_TOOLS),
+            "repo_publish_tools": sorted(policy_membership("repo_publish_tools")),
             "protected_domains": dict(sorted(policy._PROTECTED_RESULT_DOMAINS.items())),
             "readable_domains": dict(sorted(policy._OPERATION_READABLE_DOMAIN.items())),
             "read_resource_operations": sorted(read_policy.READ_RESOURCE_OPERATIONS),
@@ -379,3 +399,45 @@ def test_original_core_policy_matches_frozen_oracle(
     assert len(expected["descriptors"]) == 100
     assert _canonical(expected, home) == fixture_bytes
     assert _canonical(_snapshot(home, monkeypatch), home) == fixture_bytes
+
+
+def test_pre_extraction_coding_policy_is_frozen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    home = tmp_path / "oracle-home"
+    _prepare_inputs(home, monkeypatch)
+    frozen = json.loads(FIXTURE.read_bytes())
+    tables = frozen["tables"]
+    registry = core_policy_registry()
+
+    assert len(CODING_TOOLS) == 40
+    assert CODING_TOOLS <= frozen["descriptors"].keys()
+    assert CODING_TOOLS <= frozen["authorization"].keys()
+    assert CODING_TOOLS <= frozen["extractor_results"].keys()
+    assert CODING_TOOLS <= registry.tools.keys()
+    required_memberships = (
+        "retained_repo_tools", "worklink_build_tools", "repo_publish_tools",
+        "tainted_writes",
+    )
+    assert set(required_memberships) <= tables.keys()
+    for name in sorted(CODING_TOOLS):
+        tool = registry.tools[name]
+        descriptor = frozen["descriptors"][name]
+        assert tool.flow == tables["flow"].get(name)
+        assert tool.tier == tables["tier"].get(name)
+        assert tool.operation_class == tables["catalog"][name]
+        assert tool.result_domain == tables["protected_domains"].get(name)
+        assert tool.readable_domain == tables["readable_domains"].get(name)
+        assert tool.descriptor is not None
+        assert tool.descriptor.sink_category == descriptor["sink_category"]
+        assert tool.descriptor.sink_destination == descriptor["sink_destination"]
+        assert tool.writes_code_or_state == (name in CODING_WRITES_CODE_OR_STATE)
+        assert tool.profiles == frozenset(
+            profile for profile, names in tables["profiles"].items() if name in names
+        )
+        for membership in required_memberships:
+            assert (membership in tool.memberships) == (name in tables[membership])
+        assert len(frozen["authorization"][name]) == 18
+    observed = _outcomes(home)
+    for name in CODING_TOOLS:
+        assert observed[name] == frozen["authorization"][name]
