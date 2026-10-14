@@ -50,6 +50,7 @@ from mimir.project_tests import (
     ProjectTestRefusal,
     ProjectTestResult,
     RepoProjectTests,
+    _safe_output,
     _safe_stderr_output,
     _validated_selectors,
     _configured_command,
@@ -2647,6 +2648,9 @@ async def test_frontend_result_preserves_bounded_failure_reporting(
     assert not result.ok and result.code == code and result.suite == "frontend"
     assert result.returncode == exit_code
     assert len(result.stdout) == 8000 and len(result.stderr) == 4000
+    assert result.output_limited
+    assert result.stdout_return_dropped_bytes > 0
+    assert result.stderr_return_dropped_bytes > 0
     assert state.full_tested_head is None
 
 
@@ -2683,11 +2687,126 @@ async def test_project_test_output_overflow_verdict_and_accounting(
     assert result.code == code
     assert result.ok is (code == "tests_passed")
     assert result.returncode == (None if timed_out else exit_code)
-    assert result.output_limited is overflow
+    assert result.output_limited is True
     assert result.stdout_dropped_bytes == stdout_dropped
     assert result.stderr_dropped_bytes == stderr_dropped
+    assert result.stdout_return_dropped_bytes > 0
+    assert result.stderr_return_dropped_bytes > 0
     assert len(result.stdout) == 8000 and len(result.stderr) == 4000
     assert state.full_tested_head == (state.git_expected_head if result.ok else None)
+
+
+@pytest.mark.asyncio
+async def test_project_test_long_pytest_output_keeps_footer_and_validated_failure_ids(
+    repo_tools, tmp_path, monkeypatch,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    lease = state.checkout_lease.path
+    tests = lease / "tests"
+    tests.mkdir()
+    (tests / "test_results.py").write_text(
+        "def test_broken(): pass\n"
+        "def test_other(): pass\n"
+    )
+    footer = (
+        "=== short test summary info ===\n"
+        "FAILED tests/test_results.py::test_broken - AssertionError\n"
+        "FAILED tests/test_results.py::test_other - AssertionError\n"
+        "2 failed, 21 passed in 19.42s\n"
+    )
+    stdout = ("pytest session\n" + "." * 25_000 + "\n" + footer).encode()
+    stderr = ("stderr opening\n" + "e" * 7_000 + "\nstderr ending\n").encode()
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(1, stdout, stderr, False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tests/test_results.py",))
+    assert result.code == "tests_failed"
+    assert result.output_limited is True
+    assert result.stdout_dropped_bytes == result.stderr_dropped_bytes == 0
+    assert result.stdout.startswith("pytest session\n")
+    assert result.stdout.endswith(footer)
+    assert result.failing_node_ids == [
+        "tests/test_results.py::test_broken", "tests/test_results.py::test_other",
+    ]
+    assert result.pytest_summary == {
+        "passed": 21, "failed": 2, "errors": 0, "skipped": 0, "duration": "19.42s",
+    }
+    for source, excerpt, dropped, limit in (
+        (stdout, result.stdout, result.stdout_return_dropped_bytes, 8000),
+        (stderr, result.stderr, result.stderr_return_dropped_bytes, 4000),
+    ):
+        assert len(excerpt) == limit
+        assert dropped == len(source) - len(excerpt.encode()) + len(f"…[{dropped} bytes omitted]…".encode())
+        assert f"…[{dropped} bytes omitted]…" in excerpt
+    assert result.stderr.startswith("stderr opening\n")
+    assert result.stderr.endswith("\nstderr ending\n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stdout", "expected"), [
+    (b"1 passed in 0.11s\n", {"passed": 1, "failed": 0, "errors": 0, "skipped": 0, "duration": "0.11s"}),
+    (b"1 error in 0.30s\n", {"passed": 0, "failed": 0, "errors": 1, "skipped": 0, "duration": "0.30s"}),
+    (b"pytest process crashed before summary\n", None),
+])
+async def test_project_test_short_output_and_missing_summary(
+    repo_tools, tmp_path, monkeypatch, stdout, expected,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_worklink_test(home)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(0 if expected and expected["passed"] else 1,
+                                        stdout, b"short stderr", False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tracked.txt",))
+    assert result.stdout == stdout.decode()
+    assert result.stderr == "short stderr"
+    assert result.output_limited is False
+    assert result.stdout_return_dropped_bytes == result.stderr_return_dropped_bytes == 0
+    assert result.pytest_summary == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("complete", [True, False])
+async def test_repo_test_raw_result_leads_with_parsed_summary_when_available(
+    repo_tools, monkeypatch, complete,
+):
+    from mimir.tools import repo as repo_module
+
+    state = repo_tools[-2]
+    monkeypatch.setattr(repo_module, "_state", lambda *args: state)
+
+    async def execute(self, selectors, *, suite):
+        return ProjectTestResult(
+            False, "tests_failed", 1,
+            stdout="1 failed in 0.20s\n" if complete else "process crashed\n",
+            pytest_summary=({"passed": 0, "failed": 1, "errors": 0,
+                             "skipped": 0, "duration": "0.20s"} if complete else None),
+            failing_node_ids=["tests/test_results.py::test_broken"] if complete else [],
+        )
+
+    monkeypatch.setattr(repo_module.RepoProjectTests, "execute", execute)
+    result = await repo_module.repo_test.coroutine("owner/repo", 7, include_output=True)
+    assert list(result)[:3] == ["ok", "code", "returncode"]
+    if complete:
+        assert list(result)[3:5] == ["pytest_summary", "failing_node_ids"]
+        assert result["pytest_summary"] == {
+            "passed": 0, "failed": 1, "errors": 0, "skipped": 0, "duration": "0.20s",
+        }
+        assert result["failing_node_ids"] == ["tests/test_results.py::test_broken"]
+    else:
+        assert "pytest_summary" not in result
+        assert result["failing_node_ids"] == []
 
 
 def _snapshot_checkout_factory(root: Path, issued: list[Path]):
@@ -2979,20 +3098,74 @@ async def test_project_test_retains_builtin_hang_dump_after_stderr_truncation(
     ).execute(("tracked.txt",))
     assert result.ok
     assert len(result.stderr) <= 4_000
-    assert result.stderr.startswith("Timeout (0:00:00.100000)!")
+    assert result.stderr.startswith("Timeout (0:00:00.100000)!") or re.match(
+        r"^…\[\d+ bytes omitted\]…Timeout \(0:00:00.100000\)!", result.stderr,
+    )
     assert "in blocked_worker" in result.stderr
     assert "in test_synthetic_hang" in result.stderr
     assert "credential-value-must-not-appear" not in result.stderr
+    assert result.output_limited is True
+    assert result.stderr_dropped_bytes == 0
+    assert result.stderr_return_dropped_bytes > 0
+
+
+@pytest.mark.parametrize(
+    "noise", ["", "noise\n" + "ø" * 5_000 + "\n"], ids=["no-prefix", "utf8-prefix"],
+)
+@pytest.mark.parametrize("long_dump", [False, True])
+def test_stderr_hang_dump_keeps_contiguous_leading_frames_and_counts_dropped_bytes(
+    noise: str, long_dump: bool,
+) -> None:
+    scrubber = SensitiveMaterialScrubber(home=None)
+    dump = (
+        "Timeout (0:05:00)!\n"
+        + "  File worker_context.py, line 1\n" * 50
+        + "  File test_hang.py, line 7, in blocked_worker\n"
+        + "  File test_hang.py, line 10, in test_synthetic_hang\n"
+        + ("  File later_context.py, line 20\n" * 200 if long_dump else "")
+    )
+    source = noise + dump
+    excerpt, dropped = _safe_stderr_output(source.encode(), scrubber, 4_000)
+    prefix_bytes = len(noise.encode())
+    prefix = f"…[{prefix_bytes} bytes omitted]…" if noise else ""
+    if len(source) <= 4_000:
+        assert excerpt == source
+        assert dropped == 0
+    else:
+        expected_dump = dump[:4_000 - len(prefix)]
+        assert excerpt == prefix + expected_dump
+        assert dropped == prefix_bytes + len(dump[len(expected_dump):].encode())
+    assert len(excerpt) <= 4_000
+    # These frames occur past the ordinary excerpt's 1,000-character head.
+    assert dump.index("in blocked_worker") > 1_000
+    assert "in blocked_worker" in excerpt
+    assert "in test_synthetic_hang" in excerpt
 
 
 def test_stderr_without_hang_dump_keeps_existing_positional_policy() -> None:
     scrubber = SensitiveMaterialScrubber(home=None)
     stderr = b"head-context\n" + b"x" * 5_000 + b"\ntail-context"
 
-    assert _safe_stderr_output(stderr, scrubber, 100).startswith("head-context")
-    assert _safe_stderr_output(stderr, scrubber, 100, keep_tail=True).endswith(
-        "tail-context"
-    )
+    excerpt, dropped = _safe_stderr_output(stderr, scrubber, 100)
+    assert excerpt.startswith("head-context")
+    assert excerpt.endswith("tail-context")
+    assert dropped > 0
+
+
+def test_bounded_output_counts_scrubbed_utf8_bytes_and_keeps_both_ends() -> None:
+    scrubber = SensitiveMaterialScrubber(home=None)
+    secret = "https://user:password@example.invalid/path"
+    scrubber.add_scalar(secret)
+    payload = ("opening " + secret + "\n" + "ø" * 9_000 + "\nlast line\n").encode()
+    excerpt, dropped = _safe_output(payload, scrubber, 8_000)
+    assert len(excerpt) <= 8_000
+    assert excerpt.startswith("opening <redacted>\n")
+    assert excerpt.endswith("\nlast line\n")
+    assert "password" not in excerpt
+    assert f"…[{dropped} bytes omitted]…" in excerpt
+    # Multi-byte characters make omitted bytes different from omitted chars.
+    scrubbed = scrubber.scrub_text(payload)
+    assert dropped > len(scrubbed) - len(excerpt) + len(f"…[{dropped} bytes omitted]…")
 
 
 @pytest.mark.asyncio
@@ -3021,7 +3194,7 @@ async def test_project_test_timeout_returns_captured_hang_diagnostic(
 
     assert result.code == "test_timeout"
     assert result.stdout == "partial stdout"
-    assert result.stderr.startswith("Timeout (0:05:00)!")
+    assert re.match(r"^…\[\d+ bytes omitted\]…Timeout \(0:05:00\)!", result.stderr)
     assert "test_hang.py" in result.stderr
     assert result.stdout_path.startswith("state/worklink/transcripts/repo-test-")
     assert result.stderr_path.startswith("state/worklink/transcripts/repo-test-")

@@ -6,6 +6,7 @@ import pytest
 
 from mimir.project_tests import (
     _PYTEST_FAILING_BYTES,
+    _pytest_terminal_summary,
     pytest_failure_summary,
     pytest_node_inventory,
 )
@@ -29,6 +30,18 @@ def _output(node: str) -> bytes:
         f"FAILED {node} - arbitrary diagnostic\n"
         "1 failed, 2 passed in 0.01s\n"
     ).encode()
+
+
+@pytest.mark.parametrize(("output", "expected"), [
+    (b"2 passed in 0.31s\n", {"passed": 2, "failed": 0, "errors": 0, "skipped": 0, "duration": "0.31s"}),
+    (b"=== 1 failed, 2 passed, 3 skipped in 1.25s ===\n",
+     {"passed": 2, "failed": 1, "errors": 0, "skipped": 3, "duration": "1.25s"}),
+    (b"1 error, 4 passed in 0.42s\n",
+     {"passed": 4, "failed": 0, "errors": 1, "skipped": 0, "duration": "0.42s"}),
+    (b"running tests\nFAILED tests/test_real.py::test_real\nprocess crashed\n", None),
+])
+def test_terminal_summary_requires_a_complete_pytest_footer(output, expected):
+    assert _pytest_terminal_summary(output) == expected
 
 
 def test_inventory_uses_definitions_without_importing_source(tmp_path):
