@@ -2139,7 +2139,8 @@ class Agent:
 
         plugin_manager = self._config.plugin_manager
         preflight_emitter = None
-        if plugin_manager.plugins:
+        async def run_plugin_preflight() -> None:
+            nonlocal turn_id, preflight_emitter, initial_ifc_labels, initial_auth_context
             initial_ifc_labels, initial_auth_context = prepare_preflight_context()
             turn_id = turn_id or make_turn_id()
             preflight_emitter = TurnEventEmitter(
@@ -2163,8 +2164,17 @@ class Agent:
                 except Exception:  # noqa: BLE001 — emission must not mask rejection
                     pass
                 raise
+
         bare_reply = (event.content or "").strip().lower() in {"approve", "decline"}
         named_reply = is_non_turn_bound_reply(event)
+        # When no request is known, providers with preflight hooks still guard
+        # turns that look like replies. Empty providers have no hook to invoke:
+        # let the authenticated approval resolver consult durable/recent state
+        # before entering ordinary turn setup.
+        if (plugin_manager.plugins and named_reply and not pending_approvals(event.channel_id)
+                and any(getattr(plugin.contributor, "turn_preflight", None) is not None
+                        for plugin in plugin_manager.plugins)):
+            await run_plugin_preflight()
         if _is_authenticated_operator(event, self._identity_resolver, allow_web=named_reply) and (named_reply or bare_reply):
             sync_pending(self._config.home)
             await asyncio.to_thread(
@@ -2218,6 +2228,8 @@ class Agent:
                         ) else "operator_approval"
                     ),
                 )
+        if plugin_manager.plugins and preflight_emitter is None:
+            await run_plugin_preflight()
         turn_id = turn_id or make_turn_id()
         t_total_start = time.monotonic()
         if not plugin_manager.plugins:

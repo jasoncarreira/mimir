@@ -6,8 +6,10 @@ import os
 import subprocess
 import sys
 import tarfile
+import time
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
@@ -91,3 +93,98 @@ def test_selected_provider_registers_no_future_resources() -> None:
     manager = load_plugins(enable="cultivate")
     assert [plugin.candidate.name for plugin in manager.plugins] == ["cultivate"]
     assert not any(tool.owner == "cultivate" for tool in manager.policy.tools.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("named", [True, False])
+async def test_selected_empty_provider_preserves_authenticated_approval_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, named: bool,
+) -> None:
+    from mimir import approval_requests
+    from mimir.models import AgentEvent
+    from tests.test_agent import _resolver
+    from tests.test_turn_prompt_assembly import _make_agent
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    agent = _make_agent(tmp_path)
+    assert [plugin.candidate.name for plugin in agent._config.plugin_manager.plugins] == ["cultivate"]
+    agent._identity_resolver = _resolver(tmp_path, """people:
+  - canonical: operator
+    aliases: [discord-99]
+    access: {roles: [admin]}
+""")
+    channel = f"cultivate-approval-{tmp_path.name}"
+    entry = approval_requests.register(
+        kind="update", channel_id=channel,
+        description="test update", expires_at=time.monotonic() + 60,
+        resolver=lambda *_args: "granted", inject_into_turn=False,
+    )
+    try:
+        def reject_turn_setup(*_args: object, **_kwargs: object) -> None:
+            pytest.fail("approval entered ordinary turn setup")
+
+        monkeypatch.setattr("mimir.agent._initialize_ifc_labels", reject_turn_setup)
+        result = await agent.run_turn(AgentEvent(
+            trigger="user_message", channel_id=channel, source="discord",
+            author="discord-99", content=(f"approve {entry.approval_id}" if named else "approve"),
+        ))
+        assert result.kind == "operator_approval"
+        assert result.output == f"granted {entry.approval_id}"
+        assert approval_requests.pending(channel) == ()
+    finally:
+        approval_requests.cancel(entry.approval_id)
+
+
+@pytest.mark.asyncio
+async def test_selected_empty_provider_does_not_bypass_invalid_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import approval_requests
+    from mimir.models import AgentEvent
+    from tests.test_agent import _resolver
+    from tests.test_turn_prompt_assembly import _make_agent
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    agent = _make_agent(tmp_path)
+    agent._identity_resolver = _resolver(tmp_path, """people:
+  - canonical: operator
+    aliases: [discord-99]
+    access: {roles: [admin]}
+""")
+    channel = f"cultivate-invalid-{tmp_path.name}"
+    entry = approval_requests.register(
+        kind="update", channel_id=channel,
+        description="test update", expires_at=time.monotonic() + 60,
+        resolver=lambda *_args: pytest.fail("unauthenticated approval resolved"),
+        inject_into_turn=False,
+    )
+    try:
+        def ordinary_setup(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("ordinary turn reached")
+
+        monkeypatch.setattr("mimir.agent._initialize_ifc_labels", ordinary_setup)
+        with pytest.raises(RuntimeError, match="ordinary turn reached"):
+            await agent.run_turn(AgentEvent(
+                trigger="user_message", channel_id=channel, source="discord",
+                author="discord-98", content=f"approve {entry.approval_id}",
+            ))
+        assert approval_requests.pending(channel) == (entry,)
+    finally:
+        approval_requests.cancel(entry.approval_id)
+
+
+@pytest.mark.asyncio
+async def test_selected_empty_provider_keeps_core_health_response() -> None:
+    import json
+
+    from mimir.plugins.manager import load_plugins
+    from mimir.server import _handle_health
+
+    manager = load_plugins(enable="cultivate")
+    assert len(manager.plugins) == 1
+    response = await _handle_health(SimpleNamespace(app={
+        "plugin_manager": manager, "check_worker_executor_health": False,
+    }))
+    assert json.loads(response.text) == {"ok": True}
