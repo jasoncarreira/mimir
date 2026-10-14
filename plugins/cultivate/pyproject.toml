@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mimir-cultivate"
+version = "0.9.9"
+description = "Cultivate coding provider for Mimir"
+requires-python = ">=3.11"
+license = "BUSL-1.1"
+dependencies = ["mimir-agent==0.9.9"]
+
+[tool.uv.sources]
+mimir-agent = { workspace = true }
+
+[project.entry-points."mimir.plugins"]
+cultivate = "mimir_cultivate:provider"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mimir_cultivate"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"LICENSE" = "mimir_cultivate/LICENSE"
+"brand/LICENSE" = "mimir_cultivate/brand/LICENSE"
+"mimir-plugin.toml" = "mimir_cultivate/mimir-plugin.toml"
+
+[tool.hatch.build.targets.sdist]
+include = ["pyproject.toml", "LICENSE", "brand/LICENSE", "mimir-plugin.toml", "mimir_cultivate/**/*"]

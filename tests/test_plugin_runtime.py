@@ -415,7 +415,7 @@ assert not manager.policy.prompt_providers
 assert not manager.policy.state_slots
 assert "example-hello" not in manager.policy.cli_commands
 assert not select_plugins(enable="")
-assert select_plugins(enable="", all_installed=True)[0].name == "example"
+assert "example" in {candidate.name for candidate in select_plugins(enable="", all_installed=True)}
 assert discover_pollers(home / "skills", policy=manager.policy) == []
 with contextlib.redirect_stderr(io.StringIO()):
     try:
