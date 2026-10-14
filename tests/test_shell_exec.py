@@ -16,6 +16,7 @@ silently revert to the shlex+shell=False path that broke it.
 from __future__ import annotations
 
 import errno
+import inspect
 import json
 import os
 import subprocess
@@ -264,9 +265,26 @@ def test_shell_exec_valid_direct_executable_and_cwd(tmp_path):
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
 @pytest.mark.parametrize("direct", [False, True], ids=["login-shell", "direct-argv"])
-@pytest.mark.parametrize("isolated", [True, False], ids=["isolated", "mutation-control"])
-def test_shell_exec_timeout_reaps_spawned_child(tmp_path, monkeypatch, direct, isolated):
-    """The wrapper and a child it spawned must both stop before a retry."""
+@pytest.mark.parametrize(
+    "isolated, guard_regression",
+    [(True, False), (False, False), (False, True)],
+    ids=["isolated", "mutation-control", "guard-regression-safety"],
+)
+def test_shell_exec_timeout_reaps_spawned_child(
+    tmp_path, monkeypatch, direct, isolated, guard_regression,
+):
+    """Pin descendant cleanup without ever signalling the test runner's group."""
+    killpg = os.killpg
+    runner_pgid = os.getpgrp()
+
+    def safe_killpg(pgid, sig):
+        # This safety boundary must hold even if the production guard regresses.
+        # Keep real signals for isolated groups so descendant cleanup is tested.
+        assert pgid != runner_pgid, "timeout cleanup attempted to signal the test runner's group"
+        return killpg(pgid, sig)
+
+    monkeypatch.setattr(extra.os, "killpg", safe_killpg)
+    wrappers = []
     script = tmp_path / "spawn.py"
     pidfile = tmp_path / "child.pid"
     script.write_text(
@@ -294,13 +312,35 @@ def test_shell_exec_timeout_reaps_spawned_child(tmp_path, monkeypatch, direct, i
 
         def without_session(*args, **kwargs):
             kwargs["start_new_session"] = False
-            return popen(*args, **kwargs)
+            proc = popen(*args, **kwargs)
+            wrappers.append(proc)
+            return proc
 
         monkeypatch.setattr(extra.subprocess, "Popen", without_session)
-    result = shell_exec.invoke(args)
-    assert pidfile.exists(), "child must have started before the timeout"
-    pid = int(pidfile.read_text())
+    if guard_regression:
+        # Exercise the reviewer's exact mutation with the real timeout path.
+        # The test-owned killpg interlock above remains independent of it.
+        source = inspect.getsource(extra._kill_shell_process_group)
+        guard = "if pgid == os.getpgrp():"
+        assert source.count(guard) == 1
+        namespace = {}
+        exec(
+            compile(source.replace(guard, "if False:"), "<guard-regression>", "exec"),
+            extra.__dict__, namespace,
+        )
+        monkeypatch.setattr(
+            extra, "_kill_shell_process_group", namespace["_kill_shell_process_group"],
+        )
     try:
+        if guard_regression:
+            with pytest.raises(AssertionError, match="attempted to signal the test runner's group"):
+                shell_exec.invoke(args)
+            assert pidfile.exists(), "child must have started before the timeout"
+            os.kill(int(pidfile.read_text()), 0)
+            return
+        result = shell_exec.invoke(args)
+        assert pidfile.exists(), "child must have started before the timeout"
+        pid = int(pidfile.read_text())
         if not isolated:
             # Prove the same disappearance predicate detects the original bug.
             os.kill(pid, 0)
@@ -316,11 +356,16 @@ def test_shell_exec_timeout_reaps_spawned_child(tmp_path, monkeypatch, direct, i
             "or use bash_async for long jobs."
         )
     finally:
-        # Keep a failed regression test from leaving a live sleep behind.
-        try:
-            os.kill(pid, 9)
-        except ProcessLookupError:
-            pass
+        # Also clean up when the interlock raises before shell_exec returns.
+        for proc in wrappers:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=2)
+        if pidfile.exists():
+            try:
+                os.kill(int(pidfile.read_text()), 9)
+            except ProcessLookupError:
+                pass
 
 
 @pytest.mark.parametrize("filename", [None, "private-unrelated-path", "same-target"])
