@@ -763,6 +763,7 @@ async def test_repo_test_non_summary_results_keep_original_shape(tmp_path, monke
         provenance = end_protected_result_capture(token)
     expected = asdict(original)
     expected.pop("failure_summary")
+    expected.pop("pytest_summary")
     assert {key: value for key, value in returned.items() if key != "remediation_guidance"} == expected
     labels = classify_protected_result(
         "repo_test", {"repository": "owner/repo", "pull_request": 7}, auth,

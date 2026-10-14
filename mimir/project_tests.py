@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -93,7 +93,9 @@ _PYTEST_QUIET_FINAL = re.compile(
     r"(?:\d+ (?:failed|errors?|passed|skipped|deselected|xfailed|xpassed|warnings?)"
     r"(?:, )?)+ in \d+(?:\.\d+)?s(?: \([^\r\n]*\))?"
 )
+_PYTEST_DURATION = re.compile(r"\bin (\d+(?:\.\d+)?s)(?: \([^\r\n]*\))?$")
 _PYTEST_FAILING_BYTES = 4_096
+_RETURN_FAILING_NODES = 10
 
 
 def pytest_node_inventory(root: Path) -> frozenset[str]:
@@ -243,6 +245,28 @@ def pytest_failure_summary(
     return {**counts, "failing": failing, "failing_dropped": dropped}
 
 
+def _pytest_terminal_summary(stdout: bytes) -> dict[str, int | str] | None:
+    """Return only numeric pytest footer observations, never arbitrary output text."""
+    for line in reversed(stdout.decode("utf-8", errors="replace").splitlines()):
+        match = _PYTEST_FINAL_LINE.fullmatch(line)
+        text = match[1] if match is not None else line
+        if match is None and _PYTEST_QUIET_FINAL.fullmatch(line) is None:
+            continue
+        duration = _PYTEST_DURATION.search(text)
+        counts = _PYTEST_COUNTS.findall(text)
+        if duration is None or not counts:
+            continue
+        summary: dict[str, int | str] = {
+            "passed": 0, "failed": 0, "errors": 0, "skipped": 0,
+            "duration": duration[1],
+        }
+        for amount, kind in counts:
+            if len(amount) <= 9:
+                summary["errors" if kind in {"error", "errors"} else kind] = int(amount)
+        return summary
+    return None
+
+
 class ProjectTestRefusal(RuntimeError):
     """A named policy refusal, distinct from a red test suite.
 
@@ -280,6 +304,8 @@ class ProjectTestResult:
     ok: bool
     code: str
     returncode: int | None
+    pytest_summary: dict[str, int | str] | None = field(default=None, kw_only=True)
+    failing_node_ids: list[str] = field(default_factory=list, kw_only=True)
     stdout: str = ""
     stderr: str = ""
     command: tuple[str, ...] = ()
@@ -287,6 +313,8 @@ class ProjectTestResult:
     output_limited: bool = False
     stdout_dropped_bytes: int = 0
     stderr_dropped_bytes: int = 0
+    stdout_return_dropped_bytes: int = 0
+    stderr_return_dropped_bytes: int = 0
     git_context: str = ""
     stdout_path: str = ""
     stderr_path: str = ""
@@ -566,26 +594,43 @@ def _safe_output(
     value: bytes,
     scrubber: SensitiveMaterialScrubber,
     limit: int,
-    *,
-    keep_tail: bool = False,
-) -> str:
+) -> tuple[str, int]:
     scrubbed = redact_text(scrubber.scrub_text(value))
-    return scrubbed[-limit:] if keep_tail else scrubbed[:limit]
+    return _bounded_scrubbed_output(scrubbed, limit)
+
+
+def _bounded_scrubbed_output(scrubbed: str, limit: int, *, head_start: int = 0) -> tuple[str, int]:
+    if len(scrubbed) <= limit:
+        return scrubbed, 0
+    omitted_prefix = len(scrubbed[:head_start].encode("utf-8"))
+    suffix = scrubbed[head_start:]
+    prefix_marker = f"…[{omitted_prefix} bytes omitted]…"
+    if head_start and len(suffix) + len(prefix_marker) <= limit:
+        return prefix_marker + suffix, omitted_prefix
+    # Reserve a short opening for context and keep the terminal diagnostics.
+    # Count UTF-8 bytes in the *scrubbed* text that the returned excerpt omits.
+    head_size = min(limit // 4, len(suffix))
+    prefix = suffix[:head_size]
+    # Reserve enough space for the longest possible byte count, then use any
+    # remaining space for the tail (the count and marker stay self-consistent).
+    marker_budget = len(f"…[{len(scrubbed.encode('utf-8'))} bytes omitted]…")
+    tail_size = min(max(0, limit - head_size - marker_budget), len(suffix) - head_size)
+    tail = suffix[-tail_size:] if tail_size else ""
+    dropped = omitted_prefix + len(suffix[head_size:len(suffix) - tail_size].encode("utf-8"))
+    return prefix + f"…[{dropped} bytes omitted]…" + tail, dropped
 
 
 def _safe_stderr_output(
     value: bytes,
     scrubber: SensitiveMaterialScrubber,
     limit: int,
-    *,
-    keep_tail: bool = False,
-) -> str:
+) -> tuple[str, int]:
     """Prefer a pytest faulthandler dump over positional stderr context."""
     scrubbed = redact_text(scrubber.scrub_text(value))
     marker = re.search(r"Timeout \([^\r\n]+\)!", scrubbed)
     if marker is not None and len(scrubbed) > limit:
-        return scrubbed[marker.start():marker.start() + limit]
-    return scrubbed[-limit:] if keep_tail else scrubbed[:limit]
+        return _bounded_scrubbed_output(scrubbed, limit, head_start=marker.start())
+    return _bounded_scrubbed_output(scrubbed, limit)
 
 
 def _live_output_paths(home: str, identifier: str) -> tuple[Path, Path, str, str]:
@@ -946,28 +991,31 @@ class RepoProjectTests:
 
         assert result is not None
 
-        stdout = _safe_output(
-            result.stdout,
-            scrubber,
-            _RETURN_STDOUT_CHARS,
-            keep_tail=result.stdout_dropped_bytes > 0,
-        )
-        stderr = _safe_stderr_output(
-            result.stderr,
-            scrubber,
-            _RETURN_STDERR_CHARS,
-            keep_tail=result.stderr_dropped_bytes > 0,
+        stdout, stdout_return_dropped = _safe_output(result.stdout, scrubber, _RETURN_STDOUT_CHARS)
+        stderr, stderr_return_dropped = _safe_stderr_output(result.stderr, scrubber, _RETURN_STDERR_CHARS)
+        summary = _pytest_terminal_summary(result.stdout)
+        failure_summary = (
+            pytest_failure_summary(result.stdout, node_inventory)
+            if result.exit_code not in {None, 0} and not result.output_overflow and not result.timed_out
+            else None
         )
         truncation = {
             "suite": suite_name,
-            "output_limited": result.output_overflow,
+            "output_limited": result.output_overflow or bool(stdout_return_dropped or stderr_return_dropped),
             "stdout_dropped_bytes": result.stdout_dropped_bytes,
             "stderr_dropped_bytes": result.stderr_dropped_bytes,
+            "stdout_return_dropped_bytes": stdout_return_dropped,
+            "stderr_return_dropped_bytes": stderr_return_dropped,
+        }
+        parsed = {
+            "pytest_summary": summary,
+            "failing_node_ids": (failure_summary["failing"][:_RETURN_FAILING_NODES]
+                                 if failure_summary is not None else []),
         }
         if result.timed_out:
             return ProjectTestResult(
                 False, "test_timeout", None, stdout, stderr,
-                command, command_source, **truncation,
+                command, command_source, **truncation, **parsed,
                 git_context=_git_execution_context(),
                 stdout_path=stdout_relative,
                 stderr_path=stderr_relative,
@@ -980,9 +1028,9 @@ class RepoProjectTests:
                 code = "test_output_overflow" if result.exit_code == 0 else "tests_failed_output_overflow"
             return ProjectTestResult(
                 False, code, result.exit_code, stdout, stderr,
-                command, command_source, **truncation,
+                command, command_source, **truncation, **parsed,
                 git_context=_git_execution_context(),
-                failure_summary=(pytest_failure_summary(result.stdout, node_inventory) if code == "tests_failed" else None),
+                failure_summary=(failure_summary if code == "tests_failed" else None),
             )
         # A non-default suite must not satisfy the existing default-test push gate.
         if not retained and not selectors and is_default:
@@ -998,5 +1046,5 @@ class RepoProjectTests:
             self._state.record_full_test(scope.scope_id, head)
         return ProjectTestResult(
             True, "tests_passed", 0, stdout, stderr, command, command_source,
-            **truncation, git_context=_git_execution_context(),
+            **truncation, **parsed, git_context=_git_execution_context(),
         )
