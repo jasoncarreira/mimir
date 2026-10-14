@@ -25,8 +25,10 @@ import xml.etree.ElementTree as ET
 from mimir.redaction import redact_text
 from mimir.worklink.compute import (
     ComputeBackend,
+    ComputeLaunchError,
     ComputeResult,
     LaunchHandle,
+    LocalSubprocessComputeBackend,
     WorkSpec,
     with_worker_environment,
 )
@@ -636,9 +638,22 @@ async def _observe_evidence_from_ref(
     gate_rerun_max_failures: int = 10,
 ) -> EvidenceValidation:
     runner = runner or _run
-    from mimir.worklink.checkout import coding_enabled
+    # Until the provider-owned compute substrate lands, the core local backend
+    # can still launch directly as the controller when the legacy flag is off.
+    # Never allow a selected provider's checkout command onto that path.
+    from mimir.coding import coding_enabled
 
-    worker_uid_drop = coding_enabled() and backend == "opencode"
+    worker_uid_drop = backend == "opencode"
+    if test_command and not skip_test_reason:
+        if (
+            not worker_uid_drop
+            or not coding_enabled()
+            or type(compute) is not LocalSubprocessComputeBackend
+            or compute._authorized_checkout is None
+            or work_spec is None
+            or work_spec.local_checkout != checkout
+        ):
+            raise ComputeLaunchError("Cultivate evidence gate requires an authorized worker checkout")
     range_ref = f"{base_ref}...{head_ref}"
     def git_run(*args: str) -> subprocess.CompletedProcess[str]:
         if safe_git is not None:

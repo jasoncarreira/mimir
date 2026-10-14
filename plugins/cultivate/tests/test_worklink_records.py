@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
+import os
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
 
-from mimir.worklink.compute import LaunchHandle
+from mimir.worklink.backends.feature_factory import parse_factory_status
+from mimir.worklink.compute import (
+    ComputeLaunchError, ComputeResult, LaunchHandle, LocalSubprocessComputeBackend, WorkSpec,
+)
 from mimir_cultivate.worklink.backends.base import blocked_reason_from_output
+from mimir_cultivate.worklink import evidence as provider_evidence
 from mimir_cultivate.worklink.evidence import (
     TestResult,
     WorklinkEvidence,
+    observe_evidence,
     validate_evidence,
 )
 from mimir_cultivate.worklink.factory_state import (
@@ -24,7 +32,9 @@ from mimir_cultivate.worklink.factory_state import (
 from mimir_cultivate.worklink import identities
 from mimir_cultivate.worklink.planning import target_branch_from_description
 from mimir_cultivate.worklink.run_state import WorklinkRunState
-from mimir_cultivate.worklink.safe_git import SafeGitError, _validated_branch_ref
+from mimir_cultivate.worklink.safe_git import (
+    ControllerGitPublication, SafeGitError, _validated_branch_ref,
+)
 
 
 def _factory_record(tmp_path: Path) -> FactoryRunRecord:
@@ -56,6 +66,29 @@ def test_factory_record_refuses_symlinked_store(tmp_path: Path) -> None:
     (home / "state" / "worklink").symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(FactoryRecordError, match="not contained"):
         save_factory_record(home, _factory_record(tmp_path))
+
+
+def test_populated_factory_record_recovers_legacy_status_and_handle(tmp_path: Path) -> None:
+    record = _factory_record(tmp_path)
+    status = parse_factory_status({
+        "run_id": record.run_id, "issue_key": str(record.issue_id), "valid": True,
+        "sandbox_path": record.sandbox, "status": "running", "mode": "autonomous",
+        "branch": record.branch, "pr_base": record.base_ref, "pr_draft": False,
+        "lock": "fresh", "dead_lock": False, "lock_session": "session-1",
+        "gates": {}, "steps": [], "slices": [], "validator": None, "pr_url": None,
+        "terminal_result": None, "next": "implementation",
+    })
+    populated = replace(record, status=status, observed_at="2026-10-01T12:00:00+00:00")
+    assert load_factory_record(tmp_path, populated.run_id) is None
+    save_factory_record(tmp_path, populated)
+    assert load_factory_record(tmp_path, populated.run_id) == populated
+    legacy = populated.to_json()
+    legacy["version"] = 1
+    del legacy["transcript"]
+    assert FactoryRunRecord.from_json(legacy) == populated
+    assert FactoryRunRecord.from_json(populated.to_json()).handle == populated.handle
+    with pytest.raises(FactoryRecordError, match="status identity mismatch"):
+        FactoryRunRecord.from_json({**populated.to_json(), "run_id": str(populated.issue_id)})
 
 
 def test_run_state_accepts_legacy_pid_but_requires_worker_identity() -> None:
@@ -95,6 +128,52 @@ def test_planning_branch_and_git_publication_reject_unsafe_refs() -> None:
         _validated_branch_ref("../escape")
 
 
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def test_provider_publication_pins_head_and_refuses_replaced_git_fd(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Trusted User")
+    _git(repo, "config", "user.email", "trusted@example.test")
+    _git(repo, "remote", "add", "origin", str(tmp_path / "remote.git"))
+    (repo / "tracked.txt").write_text("original\n")
+    _git(repo, "add", "tracked.txt")
+    _git(repo, "commit", "-qm", "original")
+    branch = _git(repo, "branch", "--show-current")
+    initial_head = _git(repo, "rev-parse", "HEAD")
+    fd = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        publication = ControllerGitPublication.capture(
+            fd, trusted_repo=repo, branch=branch, metadata_root=tmp_path / "metadata",
+        )
+        try:
+            (repo / "tracked.txt").write_text("worker change\n")
+            publication.run("add", "tracked.txt", check=True)
+            publication.run("commit", "-m", "private commit", check=True)
+            assert publication.initial_head == initial_head
+            assert publication.run("rev-parse", "HEAD", check=True).stdout.strip() != initial_head
+            assert _git(repo, "rev-parse", "HEAD") == initial_head
+            (repo / ".git").rename(repo / "git-original")
+            (repo / ".git").symlink_to(repo / "git-original", target_is_directory=True)
+            with pytest.raises(SafeGitError, match="unavailable or unsafe"):
+                publication.run("status")
+            (repo / ".git").unlink()
+            (repo / "git-original").rename(repo / ".git")
+            (repo / ".git").rename(repo / "git-original")
+            (repo / ".git").mkdir()
+            with pytest.raises(SafeGitError, match="replaced"):
+                publication.run("status")
+        finally:
+            publication.close()
+    finally:
+        os.close(fd)
+
+
 def test_backend_blocked_marker_must_end_the_output() -> None:
     assert blocked_reason_from_output("WORKLINK_BLOCKED: needs design\n", "") == "needs design"
     assert blocked_reason_from_output("WORKLINK_BLOCKED: example\ndone", "") is None
@@ -114,3 +193,80 @@ def test_identity_lookup_requires_both_accounts_and_group(monkeypatch: pytest.Mo
     with pytest.raises(RuntimeError, match="required group 'worklink'"):
         identities.get_identities()
     identities.get_identities.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_selected_provider_gate_never_runs_controller_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    called: list[object] = []
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        called.append((args, kwargs))
+        raise AssertionError("checkout test command ran as controller")
+
+    monkeypatch.setattr(provider_evidence, "_run", forbidden)
+    class GitObservation:
+        def run(self, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args, 0, "changed.py\n" if "--name-only" in args else "")
+
+    with pytest.raises(ComputeLaunchError, match="authorized worker checkout"):
+        await observe_evidence(
+            issue=1949, attempt=1, backend="opencode", branch="feature/1949",
+            checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
+            backend_status="completed", test_command="touch controller-canary",
+            safe_git=GitObservation(),
+        )
+    assert not called
+    assert not (tmp_path / "controller-canary").exists()
+
+
+@pytest.mark.asyncio
+async def test_selected_provider_observes_gate_through_authorized_compute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    calls: list[object] = []
+    compute = LocalSubprocessComputeBackend(_authorized_checkout=object())
+    handle = LaunchHandle("local_subprocess", "worker-handle")
+
+    async def launch(spec: WorkSpec) -> LaunchHandle:
+        calls.append(spec)
+        return handle
+
+    async def wait(observed: LaunchHandle, timeout: int) -> ComputeResult:
+        assert observed == handle
+        return ComputeResult(exit_code=0, stdout="passed", stderr="")
+
+    async def cleanup(observed: LaunchHandle) -> None:
+        assert observed == handle
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("controller shell must not run the gate")
+
+    class GitObservation:
+        def run(self, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args, 0, "changed.py\n" if "--name-only" in args else "")
+
+    monkeypatch.setattr(compute, "launch", launch)
+    monkeypatch.setattr(compute, "wait", wait)
+    monkeypatch.setattr(compute, "cleanup", cleanup)
+    monkeypatch.setattr(provider_evidence, "_run", forbidden)
+    result = await observe_evidence(
+        issue=1949, attempt=1, backend="opencode", branch="feature/1949",
+        checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
+        backend_status="completed", test_command="pytest -q", safe_git=GitObservation(),
+        compute=compute,
+        work_spec=WorkSpec(
+            issue_id=1949, attempt=1, repo_url="repo", base_ref="main",
+            branch="feature/1949", prompt="", rules=None, test_command="pytest -q",
+            backend="opencode", timeout_s=30, local_checkout=tmp_path,
+        ),
+    )
+    assert result.review_ready
+    assert result.evidence.tests is not None and result.evidence.tests.exit_code == 0
+    assert len(calls) == 1
+    assert calls[0].local_argv == ("/bin/sh", "-c", "pytest -q")
