@@ -1600,7 +1600,10 @@ def _service_shell_refusal_guidance(
         "repo_review": "hardened local read-only Git inspection bound to a server-owned PR state; use typed pr_* and repo_* tools for GitHub operations, checkout, tests and mutations",
         "upgrade_workspace": "bounded file inspection, workspace Git, Chainlink and uv lock/sync operations",
     }.get(policy.destination if policy is not None else "")
-    if operations and "trusted-service shell profile does not admit" in message:
+    if operations and (
+        "trusted-service shell profile does not admit" in message
+        or "trusted-service shell profile never admits" in message
+    ):
         message += f" Profile allows {operations}, subject to its option and scope limits."
     if "filesystem operand" in message:
         # Only principal-owned read roots, never the rejected operand or global
@@ -1619,7 +1622,7 @@ def _service_shell_refusal_guidance(
             message += f" Allowed read roots{qualifier}: {', '.join(shown)}; protected files remain withheld."
     if "shell metacharacters" in message:
         message += (
-            " Pipes, redirections and command chaining are not available on this turn;"
+            " Pipes, redirections and command chaining are not allowed on this turn;"
             " a single plain command is available if the profile admits it."
         )
     return message + (
@@ -3973,9 +3976,31 @@ class BudgetGateMiddleware(AgentMiddleware):
     def __init__(self) -> None:
         get_tool_registry().enable_shadow_logging()
 
+    @staticmethod
+    def _available_after_budget(request: Any) -> Any:
+        """Stop advertising spent tools on the next model step.
+
+        Exempt reply tools remain callable; the execution gate still protects
+        stale or fabricated calls and parallel calls already in flight.
+        """
+        state = _resolve_budget_state()
+        if state is None:
+            return request
+        ctx, budget = state
+        if (getattr(ctx, "tool_call_count", 0) or 0) < budget:
+            return request
+        tools = [
+            tool for tool in request.tools
+            if (descriptor := get_tool_descriptor(
+                tool.get("name", "") if isinstance(tool, dict) else getattr(tool, "name", ""),
+            )) is not None and descriptor.budget_exempt
+        ]
+        return request.override(tools=tools)
+
     def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         request = _request_for_acp_model(request)
         request = _request_with_ingest_trust_notice(request)
+        request = self._available_after_budget(request)
         get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return handler(request)
 
@@ -3986,6 +4011,7 @@ class BudgetGateMiddleware(AgentMiddleware):
     ) -> Any:
         request = _request_for_acp_model(request)
         request = _request_with_ingest_trust_notice(request)
+        request = self._available_after_budget(request)
         get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return await handler(request)
 

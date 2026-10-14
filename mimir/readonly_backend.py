@@ -1353,6 +1353,18 @@ class _BoundedFilesystemBackend(FilesystemBackend):
 
         try:
             search_path = self._resolve_read_path(path or "/")
+            if path is None:
+                # A literal leading directory is an anchor, not a reason to
+                # visit every sibling in the home. Keep the last component as
+                # the match target when the entire pattern is literal.
+                parts = Path(pattern).parts
+                prefix = []
+                for part in parts[:-1]:
+                    if any(char in part for char in "*?["):
+                        break
+                    prefix.append(part)
+                if prefix:
+                    search_path = self._resolve_read_path("/" + "/".join(prefix))
             from .read_policy import (
                 is_mimir_home_root,
                 non_admin_read_filter_enabled,
@@ -1484,6 +1496,11 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             reason=truncated,
         )
         return GlobResult(
+            error=(
+                f"glob timed out after {timeout_seconds:g}s; results are incomplete; "
+                "narrow the path or pattern"
+                if truncated and truncated.startswith("ran longer than") else None
+            ),
             matches=results,
             truncated=truncated is not None,
         )
@@ -2289,8 +2306,8 @@ class WriteGuardBackend:
             return True
 
     _SCHEDULED_INSTRUCTION_DENY_REASON = (
-        "Write blocked after untrusted ingest: propose this change with "
-        "open_proposal/submit_proposal; the operator merges it."
+        "Write blocked: scheduler.yaml is managed by add_schedule / "
+        "remove_schedule / set_schedule_priority (and set_schedule_cron)."
     )
 
     def _allowed_dirs_label(self) -> str:

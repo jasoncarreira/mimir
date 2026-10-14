@@ -646,7 +646,7 @@ async def test_fetch_url_http_failure_does_not_return_remote_reason(
 
     result = await web_tools_mod.fetch_url.ainvoke({"url": "https://example.com/fail"})
 
-    assert result == "fetch_url failed: HTTP request failed."
+    assert result == "fetch_url failed: HTTP 500 Internal Server Error."
     assert remote_reason not in result
 
 
@@ -894,10 +894,10 @@ def test_fetch_url_rejects_public_redirect_not_on_exact_url_allowlist(
     handler = web_tools_mod._SSRFCheckingRedirectHandler()
     token = web_tools_mod.begin_authorized_fetch(frozenset({"https://example.com/start"}))
     try:
-        with pytest.raises(web_tools_mod.SSRFBlocked, match="exact URL"):
+        with pytest.raises(web_tools_mod.SSRFBlocked, match="host 'other.example' needs approval for exact URL"):
             handler.redirect_request(
                 web_tools_mod.Request("https://example.com/start"), None, 302, "Found", {},
-                "https://example.com/other",
+                "https://other.example/other",
             )
     finally:
         web_tools_mod.end_authorized_fetch(token)

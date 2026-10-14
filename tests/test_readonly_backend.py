@@ -144,6 +144,9 @@ def test_admin_agent_cannot_write_operator_scheduler_declaration(
     backend._writable_roots.append(home)  # Even a permissive home root cannot bypass it.
     result = getattr(backend, operation)("scheduler.yaml", *args)
     assert result.error
+    for tool_name in ("add_schedule", "remove_schedule", "set_schedule_priority", "set_schedule_cron"):
+        assert tool_name in result.error
+    assert "open_proposal" not in result.error
     assert target.read_text(encoding="utf-8") == "original"
 
 
@@ -236,7 +239,7 @@ def test_tainted_file_guard_resolves_alias_and_traversal(
     try:
         backend = WriteGuardBackend(home, ["prompts"])
         backend._writable_roots.append(home)
-        assert "open_proposal/submit_proposal" in backend.replace(spelling, "changed").error
+        assert "scheduler.yaml is managed by add_schedule" in backend.replace(spelling, "changed").error
         assert (home / "scheduler.yaml").read_text(encoding="utf-8") == "original"
     finally:
         reset_current_turn(token)
@@ -3036,6 +3039,25 @@ class TestBuildFileToolRoutes:
         assert result.status == "success"
         assert result.content == "['/match.py']"
 
+    def test_glob_omitted_path_anchors_literal_prefix(self, tmp_path: Path, monkeypatch) -> None:
+        (tmp_path / "state").mkdir()
+        (tmp_path / "state" / "match.md").write_text("yes")
+        (tmp_path / "other").mkdir()
+        (tmp_path / "other" / "match.md").write_text("no")
+        backend = _RootAwareFilesystemBackend(root_dir=tmp_path, virtual_mode=True)
+        visited = []
+        walk = backend._walk_files
+
+        def observe(root, **kwargs):
+            visited.append(root)
+            return walk(root, **kwargs)
+
+        monkeypatch.setattr(backend, "_walk_files", observe)
+        result = backend.glob("state/*.md")
+        assert result.error is None
+        assert [match["path"] for match in result.matches] == ["/state/match.md"]
+        assert visited == [tmp_path / "state"]
+
     @pytest.mark.parametrize(
         ("kwargs", "argument", "retry_text"),
         [
@@ -3203,7 +3225,9 @@ class TestBuildFileToolRoutes:
 
         result = backend.glob("**/*.py", path="/")
 
-        assert result.error is None
+        assert result.error == (
+            "glob timed out after 0.001s; results are incomplete; narrow the path or pattern"
+        )
         assert result.truncated is True
         assert str(repo) in caplog.text
         assert "was cut short" in caplog.text
@@ -3214,6 +3238,21 @@ class TestBuildFileToolRoutes:
         assert fields["visited_entries"] == 1
         assert fields["truncated"] is True
         assert fields["reason"] == "ran longer than 0.001s"
+
+    def test_glob_timeout_tool_result_is_not_a_false_negative(self, tmp_path: Path) -> None:
+        (tmp_path / "file.txt").touch()
+        (tmp_path / "second.txt").touch()
+        backend = _RootAwareFilesystemBackend(
+            root_dir=tmp_path, virtual_mode=True, glob_timeout_seconds=0,
+        )
+        assert "glob timed out" in backend.glob("**/*.missing").error
+        middleware = MimirFilesystemMiddleware(backend=backend)
+        glob_tool = next(tool for tool in middleware.tools if tool.name == "glob")
+        result = glob_tool.func(
+            pattern="**/*.missing", runtime=SimpleNamespace(tool_call_id="timeout"),
+        )
+        assert "glob timed out after 0s; results are incomplete" in result.content
+        assert "No files found" not in result.content
 
     def test_glob_time_truncation_always_reports_forward_progress(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -3252,7 +3291,7 @@ class TestBuildFileToolRoutes:
 
         result = backend.glob("**/*.py", path="/")
 
-        assert result.error is None
+        assert "glob timed out after 0s; results are incomplete" in result.error
         assert result.truncated is True
         kind, fields = events[-1]
         assert kind == "filesystem_glob_search"

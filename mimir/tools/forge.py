@@ -1736,16 +1736,18 @@ def _emit_unsupported(
     description: str,
     attempted_operations: list[str],
 ) -> bool:
-    key = f"{scope.scope_id}:{operation}"
+    key = f"{scope.canonical_repo}#{scope.pr_number}"
+    fingerprint = f"{scope.observed_head_sha}:{operation}"
     state_path = _escalation_state_path()
     with _escalation_lock:
         try:
-            known = set(json.loads(state_path.read_text(encoding="utf-8")))
+            stored = json.loads(state_path.read_text(encoding="utf-8"))
+            known = stored if isinstance(stored, dict) else {}
         except FileNotFoundError:
-            known = set()
+            known = {}
         except (OSError, ValueError, TypeError) as exc:
             raise ToolException("unsupported operation escalation state is unreadable") from exc
-        if key in known:
+        if known.get(key) == fingerprint:
             return False
 
         from ..event_logger import log_durable_event_sync
@@ -1764,7 +1766,7 @@ def _emit_unsupported(
             state_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = state_path.with_suffix(".tmp")
             temporary.write_text(
-                json.dumps(sorted(known | {key}), separators=(",", ":")),
+                json.dumps({**known, key: fingerprint}, sort_keys=True, separators=(",", ":")),
                 encoding="utf-8",
             )
             with temporary.open("rb") as handle:

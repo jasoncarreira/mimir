@@ -20,6 +20,7 @@ import os
 import select
 import signal
 import shlex
+import sqlite3
 import subprocess
 import threading
 import time
@@ -110,6 +111,8 @@ async def file_search(
             recency_weight=recency_weight,
             include_protected=not non_admin_read_filter_enabled(),
         )
+    except sqlite3.OperationalError as exc:
+        return f"file_search failed: invalid search query ({exc}); try simpler terms"
     except ValueError as exc:
         # Negative-weight rejection from the indexer surfaces as a
         # readable tool error rather than a generic failure.

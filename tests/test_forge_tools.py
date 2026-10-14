@@ -5254,3 +5254,37 @@ def test_unavailable_comment_verdict_is_retried_on_next_turn(monkeypatch):
     assert first[0]["withheld"] is True
     assert second[0]["body"] == "safe after attestation"
     assert calls == ["other", "other"]
+@pytest.mark.parametrize("method", ["POST", "PATCH", "GET"])
+def test_forge_transport_write_warns_about_ambiguous_outcome(method):
+    import requests
+    from mimir.forge.github import GitHubForgeClient
+    from mimir.tools.forge import _call
+
+    class TimeoutSession:
+        def request(self, *args, **kwargs):
+            raise requests.Timeout("request timed out")
+
+    client = GitHubForgeClient(token="test", session=TimeoutSession())
+    with pytest.raises(ToolException) as caught:
+        _call(lambda: client._request(method, "/repos/owner/repo/issues/17/comments"))
+    if method == "GET":
+        assert "may have been applied" not in str(caught.value)
+    else:
+        assert "write may have been applied; check pr_reviews / pr_comments before retrying" in str(caught.value)
+
+
+def test_repeated_poller_escalation_suppressed_by_reason_and_head(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    init_logger(home / "events.jsonl", "test")
+    scope = _scope(RepoPRAction.INSPECT)
+    first = unsupported_operation.func("owner/repo", 17, "Need thread resolution", runtime=_runtime(scope))
+    # A new poller invocation can carry a different scope_id for the same PR head.
+    from mimir.tools import forge
+    same_head = replace(scope, event_type="pr_poller_tick")
+    again = forge._emit_unsupported(same_head, first["operation"], first["description"], [])
+    assert again is False
+    changed_reason = forge._emit_unsupported(same_head, "different-reason", "Different", [])
+    assert changed_reason is True
+    changed_head = replace(same_head, observed_head_sha="b" * 40)
+    assert forge._emit_unsupported(changed_head, "different-reason", "Different", []) is True

@@ -182,13 +182,14 @@ def test_deployment_index_skip_file_matches_exact_file_entries(tmp_path: Path):
 
 def test_fts_query_strips_operators():
     # Parentheses get stripped to nothing; alnum tokens kept and OR-joined.
-    assert _to_fts_query("foo (bar) baz") == "foo OR bar OR baz"
+    assert _to_fts_query("foo (bar) baz") == '"foo" OR "bar" OR "baz"'
     # Dashes split into separate OR-joined tokens — FTS5 parses
     # ``-foo`` as the unary NOT operator on a column named ``foo``,
     # which raises OperationalError for chunks_fts (no such column).
     # Underscores stay intact (they're term-internal for FTS5
     # tokenizers).
-    assert _to_fts_query("hello-world_v2") == "hello OR world_v2"
+    assert _to_fts_query("hello-world_v2") == '"hello" OR "world_v2"'
+    assert _to_fts_query("worklink-1978 OR timeout") == '"worklink" OR "1978" OR "OR" OR "timeout"'
     assert _to_fts_query("") == ""
     assert _to_fts_query("   ") == ""
 
