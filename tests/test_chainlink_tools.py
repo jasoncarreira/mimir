@@ -27,7 +27,11 @@ def test_chainlink_issue_show_reads_only_exact_issue_and_bounds_content(tmp_path
             "id": 42, "title": "Live issue", "status": "open",
             "labels": ["worklink:ready"], "parent_id": 7,
             "description": "x" * 20_000,
-            "comments": [{"content": "z" * 3_000, "author": "bot"} for _ in range(8)],
+            "comments": [
+                {"id": i, "issue_id": 42, "content": "z" * 3_000,
+                 "created_at": "2026-10-15T00:00:00Z", "kind": "note"}
+                for i in range(8)
+            ],
         }).encode())
         return subprocess.CompletedProcess(argv, 0)
 
@@ -36,9 +40,52 @@ def test_chainlink_issue_show_reads_only_exact_issue_and_bounds_content(tmp_path
     assert result == {
         "id": 42, "title": "Live issue", "status": "open", "labels": ["worklink:ready"],
         "parent": 7, "description_excerpt": "x" * 16_384,
-        "recent_comments": [{"body": "z" * 2_048, "author": "bot", "created_at": ""}] * 5,
+        "recent_comments": [
+            {"body": "z" * 2_048, "kind": "note", "created_at": "2026-10-15T00:00:00Z"}
+        ] * 5,
     }
     assert calls == [(["/usr/local/bin/chainlink", "issue", "show", "42", "--json"], str(tmp_path))]
+
+
+def test_chainlink_issue_show_projects_multi_megabyte_epic_history(tmp_path, monkeypatch):
+    (tmp_path / ".chainlink").mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr("mimir.tools.chainlink.chainlink_bin", lambda: "chainlink")
+    # Live CLI comment schema: no author; kind distinguishes results from notes.
+    comments = [
+        {"id": i, "issue_id": 42, "content": f"comment-{i}:" + "x" * 1_100,
+         "created_at": "2026-10-15T00:00:00Z", "kind": "note"}
+        for i in range(6_000)
+    ]
+    for i in range(5_995, 6_000):
+        comments[i]["content"] = f"WORKLINK_EVIDENCE-{i}:" + "界" * 1_000
+        comments[i]["kind"] = "result" if i % 2 else "note"
+    raw = json.dumps({
+        "id": 42, "title": "Epic", "status": "open", "parent_id": None,
+        "labels": ["worklink:epic"], "description": "界" * 10_000,
+        "comments": comments,
+    }, ensure_ascii=False).encode("utf-8")
+    assert 6_000_000 < len(raw) < 32 * 1024 * 1024
+
+    def run(argv, *, stdout, **kwargs):
+        stdout.write(raw)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr("mimir.tools.chainlink.subprocess.run", run)
+    result = chainlink_issue_show.invoke({"issue_id": 42})
+    assert result == {
+        "id": 42, "title": "Epic", "status": "open", "parent": None,
+        "labels": ["worklink:epic"], "description_excerpt": "界" * (16_384 // 3),
+        "recent_comments": [
+            {"body": comment["content"].encode("utf-8")[:2_048].decode("utf-8", errors="ignore"),
+             "kind": comment["kind"], "created_at": comment["created_at"]}
+            for comment in comments[-5:]
+        ],
+    }
+    # Large raw history never becomes a large model-facing result.
+    projected = json.dumps(result, ensure_ascii=False).encode("utf-8")
+    assert len(projected) < 32_768
+    assert "\ufffd" not in projected.decode("utf-8")
 
 
 def test_chainlink_issue_show_missing_and_invalid(tmp_path, monkeypatch):
@@ -73,12 +120,17 @@ def test_chainlink_issue_show_requires_tracker_and_bounded_output(tmp_path, monk
     def run(argv, *, stdout, **kwargs):
         stdout.write(json.dumps({
             "id": 42, "title": "Large", "status": "open", "labels": [],
-            "parent_id": None, "description": "x" * 131_073, "comments": [],
+            "parent_id": None, "description": "large", "comments": [],
         }).encode())
+        # A sparse oversized raw result must be refused before JSON parsing.
+        stdout.seek(32 * 1024 * 1024)
+        stdout.write(b" ")
         return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr("mimir.tools.chainlink.chainlink_bin", lambda: "chainlink")
     monkeypatch.setattr("mimir.tools.chainlink.subprocess.run", run)
+    monkeypatch.setattr("mimir.tools.chainlink.json.load",
+                        lambda *_: pytest.fail("oversized raw output must not be parsed"))
     assert chainlink_issue_show.func(42) == {"error": "chainlink_tracker_unavailable"}
     (tmp_path / ".chainlink").mkdir()
     assert chainlink_issue_show.func(42) == {"error": "chainlink_read_failed"}

@@ -13,7 +13,9 @@ from langchain_core.tools import tool
 
 from ..worklink.autonomy import chainlink_bin
 
-_MAX_OUTPUT = 131_072
+# Epic histories can be several MiB. Bound raw parsing separately from the
+# small, field-bounded projection returned to the model below.
+_MAX_RAW_OUTPUT = 32 * 1024 * 1024
 _MAX_DESCRIPTION = 16_384
 _MAX_COMMENT = 2_048
 _MAX_COMMENTS = 5
@@ -43,7 +45,7 @@ def chainlink_issue_show(issue_id: int) -> dict[str, Any]:
             )
             if result.returncode != 0:
                 return {"error": "issue_not_found", "issue_id": issue_id}
-            if output.tell() > _MAX_OUTPUT:
+            if output.tell() > _MAX_RAW_OUTPUT:
                 return {"error": "chainlink_read_failed"}
             output.seek(0)
             payload = json.load(output)
@@ -68,7 +70,7 @@ def chainlink_issue_show(issue_id: int) -> dict[str, Any]:
             return {"error": "chainlink_read_failed"}
         recent.append({
             "body": _excerpt(body, _MAX_COMMENT),
-            "author": _excerpt(comment.get("author", ""), 128) if isinstance(comment.get("author", ""), str) else "",
+            "kind": _excerpt(comment.get("kind", ""), 128) if isinstance(comment.get("kind", ""), str) else "",
             "created_at": _excerpt(comment.get("created_at", ""), 64) if isinstance(comment.get("created_at", ""), str) else "",
         })
     return {
