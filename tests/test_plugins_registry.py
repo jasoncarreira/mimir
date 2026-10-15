@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, dataclass
+from enum import StrEnum
 from types import SimpleNamespace
 
 import pytest
@@ -392,12 +393,112 @@ def test_freeze_rejects_unknown_references_and_resource_scopes():
 
 def test_repo_pr_action_must_be_typed():
     registry = PolicyRegistry()
+    registry.registrar("example").register_scoped_action(RepoPRAction, lambda *_: True)
     registry.registrar("example").register_tool(**tool_fields(
         operation_class="resource_scoped", resource_scope="repo_pr", typed_action="unknown",
     ))
     with pytest.raises(PolicyRegistrationError, match="invalid repo/PR action"):
         registry.freeze()
     assert list(RepoPRAction)
+
+
+def test_scoped_action_protocol_is_owner_bound_and_frozen():
+    class Action(StrEnum):
+        INSPECT = "resource.inspect"
+
+    class OtherAction(StrEnum):
+        INSPECT = "resource.inspect"
+
+    registry = PolicyRegistry()
+    alpha = registry.registrar("alpha")
+    beta = registry.registrar("beta")
+    validator = lambda *_: True
+    alpha.register_scoped_action(Action, validator)
+    alpha.register_tool(**tool_fields(
+        operation_class="resource_scoped", resource_scope="repo_pr",
+        typed_action=Action.INSPECT,
+    ))
+    with pytest.raises(PolicyRegistrationError, match="duplicate scoped action protocol"):
+        alpha.register_scoped_action(Action, validator)
+    with pytest.raises(PolicyRegistrationError, match="scoped action protocol"):
+        beta.register_scoped_action(Action, validator)
+    beta.register_scoped_action(OtherAction, validator)
+    beta.register_tool(**tool_fields(name="foreign", operation_class="resource_scoped",
+                                      resource_scope="repo_pr", typed_action=Action.INSPECT))
+    with pytest.raises(PolicyRegistrationError, match="invalid repo/PR action"):
+        registry.freeze()
+    assert not registry.frozen
+    assert registry.scoped_actions["alpha"].validate_scope is validator
+
+
+def test_registered_owner_action_freezes():
+    class Action(StrEnum):
+        INSPECT = "resource.inspect"
+
+    registry = PolicyRegistry()
+    plugin = registry.registrar("example")
+    plugin.register_scoped_action(Action, lambda *_: True)
+    plugin.register_tool(**tool_fields(operation_class="resource_scoped",
+                                       resource_scope="repo_pr", typed_action=Action.INSPECT))
+    assert registry.freeze().tools["sample"].typed_action is Action.INSPECT
+
+
+def test_registered_action_freezes_without_legacy_model_type(monkeypatch):
+    from mimir import models
+
+    class Action(StrEnum):
+        INSPECT = "resource.inspect"
+
+    registry = PolicyRegistry()
+    plugin = registry.registrar("example")
+    plugin.register_scoped_action(Action, lambda *_: True)
+    plugin.register_tool(**tool_fields(operation_class="resource_scoped",
+                                       resource_scope="repo_pr", typed_action=Action.INSPECT))
+    monkeypatch.delattr(models, "RepoPRAction")
+    assert registry.freeze().tools["sample"].typed_action is Action.INSPECT
+
+
+def test_plugin_cannot_borrow_legacy_core_action_without_own_protocol():
+    registry = PolicyRegistry()
+    registry.registrar("example").register_tool(**tool_fields(
+        operation_class="resource_scoped", resource_scope="repo_pr",
+        typed_action=RepoPRAction.INSPECT,
+    ))
+    with pytest.raises(PolicyRegistrationError, match="requires owner action protocol"):
+        registry.freeze()
+    assert not registry.frozen
+
+
+def test_core_legacy_action_freezes_without_plugin_protocol():
+    registry = PolicyRegistry()
+    registry.register_tool(**tool_fields(
+        operation_class="resource_scoped", resource_scope="repo_pr",
+        typed_action=RepoPRAction.INSPECT,
+    ))
+    assert registry.freeze().tools["sample"].typed_action is RepoPRAction.INSPECT
+
+
+def test_registered_action_cannot_be_replaced_by_legacy_action():
+    class Action(StrEnum):
+        INSPECT = "resource.inspect"
+
+    registry = PolicyRegistry()
+    plugin = registry.registrar("example")
+    plugin.register_scoped_action(Action, lambda *_: True)
+    plugin.register_tool(**tool_fields(operation_class="resource_scoped",
+                                       resource_scope="repo_pr", typed_action=RepoPRAction.INSPECT))
+    with pytest.raises(PolicyRegistrationError, match="invalid repo/PR action"):
+        registry.freeze()
+
+
+@pytest.mark.parametrize("action_type,validator", [
+    (str, lambda *_: True), (RepoPRAction, None),
+])
+def test_invalid_action_protocol_does_not_publish(action_type, validator):
+    registry = PolicyRegistry()
+    with pytest.raises(PolicyRegistrationError, match="scoped action protocol"):
+        registry.registrar("example").register_scoped_action(action_type, validator)
+    assert not registry.scoped_actions
 
 
 def test_freeze_exposes_immutable_projections_and_refuses_writes():

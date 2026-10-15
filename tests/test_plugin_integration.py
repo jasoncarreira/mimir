@@ -50,6 +50,7 @@ def policy():
     registry = PolicyRegistry()
     register_core_tools(registry)
     registrar = PolicyRegistrar(registry, "example")
+    registrar.register_scoped_action(RepoPRAction, lambda *_: True)
     for name, scope, extractor, category, flow, action, writes in (
         ("example_channel", "channel", _channel_target, SinkCategory.SAME_CHANNEL, "sink", None, False),
         ("example_repo", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.INSPECT, False),
