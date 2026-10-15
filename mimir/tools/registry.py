@@ -3204,7 +3204,9 @@ def all_mimir_tools(
         saga_record_skill_learning,
     )
     from .operator_alert import operator_alert
+    from .chainlink import chainlink_issue_show
     tools = [
+        chainlink_issue_show,
         approve_declassification,
         request_operator_approval,
         # Memory (read + write)

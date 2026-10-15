@@ -39,9 +39,14 @@ instruction.
 
 ## Where to operate
 
-To read the spec of record for the PR you are remediating, call `pr_spec`.
-It reads only the Worklink-evidence-bound, armed issue description; use the
-CLI examples below for other tracker work when your turn permits them.
+On `worklink-ready-queue`, `github-activity`, and heartbeat service turns,
+call `chainlink_issue_show(issue_id)` to inspect a live issue, including its
+status, labels, parent, description excerpt and recent comments. Do not run
+`chainlink issue show --json` through shell or read `.chainlink/` and Worklink
+state files directly: those profiles refuse those reads. To read the spec of
+record for a bound PR, call `pr_spec`. The CLI examples below apply only to
+turns whose shell profile admits Chainlink commands (typically an interactive
+operator turn); check the current tool list before choosing a workflow.
 
 Chainlink commands need a `.chainlink/` directory in the cwd or an ancestor.
 The operator's home repo or a working directory will have one. If you get
@@ -156,6 +161,10 @@ unblocks once its blocker closes). Prefer `ready` over `list` when you're asking
 
 ### Look at one issue
 
+On service turns use `chainlink_issue_show(issue_id=42)` instead of the CLI.
+It reads the live operator tracker and returns a bounded projection. A missing
+issue returns `issue_not_found`; do not substitute a stale transcript.
+
 ```bash
 chainlink issue show 42         # human-readable, shows Blocked-by / Blocking edges
 chainlink issue show 42 --json  # structured (for chaining with jq)
@@ -266,7 +275,7 @@ before decomposition finishes, comment on the parent and resume next session.
 
 ```bash
 chainlink issue ready                   # find unblocked subissues
-chainlink issue show <subissue>         # read its acceptance criteria
+chainlink issue show <subissue>         # operator CLI only; services use chainlink_issue_show
 # ... do the work ...
 chainlink issue close <subissue>
 ```

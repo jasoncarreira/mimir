@@ -521,6 +521,7 @@ class GitHubForgeClient:
             mergeable=data.get("mergeable") if isinstance(data.get("mergeable"), bool) else None,
             created_at=self._text(data.get("created_at"), 64),
             updated_at=self._text(data.get("updated_at"), 64),
+            merged_at=self._text(data.get("merged_at"), 64) if isinstance(data.get("merged_at"), str) else None,
             body=self._text(
                 data.get("body") if isinstance(data.get("body"), str) else "",
                 _MAX_BODY_BYTES,

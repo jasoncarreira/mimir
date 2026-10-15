@@ -262,6 +262,13 @@ def test_pr_metadata_body_is_bounded_by_writer_utf8_limit(body, expected) -> Non
     assert "\ufffd" not in result.body
 
 
+def test_pr_metadata_merged_at_comes_from_github_response() -> None:
+    session = Session([Response({"number": 17, "body": "description", "merged_at": "2026-10-14T12:00:00Z"})])
+    result = GitHubForgeClient(token="secret", session=session).get_pull_request(_scope())
+    assert result.body == "description"
+    assert result.merged_at == "2026-10-14T12:00:00Z"
+
+
 def _pr_row(number, *, merged=False):
     return {
         "number": number, "title": "外" * 2000, "state": "closed" if merged else "open",

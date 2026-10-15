@@ -1,11 +1,19 @@
 ---
 name: github
-description: Interact with GitHub via the `gh` CLI. Use for issues (read, comment, file), pull requests (view, comment, check CI status), workflow runs, and `gh api` for queries the subcommands don't cover. Authentication is via the bot's GITHUB_TOKEN (already wired through `gh auth setup-git` at container start).
+description: Interact with GitHub via scoped PR tools on service turns or the `gh` CLI on interactive turns. Use for issues, pull requests, CI status and workflow runs.
 success_criteria:
-  # The skill exists to wrap gh CLI invocations. Loading the SKILL.md
-  # and not running any gh command means we read the policy but
-  # didn't actually act on it.
+  # Service reads use typed tools; interactive turns may use gh.
   any_of:
+    - tool_call:
+        name: pr_metadata
+    - tool_call:
+        name: pr_list
+    - tool_call:
+        name: pr_checks
+    - tool_call:
+        name: pr_diff
+    - tool_call:
+        name: chainlink_issue_show
     - tool_call:
         name: Bash
         args:
@@ -16,7 +24,7 @@ success_criteria:
           command_glob: "* gh *"
 ---
 
-<!-- desc: Interact with GitHub via the gh CLI — issues, pull requests, CI status, workflow runs, and gh api for uncovered queries. -->
+<!-- desc: Read GitHub via scoped PR tools on service turns and gh on interactive turns. -->
 
 # GitHub
 
@@ -35,8 +43,8 @@ scope determines which repos are reachable — operations on out-of-scope repos 
 403; check what the operator configured if you hit one.
 
 **Guarantees**:
-- GitHub interactions happen via `gh` CLI (authenticated, auditable), not via
-  WebFetch on raw GitHub URLs.
+- Service-turn PR reads use scoped typed tools; interactive CLI turns use
+  authenticated `gh`, rather than WebFetch on raw GitHub URLs.
 - PAT scope is checked mentally before any cross-repo operation — a 403 from an
   out-of-scope repo is expected behavior, not a bug.
 
@@ -133,6 +141,14 @@ Four concrete instances from 2026-05-27 that this gate would have caught:
 after #395 merged).
 
 ## Pull requests
+
+On `github-activity` and other repo-review service turns, use `pr_metadata`
+for the PR title, bounded body, state and merge time; use `pr_files`, `pr_diff`,
+`pr_reviews` and `pr_checks` for the corresponding reads. Use
+`chainlink_issue_show(issue_id)` for live Chainlink issue details. The
+`repo_review` shell profile refuses `gh pr view` and arbitrary git revision
+ranges; use `repo_diff` for a lease-bound diff. CLI examples below are for
+interactive operator turns whose shell profile admits them.
 
 Budget rule: perform required GitHub side effects before optional long
 validation or repeated polling consumes the turn. Once a PR comment,
