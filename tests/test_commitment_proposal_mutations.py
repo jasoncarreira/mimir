@@ -22,6 +22,20 @@ MUTANTS = [
     ("direct_taint", "mimir/tools/registry.py", '_commitment_taint_refusal(runtime, "commitment_complete")', "None", "test_tainted_scheduled_review_to_authenticated_operator_reply"),
 ]
 
+# Pin each identity predicate independently, and the reviewer's combined
+# replacement, through both tool consumers and the store's read bypass.
+for guard, old, identity in [
+    ("review_trigger", 'and auth_context.trigger == "scheduled_tick"', "trigger"),
+    ("review_channel", 'and service.channel_memory_directory == "scheduler:commitments-review"', "scheduler_channel"),
+    ("review_identity", 'and auth_context.trigger == "scheduled_tick"\n                and service.channel_memory_directory == "scheduler:commitments-review"', "trigger"),
+]:
+    for consumer in ("proposal", "tool_list", "store_list"):
+        MUTANTS.append((
+            f"{guard}_{consumer}", "mimir/access_control.py", old, "and True",
+            f"test_review_identity_required_even_with_both_capabilities[{consumer}-{identity}]",
+        ))
+
+
 @pytest.mark.parametrize("name,path,old,new,test", MUTANTS, ids=[row[0] for row in MUTANTS])
 def test_guard_removal_is_detected(tmp_path, name, path, old, new, test):
     package = tmp_path / "project"

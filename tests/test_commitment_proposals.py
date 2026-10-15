@@ -262,6 +262,55 @@ async def test_review_grant_is_read_and_propose_only_and_not_shared(env):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("identity", ["trigger", "scheduler_channel"])
+@pytest.mark.parametrize("consumer", ["proposal", "tool_list", "store_list"])
+async def test_review_identity_required_even_with_both_capabilities(env, identity, consumer):
+    rec = await env.add()
+    # Positive control: the real job can read this operator-owned record.
+    assert rec.id in await registry.commitment_list.coroutine(
+        due_within_days=0, runtime=env.runtime)
+    review_service = ac.get_trusted_service_from_auth_context(env.auth)
+    assert review_service is not None
+    # Construct a trusted service with the same grants through the production
+    # builder. Capability absence must not mask the exact-job identity guard.
+    trigger = "shell_job_complete" if identity == "trigger" else "scheduled_tick"
+    channel = ("scheduler:issues-audit" if identity == "scheduler_channel"
+               else "scheduler:commitments-review")
+    service = ac.build_trigger_service_principal(
+        canonical=review_service.canonical,
+        trigger=trigger,
+        profile=review_service.authority_profile,
+        tier=review_service.capability_tier,
+        capabilities=review_service.capabilities,
+        channel_memory_directory=channel,
+        creation_path="test:misrouted-commitments-review-grant",
+    )
+    auth = ac.create_auth_context(AgentEvent(
+        trigger=trigger, channel_id=channel, source="scheduler",
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=True, ifc_labels=env.auth.ifc_labels)
+    assert ac.get_trusted_service_from_auth_context(auth) is service
+    for operation in ("commitment_list", "commitment_propose_closure"):
+        assert ac.service_can_invoke_operation(service, operation)
+    env.turn.auth_context = auth
+    env.turn.trigger, env.turn.channel_id = trigger, channel
+    runtime = SimpleNamespace(context=auth)
+    before = env.store.path.read_bytes()
+    if consumer == "proposal":
+        with pytest.raises(ToolPolicyRefusal, match="scheduled review authority"):
+            await registry.commitment_propose_closure.coroutine(
+                commitment_id=rec.id, action="complete", evidence="merged", runtime=runtime)
+        assert not cp.proposal_path(env.home).exists()
+    elif consumer == "tool_list":
+        assert rec.id not in await registry.commitment_list.coroutine(
+            due_within_days=0, runtime=runtime)
+    else:
+        assert rec.id not in {item.id for item in env.store.list(auth_context=auth)}
+    assert env.store.path.read_bytes() == before
+    assert not ac.can_review_commitments(auth)
+
+
+@pytest.mark.asyncio
 async def test_sealed_review_has_one_digest_over_twenty_items_and_recovers(env):
     import asyncio
     ids = [await env.queue(await env.add()) for _ in range(21)]
