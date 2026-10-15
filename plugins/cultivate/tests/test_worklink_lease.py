@@ -10,6 +10,7 @@ import os
 import subprocess
 from pathlib import Path
 import asyncio
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +83,100 @@ def test_selected_checkout_path_and_pruning_ignore_legacy_flag(
     assert not path.parent.exists()
 
 
+def test_selected_worker_checkout_issues_capability_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    root = tmp_path / "worker-checkouts"
+    monkeypatch.setattr(checkout, "_ENABLED_CHECKOUT_ROOT", root)
+    monkeypatch.setattr(checkout, "get_identities", lambda: SimpleNamespace(
+        mimir_uid=os.getuid(), worklink_gid=os.getgid(),
+    ))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+        return result
+
+    git("init", "-b", "main", str(repo))
+    git("-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.org",
+        "commit", "--allow-empty", "-m", "initial")
+    git("-C", str(repo), "remote", "add", "origin", str(repo))
+    calls: list[list[str]] = []
+
+    def runner(args):
+        calls.append(list(args))
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    lease = checkout.create_isolated_checkout(
+        repo, issue_id=1949, attempt=1, worker_eligible=True, runner=runner,
+    )
+    assert lease.path.parent.parent.parent == root
+    assert lease.path.name == "checkout"
+    assert lease.worker_authorized
+    assert lease.authorization is not None
+    lease.authorization.verify(lease.path)
+    assert stat.S_IMODE(lease.path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(lease.path.stat().st_mode) == 0o2770
+    assert "--no-hardlinks" in next(call for call in calls if call[:3] == ["git", "clone", "--local"])
+    assert not (tmp_path / ".worklink").exists()
+
+    class SafeGit:
+        def run(self, *args, **kwargs):
+            assert args == ("update-ref", "-d", "refs/heads/issue/1949-a1")
+            assert kwargs == {"check": True}
+
+    assert checkout.cleanup_checkout(lease, outcome="completed", safe_git=SafeGit())
+    assert not lease.path.parent.exists()
+    with pytest.raises(ValueError, match="closed"):
+        lease.authorization.verify(lease.path)
+
+    controller = checkout.create_isolated_checkout(
+        repo, issue_id=1949, attempt=3, worker_eligible=False, runner=runner,
+    )
+    assert controller.path == tmp_path / ".worklink" / "repo" / "1949-3"
+    assert not controller.worker_authorized and controller.authorization is None
+    assert checkout.cleanup_checkout(controller, outcome="completed", runner=runner)
+
+
+def test_selected_worker_checkout_refuses_replaced_checkout_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    root = tmp_path / "worker-checkouts"
+    monkeypatch.setattr(checkout, "_ENABLED_CHECKOUT_ROOT", root)
+    monkeypatch.setattr(checkout, "get_identities", lambda: SimpleNamespace(
+        mimir_uid=os.getuid(), worklink_gid=os.getgid(),
+    ))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test",
+                    "-c", "user.email=test@example.org", "commit", "--allow-empty", "-m", "initial"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(repo)],
+                   check=True, capture_output=True)
+    original = checkout._assert_self_contained_checkout
+    external = tmp_path / "external"
+    external.mkdir()
+
+    def replace(path, *, runner):
+        original(path, runner=runner)
+        path.rename(path.parent / "old-checkout")
+        path.symlink_to(external, target_is_directory=True)
+
+    monkeypatch.setattr(checkout, "_assert_self_contained_checkout", replace)
+    with pytest.raises(RuntimeError, match="unavailable or unsafe"):
+        checkout.create_isolated_checkout(
+            repo, issue_id=1949, attempt=2, worker_eligible=True,
+        )
+    assert external.is_dir()
+
+
 def test_claim_reset_preserves_wire_format_and_bounded_budget() -> None:
     record = claims.ClaimRecord(1949, 1, "worker", datetime(2026, 10, 1, tzinfo=UTC))
     assert record.to_comment() == "WORKLINK_CLAIM " + json.dumps({
@@ -141,6 +236,41 @@ def test_shutdown_abort_forgives_claim_without_reusing_ordinal() -> None:
     assert client.next_attempt(comments) == 2
 
 
+def test_provider_shutdown_releases_only_owned_claim_and_forgives_budget() -> None:
+    now = datetime(2026, 10, 1, tzinfo=UTC)
+    own = claims.ClaimRecord(1949, 1, "worker-a", now)
+    foreign = claims.ClaimRecord(1950, 1, "worker-b", now)
+    calls: list[list[str]] = []
+
+    def runner(args):
+        call = list(args)
+        calls.append(call)
+        if call[1:3] == ["issue", "list"]:
+            value = [{"id": 1949}, {"id": 1950}]
+        elif call[1:3] == ["issue", "show"]:
+            record = own if call[3] == "1949" else foreign
+            value = {"comments": [{"content": record.to_comment()}]}
+        else:
+            value = ""
+        return subprocess.CompletedProcess(call, 0, json.dumps(value), "")
+
+    client = claims.ChainlinkClaims(agent_id="worker-a", runner=runner,
+                                    clock=lambda: now + timedelta(minutes=1))
+    released, failed = client.release_owned_claims_for_shutdown()
+    assert released == [own] and failed == []
+    assert [call[1:3] for call in calls if "1950" in call] == [["issue", "show"]]
+    assert [call[1:3] for call in calls if call[1:3] == ["locks", "release"]] == [
+        ["locks", "release"]]
+    assert [call[1:3] for call in calls if "1949" in call] == [
+        ["issue", "show"], ["issue", "comment"], ["issue", "label"],
+        ["locks", "release"], ["issue", "unlabel"],
+    ]
+    abort = next(call[-1] for call in calls if call[1:3] == ["issue", "comment"])
+    assert abort.startswith(claims.SHUTDOWN_ABORT_PREFIX)
+    assert client.attempts_used([own.to_comment(), abort]) == 0
+    assert client.next_attempt([own.to_comment(), abort]) == 2
+
+
 def test_continuation_delivery_key_keeps_existing_identity(tmp_path: Path) -> None:
     action = continuation.WorklinkContinuationAction(tmp_path / "key.json", "key", 1949, None, 1)
     assert action.delivery_key == "worklink-continuation:key"
@@ -164,6 +294,38 @@ def test_continuation_offer_is_stable_until_delivery_receipt(tmp_path: Path) -> 
     assert first[0].occurrences == 2
     assert continuation.consume_worklink_budget_continuations(tmp_path) == first
     assert json.loads(path.read_text(encoding="utf-8")) == payload
+
+
+def test_provider_continuation_delivers_after_receipt_only_once(tmp_path: Path) -> None:
+    path = continuation.continuation_sidecar_path(tmp_path, "key")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "kind": continuation.CONTINUATION_KIND, "idempotency_key": "key",
+        "association": {"issue_id": 1949}, "occurrences": 1,
+    }), encoding="utf-8")
+    comments: list[str] = []
+
+    def runner(args, cwd=None):
+        assert cwd == tmp_path
+        if args[1:3] == ["issue", "show"]:
+            value = {"status": "open", "comments": [{"content": comment} for comment in comments]}
+            return subprocess.CompletedProcess(args, 0, json.dumps(value), "")
+        assert args[1:3] == ["issue", "comment"]
+        comments.append(args[-1])
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    offered = continuation.consume_worklink_budget_continuations(tmp_path, runner=runner)
+    assert len(offered) == 1
+    assert continuation.consume_worklink_budget_continuations(tmp_path, runner=runner) == offered
+    assert comments == []
+    assert continuation.consume_worklink_budget_continuations(
+        tmp_path, runner=runner, delivery_receipt_exists=lambda key: key == offered[0].delivery_key,
+    ) == []
+    assert len(comments) == 1 and "key" in comments[0]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["actioned_at"] and payload["external_comment"]["posted"] is True
+    assert continuation.consume_worklink_budget_continuations(tmp_path, runner=runner) == []
+    assert len(comments) == 1
 
 
 def test_merge_closure_rejects_ambiguous_completion() -> None:

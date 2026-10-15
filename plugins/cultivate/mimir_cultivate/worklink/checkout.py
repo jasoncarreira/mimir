@@ -541,15 +541,19 @@ def create_isolated_checkout(
 
     _assert_base_separate_from_controller(repo)
 
-    worker_accessible = factory_worker or (_cultivate_selected() and worker_eligible)
+    selected_worker = _cultivate_selected() and worker_eligible and not factory_worker
+    worker_accessible = factory_worker or selected_worker
     identities = get_identities() if worker_accessible else None
     path = _isolated_checkout_path(
-        repo, worklink_dir, issue_id, attempt, worker_authorized=False
+        repo, worklink_dir, issue_id, attempt, worker_authorized=selected_worker
     )
     branch = checkout_branch or f"issue/{issue_id}-a{attempt}"
-    if factory_worker:
+    if factory_worker or selected_worker:
         path.parent.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-        path.parent.mkdir(mode=0o755, exist_ok=True)
+        if selected_worker:
+            path.parent.mkdir(mode=0o700)
+        else:
+            path.parent.mkdir(mode=0o755, exist_ok=True)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -648,9 +652,12 @@ def create_isolated_checkout(
     try:
         _assert_self_contained_checkout(path, runner=runner)
         if worker_accessible:
-            checkout_fd = os.open(
-                path,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            checkout_fd = (
+                _open_worklink_checkout(path.relative_to(_ENABLED_CHECKOUT_ROOT))
+                if selected_worker else os.open(
+                    path,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                )
             )
             try:
                 assert identities is not None
@@ -659,8 +666,12 @@ def create_isolated_checkout(
                     owner_uid=identities.mimir_uid,
                     group_gid=identities.worklink_gid,
                 )
+                if selected_worker:
+                    authorization = _mint_checkout_authorization(path, issue_id, attempt, checkout_fd)
+                    checkout_fd = -1
             finally:
-                os.close(checkout_fd)
+                if checkout_fd >= 0:
+                    os.close(checkout_fd)
     except (OSError, RuntimeError):
         shutil.rmtree(path, ignore_errors=True)
         raise
@@ -674,7 +685,7 @@ def create_isolated_checkout(
         base_ref=base,
         local_base=local_base,
         isolated_checkout=True,
-        worker_authorized=False,
+        worker_authorized=selected_worker,
         authorization=authorization,
     )
 
