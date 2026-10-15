@@ -709,7 +709,6 @@ class PolicyRegistry:
 
     def freeze(self) -> PolicyRegistry:
         self._writable()
-        from mimir.models import RepoPRAction
         from mimir.tool_descriptors import SinkCategory, validate_tool_descriptors
         from .core import CapabilityTier, ServiceSinkPolicy
 
@@ -752,16 +751,18 @@ class PolicyRegistry:
                 if profile not in self._profiles or name not in self._profiles[profile].capabilities:
                     raise PolicyRegistrationError(f"{name}: missing profile membership {profile}")
             protocol = self._scoped_actions.get(tool.owner)
-            if tool.typed_action is not None and not (
-                isinstance(tool.typed_action, RepoPRAction)
-                or protocol is not None and type(tool.typed_action) is protocol.action_type
-            ):
-                raise PolicyRegistrationError(f"{name}: invalid repo/PR action {tool.typed_action!r}")
-            if (protocol is not None and tool.resource_scope == "repo_pr"
-                    and type(tool.typed_action) is not protocol.action_type):
-                raise PolicyRegistrationError(f"{name}: repo/PR action belongs to a different owner")
-            if tool.owner != "core" and tool.resource_scope == "repo_pr" and tool.typed_action is None:
-                raise PolicyRegistrationError(f"{name}: repo_pr scope requires typed action")
+            if tool.owner != "core" and tool.resource_scope == "repo_pr":
+                if tool.typed_action is None:
+                    raise PolicyRegistrationError(f"{name}: repo_pr scope requires typed action")
+                if protocol is None:
+                    raise PolicyRegistrationError(f"{name}: repo_pr scope requires owner action protocol")
+            if tool.typed_action is not None:
+                if tool.owner == "core":
+                    valid = isinstance(tool.typed_action, StrEnum)
+                else:
+                    valid = protocol is not None and type(tool.typed_action) is protocol.action_type
+                if not valid:
+                    raise PolicyRegistrationError(f"{name}: invalid repo/PR action {tool.typed_action!r}")
         for name, profile in self._profiles.items():
             for capability in profile.capabilities | profile.bounded_capabilities:
                 if capability not in self._capabilities:
