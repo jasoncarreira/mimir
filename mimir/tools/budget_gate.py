@@ -4030,10 +4030,12 @@ def _finish_tool_result(
 
 def _scoped_pr_checkout_call(call: _PreparedToolCall) -> bool:
     registered = _plugin_tool(call.tool_name, call.policy)
+    protocol = (call.policy.scoped_actions.get(registered.owner)
+                if registered is not None and call.policy is not None else None)
     return (
-        registered is not None and registered.owner == "cultivate"
+        registered is not None and protocol is not None
         and registered.resource_scope == "repo_pr"
-        and getattr(registered.typed_action, "value", None) == "repo.checkout"
+        and registered.typed_action is protocol.checkout_action
     )
 
 
@@ -4041,7 +4043,10 @@ def _consume_scoped_pr_checkout(call: _PreparedToolCall) -> object | None:
     from ..access_control import consume_scoped_pr_checkout
 
     scope = call.authorization.repo_pr_action_scope
-    return scope is not None and consume_scoped_pr_checkout(call.auth_context, scope)
+    registered = _plugin_tool(call.tool_name, call.policy)
+    return scope is not None and registered is not None and consume_scoped_pr_checkout(
+        call.auth_context, scope, registered.owner,
+    )
 
 
 def _observe_scoped_pr_checkout(call: _PreparedToolCall, result: Any, token: object) -> bool:
@@ -4050,10 +4055,17 @@ def _observe_scoped_pr_checkout(call: _PreparedToolCall, result: Any, token: obj
     from ..access_control import observe_scoped_pr_checkout
 
     scope = call.authorization.repo_pr_action_scope
+    registered = _plugin_tool(call.tool_name, call.policy)
+    protocol = call.policy.scoped_actions.get(registered.owner) if registered is not None else None
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
     registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
-    state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request")) if registry is not None else None
+    state = discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request")) if discovered is not None else None
+    if state is None and registry is not None:
+        state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    if state is not None and state.action_scope is not scope:
+        return False
     return scope is not None and state is not None and observe_scoped_pr_checkout(
-        call.auth_context, scope, state, token,
+        call.auth_context, scope, state, token, registered.owner, protocol,
     )
 
 

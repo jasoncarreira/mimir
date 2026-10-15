@@ -8998,51 +8998,67 @@ class ScopedPRGrant:
 class ScopedPRGrants:
     """Turn-local host authority; checkout is consumed before execution."""
 
-    def __init__(self, principal: str, scopes: Iterable[Any], *, _issuer: Any) -> None:
+    def __init__(self, principal: str, scopes: Iterable[Any], *,
+                 protocols: Mapping[str, Any] | None = None, _issuer: Any) -> None:
         if _issuer is not _SCOPED_PR_ISSUER:
             raise ValueError("scoped PR grants require the trusted ingress issuer")
         self.principal = principal
         self.nonce = secrets.token_hex(16)
         self._lock = threading.Lock()
-        self._prelease = {
-            scope.scope_id: self._grant(scope, "repo.checkout", None)
-            for scope in scopes if "repo.checkout" in scope.allowed_operations
-        }
-        self._follow: dict[str, dict[str, ScopedPRGrant]] = {}
-        self._pending: dict[str, object] = {}
+        self._protocols = dict(protocols or {})
+        self._prelease: dict[tuple[str, str], ScopedPRGrant] = {}
+        self._follow: dict[tuple[str, str], dict[str, ScopedPRGrant]] = {}
+        self._pending: dict[tuple[str, str], object] = {}
+        for scope in scopes:
+            self.issue(scope)
 
-    def _grant(self, scope: Any, action: str, lease: Any) -> ScopedPRGrant:
+    def issue(self, scope: Any) -> None:
+        """Issue only for a host-resolved scope, never for model arguments."""
+        with self._lock:
+            for owner, protocol in self._protocols.items():
+                checkout = getattr(protocol.checkout_action, "value", None)
+                if checkout in scope.allowed_operations:
+                    key = (owner, scope.scope_id)
+                    if key not in self._prelease and key not in self._pending and key not in self._follow:
+                        self._prelease[key] = self._grant(owner, scope, checkout, None)
+
+    def _grant(self, owner: str, scope: Any, action: str, lease: Any) -> ScopedPRGrant:
         return ScopedPRGrant(
-            "cultivate", self.principal, scope.scope_id, scope.canonical_repo,
+            owner, self.principal, scope.scope_id, scope.canonical_repo,
             scope.pr_number, scope.observed_head_sha, action, self.nonce,
             time.monotonic() + _SCOPED_PR_LIFETIME,
             (str(lease.path), lease.recovery_id) if lease is not None else None,
             _SCOPED_PR_ISSUER,
         )
 
-    def get(self, scope: Any, action: str) -> ScopedPRGrant | None:
+    def get(self, owner: str, scope: Any, action: str) -> ScopedPRGrant | None:
         with self._lock:
-            if action == "repo.checkout":
-                return self._prelease.get(scope.scope_id)
-            return self._follow.get(scope.scope_id, {}).get(action)
+            key = (owner, scope.scope_id)
+            protocol = self._protocols.get(owner)
+            if protocol is not None and action == getattr(protocol.checkout_action, "value", None):
+                return self._prelease.get(key)
+            return self._follow.get(key, {}).get(action)
 
-    def consume_checkout(self, scope: Any) -> object | None:
+    def consume_checkout(self, owner: str, scope: Any) -> object | None:
         with self._lock:
-            grant = self._prelease.pop(scope.scope_id, None)
+            key = (owner, scope.scope_id)
+            grant = self._prelease.pop(key, None)
             if grant is None or time.monotonic() >= grant.expires_at:
                 return None
             token = object()
-            self._pending[scope.scope_id] = token
+            self._pending[key] = token
             return token
 
-    def observe_checkout(self, scope: Any, lease: Any, token: object) -> bool:
+    def observe_checkout(self, owner: str, scope: Any, lease: Any, token: object) -> bool:
         with self._lock:
-            if token is None or self._pending.get(scope.scope_id) is not token:
+            key = (owner, scope.scope_id)
+            protocol = self._protocols.get(owner)
+            if token is None or protocol is None or self._pending.get(key) is not token:
                 return False
-            del self._pending[scope.scope_id]
-            self._follow[scope.scope_id] = {
-                action: self._grant(scope, action, lease)
-                for action in scope.allowed_operations if action != "repo.checkout"
+            del self._pending[key]
+            self._follow[key] = {
+                action: self._grant(owner, scope, action, lease)
+                for action in scope.allowed_operations if action != protocol.checkout_action.value
             }
             return True
 
@@ -9074,23 +9090,24 @@ def _valid_scoped_pr_grant(
     protocol: Any, scope: Any, review_state: Any,
 ) -> bool:
     grants = getattr(auth_context, "scoped_pr_grants", None)
-    if (not isinstance(grants, ScopedPRGrants) or owner != "cultivate"
-            or protocol is None or protocol.owner != owner
+    if (not isinstance(grants, ScopedPRGrants)
+             or protocol is None or protocol.owner != owner
+             or grants._protocols.get(owner) is not protocol
             or type(action) is not protocol.action_type
             or scope is None or grants.principal != getattr(auth_context, "canonical_principal", None)):
         return False
-    grant = grants.get(scope, action.value)
+    grant = grants.get(owner, scope, action.value)
     if (grant is None or grant._issuer is not _SCOPED_PR_ISSUER
             or grant.owner != owner or grant.principal != grants.principal
             or grant.turn_nonce != grants.nonce or time.monotonic() >= grant.expires_at
             or grant.scope_id != scope.scope_id or grant.repository != scope.canonical_repo
             or grant.pull_request != scope.pr_number or grant.head != scope.observed_head_sha):
         return False
-    if action.value == "repo.checkout":
+    if action is protocol.checkout_action:
         if grant.lease_identity is not None:
             return False
     else:
-        live = _live_scoped_pr_lease(scope, review_state)
+        live = protocol.live_lease(scope, review_state) if protocol.live_lease is not None else None
         if live is None or grant.lease_identity != (str(live.path), live.recovery_id):
             return False
     try:
@@ -9099,19 +9116,20 @@ def _valid_scoped_pr_grant(
         return False
 
 
-def consume_scoped_pr_checkout(auth_context: AuthContext, scope: Any) -> object | None:
+def consume_scoped_pr_checkout(auth_context: AuthContext, scope: Any, owner: str) -> object | None:
     grants = getattr(auth_context, "scoped_pr_grants", None)
-    return grants.consume_checkout(scope) if isinstance(grants, ScopedPRGrants) else None
+    return grants.consume_checkout(owner, scope) if isinstance(grants, ScopedPRGrants) else None
 
 
 def observe_scoped_pr_checkout(
     auth_context: AuthContext, scope: Any, state: Any, token: object,
+    owner: str, protocol: Any,
 ) -> bool:
     grants = getattr(auth_context, "scoped_pr_grants", None)
-    lease = _live_scoped_pr_lease(scope, state)
+    lease = protocol.live_lease(scope, state) if protocol is not None and protocol.live_lease is not None else None
     if not isinstance(grants, ScopedPRGrants) or lease is None:
         return False
-    return grants.observe_checkout(scope, lease, token)
+    return grants.observe_checkout(owner, scope, lease, token)
 
 
 def authorize_repo_pr_tool(
@@ -9172,7 +9190,7 @@ def authorize_repo_pr_tool(
     )
     from .models import RepoPRActionScope
 
-    grant_valid = not registered_plugin or owner != "cultivate" or _valid_scoped_pr_grant(
+    grant_valid = not registered_plugin or _valid_scoped_pr_grant(
         auth_context, owner, action, protocol, scope, review_state,
     )
     in_scope = (
@@ -9199,7 +9217,8 @@ def authorize_repo_pr_tool(
         decision=OperationDecision.RESOURCE_SCOPED,
         allowed=in_scope or not enforce,
         reason=None if in_scope else (
-            "repo_pr_grant_denied" if not grant_valid else "repo_pr_scope_denied"
+            "repo_pr_scope_denied" if scope is None or missing_actions
+            else "repo_pr_grant_denied" if not grant_valid else "repo_pr_scope_denied"
         ),
         service_principal=service_principal,
         required_tier=AccessTier.USER,
@@ -9847,6 +9866,12 @@ class ToolRegistry:
                         or state.pr_number != tool_arguments["pull_request"]
                     ):
                         state = None
+                if plugin_tool is not None and state is not None and discovered is not None and (
+                    discovered.resolve(state.repo, state.pr_number) is state
+                ):
+                    grants = getattr(auth_context, "scoped_pr_grants", None)
+                    if isinstance(grants, ScopedPRGrants):
+                        grants.issue(state.action_scope)
                 if not retained_matches:
                     repo_pr_action_scope = (
                         state.action_scope if state is not None else None
@@ -12646,11 +12671,12 @@ def create_auth_context(
         and (registered_service.github_activity or
              registered_service.authority_profile in _PR_REVIEW_SCOPE_AUTHORITY_PROFILES)
         and event_ingress is None and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
-        and repo_pr_scope_registry is not None
-        and "cultivate" in (policy if policy is not None else selected_policy_registry()).scoped_actions
+        and (policy if policy is not None else selected_policy_registry()).scoped_actions
     ):
         scoped_pr_grants = ScopedPRGrants(
-            canonical, (state.action_scope for state in repo_pr_scope_registry.review_states),
+            canonical, (state.action_scope for state in repo_pr_scope_registry.review_states)
+            if repo_pr_scope_registry is not None else (),
+            protocols=(policy if policy is not None else selected_policy_registry()).scoped_actions,
             _issuer=_SCOPED_PR_ISSUER,
         )
 

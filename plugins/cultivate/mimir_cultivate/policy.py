@@ -25,7 +25,12 @@ class RepoPRAction(StrEnum):
 
 def register_action_protocol(registrar: PolicyRegistrar, validate_scope: Callable[..., bool]) -> None:
     """Bind the vocabulary and grant validator to this selected registrar."""
-    registrar.register_scoped_action(RepoPRAction, validate_scope)
+    from mimir.access_control import _live_scoped_pr_lease
+
+    registrar.register_scoped_action(
+        RepoPRAction, validate_scope, checkout_action=RepoPRAction.CHECKOUT,
+        live_lease=_live_scoped_pr_lease,
+    )
 
 
 def validate_scoped_pr_action(action: RepoPRAction, scope: object, grant: object) -> bool:

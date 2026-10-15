@@ -48,6 +48,8 @@ class ScopedActionProtocol:
     owner: str
     action_type: type[StrEnum]
     validate_scope: Callable[..., bool]
+    checkout_action: StrEnum | None = None
+    live_lease: Callable[..., Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -317,14 +319,23 @@ class PolicyRegistry:
     def scoped_actions(self) -> Mapping[str, ScopedActionProtocol]:
         return MappingProxyType(self._scoped_actions)
 
-    def register_scoped_action(self, action_type: type[StrEnum], validate_scope: Callable[..., bool], *, owner: str = "core") -> None:
+    def register_scoped_action(
+        self, action_type: type[StrEnum], validate_scope: Callable[..., bool],
+        *, checkout_action: StrEnum | None = None,
+        live_lease: Callable[..., Any] | None = None, owner: str = "core",
+    ) -> None:
         self._writable()
         if (owner == "core" or owner in self._scoped_actions
                 or not isinstance(action_type, type) or not issubclass(action_type, StrEnum)
                 or not tuple(action_type) or not callable(validate_scope)
+                or (checkout_action is None) != (live_lease is None)
+                or (checkout_action is not None and type(checkout_action) is not action_type)
+                or (live_lease is not None and not callable(live_lease))
                 or any(protocol.action_type is action_type for protocol in self._scoped_actions.values())):
             raise PolicyRegistrationError(f"{owner}: invalid or duplicate scoped action protocol")
-        self._scoped_actions[owner] = ScopedActionProtocol(owner, action_type, validate_scope)
+        self._scoped_actions[owner] = ScopedActionProtocol(
+            owner, action_type, validate_scope, checkout_action, live_lease,
+        )
 
     def register_poller_hook(self, name: str, hook: Callable[..., Any], *, owner: str = "core") -> None:
         self._writable()
@@ -903,5 +914,12 @@ class PolicyRegistrar:
     def register_state_slot(self, slot_type: type) -> None:
         self._registry.register_state_slot(slot_type, owner=self.plugin)
 
-    def register_scoped_action(self, action_type: type[StrEnum], validate_scope: Callable[..., bool]) -> None:
-        self._registry.register_scoped_action(action_type, validate_scope, owner=self.plugin)
+    def register_scoped_action(
+        self, action_type: type[StrEnum], validate_scope: Callable[..., bool],
+        *, checkout_action: StrEnum | None = None,
+        live_lease: Callable[..., Any] | None = None,
+    ) -> None:
+        self._registry.register_scoped_action(
+            action_type, validate_scope, checkout_action=checkout_action,
+            live_lease=live_lease, owner=self.plugin,
+        )

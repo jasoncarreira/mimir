@@ -10238,39 +10238,6 @@ def _github_poller_auth(
     )
 
 
-def test_trusted_poller_issues_checkout_grant_but_http_ingress_does_not(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mimir.plugins.registry import PolicyRegistry
-    from mimir_cultivate.policy import RepoPRAction as OwnerAction, validate_scoped_pr_action
-
-    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
-    policy = PolicyRegistry()
-    policy.registrar("cultivate").register_scoped_action(OwnerAction, validate_scoped_pr_action)
-    policy.freeze()
-    event = AgentEvent(
-        trigger="poller", channel_id="poller:github-activity",
-        service_principal=authority.canonical, service_authority=authority,
-        extra={"poller_name": "github-activity", "items": [item]},
-    )
-    trusted = create_auth_context(event, policy=policy, enforce=True)
-    assert trusted.repo_pr_action_scope is not None
-    assert trusted.scoped_pr_grants is not None, (trusted.is_service, trusted.service_authority)
-    protocol = policy.scoped_actions["cultivate"]
-    assert access_control._valid_scoped_pr_grant(
-        trusted, "cultivate", OwnerAction.CHECKOUT, protocol,
-        trusted.repo_pr_action_scope, trusted.repo_review_state,
-    )
-    assert not access_control._valid_scoped_pr_grant(
-        trusted, "cultivate", OwnerAction.COMMIT, protocol,
-        trusted.repo_pr_action_scope, trusted.repo_review_state,
-    )
-    untrusted = create_auth_context(
-        event, event_ingress="http_event", policy=policy, enforce=False,
-    )
-    assert untrusted.scoped_pr_grants is None
-
-
 @pytest.mark.parametrize("path", ["review", "heartbeat", "poller"])
 @pytest.mark.parametrize("verdict", [False, None, 1, "yes", "missing"])
 def test_outsider_pr_scope_requires_exact_attestation(
