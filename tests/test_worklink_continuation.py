@@ -12,7 +12,7 @@ import pytest
 from mimir import event_logger
 from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent, TurnContext, TurnRecord
-from mimir.worklink.continuation import (
+from mimir_cultivate.worklink.continuation import (
     CONTINUATION_PREFIX,
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     HTTP_EVENT_INGRESS_EXTRA_VALUE,
@@ -796,7 +796,7 @@ def test_no_target_continuation_routes_once_without_churn_then_expires(
 
     with monkeypatch.context() as patch:
         patch.setattr(
-            "mimir.worklink.continuation.atomic_write_json",
+            "mimir_cultivate.worklink.continuation.atomic_write_json",
             lambda *_args, **_kwargs: pytest.fail("resolved sidecar was rewritten"),
         )
         assert consume_worklink_budget_continuations(
@@ -917,7 +917,7 @@ def test_untrusted_hints_do_not_drive_comment_or_path_inspection(tmp_path: Path)
 
 
 def test_evidence_checkout_reader_accepts_legacy_key_and_prefers_new_key(tmp_path: Path) -> None:
-    from mimir.worklink.continuation import _load_evidence_records
+    from mimir_cultivate.worklink.continuation import _load_evidence_records
 
     home = tmp_path / "home"
     evidence_dir = home / "state" / "worklink" / "evidence"

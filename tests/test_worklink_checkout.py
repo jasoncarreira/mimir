@@ -12,9 +12,9 @@ from typing import Sequence
 
 import pytest
 
-import mimir.worklink.checkout as checkout_module
+import mimir_cultivate.worklink.checkout as checkout_module
 from mimir.worklink.backends.feature_factory import DEFAULT_FACTORY_ENTRYPOINT
-from mimir.worklink.checkout import (
+from mimir_cultivate.worklink.checkout import (
     FALLBACK_BUILD_IDENTITY,
     CheckoutAuthorization,
     CheckoutLease,
@@ -1090,7 +1090,7 @@ def test_clone_falls_back_to_object_copy_when_hardlinks_are_refused() -> None:
     ``clone --local`` fail outright. The attempt must degrade to an object copy
     rather than dying, and must say so.
     """
-    from mimir.worklink.checkout import _clone_attempt_checkout
+    from mimir_cultivate.worklink.checkout import _clone_attempt_checkout
 
     calls: list[Sequence[str]] = []
     events: list[tuple[str, dict]] = []
@@ -1118,7 +1118,7 @@ def test_clone_falls_back_to_object_copy_when_hardlinks_are_refused() -> None:
 def test_clone_does_not_retry_an_unrelated_failure() -> None:
     """A fallback that fires on any error would turn a real fault into 179 MB
     of copying and a confusing success. Only the hardlink error retries."""
-    from mimir.worklink.checkout import _clone_attempt_checkout
+    from mimir_cultivate.worklink.checkout import _clone_attempt_checkout
 
     calls: list[Sequence[str]] = []
 
@@ -1139,7 +1139,7 @@ def test_clone_does_not_retry_an_unrelated_failure() -> None:
 
 def test_clone_raises_when_the_object_copy_also_fails() -> None:
     """The fallback is a degradation, not a guarantee; it must still fail loud."""
-    from mimir.worklink.checkout import _clone_attempt_checkout
+    from mimir_cultivate.worklink.checkout import _clone_attempt_checkout
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         if "--no-hardlinks" in args:
@@ -1227,29 +1227,31 @@ def test_git_object_ownership_check_is_not_reachable_from_clone_path(
     assert scanner_name not in inspect.getsource(checkout_module.create_isolated_checkout)
 
 
-@pytest.mark.parametrize("value", [None, "", "0", "false", "off"])
-def test_disabled_coding_keeps_legacy_checkout_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str | None
+@pytest.mark.parametrize("selection", [None, ""])
+def test_unselected_cultivate_keeps_legacy_checkout_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selection: str | None
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
-    if value is None:
-        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    if selection is None:
+        monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     else:
-        monkeypatch.setenv("MIMIR_CODING_ENABLED", value)
+        monkeypatch.setenv("MIMIR_PLUGINS", selection)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
 
     assert checkout_module._isolated_checkout_path(repo, ".worklink", 1410, 2) == (
         tmp_path / ".worklink" / "repo" / "1410-2"
     )
 
 
-def test_enabled_coding_uses_bounded_hashed_checkout_path(
+def test_selected_cultivate_uses_bounded_hashed_checkout_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     root = tmp_path / "enabled"
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
     monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", root)
 
     path = checkout_module._isolated_checkout_path(repo, ".worklink", 1410, 2)
@@ -1258,6 +1260,28 @@ def test_enabled_coding_uses_bounded_hashed_checkout_path(
     assert len(path.parent.parent.name) == 64
     assert path.parent.name == "1410-2"
     assert path.name == "checkout"
+
+
+def test_selected_cultivate_prunes_worker_root_without_legacy_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    root = tmp_path / "worker-checkouts"
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", root)
+    attempt = checkout_module._isolated_checkout_path(repo, ".worklink", 1949, 1).parent
+    attempt.mkdir(parents=True)
+    os.utime(attempt, (0, 0))
+
+    removed = prune_attempt_checkouts(
+        repo, older_than=timedelta(days=1), now=datetime.now(UTC),
+        runner=lambda args: completed(args),
+    )
+
+    assert removed == [attempt]
+    assert not attempt.exists()
 
 
 def test_enabled_clone_uses_no_hardlinks() -> None:
@@ -1355,7 +1379,8 @@ def test_enabled_eligible_checkout_uses_normal_path_and_shared_modes_without_aut
 ) -> None:
     repo = _repo_with_main(tmp_path)
     calls: list[list[str]] = []
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
     forbidden_root = tmp_path / "enabled"
     monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", forbidden_root)
     monkeypatch.setattr(
@@ -1402,7 +1427,7 @@ def test_enabled_controller_only_checkout_preserves_legacy_behavior(
 ) -> None:
     repo = _repo_with_main(tmp_path)
     calls: list[list[str]] = []
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", tmp_path / "enabled")
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -1525,10 +1550,10 @@ def test_non_linux_issued_checkout_rejects_paths_outside_root(
         checkout_module._open_issued_checkout(root, relative_path)
 
 
-@pytest.mark.parametrize("coding", [False, True])
-def test_factory_checkout_is_private_inner_clone_regardless_of_coding(tmp_path, monkeypatch, coding):
+@pytest.mark.parametrize("selected", [False, True])
+def test_factory_checkout_is_private_inner_clone_regardless_of_selection(tmp_path, monkeypatch, selected):
     repo = _repo_with_main(tmp_path)
-    monkeypatch.setattr(checkout_module, "coding_enabled", lambda: coding)
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if selected else "")
     monkeypatch.setattr(checkout_module, "get_identities", lambda: SimpleNamespace(
         mimir_uid=os.getuid(), worklink_gid=os.getgid(),
     ))

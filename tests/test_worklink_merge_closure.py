@@ -10,7 +10,7 @@ from typing import Sequence
 
 import pytest
 
-from mimir.worklink import merge_closure as closure
+from mimir_cultivate.worklink import merge_closure as closure
 from mimir.worklink import dispatch_failures
 from mimir.worklink.dispatch_failures import (
     autonomous_dispatch_block_reason,
@@ -1323,7 +1323,7 @@ def test_overlapping_process_sweeps_are_serialized(
     script = r'''
 import os, subprocess, sys, time
 from pathlib import Path
-from mimir.worklink.merge_closure import reconcile_merged_leaves
+from mimir_cultivate.worklink.merge_closure import reconcile_merged_leaves
 home, repo, journal = map(Path, sys.argv[1:])
 def cp(out=""):
     return subprocess.CompletedProcess([], 0, out, "")

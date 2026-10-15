@@ -17,7 +17,7 @@ import sys
 from typing import Any, Callable, Sequence
 
 from mimir._rmtree import rmtree_missing_ok
-from mimir.coding import coding_enabled
+from mimir.plugins.discovery import enabled_plugins
 from .identities import get_identities
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -28,6 +28,11 @@ _REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 _OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 _AUTHORIZATION_FACTORY = object()
 _DIRTY_PATH_SAMPLE_LIMIT = 20
+
+
+def _cultivate_selected() -> bool:
+    """Use the installed, process-selected provider rather than the retired coding flag."""
+    return any(candidate.name == "cultivate" for candidate in enabled_plugins())
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -536,7 +541,7 @@ def create_isolated_checkout(
 
     _assert_base_separate_from_controller(repo)
 
-    worker_accessible = factory_worker or (coding_enabled() and worker_eligible)
+    worker_accessible = factory_worker or (_cultivate_selected() and worker_eligible)
     identities = get_identities() if worker_accessible else None
     path = _isolated_checkout_path(
         repo, worklink_dir, issue_id, attempt, worker_authorized=False
@@ -1263,7 +1268,7 @@ def _isolated_checkout_path(
     writable checkout through its issued directory FD.
     """
     if worker_authorized is None:
-        worker_authorized = coding_enabled()
+        worker_authorized = _cultivate_selected()
     if worker_authorized:
         repo_id = hashlib.sha256(str(repo.resolve()).encode("utf-8")).hexdigest()
         return (
@@ -1407,7 +1412,7 @@ def _attempt_roots(repo: Path, worklink_dir: str) -> list[tuple[Path, bool]]:
     roots = [(legacy_root, False)]
     if relocated_root != legacy_root:
         roots.append((relocated_root, True))
-    if coding_enabled():
+    if _cultivate_selected():
         enabled_root = _isolated_checkout_path(
             repo, worklink_dir, 0, 0, worker_authorized=True
         ).parent.parent

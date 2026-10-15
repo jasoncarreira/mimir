@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,9 @@ import pytest
 
 from mimir_cultivate.worklink import checkout, claims, continuation, merge_closure, poller_hooks
 from mimir_cultivate.worklink.retained_scope import derive_retained_factory_scope
+from mimir_cultivate.worklink import retained_scope
+from mimir.models import RetainedFactoryScope
+from mimir.worklink.dispatch_failures import dispatch_failure_state_dir
 
 
 def test_checkout_capability_requires_issued_directory(tmp_path: Path) -> None:
@@ -94,3 +99,57 @@ def test_retained_scope_refuses_untrusted_service() -> None:
     )
     assert result.scope is None
     assert result.refusal_reason == "service is not the Worklink ready queue"
+
+
+def test_retained_effect_lease_accepts_only_current_dead_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = RetainedFactoryScope(
+        issue_id=1949, signature="failure", occurrence_id="occurrence",
+        run_id="run", attempt=1, session="session", repository="owner/repo",
+        branch="branch", sandbox=str(tmp_path / "sandbox"),
+    )
+    record = SimpleNamespace(**{
+        key: getattr(scope, key) for key in (
+            "issue_id", "run_id", "attempt", "session", "repository", "branch", "sandbox"
+        )
+    })
+
+    @contextmanager
+    def acquired(*_args):
+        yield True
+
+    monkeypatch.setattr(retained_scope, "factory_checkout_interlock", acquired)
+    monkeypatch.setattr(retained_scope, "factory_issue_resource_lock", acquired)
+    monkeypatch.setattr(retained_scope, "current_failure_record", lambda *_: {
+        "signature": scope.signature, "occurrence_id": scope.occurrence_id,
+    })
+    monkeypatch.setattr(retained_scope, "load_factory_records_for_issue", lambda *_: [record])
+    monkeypatch.setattr(retained_scope, "factory_process_is_alive", lambda _: False)
+    monkeypatch.setattr(retained_scope, "factory_process_is_verified_dead", lambda _: True)
+    monkeypatch.setattr(retained_scope, "_factory_session_lock_is_fresh", lambda _: False)
+
+    with retained_scope.retained_factory_effect_lease(tmp_path, scope) as result:
+        assert result.scope is scope
+    monkeypatch.setattr(retained_scope, "_factory_session_lock_is_fresh", lambda _: True)
+    with retained_scope.retained_factory_effect_lease(tmp_path, scope) as result:
+        assert result.scope is None
+        assert result.refusal_reason == "factory session lock is fresh"
+
+
+def test_poller_receipt_keeps_only_live_unnotified_incident(tmp_path: Path) -> None:
+    root = dispatch_failure_state_dir(tmp_path)
+    root.mkdir(parents=True)
+    state = {"version": 1, "issues": {"1949": {
+        "issue_id": 1949, "active": True, "signature": "failure",
+        "occurrence_id": "occurrence", "notified_signatures": [],
+    }}}
+    (root / poller_hooks.STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
+    receipts = []
+    poller_hooks.report_live_delivery_receipts(root, tmp_path, receipts.append)
+    key = hashlib.sha256(b"worklink-run-failure:1949:failure:occurrence").hexdigest()
+    assert receipts == [{key}]
+    state["issues"]["1949"]["notified_signatures"] = ["failure"]
+    (root / poller_hooks.STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
+    poller_hooks.report_live_delivery_receipts(root, tmp_path, receipts.append)
+    assert receipts[-1] == set()
