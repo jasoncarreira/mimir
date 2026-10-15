@@ -18708,6 +18708,11 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
         protected[name] = "repository"
     # Preserve both proposal and repository reads in the frozen inventories.
     flows[access_control.ToolFlowDirection.SOURCE].add("proposal_diff")
+    flows[access_control.ToolFlowDirection.SOURCE].add("chainlink_issue_show")
+    decisions[OperationDecision.ADMIN_REQUIRED].add("chainlink_issue_show")
+    admin_catalog.add("chainlink_issue_show")
+    readable["chainlink_issue_show"] = "chainlink"
+    protected["chainlink_issue_show"] = "chainlink"
     decisions[OperationDecision.ADMIN_REQUIRED].add("proposal_diff")
     admin_catalog.add("proposal_diff")
     readable["proposal_diff"] = "filesystem"
