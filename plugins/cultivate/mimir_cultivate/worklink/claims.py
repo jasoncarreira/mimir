@@ -1,0 +1,1484 @@
+"""Chainlink-backed claim protocol for Worklink.
+
+This module deliberately uses Chainlink as the coordination surface instead of
+introducing a second claim database. Attempt state is recorded as structured
+issue comments and locks are delegated to ``chainlink locks`` (slice-0 verified
+as atomic during chainlink #438).
+"""
+
+from __future__ import annotations
+
+import contextvars
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+import fcntl
+import json
+import logging
+from pathlib import Path
+import re
+import subprocess
+import time
+from typing import Any, Callable, Iterable, Sequence
+
+from .checkout import _default_runner
+from mimir.worklink.control import operator_stop_requested
+from mimir.worklink.dispatch_failures import _find_latest_evidence_file_for_issue, record_leaf_transition_best_effort
+
+CLAIM_PREFIX = "WORKLINK_CLAIM "
+WORKLINK_EPIC_LABEL = "worklink:epic"
+
+# Standalone callers without a Worklink config get the same finite safety
+# budget as a missing or malformed defaults.max_claim_attempts setting.
+DEFAULT_MAX_CLAIM_ATTEMPTS = 3
+
+#: Operator marker that forgives the attempts consumed before it. The attempt
+#: budget is derived from claim comments, so an infrastructure fault that fails
+#: every attempt — a broken base-repo fetch, a reclaimed object store — exhausts a
+#: leaf that was never itself at fault, and relabelling cannot undo it because the
+#: count is recomputed from history on each dispatch. That happened to #1019,
+#: #1020 and #1023 on 2026-07-28: six attempts burned by dangling git alternates,
+#: three leaves demoted, and re-promotion re-exhausted them within seconds.
+#:
+#: Add with:  chainlink issue comment <id> 'WORKLINK_CLAIM_RESET {"reason": "..."}'
+CLAIM_RESET_PREFIX = "WORKLINK_CLAIM_RESET "
+
+#: How many resets one issue may be granted. Unbounded forgiveness would let a
+#: genuinely stuck leaf loop forever by resetting itself — the comment carries no
+#: author, so intent cannot be verified — which is exactly what ``max_attempts``
+#: exists to prevent. After this many, the cap re-asserts permanently and the leaf
+#: needs a human decision rather than another retry.
+MAX_CLAIM_RESETS = 2
+SHUTDOWN_ABORT_PREFIX = "WORKLINK_SHUTDOWN_ABORT "
+OPERATOR_STOP_PREFIX = "WORKLINK_STOPPED "
+QUOTA_HOLD_PREFIX = "WORKLINK_QUOTA_HOLD "
+# A planned restart must not consume the ordinary retry budget, but repeated
+# restarts must not turn max_attempts into an infinite-retry loophole.
+MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
+REAPER_PREFIX = "WORKLINK_REAPER "
+REAPER_SKIP_SAMPLE_LIMIT = 20
+
+# Retrying remains useful even with Mimir's mutex: another Chainlink caller may
+# not participate in it. On mimirbot 2026-09-09, dispatch to successful claim
+# took 3.469s under contention (#1607). Seven attempts (first immediate) sleep
+# for 0.1 + 0.2 + 0.4 + 0.8 + 1.6 + 3.2 = 6.3s, leaving slower-machine
+# headroom while keeping persistent contention bounded.
+CLAIM_CONTENTION_MAX_ATTEMPTS = 7
+CLAIM_CONTENTION_INITIAL_BACKOFF_S = 0.1
+CLAIM_CONTENDED_RESOURCE = "chainlink_locks_worktree"
+_CLAIM_CRITICAL_SECTION: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "worklink_claim_critical_section", default=False,
+)
+
+_GIT_CONTENTION_PATTERNS = (
+    re.compile(
+        r"unable to create .*[/\\]index\.lock.*file exists",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(r"another git process seems to be running", re.IGNORECASE),
+    re.compile(r"another process is using this repository", re.IGNORECASE),
+)
+
+Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+EventLogger = Callable[..., None]
+
+log = logging.getLogger(__name__)
+
+
+class _ChainlinkContentionExhausted(RuntimeError):
+    pass
+
+
+def scope_active_worklink_lock_ids(
+    active_ids: Iterable[int],
+    *,
+    label_ids: Iterable[int] | None = None,
+    exclude_ids: Iterable[int] | None = None,
+) -> set[int]:
+    """Apply the label scope shared by every Worklink concurrency consumer."""
+    if label_ids is not None and exclude_ids is not None:
+        raise ValueError("active lock scope accepts label ids or excluded ids, not both")
+    scoped = set(active_ids)
+    if label_ids is not None:
+        return scoped & set(label_ids)
+    if exclude_ids is not None:
+        return scoped - set(exclude_ids)
+    return scoped
+
+
+
+
+def _is_git_contention(result: subprocess.CompletedProcess[str]) -> bool:
+    if result.returncode == 0:
+        return False
+    detail = (result.stderr or "") + "\n" + (result.stdout or "")
+    return any(pattern.search(detail) for pattern in _GIT_CONTENTION_PATTERNS)
+
+
+@dataclass(frozen=True)
+class ClaimRecord:
+    issue_id: int
+    attempt: int
+    agent_id: str
+    claimed_at: datetime
+    heartbeat_at: datetime | None = None
+    # Unique attempt ordinals can exceed the charged budget after a forgiven
+    # shutdown. Kept on the wire so terminal transitions use the right budget.
+    budget_attempt: int | None = None
+    # How many honoured ``WORKLINK_CLAIM_RESET`` markers precede this record.
+    # Derived from position in the comment history rather than carried on the
+    # wire, so ``to_comment`` stays byte-identical. Generation still orders
+    # legacy histories whose reset restarted attempt numbering.
+    generation: int = 0
+
+    def is_stale(self, now: datetime, ttl: timedelta) -> bool:
+        anchor = self.heartbeat_at or self.claimed_at
+        return now - anchor > ttl
+
+    def to_comment(self) -> str:
+        payload = {
+            "issue_id": self.issue_id,
+            "attempt": self.attempt,
+            "agent_id": self.agent_id,
+            "claimed_at": self.claimed_at.isoformat(),
+            "heartbeat_at": self.heartbeat_at.isoformat() if self.heartbeat_at else None,
+        }
+        if self.budget_attempt is not None:
+            payload["budget_attempt"] = self.budget_attempt
+        return CLAIM_PREFIX + json.dumps(payload, sort_keys=True)
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "ClaimRecord":
+        return cls(
+            issue_id=int(payload["issue_id"]),
+            attempt=int(payload["attempt"]),
+            agent_id=str(payload["agent_id"]),
+            claimed_at=_parse_dt(str(payload["claimed_at"])),
+            heartbeat_at=_parse_dt(str(payload["heartbeat_at"])) if payload.get("heartbeat_at") else None,
+            budget_attempt=(
+                int(payload["budget_attempt"])
+                if payload.get("budget_attempt") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ShutdownAbortRecord:
+    issue_id: int
+    attempt: int
+    agent_id: str
+    claimed_at: datetime
+    aborted_at: datetime
+    generation: int = 0
+
+    def to_comment(self) -> str:
+        return SHUTDOWN_ABORT_PREFIX + json.dumps(
+            {
+                "issue_id": self.issue_id,
+                "attempt": self.attempt,
+                "agent_id": self.agent_id,
+                "claimed_at": self.claimed_at.isoformat(),
+                "aborted_at": self.aborted_at.isoformat(),
+            },
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "ShutdownAbortRecord":
+        return cls(
+            issue_id=int(payload["issue_id"]),
+            attempt=int(payload["attempt"]),
+            agent_id=str(payload["agent_id"]),
+            claimed_at=_parse_dt(str(payload["claimed_at"])),
+            aborted_at=_parse_dt(str(payload["aborted_at"])),
+        )
+
+
+@dataclass(frozen=True)
+class ClaimResult:
+    claimed: bool
+    record: ClaimRecord | None = None
+    attempts_exhausted: bool = False
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ReapResult:
+    reaped: list[ClaimRecord]
+    examined: int
+    skipped: dict[str, int]
+    skipped_issue_ids: dict[str, list[int]]
+
+
+@dataclass(frozen=True)
+class ShutdownClaimFailure:
+    issue_id: int | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class ReviewReadyEvidence:
+    path: Path
+    payload: dict[str, Any]
+
+
+def _parse_dt(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _scan_claim_history(
+    comments: Iterable[str],
+) -> tuple[list[ClaimRecord], list[ShutdownAbortRecord], list[ShutdownAbortRecord], int]:
+    """Parse every claim record with its reset generation, plus the final one.
+
+    Scans in comment order, so a ``WORKLINK_CLAIM_RESET`` marker advances the
+    generation of everything after it. Only the first ``MAX_CLAIM_RESETS``
+    markers advance it, matching the reset budget: later markers are inert, and
+    the records following them stay in the last honoured generation.
+
+    Every record is returned regardless of generation. The duplicate-liveness
+    guard and the stale-claim reaper both have to see a live claim even when it
+    predates a reset, so a generation changes how records are ORDERED, never
+    whether they exist.
+
+    The returned generation is the final counter, which is not always the
+    highest generation among the records: a reset posted after the last claim
+    leaves its generation empty, which is what tells ``next_attempt`` the
+    budget is fresh.
+    """
+    records: list[ClaimRecord] = []
+    aborts: list[ShutdownAbortRecord] = []
+    stops: list[ShutdownAbortRecord] = []
+    seen_claims: set[tuple[int, int, str, datetime]] = set()
+    generation = 0
+    for comment in comments:
+        for line in comment.splitlines():
+            if line.startswith(CLAIM_RESET_PREFIX):
+                if generation < MAX_CLAIM_RESETS:
+                    generation += 1
+                continue
+            if not line.startswith(CLAIM_PREFIX):
+                prefix = next((p for p in (SHUTDOWN_ABORT_PREFIX, OPERATOR_STOP_PREFIX, QUOTA_HOLD_PREFIX) if line.startswith(p)), None)
+                if prefix is None:
+                    continue
+                try:
+                    abort = ShutdownAbortRecord.from_payload(
+                        json.loads(line[len(prefix) :])
+                    )
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                abort_key = (
+                    abort.issue_id,
+                    abort.attempt,
+                    abort.agent_id,
+                    abort.claimed_at,
+                )
+                if abort_key not in seen_claims:
+                    continue
+                (stops if prefix in {OPERATOR_STOP_PREFIX, QUOTA_HOLD_PREFIX} else aborts).append(
+                    replace(abort, generation=generation)
+                )
+                continue
+            try:
+                record = ClaimRecord.from_payload(json.loads(line[len(CLAIM_PREFIX) :]))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            records.append(replace(record, generation=generation))
+            seen_claims.add(
+                (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
+            )
+    return records, aborts, stops, generation
+
+
+def _scan_claim_comments(comments: Iterable[str]) -> tuple[list[ClaimRecord], int]:
+    records, _aborts, _stops, generation = _scan_claim_history(comments)
+    return records, generation
+
+
+def claim_records_from_comments(comments: Iterable[str]) -> list[ClaimRecord]:
+    return _scan_claim_comments(comments)[0]
+
+
+def _claim_is_newer(candidate: ClaimRecord, current: ClaimRecord) -> bool:
+    """True when ``candidate`` supersedes ``current`` for the same issue.
+
+    Generation is compared first for persisted histories from before attempt
+    ordinals became monotonic across resets. Comparing attempt first made every
+    post-reset build in those histories lose to the stale pre-reset record with
+    the higher attempt number, and the reaper then judged staleness from that
+    dead record's anchor and released a claim that was still heartbeating.
+    Within one generation: a higher attempt, then a later claim/heartbeat
+    anchor (the record the reaper should judge for staleness).
+    """
+    if candidate.generation != current.generation:
+        return candidate.generation > current.generation
+    if candidate.attempt != current.attempt:
+        return candidate.attempt > current.attempt
+    cand_anchor = candidate.heartbeat_at or candidate.claimed_at
+    cur_anchor = current.heartbeat_at or current.claimed_at
+    return cand_anchor > cur_anchor
+
+
+def _lock_issue_id(lock: dict[str, Any]) -> int | None:
+    for key in ("issue_id", "id", "issue"):
+        raw = lock.get(key)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+class ChainlinkClaims:
+    """Small wrapper around the Chainlink CLI claim/label/comment protocol."""
+
+    def __init__(
+        self,
+        *,
+        chainlink_bin: str = "chainlink",
+        agent_id: str,
+        runner: Runner = _default_runner,
+        clock: Callable[[], datetime] | None = None,
+        max_attempts: int = DEFAULT_MAX_CLAIM_ATTEMPTS,
+        duplicate_freshness_s: float = 600.0,
+        home_path: str | Path | None = None,
+        event_logger: EventLogger | None = None,
+        contention_max_attempts: int = CLAIM_CONTENTION_MAX_ATTEMPTS,
+        contention_initial_backoff_s: float = CLAIM_CONTENTION_INITIAL_BACKOFF_S,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.chainlink_bin = chainlink_bin
+        self.agent_id = agent_id
+        self.runner = runner
+        self.clock = clock or (lambda: datetime.now(UTC))
+        self.max_attempts = max_attempts
+        self.home_path = Path(home_path) if home_path is not None else None
+        self.event_logger = event_logger
+        self.contention_max_attempts = max(1, contention_max_attempts)
+        self.contention_initial_backoff_s = max(0.0, contention_initial_backoff_s)
+        self.sleeper = sleeper
+        # chainlink #822: a claim-comment heartbeat younger than this means the
+        # owning process is alive (2x the max epic heartbeat interval of 300s).
+        self.duplicate_freshness_s = duplicate_freshness_s
+
+    def claim_issue(
+        self,
+        issue_id: int,
+        comments: Iterable[str] = (),
+        *,
+        labels: Iterable[str] | None = None,
+        home_path: str | Path | None = None,
+        max_active_locks: int | None = None,
+        active_label: str | None = None,
+        exclude_active_label: str | None = None,
+        before_claim: Callable[[], None] | None = None,
+        issue_title: str = "",
+    ) -> ClaimResult:
+        """Claim ``issue_id`` if its lifecycle, evidence, attempts, and cap allow it.
+
+        ``max_active_locks`` is the autonomous-dispatch hard bound. The issue
+        lock is acquired first, then the active lock count is checked while this
+        claim is already reserved; if admitting this reservation would exceed
+        the cap, the lock is released before any label/comment mutation or
+        backend compute launch.
+
+        Admission resolves current labels itself when a caller does not supply
+        them and refuses ``worklink:review`` before claiming. It also reads the
+        latest persisted evidence under the configured home (or the per-call
+        override) and refuses completed evidence with an associated PR, even if
+        labels have drifted. ``worklink:in-progress`` remains admissible for
+        legitimate reattach scenarios.
+        """
+        comments = list(comments)
+        label_set = self._issue_labels(issue_id)
+        if labels is not None:
+            label_set.update(labels)
+        if "worklink:review" in label_set:
+            return ClaimResult(False, reason="lifecycle_state_incompatible")
+
+        claim_home = Path(home_path) if home_path is not None else self.home_path
+        if claim_home is not None:
+            intent_path = claim_home / "state" / "worklink" / "publications" / f"{issue_id}.json"
+            # Presence, not parseability, is the publication fence. Do not park
+            # labels or charge an attempt: operator clearing must allow retry.
+            if intent_path.exists() or intent_path.is_symlink():
+                log.info(
+                    "Worklink claim refused: issue_id=%s reason=publication_intent_exists "
+                    "intent_path=%s",
+                    issue_id,
+                    intent_path,
+                )
+                return ClaimResult(False, reason="publication_intent_exists")
+
+        review_ready = self.review_ready_evidence(issue_id, home_path=home_path)
+        if review_ready is not None:
+            # Completed PR evidence is the publication authority. Repair labels
+            # before refusing a duplicate run so ready and undispatchable cannot
+            # persist together after transient post-publication bookkeeping fails.
+            self.transition_issue(
+                issue_id,
+                status="completed",
+                review_ready=True,
+            )
+            log.info(
+                "Worklink claim refused: issue_id=%s reason=review_ready_evidence_exists "
+                "evidence_path=%s pr_url=%s",
+                issue_id,
+                review_ready.path,
+                review_ready.payload.get("pr_url"),
+            )
+            return ClaimResult(False, reason="review_ready_evidence_exists")
+
+        def finish_claim(lock: subprocess.CompletedProcess[str]) -> ClaimResult:
+            if lock.returncode != 0:
+                return ClaimResult(
+                    False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed"
+                )
+            if "already hold" in ((lock.stdout or "") + (lock.stderr or "")).lower():
+                # The CLI treats a same-agent re-claim as idempotent success.
+                # Keep this liveness guard and its authoritative comment read
+                # inside the same mutex as acquisition and publication.
+                latest: ClaimRecord | None = None
+                # Never trust the caller's earlier comment snapshot here.
+                guard_outcome = "claim_record_missing"
+                try:
+                    guard_comments = self._issue_comments(issue_id, strict=True)
+                except Exception as exc:
+                    guard_outcome = "degraded"
+                    if self.event_logger is not None:
+                        self.event_logger(
+                            "worklink_claim_guard_degraded",
+                            issue_id=issue_id,
+                            error=f"{type(exc).__name__}: {exc}"[:500],
+                        )
+                    return ClaimResult(False, reason=f"claim_guard_{guard_outcome}")
+                for existing in claim_records_from_comments(guard_comments):
+                    if existing.issue_id != issue_id:
+                        continue
+                    if latest is None or _claim_is_newer(existing, latest):
+                        latest = existing
+                if latest is not None:
+                    anchor = latest.heartbeat_at or latest.claimed_at
+                    age_s = (self.clock() - anchor).total_seconds()
+                    if age_s < self.duplicate_freshness_s:
+                        return ClaimResult(False, reason="duplicate_run_live")
+                    guard_outcome = "stale_heartbeat"
+                steal = self._run("locks", "steal", str(issue_id), check=False)
+                self._emit_claim_stolen(
+                    issue_id=issue_id,
+                    prior=latest,
+                    now=self.clock(),
+                    guard_outcome=guard_outcome,
+                    result=steal,
+                )
+
+            # Judge exhaustion only after duplicate liveness, so a live final
+            # attempt is refused as a duplicate instead of being blocked.
+            attempt = self.next_attempt(comments)
+            attempts_used = self.attempts_used(comments)
+            if attempts_used >= self.max_attempts:
+                self.release_issue(issue_id)
+                self._attempts_exhausted(
+                    issue_id, attempts_used, issue_title=issue_title, home=claim_home,
+                    generation=_scan_claim_comments(comments)[1],
+                )
+                return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
+
+            if max_active_locks is not None:
+                try:
+                    active_ids = self._active_worklink_lock_ids_for_scope(
+                        label=active_label,
+                        exclude_label=exclude_active_label,
+                    )
+                    active = len(active_ids)
+                except Exception:
+                    self.release_issue(issue_id)
+                    raise
+                if active > max_active_locks:
+                    self.release_issue(issue_id)
+                    consuming_ids = sorted(
+                        lock_id
+                        for lock_id in active_ids
+                        if lock_id > 0 and lock_id != issue_id
+                    )
+                    ids_suffix = f"; active issue ids: {consuming_ids}" if consuming_ids else ""
+                    return ClaimResult(
+                        False,
+                        reason=(
+                            f"concurrency cap reached ({active - 1}/{max_active_locks} active "
+                            f"claims before this reservation{ids_suffix})"
+                        ),
+                    )
+
+            record = ClaimRecord(
+                issue_id=issue_id,
+                attempt=attempt,
+                agent_id=self.agent_id,
+                claimed_at=self.clock(),
+                budget_attempt=attempts_used + 1,
+            )
+            try:
+                self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
+                self._run("issue", "label", str(issue_id), "worklink:in-progress")
+                self._run("issue", "comment", str(issue_id), record.to_comment())
+            except Exception:
+                self.release_issue(issue_id)
+                raise
+            return ClaimResult(True, record=record)
+
+        try:
+            return self._claim_lock_with_retry(
+                issue_id,
+                home_path=claim_home,
+                before_claim=before_claim,
+                after_claim=finish_claim,
+            )
+        except _ChainlinkContentionExhausted:
+            return ClaimResult(False, reason="claim_contention_exhausted")
+
+    def _claim_lock_with_retry(
+        self,
+        issue_id: int,
+        *,
+        home_path: Path | None,
+        before_claim: Callable[[], None] | None = None,
+        after_claim: Callable[[subprocess.CompletedProcess[str]], ClaimResult] | None = None,
+    ) -> subprocess.CompletedProcess[str] | ClaimResult:
+        return self._run_with_retry(
+            "locks", "claim", str(issue_id), home_path=home_path,
+            before_claim=before_claim, after_claim=after_claim,
+        )
+
+    def _run_with_retry(
+        self,
+        *args: str,
+        home_path: Path | None,
+        before_claim: Callable[[], None] | None = None,
+        after_claim: Callable[[subprocess.CompletedProcess[str]], ClaimResult] | None = None,
+    ) -> subprocess.CompletedProcess[str] | ClaimResult:
+        """Run with bounded contention; claim finalization may stay under the mutex.
+
+        Local mutex waits and external Git contention share one bounded budget.
+        The callbacks run once around the successful claim command.
+        """
+        issue_id = int(args[2]) if len(args) > 2 and args[2].isdigit() else None
+        if _CLAIM_CRITICAL_SECTION.get():
+            result: subprocess.CompletedProcess[str] | None = None
+            for attempt in range(1, self.contention_max_attempts + 1):
+                result = self.runner([self.chainlink_bin, *args])
+                if not _is_git_contention(result):
+                    if attempt > 1 and result.returncode == 0:
+                        self._emit_claim_contention(issue_id, attempt, "succeeded")
+                    return after_claim(result) if after_claim is not None else result
+                if attempt < self.contention_max_attempts:
+                    self._emit_claim_contention(issue_id, attempt, "retrying")
+                    self.sleeper(self.contention_initial_backoff_s * (2 ** (attempt - 1)))
+            self._emit_claim_contention(issue_id, self.contention_max_attempts, "exhausted")
+            raise _ChainlinkContentionExhausted(
+                "chainlink contention exhausted (chainlink_locks_worktree)"
+            )
+        lock_path: Path | None = None
+        if home_path is None:
+            log.warning(
+                "Worklink claim serialization unavailable: issue_id=%s reason=home_path_missing",
+                issue_id,
+            )
+            if self.event_logger is not None:
+                self.event_logger(
+                    "worklink_claim_serialization_unavailable",
+                    issue_id=issue_id,
+                    resource=CLAIM_CONTENDED_RESOURCE,
+                    reason="home_path_missing",
+                )
+        else:
+            lock_dir = home_path / "state" / "worklink"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock_path = lock_dir / "chainlink-claim.lock"
+
+        result: subprocess.CompletedProcess[str] | None = None
+        prepared = False
+        for attempt in range(1, self.contention_max_attempts + 1):
+            if lock_path is None:
+                if not prepared and before_claim is not None:
+                    before_claim()
+                prepared = True
+                result = self.runner([self.chainlink_bin, *args])
+                if not _is_git_contention(result):
+                    if attempt > 1 and result.returncode == 0:
+                        self._emit_claim_contention(issue_id, attempt, "succeeded")
+                    return after_claim(result) if after_claim is not None else result
+            else:
+                with lock_path.open("a", encoding="utf-8") as handle:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        result = None
+                    else:
+                        try:
+                            if not prepared and before_claim is not None:
+                                before_claim()
+                            prepared = True
+                            result = self.runner([self.chainlink_bin, *args])
+                            if not _is_git_contention(result):
+                                if attempt > 1 and result.returncode == 0:
+                                    self._emit_claim_contention(issue_id, attempt, "succeeded")
+                                if after_claim is None:
+                                    return result
+                                token = _CLAIM_CRITICAL_SECTION.set(True)
+                                try:
+                                    return after_claim(result)
+                                finally:
+                                    _CLAIM_CRITICAL_SECTION.reset(token)
+                        finally:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+            if result is not None and not _is_git_contention(result):
+                if attempt > 1 and result.returncode == 0:
+                    self._emit_claim_contention(issue_id, attempt, "succeeded")
+                return result
+
+            if attempt < self.contention_max_attempts:
+                self._emit_claim_contention(issue_id, attempt, "retrying")
+                self.sleeper(self.contention_initial_backoff_s * (2 ** (attempt - 1)))
+
+        self._emit_claim_contention(issue_id, self.contention_max_attempts, "exhausted")
+        raise _ChainlinkContentionExhausted(
+            "chainlink contention exhausted (chainlink_locks_worktree)"
+        )
+
+    def _emit_claim_contention(self, issue_id: int | None, attempt: int, outcome: str) -> None:
+        if self.event_logger is None:
+            return
+        self.event_logger(
+            "worklink_claim_contention",
+            issue_id=issue_id,
+            resource=CLAIM_CONTENDED_RESOURCE,
+            retry_attempt=attempt,
+            max_attempts=self.contention_max_attempts,
+            outcome=outcome,
+        )
+
+    def _emit_claim_stolen(
+        self,
+        *,
+        issue_id: int,
+        prior: ClaimRecord | None,
+        now: datetime,
+        guard_outcome: str,
+        result: subprocess.CompletedProcess[str],
+    ) -> None:
+        if self.event_logger is None:
+            return
+        anchor = (prior.heartbeat_at or prior.claimed_at) if prior is not None else None
+        self.event_logger(
+            "worklink_claim_stolen",
+            issue_id=issue_id,
+            prior_agent_id=prior.agent_id if prior is not None else None,
+            heartbeat_age_s=(now - anchor).total_seconds() if anchor is not None else None,
+            guard_outcome=guard_outcome,
+            steal_succeeded=result.returncode == 0,
+            error=(
+                None
+                if result.returncode == 0
+                else ((result.stderr or result.stdout).strip() or "lock_steal_failed")[:500]
+            ),
+        )
+
+    def review_ready_evidence(
+        self,
+        issue_id: int,
+        *,
+        home_path: str | Path | None = None,
+    ) -> ReviewReadyEvidence | None:
+        """Return the latest active completed evidence associated with a PR.
+
+        Archived ``.json.closed-unmerged`` evidence is intentionally excluded by
+        the shared finder, so operator-approved re-attempts remain admissible.
+        """
+        effective_home = Path(home_path) if home_path is not None else self.home_path
+        if effective_home is None:
+            return None
+
+        from mimir.worklink.autonomy import _find_latest_evidence_file_for_issue
+
+        found = _find_latest_evidence_file_for_issue(effective_home, issue_id)
+        if found is None:
+            return None
+        path, payload = found
+        if payload.get("status") != "completed" or not payload.get("pr_url"):
+            return None
+        return ReviewReadyEvidence(path=path, payload=payload)
+
+    def release_issue(self, issue_id: int) -> bool:
+        """Attempt to release ``issue_id`` and report whether Chainlink confirmed it."""
+        result = self._run("locks", "release", str(issue_id), check=False)
+        return result.returncode == 0
+
+    def release_owned_claims_for_shutdown(
+        self,
+    ) -> tuple[list[ClaimRecord], list[ShutdownClaimFailure]]:
+        """Return this process's in-flight claims to ready, best-effort.
+
+        Ownership is taken only from the latest structured claim comment. A
+        different process/host therefore cannot be released even when both use
+        the same underlying Chainlink tracker identity.
+        """
+        released: list[ClaimRecord] = []
+        failed: list[ShutdownClaimFailure] = []
+        try:
+            issue_ids = self._list_issue_ids("worklink:in-progress")
+        except Exception as exc:  # noqa: BLE001 - shutdown must continue
+            log.warning("Worklink shutdown claim discovery failed: %s", exc)
+            failed.append(ShutdownClaimFailure(issue_id=None, reason=f"discovery_failed: {exc}"))
+            self._emit_shutdown_release_failures(released, failed)
+            return released, failed
+
+        for index, issue_id in enumerate(issue_ids):
+            try:
+                latest: ClaimRecord | None = None
+                for record in claim_records_from_comments(self._issue_comments(issue_id)):
+                    if record.issue_id != issue_id:
+                        continue
+                    if latest is None or _claim_is_newer(record, latest):
+                        latest = record
+                if latest is None or latest.agent_id != self.agent_id:
+                    continue
+
+                if operator_stop_requested(self.home_path, issue_id, latest.attempt):
+                    # The run owns the terminal evidence and stop comment. This
+                    # release must not forgive via a shutdown abort or re-arm it.
+                    lock = self._run("locks", "release", str(issue_id), check=False)
+                    if lock.returncode != 0:
+                        raise RuntimeError((lock.stderr or lock.stdout).strip() or "chainlink lock release failed")
+                    self._run("issue", "unlabel", str(issue_id), "worklink:ready")
+                    self._run("issue", "unlabel", str(issue_id), "worklink:in-progress")
+                    released.append(latest)
+                    continue
+
+                abort = ShutdownAbortRecord(
+                    issue_id=issue_id,
+                    attempt=latest.attempt,
+                    agent_id=latest.agent_id,
+                    claimed_at=latest.claimed_at,
+                    aborted_at=self.clock(),
+                )
+                # Keep the issue dispatchable throughout partial failure: first
+                # record forgiveness, then add ready, release the lock, and only
+                # then remove in-progress. No forceful lock steal is used here.
+                self._run("issue", "comment", str(issue_id), abort.to_comment())
+                self._run("issue", "label", str(issue_id), "worklink:ready")
+                lock = self._run("locks", "release", str(issue_id), check=False)
+                if lock.returncode != 0:
+                    raise RuntimeError(
+                        (lock.stderr or lock.stdout).strip() or "chainlink lock release failed"
+                    )
+                self._run("issue", "unlabel", str(issue_id), "worklink:in-progress")
+                released.append(latest)
+            except Exception as exc:  # noqa: BLE001 - one claim cannot hang shutdown
+                log.warning(
+                    "Worklink shutdown claim release failed: issue_id=%s error=%s",
+                    issue_id,
+                    exc,
+                )
+                failed.append(
+                    ShutdownClaimFailure(
+                        issue_id=issue_id,
+                        reason=f"{type(exc).__name__}: {exc}"[:500],
+                    )
+                )
+                if isinstance(exc, subprocess.TimeoutExpired):
+                    failed.extend(
+                        ShutdownClaimFailure(
+                            issue_id=remaining_issue_id,
+                            reason="abandoned_after_timeout",
+                        )
+                        for remaining_issue_id in issue_ids[index + 1 :]
+                    )
+                    break
+        self._emit_shutdown_release_failures(released, failed)
+        return released, failed
+
+    def _emit_shutdown_release_failures(
+        self,
+        released: list[ClaimRecord],
+        failed: list[ShutdownClaimFailure],
+    ) -> None:
+        if self.event_logger is None or not failed:
+            return
+        try:
+            self.event_logger(
+                "worklink_shutdown_claim_release_failed",
+                released_issue_ids=[record.issue_id for record in released],
+                failed=[
+                    {"issue_id": failure.issue_id, "reason": failure.reason}
+                    for failure in failed
+                ],
+            )
+        except Exception:  # noqa: BLE001 - telemetry cannot block shutdown
+            pass
+
+    def heartbeat_issue(self, record: ClaimRecord) -> ClaimRecord:
+        """Append a refreshed claim record so the TTL reaper sees liveness."""
+        updated = ClaimRecord(
+            issue_id=record.issue_id,
+            attempt=record.attempt,
+            agent_id=record.agent_id,
+            claimed_at=record.claimed_at,
+            heartbeat_at=self.clock(),
+            budget_attempt=record.budget_attempt,
+        )
+        self._run("issue", "comment", str(record.issue_id), updated.to_comment(), check=False)
+        return updated
+
+    def transition_issue(
+        self,
+        issue_id: int,
+        *,
+        status: str,
+        review_ready: bool,
+        attempt: int | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Move Worklink labels after evidence validation."""
+        stopped = status in {"failed", "stopped"} and operator_stop_requested(self.home_path, issue_id, attempt)
+        self._run("issue", "unlabel", str(issue_id), "worklink:in-progress", check=False)
+        self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
+        self._run("issue", "unlabel", str(issue_id), "worklink:review", check=False)
+        self._run("issue", "unlabel", str(issue_id), "worklink:blocked", check=False)
+        self._run("issue", "unlabel", str(issue_id), "worklink:failed", check=False)
+        if stopped:
+            return
+        if review_ready:
+            self._run("issue", "label", str(issue_id), "worklink:review")
+            return
+        if status == "blocked" or (attempt is not None and attempt >= self.max_attempts):
+            self._run("issue", "label", str(issue_id), "worklink:blocked")
+        else:
+            self._run("issue", "label", str(issue_id), "worklink:ready")
+        if reason:
+            prefix = "WORKLINK_BLOCKED" if status == "blocked" else "WORKLINK_FAILED"
+            self._run("issue", "comment", str(issue_id), f"{prefix} {reason}")
+
+    def next_attempt(self, comments: Iterable[str]) -> int:
+        """The globally monotonic attempt number a fresh claim would take.
+
+        Only the attempt BUDGET is reset. ``claim_records_from_comments`` still
+        reports every claim, because the duplicate-liveness guard and the stale
+        claim reaper judge live runs from those records — forgetting them here
+        would let a second run claim an issue a live run already holds. Admission
+        checks liveness before exhaustion, so a reset cannot smuggle a concurrent
+        build past that guard.
+
+        Reset markers forgive the attempt budget, not attempt ordinals. Keeping
+        ordinals monotonic prevents collisions with retained checkout directories,
+        branches, and evidence files from earlier reset generations.
+        """
+        records, _generation = _scan_claim_comments(comments)
+        attempts = [record.attempt for record in records]
+        if not attempts:
+            return 1
+        return max(attempts) + 1
+
+    def attempts_used(self, comments: Iterable[str]) -> int:
+        """Charged attempts in the active reset generation.
+
+        The first bounded set of valid shutdown markers across the leaf's
+        history forgive their matching claims. Attempt ordinals still advance,
+        preventing checkout/branch/evidence collisions.
+        """
+        records, aborts, stops, generation = _scan_claim_history(comments)
+        claim_keys = {
+            (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
+            for record in records
+        }
+        forgiven: set[tuple[int, int, str, datetime]] = set()
+        for abort in aborts:
+            key = (abort.issue_id, abort.attempt, abort.agent_id, abort.claimed_at)
+            if key not in claim_keys or key in forgiven:
+                continue
+            if len(forgiven) >= MAX_SHUTDOWN_ABORT_FORGIVENESS:
+                break
+            forgiven.add(key)
+        forgiven.update(
+            key for stop in stops
+            if (key := (stop.issue_id, stop.attempt, stop.agent_id, stop.claimed_at)) in claim_keys
+        )
+        active_claims = {
+            (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
+            for record in records
+            if record.generation == generation
+        }
+        return len(active_claims - forgiven)
+
+    def reap_stale_claims(
+        self,
+        records: Iterable[ClaimRecord],
+        *,
+        ttl: timedelta,
+        release_only_issue_ids: Iterable[int] = (),
+        before_rearm: Callable[[ClaimRecord, str], None] | None = None,
+    ) -> ReapResult:
+        """Release stale claims and move the issue back to ready or blocked.
+
+        ``chainlink locks steal`` is forceful in the verified Chainlink version,
+        so staleness is decided here from claim/heartbeat timestamps before the
+        steal is attempted.
+        """
+        now = self.clock()
+        release_only_ids = set(release_only_issue_ids)
+        reaped: list[ClaimRecord] = []
+        examined = 0
+        skipped: dict[str, int] = {}
+        skipped_issue_ids: dict[str, list[int]] = {}
+
+        def record_skip(reason: str, issue_id: int) -> None:
+            skipped[reason] = skipped.get(reason, 0) + 1
+            sample = skipped_issue_ids.setdefault(reason, [])
+            if len(sample) < REAPER_SKIP_SAMPLE_LIMIT:
+                sample.append(issue_id)
+
+        for record in records:
+            if not record.is_stale(now, ttl):
+                continue
+            examined += 1
+            try:
+                lock_held = self._lock_still_held_by(record)
+            except RuntimeError:
+                record_skip("lock_query_failed", record.issue_id)
+                continue
+            if not lock_held:
+                record_skip("lock_not_held", record.issue_id)
+                continue
+            current = record
+            for candidate in claim_records_from_comments(self._issue_comments(record.issue_id)):
+                if candidate.issue_id == record.issue_id and _claim_is_newer(candidate, current):
+                    current = candidate
+            if current != record:
+                record_skip("claim_changed", record.issue_id)
+                continue
+            try:
+                labels = self._issue_labels(record.issue_id, strict=True)
+            except (RuntimeError, OSError):
+                record_skip("epic_label_unavailable", record.issue_id)
+                continue
+            is_epic = WORKLINK_EPIC_LABEL in labels
+            review_only = "worklink:review" in labels and "worklink:in-progress" not in labels
+            if (is_epic or record.issue_id in release_only_ids) and not review_only:
+                record_skip("epic_not_review_only", record.issue_id)
+                continue
+            release_only = is_epic or record.issue_id in release_only_ids
+            review_evidence = (
+                None
+                if release_only
+                else self.review_ready_evidence(record.issue_id)
+            )
+            in_progress = self._issue_has_label(record.issue_id, "worklink:in-progress")
+            if not release_only and review_evidence is None and in_progress:
+                transition = (
+                    "blocked"
+                    if (record.budget_attempt or record.attempt) >= self.max_attempts
+                    else "ready"
+                )
+                if before_rearm is not None:
+                    try:
+                        before_rearm(record, transition)
+                    except Exception as exc:
+                        record_skip("incident_record_failed", record.issue_id)
+                        if self.event_logger is not None:
+                            self.event_logger(
+                                "worklink_claim_reap_incident_failed",
+                                issue_id=record.issue_id,
+                                attempt=record.attempt,
+                                error=str(exc),
+                            )
+                        continue
+            steal = self._run("locks", "steal", str(record.issue_id), check=False)
+            self._emit_claim_stolen(
+                issue_id=record.issue_id,
+                prior=record,
+                now=now,
+                guard_outcome="stale_lock_confirmed",
+                result=steal,
+            )
+            if steal.returncode != 0:
+                record_skip("lock_steal_failed", record.issue_id)
+                continue
+            # A leaf may have published before terminal label routing failed,
+            # including after in-progress was removed. Repair from publication
+            # evidence before releasing its last discoverable recovery handle.
+            if review_evidence is not None:
+                self.transition_issue(record.issue_id, status="completed", review_ready=True)
+                self._run("locks", "release", str(record.issue_id))
+                reaped.append(record)
+                continue
+            if release_only or not in_progress:
+                self._run("locks", "release", str(record.issue_id), check=False)
+                record_skip("in_progress_label_missing", record.issue_id)
+                continue
+            self._run("locks", "release", str(record.issue_id), check=False)
+            self._run("issue", "unlabel", str(record.issue_id), "worklink:in-progress", check=False)
+            self._run("issue", "label", str(record.issue_id), f"worklink:{transition}")
+            payload = {
+                "issue_id": record.issue_id,
+                "stale_agent_id": record.agent_id,
+                "attempt": record.attempt,
+                "transition": transition,
+                "last_heartbeat": (
+                    record.heartbeat_at.isoformat() if record.heartbeat_at else None
+                ),
+                "resulting_label": f"worklink:{transition}",
+                "reaped_at": now.isoformat(),
+            }
+            self._run(
+                "issue",
+                "comment",
+                str(record.issue_id),
+                REAPER_PREFIX + json.dumps(payload, sort_keys=True),
+            )
+            self._record_leaf_ending(
+                "leaf_claim_reaped", record.issue_id, record.attempt,
+                reason=(f"stale claim: agent={record.agent_id}; last heartbeat="
+                        f"{payload['last_heartbeat'] or record.claimed_at.isoformat()}; "
+                        f"reaped at={payload['reaped_at']}; resulting label={payload['resulting_label']}"),
+            )
+            if self.event_logger is not None:
+                self.event_logger(
+                    "worklink_claim_reaped",
+                    issue_id=record.issue_id,
+                    agent_id=record.agent_id,
+                    last_heartbeat=payload["last_heartbeat"],
+                    resulting_label=payload["resulting_label"],
+                )
+            reaped.append(record)
+        if self.event_logger is not None and skipped:
+            self.event_logger(
+                "worklink_claim_reap_skipped",
+                examined=examined,
+                skipped=skipped,
+                skipped_issue_ids=skipped_issue_ids,
+                sample_limit=REAPER_SKIP_SAMPLE_LIMIT,
+            )
+        return ReapResult(
+            reaped=reaped,
+            examined=examined,
+            skipped=skipped,
+            skipped_issue_ids=skipped_issue_ids,
+        )
+
+    def _issue_labels(self, issue_id: int, *, strict: bool = False) -> set[str]:
+        """Return current labels when Chainlink exposes them, otherwise empty."""
+        result = self._run("issue", "show", str(issue_id), "--json", check=False)
+        if result.returncode != 0:
+            if strict:
+                raise RuntimeError("issue labels unavailable")
+            return set()
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            if strict:
+                raise RuntimeError("issue labels unavailable")
+            return set()
+        if strict and (
+            not isinstance(data, dict) or not isinstance(data.get("labels"), (list, dict))
+        ):
+            raise RuntimeError("issue labels unavailable")
+        raw_labels = data.get("labels")
+        labels: set[str] = set()
+        if isinstance(raw_labels, list):
+            for item in raw_labels:
+                if isinstance(item, str):
+                    labels.add(item)
+                elif isinstance(item, dict):
+                    name = item.get("name") or item.get("label")
+                    if name:
+                        labels.add(str(name))
+                    elif strict:
+                        raise RuntimeError("issue labels unavailable")
+                elif strict:
+                    raise RuntimeError("issue labels unavailable")
+        elif isinstance(raw_labels, dict):
+            labels.update(str(name) for name in raw_labels)
+        return labels
+
+    def _issue_has_label(
+        self,
+        issue_id: int,
+        label: str,
+        *,
+        default_on_unavailable: bool | None = True,
+    ) -> bool | None:
+        """Best-effort current-label check for reaper race avoidance.
+
+        Reaper discovery is necessarily two-step (list in-progress, then inspect
+        comments). A worker can transition the issue to review/blocked between
+        discovery and ``locks steal``. When ``issue show --json`` exposes labels,
+        refuse to relabel anything no longer in-progress. If the label shape is
+        unavailable, callers choose the safe result for their operation. The
+        in-progress race guards preserve prior behavior with the default ``True``;
+        the epic exclusion passes ``None`` so it can fail closed *and* record that
+        the label read was unavailable instead of silently treating every issue
+        as an epic.
+        """
+        result = self._run("issue", "show", str(issue_id), "--json", check=False)
+        if result.returncode != 0:
+            return default_on_unavailable
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return default_on_unavailable
+        raw_labels = data.get("labels")
+        if raw_labels is None:
+            return default_on_unavailable
+        labels: set[str] = set()
+        if isinstance(raw_labels, list):
+            for item in raw_labels:
+                if isinstance(item, str):
+                    labels.add(item)
+                elif isinstance(item, dict):
+                    name = item.get("name") or item.get("label")
+                    if name:
+                        labels.add(str(name))
+        elif isinstance(raw_labels, dict):
+            labels.update(str(name) for name in raw_labels)
+        return label in labels
+
+    def _lock_still_held_by(self, record: ClaimRecord) -> bool:
+        """Return whether the issue still consumes a Chainlink lock.
+
+        If the original worker already released the lock during its normal
+        transition, do not steal/relabel the issue back to ready. The lock's
+        ``agent_id`` is the Chainlink tracker identity, while ``record.agent_id``
+        is the Worklink process identity; comparing them made every normally
+        shaped live lock invisible to the reaper. Claim ownership and freshness
+        therefore come from the latest structured claim comment, while this
+        guard checks only that the concurrency-slot lock still exists.
+        """
+        result = self._run("locks", "list", "--json", check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                (result.stderr or result.stdout).strip()
+                or f"chainlink locks list failed (rc={result.returncode})"
+            )
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("chainlink locks list returned invalid JSON") from exc
+        locks = data.get("locks", data if isinstance(data, list) else {})
+        lock: Any | None = None
+        if isinstance(locks, dict):
+            lock = locks.get(str(record.issue_id))
+            if lock is None:
+                for value in locks.values():
+                    if isinstance(value, dict) and _lock_issue_id(value) == record.issue_id:
+                        lock = value
+                        break
+        elif isinstance(locks, list):
+            for value in locks:
+                if isinstance(value, dict) and _lock_issue_id(value) == record.issue_id:
+                    lock = value
+                    break
+        if lock is None:
+            return False
+        return True
+
+    # ---- Discovery / concurrency (slice-3 autonomy) ------------------
+
+    def _list_issue_ids(self, label: str | None, *, status: str = "open") -> list[int]:
+        """Query issue ids, optionally carrying ``label``; raise on failure.
+
+        The strict path behind the safety cap: it must distinguish "no active
+        claims" from "couldn't read active claims" so the cap can fail closed.
+        """
+        args = ["issue", "list"]
+        if label is not None:
+            args.extend(["--label", label])
+        args.extend(["--status", status, "--json"])
+        result = self._run(*args, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                (result.stderr or result.stdout).strip()
+                or f"chainlink issue list failed (rc={result.returncode})"
+            )
+        try:
+            data = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "chainlink issue list returned invalid JSON"
+            ) from exc
+        issues = data if isinstance(data, list) else data.get("issues", [])
+        ids: list[int] = []
+        for item in issues:
+            if not isinstance(item, dict):
+                continue
+            raw = item.get("id")
+            if raw is None:
+                raw = item.get("number")
+            try:
+                ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        return ids
+
+    def issue_ids_with_label(self, label: str, *, status: str = "open") -> list[int]:
+        """Best-effort id list for ``label`` ([] on any query failure).
+
+        Use for *discovery* (ready-queue scan, reaper sweep) where a missing
+        list just means "do less this cycle". The concurrency CAP must NOT use
+        this — see :meth:`active_worklink_lock_count`, which fails closed instead.
+        """
+        try:
+            return self._list_issue_ids(label, status=status)
+        except RuntimeError:
+            return []
+
+    def issue_ids(self, *, status: str = "open") -> list[int]:
+        """Best-effort issue id list without a label filter."""
+        try:
+            return self._list_issue_ids(None, status=status)
+        except RuntimeError:
+            return []
+
+    def active_claim_count(self) -> int:
+        """Number of ``worklink:in-progress`` issues.
+
+        Kept for discovery/telemetry compatibility. The autonomous concurrency
+        cap uses :meth:`active_worklink_lock_count` instead: labels are applied
+        after process start, while locks are the atomic reservation surface.
+        """
+        return len(self._list_issue_ids("worklink:in-progress"))
+
+    def active_worklink_lock_count(
+        self,
+        *,
+        label: str | None = None,
+        exclude_label: str | None = None,
+    ) -> int:
+        """Number of active Chainlink locks — the autonomous hard-cap surface.
+
+        RAISES if the lock table can't be read or parsed, so the cap fails
+        closed. Chainlink locks are the atomic reservation mechanism; counting
+        them avoids the label-based check-then-act window where a worker has
+        been admitted but has not yet applied ``worklink:in-progress``.
+        """
+        return len(
+            self._active_worklink_lock_ids_for_scope(
+                label=label,
+                exclude_label=exclude_label,
+            )
+        )
+
+    def _active_worklink_lock_ids_for_scope(
+        self,
+        *,
+        label: str | None = None,
+        exclude_label: str | None = None,
+    ) -> set[int]:
+        if label is not None and exclude_label is not None:
+            raise ValueError("active lock scope accepts label or exclude_label, not both")
+        active_ids = self._active_worklink_lock_ids(
+            require_identity=label is not None or exclude_label is not None
+        )
+        label_ids = self._list_issue_ids(label) if label is not None else None
+        exclude_ids = self._list_issue_ids(exclude_label) if exclude_label is not None else None
+        return scope_active_worklink_lock_ids(
+            active_ids,
+            label_ids=label_ids,
+            exclude_ids=exclude_ids,
+        )
+
+    def _active_worklink_lock_ids(self, *, require_identity: bool) -> set[int]:
+        result = self._run("locks", "list", "--json", check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                (result.stderr or result.stdout).strip()
+                or f"chainlink locks list --json failed (rc={result.returncode})"
+            )
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("chainlink locks list --json returned invalid JSON") from exc
+        locks = data.get("locks", data if isinstance(data, list) else {})
+        ids: set[int] = set()
+        if isinstance(locks, dict):
+            iterable = locks.items()
+        elif isinstance(locks, list):
+            iterable = enumerate(locks)
+        else:
+            raise RuntimeError("chainlink locks list --json returned unexpected shape")
+        for index, (key, value) in enumerate(iterable):
+            raw = _lock_issue_id(value) if isinstance(value, dict) else None
+            if raw is None:
+                try:
+                    raw = int(key)
+                except (TypeError, ValueError):
+                    if require_identity:
+                        raise RuntimeError("chainlink locks list --json omitted issue identity")
+                    raw = -(index + 1)
+            ids.add(raw)
+        return ids
+
+    def _issue_comments(self, issue_id: int, *, strict: bool = False) -> list[str]:
+        result = self._run("issue", "show", str(issue_id), "--json", check=False)
+        if result.returncode != 0:
+            if strict:
+                raise RuntimeError("chainlink issue show failed while reading comments")
+            return []
+        try:
+            payload = json.loads(result.stdout if strict else result.stdout or "{}")
+        except json.JSONDecodeError:
+            if strict:
+                raise
+            return []
+        if strict and (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("comments"), list)
+            or any(not isinstance(item, (str, dict)) for item in payload["comments"])
+        ):
+            raise RuntimeError("chainlink issue show returned unexpected comments shape")
+        out: list[str] = []
+        for item in payload.get("comments") or ():
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, dict):
+                text = item.get("content") or item.get("text") or item.get("body") or ""
+                if text:
+                    out.append(str(text))
+        return out
+
+    def reap_home(
+        self,
+        *,
+        ttl: timedelta,
+        before_rearm: Callable[[ClaimRecord, str], None] | None = None,
+    ) -> ReapResult:
+        """Discover ``worklink:in-progress`` issues, gather the latest claim
+        record per issue from their comments, and reap any stale ones.
+
+        This is the entry point the scheduler's TTL-reaper callable uses:
+        it owns the discovery so :meth:`reap_stale_claims` stays a pure,
+        records-in transform that's trivial to unit-test.
+        """
+        latest: dict[int, ClaimRecord] = {}
+        release_only_ids: set[int] = set()
+        discovery_skipped: dict[str, int] = {}
+        try:
+            issue_ids = set(self._list_issue_ids("worklink:in-progress"))
+        except RuntimeError as exc:
+            log.warning("Worklink reaper issue discovery failed: %s", exc)
+            issue_ids = set()
+            discovery_skipped["issue_discovery_failed"] = 1
+        try:
+            # Locks are the authoritative reservation surface. Including them
+            # recovers terminal-phase leaks after transition removed in-progress;
+            # freshness and holder checks below still prevent stealing live runs.
+            issue_ids.update(self._active_worklink_lock_ids(require_identity=True))
+        except RuntimeError as exc:
+            log.warning("Worklink reaper lock discovery failed: %s", exc)
+            discovery_skipped["lock_discovery_failed"] = 1
+        for issue_id in sorted(issue_ids):
+            # Factory claims have a longer runtime than leaves. If labels cannot
+            # be read, fail closed and skip the issue rather than applying the
+            # leaf TTL to a factory lock whose epic marker could not be observed.
+            try:
+                labels = self._issue_labels(issue_id, strict=True)
+            except (RuntimeError, OSError):
+                discovery_skipped["epic_label_unavailable"] = (
+                    discovery_skipped.get("epic_label_unavailable", 0) + 1
+                )
+                continue
+            if WORKLINK_EPIC_LABEL in labels:
+                if "worklink:review" not in labels or "worklink:in-progress" in labels:
+                    continue
+                # Pin cleanup to release-only even if labels change after stealing.
+                release_only_ids.add(issue_id)
+            for record in claim_records_from_comments(self._issue_comments(issue_id)):
+                current = latest.get(record.issue_id)
+                if current is None or _claim_is_newer(record, current):
+                    latest[record.issue_id] = record
+        result = self.reap_stale_claims(
+            latest.values(),
+            ttl=ttl,
+            release_only_issue_ids=release_only_ids,
+            before_rearm=before_rearm,
+        )
+        if not discovery_skipped:
+            return result
+        return ReapResult(
+            reaped=result.reaped,
+            examined=result.examined,
+            skipped={**discovery_skipped, **result.skipped},
+            skipped_issue_ids=result.skipped_issue_ids,
+        )
+
+    def _attempts_exhausted(
+        self, issue_id: int, attempts: int, *, issue_title: str = "", home: Path | None = None,
+        generation: int = 0,
+    ) -> None:
+        self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
+        self._run("issue", "unlabel", str(issue_id), "worklink:in-progress", check=False)
+        self._run("issue", "label", str(issue_id), "worklink:blocked")
+        self._run(
+            "issue",
+            "comment",
+            str(issue_id),
+            REAPER_PREFIX
+            + json.dumps(
+                {
+                    "issue_id": issue_id,
+                    "attempts": attempts,
+                    "transition": "blocked",
+                    "reason": "attempts_exhausted",
+                },
+                sort_keys=True,
+            ),
+        )
+        self._record_leaf_ending(
+            "leaf_attempts_exhausted", issue_id, attempts,
+            reason=f"attempts exhausted: {attempts} of {self.max_attempts} allowed attempts used",
+            issue_title=issue_title, home=home,
+            occurrence_id=f"claim-reset-generation:{generation}",
+        )
+
+    def _record_leaf_ending(
+        self, kind: str, issue_id: int, attempt: int, *, reason: str,
+        issue_title: str = "", home: Path | None = None, occurrence_id: str = "",
+    ) -> None:
+        home = home or self.home_path
+        if home is None:
+            return
+        # Fetch only optional descriptive fields after all authoritative mutations.
+        evidence_path = None
+        evidence: dict[str, Any] = {}
+        try:
+            if not issue_title:
+                shown = self._run("issue", "show", str(issue_id), "--json", check=False)
+                if shown.returncode == 0:
+                    title = json.loads(shown.stdout or "{}").get("title", "")
+                    issue_title = title if isinstance(title, str) else ""
+        except Exception:
+            pass
+        try:
+            found = _find_latest_evidence_file_for_issue(home, issue_id)
+            evidence_path, evidence = found if found else (None, {})
+            if found and kind == "leaf_claim_reaped" and evidence.get("attempt") != attempt:
+                evidence_path, evidence = None, {}
+        except Exception:
+            pass
+        record_leaf_transition_best_effort(
+            home, kind=kind, issue_id=issue_id, issue_title=issue_title,
+            attempt=attempt, reason=reason, occurrence_id=occurrence_id,
+            evidence_path=str(evidence_path) if evidence_path else None,
+            transcript_path=evidence.get("transcript"),
+            checkout=evidence.get("checkout"), branch=evidence.get("branch"),
+        )
+
+    def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        result = self._run_with_retry(*args, home_path=self.home_path)
+        if check and result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout).strip() or f"chainlink {' '.join(args)} failed")
+        return result
