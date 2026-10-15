@@ -26,3 +26,14 @@ class RepoPRAction(StrEnum):
 def register_action_protocol(registrar: PolicyRegistrar, validate_scope: Callable[..., bool]) -> None:
     """Bind the vocabulary and grant validator to this selected registrar."""
     registrar.register_scoped_action(RepoPRAction, validate_scope)
+
+
+def validate_scoped_pr_action(action: RepoPRAction, scope: object, grant: object) -> bool:
+    """Validate the selected owner's action against host-observed authority."""
+    return (
+        type(action) is RepoPRAction
+        and action.value in getattr(scope, "allowed_operations", ())
+        and getattr(grant, "scope_id", None) == getattr(scope, "scope_id", None)
+        and getattr(grant, "owner", None) == "cultivate"
+        and getattr(grant, "action", None) == action.value
+    )

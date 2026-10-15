@@ -1717,6 +1717,7 @@ class AuthContext(_AuthContextAuthoritySlot):
     repo_pr_action_scope: RepoPRActionScope | None = field(
         default=None, repr=False, compare=False,
     )
+    scoped_pr_grants: Any = field(default=None, repr=False, compare=False)
     # Exact CI selectors from the server-delivered github-ci-watch record.
     ci_run_targets: frozenset[tuple[str, int]] = frozenset()
     ci_branch_targets: frozenset[tuple[str, str, int | None]] = frozenset()

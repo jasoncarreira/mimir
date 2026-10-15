@@ -3583,6 +3583,15 @@ def _prepare_tool_call_execution(
             call, admin_denial, arguments=arguments,
             operator_shell_audit=operator_shell_audit,
         )
+    if getattr(authorization, "reason", None) == "repo_pr_grant_denied":
+        _emit_hard_boundary_denied(
+            tool=tool_name, boundary="scoped_pr_grant", reason="repo_pr_grant_denied",
+            auth_context=auth_context,
+        )
+        return _tool_call_refusal(
+            call, "scoped PR grant refused before execution", arguments=None,
+            record_outcome=True,
+        )
     if arguments is None:
         return _tool_call_refusal(
             call, _argument_validation_refusal(request), arguments=None,
@@ -4019,6 +4028,35 @@ def _finish_tool_result(
     return result
 
 
+def _scoped_pr_checkout_call(call: _PreparedToolCall) -> bool:
+    registered = _plugin_tool(call.tool_name, call.policy)
+    return (
+        registered is not None and registered.owner == "cultivate"
+        and registered.resource_scope == "repo_pr"
+        and getattr(registered.typed_action, "value", None) == "repo.checkout"
+    )
+
+
+def _consume_scoped_pr_checkout(call: _PreparedToolCall) -> object | None:
+    from ..access_control import consume_scoped_pr_checkout
+
+    scope = call.authorization.repo_pr_action_scope
+    return scope is not None and consume_scoped_pr_checkout(call.auth_context, scope)
+
+
+def _observe_scoped_pr_checkout(call: _PreparedToolCall, result: Any, token: object) -> bool:
+    if _result_is_error(call.tool_name, result, policy=call.policy):
+        return True
+    from ..access_control import observe_scoped_pr_checkout
+
+    scope = call.authorization.repo_pr_action_scope
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request")) if registry is not None else None
+    return scope is not None and state is not None and observe_scoped_pr_checkout(
+        call.auth_context, scope, state, token,
+    )
+
+
 class BudgetGateMiddleware(AgentMiddleware):
     """Intercept model and tool calls at their exact LangGraph boundaries."""
 
@@ -4059,6 +4097,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         if not isinstance(call, _PreparedToolCall):
             return call
         capture = _ToolExecutionCapture()
+        checkout_token = None
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
@@ -4075,7 +4114,13 @@ class BudgetGateMiddleware(AgentMiddleware):
             if result is None:
                 result = _soft_live_execution_refusal(call)
             if result is None:
+                if _scoped_pr_checkout_call(call):
+                    checkout_token = _consume_scoped_pr_checkout(call)
+                    if checkout_token is None:
+                        return _tool_call_refusal(call, "scoped PR checkout grant already used", arguments=None)
                 result = handler(call.execution_request)
+                if checkout_token is not None and not _observe_scoped_pr_checkout(call, result, checkout_token):
+                    return _tool_call_refusal(call, "scoped PR checkout lease was not observed", arguments=None)
         except ToolException as exc:
             refusal = _finish_tool_exception(call, capture, exc)
             if refusal is None:
@@ -4159,6 +4204,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             if privacy_refusal is not None:
                 return _tool_call_refusal(call, privacy_refusal, arguments=None)
         capture = _ToolExecutionCapture()
+        checkout_token = None
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
@@ -4177,7 +4223,13 @@ class BudgetGateMiddleware(AgentMiddleware):
             if result is None:
                 result = _soft_live_execution_refusal(call)
             if result is None:
+                if _scoped_pr_checkout_call(call):
+                    checkout_token = _consume_scoped_pr_checkout(call)
+                    if checkout_token is None:
+                        return _tool_call_refusal(call, "scoped PR checkout grant already used", arguments=None)
                 result = await handler(call.execution_request)
+                if checkout_token is not None and not _observe_scoped_pr_checkout(call, result, checkout_token):
+                    return _tool_call_refusal(call, "scoped PR checkout lease was not observed", arguments=None)
         except ToolException as exc:
             refusal = _finish_tool_exception(call, capture, exc)
             if refusal is None:

@@ -13,7 +13,13 @@ import pytest
 
 from mimir.access_control import (
     CapabilityTier,
+    ScopedPRGrants,
+    ToolFlowDirection,
     ToolRegistry,
+    _valid_scoped_pr_grant,
+    authorize_repo_pr_tool,
+    consume_scoped_pr_checkout,
+    observe_scoped_pr_checkout,
     build_trigger_service_principal,
 )
 from mimir.models import (
@@ -120,6 +126,73 @@ def test_pr_checkout_lease_checks_out_exact_authorized_head_and_recovers(tmp_pat
     assert cleanup_pr_checkout_lease(recovered, review_state=state) is True
     assert cleanup_pr_checkout_lease(recovered, review_state=state) is False
     assert state.checkout_lease is None
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_scoped_pr_checkout_requires_one_shot_grant_and_live_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforce: bool,
+) -> None:
+    from mimir.plugins.registry import PolicyRegistry
+    from mimir_cultivate.policy import RepoPRAction as OwnerAction, validate_scoped_pr_action
+
+    _repo, scope = _repo_and_scope(tmp_path)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    policy = PolicyRegistry()
+    policy.registrar("cultivate").register_scoped_action(OwnerAction, validate_scoped_pr_action)
+    protocol = policy.freeze().scoped_actions["cultivate"]
+    from mimir.access_control import _SCOPED_PR_ISSUER
+
+    with pytest.raises(ValueError, match="trusted ingress"):
+        ScopedPRGrants("poller:github", (scope,), _issuer=object())
+    grants = ScopedPRGrants("poller:github", (scope,), _issuer=_SCOPED_PR_ISSUER)
+    auth = AuthContext(
+        principal="poller:github", canonical_principal="poller:github", roles=(),
+        event_ingress=None, trigger="poller", channel_id="poller:github",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        enforcement_enabled=enforce, scoped_pr_grants=grants,
+    )
+    state = RepoReviewState(scope)
+
+    def valid(action: OwnerAction, selected_scope=scope, selected_state=state) -> bool:
+        return _valid_scoped_pr_grant(
+            auth, "cultivate", action, protocol, selected_scope, selected_state,
+        )
+
+    def decision(action: OwnerAction):
+        return authorize_repo_pr_tool(
+            action.value, scope, service_principal=None, enforce=enforce,
+            flow_direction=ToolFlowDirection.SOURCE,
+            required_actions=(action.value,), registered_plugin=True,
+            auth_context=auth, owner="cultivate", action=action,
+            protocol=protocol, review_state=state,
+        )
+
+    assert valid(OwnerAction.CHECKOUT)
+    assert decision(OwnerAction.CHECKOUT).would_block is False
+    assert not valid(OwnerAction.COMMIT)
+    assert decision(OwnerAction.COMMIT).reason == "repo_pr_grant_denied"
+    token = consume_scoped_pr_checkout(auth, scope)
+    assert token is not None
+    assert consume_scoped_pr_checkout(auth, scope) is None
+    assert not valid(OwnerAction.CHECKOUT)
+    assert not observe_scoped_pr_checkout(auth, scope, state, token)
+    lease = create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=root, review_state=state,
+    )
+    assert not observe_scoped_pr_checkout(auth, scope, state, object())
+    assert not observe_scoped_pr_checkout(auth, scope, state, None)
+    assert observe_scoped_pr_checkout(auth, scope, state, token)
+    assert not observe_scoped_pr_checkout(auth, scope, state, token)
+    assert valid(OwnerAction.COMMIT)
+    assert decision(OwnerAction.COMMIT).would_block is False
+    assert not valid(OwnerAction.CHECKOUT)
+    assert not valid(OwnerAction.COMMIT, replace(scope, observed_head_sha="a" * 40))
+    assert not _valid_scoped_pr_grant(auth, "foreign", OwnerAction.COMMIT, protocol, scope, state)
+    lease.revoke()
+    assert not valid(OwnerAction.COMMIT)
+    assert decision(OwnerAction.COMMIT).reason == "repo_pr_grant_denied"
 
 
 @pytest.mark.parametrize("reuse", ["acquire", "recover"])
