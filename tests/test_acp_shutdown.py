@@ -126,13 +126,21 @@ def _handle_signal(self, signum, frame):
     record(b'signal-enter:' + str(signum).encode())
     return _journal_signal(self, signum, frame)
 proxy._ShutdownHooks._handle_signal = _handle_signal
+def _stop_stack_dumps():
+    # faulthandler's periodic dump walks every thread's frames from its own
+    # watchdog thread. Racing it against the watchdog's exit path crashed the
+    # child (SIGSEGV mid-dump under load), so the journal stops observation
+    # before exiting. cancel_dump_traceback_later waits for a dump in progress.
+    faulthandler.cancel_dump_traceback_later()
 _journal_force_exit = proxy._ShutdownHooks._force_exit
 def _force_exit(self):
+    _stop_stack_dumps()
     record(b'force-exit-enter')
     return _journal_force_exit(self)
 proxy._ShutdownHooks._force_exit = _force_exit
 _journal_exit = os._exit
 def _exit(code):
+    _stop_stack_dumps()
     diagnose(f'exit-dispatch:{code}')
     if _controlled_exit:
         # The parent observes this actual exit call, then checks C delivery.
@@ -1775,8 +1783,11 @@ asyncio.run(run())
     try:
         async with _shutdown_ceiling(process, progress, lambda: "blocked main handshake"):
             assert await process.stdout.readline() == b"blocked\n"
-        # The real, unchanged five-second watchdog must release this child.
-        async with asyncio.timeout(6):
+        # The real, unchanged five-second watchdog must release this child: main
+        # is blocked in an untimed recv, so exit 128+signum (asserted below) can
+        # only come from the watchdog. This timeout is a hang guard, not a
+        # latency bound; a 6s ceiling failed under parallel full-suite load.
+        async with asyncio.timeout(60):
             process.stdin.write(b"x")
             await process.stdin.drain()
             if delivery != "worker":
