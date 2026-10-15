@@ -10,7 +10,7 @@ from typing import Sequence
 
 import pytest
 
-from mimir_cultivate.worklink.claims import (
+from mimir.worklink.claims import (
     MAX_SHUTDOWN_ABORT_FORGIVENESS,
     SHUTDOWN_ABORT_PREFIX,
     ChainlinkClaims,
@@ -1351,7 +1351,7 @@ def test_claim_issue_refuses_when_review_ready_evidence_exists(tmp_path: Path, c
 
     claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, home_path=tmp_path)
 
-    with caplog.at_level("INFO", logger="mimir_cultivate.worklink.claims"):
+    with caplog.at_level("INFO", logger="mimir.worklink.claims"):
         result = claims.claim_issue(200, labels=["worklink:ready"])
 
     assert result.claimed is False

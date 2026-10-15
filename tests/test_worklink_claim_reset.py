@@ -24,14 +24,14 @@ import subprocess
 from typing import Sequence
 
 from mimir.worklink.autonomy import _find_latest_evidence_file_for_issue
-from mimir_cultivate.worklink.claims import (
+from mimir.worklink.claims import (
     CLAIM_PREFIX,
     CLAIM_RESET_PREFIX,
     MAX_CLAIM_RESETS,
     ChainlinkClaims,
     claim_records_from_comments,
 )
-from mimir_cultivate.worklink.checkout import create_isolated_checkout
+from mimir.worklink.checkout import create_isolated_checkout
 
 
 def _claim(issue_id: int, attempt: int) -> str:
