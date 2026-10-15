@@ -1,1 +1,0 @@
-- CI loads the root Dockerfile's base image from the Actions cache (pulling with backoff only on a weekly miss), so the image-build test stops failing on public.ecr.aws 429 rate limits.
