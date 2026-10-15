@@ -1,0 +1,703 @@
+"""OpenCode CLI Worklink backend (chainlink #830)."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import time
+from typing import Awaitable, Callable, Mapping, Sequence
+
+from mimir._reasoning_effort import validate_effort
+from mimir.config import model_spec_at_call_time
+from mimir_cultivate.opencode import (
+    OpenCodeInvocation,
+    opencode_model_from_agent_spec,
+    opencode_worker_documents,
+    resolve_opencode_invocation,
+)
+from mimir.redaction import redact_text
+from ..compute import ComputeResult, WorkSpec
+from .base import (
+    Caps,
+    CheckoutShape,
+    RawResult,
+    WorkOrder,
+    blocked_reason_from_output,
+    last_nonempty_line,
+)
+
+
+DEFAULT_BASH_ALLOWLIST: tuple[str, ...] = ("git *", "uv *")
+DERIVABLE_TEST_RUNNERS: frozenset[str] = frozenset({
+    "bun",
+    "cargo",
+    "go",
+    "gradle",
+    "gradlew",
+    "mvn",
+    "mvnw",
+    "npm",
+    "pnpm",
+    "uv",
+    "yarn",
+})
+_INJECTED_FLAGS: tuple[str, ...] = ("-m", "--model", "--variant", "--dir", "--")
+# Five total attempts wait 0.1 + 0.2 + 0.4 + 0.8 = 1.5 seconds. That
+# comfortably spans the observed sub-second SQLite startup lock while bounding
+# a genuinely stuck session store to a short delay.
+STARTUP_CONTENTION_MAX_ATTEMPTS = 5
+STARTUP_CONTENTION_INITIAL_BACKOFF_S = 0.1
+STARTUP_CONTENTION_WINDOW_S = 5.0
+STARTUP_CONTENTION_RESOURCE = "opencode_sqlite_session_store"
+STARTUP_CONTENTION_EXHAUSTED_REASON = "opencode_startup_sqlite_contention_exhausted"
+TRANSCRIPT_STREAM_MAX_BYTES = 1024 * 1024
+TRANSCRIPT_MAX_BYTES = 16 * 1024 * 1024
+TRANSCRIPTS_PER_ISSUE = 10
+_TRANSCRIPT_COMMAND_MAX_BYTES = 256 * 1024
+_TRANSCRIPT_TRUNCATED = "[earlier output omitted by Worklink]\n"
+_SQLITE_CONTENTION_PATTERNS = (
+    re.compile(r"\bdatabase(?: table)? is locked\b", re.IGNORECASE),
+    re.compile(r"\bdatabase is busy\b", re.IGNORECASE),
+    re.compile(r"\bSQLITE_BUSY\b", re.IGNORECASE),
+)
+log = logging.getLogger(__name__)
+
+EventLogger = Callable[..., None]
+Sleeper = Callable[[float], Awaitable[None]]
+CheckoutSnapshot = Callable[[], object]
+Clock = Callable[[], float]
+
+
+@dataclass(frozen=True)
+class WorkerProjection:
+    path: str
+    document: bytes
+
+    def __post_init__(self) -> None:
+        if self.path not in {
+            ".config/opencode/opencode.json",
+            ".local/share/opencode/auth.json",
+        }:
+            raise ValueError("worker projection destination is not permitted")
+        if len(self.document) > 1024 * 1024:
+            raise ValueError("worker projection exceeds size limit")
+        if not isinstance(json.loads(self.document), dict):
+            raise ValueError("worker projection must be a JSON object")
+
+
+@dataclass(frozen=True)
+class WorklinkOpenCodeResolution:
+    invocation: OpenCodeInvocation
+    configured_model: str
+    model_diverged: bool
+    env: Mapping[str, str] = field(repr=False)
+
+
+def resolve_worklink_opencode_invocation(
+    env: Mapping[str, str],
+) -> WorklinkOpenCodeResolution:
+    """Resolve an OpenCode invocation consistently for every Worklink path."""
+    model_home = Path(env["MIMIR_HOME"]) if env.get("MIMIR_HOME") else None
+    dotenv_model_spec = model_spec_at_call_time(model_home)
+    configured_model_spec = env.get("MIMIR_MODEL_SPEC", dotenv_model_spec)
+    resolution_env = {**os.environ, **env}
+    resolution_env.setdefault("MIMIR_MODEL_SPEC", configured_model_spec)
+    invocation = resolve_opencode_invocation(env=resolution_env)
+    configured_model = opencode_model_from_agent_spec(configured_model_spec)
+    model_diverged = invocation.model != configured_model
+    if model_diverged:
+        log.warning(
+            "Worklink OpenCode model %s differs from configured agent model %s",
+            invocation.model,
+            configured_model,
+        )
+    return WorklinkOpenCodeResolution(
+        invocation=invocation,
+        configured_model=configured_model,
+        model_diverged=model_diverged,
+        env=resolution_env,
+    )
+
+
+@dataclass(frozen=True)
+class OpenCodeBackend:
+    """Adapter for ``opencode run`` Worklink jobs.
+
+    The provider-agnostic coding substrate from the #830 pivot: opencode
+    routes to whichever model provider its own config selects, so per-leaf
+    worklink no longer cares which subscription executes the build. Runs
+    non-interactively in the leaf checkout via ``opencode run --dir``.
+    """
+
+    bin: str = "opencode"
+    extra_args: Sequence[str] = field(default_factory=tuple)
+    bash_allowlist: Sequence[str] = field(default_factory=lambda: DEFAULT_BASH_ALLOWLIST)
+    test_env: Mapping[str, str] = field(default_factory=dict)
+    name: str = "opencode"
+    checkout_shape: CheckoutShape = CheckoutShape.ISOLATED_CLONE
+
+    def __post_init__(self) -> None:
+        validate_extra_args(self.extra_args)
+        validate_test_env(self.test_env)
+
+    def capabilities(self) -> Caps:
+        return Caps(
+            tool_category="coding-cli",
+            persistent_sessions=False,
+            json_output=False,
+            native_pr_creation=False,
+            quota_pool="opencode",
+        )
+
+    def work_spec(
+        self,
+        order: WorkOrder,
+        *,
+        attempt: int,
+        repo_url: str,
+        base_ref: str,
+        branch: str,
+        test_command: str,
+    ) -> WorkSpec:
+        prompt = _prompt_for_order(order)
+        args = list(self.extra_args)
+        env = dict(order.env)
+        resolution = resolve_worklink_opencode_invocation(env)
+        invocation = resolution.invocation
+        resolution_env = resolution.env
+        args.extend(("-m", invocation.model))
+        override = resolution_env.get("MIMIR_WORKLINK_REASONING_EFFORT", "")
+        agent_effort = resolution_env.get("MIMIR_MODEL_REASONING_EFFORT", "")
+        effort_name = "MIMIR_WORKLINK_REASONING_EFFORT" if override else "MIMIR_MODEL_REASONING_EFFORT"
+        raw_effort = override or agent_effort
+        try:
+            effort = (
+                validate_effort("codex-plus", raw_effort)
+                if invocation.provider == "openai" else raw_effort
+            )
+        except ValueError as exc:
+            raise ValueError(f"{effort_name}: {exc}") from exc
+        variant = effort if effort and effort != "none" else None
+        variant_source = (
+            "worklink_override" if override else "agent"
+        ) if variant else "none"
+        if variant:
+            args.extend(("--variant", variant))
+        if invocation.config_path.exists() or "OPENCODE_CONFIG" in env:
+            env["OPENCODE_CONFIG"] = str(invocation.config_path)
+        for key in invocation.pass_env:
+            if key in os.environ:
+                env[key] = os.environ[key]
+        for key in invocation.remove_env:
+            # WorkSpec overrides an allowlisted parent environment; an empty
+            # value is required here because omission would inherit it again.
+            env[key] = ""
+        # Model selection is consumed above by the backend. Do not expose it to
+        # the executor or repository-controlled test processes it launches.
+            from mimir.tools._shell_env import scrub_model_selection_env
+
+        env["OPENCODE_PERMISSION"] = _permission_override(self.bash_allowlist)
+        backend_config: dict[str, object] = {
+            "bin": self.bin,
+            "args": args,
+            "bash_allowlist": list(self.bash_allowlist),
+            "model": invocation.model,
+            "configured_model": resolution.configured_model,
+            "model_diverged": resolution.model_diverged,
+            "model_source": invocation.model_source,
+            "variant": variant,
+            "variant_source": variant_source,
+            "test_env": dict(self.test_env),
+        }
+        enabled = _coding_enabled()
+        if enabled:
+            documents = opencode_worker_documents(invocation, resolution_env)
+            projections = [
+                WorkerProjection(
+                    ".config/opencode/opencode.json", documents.config_document
+                )
+            ]
+            if documents.auth_document is not None:
+                projections.append(
+                    WorkerProjection(
+                        ".local/share/opencode/auth.json", documents.auth_document
+                    )
+                )
+            env = {
+                "OPENCODE_PERMISSION": _permission_override(self.bash_allowlist),
+            }
+            backend_config["worker_projections"] = projections
+            backend_config["pass_env"] = tuple(self.test_env)
+        env.update(self.test_env)
+        scrub_model_selection_env(env)
+        return WorkSpec(
+            issue_id=order.issue_id,
+            attempt=attempt,
+            repo_url=repo_url,
+            base_ref=base_ref,
+            branch=branch,
+            prompt=order.prompt,
+            rules=order.rules,
+            test_command=test_command,
+            backend=self.name,
+            timeout_s=order.timeout_s,
+            env=env,
+            backend_config=backend_config,
+            local_checkout=order.checkout,
+            local_argv=_local_argv(
+                self.bin, args, order.checkout, prompt, fd_anchored=enabled
+            ),
+            output_root=order.transcript_root,
+        )
+
+    async def invoke_with_startup_retry(
+        self,
+        invoke: Callable[[], Awaitable[ComputeResult]],
+        *,
+        issue_id: int,
+        checkout_snapshot: CheckoutSnapshot,
+        event_logger: EventLogger | None = None,
+        max_attempts: int = STARTUP_CONTENTION_MAX_ATTEMPTS,
+        initial_backoff_s: float = STARTUP_CONTENTION_INITIAL_BACKOFF_S,
+        startup_window_s: float = STARTUP_CONTENTION_WINDOW_S,
+        sleeper: Sleeper = asyncio.sleep,
+        clock: Clock = time.monotonic,
+    ) -> ComputeResult:
+        """Retry transient SQLite contention only before the run can mutate work."""
+        max_attempts = max(1, max_attempts)
+        initial_backoff_s = max(0.0, initial_backoff_s)
+        startup_window_s = max(0.0, startup_window_s)
+        initial_checkout = checkout_snapshot()
+        result: ComputeResult | None = None
+        for attempt in range(1, max_attempts + 1):
+            invoked_at = clock()
+            result = await invoke()
+            elapsed_s = max(0.0, clock() - invoked_at)
+            retryable = (
+                _is_sqlite_contention(result)
+                and elapsed_s <= startup_window_s
+                and checkout_snapshot() == initial_checkout
+            )
+            if not retryable:
+                if attempt > 1 and result.exit_code == 0:
+                    _emit_startup_contention(
+                        event_logger, issue_id, attempt, max_attempts, "succeeded"
+                    )
+                return result
+
+            if attempt < max_attempts:
+                _emit_startup_contention(
+                    event_logger, issue_id, attempt, max_attempts, "retrying"
+                )
+                await sleeper(initial_backoff_s * (2 ** (attempt - 1)))
+
+        assert result is not None
+        _emit_startup_contention(
+            event_logger, issue_id, max_attempts, max_attempts, "exhausted"
+        )
+        detail = result.stderr.rstrip()
+        stderr = f"{detail}\n{STARTUP_CONTENTION_EXHAUSTED_REASON}" if detail else (
+            STARTUP_CONTENTION_EXHAUSTED_REASON
+        )
+        return replace(result, stderr=stderr)
+
+    async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+        if not isinstance(result, ComputeResult):
+            raise TypeError("OpenCodeBackend.interpret expects ComputeResult")
+        transcript_file = transcript_path(order.transcript_root, order.issue_id)
+        if result.launch_error:
+            write_transcript(
+                transcript_file,
+                command=list(result.command),
+                exit_code=None,
+                status="backend_error",
+                stdout=result.stdout,
+                stderr=result.stderr,
+                timed_out=False,
+                output_overflow=False,
+                stdout_path=result.stdout_path,
+                stderr_path=result.stderr_path,
+            )
+            return RawResult(-1, transcript_file, "backend_error", result.launch_error)
+
+        blocked_reason = blocked_reason_from_output(result.stdout, result.stderr)
+        permission_refusal = _permission_refusal_reason(
+            result.stdout, result.stderr, self.bash_allowlist, result.exit_code
+        )
+        status = "output_overflow" if result.output_overflow else (
+            "blocked" if blocked_reason else (
+                "failed" if permission_refusal else (
+                    "timeout" if result.timed_out else _status_from_output(
+                        result.exit_code, result.stdout, result.stderr
+                    )
+                )
+            )
+        )
+        error = (
+            "backend output exceeded configured Worklink limit"
+            if result.output_overflow
+            else blocked_reason or permission_refusal or _error_from_status(
+                status, result.stdout, result.stderr, result.command
+            )
+        )
+        write_transcript(
+            transcript_file,
+            command=list(result.command),
+            exit_code=result.exit_code,
+            status=status,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            timed_out=result.timed_out,
+            output_overflow=result.output_overflow,
+            stdout_path=result.stdout_path,
+            stderr_path=result.stderr_path,
+        )
+        return RawResult(
+            result.exit_code,
+            transcript_file,
+            status,
+            error,
+            blocked_reason,
+            output_overflow=result.output_overflow,
+        )
+
+
+def _coding_enabled() -> bool:
+    from .. import checkout
+
+    return checkout.coding_enabled()
+
+
+def _is_sqlite_contention(result: ComputeResult) -> bool:
+    if result.exit_code == 0:
+        return False
+    return any(pattern.search(result.stderr) for pattern in _SQLITE_CONTENTION_PATTERNS)
+
+
+def _emit_startup_contention(
+    event_logger: EventLogger | None,
+    issue_id: int,
+    attempt: int,
+    max_attempts: int,
+    outcome: str,
+) -> None:
+    if event_logger is None:
+        return
+    event_logger(
+        "worklink_backend_startup_contention",
+        issue_id=issue_id,
+        backend="opencode",
+        resource=STARTUP_CONTENTION_RESOURCE,
+        retry_attempt=attempt,
+        max_attempts=max_attempts,
+        outcome=outcome,
+    )
+
+
+def validate_test_env(value: object) -> None:
+    label = "worklink backends.opencode.test_env"
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a mapping")
+    for key, text in value.items():
+        if key not in {"PYTEST_ADDOPTS"}:
+            raise ValueError(f"{label} key {key!r} is not allowed")
+        if not isinstance(text, str) or any(not char.isprintable() for char in text):
+            raise ValueError(f"{label}.{key} must be plain text without newlines or control characters")
+
+
+def validate_extra_args(args: Sequence[str]) -> None:
+    for arg in args:
+        flag = arg.split("=", 1)[0]
+        if flag in _INJECTED_FLAGS or (
+            flag == arg and arg.startswith("-m") and not arg.startswith("--") and arg != "-m"
+        ):
+            raise ValueError(
+                f"worklink opencode args cannot contain {arg!r}: the backend injects "
+                f"{flag!r} itself; remove it from backends.opencode.args"
+            )
+
+
+def _prompt_for_order(order: WorkOrder) -> str:
+    return order.prompt if order.rules is None else f"{order.rules.rstrip()}\n\n{order.prompt}"
+
+
+def _local_argv(
+    bin_name: str,
+    args: Sequence[str],
+    checkout: Path,
+    prompt: str,
+    *,
+    fd_anchored: bool = False,
+) -> tuple[str, ...]:
+    # ``--`` so a prompt that begins with ``-`` is never parsed as a flag.
+    directory = "." if fd_anchored else str(checkout)
+    return (bin_name, "run", "--dir", directory, *args, "--", prompt)
+
+
+def _permission_override(bash_allowlist: Sequence[str]) -> str:
+    # OpenCode evaluates the last matching rule. Keep the deny first and append
+    # only explicit operator grants so unmatched commands cannot prompt or run.
+    bash = {"*": "deny"}
+    bash.update((pattern, "allow") for pattern in bash_allowlist)
+    return json.dumps({
+        "external_directory": {"/**": "deny"},
+        "bash": bash,
+    }, separators=(",", ":"))
+
+
+def _permission_refusal_reason(
+    stdout: str, stderr: str, bash_allowlist: Sequence[str], exit_code: int
+) -> str | None:
+    """Report an executor permission refusal, distinguished by position or exit.
+
+    The refusal text is free-form OpenCode output, so presence alone cannot
+    distinguish "the executor was refused a command" from "the executor wrote the
+    words permission denied" — a build editing authorization code necessarily
+    writes them into source, tests and docs. Chainlink #1152: nine of the ten
+    retained transcripts (#1123, #1149 and #1152's own attempts) matched this way
+    while exiting 0 with their work committed and their gate green, because the
+    phrase appeared in a Python literal they were editing.
+
+    A refusal counts when it is *positioned as a signal* — the final non-empty
+    line of a stream — or when the executor also exited nonzero. This is the same
+    discipline ``blocked_reason_from_output`` already applies to its own marker,
+    and for the same stated reason: a backend that echoes the phrase mid-stream
+    and then completes normally must not be mislabeled.
+
+    Both fail-closed shapes are retained. A refusal that halted the executor
+    surfaces via the nonzero exit wherever it appears; a refusal the executor
+    reported last surfaces via position even at exit 0. Measured against the
+    discarded builds, the nearest false positive sat four non-empty lines from
+    the end of its stream, so neither rule admits them.
+    """
+    permission_pattern = re.compile(
+        r"(?:permission.{0,40}(?:denied|reject)|(?:denied|reject).{0,40}permission)",
+        re.IGNORECASE,
+    )
+    shell_pattern = re.compile(r"\b(?:bash|shell)\b", re.IGNORECASE)
+
+    def is_refusal(value: str) -> bool:
+        permission = permission_pattern.search(value)
+        if permission is None:
+            return False
+        return any(
+            abs(permission.start() - shell.start()) <= 120
+            for shell in shell_pattern.finditer(value)
+        )
+
+    positioned = any(
+        (last := last_nonempty_line(stream)) is not None and is_refusal(last)
+        for stream in (stdout, stderr)
+    )
+    if not positioned and not (
+        exit_code != 0 and is_refusal(f"{stdout}\n{stderr}")
+    ):
+        return None
+    return (
+        "OpenCode refused an executor shell command because it is not allowed by "
+        "backends.opencode.bash_allowlist; effective patterns: "
+        f"{list(bash_allowlist)!r}"
+    )
+
+
+def transcript_path(transcript_root: Path | None, issue_id: int) -> Path:
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    directory = transcript_root or _default_transcript_root()
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"opencode-{issue_id}-{stamp}.json"
+
+
+def _default_transcript_root() -> Path:
+    import os
+
+    home = Path(os.environ.get("MIMIR_HOME", ".")).resolve()
+    return home / "state" / "worklink" / "transcripts"
+
+
+def _bounded_transcript_tail(value: str, limit: int) -> str:
+    scrubbed = redact_text(value)
+    encoded = scrubbed.encode("utf-8")
+    if len(encoded) <= limit:
+        return scrubbed
+    marker = _TRANSCRIPT_TRUNCATED.encode("utf-8")
+    if limit <= len(marker):
+        return encoded[-limit:].decode("utf-8", errors="ignore")
+    return _TRANSCRIPT_TRUNCATED + encoded[-(limit - len(marker)):].decode(
+        "utf-8", errors="ignore"
+    )
+
+
+def _bounded_transcript_command(command: Sequence[str]) -> list[str]:
+    retained: list[str] = []
+    remaining = _TRANSCRIPT_COMMAND_MAX_BYTES
+    for arg in command:
+        if remaining <= 0:
+            retained.append("[remaining command omitted by Worklink]")
+            break
+        bounded = _bounded_transcript_tail(str(arg), remaining)
+        retained.append(bounded)
+        remaining -= len(bounded.encode("utf-8"))
+    return retained
+
+
+def write_transcript(
+    path: Path,
+    *,
+    command: Sequence[str],
+    exit_code: int | None,
+    status: str,
+    stdout: str,
+    stderr: str,
+    timed_out: bool,
+    output_overflow: bool,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
+) -> None:
+    payload = {
+        "backend": "opencode",
+        "command": _bounded_transcript_command(command),
+        "exit_code": exit_code,
+        "status": status,
+        "stdout": _bounded_transcript_tail(stdout, TRANSCRIPT_STREAM_MAX_BYTES),
+        "stderr": _bounded_transcript_tail(stderr, TRANSCRIPT_STREAM_MAX_BYTES),
+        "timed_out": timed_out,
+        "output_overflow": output_overflow,
+        "stdout_path": str(stdout_path) if stdout_path is not None else None,
+        "stderr_path": str(stderr_path) if stderr_path is not None else None,
+        "recorded_at": datetime.now(UTC).isoformat(),
+    }
+    encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    if len(encoded) > TRANSCRIPT_MAX_BYTES:
+        raise ValueError("OpenCode transcript exceeds size limit")
+    path.write_bytes(encoded)
+    siblings = sorted(
+        path.parent.glob(f"opencode-{path.name.split('-', 2)[1]}-*.json"),
+        key=lambda candidate: (candidate.stat().st_mtime_ns, candidate.name),
+        reverse=True,
+    )
+    for stale in siblings[TRANSCRIPTS_PER_ISSUE:]:
+        _remove_transcript_outputs(stale)
+        stale.unlink(missing_ok=True)
+
+
+def _remove_transcript_outputs(path: Path) -> None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for field in ("stdout_path", "stderr_path"):
+        value = payload.get(field) if isinstance(payload, dict) else None
+        if not isinstance(value, str):
+            continue
+        output = Path(value)
+        if (
+            output.parent == path.parent
+            and output.name.endswith((".stdout.log", ".stderr.log"))
+        ):
+            output.unlink(missing_ok=True)
+
+
+# OpenCode styles both the error prefix and tool-output markers. Normalize
+# before classification and quoting so ANSI codes cannot hide either one.
+_ANSI_CSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_PROVIDER_AUTH_EVIDENCE = re.compile(
+    r"^(?:error[: ]+|provider(?:\s+\w+)?[: ]+|openai[: ]+|codex[: ]+)?"
+    r"(?:https?://\S*oauth/token\s+)?(?:http(?:/\d(?:\.\d)?)?\s+|status(?:\s+code)?[:= ]+)?40[13]\b"
+    r"|^(?:error[: ]+|provider(?:\s+\w+)?[: ]+|openai[: ]+|codex[: ]+)"
+    r".*(?:invalid or expired token|authentication failed|unauthorized token|"
+    r"(?:refresh|oauth/token).*?(?:refused|failed|40[13]))\b"
+    r"|^(?:(?:error|provider|openai|codex|post|request)[: ]+)?"
+    r"(?:https?://\S*)?oauth/token\b.*\b40[13]\b"
+    r"|^token refresh failed[: ]+40[13]\b",
+    re.IGNORECASE,
+)
+_HTTP_QUOTA_STATUS = (
+    r"http(?:/\d(?:\.\d)?)?\s+429\b"
+    r"|status(?:\s+code)?[:= ]+429\b|429\s+Too Many Requests\b"
+)
+# OpenCode v1.18.21 cli/ui.ts emits exactly "Error: " before the message.
+# cli/cmd/run.ts prints session.error.data.message, not the structured statusCode;
+# provider/error.ts preserves the API message (or falls back to STATUS_CODES).
+# Match the beginning of that message, never a status mentioned in tool output.
+# "Too Many Requests" is the status-text fallback for an HTTP 429 API error.
+_PROVIDER_QUOTA_EVIDENCE = re.compile(
+    r"^(?:the usage limit has been reached\b|rate limit (?:exceeded|reached)\b|"
+    r"Too Many Requests\b|" + _HTTP_QUOTA_STATUS + r")",
+    re.IGNORECASE,
+)
+_ERROR_RECORD = re.compile(r"^Error: ")
+
+
+def _provider_quota_line(stdout: str, stderr: str) -> str | None:
+    for stream, is_stderr in ((stderr, True), (stdout, False)):
+        for line in stream.splitlines():
+            clean = _ANSI_CSI.sub("", line).strip()
+            prefix = _ERROR_RECORD.match(clean)
+            if prefix is not None:
+                message = clean[prefix.end():]
+            elif is_stderr:
+                message = clean
+            else:
+                continue
+            if _PROVIDER_QUOTA_EVIDENCE.match(message):
+                return clean
+    return None
+
+
+def _provider_auth_line(stderr: str) -> str | None:
+    for line in stderr.splitlines():
+        stripped = _ANSI_CSI.sub("", line).strip()
+        if (
+            stripped
+            and not stripped.startswith(("→", ">", "|"))
+            and _PROVIDER_AUTH_EVIDENCE.search(stripped)
+        ):
+            return stripped
+    return None
+
+
+def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:
+    if exit_code == 0:
+        return "success"
+    if _provider_auth_line(stderr) is not None:
+        return "auth_error"
+    if _provider_quota_line(stdout, stderr) is not None:
+        return "quota_exhausted"
+    return "failed"
+
+
+def _error_from_status(
+    status: str,
+    stdout: str,
+    stderr: str,
+    command: Sequence[str] = (),
+) -> str | None:
+    if status == "success":
+        return None
+    detail = stderr.strip() or stdout.strip()
+    message = detail.splitlines()[-1] if detail else status
+    if status == "auth_error":
+        message = _provider_auth_line(stderr) or message
+    if status == "quota_exhausted":
+        message = _provider_quota_line(stdout, stderr) or message
+    if status == "timeout":
+        return f"opencode execution timed out: {message}"
+    if status == "auth_error":
+        provider = _provider_from_command(command)
+        return f"OpenCode provider {provider!r} authentication failed: {message}"
+    if re.search(r"\bEACCES\b", detail, re.IGNORECASE):
+        return detail
+    return message
+
+
+def _provider_from_command(command: Sequence[str]) -> str:
+    for index in range(len(command) - 2, -1, -1):
+        if command[index] in {"-m", "--model"}:
+            return command[index + 1].partition("/")[0] or "unknown"
+    return "unknown"

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from mimir.models import RetainedFactoryScope
-from mimir.worklink.dispatch_failures import (
+from .dispatch_failures import (
     POLLER_NAME,
     current_failure_record,
     dispatch_failure_state_dir,
@@ -22,7 +22,7 @@ from .factory_state import (
     factory_process_is_verified_dead,
     load_factory_records_for_issue,
 )
-from mimir.worklink.worker_client import factory_checkout_for_path
+from .worker_client import factory_checkout_for_path
 
 
 @dataclass(frozen=True)

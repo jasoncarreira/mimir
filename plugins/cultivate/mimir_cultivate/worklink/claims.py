@@ -21,8 +21,8 @@ import time
 from typing import Any, Callable, Iterable, Sequence
 
 from .checkout import _default_runner
-from mimir.worklink.control import operator_stop_requested
-from mimir.worklink.dispatch_failures import _find_latest_evidence_file_for_issue, record_leaf_transition_best_effort
+from .control import operator_stop_requested
+from .dispatch_failures import _find_latest_evidence_file_for_issue, record_leaf_transition_best_effort
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
 WORKLINK_EPIC_LABEL = "worklink:epic"

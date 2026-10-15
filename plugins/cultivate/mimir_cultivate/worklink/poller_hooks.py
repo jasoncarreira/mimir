@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Collection
 
 from mimir.models import AgentEvent
-from mimir.worklink.dispatch_failures import (
+from .dispatch_failures import (
     FACTORY_STOP_KINDS,
     FACTORY_TRANSITION_KINDS,
     LEAF_TRANSITION_KINDS,
