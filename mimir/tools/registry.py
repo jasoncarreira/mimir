@@ -1947,6 +1947,48 @@ def _commitment_taint_refusal(
 
 
 @tool
+async def commitment_propose_closure(
+    commitment_id: str, action: str, evidence: str,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Queue an inert closure for operator approval; never closes a commitment.
+
+    Args:
+        commitment_id: Non-terminal, non-CARE commitment to propose closing.
+        action: complete or dismiss (dismissals require individual approval).
+        evidence: Concrete evidence excerpt; redacted and bounded to 1000 characters.
+    """
+    from .. import access_control
+    from .._context import get_current_turn
+    from ..commitment_proposals import queue_closure
+    from ..commitments.store import run_store_io
+    from ..memory_proposals import ProposalRefusal
+
+    auth = runtime.context if runtime is not None else None
+    turn = get_current_turn()
+    if (not isinstance(auth, AuthContext) or turn is None
+            or turn.auth_context is not auth or not turn.turn_id
+            or not access_control.can_review_commitments(auth)):
+        raise ToolPolicyRefusal("commitment_propose_closure refused: scheduled review authority required")
+    store = _STATE["commitments_store"]
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if store is None or not home:
+        raise ToolPolicyRefusal("commitment_propose_closure refused: store unavailable")
+    records = await store.current_state_async()
+    record = records.get(commitment_id)
+    if record is None:
+        raise ToolPolicyRefusal("commitment_propose_closure refused: unknown commitment")
+    try:
+        pid = await run_store_io(
+            queue_closure, Path(home), record=record, action=action, evidence=evidence,
+            proposed_by=auth.canonical_principal, turn_id=turn.turn_id,
+        )
+    except (ProposalRefusal, OSError, ValueError) as exc:
+        raise ToolPolicyRefusal(f"commitment_propose_closure refused: {exc}") from exc
+    return f"Queued {pid}; nothing closed. Server digest will request operator approval."
+
+
+@tool
 async def commitment_complete(
     commitment_id: str,
     message_id: Optional[str] = None,
@@ -2098,8 +2140,12 @@ async def commitment_list(
         return "commitment_list failed: authorization context unavailable"
     actor_principal, actor_is_admin, actor_is_service = actor
     try:
+        # This grant is read-only and exact-job-bound, not actor_is_admin.
+        from ..access_control import can_review_commitments
+        review_read = can_review_commitments(runtime.context)
         # Filter in the store before any record text enters the tool result.
         all_items = store.list(
+            **({"auth_context": runtime.context} if review_read else {}),
             actor_principal=actor_principal,
             # Services need store policy evaluation rather than a caller-side
             # owner filter so service-visibility opt-in is checked centrally.
@@ -2150,6 +2196,9 @@ async def commitment_list(
                 "id": c.id,
                 "text": c.text,
                 "status": c.status,
+                "sensitivity": c.sensitivity,
+                "source_turn_id": c.source_turn_id,
+                "saga_session_id": c.saga_session_id,
                 "channel_id": c.channel_id,
                 "due_window_hint": c.due_window_hint,
                 "due_window_end_unix": c.due_window_end_unix,
@@ -3245,7 +3294,7 @@ def all_mimir_tools(
         set_poller_overrides, reload_pollers,
         # Commitments
         commitment_complete, commitment_snooze,
-        commitment_dismiss, commitment_list,
+        commitment_dismiss, commitment_list, commitment_propose_closure,
         # Worklink in-turn dispatch (#444). Core tool (no skill mechanism);
         # arbiter- + cap-gated autonomous dispatch to the deterministic executor.
         worklink_run, worklink_resume,

@@ -3149,6 +3149,8 @@ class Scheduler:
                     await log_event("memory_proposal_digest_channel_unset")
                 return
             await post_review_digest(home, channel, send)
+            from .commitment_proposals import post_review_digest as post_closure_digest
+            await post_closure_digest(home, channel, send)
 
         return self.register_callable(
             name="memory-proposal-digest", fn=_fire, default_cron="*/5 * * * *",

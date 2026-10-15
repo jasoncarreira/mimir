@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -47,6 +48,11 @@ from .models import (
     make_commitment_id,
     make_dedupe_key,
 )
+
+def commitment_fingerprint(record: CommitmentRecord) -> str:
+    """Bind approval to the complete observed record, including ownership/status."""
+    return hashlib.sha256(json.dumps(record.to_dict(), sort_keys=True).encode()).hexdigest()
+
 
 log = logging.getLogger(__name__)
 
@@ -232,6 +238,44 @@ class CommitmentsStore:
             f.write(json.dumps(event, ensure_ascii=True, default=str) + "\n")
             f.flush()
             os.fsync(f.fileno())
+
+    def apply_proposed_closure_sync(
+        self, id: str, *, action: str, expected_fingerprint: str,
+        expected_owner: str | None, actor_principal: str,
+        approval_message_id: str | None, proposal_id: str,
+    ) -> bool:
+        """Server-only compare-and-append under the cross-process writer lock.
+
+        The caller attests an authenticated admin reply. The snapshot comparison
+        is deliberately inside the same lock as append, not a tool-side check.
+        """
+        if action not in {"complete", "dismiss"} or not actor_principal:
+            return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._writer_lock():
+            record = self.current_state().get(id)
+            if (record is None or record.is_terminal() or record.sensitivity == "care"
+                    or record.owner_principal != expected_owner
+                    or commitment_fingerprint(record) != expected_fingerprint):
+                return False
+            target = (CommitmentStatus.COMPLETED.value if action == "complete"
+                      else CommitmentStatus.DISMISSED.value)
+            if not self._is_authorized(record, actor_principal, target_status=target,
+                                       actor_is_admin=True):
+                return False
+            event = {
+                "v": COMMITMENTS_JSONL_SCHEMA_VERSION,
+                "type": "commitment_completed" if action == "complete" else "commitment_dismissed",
+                "ts_unix": time.time(), "at_unix": time.time(), "id": id,
+                "message_id": approval_message_id,
+                "reason": f"Operator approved closure proposal {proposal_id}",
+                "approved_by": actor_principal, "proposal_id": proposal_id,
+            }
+            with self.path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(event) + "\n")
+                file.flush()
+                os.fsync(file.fileno())
+        return True
 
     async def _append(self, event: dict[str, Any]) -> None:
         # Stamp the schema version (chainlink #82 sub #86): every
@@ -875,6 +919,8 @@ class CommitmentsStore:
           actor is also authorized for their owner. It never grants cross-owner
           access. Default False.
         Sorted by created_at_unix ascending."""
+        from ..access_control import can_review_commitments
+        review_read = can_review_commitments(auth_context) if auth_context is not None else False
         if auth_context is not None:
             if not isinstance(auth_context, AuthContext):
                 raise TypeError("commitment reads require the exact AuthContext")
@@ -894,7 +940,7 @@ class CommitmentsStore:
                 continue
             if owner_principal is not None and rec.owner_principal != owner_principal:
                 continue
-            if not self._can_view(
+            if not review_read and not self._can_view(
                 rec, actor_principal, include_service,
                 actor_is_admin=actor_is_admin,
             ):

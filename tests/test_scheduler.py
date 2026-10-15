@@ -4427,7 +4427,9 @@ async def test_bundled_scheduler_template_authority_profiles(
     for name, authority in authorities.items():
         if name != "heartbeat":
             assert authority.canonical == scheduled_tick.canonical
-            assert set(authority.capabilities) == set(scheduled_tick.capabilities)
+            extras = {"commitment_list", "commitment_propose_closure"} if name == "commitments-review" else set()
+            assert set(authority.capabilities) == set(scheduled_tick.capabilities) | extras
+            assert not {"commitment_complete", "commitment_dismiss", "commitment_snooze"} & set(authority.capabilities)
 
     mutated = yaml.safe_load(template_text)
     heartbeat_entry = next(entry for entry in mutated if entry["name"] == "heartbeat")

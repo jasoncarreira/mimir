@@ -74,7 +74,13 @@ def protected_model_targets(home: Path) -> tuple[tuple[Path, bool], ...]:
     """
     store = proposal_path(home)
     outbox = home / "state/social-outbox"
-    targets = [(store, False), (store.with_suffix(".lock"), False),
+    from .commitment_proposals import proposal_path as closure_path
+    closure = closure_path(home)
+    targets = [(closure, False),
+               (closure.with_name(closure.name + "-journal"), False),
+               (closure.with_name(closure.name + "-wal"), False),
+               (closure.with_name(closure.name + "-shm"), False),
+               (store, False), (store.with_suffix(".lock"), False),
                (store.parent, False), (outbox, True)]
     if store.parent.exists():
         targets.extend((path, False) for path in store.parent.glob(".memory-proposals-*"))

@@ -51,9 +51,9 @@ async def test_scheduled_review_alert_then_fresh_operator_completes(tmp_path: Pa
     prompt = bundled_defaults()["commitments-review.md"]
     prose = " ".join(prompt.split())
     assert "commitment_list(due_within_days=0)" in prose
-    assert "operator_alert" in prose and "new user turn" in prose
-    assert "another fresh user turn" in prose
-    assert "commitment_complete(commitment_id=...)" in prompt
+    assert "operator_alert" in prose and "commitment_propose_closure" in prose
+    assert "approve cb-xxxx" in prose and "approve cp-xxxx cp-yyyy" in prose
+    assert "another fresh user turn" not in prose
 
     store = CommitmentsStore(path=tmp_path / "commitments.jsonl")
     rec = await store.add(CommitmentRecord(

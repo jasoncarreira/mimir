@@ -300,6 +300,9 @@ class _FakeCommitment:
     id: str
     text: str
     status: str
+    sensitivity: str = "routine"
+    source_turn_id: Optional[str] = None
+    saga_session_id: Optional[str] = None
     channel_id: Optional[str] = None
     due_window_hint: Optional[str] = None
     due_window_end_unix: Optional[float] = None

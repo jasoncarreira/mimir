@@ -230,6 +230,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "remove_schedule": ToolFlowDirection.SINK,
     "set_poller_overrides": ToolFlowDirection.SINK,
     "reload_pollers": ToolFlowDirection.SINK,
+    "commitment_propose_closure": ToolFlowDirection.SINK,
     "commitment_complete": ToolFlowDirection.SINK,
     "commitment_snooze": ToolFlowDirection.SINK,
     "commitment_dismiss": ToolFlowDirection.SINK,
@@ -443,6 +444,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "operator_alert": CapabilityTier.SCOPE_CONTAINED,
     "memory_store": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "memory_propose": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "commitment_propose_closure": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "open_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "submit_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "abandon_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
@@ -817,6 +819,14 @@ def build_scheduled_tick_service_principal(
     script_roots = (
         (str((home / "scripts").resolve()),) if home is not None else ()
     )
+    if job_name == "commitments-review":
+        # Server-issued, job-specific read/proposal grant; no closure authority.
+        base = replace(
+            base,
+            capabilities=tuple(dict.fromkeys((*base.capabilities, "commitment_list", "commitment_propose_closure"))),
+            readable_domains=tuple(dict.fromkeys((*base.readable_domains, "commitments"))),
+            sink_destinations=tuple(dict.fromkeys((*base.sink_destinations, "commitment_proposals"))),
+        )
     return replace(
         base,
         filesystem_read_roots=tuple(dict.fromkeys((
@@ -6142,6 +6152,16 @@ SAGA_TAINT_REFUSAL = (
 )
 
 
+def can_review_commitments(auth_context: Any) -> bool:
+    """Exact server-issued scheduled review grant, read/proposal only."""
+    service = get_trusted_service_from_auth_context(auth_context)
+    return bool(service is not None
+                and auth_context.trigger == "scheduled_tick"
+                and service.channel_memory_directory == "scheduler:commitments-review"
+                and service_can_invoke_operation(service, "commitment_propose_closure")
+                and service_can_invoke_operation(service, "commitment_list"))
+
+
 def can_propose_memory(auth_context: Any) -> bool:
     """Shared capability gate for the proposal tool and its taint-refusal hint."""
     return is_admin(auth_context) or service_can_invoke_operation(
@@ -7369,7 +7389,7 @@ class SinkGate:
                 would_block=True,
             )
 
-        if tool_name == "memory_propose":
+        if tool_name in {"memory_propose", "commitment_propose_closure"}:
             # Review queue only: no atom is written. Keep normal capability
             # checks in authorize_tool, but do not impose SAGA's trust gate.
             return ToolAuthorization(
@@ -8823,6 +8843,7 @@ class OperationCatalog:
         "task",
         "memory_store",
         "memory_propose",
+        "commitment_propose_closure",
         "saga_feedback",
         "saga_mark_contributions",
         "saga_end_session",
