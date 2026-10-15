@@ -33,6 +33,16 @@ from langchain_core.tools import ToolException
 
 from tests.lease_attestation_helper import assert_lease_attested
 
+
+@pytest.mark.parametrize("revision", ["HEAD~4..HEAD", "origin/feature/plugins...HEAD"])
+def test_repo_review_git_range_refusal_names_token(revision):
+    from mimir.access_control import _service_shell_not_admitted_reason
+
+    reason = _service_shell_not_admitted_reason(
+        ["git", "diff", "--stat", revision], "repo_review",
+    )
+    assert f"revision range {revision} is not bound to this lease; use repo_diff" in reason
+
 from mimir.contained_execution import (
     CollectedExecutionResult,
     SensitiveMaterialScrubber,

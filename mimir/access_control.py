@@ -285,6 +285,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "activity_panel_post": ToolFlowDirection.SINK,
     "activity_panel_edit": ToolFlowDirection.SINK,
     "pr_metadata": ToolFlowDirection.SOURCE,
+    "chainlink_issue_show": ToolFlowDirection.SOURCE,
     "pr_spec": ToolFlowDirection.SOURCE,
     "pr_list": ToolFlowDirection.SOURCE,
     "pr_files": ToolFlowDirection.SOURCE,
@@ -463,6 +464,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "task": CapabilityTier.SCOPE_CONTAINED,
     "list_schedules": CapabilityTier.SCOPE_CONTAINED,
     "pr_metadata": CapabilityTier.SCOPE_CONTAINED,
+    "chainlink_issue_show": CapabilityTier.SCOPE_CONTAINED,
     "pr_spec": CapabilityTier.SCOPE_CONTAINED,
     "pr_list": CapabilityTier.SCOPE_CONTAINED,
     "pr_files": CapabilityTier.SCOPE_CONTAINED,
@@ -546,6 +548,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "open_proposal", "submit_proposal", "abandon_proposal",
     }),
     "github": frozenset({
+        "chainlink_issue_show",
         "worklink_run", "worklink_resume", "write_file", "edit_file", "replace_file", "shell_exec",
         "bash_async", "bash_jobs_list", "bash_job_output", "read_file",
         "aread", "ls", "als", "glob", "aglob", "grep", "agrep",
@@ -568,6 +571,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "proposal_diff",
     },
     "heartbeat": frozenset({
+        "chainlink_issue_show",
         "write_file", "edit_file", "replace_file", "shell_exec", "bash_async",
         "bash_jobs_list", "bash_job_output", "read_file", "aread", "ls",
         "als", "glob", "aglob", "grep", "agrep", "file_search",
@@ -4622,6 +4626,15 @@ def _service_shell_not_admitted_reason(
             "do not retry through shell or HTTP commands."
         )
     if destination == "repo_review":
+        # Name a range operand precisely; keep the review allowlist unchanged.
+        if len(argv) >= 3 and Path(argv[0]).name == "git" and argv[1] == "diff":
+            revision_range = next((token for token in argv[2:]
+                                   if ".." in token and not token.startswith("-")), None)
+            if revision_range is not None:
+                return (
+                    f"revision range {revision_range[:255]} is not bound to this lease; "
+                    "use repo_diff"
+                )
         return (
             "The repo_review shell profile admits only hardened local read-only Git "
             "inspection bound to a server-owned PR state with inspect permission. "
@@ -8819,6 +8832,7 @@ class OperationCatalog:
     )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
+        "chainlink_issue_show",
         "pr_list",
         "issue_comment",
         "operator_alert",
@@ -10508,6 +10522,7 @@ class ToolRegistry:
 
 
 _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
+    "chainlink_issue_show": "chainlink",
     "fetch_channel_history": "channel_history",
     "list_channels": "channel_metadata",
     "list_schedules": "schedule_metadata",
@@ -10593,6 +10608,7 @@ _ACP_HANDS_RESULT_TOOLS = frozenset({
 # result taint. MCP reads have equivalent adapter/resource parity checks in
 # MCPResourceAdapter.authorize_call.
 _READ_BACKEND_RESULT_TOOLS = frozenset({
+    "chainlink_issue_show",
     "pr_job_log",
     "ci_run_jobs",
     "ci_run",
@@ -11634,6 +11650,27 @@ def classify_protected_result(
         return acp_error_labels
 
     args = arguments or {}
+    if tool_name == "chainlink_issue_show" and not failed:
+        issue_id = args.get("issue_id")
+        if type(issue_id) is not int or issue_id < 1:
+            return _incomplete_protected_result(
+                "chainlink", args, tool_name=tool_name, auth_context=auth_context,
+            )
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        source = SourceLabel(
+            principal=principal, domain="chainlink", resource_id=f"issue/{issue_id}",
+            bridge_instance="chainlink", sensitivity="internal",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            source_kind="protected_tool", integrity="untrusted",
+            # Match bounded Chainlink shell queries: tracker text is not trusted
+            # instruction, but a read does not taint the next Worklink action.
+            integrity_effect="informational",
+        )
+        labels = InformationFlowLabels().with_source(source)
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
     retained_scope = getattr(auth_context, "retained_factory_scope", None)
     if (
         tool_name in {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
@@ -12235,6 +12272,7 @@ _REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset({
 
 # Executable capabilities and information-flow metadata are one policy.
 _OPERATION_READABLE_DOMAIN: dict[str, str] = {
+    "chainlink_issue_show": "chainlink",
     "pr_list": "repository",
     "list_channels": "channel_metadata",
     "list_schedules": "schedule_metadata",

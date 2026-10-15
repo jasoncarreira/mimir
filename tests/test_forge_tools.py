@@ -2641,6 +2641,38 @@ def test_read_uses_only_immutable_scope_target() -> None:
     assert client.calls == [("metadata", scope)]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trusted", [True, False, None])
+async def test_pr_metadata_body_and_merge_time_keep_author_attestation(monkeypatch, trusted):
+    client = FakeForge()
+    body = "PR description from author"
+    original = client.get_pull_request
+    client.get_pull_request = lambda scope: replace(
+        original(scope), body=body, merged_at="2026-10-14T12:00:00Z",
+    )
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: trusted, raising=False)
+    set_forge_client(client)
+    scope = _scope(RepoPRAction.INSPECT)
+    runtime = _runtime(scope)
+    token = access_control.begin_protected_result_capture()
+    try:
+        result = await pr_metadata.coroutine("owner/repo", 17, runtime=runtime)
+    finally:
+        provenance = access_control.end_protected_result_capture(token)
+        set_forge_client(None)
+    assert result["body"] == body
+    assert result["merged_at"] == "2026-10-14T12:00:00Z"
+    labels = access_control.classify_protected_result(
+        "pr_metadata", {"repository": "owner/repo", "pull_request": 17}, runtime.context,
+        access_control.ToolAuthorization(tool_name="pr_metadata", decision="resource_scoped",
+                                         allowed=True, repo_pr_action_scope=scope),
+        result=result, provenance=provenance,
+    )
+    source, = labels.sources
+    assert source.integrity == ("trusted" if trusted is True else "untrusted")
+    assert source.integrity_effect == "active_ingest"
+
+
 def test_review_scope_cannot_rerequest_review() -> None:
     client = FakeForge()
     set_forge_client(client)

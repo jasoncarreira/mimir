@@ -12,6 +12,7 @@ API is the flat ``mimir.tools`` namespace.
 """
 
 from .memory import memory_get, memory_query, set_memory_client
+from .chainlink import chainlink_issue_show
 from .store import memory_store
 from .memory_propose import memory_propose
 from .operator_alert import operator_alert, set_operator_alert_dependencies
@@ -115,6 +116,7 @@ from .proposals import proposal_diff
 __all__ = [
     # Core tools (callable by the agent)
     "memory_query",
+    "chainlink_issue_show",
     "memory_get",
     "memory_store",
     "memory_propose",
