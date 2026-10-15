@@ -300,6 +300,7 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "bash": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
     "bash_async": _D(SinkCategory.SHELL_PROCESS, _command_target, "shell_process", result_origin=_N, ifc_delegation=True, sink_payload_extractor=_argument_payload("command")),
     "bash_exec": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
+    "commitment_propose_closure": _D(SinkCategory.SAGA, _fixed_target("commitment_proposals"), "commitment_proposals", result_origin=_N, sink_payload_extractor=_argument_payload("evidence")),
     "commitment_complete": _D(SinkCategory.SAGA, _commitment_target, "commitments", result_origin=_N),
     "chainlink_issue_show": _D(),
     "commitment_dismiss": _D(SinkCategory.SAGA, _commitment_target, "commitments", result_origin=_N),

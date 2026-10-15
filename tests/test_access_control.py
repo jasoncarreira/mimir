@@ -18520,6 +18520,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
         for category in expected
     }
 
+    expected[SinkCategory.SAGA].add("commitment_propose_closure")
     assert actual == expected
     categorized = {
         name for name, descriptor in access_control.TOOL_DESCRIPTORS.items()
@@ -18575,7 +18576,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
             (True, "harness_metadata_display")
             if name in display_tools
             else (True, "memory_proposal_queue")
-            if name == "memory_propose"
+            if name in {"memory_propose", "commitment_propose_closure"}
             else (False, "write_blocked_by_untrusted_ingest")
             if name in {"memory_store", "saga_record_skill_learning", "saga_feedback",
                         "saga_mark_contributions", "saga_forget", "saga_end_session",
@@ -18697,6 +18698,10 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
         for destination, names in destination_groups.items()
         for name in names
     }
+    flows[access_control.ToolFlowDirection.SINK].add("commitment_propose_closure")
+    decisions[OperationDecision.ADMIN_REQUIRED].add("commitment_propose_closure")
+    admin_catalog.add("commitment_propose_closure")
+    destinations["commitment_propose_closure"] = "commitment_proposals"
     destinations["memory_propose"] = "memory_proposals"
     destinations["replace_file"] = "filesystem"
     destinations["set_schedule_cron"] = "scheduler"

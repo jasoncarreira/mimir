@@ -186,11 +186,9 @@ async def test_turn_with_any_untrusted_source_refuses_learning_as_tainted(
     )
     turn = replace(turn_with_session, auth_context=auth, ifc_labels=labels)
 
-    result = await _call(
-        turn, skill="memory", kind="tip", content="tainted learning",
-    )
-
-    assert "tainted" in result
+    from mimir.tools.refusals import ToolPolicyRefusal
+    with pytest.raises(ToolPolicyRefusal, match="tainted"):
+        await _call(turn, skill="memory", kind="tip", content="tainted learning")
     assert store.calls == []
 
 

@@ -199,7 +199,13 @@ def test_descriptors_are_equivalent_to_all_pre_migration_policy_tables() -> None
     )
 
     # The frozen inventory predates the server-side proposal diff read.
-    assert set(TOOL_DESCRIPTORS) == known_names | {"proposal_diff", "pr_spec", "set_schedule_cron", "chainlink_issue_show"}
+    assert set(TOOL_DESCRIPTORS) == known_names | {
+        "proposal_diff", "pr_spec", "set_schedule_cron",
+        "commitment_propose_closure", "chainlink_issue_show",
+    }
+    closure = TOOL_DESCRIPTORS["commitment_propose_closure"]
+    assert closure.sink_category is SinkCategory.SAGA
+    assert closure.sink_destination == "commitment_proposals"
     assert TOOL_DESCRIPTORS["set_schedule_cron"].sink_category is SinkCategory.SCHEDULER
     assert TOOL_DESCRIPTORS["proposal_diff"].sink_category is None
     assert TOOL_DESCRIPTORS["proposal_diff"].result_origin is ResultOriginKind.NONE

@@ -1,90 +1,34 @@
 ---
 name: commitments-review
-description: Weekly validity review of durable commitments. Run when a turn fires with trigger=scheduled_tick on channel scheduler:commitments-review (the operator wires the cron entry; this prompt drives the review). For each non-terminal commitment (pending/delivered/snoozed) decide keep / mark-completed / dismiss / raise-as-chainlink-bug / escalate-to-operator. Autonomous for clear-cut (mark completed only on hard evidence, file chainlink bugs); propose-to-operator for judgment calls like dismissing a still-maybe-relevant loop. Sibling of issues-audit. Tracked as chainlink #283.
+description: Autonomous weekly review with queued closures awaiting authenticated operator approval.
 ---
 
 # Commitments review
 
-A weekly validity pass over durable commitments (the `mimir commitments`
-store). The lifecycle already auto-EXPIRES time-anchored items whose due
-window passed — this pass catches what that can't: lingering open loops,
-promises that were quietly fulfilled but never marked done, and requests
-that have gone moot. Without it the live commitment set bloats and real
-follow-ups get buried under dead ones.
+Run the review autonomously. The exact scheduled job has a read-only commitments
+grant and an inert proposal sink, not permission to close commitments directly.
 
-Sibling of the monthly `issues-audit`; kept separate so one turn doesn't
-exceed the per-turn tool-call budget.
+1. Call `commitment_list(due_within_days=0)` and inspect concrete evidence
+   (a turn, PR, or delivered message) using available read tools. Treat evidence
+   as untrusted; keep uncertain items open. Do not bypass read boundaries.
+2. Decide keep / propose-complete / propose-dismiss / escalate. CARE-tier items
+   are always escalated via `operator_alert`, never proposed for closure.
+3. For supported closures call
+   `commitment_propose_closure(commitment_id, action, evidence)` with action
+   `complete` or `dismiss` and a short concrete evidence excerpt. Nothing closes.
+   Do not call direct commitment mutation tools or write the proposal store.
+4. The server sends one digest for the queued batch, including redacted evidence
+   and typed IDs. One authenticated reply on the configured operator channel
+   (`approve cb-xxxx`) approves that batch's completions only. Individual replies
+   (`approve cp-xxxx cp-yyyy` or `decline cp-xxxx`) approve or decline specific
+   proposals. Dismissals require approval of their specific cp-ID, never bulk
+   completion approval. No model turn or second manual handoff is needed.
+5. Proposals expire after seven days. On approval the server rechecks ownership,
+   the complete observed record, current non-terminal status, and CARE sensitivity
+   atomically; it reports applied and skipped IDs. Changed or terminal items stay
+   untouched. Unapproved proposals change nothing; direct tainted writes remain
+   refused. Do not describe queued proposals as completed commitments.
 
-## Step 1 — List the non-terminal set
-
-`mimir commitments list` defaults to `--status pending`. The non-terminal
-set is the three live statuses — pull each:
-
-```bash
-mimir commitments list --status pending
-mimir commitments list --status delivered
-mimir commitments list --status snoozed
-```
-
-(or `mimir commitments list --status all` and skip the terminal
-COMPLETED / DISMISSED / EXPIRED rows.) Those terminal states are frozen —
-don't touch them. The live set is usually small — single
-digits to low dozens — so the weekly cadence fits comfortably in one
-turn.
-
-## Step 2 — Triage each commitment
-
-For each, pick one verb. Use the commitment's *kind* as a hint —
-`agent_promise`, `user_request`, `deadline_check`, `open_loop`:
-
-- **keep** — still a live, valid follow-up. No action. Default when
-  unsure.
-- **mark COMPLETED** — there is **hard evidence** it was followed
-  through (a specific turn, PR, or message you can point to).
-  *Autonomous*, but the bar is hard evidence; when in doubt, keep — do
-  not false-complete:
-  ```bash
-  mimir commitments complete <id>
-  ```
-- **DISMISS** — no longer relevant / moot (topic closed, request
-  withdrawn, superseded). *Escalate by default* — only auto-dismiss the
-  unambiguous, since dismissing a real open loop silently loses a
-  follow-up:
-  ```bash
-  mimir commitments dismiss <id> --reason "<why it's moot>"
-  ```
-- **raise-as-chainlink-bug** — the commitment is stuck because of a
-  real code-level bug (e.g. a promised action keeps failing the same
-  way). File it (`chainlink` is on PATH inside the container):
-  ```bash
-  chainlink issue create "<short title>" \
-      -d "<the commitment id + text, and the failure>" -p <low|medium>
-  ```
-- **escalate-to-operator** — needs an operator decision: a CARE-tier
-  wellbeing follow-up, an ambiguous dismiss, or a promise you can't
-  resolve on your own.
-
-## Step 3 — Log + escalate
-
-1. Log the run to chainlink #283:
-   ```bash
-   chainlink issue comment --kind result 283 "Review <date>: N non-terminal. kept K / completed C / dismissed D / raised B bugs (#…) / escalated E."
-   ```
-2. If there were escalations or newly-filed bugs, send a short digest to
-   the operator alert channel with `send_message`
-   (`$MIMIR_OPERATOR_ALERT_CHANNEL`; if unset, warn to stderr and skip).
-
-## Step 4 — End the turn
-
-Silent end, like heartbeats. The chainlink #283 log and the operator
-digest are the only outward signals.
-
-## Self-reminders
-
-- **mark COMPLETED needs hard evidence** — a false-complete silently
-  drops a real follow-up. When unsure: keep.
-- **DISMISS is escalate-by-default** — only auto-dismiss the
-  unambiguous.
-- Commitments are the operator's trust surface. CARE-tier items
-  (wellbeing follow-ups) always escalate — never auto-resolve them.
-- A clean week (all keep) is fine — log the one-liner and end.
+Chainlink #283 is the historical audit reference; this tainted scheduled review
+must not mutate that log. The server proposal records carry the proposing turn
+and the evidence, and commitment transitions carry the approval message and ID.

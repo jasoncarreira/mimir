@@ -36,6 +36,7 @@ from pydantic import BeforeValidator, Field
 from ..models import AuthContext
 from ..sagatools import _ATOM_CONTENT_CAP
 from .memory import _MEMORY_STATE
+from .refusals import ToolPolicyRefusal
 
 log = logging.getLogger(__name__)
 
@@ -137,7 +138,7 @@ async def saga_feedback(
     )
     taint_refusal = saga_mutation_taint_refusal(auth_context)
     if taint_refusal is not None:
-        return f"saga_feedback failed: {taint_refusal}"
+        raise ToolPolicyRefusal(f"saga_feedback failed: {taint_refusal}")
     if not can_write_saga(auth_context, "saga_feedback"):
         return (
             "saga_feedback failed: write access denied. "
@@ -192,7 +193,7 @@ async def saga_mark_contributions(
     )
     taint_refusal = saga_mutation_taint_refusal(auth_context)
     if taint_refusal is not None:
-        return f"saga_mark_contributions failed: {taint_refusal}"
+        raise ToolPolicyRefusal(f"saga_mark_contributions failed: {taint_refusal}")
     if not can_write_saga(auth_context, "saga_mark_contributions"):
         return (
             "saga_mark_contributions failed: write access denied. "
@@ -289,7 +290,7 @@ async def saga_end_session(
     )
     taint_refusal = saga_mutation_taint_refusal(auth_context)
     if taint_refusal is not None:
-        return f"saga_end_session failed: {taint_refusal}"
+        raise ToolPolicyRefusal(f"saga_end_session failed: {taint_refusal}")
     if not can_write_saga(auth_context, "saga_end_session"):
         return (
             "saga_end_session failed: write access denied. "
@@ -388,7 +389,7 @@ async def saga_forget(
     )
     taint_refusal = saga_mutation_taint_refusal(auth_context)
     if taint_refusal is not None:
-        return f"saga_forget failed: {taint_refusal}"
+        raise ToolPolicyRefusal(f"saga_forget failed: {taint_refusal}")
     if not can_write_saga(auth_context, "saga_forget"):
         return (
             "saga_forget failed: write access denied. "
@@ -502,7 +503,7 @@ async def saga_record_skill_learning(
     )
     taint_refusal = saga_mutation_taint_refusal(auth_context)
     if taint_refusal is not None:
-        return f"saga_record_skill_learning failed: {taint_refusal}"
+        raise ToolPolicyRefusal(f"saga_record_skill_learning failed: {taint_refusal}")
     if not can_write_saga(auth_context, "saga_record_skill_learning"):
         return (
             "saga_record_skill_learning failed: write access denied. "

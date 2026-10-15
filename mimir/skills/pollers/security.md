@@ -68,6 +68,23 @@ The pattern isn't Bluesky-specific. The relationship graph varies by platform:
 
 ## Credential Handling
 
+### Agent-facing draft destinations
+
+Poller subprocesses may persist their own cursors in `$STATE_DIR`, but turns
+triggered by their external output carry untrusted active ingest. Do not ask the
+agent to write drafts or notes to `state/pollers/<name>/` (including
+`$STATE_DIR/drafts/`), `memory/`, or any other live home path: the write veto
+refuses those writes. For ordinary pollers with file-write capability, direct
+ephemeral drafts to the **current turn's** `scratch/turns/<turn-id>/` directory
+supplied in the turn context. Research-profile pollers do not get that scratch
+grant: use an active proposal worktree via `open_proposal` / `submit_proposal`
+with the appropriate manifest capabilities, or `memory_propose` (when granted)
+for operator review; never treat scratch as trusted input on subsequent turns.
+Declare dynamic agent destinations as `agent_write_paths` in
+`pollers.json`. Discovery warns with the poller name and vetoed path, and the
+repository closure test checks shipped pollers. This does not change the write
+veto or grant agent writes to the subprocess's state directory.
+
 Poller credentials come from the agent's process environment, never hardcoded in `pollers.json`. The subprocess env is built by:
 
 1. **Deny-filtered allowlist** of the agent's process env — `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `MIMIR_*` are stripped by default (`mimir/pollers.py:_DENY_SUFFIXES` / `_DENY_PREFIXES`), so a stray secret can't leak to a poller that didn't ask for it.

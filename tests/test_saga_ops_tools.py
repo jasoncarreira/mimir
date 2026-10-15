@@ -408,10 +408,10 @@ async def test_end_session_missing_session_id_returns_error(
 async def test_end_session_without_server_runtime_fails_closed(
     store: _StubStore,
 ) -> None:
-    out = await saga_ops.saga_end_session.ainvoke(
-        {"session_id": "sess-xyz", "summary": "wrapping up"}
-    )
-    assert "tainted" in out
+    with pytest.raises(saga_ops.ToolPolicyRefusal, match="tainted"):
+        await saga_ops.saga_end_session.ainvoke(
+            {"session_id": "sess-xyz", "summary": "wrapping up"}
+        )
     assert store.end_session_calls == []
 
 
@@ -422,12 +422,12 @@ async def test_end_session_does_not_consult_active_registry(
 ) -> None:
     token = _context._current_turn.set(None)
     try:
-        out = await saga_ops.saga_end_session.ainvoke(
-            {"session_id": "sess-abc", "summary": "wrapping up"}
-        )
+        with pytest.raises(saga_ops.ToolPolicyRefusal, match="tainted"):
+            await saga_ops.saga_end_session.ainvoke(
+                {"session_id": "sess-abc", "summary": "wrapping up"}
+            )
     finally:
         _context._current_turn.reset(token)
-    assert "tainted" in out
     assert store.end_session_calls == []
 
 
@@ -567,10 +567,10 @@ async def test_saga_feedback_no_event_on_failure(
 
     monkeypatch.setattr(_ev, "log_event", _fake_log_event)
     store.raise_on = "outcome"
-    out = await saga_ops.saga_feedback.ainvoke(
-        {"atom_id": "a" * 16, "signal": "useful"}
-    )
-    assert "failed" in out
+    with pytest.raises(saga_ops.ToolPolicyRefusal, match="tainted"):
+        await saga_ops.saga_feedback.ainvoke(
+            {"atom_id": "a" * 16, "signal": "useful"}
+        )
     assert not any(e[0] == "saga_feedback_sent" for e in captured)
 
 
@@ -606,10 +606,10 @@ async def test_record_skill_learning_without_runtime_fails_closed(
     store: _StubStore,
 ) -> None:
     """Without a server-provided runtime (AuthContext), the write must be denied."""
-    out = await saga_ops.saga_record_skill_learning.ainvoke(
-        {"skill": "test-skill", "kind": "tip", "content": "Test learning"}
-    )
-    assert "tainted" in out
+    with pytest.raises(saga_ops.ToolPolicyRefusal, match="tainted"):
+        await saga_ops.saga_record_skill_learning.ainvoke(
+            {"skill": "test-skill", "kind": "tip", "content": "Test learning"}
+        )
     assert store.store_calls == []
 
 
