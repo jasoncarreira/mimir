@@ -45,6 +45,7 @@ log = logging.getLogger(__name__)
 
 from langchain_core.runnables import RunnableConfig
 from langchain.tools import ToolRuntime
+from .refusals import ToolPolicyRefusal
 
 from ..bridges._directives import (
     Directive,
@@ -1607,8 +1608,12 @@ async def add_schedule(
     channel_id: Optional[str] = None,
     priority: Optional[str] = None,
     prompt_file: Optional[str] = None,
+    replace: bool = False,
 ) -> str:
-    """Add a new scheduled tick (add-or-replace by name).
+    """Add a scheduled tick. An existing name is refused unless replace=true.
+
+    Replacing overwrites the ENTIRE job entry. For partial changes use
+    set_schedule_cron or set_schedule_priority instead.
 
     Provide exactly one of ``prompt`` or ``prompt_file``. Prefer ``prompt_file``
     for anything beyond a one-liner — it's the canonical shape used by the
@@ -1630,6 +1635,7 @@ async def add_schedule(
         prompt_file: Basename of a prompt file under ``<home>/prompts/`` (e.g.
             ``"memory-hygiene.md"``) to fire on the tick. Mutually exclusive
             with ``prompt``; persisted as ``prompt_file:`` in scheduler.yaml.
+        replace: Explicitly replace an existing entry and report its old values.
     """
     scheduler = _STATE["scheduler"]
     if scheduler is None:
@@ -1669,6 +1675,7 @@ async def add_schedule(
                     f"'..', absolute paths, or symlinks; create the file first)"
                 )
     try:
+        previous = next((j for j in await scheduler.list_jobs() if j.name == name), None)
         if pfile:
             job = SchedulerJob(
                 name=name, cron=cron, prompt_file=pfile, channel_id=channel_id,
@@ -1679,14 +1686,42 @@ async def add_schedule(
                 name=name, cron=cron, prompt=inline, channel_id=channel_id,
                 priority=resolved_priority,
             )
-        job = await scheduler.add_job(job)
+        job = await scheduler.add_job(job, replace_existing=replace)
     except Exception as exc:
         return f"add_schedule failed: {exc}"
     source = f"prompt_file={job.prompt_file}" if job.prompt_file else "prompt=inline"
     return (
         f"add_schedule ok: name={job.name} cron={job.cron} "
         f"priority={job.priority} {source}"
+        + (f"; replaced previous values: {previous.to_yaml_entry()!r}" if previous else "")
     )
+
+
+@tool
+async def set_schedule_cron(name: str, cron: str) -> str:
+    """Change only an existing job's cron; preserve prompt, priority, channel and other fields.
+
+    For callable jobs, cron='' explicitly disables the default cron.
+    A prompt job must have a nonempty five-field cron expression.
+    """
+    scheduler = _STATE["scheduler"]
+    if scheduler is None:
+        return "set_schedule_cron failed: no scheduler configured"
+    try:
+        match = next((j for j in await scheduler.list_jobs() if j.name == name), None)
+        if match is None:
+            return f"set_schedule_cron failed: no job named {name!r}"
+        if match.time_of_day:
+            return (
+                "set_schedule_cron failed: this job uses time_of_day; "
+                "changing it to cron requires an explicit add_schedule replace=true"
+            )
+        if not isinstance(cron, str) or (not cron.strip() and not match.callable_name):
+            return "set_schedule_cron failed: cron must be nonempty for a prompt job"
+        await scheduler.add_job(replace(match, cron=cron.strip()))
+    except Exception as exc:
+        return f"set_schedule_cron failed: {exc}"
+    return f"set_schedule_cron ok: name={name} cron={cron.strip()!r}; other fields preserved"
 
 
 @tool
@@ -1728,17 +1763,23 @@ async def set_schedule_priority(name: str, priority: str) -> str:
 
 @tool
 async def remove_schedule(name: str) -> str:
-    """Remove a scheduled tick by name."""
+    """Remove a scheduled entry by name. Removing a callable's cron='' disable entry re-enables its default cron."""
     scheduler = _STATE["scheduler"]
     if scheduler is None:
         return "remove_schedule failed: no scheduler configured"
     try:
+        previous = next((j for j in await scheduler.list_jobs() if j.name == name), None)
         removed = await scheduler.remove_job(name)
     except Exception as exc:
         return f"remove_schedule failed: {exc}"
     if not removed:
         return f"remove_schedule: no job named {name!r}"
-    return f"remove_schedule ok: name={name}"
+    kind = "callable" if previous and previous.callable_name else "scheduled tick"
+    warning = (
+        "; warning: removed callable disable entry (cron=''); its default cron is re-enabled"
+        if previous and previous.callable_name and not previous.cron else ""
+    )
+    return f"remove_schedule ok: name={name} type={kind}{warning}"
 
 
 def _atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
@@ -1775,14 +1816,15 @@ def _atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
 
 
 @tool
-async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> str:
-    """Create or replace one poller's operator overrides.
+async def set_poller_overrides(poller_name: str, overrides: dict[str, Any], replace: bool = False) -> str:
+    """Merge one poller's operator overrides; null deletes an individual key.
 
     Writes ``<home>/pollers-overrides.yaml`` through a narrow validated path.
     ``overrides`` may contain only poller override keys such as ``cron``,
     ``priority``, ``batch_size``, ``env``, ``pass_env``, and ``budget``. Environment
     names are restricted to non-secret poller tuning variables. Passing an empty
-    dict removes that poller's override entry. Call ``reload_pollers`` after a
+    dict changes nothing; replace=true replaces the entire entry (an empty dict
+    then removes it). Call ``reload_pollers`` after a
     successful write to apply the new values to the running scheduler.
     """
     scheduler = _STATE["scheduler"]
@@ -1800,14 +1842,22 @@ async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> s
     path = Path(home) / "pollers-overrides.yaml"
     try:
         current_text = path.read_text(encoding="utf-8") if path.exists() else ""
-        current = validate_poller_overrides_text(current_text, path=path)
+        validate_poller_overrides_text(current_text, path=path)
+        import yaml
+        current = yaml.safe_load(current_text) or {}
         proposed = dict(current)
-        if overrides:
-            proposed[name] = dict(overrides)
+        before = dict(current.get(name, {}))
+        updated = {} if replace else dict(before)
+        for key, value in overrides.items():
+            if value is None:
+                updated.pop(key, None)
+            else:
+                updated[key] = value
+        if updated:
+            proposed[name] = updated
         else:
             proposed.pop(name, None)
 
-        import yaml
         body = yaml.safe_dump(
             proposed,
             allow_unicode=True,
@@ -1824,9 +1874,13 @@ async def set_poller_overrides(poller_name: str, overrides: dict[str, Any]) -> s
         return f"set_poller_overrides failed: {exc}"
     except Exception as exc:
         return f"set_poller_overrides failed: {exc}"
-    action = "removed" if not overrides else "updated"
+    action = "replaced" if replace else "merged"
+    set_keys = sorted(key for key, value in overrides.items() if value is not None)
+    deleted = sorted(set(before) - set(updated))
+    preserved = sorted(key for key in before if key in updated and key not in set_keys)
     return (
         f"set_poller_overrides ok: {action} {name} in {path.name}; "
+        f"set={set_keys}, deleted={deleted}, preserved={preserved}; "
         "call reload_pollers to apply"
     )
 
@@ -1894,6 +1948,48 @@ def _commitment_taint_refusal(
 
 
 @tool
+async def commitment_propose_closure(
+    commitment_id: str, action: str, evidence: str,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Queue an inert closure for operator approval; never closes a commitment.
+
+    Args:
+        commitment_id: Non-terminal, non-CARE commitment to propose closing.
+        action: complete or dismiss (dismissals require individual approval).
+        evidence: Concrete evidence excerpt; redacted and bounded to 1000 characters.
+    """
+    from .. import access_control
+    from .._context import get_current_turn
+    from ..commitment_proposals import queue_closure
+    from ..commitments.store import run_store_io
+    from ..memory_proposals import ProposalRefusal
+
+    auth = runtime.context if runtime is not None else None
+    turn = get_current_turn()
+    if (not isinstance(auth, AuthContext) or turn is None
+            or turn.auth_context is not auth or not turn.turn_id
+            or not access_control.can_review_commitments(auth)):
+        raise ToolPolicyRefusal("commitment_propose_closure refused: scheduled review authority required")
+    store = _STATE["commitments_store"]
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if store is None or not home:
+        raise ToolPolicyRefusal("commitment_propose_closure refused: store unavailable")
+    records = await store.current_state_async()
+    record = records.get(commitment_id)
+    if record is None:
+        raise ToolPolicyRefusal("commitment_propose_closure refused: unknown commitment")
+    try:
+        pid = await run_store_io(
+            queue_closure, Path(home), record=record, action=action, evidence=evidence,
+            proposed_by=auth.canonical_principal, turn_id=turn.turn_id,
+        )
+    except (ProposalRefusal, OSError, ValueError) as exc:
+        raise ToolPolicyRefusal(f"commitment_propose_closure refused: {exc}") from exc
+    return f"Queued {pid}; nothing closed. Server digest will request operator approval."
+
+
+@tool
 async def commitment_complete(
     commitment_id: str,
     message_id: Optional[str] = None,
@@ -1910,7 +2006,7 @@ async def commitment_complete(
         return "commitment_complete failed: no commitments store"
     refusal = _commitment_taint_refusal(runtime, "commitment_complete")
     if refusal is not None:
-        return f"commitment_complete failed: {refusal}"
+        raise ToolPolicyRefusal(f"commitment_complete failed: {refusal}")
     actor = _commitment_actor(runtime)
     if actor is None:
         return "commitment_complete failed: authorization context unavailable"
@@ -1948,7 +2044,7 @@ async def commitment_snooze(
         return "commitment_snooze failed: no commitments store"
     refusal = _commitment_taint_refusal(runtime, "commitment_snooze")
     if refusal is not None:
-        return f"commitment_snooze failed: {refusal}"
+        raise ToolPolicyRefusal(f"commitment_snooze failed: {refusal}")
     actor = _commitment_actor(runtime)
     if actor is None:
         return "commitment_snooze failed: authorization context unavailable"
@@ -1993,7 +2089,7 @@ async def commitment_dismiss(
         return "commitment_dismiss failed: no commitments store"
     refusal = _commitment_taint_refusal(runtime, "commitment_dismiss")
     if refusal is not None:
-        return f"commitment_dismiss failed: {refusal}"
+        raise ToolPolicyRefusal(f"commitment_dismiss failed: {refusal}")
     actor = _commitment_actor(runtime)
     if actor is None:
         return "commitment_dismiss failed: authorization context unavailable"
@@ -2045,8 +2141,12 @@ async def commitment_list(
         return "commitment_list failed: authorization context unavailable"
     actor_principal, actor_is_admin, actor_is_service = actor
     try:
+        # This grant is read-only and exact-job-bound, not actor_is_admin.
+        from ..access_control import can_review_commitments
+        review_read = can_review_commitments(runtime.context)
         # Filter in the store before any record text enters the tool result.
         all_items = store.list(
+            **({"auth_context": runtime.context} if review_read else {}),
             actor_principal=actor_principal,
             # Services need store policy evaluation rather than a caller-side
             # owner filter so service-visibility opt-in is checked centrally.
@@ -2097,6 +2197,9 @@ async def commitment_list(
                 "id": c.id,
                 "text": c.text,
                 "status": c.status,
+                "sensitivity": c.sensitivity,
+                "source_turn_id": c.source_turn_id,
+                "saga_session_id": c.saga_session_id,
                 "channel_id": c.channel_id,
                 "due_window_hint": c.due_window_hint,
                 "due_window_end_unix": c.due_window_end_unix,
@@ -2873,7 +2976,8 @@ async def worklink_run(
     Autonomous-dispatch guards apply here but NOT to the operator CLI:
       * Sheds under resource pressure — if the HomeostaticArbiter says the
         worklink priority can't fire (e.g. severity TIGHT), the dispatch is
-        refused and you should try later. Use ``mimir worklink run`` to force.
+         refused and you should try later. Ask the operator to run the CLI
+         if manual dispatch is needed.
        * Respects the concurrent-claim cap (``defaults.max_concurrent`` in
          worklink.yaml, default 2) across all in-flight Worklink workers.
       * Refuses fresh work while an unresolved incident or retained run exists.
@@ -2925,7 +3029,7 @@ async def worklink_run(
             raise ToolException(
                 f"worklink_run shed: resource pressure {decision.severity.name} "
                 f"(priority={decision.priority}) — {decision.reason}. "
-                "Try again later, or run `mimir worklink run` to force."
+                "Try again later, or ask the operator to run `mimir worklink run`."
             )
 
     # 2) Concurrency cap (chainlink query): bound total in-flight workers.

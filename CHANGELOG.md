@@ -8,6 +8,70 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [0.9.10] — 2026-10-15
+
+- Alert operators through the configured operator channel when a feature-factory epic parks for human input, once per park.
+
+- Diagnose refused PR checkout lease attestations with content-free, turn-deduplicated reason events (#1951).
+
+- Park quiet live factory drivers after a separate conservative idle backstop without consuming an attempt, and preserve bare run-id recovery request bytes; resumed-driver context remains unresolved (#1952).
+
+- Fix factory-run stop across split user IDs by verifying process identity and cancellation through the privileged executor (#1953).
+
+- Resume parked factory epics in a fresh OpenCode session after a verified lock handoff.
+
+- Prompt the agent on factory parks, blocked and partial endings with durable, deduplicated Worklink notices for autonomous and operator-launched runs; validate real ending-to-receipt delivery and normalize stop fields to the receipt contract.
+
+- Prompt the agent on blocked leaves, exhausted attempts, invalid templates and reaped leaf claims.
+
+- Retain dead but resumable factory attempt checkouts for a configurable window after their last observation (#1957).
+
+- Park verified-dead factory runs left running by a crashed controller before resuming them (#1959).
+
+- Keep supervising factory drivers across controller observation errors and retain recently stopped factory checkouts for at least 15 minutes (#1960).
+
+- Use the executing uid's identity for local Worklink test gates and isolate nested pytest temporary directories (#1962).
+- Keep reindex and calibration test providers isolated from import order by patching the consumer's captured provider and config lookups.
+
+- Bump feature-factory and opencode-feature-factory to 0.10.16 for reviewed conflicted base syncs, verification evidence replay, and clearer compaction guidance (#1963).
+
+- Missing-path and explicitly content-free filesystem errors do not taint a turn, while errors exposing discovered names or resolved targets remain untrusted; PR lease lookup handles missing paths beneath a lease.
+- Collaborator-remediation integration coverage uses a test-only Git status hang guard on loaded runners and verifies that a timed-out attestation still taints checkout reads and blocks edits, without changing production timeout bounds.
+
+- Record exact reasons for untrusted repository results and attest collaborator PR checkouts based on the exact lease head even when the base is a feature branch.
+
+- Keep fixed pre-execution repository refusals from tainting remediation turns and renew active PR checkout leases on reuse.
+
+- Keep failed single-file reads under their file's trust anchor and identify untrusted sources in write vetoes.
+
+- Retry poller turns after transient provider failures with durable, capped backoff without spending content attempts.
+
+- Reclaim expired PR checkout leases through tombstones and refuse recovery of broken or marked leases.
+
+- Preserve scoped forge author provenance when a native PR read fails after attestation, while rejecting intervening head changes (#1971).
+
+- Warn that `replace_file` deletes omitted content and refuse large accidental shrinks unless explicitly allowed (#1972).
+
+- Make SAGA bulk forget previews binding, guard large deletions, and allow operator restoration of forgotten atoms.
+
+- Preserve pytest summaries and failing node IDs in bounded `repo_test` output, with separate accounting for returned truncation (#1974).
+
+- Kill synchronous shell process groups on timeout and warn that partial side effects may have occurred (#1975).
+
+- Make poller override and schedule edits explicit about merging and replacement, preserve scheduler comments, and guard destructive PR-body and proposal edits.
+
+- Route tainted poller drafts to scratch or reviewed proposals, report vetoed poller destinations, and make refused durable writes honest. Scheduled commitments review now reads autonomously and queues redacted, expiring closure proposals for one-step authenticated operator approval; CARE items are escalated, dismissals require individual approval, and changed commitments are skipped atomically without weakening direct-write vetoes.
+
+- Make tool refusals and incomplete results actionable, suppress repeated PR blocker escalations, and remove autonomous Worklink guard-bypass hints.
+
+- Add a bounded Chainlink issue reader, PR merge metadata, and actionable git-range refusals for service turns.
+
+- Allow read-only Gmail turns to select configured accounts and read messages with `gmail messages get` (#1980).
+
+- CI loads the root Dockerfile's base image from the Actions cache (pulling with backoff only on a weekly miss), so the image-build test stops failing on public.ecr.aws 429 rate limits.
+
+- Factory park alerts go to the operator channel only; they no longer send an ntfy push (#1950 follow-up).
+
 ## [0.9.9] — 2026-10-11
 
 - Measure proposed post-ingest egress vetoes with shadow-only `egress_veto_would_block` telemetry and a read-only `mimir stats --egress-shadow` report; authorization behavior is unchanged.

@@ -592,6 +592,10 @@ def _format_event(msg: dict, account: Account) -> dict | None:
     # so a batch showed N copies of the account instructions with no idea
     # which emails arrived.)
     detail = _default_prompt(sender, subject, snippet, web_url, msg_id)
+    detail += (
+        f"\n  Source account: {account.name} ({account.email}). "
+        f"Pass --account {account.email} to run-gog.sh when reading this message."
+    )
     event = {
         "poller": POLLER_NAME,
         "prompt": detail,

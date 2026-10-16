@@ -30,6 +30,7 @@ from dataclasses import asdict, fields, replace
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -79,6 +80,44 @@ from mimir.tools.budget_gate import (
 from tests.auth_helpers import attach_middleware_auth_context
 
 pytestmark = pytest.mark.usefixtures("middleware_event_logger")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,args", [
+    ("commitment_complete", {"commitment_id": "c-pending"}),
+    ("memory_store", {"content": "fact", "stream": "semantic"}),
+])
+async def test_durable_taint_refusal_is_error_shaped(name, args, monkeypatch):
+    from mimir.tools.registry import _STATE, commitment_complete
+    from mimir.tools.memory import _MEMORY_STATE
+    from mimir.tools.store import memory_store
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    monkeypatch.setitem(_STATE, "commitments_store", object())
+    monkeypatch.setitem(_MEMORY_STATE, "client", object())
+    label = SourceLabel(
+        principal="external", domain="web", resource_id="poller:response",
+        bridge_instance="test", sensitivity="public",
+        authorized_principals=frozenset({"external"}),
+    )
+    labels = InformationFlowLabels(sources=(label,))
+    auth = replace(_untainted_ifc_auth(), ifc_labels=labels,
+                   ifc_state=InformationFlowState(labels=labels))
+    tool = {"commitment_complete": commitment_complete, "memory_store": memory_store}[name]
+    # Pin the tool's refusal as well as the middleware result: a pre-execution
+    # gate denial alone would not catch a success-shaped tool implementation.
+    with pytest.raises(ToolPolicyRefusal, match="durable memory mutation refused"):
+        await tool.coroutine(**args, runtime=SimpleNamespace(context=auth))
+
+    async def handler(request):
+        await tool.coroutine(**args, runtime=SimpleNamespace(context=auth))
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    result = await BudgetGateMiddleware().awrap_tool_call(
+        _make_request(name, "taint-refusal", auth, args), handler,
+    )
+    assert result.status == "error"
+    assert "refused" in result.content.lower() or "untrusted" in result.content.lower()
 
 
 def test_replace_file_outbox_payload_control_and_effect_inventory(tmp_path, monkeypatch):
@@ -4099,7 +4138,7 @@ def test_non_shell_server_args_are_stripped_before_nested_shell_exec(
             run_shell,
         )
 
-    monkeypatch.setattr(extra.subprocess, "run", run)
+    monkeypatch.setattr(extra, "_run_shell_command", run)
     token = set_current_turn(ctx)
     try:
         middleware.wrap_tool_call(
@@ -5228,7 +5267,7 @@ async def test_tainted_operator_bound_command_reaches_real_direct_process_path(
     async def async_handler(request: ToolCallRequest) -> ToolMessage:
         return sync_handler(request)
 
-    monkeypatch.setattr(extra.subprocess, "run", run)
+    monkeypatch.setattr(extra, "_run_shell_command", run)
     request = _make_request(
         "shell_exec", f"real-direct-{middleware_path}", auth,
         {"command": "pwd -P", "cwd": str(root)},
@@ -5336,7 +5375,7 @@ async def test_pre_ingest_soft_operator_uses_actual_bash_lc_path(
         return sync_handler(request)
 
     monkeypatch.setattr(budget_gate, "parse_service_shell_argv_with_diagnostics", parser)
-    monkeypatch.setattr(extra.subprocess, "run", run)
+    monkeypatch.setattr(extra, "_run_shell_command", run)
     command = "printf pre-ingest-soft"
     request = _make_request(
         "shell_exec", f"soft-bash-{middleware_path}", auth, {"command": command},
@@ -6827,8 +6866,9 @@ async def test_real_repo_test_payload_error_detection(monkeypatch, ok):
     monkeypatch.setattr(repo_module, "_state", lambda *_args: object())
     monkeypatch.setattr(repo_module.RepoProjectTests, "execute", AsyncMock(return_value=producer))
     payload = await repo_module.repo_test.coroutine(repository="owner/repo", pull_request=1)
-    assert {field.name for field in fields(producer)} - {"failure_summary"} < payload.keys()
+    assert {field.name for field in fields(producer)} - {"failure_summary", "pytest_summary"} < payload.keys()
     assert "failure_summary" not in payload
+    assert "pytest_summary" not in payload
     assert payload["remediation_guidance"]
     message = ToolMessage(content=json.dumps(payload), tool_call_id="real-repo-test", status="success")
     assert _result_is_error("repo_test", message) is (not ok)
@@ -6887,7 +6927,7 @@ async def test_shell_exec_timeout_event_contains_bounded_command(
         raise subprocess.TimeoutExpired(cmd="bash", timeout=900)
 
     monkeypatch.setattr("mimir.event_logger.log_event", _capture)
-    monkeypatch.setattr("mimir.tools.extra.subprocess.run", _timeout)
+    monkeypatch.setattr("mimir.tools.extra._run_shell_command", _timeout)
     mw = BudgetGateMiddleware()
 
     async def handler(req: ToolCallRequest) -> ToolMessage:
@@ -7960,3 +8000,36 @@ async def test_exact_shell_grant_admits_only_one_shadow_operator_command(
         "binding_rule": ServiceShellBindingRule.PROFILE_ALLOWLIST.value,
     }]
     assert command not in json.dumps(captured)
+@pytest.mark.asyncio
+async def test_exhausted_budget_removes_spendable_tools_before_next_model_step():
+    from types import SimpleNamespace
+
+    ctx = _make_ctx(budget=1)
+    request = SimpleNamespace(tools=[SimpleNamespace(name=name) for name in (
+        "read_file", "shell_exec", "send_message", "react",
+    )])
+
+    def override(**updates):
+        return SimpleNamespace(**{**vars(request), **updates})
+
+    request.override = override
+    middleware = BudgetGateMiddleware()
+    token = set_current_turn(ctx)
+    try:
+        assert [t.name for t in middleware._available_after_budget(request).tools] == [
+            "read_file", "shell_exec", "send_message", "react",
+        ]
+        assert _check_and_increment_or_deny("read_file") is None
+        available = middleware._available_after_budget(request)
+        assert [t.name for t in available.tools] == ["send_message", "react"]
+        assert [t.name for t in middleware.wrap_model_call(request, lambda req: req).tools] == [
+            "send_message", "react",
+        ]
+        async def handler(req):
+            return req
+        assert [t.name for t in (await middleware.awrap_model_call(request, handler)).tools] == [
+            "send_message", "react",
+        ]
+        assert ctx.tool_call_budget_denied_count == 0
+    finally:
+        reset_current_turn(token)

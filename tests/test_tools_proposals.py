@@ -205,15 +205,24 @@ def test_submit_tool_pr_failure_is_typed_for_every_lane(monkeypatch, tmp_path, l
 def test_abandon_tool(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setattr(tp, "list_open_proposals", lambda home, lane="agent": [("upgrade/z", tmp_path)])
-    monkeypatch.setattr(tp, "_abandon_proposal", lambda home, lane="agent": True)
+    monkeypatch.setattr(tp, "_abandon_proposal", lambda home, **kwargs: True)
     out = _inv(tp.abandon_proposal, lane="upgrade")
     assert "upgrade/z" in out and "upgrade" in out and "bandon" in out
+
+
+def test_abandon_tool_reports_discarded_diffstat(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(tp, "list_open_proposals", lambda home, lane="agent": [("agent/z", tmp_path)])
+    monkeypatch.setattr(tp, "proposal_discard_diffstat", lambda worktree: "prompts/draft.md | 2 ++")
+    monkeypatch.setattr(tp, "_abandon_proposal", lambda home, **kwargs: kwargs["discard_changes"])
+    out = _inv(tp.abandon_proposal, discard_changes=True)
+    assert "Discarded diffstat" in out and "prompts/draft.md | 2 ++" in out
 
 
 def test_abandon_tool_nothing_open(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setattr(tp, "list_open_proposals", lambda home, lane="agent": [])
-    monkeypatch.setattr(tp, "_abandon_proposal", lambda home, lane="agent": False)
+    monkeypatch.setattr(tp, "_abandon_proposal", lambda home, **kwargs: False)
     assert "nothing to abandon" in _inv(tp.abandon_proposal, lane="upgrade").lower()
 
 

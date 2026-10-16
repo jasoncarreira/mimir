@@ -242,6 +242,33 @@ def test_metadata_target_and_auth_are_adapter_constructed() -> None:
     assert kwargs["headers"]["Authorization"] == "Bearer secret"
 
 
+@pytest.mark.parametrize("body,expected", [
+    ("x" * 65_537, "x" * 65_536),
+    ("x" * 65_535 + "外tail", "x" * 65_535),
+    ("外" * 21_846, "外" * 21_845),
+    ("x" * 65_533 + "外", "x" * 65_533 + "外"),
+    ("short body", "short body"),
+    (None, ""),
+    (42, ""),
+])
+def test_pr_metadata_body_is_bounded_by_writer_utf8_limit(body, expected) -> None:
+    from mimir.tools.forge import _BODY_MAX_BYTES
+
+    assert github_module._MAX_BODY_BYTES == _BODY_MAX_BYTES == 65_536
+    session = Session([Response({"number": 17, "body": body})])
+    result = GitHubForgeClient(token="secret", session=session).get_pull_request(_scope())
+    assert result.body == expected
+    assert len(result.body.encode("utf-8")) <= _BODY_MAX_BYTES
+    assert "\ufffd" not in result.body
+
+
+def test_pr_metadata_merged_at_comes_from_github_response() -> None:
+    session = Session([Response({"number": 17, "body": "description", "merged_at": "2026-10-14T12:00:00Z"})])
+    result = GitHubForgeClient(token="secret", session=session).get_pull_request(_scope())
+    assert result.body == "description"
+    assert result.merged_at == "2026-10-14T12:00:00Z"
+
+
 def _pr_row(number, *, merged=False):
     return {
         "number": number, "title": "外" * 2000, "state": "closed" if merged else "open",

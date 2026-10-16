@@ -139,7 +139,9 @@ def test_no_triage_preserves_event_and_makes_no_request(
                 "[gmail] new message from Deals <deals@shop-example.com>: "
                 "'48-hour flash sale'\n  > Don't miss out.\n"
                 "  URL: https://mail.google.com/mail/u/0/#inbox/thread-1\n"
-                "  message_id: m1"
+                "  message_id: m1\n"
+                "  Source account: home (owner@example.com). "
+                "Pass --account owner@example.com to run-gog.sh when reading this message."
             ),
             "batch_context": "Account rules",
             "source_platform": "gmail",

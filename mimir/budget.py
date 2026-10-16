@@ -542,7 +542,7 @@ class HomeostaticArbiter:
         lines: list[str] = []
 
         # Pending forget candidates from the most recent decay cycle.
-        # Sticky: stays visible across turns until a saga_forget_ok
+        # Sticky: stays visible until a matching preview is acknowledged or deletion succeeds.
         # event lands (newer than the latest saga_decay_ok). Top of
         # the block because it's actionable agent-maintenance, not
         # ambient telemetry.
@@ -557,7 +557,7 @@ class HomeostaticArbiter:
         if pending is not None and pending > 0:
             lines.append(
                 f"- {pending} forget candidates pending review "
-                f"(saga_forget tool, dry_run=true to preview)"
+                f"(saga_forget tool, dry_run=true to preview; acknowledge the preview_token after review)"
             )
 
         # Autonomy throttle: surface the severity the scheduler is

@@ -247,6 +247,12 @@ class Dispatcher:
         if not await self._authorize_bridge_event(event):
             return False
 
+        from .commitment_proposals import handle_reply as handle_closure_reply
+        closure_notice = await handle_closure_reply(self._config.home, event, self._identity_resolver)
+        if closure_notice is not None:
+            await self._send_approval_notice(event.channel_id, closure_notice)
+            return True
+
         # A trust reply is a server action, not a model turn. Handle it while
         # the channel's turn is in flight even when mid-turn injection is off.
         from .trust_approval import _TRUST_REPLY, complete_reply as complete_trust_reply

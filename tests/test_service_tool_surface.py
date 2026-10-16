@@ -27,7 +27,7 @@ from mimir.access_control import (
     build_trigger_service_principal,
     builtin_trigger_service_principal,
 )
-from mimir.models import AuthContext
+from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.tools.service_tool_surface import (
     ServiceToolSurfaceMiddleware,
@@ -61,6 +61,39 @@ def service_context(kind: str) -> AuthContext:
         else CapabilityTier.CODE_EXECUTION,
         capabilities=capabilities, creation_path="test",
     ))
+
+
+def test_tainted_poller_surface_hides_durable_mutations_but_keeps_proposal_and_scratch():
+    context = service_context("code_execution")
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="external", domain="web", resource_id="poller:item",
+        bridge_instance="test", sensitivity="public",
+        authorized_principals=frozenset({"external"}),
+    ),))
+    context = replace(context, ifc_labels=labels, ifc_state=InformationFlowState(labels=labels))
+    inventory = tools("memory_store", "saga_record_skill_learning", "saga_feedback",
+                      "commitment_complete", "commitment_snooze", "write_file", "edit_file")
+    request = ModelRequest(model=RecordingModel(), messages=[], tools=inventory,
+                           runtime=Runtime(context=context))
+    filtered = ServiceToolSurfaceMiddleware()._filter_request(request)
+    assert [tool.name for tool in filtered.tools] == ["write_file", "edit_file"]
+    assert "Available tools: write_file, edit_file." in filtered.system_message.text
+    clean = replace(context, ifc_state=InformationFlowState(labels=InformationFlowLabels()))
+    clean_names = [tool.name for tool in ServiceToolSurfaceMiddleware()._filter_request(
+        request.override(runtime=Runtime(context=clean)),
+    ).tools]
+    assert "memory_store" in clean_names
+    # A service with a different trigger still receives its declared tool
+    # inventory; the poller-only surface rule is not an authorization bypass.
+    scheduled = build_trigger_service_principal(
+        canonical="scheduled:custom", trigger="scheduled_tick", profile="custom",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("memory_store",), creation_path="test",
+    )
+    other = auth(scheduled, ifc_labels=labels, ifc_state=InformationFlowState(labels=labels))
+    assert "memory_store" in [tool.name for tool in ServiceToolSurfaceMiddleware()._filter_request(
+        request.override(runtime=Runtime(context=other)),
+    ).tools]
 
 
 def tools(*names: str) -> list[StructuredTool]:

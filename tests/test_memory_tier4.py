@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from mimir.models import AuthContext
-from mimir.saga.forget import ForgetResult, forget, forget_by_criteria
+from mimir.saga.forget import ForgetResult, forget, forget_by_criteria, unforget
 from mimir.saga.mark_access import AccessEvent, mark_access
 from mimir.saga.recall import recall
 from mimir.saga.store import store
@@ -252,6 +252,91 @@ def test_forget_by_criteria_dry_run_returns_preview(conn):
     assert count == 0
 
 
+@pytest.mark.parametrize("activation_below", [0.1, float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_forget_by_criteria_rejects_invalid_activation_directly(conn, activation_below, dry_run):
+    """Bypass the tool guard: direct callers must get the inner refusal."""
+    atom_id = store(conn, "must survive invalid activation", embed_fn=_fake_embed).atom_id
+    with pytest.raises(ValueError, match="activation_below must be finite and <= 0"):
+        forget_by_criteria(
+            conn, activation_below=activation_below, dry_run=dry_run,
+            allow_bulk=True,
+        )
+    assert conn.execute(
+        "SELECT tombstoned FROM atoms WHERE id = ?", (atom_id,),
+    ).fetchone()[0] == 0
+    assert not conn.in_transaction
+
+
+@pytest.mark.parametrize("activation_below", [0.0, -1.0])
+def test_forget_by_criteria_accepts_finite_nonpositive_activation(conn, activation_below):
+    atom_id = store(conn, "never accessed", embed_fn=_fake_embed).atom_id
+    # store() records a creation access; explicitly model a never-accessed row.
+    conn.execute(
+        "UPDATE atom_access_summary SET recent_ts_json = '[]', recent_weights_json = '[]', "
+        "old_count = 0, old_weight_sum = 0, old_oldest_ts = NULL WHERE atom_id = ?",
+        (atom_id,),
+    )
+    conn.commit()
+    preview = forget_by_criteria(conn, activation_below=activation_below)
+    assert preview.tombstoned_ids == [atom_id]
+    result = forget_by_criteria(
+        conn, activation_below=activation_below, dry_run=False,
+        preview_token=preview.preview_token, allow_bulk=True,
+    )
+    assert result.tombstoned_ids == [atom_id]
+
+
+def test_forget_requires_binding_preview_and_detects_changed_selection(conn):
+    first = store(conn, "first " + "x" * 200, embed_fn=_fake_embed, stream="episodic").atom_id
+    preview = forget_by_criteria(conn, stream="episodic")
+    assert preview.candidates[0]["id"] == first
+    assert len(preview.candidates[0]["snippet"]) <= 160
+    assert {"created_at", "stream", "memory_type"} <= preview.candidates[0].keys()
+    with pytest.raises(ValueError, match="Preview token"):
+        forget_by_criteria(conn, stream="episodic", dry_run=False, allow_bulk=True)
+    store(conn, "second", embed_fn=_fake_embed, stream="episodic")
+    with pytest.raises(ValueError, match="selection changed"):
+        forget_by_criteria(conn, stream="episodic", dry_run=False,
+                           preview_token=preview.preview_token, allow_bulk=True)
+    assert conn.execute("SELECT COUNT(*) FROM atoms WHERE tombstoned = 1").fetchone()[0] == 0
+
+
+def test_oldest_thousand_bulk_guard_and_operator_round_trip(conn):
+    # The muninn failure shape: an age-ordered 1,000-row window from a larger corpus.
+    template = store(conn, "template", embed_fn=_fake_embed).atom_id
+    rows = [(f"old{i:04d}", f"old content {i}", f"2026-03-01T00:{i // 60:02d}:{i % 60:02d}+00:00")
+            for i in range(1000)]
+    conn.executemany(
+        "INSERT INTO atoms (id, content, content_hash, created_at, stream, memory_type) "
+        "VALUES (?, ?, ?, ?, 'episodic', 'raw')",
+        [(aid, content, aid, ts) for aid, content, ts in rows],
+    )
+    conn.commit()
+    preview = forget_by_criteria(conn, min_age_days=1)
+    assert len(preview.tombstoned_ids) == 1000
+    assert preview.tombstoned_ids[0] == "old0000"
+    with pytest.raises(ValueError, match="1000.*%"):
+        forget_by_criteria(conn, min_age_days=1, dry_run=False,
+                           preview_token=preview.preview_token)
+    assert conn.execute("SELECT COUNT(*) FROM atoms WHERE tombstoned = 1").fetchone()[0] == 0
+    result = forget_by_criteria(conn, min_age_days=1, dry_run=False,
+                                preview_token=preview.preview_token, allow_bulk=True)
+    assert result.tombstoned_ids == preview.tombstoned_ids
+    restored = unforget(conn, ids=result.tombstoned_ids)
+    assert restored == result.tombstoned_ids
+    assert conn.execute("SELECT COUNT(*) FROM atoms WHERE tombstoned = 0").fetchone()[0] == 1001
+    assert conn.execute("SELECT COUNT(*) FROM forget_restore_audit").fetchone()[0] == 1000
+
+
+def test_forget_ratio_guard_requires_bulk_override(conn):
+    store(conn, "one", embed_fn=_fake_embed)
+    preview = forget_by_criteria(conn, min_retrievals=1)
+    with pytest.raises(ValueError, match="100.0%"):
+        forget_by_criteria(conn, min_retrievals=1, dry_run=False,
+                           preview_token=preview.preview_token)
+
+
 @pytest.mark.parametrize("max_atoms", [1000, 1])
 @pytest.mark.parametrize("scope", [
     {},
@@ -283,8 +368,10 @@ def test_forget_by_criteria_stream_filter(conn):
     epi = store(conn, "episodic atom", embed_fn=_fake_embed,
                 stream="episodic").atom_id
 
+    preview = forget_by_criteria(conn, stream="episodic")
     result = forget_by_criteria(
-        conn, stream="episodic", dry_run=False,
+        conn, stream="episodic", dry_run=False, preview_token=preview.preview_token,
+        allow_bulk=True,
     )
     assert epi in result.tombstoned_ids
     assert sem not in result.tombstoned_ids
@@ -296,7 +383,9 @@ def test_forget_by_criteria_protects_pinned_atoms(conn):
                    is_pinned=True).atom_id
     regular = store(conn, "regular", embed_fn=_fake_embed).atom_id
 
-    result = forget_by_criteria(conn, min_retrievals=1, dry_run=False)
+    preview = forget_by_criteria(conn, min_retrievals=1)
+    result = forget_by_criteria(conn, min_retrievals=1, dry_run=False,
+                                preview_token=preview.preview_token, allow_bulk=True)
     assert pinned not in result.tombstoned_ids
     assert regular in result.tombstoned_ids
 
@@ -339,12 +428,15 @@ def test_forget_by_criteria_domains_cannot_widen_owner_scope(conn, origin_domain
     conn.execute("UPDATE atoms SET created_at = ?", (old_ts,))
     conn.commit()
 
+    preview = forget_by_criteria(conn, owner_principal="service:scheduler",
+                                 origin_domains=origin_domains, min_age_days=30)
     result = forget_by_criteria(
         conn,
         owner_principal="service:scheduler",
         origin_domains=origin_domains,
         min_age_days=30,
         dry_run=False,
+        preview_token=preview.preview_token, allow_bulk=True,
     )
 
     assert result.tombstoned_ids == [owned]
@@ -391,7 +483,9 @@ def test_forget_by_criteria_narrowed_destructive_respects_cap(conn):
         for i in range(3)
     }
 
-    result = forget_by_criteria(conn, stream="episodic", max_atoms=1, dry_run=False)
+    preview = forget_by_criteria(conn, stream="episodic", max_atoms=1)
+    result = forget_by_criteria(conn, stream="episodic", max_atoms=1, dry_run=False,
+                                preview_token=preview.preview_token, allow_bulk=True)
 
     assert result.dry_run is False
     assert result.tombstoned_count == 1

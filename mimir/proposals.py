@@ -404,8 +404,8 @@ def open_proposal(
         return OpenResult(
             ok=False, branch=b, worktree=w, reason="exists",
             detail=(
-                f"a {lane} proposal is already open ({b}); submit or "
-                f"abandon it before opening another {lane} proposal"
+                f"a {lane} proposal is already open ({b}); inspect it with "
+                "proposal_diff, then submit it or abandon it"
             ),
         )
     ignore_err = _ensure_scratch_ignored(home)
@@ -822,9 +822,24 @@ def finalize_proposal(
     )
 
 
+def proposal_discard_diffstat(worktree: Path) -> str:
+    """Describe staged, unstaged and untracked edits that force-removal would lose."""
+    status = _git(["status", "--porcelain=v1", "--untracked-files=all"], cwd=worktree)
+    if status.returncode != 0:
+        raise ValueError("cannot inspect proposal changes; refusing to abandon")
+    if not status.stdout.strip():
+        return ""
+    stat = _git(["diff", "HEAD", "--stat", "--no-ext-diff", "--no-textconv"], cwd=worktree)
+    if stat.returncode != 0:
+        raise ValueError("cannot inspect proposal diffstat; refusing to abandon")
+    untracked = [line[3:] for line in status.stdout.splitlines() if line.startswith("?? ")]
+    return ((stat.stdout or "").strip() + "\n" +
+            "\n".join(f"{name} | untracked" for name in untracked)).strip()
+
+
 def abandon_proposal(
     home: Path, *, branch: str | None = None, lane: str = AGENT_PROPOSAL_LANE,
-    poller: PollerProposalScope | None = None,
+    poller: PollerProposalScope | None = None, discard_changes: bool = False,
 ) -> bool:
     """Discard an open proposal in ``lane`` (remove its worktree + local branch).
 
@@ -843,6 +858,11 @@ def abandon_proposal(
         b, w = match[0]
     else:
         b, w = opens[0]
+    if proposal_discard_diffstat(w) and not discard_changes:
+        raise ValueError(
+            "abandon_proposal refused: proposal has staged, unstaged or untracked changes; "
+            "inspect with proposal_diff, then submit or pass discard_changes=true"
+        )
     _cleanup_worktree(home, w, b)
     return True
 

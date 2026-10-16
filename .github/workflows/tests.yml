@@ -38,7 +38,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: "22"
 
@@ -48,7 +48,7 @@ jobs:
           npm run build
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           version: "0.11.12"
 
@@ -86,7 +86,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           # Pin to a known-good minor — ``latest`` is a slow-motion
           # supply-chain risk + a reproducibility hole. Bump
@@ -230,7 +230,7 @@ jobs:
 
       - name: Upload pytest evidence
         if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-evidence-skill-conformance-3.11-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
@@ -250,7 +250,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           version: "0.11.12"
           enable-cache: true
@@ -360,7 +360,7 @@ jobs:
 
       - name: Upload pytest evidence
         if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-evidence-chainlink-cli-audit-3.12-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
@@ -385,8 +385,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
+      - name: Prime Dockerfile base image (avoids registry 429s)
+        uses: ./.github/actions/prime-base-image
+
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           version: "0.11.12"
           enable-cache: true
@@ -467,7 +470,7 @@ jobs:
 
       - name: Upload pytest evidence
         if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-evidence-${{ github.job }}-${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
@@ -495,7 +498,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           version: "0.11.12"
           enable-cache: true
@@ -622,7 +625,7 @@ jobs:
 
       - name: Upload pytest evidence
         if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-evidence-pytest-worker-uid-3.12-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
@@ -645,7 +648,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           version: "0.11.12"
           enable-cache: true
@@ -701,7 +704,7 @@ jobs:
 
       - name: Upload pytest evidence
         if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-evidence-${{ github.job }}-${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
@@ -729,8 +732,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
+      - name: Prime Dockerfile base image (avoids registry 429s)
+        uses: ./.github/actions/prime-base-image
+
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           version: "0.11.12"
 
@@ -770,7 +776,7 @@ jobs:
 
       - name: Upload pytest evidence
         if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-evidence-pytest-fresh-resolve-3.12-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
@@ -806,8 +812,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
+      - name: Prime Dockerfile base image (avoids registry 429s)
+        uses: ./.github/actions/prime-base-image
+
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           version: "0.11.12"
           enable-cache: true
@@ -848,7 +857,7 @@ jobs:
 
       - name: Upload pytest evidence
         if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-evidence-pytest-enforced-3.12-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
@@ -864,8 +873,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
+      - name: Prime Dockerfile base image (avoids registry 429s)
+        uses: ./.github/actions/prime-base-image
+
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           version: "0.11.12"
 
@@ -883,7 +895,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           version: "0.11.12"
           enable-cache: true
@@ -916,7 +928,7 @@ jobs:
 
       - name: Set up Node
         id: setup-node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: "24"
           cache: npm
