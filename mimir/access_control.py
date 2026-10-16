@@ -11271,7 +11271,7 @@ class _RetainedResultReceipt:
     def __init__(self, tool: str, context: Any, scope: RetainedFactoryScope,
                  result: Any, failed: bool, policy: Any,
                  *, execution_id: str, head: str,
-                 lease_identity: tuple[str, str]) -> None:
+                 lease_identity: tuple[str, str, int, int]) -> None:
         self.tool = tool
         self.context = context
         self.scope = scope
@@ -11306,29 +11306,48 @@ class _RetainedResultReceipt:
         )
 
     def _live_binding(self, context: Any, scope: RetainedFactoryScope, policy: Any) -> bool:
-        registered = policy.tools.get(self.tool)
-        protocol = (policy.scoped_actions.get(registered.owner)
-                    if registered is not None else None)
-        discovered = getattr(context, "server_discovered_pr_states", None)
-        registry = getattr(context, "repo_pr_scope_registry", None)
-        state = (discovered.resolve(scope.repository, scope.issue_id)
-                 if discovered is not None else None)
-        if state is None and registry is not None:
-            state = registry.resolve(scope.repository, scope.issue_id)
-        pr_scope = getattr(state, "action_scope", None)
-        lease = (protocol.live_lease(pr_scope, state)
-                 if protocol is not None and protocol.live_lease is not None and pr_scope is not None
-                 else None)
-        return (
-            pr_scope is not None and lease is not None
-            and getattr(pr_scope, "canonical_repo", None) == scope.repository
-            and getattr(pr_scope, "pr_number", None) == scope.issue_id
-            and getattr(pr_scope, "observed_head_sha", "").lower() == self.head
-            and getattr(lease, "is_active", False)
-            and getattr(lease, "head_sha", "").lower() == self.head
-            and getattr(lease, "scope_id", None) == pr_scope.scope_id
-            and (str(lease.path), lease.recovery_id) == self.lease_identity
-        )
+        binding = _retained_checkout_binding(scope)
+        return binding == (self.head, self.lease_identity)
+
+
+def _retained_checkout_binding(
+    scope: RetainedFactoryScope,
+) -> tuple[str, tuple[str, str, int, int]] | None:
+    """Observe the incident's checkout, never a numerically colliding PR lease."""
+    from .repo_tools import retained_factory_subprocess_runner
+    from .worklink.retained_scope import retained_factory_effect_lease
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return None
+    try:
+        with retained_factory_effect_lease(Path(home), scope) as lease:
+            if lease.scope is not scope:
+                return None
+            checkout = Path(scope.sandbox)
+            if checkout.resolve(strict=True) != checkout or not checkout.is_dir():
+                return None
+            identity = checkout.stat()
+
+            def git(*args: str) -> str | None:
+                result = retained_factory_subprocess_runner(
+                    ("git", "-C", str(checkout), *args), output_limit=4096,
+                )
+                return result.stdout.decode("ascii", "strict").strip() if result.returncode == 0 else None
+
+            if git("rev-parse", "--show-toplevel") != str(checkout):
+                return None
+            git_dir = git("rev-parse", "--absolute-git-dir")
+            if git_dir is None or not Path(git_dir).resolve(strict=True).is_relative_to(checkout):
+                return None
+            if git("branch", "--show-current") != scope.branch:
+                return None
+            head = git("rev-parse", "--verify", "HEAD^{commit}")
+            if head is None or len(head) != 40 or any(c not in "0123456789abcdef" for c in head.lower()):
+                return None
+            return head.lower(), (str(checkout), scope.scope_id, identity.st_dev, identity.st_ino)
+    except (OSError, RuntimeError, ValueError, UnicodeError):
+        return None
 
 
 def _single_filesystem_result_source(
