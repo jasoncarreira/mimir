@@ -42,12 +42,13 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import stat
 import time
 from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import UnionType
@@ -3415,6 +3416,7 @@ class _PreparedToolCall:
 
 @dataclass
 class _ToolExecutionCapture:
+    execution_id: str = field(default_factory=lambda: secrets.token_hex(16))
     review_claim: Any = None
     direct_argv_token: Any = None
     capture_token: Any = None
@@ -4058,13 +4060,13 @@ def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
         return None
     from ..models import RetainedFactoryScope
 
-    if "retained_repo_tools" in registered.memberships and _retained_dispatch_scope(call) is None:
+    if isinstance(call.authorization.repo_pr_action_scope, RetainedFactoryScope):
+        if _retained_dispatch_scope(call) is not None:
+            return None
         return _tool_call_refusal(
             call, "retained factory scope refused before execution", arguments=None,
             record_outcome=True,
         )
-    if isinstance(call.authorization.repo_pr_action_scope, RetainedFactoryScope):
-        return None
     from ..access_control import _valid_scoped_pr_grant
 
     protocol = (call.policy.scoped_actions.get(registered.owner)
@@ -4144,16 +4146,39 @@ def _capture_retained_result(call: _PreparedToolCall, capture: _ToolExecutionCap
     content = result.content
     if not isinstance(content, (str, bytes)):
         return
-    invocation_id = _tool_call_id(call.request)
-    if not invocation_id or result.tool_call_id != invocation_id:
+    if result.tool_call_id != _tool_call_id(call.request):
         return
     from ..access_control import _RetainedResultReceipt
 
     selected = call.policy if call.policy is not None else selected_policy_registry()
+    registered = _plugin_tool(call.tool_name, selected)
+    protocol = selected.scoped_actions.get(registered.owner) if registered is not None else None
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = (discovered.resolve(scope.repository, scope.issue_id)
+             if discovered is not None else None)
+    if state is None and registry is not None:
+        state = registry.resolve(scope.repository, scope.issue_id)
+    pr_scope = getattr(state, "action_scope", None)
+    lease = (protocol.live_lease(pr_scope, state)
+             if protocol is not None and protocol.live_lease is not None and pr_scope is not None
+             else None)
+    head = getattr(pr_scope, "observed_head_sha", None)
+    if (not isinstance(head, str) or len(head) != 40
+            or any(c not in "0123456789abcdef" for c in head.lower())
+            or getattr(pr_scope, "canonical_repo", None) != scope.repository
+            or getattr(pr_scope, "pr_number", None) != scope.issue_id
+            or lease is None or not getattr(lease, "is_active", False)
+            or getattr(lease, "head_sha", "").lower() != head.lower()
+            or getattr(lease, "scope_id", None) != pr_scope.scope_id
+            or not getattr(lease, "recovery_id", None)
+            or not getattr(lease, "path", None)):
+        return
     capture.retained_receipt = _RetainedResultReceipt(
         call.tool_name, call.auth_context, scope, result,
         _result_is_error(call.tool_name, result, policy=selected), selected,
-        invocation_id=invocation_id,
+        execution_id=capture.execution_id, head=head.lower(),
+        lease_identity=(str(lease.path), lease.recovery_id),
     )
 
 

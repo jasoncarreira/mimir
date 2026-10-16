@@ -11270,7 +11270,8 @@ class _RetainedResultReceipt:
 
     def __init__(self, tool: str, context: Any, scope: RetainedFactoryScope,
                  result: Any, failed: bool, policy: Any,
-                 invocation_id: str | None = None) -> None:
+                 *, execution_id: str, head: str,
+                 lease_identity: tuple[str, str]) -> None:
         self.tool = tool
         self.context = context
         self.scope = scope
@@ -11279,9 +11280,9 @@ class _RetainedResultReceipt:
         self.result = result
         self._used = False
         self._lock = threading.Lock()
-        self.invocation_id = invocation_id or secrets.token_hex(16)
-        self.head = scope.branch
-        self.lease_identity = (scope.run_id, scope.session, scope.occurrence_id, scope.scope_id)
+        self.execution_id = execution_id
+        self.head = head
+        self.lease_identity = lease_identity
         content = getattr(result, "content", None)
         if not isinstance(content, (str, bytes)):
             raise ValueError("retained receipt requires captured output bytes")
@@ -11298,11 +11299,35 @@ class _RetainedResultReceipt:
             self.tool == tool and self.context is context and self.scope is scope
             and self.result is result and self.failed == failed and self.policy is policy
             and not failed and getattr(result, "status", None) != "error"
-            and getattr(result, "tool_call_id", None) == self.invocation_id
-            and self.head == scope.branch
-            and self.lease_identity == (scope.run_id, scope.session, scope.occurrence_id, scope.scope_id)
+            and isinstance(self.execution_id, str) and bool(self.execution_id)
+            and self._live_binding(context, scope, policy)
             and isinstance(content, (str, bytes))
             and hashlib.sha256(content.encode() if isinstance(content, str) else content).digest() == self.digest
+        )
+
+    def _live_binding(self, context: Any, scope: RetainedFactoryScope, policy: Any) -> bool:
+        registered = policy.tools.get(self.tool)
+        protocol = (policy.scoped_actions.get(registered.owner)
+                    if registered is not None else None)
+        discovered = getattr(context, "server_discovered_pr_states", None)
+        registry = getattr(context, "repo_pr_scope_registry", None)
+        state = (discovered.resolve(scope.repository, scope.issue_id)
+                 if discovered is not None else None)
+        if state is None and registry is not None:
+            state = registry.resolve(scope.repository, scope.issue_id)
+        pr_scope = getattr(state, "action_scope", None)
+        lease = (protocol.live_lease(pr_scope, state)
+                 if protocol is not None and protocol.live_lease is not None and pr_scope is not None
+                 else None)
+        return (
+            pr_scope is not None and lease is not None
+            and getattr(pr_scope, "canonical_repo", None) == scope.repository
+            and getattr(pr_scope, "pr_number", None) == scope.issue_id
+            and getattr(pr_scope, "observed_head_sha", "").lower() == self.head
+            and getattr(lease, "is_active", False)
+            and getattr(lease, "head_sha", "").lower() == self.head
+            and getattr(lease, "scope_id", None) == pr_scope.scope_id
+            and (str(lease.path), lease.recovery_id) == self.lease_identity
         )
 
 
