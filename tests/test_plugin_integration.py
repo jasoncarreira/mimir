@@ -102,6 +102,7 @@ def _state(operations):
         allowed_operations=frozenset(operations) | {RepoPRAction.CHECKOUT.value}, pr_number=7,
         head_repo="acme/widget", head_remote="origin", destination_ref="refs/heads/fix",
         observed_head_sha="a" * 40, base_ref="main", observed_base_sha="b" * 40,
+        owner="example",
     ))
 
 
@@ -508,7 +509,7 @@ def test_plugin_repo_and_pr_require_exact_server_scope_and_action(policy, enforc
         ("example_repo", _auth(), "acme/widget", 7),
     ):
         refusal = decide(name, context, repository, number)
-        assert refusal.reason in {"repo_pr_scope_denied", "repo_pr_grant_denied"} and refusal.would_block
+        assert refusal.reason == "repo_pr_grant_denied" and refusal.would_block
         assert refusal.allowed is not enforce
     comment_state = _state({RepoPRAction.INSPECT.value, RepoPRAction.PR_COMMENT.value})
     with_comment = _granted(policy, comment_state)
@@ -519,7 +520,7 @@ def test_plugin_repo_and_pr_require_exact_server_scope_and_action(policy, enforc
         session="session", repository="acme/widget", branch="fix", sandbox=str(tmp_path),
     )
     refusal = decide("example_repo", _auth(retained_factory_scope=retained))
-    assert refusal.reason == "repo_pr_scope_denied" and refusal.would_block
+    assert refusal.reason == "repo_pr_grant_denied" and refusal.would_block
 
 
 def test_plugin_channel_sink_ifc_and_middleware_policy(policy):
@@ -940,11 +941,11 @@ async def test_selected_plugin_resource_calls_cross_model_middleware_boundary(
         ("example_channel", {"channel_id": "scheduler:other"}, inspect, "cross_channel_scope"),
         ("example_repo", {"repository": "acme/widget", "pull_request": 7}, inspect, None),
         ("example_pr", {"repository": "acme/widget", "pull_request": 7}, comment, None),
-        ("example_repo", {"repository": "acme/other", "pull_request": 7}, inspect, "repo_pr_scope_denied"),
-        ("example_repo", {"repository": "acme/widget", "pull_request": 8}, inspect, "repo_pr_scope_denied"),
-        ("example_pr", {"repository": "acme/widget", "pull_request": 7}, inspect, "repo_pr_scope_denied"),
+         ("example_repo", {"repository": "acme/other", "pull_request": 7}, inspect, "repo_pr_grant_denied"),
+         ("example_repo", {"repository": "acme/widget", "pull_request": 8}, inspect, "repo_pr_grant_denied"),
+         ("example_pr", {"repository": "acme/widget", "pull_request": 7}, inspect, "repo_pr_grant_denied"),
         ("example_repo", {"repository": "acme/widget", "pull_request": 7},
-         _auth(enforcement_enabled=enforce, retained_factory_scope=retained), "repo_pr_scope_denied"),
+         _auth(enforcement_enabled=enforce, retained_factory_scope=retained), "repo_pr_grant_denied"),
     )
     for index, (name, args, context, refusal_reason) in enumerate(cases):
         called = []
@@ -971,13 +972,17 @@ async def test_selected_plugin_resource_calls_cross_model_middleware_boundary(
             else refusal_reason
         )
         assert decision.reason == expected_reason
-        if refusal_reason is None or not enforce:
+        hard_grant_refusal = name in {"example_repo", "example_pr"} and refusal_reason is not None
+        if refusal_reason is None or (not enforce and not hard_grant_refusal):
             assert result.status != "error"
             assert called == [f"plugin-{index}"]
         else:
             assert result.status == "error"
             assert called == []
-            assert expected_reason in str(result.content)
+            assert (
+                "scoped PR grant refused" if hard_grant_refusal and not enforce
+                else expected_reason
+            ) in str(result.content)
         if refusal_reason is not None:
             assert decision.would_block
             assert decision.is_shadow_decision is not enforce

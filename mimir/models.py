@@ -1186,6 +1186,8 @@ class RepoPRActionScope:
     # Provider-observed content provenance. The executing principal is always the
     # configured bot, so it cannot stand in for the author of fetched PR bytes.
     pull_request_author: str | None = None
+    # The trusted scope issuer, not the action vocabulary, selects the plugin owner.
+    owner: str = "cultivate"
     scope_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1213,6 +1215,7 @@ class RepoPRActionScope:
             "observed_head_sha": self.observed_head_sha,
             "base_ref": self.base_ref,
             "observed_base_sha": self.observed_base_sha,
+            "owner": self.owner,
         }
         if self.checkout_ref is not None:
             authority["checkout_ref"] = self.checkout_ref

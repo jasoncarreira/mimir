@@ -9015,12 +9015,15 @@ class ScopedPRGrants:
     def issue(self, scope: Any) -> None:
         """Issue only for a host-resolved scope, never for model arguments."""
         with self._lock:
-            for owner, protocol in self._protocols.items():
-                checkout = getattr(protocol.checkout_action, "value", None)
-                if checkout in scope.allowed_operations:
-                    key = (owner, scope.scope_id)
-                    if key not in self._prelease and key not in self._pending and key not in self._follow:
-                        self._prelease[key] = self._grant(owner, scope, checkout, None)
+            owner = getattr(scope, "owner", None)
+            protocol = self._protocols.get(owner)
+            if protocol is None or protocol.owner != owner:
+                return
+            checkout = getattr(protocol.checkout_action, "value", None)
+            if checkout in scope.allowed_operations:
+                key = (owner, scope.scope_id)
+                if key not in self._prelease and key not in self._pending and key not in self._follow:
+                    self._prelease[key] = self._grant(owner, scope, checkout, None)
 
     def _grant(self, owner: str, scope: Any, action: str, lease: Any) -> ScopedPRGrant:
         return ScopedPRGrant(
@@ -9063,28 +9066,6 @@ class ScopedPRGrants:
             return True
 
 
-def _live_scoped_pr_lease(scope: Any, review_state: Any) -> Any | None:
-    attached = getattr(review_state, "checkout_lease", None)
-    if attached is None or not getattr(attached, "is_active", False):
-        return None
-    from .pr_checkout_lease import active_pr_checkout_lease_for_path
-
-    live = active_pr_checkout_lease_for_path(attached.path)
-    if live is None or any(getattr(live, field, None) != getattr(attached, field, None)
-                           for field in ("path", "recovery_id", "scope_id", "owner",
-                                         "head_sha", "canonical_origin", "pr_number")):
-        return None
-    if (live.scope_id != scope.scope_id or live.owner != scope.principal
-            or live.head_sha.lower() != scope.observed_head_sha.lower()
-            or live.canonical_repo.lower() != scope.canonical_repo.lower()
-            or getattr(review_state, "action_scope", None) is not scope):
-        return None
-    observed = _observed_checkout_state(live.path)
-    if observed != (scope.head_ref, getattr(review_state, "git_expected_head", None)):
-        return None
-    return live
-
-
 def _valid_scoped_pr_grant(
     auth_context: AuthContext | None, owner: str | None, action: Any,
     protocol: Any, scope: Any, review_state: Any,
@@ -9094,7 +9075,8 @@ def _valid_scoped_pr_grant(
              or protocol is None or protocol.owner != owner
              or grants._protocols.get(owner) is not protocol
             or type(action) is not protocol.action_type
-            or scope is None or grants.principal != getattr(auth_context, "canonical_principal", None)):
+             or scope is None or getattr(scope, "owner", None) != owner
+             or grants.principal != getattr(auth_context, "canonical_principal", None)):
         return False
     grant = grants.get(owner, scope, action.value)
     if (grant is None or grant._issuer is not _SCOPED_PR_ISSUER
@@ -9217,7 +9199,9 @@ def authorize_repo_pr_tool(
         decision=OperationDecision.RESOURCE_SCOPED,
         allowed=in_scope or not enforce,
         reason=None if in_scope else (
-            "repo_pr_scope_denied" if scope is None or missing_actions
+            "repo_pr_grant_denied" if registered_plugin and (
+                scope is None or missing_actions or not grant_valid
+            ) else "repo_pr_scope_denied" if scope is None or missing_actions
             else "repo_pr_grant_denied" if not grant_valid else "repo_pr_scope_denied"
         ),
         service_principal=service_principal,
