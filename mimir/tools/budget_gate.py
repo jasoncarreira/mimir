@@ -4058,11 +4058,13 @@ def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
         return None
     from ..models import RetainedFactoryScope
 
-    if isinstance(call.authorization.repo_pr_action_scope, RetainedFactoryScope):
-        return None if _retained_dispatch_scope(call) is not None else _tool_call_refusal(
+    if "retained_repo_tools" in registered.memberships and _retained_dispatch_scope(call) is None:
+        return _tool_call_refusal(
             call, "retained factory scope refused before execution", arguments=None,
             record_outcome=True,
         )
+    if isinstance(call.authorization.repo_pr_action_scope, RetainedFactoryScope):
+        return None
     from ..access_control import _valid_scoped_pr_grant
 
     protocol = (call.policy.scoped_actions.get(registered.owner)
@@ -4104,6 +4106,7 @@ def _retained_dispatch_scope(call: _PreparedToolCall) -> Any:
         or registered.resource_scope != "repo_pr"
         or not call.authorization.allowed
         or call.authorization.would_block
+        or call.authorization.decision != OperationDecision.RESOURCE_SCOPED
         or not _is_worklink_retained_checkout_service(service, auth_context=call.auth_context)
         or call.arguments.get("repository") != scope.repository
         or call.arguments.get("pull_request") != scope.issue_id
@@ -4135,11 +4138,14 @@ def _retained_execution(call: _PreparedToolCall):
 
 
 def _capture_retained_result(call: _PreparedToolCall, capture: _ToolExecutionCapture,
-                             scope: Any, result: Any) -> None:
+                              scope: Any, result: Any) -> None:
     if scope is None or not isinstance(result, ToolMessage):
         return
     content = result.content
     if not isinstance(content, (str, bytes)):
+        return
+    invocation_id = _tool_call_id(call.request)
+    if not invocation_id or result.tool_call_id != invocation_id:
         return
     from ..access_control import _RetainedResultReceipt
 
@@ -4147,6 +4153,7 @@ def _capture_retained_result(call: _PreparedToolCall, capture: _ToolExecutionCap
     capture.retained_receipt = _RetainedResultReceipt(
         call.tool_name, call.auth_context, scope, result,
         _result_is_error(call.tool_name, result, policy=selected), selected,
+        invocation_id=invocation_id,
     )
 
 

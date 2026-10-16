@@ -11269,7 +11269,8 @@ class _RetainedResultReceipt:
     """One invocation's host-observed output under the live retained lease."""
 
     def __init__(self, tool: str, context: Any, scope: RetainedFactoryScope,
-                 result: Any, failed: bool, policy: Any) -> None:
+                 result: Any, failed: bool, policy: Any,
+                 invocation_id: str | None = None) -> None:
         self.tool = tool
         self.context = context
         self.scope = scope
@@ -11278,7 +11279,7 @@ class _RetainedResultReceipt:
         self.result = result
         self._used = False
         self._lock = threading.Lock()
-        self.invocation_id = secrets.token_hex(16)
+        self.invocation_id = invocation_id or secrets.token_hex(16)
         self.head = scope.branch
         self.lease_identity = (scope.run_id, scope.session, scope.occurrence_id, scope.scope_id)
         content = getattr(result, "content", None)
@@ -11296,6 +11297,8 @@ class _RetainedResultReceipt:
         return (
             self.tool == tool and self.context is context and self.scope is scope
             and self.result is result and self.failed == failed and self.policy is policy
+            and not failed and getattr(result, "status", None) != "error"
+            and getattr(result, "tool_call_id", None) == self.invocation_id
             and self.head == scope.branch
             and self.lease_identity == (scope.run_id, scope.session, scope.occurrence_id, scope.scope_id)
             and isinstance(content, (str, bytes))
@@ -11445,6 +11448,7 @@ def classify_protected_result(
             )
             and not authorization.would_block
             and authorization.allowed
+            and not failed
             and authorization.decision == OperationDecision.RESOURCE_SCOPED
             and isinstance(retained_receipt, _RetainedResultReceipt)
             and retained_receipt.consume(tool_name, auth_context, scope, result, failed, selected)

@@ -52,7 +52,7 @@ def test_only_host_observed_retained_output_is_complete(monkeypatch, enforced):
         "repo_diff", arguments, context, authorization, result=result,
     )
     assert next(iter(incomplete.sources)).integrity == "untrusted"
-    receipt = _RetainedResultReceipt("repo_diff", context, scope, result, False, policy)
+    receipt = _RetainedResultReceipt("repo_diff", context, scope, result, False, policy, "invocation")
     labels = classify_protected_result(
         "repo_diff", arguments, context, authorization,
         result=result, retained_receipt=receipt,
@@ -81,7 +81,7 @@ def test_receipt_cannot_attest_other_bytes_outcome_scope_or_policy(monkeypatch):
             tools=policy.tools, descriptors={}, frozen=True,
         ))},
     ):
-        receipt = _RetainedResultReceipt("repo_diff", context, scope, result, False, policy)
+        receipt = _RetainedResultReceipt("repo_diff", context, scope, result, False, policy, "invocation")
         params = dict(result=result, failed=False, authorization=authorization)
         params.update(changed)
         labels = classify_protected_result(
@@ -98,7 +98,7 @@ def test_non_retained_plugin_results_remain_incomplete_with_receipt(monkeypatch,
     policy.tools["other_read"] = SimpleNamespace(
         owner="cultivate", result_domain="repository", memberships=frozenset(),
     )
-    receipt = _RetainedResultReceipt("other_read", context, scope, result, False, policy)
+    receipt = _RetainedResultReceipt("other_read", context, scope, result, False, policy, "invocation")
     labels = classify_protected_result(
         "other_read", arguments, context, replace(authorization, tool_name="other_read"),
         result=result, retained_receipt=receipt,
@@ -108,7 +108,7 @@ def test_non_retained_plugin_results_remain_incomplete_with_receipt(monkeypatch,
 
 def test_receipt_rejects_mutated_output_even_on_same_result_object(monkeypatch):
     scope, context, policy, authorization, result, arguments = _case(monkeypatch)
-    receipt = _RetainedResultReceipt("repo_diff", context, scope, result, False, policy)
+    receipt = _RetainedResultReceipt("repo_diff", context, scope, result, False, policy, "invocation")
     result.content = "different output"
     labels = classify_protected_result(
         "repo_diff", arguments, context, authorization,
@@ -128,6 +128,7 @@ def test_retained_dispatch_requires_live_lease_and_captures_actual_output(tmp_pa
     call = SimpleNamespace(
         tool_name="repo_diff", policy=policy, auth_context=context,
         authorization=authorization, arguments=arguments,
+        request=SimpleNamespace(tool_call={"id": "invocation"}),
     )
     events = []
 
@@ -148,6 +149,12 @@ def test_retained_dispatch_requires_live_lease_and_captures_actual_output(tmp_pa
     assert capture.retained_receipt.consume("repo_diff", context, scope, result, False, policy)
     assert not capture.retained_receipt.consume("repo_diff", context, scope, result, False, policy)
 
+    capture.retained_receipt = None
+    budget_gate._capture_retained_result(
+        call, capture, scope, ToolMessage(content="claimed", tool_call_id="other"),
+    )
+    assert capture.retained_receipt is None
+
     @contextmanager
     def stale(_home, _scope):
         yield SimpleNamespace(scope=None, refusal_reason="stale occurrence")
@@ -156,3 +163,39 @@ def test_retained_dispatch_requires_live_lease_and_captures_actual_output(tmp_pa
     with pytest.raises(ToolException, match="stale occurrence"):
         with budget_gate._retained_execution(call):
             pytest.fail("handler ran without a live lease")
+
+
+@pytest.mark.parametrize("enforced", [False, True])
+def test_retained_dispatch_refuses_missing_or_stale_authority_in_both_modes(monkeypatch, enforced):
+    scope, context, policy, authorization, result, arguments = _case(monkeypatch)
+    policy.tools["repo_diff"].resource_scope = "repo_pr"
+    authorization.enforcement_enabled = enforced
+    call = SimpleNamespace(
+        tool_name="repo_diff", policy=policy, auth_context=context,
+        authorization=authorization, arguments=arguments,
+        request=SimpleNamespace(tool_call={"id": "invocation"}),
+    )
+    monkeypatch.setattr(budget_gate, "get_trusted_service_from_auth_context", lambda _ctx: object())
+    monkeypatch.setattr(budget_gate, "_tool_call_refusal", lambda *_args, **_kwargs: result)
+    authorization.repo_pr_action_scope = None
+    assert budget_gate._scoped_pr_dispatch_refusal(call) is result
+    authorization.repo_pr_action_scope = scope
+    authorization.would_block = True
+    assert budget_gate._scoped_pr_dispatch_refusal(call) is result
+
+
+@pytest.mark.parametrize("enforced", [False, True])
+def test_retained_receipt_rejects_failed_and_mismatched_invocation(monkeypatch, enforced):
+    scope, context, policy, authorization, result, arguments = _case(monkeypatch)
+    authorization.enforcement_enabled = enforced
+    for changed in (
+        {"result": ToolMessage(content="actual diff", tool_call_id="other")},
+        {"result": ToolMessage(content="actual diff", tool_call_id="invocation", status="error")},
+        {"failed": True},
+    ):
+        receipt = _RetainedResultReceipt("repo_diff", context, scope, result, False, policy, "invocation")
+        labels = classify_protected_result(
+            "repo_diff", arguments, context, authorization, retained_receipt=receipt,
+            result=changed.get("result", result), failed=changed.get("failed", False),
+        )
+        assert next(iter(labels.sources)).integrity == "untrusted"
