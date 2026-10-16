@@ -11282,6 +11282,8 @@ class _RetainedResultReceipt:
         self.head = scope.branch
         self.lease_identity = (scope.run_id, scope.session, scope.occurrence_id, scope.scope_id)
         content = getattr(result, "content", None)
+        if not isinstance(content, (str, bytes)):
+            raise ValueError("retained receipt requires captured output bytes")
         self.digest = hashlib.sha256(content.encode() if isinstance(content, str) else content).digest()
 
     def consume(self, tool: str, context: Any, scope: Any, result: Any,
@@ -11442,6 +11444,8 @@ def classify_protected_result(
                 authorization.service_principal, auth_context=auth_context,
             )
             and not authorization.would_block
+            and authorization.allowed
+            and authorization.decision == OperationDecision.RESOURCE_SCOPED
             and isinstance(retained_receipt, _RetainedResultReceipt)
             and retained_receipt.consume(tool_name, auth_context, scope, result, failed, selected)
         )

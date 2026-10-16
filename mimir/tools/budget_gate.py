@@ -4101,6 +4101,8 @@ def _retained_dispatch_scope(call: _PreparedToolCall) -> Any:
         not isinstance(scope, RetainedFactoryScope)
         or scope is not getattr(call.auth_context, "retained_factory_scope", None)
         or registered is None or "retained_repo_tools" not in registered.memberships
+        or registered.resource_scope != "repo_pr"
+        or not call.authorization.allowed
         or call.authorization.would_block
         or not _is_worklink_retained_checkout_service(service, auth_context=call.auth_context)
         or call.arguments.get("repository") != scope.repository

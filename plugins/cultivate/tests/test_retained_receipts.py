@@ -44,8 +44,10 @@ def _case(monkeypatch):
     return scope, context, policy, authorization, result, arguments
 
 
-def test_only_host_observed_retained_output_is_complete(monkeypatch):
+@pytest.mark.parametrize("enforced", [False, True])
+def test_only_host_observed_retained_output_is_complete(monkeypatch, enforced):
     scope, context, policy, authorization, result, arguments = _case(monkeypatch)
+    authorization.enforcement_enabled = enforced
     incomplete = classify_protected_result(
         "repo_diff", arguments, context, authorization, result=result,
     )
@@ -73,6 +75,11 @@ def test_receipt_cannot_attest_other_bytes_outcome_scope_or_policy(monkeypatch):
         {"failed": True},
         {"authorization": replace(authorization, repo_pr_action_scope=replace(scope, branch="other"))},
         {"authorization": replace(authorization, would_block=True)},
+        {"authorization": replace(authorization, allowed=False)},
+        {"authorization": replace(authorization, decision=OperationDecision.OPEN)},
+        {"authorization": replace(authorization, policy=SimpleNamespace(
+            tools=policy.tools, descriptors={}, frozen=True,
+        ))},
     ):
         receipt = _RetainedResultReceipt("repo_diff", context, scope, result, False, policy)
         params = dict(result=result, failed=False, authorization=authorization)
@@ -82,6 +89,32 @@ def test_receipt_cannot_attest_other_bytes_outcome_scope_or_policy(monkeypatch):
             result=params["result"], failed=params["failed"], retained_receipt=receipt,
         )
         assert next(iter(labels.sources)).integrity == "untrusted"
+
+
+@pytest.mark.parametrize("enforced", [False, True])
+def test_non_retained_plugin_results_remain_incomplete_with_receipt(monkeypatch, enforced):
+    scope, context, policy, authorization, result, arguments = _case(monkeypatch)
+    authorization.enforcement_enabled = enforced
+    policy.tools["other_read"] = SimpleNamespace(
+        owner="cultivate", result_domain="repository", memberships=frozenset(),
+    )
+    receipt = _RetainedResultReceipt("other_read", context, scope, result, False, policy)
+    labels = classify_protected_result(
+        "other_read", arguments, context, replace(authorization, tool_name="other_read"),
+        result=result, retained_receipt=receipt,
+    )
+    assert next(iter(labels.sources)).integrity == "untrusted"
+
+
+def test_receipt_rejects_mutated_output_even_on_same_result_object(monkeypatch):
+    scope, context, policy, authorization, result, arguments = _case(monkeypatch)
+    receipt = _RetainedResultReceipt("repo_diff", context, scope, result, False, policy)
+    result.content = "different output"
+    labels = classify_protected_result(
+        "repo_diff", arguments, context, authorization,
+        result=result, retained_receipt=receipt,
+    )
+    assert next(iter(labels.sources)).integrity == "untrusted"
 
 
 def test_retained_dispatch_requires_live_lease_and_captures_actual_output(tmp_path, monkeypatch):
