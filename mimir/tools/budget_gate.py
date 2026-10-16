@@ -4177,6 +4177,13 @@ def _scoped_pr_lease_observation_refusal(
     )
     if state is None and registry is not None:
         state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    if (
+        call.tool_name != "repo_checkout" and _plugin_tool(call.tool_name, call.policy) is None
+        and state is not None and state.checkout_lease is None
+    ):
+        # Core's pre-lease refusals are still classified by the core wrapper;
+        # there was no lease for this middleware invocation to hold or observe.
+        return None
     try:
         if state is None or state.action_scope is not scope or state.checkout_lease is None:
             raise RuntimeError("scoped checkout state changed")
