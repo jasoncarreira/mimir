@@ -23,14 +23,15 @@ from mimir_cultivate.worklink.backends import opencode
 from mimir_cultivate.worklink.backends.base import WorkOrder
 
 
-def test_worker_protocol_matches_controller_and_legacy_image() -> None:
-    from mimir.worklink import worker_client as legacy_client
-
-    assert worker_client.EXECUTOR_PROTOCOL_IDENTITY == worker_exec.EXECUTOR_PROTOCOL_IDENTITY
-    assert worker_client.EXECUTOR_PROTOCOL_IDENTITY == legacy_client.EXECUTOR_PROTOCOL_IDENTITY
-    assert worker_client.MAX_REQUEST_BYTES == legacy_client.MAX_REQUEST_BYTES
-    assert worker_client.MAX_PROJECTION_BYTES == legacy_client.MAX_PROJECTION_BYTES
-    assert worker_client.DEFAULT_EXECUTOR_SOCKET == legacy_client.DEFAULT_EXECUTOR_SOCKET
+def test_worker_protocol_matches_executor_image_contract() -> None:
+    expected_protocol = "worklink-executor-v12-factory-cancel"
+    assert worker_client.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
+    assert worker_exec.EXECUTOR_PROTOCOL_IDENTITY == expected_protocol
+    assert worker_client.MAX_REQUEST_BYTES == worker_exec.MAX_REQUEST_BYTES == 256 * 1024
+    assert worker_client.MAX_PROJECTION_BYTES == worker_exec.MAX_PROJECTION_BYTES == 1024 * 1024
+    assert worker_client.DEFAULT_EXECUTOR_SOCKET == worker_exec.DEFAULT_EXECUTOR_SOCKET == Path(
+        "/run/mimir-worklink/socket/worklink-execd.sock"
+    )
 
 
 def test_factory_checkout_binding_rejects_ambiguous_paths() -> None:
@@ -167,6 +168,41 @@ def test_provider_executor_refuses_fd_identity_and_symlink_checkout(
         os.close(old_cwd)
 
 
+def test_provider_executor_refuses_mismatched_factory_run_uid_before_opening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "worklink"
+    monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setattr(
+        worker_exec, "get_identities",
+        lambda: SimpleNamespace(worklink_uid=2001),
+    )
+
+    def unexpected_open(*args, **kwargs):
+        pytest.fail("executor opened a checkout for a mismatched worker uid")
+
+    monkeypatch.setattr(worker_exec.os, "open", unexpected_open)
+    with pytest.raises(RuntimeError, match="invalid worker uid"):
+        worker_exec._open_factory_checkout({
+            "issue": 1949, "attempt": 1,
+            "path": str(root / "repo" / "1949-1" / "checkout"),
+            "run_uid": 2002,
+        })
+
+
+def test_provider_worker_identity_guard_rejects_wrong_uid_without_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        worker_exec, "get_identities",
+        lambda: SimpleNamespace(worklink_uid=2001, worklink_gid=2002),
+    )
+    monkeypatch.setattr(worker_exec.os, "getresuid", lambda: (2001, 2001, 0))
+    monkeypatch.setattr(worker_exec.os, "getresgid", lambda: (2002, 2002, 2002))
+    with pytest.raises(RuntimeError, match="worker identity drop failed"):
+        worker_exec._verify_worker_identity()
+
+
 def test_provider_factory_file_child_in_isolated_interpreter(tmp_path: Path) -> None:
     run_id = "chainlink-1949"
     sandbox = tmp_path / ".factory-sandboxes" / run_id
@@ -251,11 +287,12 @@ def test_provider_stop_marker_and_failure_ledger_block_dispatch(tmp_path: Path) 
 
 
 def test_provider_tool_pin_is_independent_of_core_backend() -> None:
-    from mimir.worklink.backends.registry import ToolPin as CoreToolPin
-
     pin = tool_pins.default_tool_pins()[0]
     assert type(pin) is tool_pins.ToolPin
-    assert not isinstance(pin, CoreToolPin)
+    assert type(pin).__module__ == "mimir_cultivate.worklink.tool_pins"
+    assert tuple(pin.__dataclass_fields__) == (
+        "name", "category", "pin", "smoke", "source", "package", "repo", "install", "risk",
+    )
     assert pin.name == "chainlink"
     with pytest.raises(AttributeError):
         pin.pin = "untrusted"
