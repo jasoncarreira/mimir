@@ -1879,10 +1879,10 @@ def acquire_pr_checkout_lease(
         raise RuntimeError("PR checkout lease root may not be a symlink")
     root = (lease_root.resolve(strict=True) if lease_root is not None
             else configured_pr_checkout_lease_root())
-    from mimir.pr_checkout_lease import _borrowed_pr_checkout_lock
+    from mimir.tools.budget_gate import borrowed_pr_checkout_lock
 
     directory_fd = os.open(root, os.O_RDONLY)
-    borrowed = _borrowed_pr_checkout_lock(root)
+    borrowed = borrowed_pr_checkout_lock(root)
     try:
         if not borrowed:
             fcntl.flock(directory_fd, fcntl.LOCK_EX)

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import fcntl
 import inspect
 import json
 import logging
@@ -46,12 +47,13 @@ import shlex
 import stat
 import time
 from collections.abc import Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import UnionType
-from typing import Annotated, Any, Awaitable, Callable, Union, get_args, get_origin
+from typing import Annotated, Any, Awaitable, Callable, Iterator, Union, get_args, get_origin
 
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
@@ -61,7 +63,7 @@ import yaml
 
 from ..env import env_bool
 from ..event_logger import emit_event_background as _emit_event_sync
-from ..models import AuthContext, InformationFlowState
+from ..models import AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel
 from ..plugins.core import policy_membership, scoped_policy_call, selected_policy_registry
 from ..redaction import redact_text
 from ..tool_descriptors import (
@@ -121,6 +123,108 @@ from .client_provider import (
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
 log = logging.getLogger(__name__)
+
+_pr_acquisition_lock: ContextVar[tuple[Path, int] | None] = ContextVar(
+    "pr_checkout_host_acquisition_lock", default=None,
+)
+
+
+def lock_pr_checkout_acquisition_root() -> tuple[Path, int]:
+    """Lock the server-configured lease root before the checkout handler starts."""
+    value = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
+    if not value or not Path(value).is_absolute():
+        raise RuntimeError("MIMIR_PR_CHECKOUT_LEASE_ROOT must be an absolute path")
+    root = Path(value)
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink():
+        raise RuntimeError("PR checkout lease root may not be a symlink")
+    root = root.resolve(strict=True)
+    fd = os.open(root, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(fd)
+        raise
+    return root, fd
+
+
+@contextmanager
+def bind_pr_checkout_acquisition(root: Path, fd: int) -> Iterator[Path]:
+    """Keep an acquired root lock on this dispatch through result observation."""
+    try:
+        token = _pr_acquisition_lock.set((root, fd))
+        try:
+            yield root
+        finally:
+            _pr_acquisition_lock.reset(token)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextmanager
+def hold_pr_checkout_acquisition() -> Iterator[Path]:
+    with bind_pr_checkout_acquisition(*lock_pr_checkout_acquisition_root()) as root:
+        yield root
+
+
+def borrowed_pr_checkout_lock(root: Path) -> bool:
+    """Only the current host-held acquisition can reuse its exclusive lock."""
+    binding = _pr_acquisition_lock.get()
+    if binding is None:
+        return False
+    if binding[0] != root:
+        raise RuntimeError("PR checkout acquisition root changed during dispatch")
+    return binding[1] >= 0
+
+
+def _assert_observed_pr_checkout_lease(lease: Any) -> None:
+    """Validate the host-held lease identity against its recorded checkout."""
+    root = Path(lease.lease_root)
+    path = Path(lease.path)
+    if root.is_symlink() or path.is_symlink() or not lease.is_active:
+        raise RuntimeError("PR checkout lease is no longer live")
+    root = root.resolve(strict=True)
+    if path.parent.resolve(strict=True) != root or not path.is_dir():
+        raise RuntimeError("PR checkout lease path changed")
+    git_dir = path / ".git"
+    metadata = git_dir / "mimir-pr-checkout-lease.json"
+    if (
+        git_dir.is_symlink() or not git_dir.is_dir() or metadata.is_symlink()
+        or not metadata.is_file()
+        or (git_dir / "mimir-pr-checkout-lease-reclamation.json").exists()
+    ):
+        raise RuntimeError("PR checkout lease metadata is unavailable")
+    raw = json.loads(metadata.read_text(encoding="utf-8"))
+    expected = {
+        "canonical_repo": lease.canonical_repo,
+        "canonical_origin": lease.canonical_origin,
+        "scope_id": lease.scope_id,
+        "owner": lease.owner,
+        "recovery_id": lease.recovery_id,
+        "head_sha": lease.head_sha,
+        "expires_at": lease.expires_at.isoformat(),
+        "path": str(path),
+        "lease_root": str(root),
+        "pr_number": lease.pr_number,
+    }
+    if not isinstance(raw, dict) or any(raw.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("PR checkout lease identity changed")
+
+
+@contextmanager
+def _hold_observed_pr_checkout_lease(lease: Any) -> Iterator[None]:
+    root = Path(lease.lease_root)
+    if root.is_symlink():
+        raise RuntimeError("PR checkout lease root may not be a symlink")
+    fd = os.open(root.resolve(strict=True), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        _assert_observed_pr_checkout_lease(lease)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 def _plugin_tool(tool_name: str, policy: Any) -> Any:
     selected = policy if policy is not None else selected_policy_registry()
@@ -4008,8 +4112,6 @@ def _finish_tool_result(
     result: ToolMessage | Command,
 ) -> ToolMessage | Command:
     is_error = _result_is_error(call.tool_name, result, policy=call.policy)
-    if not is_error:
-        _record_tool_outcome(call.tool_name, policy=call.policy)
     result_labels = _result_labels_for_call(
         call.tool_name,
         call.arguments,
@@ -4021,10 +4123,17 @@ def _finish_tool_result(
         failed=is_error,
         operator_declared_shell=bool(call.operator_shell_preparation and call.operator_shell_preparation.declaration),
     )
+    lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+    if lease_refusal is not None:
+        return lease_refusal
     _merge_result_labels_from_result(
         call.auth_context, result_labels, result,
         tool_name=call.tool_name, failed=is_error, policy=call.policy,
     )
+    lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+    if lease_refusal is not None:
+        _taint_expired_pr_result(call)
+        return lease_refusal
     _emit_tool_call_sync(
         call.tool_name,
         ok=not is_error,
@@ -4033,6 +4142,16 @@ def _finish_tool_result(
         arguments=call.arguments,
         operator_shell_audit=call.operator_shell_audit,
     )
+    lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+    if lease_refusal is not None:
+        _taint_expired_pr_result(call)
+        return lease_refusal
+    if not is_error:
+        _record_tool_outcome(call.tool_name, policy=call.policy)
+    lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+    if lease_refusal is not None:
+        _taint_expired_pr_result(call)
+        return lease_refusal
     return result
 
 
@@ -4124,8 +4243,6 @@ def _hold_scoped_pr_dispatch(call: _PreparedToolCall, stack: ExitStack) -> None:
     if scope is None:
         return
     if call.tool_name == "repo_checkout":
-        from ..pr_checkout_lease import hold_pr_checkout_acquisition
-
         stack.enter_context(hold_pr_checkout_acquisition())
         return
     registered = _plugin_tool(call.tool_name, call.policy)
@@ -4139,15 +4256,13 @@ def _hold_scoped_pr_dispatch(call: _PreparedToolCall, stack: ExitStack) -> None:
         state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
     if state is None or state.action_scope is not scope:
         raise ToolPolicyRefusal("scoped PR checkout state changed before dispatch")
-    from ..pr_checkout_lease import hold_pr_checkout_lease
-
     lease = state.checkout_lease
     if lease is None:
         if registered is None:
             return
         raise ToolPolicyRefusal("scoped PR checkout lease is unavailable")
     try:
-        stack.enter_context(hold_pr_checkout_lease(lease))
+        stack.enter_context(_hold_observed_pr_checkout_lease(lease))
     except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
         raise ToolPolicyRefusal("scoped PR checkout lease is no longer live") from exc
 
@@ -4187,15 +4302,14 @@ def _scoped_pr_lease_observation_refusal(
     try:
         if state is None or state.action_scope is not scope or state.checkout_lease is None:
             raise RuntimeError("scoped checkout state changed")
-        from ..pr_checkout_lease import assert_live_pr_checkout_lease
-
-        assert_live_pr_checkout_lease(state.checkout_lease)
+        _assert_observed_pr_checkout_lease(state.checkout_lease)
         if call.tool_name == "repo_checkout":
-            from ..pr_checkout_lease import configured_pr_checkout_lease_root
-
-            if state.checkout_lease.lease_root != configured_pr_checkout_lease_root():
+            if Path(state.checkout_lease.lease_root) != Path(
+                os.environ["MIMIR_PR_CHECKOUT_LEASE_ROOT"]
+            ).resolve(strict=True):
                 raise RuntimeError("checkout root changed")
-    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+            json.JSONDecodeError):
         return _tool_call_refusal(
             call, "scoped PR checkout lease expired or changed before observation",
             arguments=None, record_outcome=True,
@@ -4203,13 +4317,26 @@ def _scoped_pr_lease_observation_refusal(
     return None
 
 
+def _taint_expired_pr_result(call: _PreparedToolCall) -> None:
+    """Never leave a late-expired, already merged read as clean turn evidence."""
+    scope = call.authorization.repo_pr_action_scope
+    if scope is None:
+        return
+    _merge_result_labels(call.auth_context, InformationFlowLabels().with_source(SourceLabel(
+        principal=scope.principal,
+        domain="repository",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+        bridge_instance="forge",
+        sensitivity="internal",
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    )))
+
+
 async def _hold_scoped_pr_dispatch_async(call: _PreparedToolCall, stack: ExitStack) -> None:
     """Acquire potentially contended root locks without blocking the event loop."""
     if call.tool_name == "repo_checkout" and call.authorization.repo_pr_action_scope is not None:
-        from ..pr_checkout_lease import (
-            bind_pr_checkout_acquisition, lock_pr_checkout_acquisition_root,
-        )
-
         lock = asyncio.create_task(asyncio.to_thread(lock_pr_checkout_acquisition_root))
         try:
             root, fd = await asyncio.shield(lock)

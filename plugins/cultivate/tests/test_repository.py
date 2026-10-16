@@ -47,10 +47,7 @@ def test_repository_implementation_is_owned_by_provider() -> None:
     }
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module in forbidden:
-            # Only the host's lock carrier crosses this boundary. No core
-            # repository operation or lease implementation is imported.
-            assert node.module == "mimir.pr_checkout_lease"
-            assert {alias.name for alias in node.names} == {"_borrowed_pr_checkout_lock"}
+            pytest.fail(f"provider imports retired core repository module: {node.module}")
 
 
 def test_core_repository_compatibility_does_not_import_provider() -> None:
@@ -156,11 +153,12 @@ def test_provider_creates_and_cleans_up_checkout(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("async_mode", [False, True])
 @pytest.mark.parametrize("operation", ["repo_checkout", "repo_status"])
-@pytest.mark.parametrize("expire", [False, True])
+@pytest.mark.parametrize("expiry_point", [None, "handler", "classification", "label_merge"])
 def test_provider_checkout_handoff_and_live_result_observation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    async_mode: bool, operation: str, expire: bool,
+    async_mode: bool, operation: str, expiry_point: str | None,
 ) -> None:
+    from mimir import pr_checkout_lease
     from mimir.tools import budget_gate
 
     _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
@@ -180,6 +178,28 @@ def test_provider_checkout_handoff_and_live_result_observation(
     rebound = []
     threads = []
     original_finish = budget_gate._finish_tool_result
+    original_classify = budget_gate._result_labels_for_call
+    original_merge = budget_gate._merge_result_labels_from_result
+    clock: dict[str, datetime | None] = {"now": None}
+
+    class LeaseClock:
+        @staticmethod
+        def now(tz):
+            return clock["now"] or datetime.now(tz)
+
+    def classify(*args, **kwargs):
+        labels = original_classify(*args, **kwargs)
+        if expiry_point == "classification":
+            clock["now"] = state.checkout_lease.expires_at + timedelta(seconds=1)
+        return labels
+
+    def merge(*args, **kwargs):
+        original_merge(*args, **kwargs)
+        if expiry_point == "label_merge":
+            clock["now"] = state.checkout_lease.expires_at + timedelta(seconds=1)
+
+    monkeypatch.setattr(budget_gate, "_result_labels_for_call", classify)
+    monkeypatch.setattr(budget_gate, "_merge_result_labels_from_result", merge)
 
     def run(argv):
         return subprocess.run(
@@ -217,8 +237,12 @@ def test_provider_checkout_handoff_and_live_result_observation(
             lease = state.checkout_lease
             assert repository.RepoGitTools(state).execute(repository.GitStatus()).ok
         assert lock_is_held()
-        if expire:
-            object.__setattr__(lease, "expires_at", datetime.now(UTC) - timedelta(seconds=1))
+        if expiry_point is not None:
+            lease_module = repository if operation == "repo_checkout" else pr_checkout_lease
+            monkeypatch.setattr(lease_module, "datetime", LeaseClock)
+            clock["now"] = lease.expires_at + timedelta(
+                seconds=(1 if expiry_point == "handler" else -1),
+            )
         else:
             thread = threading.Thread(target=competitor, args=(lease,))
             threads.append(thread)
@@ -234,7 +258,8 @@ def test_provider_checkout_handoff_and_live_result_observation(
         return original_finish(call, capture, result)
 
     monkeypatch.setattr(budget_gate, "_finish_tool_result", finish)
-    token = set_current_turn(_ifc_turn(auth))
+    ctx = _ifc_turn(auth)
+    token = set_current_turn(ctx)
     try:
         request = _make_request(
             operation, "provider", auth,
@@ -250,10 +275,12 @@ def test_provider_checkout_handoff_and_live_result_observation(
     finally:
         release_competitor.set()
         reset_current_turn(token)
-    if expire:
+    if expiry_point is not None:
         assert result.status == "error"
         assert "expired or changed" in str(result.content)
-        assert calls == ["handler"]
+        assert calls == (["handler"] if expiry_point == "handler" else ["handler", "observed"])
+        if expiry_point == "label_merge":
+            assert ctx.ifc_labels.has_untrusted_active_ingest
     else:
         assert result.status != "error", result.content
         assert calls == ["handler", "observed"]

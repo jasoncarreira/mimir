@@ -187,10 +187,12 @@ def test_pr_lease_stays_locked_from_handler_through_result_observation(
 
 @pytest.mark.parametrize("async_mode", [False, True])
 @pytest.mark.parametrize("operation", ["repo_checkout", "repo_status"])
+@pytest.mark.parametrize("expiry_point", ["handler", "classification", "label_merge"])
 def test_pr_lease_expiry_during_handler_refuses_post_handler_observation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_mode: bool, operation: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_mode: bool,
+    operation: str, expiry_point: str,
 ) -> None:
-    from datetime import UTC, datetime, timedelta
+    from datetime import datetime, timedelta
     from mimir import pr_checkout_lease
     from mimir.tools import budget_gate
 
@@ -208,8 +210,32 @@ def test_pr_lease_expiry_during_handler_refuses_post_handler_observation(
         return subprocess.run(
             argv, capture_output=True, text=True, check=False, env=_fixture_git_env(),
         )
-    observed: list[str] = []
-    monkeypatch.setattr(budget_gate, "_finish_tool_result", lambda *_: observed.append("classified"))
+    clock: dict[str, datetime | None] = {"now": None}
+    classified: list[str] = []
+
+    class LeaseClock:
+        @staticmethod
+        def now(tz):
+            return clock["now"] or datetime.now(tz)
+
+    monkeypatch.setattr(pr_checkout_lease, "datetime", LeaseClock)
+    original_classify = budget_gate._result_labels_for_call
+    original_merge = budget_gate._merge_result_labels_from_result
+
+    def classification(*args, **kwargs):
+        labels = original_classify(*args, **kwargs)
+        classified.append("classified")
+        if expiry_point == "classification":
+            clock["now"] = state.checkout_lease.expires_at + timedelta(seconds=1)
+        return labels
+
+    def merge(*args, **kwargs):
+        original_merge(*args, **kwargs)
+        if expiry_point == "label_merge":
+            clock["now"] = state.checkout_lease.expires_at + timedelta(seconds=1)
+
+    monkeypatch.setattr(budget_gate, "_result_labels_for_call", classification)
+    monkeypatch.setattr(budget_gate, "_merge_result_labels_from_result", merge)
 
     def handler(req):
         if operation == "repo_checkout":
@@ -219,10 +245,11 @@ def test_pr_lease_expiry_during_handler_refuses_post_handler_observation(
             )
         else:
             lease = state.checkout_lease
-        object.__setattr__(lease, "expires_at", datetime.now(UTC) - timedelta(seconds=1))
+        clock["now"] = lease.expires_at + timedelta(seconds=(1 if expiry_point == "handler" else -1))
         return ToolMessage(content='{"ok": true}', tool_call_id=req.tool_call["id"])
 
-    token = set_current_turn(_ifc_turn(auth))
+    ctx = _ifc_turn(auth)
+    token = set_current_turn(ctx)
     try:
         request = _make_request(
             operation, "expired", auth,
@@ -239,7 +266,9 @@ def test_pr_lease_expiry_during_handler_refuses_post_handler_observation(
         reset_current_turn(token)
     assert result.status == "error"
     assert "expired or changed" in str(result.content)
-    assert observed == []
+    assert classified == ([] if expiry_point == "handler" else ["classified"])
+    if expiry_point == "label_merge":
+        assert ctx.ifc_labels.has_untrusted_active_ingest
 
 
 @pytest.mark.asyncio

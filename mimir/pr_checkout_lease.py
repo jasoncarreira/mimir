@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from contextlib import contextmanager
-from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 import fcntl
 import json
@@ -37,9 +36,6 @@ _RECOVERY_DIRECTORY = ".recovery"
 _TOMBSTONE_PREFIX = ".reclaiming-"
 PUBLISHED_HEAD_REF = "refs/mimir/pr-checkout-lease/published"
 _LEASE_ROOT_ENV = "MIMIR_PR_CHECKOUT_LEASE_ROOT"
-_host_acquisition_lock: ContextVar[tuple[Path, int] | None] = ContextVar(
-    "pr_checkout_host_acquisition_lock", default=None,
-)
 _CLEANUP_IDENTITY_FIELDS = (
     "canonical_repo",
     "canonical_origin",
@@ -335,48 +331,6 @@ def _safe_lease_path(root: Path, path: Path, *, must_exist: bool) -> Path:
     if must_exist and not path.is_dir():
         raise RuntimeError("PR checkout lease path is missing")
     return path
-
-
-@contextmanager
-def hold_pr_checkout_acquisition() -> Iterator[Path]:
-    """Keep the host's exclusive root lock across checkout and observation."""
-    with bind_pr_checkout_acquisition(*lock_pr_checkout_acquisition_root()) as root:
-        yield root
-
-
-def lock_pr_checkout_acquisition_root() -> tuple[Path, int]:
-    """Return a locked descriptor; async middleware runs this in a worker thread."""
-    root = configured_pr_checkout_lease_root()
-    fd = os.open(root, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-    except BaseException:
-        os.close(fd)
-        raise
-    return root, fd
-
-
-@contextmanager
-def bind_pr_checkout_acquisition(root: Path, fd: int) -> Iterator[Path]:
-    """Transfer an acquired root lock into the exact middleware invocation."""
-    try:
-        token = _host_acquisition_lock.set((root, fd))
-        try:
-            yield root
-        finally:
-            _host_acquisition_lock.reset(token)
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-
-
-def _borrowed_pr_checkout_lock(root: Path) -> bool:
-    binding = _host_acquisition_lock.get()
-    if binding is None:
-        return False
-    if binding[0] != root:
-        raise RuntimeError("PR checkout acquisition root changed during dispatch")
-    return binding[1] >= 0
 
 
 def assert_live_pr_checkout_lease(lease: PRCheckoutLease) -> None:
@@ -1381,8 +1335,10 @@ def acquire_pr_checkout_lease(
         raise RuntimeError("PR checkout lease root may not be a symlink")
     root = (lease_root.resolve(strict=True) if lease_root is not None
             else configured_pr_checkout_lease_root())
+    from .tools.budget_gate import borrowed_pr_checkout_lock
+
     directory_fd = os.open(root, os.O_RDONLY)
-    borrowed = _borrowed_pr_checkout_lock(root)
+    borrowed = borrowed_pr_checkout_lock(root)
     try:
         if not borrowed:
             fcntl.flock(directory_fd, fcntl.LOCK_EX)
