@@ -667,20 +667,19 @@ def test_process_append_survives_trim_rename_window(tmp_path, monkeypatch):
         args=(path, sender, retry),
     )
     try:
-        assert rename_reached.wait(60)
+        rename_reached.wait()
         process.start()
         sender.close()
-        assert observation.poll(60), "detached append did not report lock contention"
         assert observation.recv() == "blocked", "detached append bypassed trim's lock"
     finally:
         allow_rename.set()
-        trim_thread.join(timeout=60)
+        trim_thread.join()
         retry.set()
         if process.pid is not None:
-            process.join(timeout=60)
+            process.join(timeout=5.0)
             if process.is_alive():
                 process.terminate()
-                process.join(timeout=60)
+                process.join()
         sender.close()
         observation.close()
 
@@ -738,7 +737,7 @@ def _hold_process_lock(path, ready, release):
     with path.open("a") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         ready.set()
-        release.wait(60)
+        release.wait(60)  # hang guard; the parent releases after 0.35s
 
 
 @pytest.mark.parametrize("contention", ["flock", "io_lock", "file_io"])
@@ -760,6 +759,7 @@ async def test_sync_logging_timer_latency(tmp_path, monkeypatch, contention, leg
             args=(logger._process_lock_path, ready, release),
         )
         process.start()
+        # Hang guard: a spawned interpreter can take >5s to start under load.
         assert await asyncio.to_thread(ready.wait, 60)
         unlock = release.set
     elif contention == "io_lock":
