@@ -63,7 +63,7 @@ import yaml
 
 from ..env import env_bool
 from ..event_logger import emit_event_background as _emit_event_sync
-from ..models import AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel
+from ..models import AuthContext, InformationFlowLabels, InformationFlowState
 from ..plugins.core import policy_membership, scoped_policy_call, selected_policy_registry
 from ..redaction import redact_text
 from ..tool_descriptors import (
@@ -4322,15 +4322,14 @@ def _taint_expired_pr_result(call: _PreparedToolCall) -> None:
     scope = call.authorization.repo_pr_action_scope
     if scope is None:
         return
-    _merge_result_labels(call.auth_context, InformationFlowLabels().with_source(SourceLabel(
+    from ..access_control import protected_result_source
+
+    _merge_result_labels(call.auth_context, InformationFlowLabels().with_source(protected_result_source(
+        call.auth_context,
         principal=scope.principal,
         domain="repository",
         resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
         bridge_instance="forge",
-        sensitivity="internal",
-        source_kind="protected_tool",
-        integrity="untrusted",
-        integrity_effect="active_ingest",
     )))
 
 
