@@ -737,7 +737,7 @@ def _hold_process_lock(path, ready, release):
     with path.open("a") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         ready.set()
-        release.wait(5)
+        release.wait(60)  # hang guard; the parent releases after 0.35s
 
 
 @pytest.mark.parametrize("contention", ["flock", "io_lock", "file_io"])
@@ -759,7 +759,8 @@ async def test_sync_logging_timer_latency(tmp_path, monkeypatch, contention, leg
             args=(logger._process_lock_path, ready, release),
         )
         process.start()
-        assert await asyncio.to_thread(ready.wait, 5)
+        # Hang guard: a spawned interpreter can take >5s to start under load.
+        assert await asyncio.to_thread(ready.wait, 60)
         unlock = release.set
     elif contention == "io_lock":
         logger._io_lock.acquire()
@@ -800,7 +801,7 @@ async def test_sync_logging_timer_latency(tmp_path, monkeypatch, contention, leg
             await asyncio.to_thread(release_timer.join)
         await asyncio.to_thread(logger.flush_sync)
         if process is not None:
-            await asyncio.to_thread(process.join, 5)
+            await asyncio.to_thread(process.join, 60)
             assert process.exitcode == 0
     assert json.loads(logger._path.read_text())["type"] == "probe"
 

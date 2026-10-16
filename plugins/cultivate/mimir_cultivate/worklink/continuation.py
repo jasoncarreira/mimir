@@ -22,7 +22,7 @@ from mimir.http_ingress import (
 )
 from mimir.models import AgentEvent, TurnContext, TurnRecord
 from .run_state import load_run_state, run_state_path
-from mimir.worklink.dispatch_failures import is_dispatch_failure_intervention
+from .dispatch_failures import is_dispatch_failure_intervention
 
 CONTINUATION_KIND = "worklink_tool_budget_continuation"
 CONTINUATION_VERSION = 1

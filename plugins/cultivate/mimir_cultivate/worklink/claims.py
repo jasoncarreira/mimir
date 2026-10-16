@@ -21,8 +21,8 @@ import time
 from typing import Any, Callable, Iterable, Sequence
 
 from .checkout import _default_runner
-from mimir.worklink.control import operator_stop_requested
-from mimir.worklink.dispatch_failures import _find_latest_evidence_file_for_issue, record_leaf_transition_best_effort
+from .control import operator_stop_requested
+from .dispatch_failures import _find_latest_evidence_file_for_issue, record_leaf_transition_best_effort
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
 WORKLINK_EPIC_LABEL = "worklink:epic"
@@ -703,8 +703,6 @@ class ChainlinkClaims:
         effective_home = Path(home_path) if home_path is not None else self.home_path
         if effective_home is None:
             return None
-
-        from mimir.worklink.autonomy import _find_latest_evidence_file_for_issue
 
         found = _find_latest_evidence_file_for_issue(effective_home, issue_id)
         if found is None:

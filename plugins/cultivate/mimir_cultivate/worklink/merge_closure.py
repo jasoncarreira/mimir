@@ -20,7 +20,7 @@ from mimir.redaction import redact_text
 from mimir.repository_config import RepositoryConfig, RepositoryInventory
 from mimir.worklink.backends import WorklinkConfig
 from .checkout import _default_runner
-from mimir.worklink.dispatch_failures import (
+from .dispatch_failures import (
     active_failure_identities,
     current_failure_identity,
     dispatch_failure_state_dir,
