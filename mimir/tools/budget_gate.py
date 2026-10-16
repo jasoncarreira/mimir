@@ -4136,16 +4136,16 @@ def _hold_scoped_pr_dispatch(call: _PreparedToolCall, stack: ExitStack) -> None:
         state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
     if state is None or state.action_scope is not scope:
         raise ToolPolicyRefusal("scoped PR checkout state changed before dispatch")
-    from ..pr_checkout_lease import PRCheckoutLease, hold_pr_checkout_lease
+    from ..pr_checkout_lease import hold_pr_checkout_lease
 
     lease = state.checkout_lease
-    if not isinstance(lease, PRCheckoutLease):
+    if lease is None:
         if registered is None:
             return
         raise ToolPolicyRefusal("scoped PR checkout lease is unavailable")
     try:
         stack.enter_context(hold_pr_checkout_lease(lease))
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
         raise ToolPolicyRefusal("scoped PR checkout lease is no longer live") from exc
 
 
