@@ -46,6 +46,7 @@ import shlex
 import stat
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -4058,8 +4059,10 @@ def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
     scope = call.authorization.repo_pr_action_scope
     discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
     registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
-    state = (discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
-             if discovered is not None else None)
+    state = (
+        discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+        if discovered is not None else None
+    )
     if state is None and registry is not None:
         state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
     if (state is None or state.action_scope is not scope
@@ -4106,6 +4109,44 @@ def _observe_scoped_pr_checkout(call: _PreparedToolCall, result: Any, token: obj
     return scope is not None and state is not None and observe_scoped_pr_checkout(
         call.auth_context, scope, state, token, registered.owner, protocol,
     )
+
+
+def _hold_scoped_pr_dispatch(call: _PreparedToolCall, stack: ExitStack) -> None:
+    """Pin the live checkout through result classification, not just execution."""
+    if not call.tool_name.startswith("repo_") or call.tool_name in {
+        "repo_checkout", "repo_cleanup",
+    }:
+        return
+    retained = getattr(call.auth_context, "retained_factory_scope", None)
+    if (retained is not None
+            and call.arguments.get("repository") == retained.repository
+            and call.arguments.get("pull_request") == retained.issue_id):
+        return
+    scope = call.authorization.repo_pr_action_scope
+    if scope is None:
+        return
+    registered = _plugin_tool(call.tool_name, call.policy)
+    if registered is not None and registered.resource_scope != "repo_pr":
+        return
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = (discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+             if discovered is not None else None)
+    if state is None and registry is not None:
+        state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    if state is None or state.action_scope is not scope:
+        raise ToolPolicyRefusal("scoped PR checkout state changed before dispatch")
+    from ..pr_checkout_lease import PRCheckoutLease, hold_pr_checkout_lease
+
+    lease = state.checkout_lease
+    if not isinstance(lease, PRCheckoutLease):
+        if registered is None:
+            return
+        raise ToolPolicyRefusal("scoped PR checkout lease is unavailable")
+    try:
+        stack.enter_context(hold_pr_checkout_lease(lease))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ToolPolicyRefusal("scoped PR checkout lease is no longer live") from exc
 
 
 class BudgetGateMiddleware(AgentMiddleware):
@@ -4172,6 +4213,8 @@ class BudgetGateMiddleware(AgentMiddleware):
             return call
         capture = _ToolExecutionCapture()
         checkout_token = None
+        lease_stack = ExitStack()
+        capture_ended = False
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
@@ -4194,9 +4237,13 @@ class BudgetGateMiddleware(AgentMiddleware):
                     checkout_token = _consume_scoped_pr_checkout(call)
                     if checkout_token is None:
                         return _tool_call_refusal(call, "scoped PR checkout grant already used", arguments=None)
+                _hold_scoped_pr_dispatch(call, lease_stack)
                 result = handler(call.execution_request)
                 if checkout_token is not None and not _observe_scoped_pr_checkout(call, result, checkout_token):
                     return _tool_call_refusal(call, "scoped PR checkout lease was not observed", arguments=None)
+            _end_tool_execution(capture)
+            capture_ended = True
+            return _finish_tool_result(call, capture, result)
         except ToolException as exc:
             refusal = _finish_tool_exception(call, capture, exc)
             if refusal is None:
@@ -4208,8 +4255,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             _finish_tool_exception(call, capture, exc)
             raise
         finally:
-            _end_tool_execution(capture)
-        return _finish_tool_result(call, capture, result)
+            if not capture_ended:
+                _end_tool_execution(capture)
+            lease_stack.close()
 
     @scoped_policy_call(lambda bound: bound.arguments["self"]._policy)
     async def awrap_tool_call(
@@ -4281,6 +4329,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 return _tool_call_refusal(call, privacy_refusal, arguments=None)
         capture = _ToolExecutionCapture()
         checkout_token = None
+        lease_stack = ExitStack()
+        capture_ended = False
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
@@ -4305,9 +4355,13 @@ class BudgetGateMiddleware(AgentMiddleware):
                     checkout_token = _consume_scoped_pr_checkout(call)
                     if checkout_token is None:
                         return _tool_call_refusal(call, "scoped PR checkout grant already used", arguments=None)
+                _hold_scoped_pr_dispatch(call, lease_stack)
                 result = await handler(call.execution_request)
                 if checkout_token is not None and not _observe_scoped_pr_checkout(call, result, checkout_token):
                     return _tool_call_refusal(call, "scoped PR checkout lease was not observed", arguments=None)
+            _end_tool_execution(capture)
+            capture_ended = True
+            return _finish_tool_result(call, capture, result)
         except ToolException as exc:
             refusal = _finish_tool_exception(call, capture, exc)
             if refusal is None:
@@ -4319,5 +4373,6 @@ class BudgetGateMiddleware(AgentMiddleware):
             _finish_tool_exception(call, capture, exc)
             raise
         finally:
-            _end_tool_execution(capture)
-        return _finish_tool_result(call, capture, result)
+            if not capture_ended:
+                _end_tool_execution(capture)
+            lease_stack.close()

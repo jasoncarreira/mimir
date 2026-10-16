@@ -121,6 +121,37 @@ def test_pr_lease_is_continuous_and_identity_changes_on_reacquisition(tmp_path: 
         assert second.is_active
 
 
+def test_middleware_dispatch_holds_checkout_through_observation(tmp_path: Path) -> None:
+    from contextlib import ExitStack
+    from mimir.tools.budget_gate import _hold_scoped_pr_dispatch
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    assert lease is not None
+    call = SimpleNamespace(
+        tool_name="repo_status", policy=None,
+        authorization=SimpleNamespace(repo_pr_action_scope=scope),
+        auth_context=SimpleNamespace(
+            server_discovered_pr_states=None,
+            repo_pr_scope_registry=SimpleNamespace(resolve=lambda *_: state),
+        ),
+        arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+    )
+    fd = os.open(lease.lease_root, os.O_RDONLY)
+    try:
+        with ExitStack() as stack:
+            _hold_scoped_pr_dispatch(call, stack)
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Repeated observation within the same dispatch must not release it.
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def test_repo_rebase_description_matches_history_rewrite_events():
     from mimir.tools.repo import repo_rebase
 
