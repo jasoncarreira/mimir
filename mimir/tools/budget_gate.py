@@ -3583,9 +3583,13 @@ def _prepare_tool_call_execution(
             call, admin_denial, arguments=arguments,
             operator_shell_audit=operator_shell_audit,
         )
-    if getattr(authorization, "reason", None) == "repo_pr_grant_denied":
+    registered = _plugin_tool(tool_name, policy)
+    if (registered is not None and registered.resource_scope == "repo_pr"
+            and (authorization is None or authorization.reason is not None
+                 or authorization.would_block or not authorization.allowed)):
         _emit_hard_boundary_denied(
-            tool=tool_name, boundary="scoped_pr_grant", reason="repo_pr_grant_denied",
+            tool=tool_name, boundary="scoped_pr_grant",
+            reason=getattr(authorization, "reason", None) or "repo_pr_scope_denied",
             auth_context=auth_context,
         )
         return _tool_call_refusal(
@@ -4039,6 +4043,38 @@ def _scoped_pr_checkout_call(call: _PreparedToolCall) -> bool:
     )
 
 
+def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
+    """Revalidate turn authority and the owner's live lease after permission waits."""
+    registered = _plugin_tool(call.tool_name, call.policy)
+    if registered is None or registered.resource_scope != "repo_pr":
+        return None
+    from ..access_control import _valid_scoped_pr_grant
+
+    protocol = (call.policy.scoped_actions.get(registered.owner)
+                if call.policy is not None else None)
+    scope = call.authorization.repo_pr_action_scope
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = (discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+             if discovered is not None else None)
+    if state is None and registry is not None:
+        state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    if (state is None or state.action_scope is not scope
+            or not _valid_scoped_pr_grant(
+                call.auth_context, registered.owner, registered.typed_action,
+                protocol, scope, state,
+            )):
+        _emit_hard_boundary_denied(
+            tool=call.tool_name, boundary="scoped_pr_grant",
+            reason="repo_pr_grant_denied", auth_context=call.auth_context,
+        )
+        return _tool_call_refusal(
+            call, "scoped PR grant refused before execution", arguments=None,
+            record_outcome=True,
+        )
+    return None
+
+
 def _consume_scoped_pr_checkout(call: _PreparedToolCall) -> object | None:
     from ..access_control import consume_scoped_pr_checkout
 
@@ -4125,6 +4161,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 result = _permission_refusal(call, capture, permission_denial)
             if result is None:
                 result = _soft_live_execution_refusal(call)
+            if result is None:
+                result = _scoped_pr_dispatch_refusal(call)
             if result is None:
                 if _scoped_pr_checkout_call(call):
                     checkout_token = _consume_scoped_pr_checkout(call)
@@ -4234,6 +4272,8 @@ class BudgetGateMiddleware(AgentMiddleware):
                 result = _permission_refusal(call, capture, permission_denial)
             if result is None:
                 result = _soft_live_execution_refusal(call)
+            if result is None:
+                result = _scoped_pr_dispatch_refusal(call)
             if result is None:
                 if _scoped_pr_checkout_call(call):
                     checkout_token = _consume_scoped_pr_checkout(call)

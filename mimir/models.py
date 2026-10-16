@@ -1215,7 +1215,6 @@ class RepoPRActionScope:
             "observed_head_sha": self.observed_head_sha,
             "base_ref": self.base_ref,
             "observed_base_sha": self.observed_base_sha,
-            "owner": self.owner,
         }
         if self.checkout_ref is not None:
             authority["checkout_ref"] = self.checkout_ref

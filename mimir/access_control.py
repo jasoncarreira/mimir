@@ -9875,7 +9875,7 @@ class ToolRegistry:
                         return finish(ToolAuthorization(
                             tool_name=tool_name,
                             decision=OperationDecision.RESOURCE_SCOPED,
-                            allowed=not enforce,
+                            allowed=False if plugin_tool is not None else not enforce,
                             reason="repo_pr_scope_denied",
                             service_principal=preliminary_service,
                             enforcement_enabled=enforce,
