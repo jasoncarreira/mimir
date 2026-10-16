@@ -10,7 +10,9 @@ if TYPE_CHECKING:
 
 class CultivateProvider:
     def register(self, registrar: PolicyRegistrar) -> None:
-        """The package skeleton has no contributions until their resources ship."""
+        from .policy import register_action_protocol, validate_scoped_pr_action
+
+        register_action_protocol(registrar, validate_scoped_pr_action)
 
 
 provider = CultivateProvider()

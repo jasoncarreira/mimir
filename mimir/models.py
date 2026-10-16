@@ -1186,6 +1186,8 @@ class RepoPRActionScope:
     # Provider-observed content provenance. The executing principal is always the
     # configured bot, so it cannot stand in for the author of fetched PR bytes.
     pull_request_author: str | None = None
+    # The trusted scope issuer, not the action vocabulary, selects the plugin owner.
+    owner: str = "cultivate"
     scope_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1717,6 +1719,7 @@ class AuthContext(_AuthContextAuthoritySlot):
     repo_pr_action_scope: RepoPRActionScope | None = field(
         default=None, repr=False, compare=False,
     )
+    scoped_pr_grants: Any = field(default=None, repr=False, compare=False)
     # Exact CI selectors from the server-delivered github-ci-watch record.
     ci_run_targets: frozenset[tuple[str, int]] = frozenset()
     ci_branch_targets: frozenset[tuple[str, str, int | None]] = frozenset()

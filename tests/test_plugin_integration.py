@@ -14,7 +14,8 @@ from mimir.access_control import (
     HTTP_EVENT_INGRESS_EXTRA_KEY, CapabilityTier, ToolRegistry, build_trigger_service_principal,
     builtin_trigger_service_principal, classify_protected_result, get_service_principal,
     get_trusted_service_from_auth_context, normalize_sink_destination,
-    service_can_invoke_operation,
+    service_can_invoke_operation, ScopedPRGrants, _SCOPED_PR_ISSUER,
+    observe_scoped_pr_checkout, consume_scoped_pr_checkout,
 )
 from mimir.models import (
     AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState, RepoPRAction,
@@ -50,9 +51,13 @@ def policy():
     registry = PolicyRegistry()
     register_core_tools(registry)
     registrar = PolicyRegistrar(registry, "example")
-    registrar.register_scoped_action(RepoPRAction, lambda *_: True)
+    registrar.register_scoped_action(
+        RepoPRAction, lambda *_: True, checkout_action=RepoPRAction.CHECKOUT,
+        live_lease=lambda _scope, state: state.checkout_lease,
+    )
     for name, scope, extractor, category, flow, action, writes in (
         ("example_channel", "channel", _channel_target, SinkCategory.SAME_CHANNEL, "sink", None, False),
+        ("example_checkout", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.CHECKOUT, False),
         ("example_repo", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.INSPECT, False),
         ("example_pr", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.PR_COMMENT, False),
         ("example_write", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.WRITE, True),
@@ -94,10 +99,33 @@ def _state(operations):
         provenance="poller_payload", canonical_repo="acme/widget",
         canonical_root="/tmp/checkout", canonical_origin="https://github.com/acme/widget.git",
         principal="mimir-bot", event_type="pr_changes_requested_stale",
-        allowed_operations=frozenset(operations), pr_number=7,
+        allowed_operations=frozenset(operations) | {RepoPRAction.CHECKOUT.value}, pr_number=7,
         head_repo="acme/widget", head_remote="origin", destination_ref="refs/heads/fix",
         observed_head_sha="a" * 40, base_ref="main", observed_base_sha="b" * 40,
+        owner="example",
     ))
+
+
+def _granted(policy, state):
+    """Model a server-issued checkout and its observed lease for example tools."""
+    grants = ScopedPRGrants(
+        "poller:example", (state.action_scope,), protocols=policy.scoped_actions,
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    auth = _auth(
+        canonical_principal="poller:example",
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)), scoped_pr_grants=grants,
+    )
+    token = consume_scoped_pr_checkout(auth, state.action_scope, "example")
+    assert token is not None
+    state.attach_checkout_lease(SimpleNamespace(
+        path="/tmp/example-lease", recovery_id="issued", is_active=True,
+        scope_id=state.action_scope.scope_id, owner=state.action_scope.principal,
+    ))
+    assert observe_scoped_pr_checkout(
+        auth, state.action_scope, state, token, "example", policy.scoped_actions["example"],
+    )
+    return auth
 
 
 @pytest.fixture
@@ -463,7 +491,7 @@ def test_plugin_channel_requires_one_explicit_same_scope_target(policy, enforce)
 @pytest.mark.parametrize("enforce", [True, False])
 def test_plugin_repo_and_pr_require_exact_server_scope_and_action(policy, enforce, tmp_path):
     state = _state({RepoPRAction.INSPECT.value})
-    auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((state,)))
+    auth = _granted(policy, state)
     registry = ToolRegistry()
 
     def decide(name, context, repository="acme/widget", number=7):
@@ -481,18 +509,18 @@ def test_plugin_repo_and_pr_require_exact_server_scope_and_action(policy, enforc
         ("example_repo", _auth(), "acme/widget", 7),
     ):
         refusal = decide(name, context, repository, number)
-        assert refusal.reason == "repo_pr_scope_denied" and refusal.would_block
+        assert refusal.reason == "repo_pr_grant_denied" and refusal.would_block
         assert refusal.allowed is not enforce
-    with_comment = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
-        _state({RepoPRAction.PR_COMMENT.value}),
-    )))
+    comment_state = _state({RepoPRAction.INSPECT.value, RepoPRAction.PR_COMMENT.value})
+    with_comment = _granted(policy, comment_state)
     assert decide("example_pr", with_comment).allowed
+    assert decide("example_checkout", with_comment).reason == "repo_pr_grant_denied"
     retained = RetainedFactoryScope(
         issue_id=7, signature="sig", occurrence_id="occ", run_id="run", attempt=1,
         session="session", repository="acme/widget", branch="fix", sandbox=str(tmp_path),
     )
     refusal = decide("example_repo", _auth(retained_factory_scope=retained))
-    assert refusal.reason == "repo_pr_scope_denied" and refusal.would_block
+    assert refusal.reason == "repo_pr_grant_denied" and refusal.would_block
 
 
 def test_plugin_channel_sink_ifc_and_middleware_policy(policy):
@@ -516,9 +544,7 @@ def test_plugin_channel_sink_ifc_and_middleware_policy(policy):
 
 
 def test_plugin_result_domain_comes_from_authorizing_policy(policy):
-    auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
-        _state({RepoPRAction.INSPECT.value}),
-    )))
+    auth = _granted(policy, _state({RepoPRAction.INSPECT.value}))
     args = {"repository": "acme/widget", "pull_request": 7}
     decision = ToolRegistry().authorize_tool(
         "example_repo", auth, enforce=True, arguments=args, policy=policy,
@@ -540,9 +566,7 @@ async def test_plugin_standing_review_precedes_handler(
 ):
     from mimir.tools import forge
 
-    auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
-        _state({RepoPRAction.INSPECT.value}),
-    )))
+    auth = _granted(policy, _state({RepoPRAction.INSPECT.value}))
     args = {"repository": "acme/widget", "pull_request": 7}
     if review_state == "missing":
         auth = replace(auth, repo_pr_scope_registry=None)
@@ -589,9 +613,7 @@ async def test_plugin_standing_review_precedes_handler(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("asynchronous", [False, True])
 async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous, monkeypatch):
-    auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
-        _state({RepoPRAction.INSPECT.value}),
-    )))
+    auth = _granted(policy, _state({RepoPRAction.INSPECT.value}))
     request = ToolCallRequest(
         tool_call={"name": "example_repo", "args": {
             "repository": "acme/widget", "pull_request": 7,
@@ -907,18 +929,8 @@ async def test_selected_plugin_resource_calls_cross_model_middleware_boundary(
     monkeypatch.setattr(ToolRegistry, "authorize_tool", observe_authorization)
     monkeypatch.setattr(ToolRegistry, "_emit_shadow_decision", observe_shadow)
 
-    inspect = _auth(
-        enforcement_enabled=enforce,
-        repo_pr_scope_registry=RepoPRScopeRegistry((
-            _state({RepoPRAction.INSPECT.value}),
-        )),
-    )
-    comment = _auth(
-        enforcement_enabled=enforce,
-        repo_pr_scope_registry=RepoPRScopeRegistry((
-            _state({RepoPRAction.PR_COMMENT.value}),
-        )),
-    )
+    inspect = replace(_granted(policy, _state({RepoPRAction.INSPECT.value})), enforcement_enabled=enforce)
+    comment = replace(_granted(policy, _state({RepoPRAction.PR_COMMENT.value})), enforcement_enabled=enforce)
     retained = RetainedFactoryScope(
         issue_id=7, signature="sig", occurrence_id="occ", run_id="run", attempt=1,
         session="session", repository="acme/widget", branch="fix", sandbox=str(tmp_path),
@@ -929,11 +941,11 @@ async def test_selected_plugin_resource_calls_cross_model_middleware_boundary(
         ("example_channel", {"channel_id": "scheduler:other"}, inspect, "cross_channel_scope"),
         ("example_repo", {"repository": "acme/widget", "pull_request": 7}, inspect, None),
         ("example_pr", {"repository": "acme/widget", "pull_request": 7}, comment, None),
-        ("example_repo", {"repository": "acme/other", "pull_request": 7}, inspect, "repo_pr_scope_denied"),
-        ("example_repo", {"repository": "acme/widget", "pull_request": 8}, inspect, "repo_pr_scope_denied"),
-        ("example_pr", {"repository": "acme/widget", "pull_request": 7}, inspect, "repo_pr_scope_denied"),
+         ("example_repo", {"repository": "acme/other", "pull_request": 7}, inspect, "repo_pr_grant_denied"),
+         ("example_repo", {"repository": "acme/widget", "pull_request": 8}, inspect, "repo_pr_grant_denied"),
+         ("example_pr", {"repository": "acme/widget", "pull_request": 7}, inspect, "repo_pr_grant_denied"),
         ("example_repo", {"repository": "acme/widget", "pull_request": 7},
-         _auth(enforcement_enabled=enforce, retained_factory_scope=retained), "repo_pr_scope_denied"),
+         _auth(enforcement_enabled=enforce, retained_factory_scope=retained), "repo_pr_grant_denied"),
     )
     for index, (name, args, context, refusal_reason) in enumerate(cases):
         called = []
@@ -960,13 +972,17 @@ async def test_selected_plugin_resource_calls_cross_model_middleware_boundary(
             else refusal_reason
         )
         assert decision.reason == expected_reason
-        if refusal_reason is None or not enforce:
+        hard_grant_refusal = name in {"example_repo", "example_pr"} and refusal_reason is not None
+        if refusal_reason is None or (not enforce and not hard_grant_refusal):
             assert result.status != "error"
             assert called == [f"plugin-{index}"]
         else:
             assert result.status == "error"
             assert called == []
-            assert expected_reason in str(result.content)
+            assert (
+                "scoped PR grant refused" if hard_grant_refusal and not enforce
+                else expected_reason
+            ) in str(result.content)
         if refusal_reason is not None:
             assert decision.would_block
             assert decision.is_shadow_decision is not enforce
