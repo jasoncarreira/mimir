@@ -663,7 +663,7 @@ def check_and_open_defaults_upgrade(
         label=vendor_branch,
     )
     if merge_error:
-        abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE)
+        abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE, discard_changes=True)
         return DefaultsUpgradeResult(ok=False, action="error", version=version, detail=merge_error, proposal=opened)
 
     # Job-aware scheduler.yaml reconciliation (chainlink #666): propose any
@@ -680,7 +680,7 @@ def check_and_open_defaults_upgrade(
     has_diff = has_diff or sched_changed
 
     if not has_diff:
-        abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE)
+        abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE, discard_changes=True)
         _write_last_synced_version(home, version)
         _delete_ref(home, PENDING_PREVIOUS_REF)
         return DefaultsUpgradeResult(ok=True, action="vendor_updated_no_home_diff", version=version)

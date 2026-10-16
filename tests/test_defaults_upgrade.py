@@ -239,6 +239,34 @@ def test_merge_error_cleans_open_upgrade_proposal(home: Path, monkeypatch: pytes
     assert (home / du.LAST_SYNCED_VERSION_FILE).read_text(encoding="utf-8") == "1.0.0\n"
 
 
+def test_merge_error_after_partial_changes_still_cleans_upgrade_proposal(
+    home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A three-way merge that fails partway leaves uncommitted changes.
+
+    abandon_proposal refuses uncommitted changes unless discard_changes=True
+    (#2384). The upgrade lane's cleanup discards the worktree it just opened,
+    so the error is reported instead of raised.
+    """
+    _defaults(monkeypatch, identity="identity v1\n", heartbeat="heartbeat v1\n")
+    assert du.check_and_open_defaults_upgrade(home, version="1.0.0").action == "baseline_initialized"
+    _defaults(monkeypatch, identity="identity v2\n", heartbeat="heartbeat v2\n")
+
+    def partial_merge(worktree: Path, **_kwargs):
+        # Leave a tracked file half-merged, as a three-way failure part way would.
+        tracked = _git("ls-files", cwd=worktree).stdout.split()[0]
+        (worktree / tracked).write_text("half applied\n", encoding="utf-8")
+        return False, False, "boom"
+
+    monkeypatch.setattr(du, "_apply_defaults_three_way", partial_merge)
+
+    result = du.check_and_open_defaults_upgrade(home, version="1.1.0")
+
+    assert not result.ok and result.detail == "boom"
+    assert list_open_proposals(home, lane="upgrade") == []
+    assert (home / du.LAST_SYNCED_VERSION_FILE).read_text(encoding="utf-8") == "1.0.0\n"
+
+
 def test_clean_upgrade_can_auto_submit_without_reconciliation_turn(
     home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
