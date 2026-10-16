@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import fcntl
 import json
@@ -11,7 +12,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tarfile
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 import uuid
 
 from ._rmtree import rmtree_missing_ok
@@ -332,6 +333,44 @@ def _safe_lease_path(root: Path, path: Path, *, must_exist: bool) -> Path:
     return path
 
 
+def assert_live_pr_checkout_lease(lease: PRCheckoutLease) -> None:
+    """Verify the current recorded lease identity while the caller holds the root."""
+    if lease.lease_root.is_symlink():
+        raise RuntimeError("PR checkout lease root may not be a symlink")
+    root = lease.lease_root.resolve(strict=True)
+    path = _safe_lease_path(root, lease.path, must_exist=True)
+    recorded = _lease_from_recorded_metadata(path, root)
+    if (
+        not lease.is_active
+        or (path / _RECLAMATION_METADATA).exists()
+        or any(getattr(recorded, key) != getattr(lease, key) for key in (
+            "scope_id", "owner", "recovery_id", "expires_at", "head_sha",
+        ))
+    ):
+        raise RuntimeError("PR checkout lease is no longer live")
+
+
+@contextmanager
+def hold_pr_checkout_lease(lease: PRCheckoutLease) -> Iterator[PRCheckoutLease]:
+    """Keep the host's root lock from binding through the handler's last observation.
+
+    Acquisition and reclamation take an exclusive lock on this same inode. A
+    shared lock prevents either from rebinding or removing a checkout while its
+    handler runs; metadata alone cannot provide that guarantee.
+    """
+    if lease.lease_root.is_symlink():
+        raise RuntimeError("PR checkout lease root may not be a symlink")
+    root = lease.lease_root.resolve(strict=True)
+    directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_SH)
+        assert_live_pr_checkout_lease(lease)
+        yield lease
+    finally:
+        fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        os.close(directory_fd)
+
+
 def create_pr_checkout_lease(
     scope: RepoPRActionScope,
     *,
@@ -477,6 +516,29 @@ def create_pr_checkout_lease(
 
 
 def recover_pr_checkout_lease(
+    path: Path, scope: RepoPRActionScope, *, owner: str,
+    lease_root: Path | None = None, renew_expired: bool = False,
+    ttl: timedelta = timedelta(hours=2), review_state: RepoReviewState | None = None,
+    runner: Runner = _default_runner,
+) -> PRCheckoutLease:
+    """Rebind an existing checkout only while no handler can hold its old identity."""
+    root = lease_root if lease_root is not None else configured_pr_checkout_lease_root()
+    if root.is_symlink():
+        raise RuntimeError("PR checkout lease root may not be a symlink")
+    directory_fd = os.open(root.resolve(strict=True), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        return _recover_pr_checkout_lease_unlocked(
+            path, scope, owner=owner, lease_root=lease_root,
+            renew_expired=renew_expired, ttl=ttl,
+            review_state=review_state, runner=runner,
+        )
+    finally:
+        fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        os.close(directory_fd)
+
+
+def _recover_pr_checkout_lease_unlocked(
     path: Path,
     scope: RepoPRActionScope,
     *,
@@ -588,7 +650,10 @@ def recover_pr_checkout_lease(
             f"PR head advanced: scoped head {scope.observed_head_sha.lower()} is stale; "
             f"fetched head is {remote_head}"
         )
-    lease = replace_lease_expiry(lease, datetime.now(UTC) + ttl)
+    lease = replace(
+        lease, expires_at=datetime.now(UTC) + ttl,
+        recovery_id=uuid.uuid4().hex,
+    )
     (path / _METADATA).write_text(
         json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
     )
@@ -962,7 +1027,7 @@ def reclaim_expired_pr_checkout_leases(
                     "PR checkout lease reclamation found no HEAD",
                 ).lower()
                 canonical_origin_contains_head = _origin_contains_head(lease, head, runner)
-                reclaimed = cleanup_pr_checkout_lease(
+                reclaimed = _cleanup_pr_checkout_lease_unlocked(
                     lease, runner=runner, deleter=delete_verified,
                     before_bundle=lambda: on_step("bundle"),
                 )
@@ -1224,6 +1289,7 @@ def _rebind_foreign_candidate(
 
     rebound = replace(
         lease,
+        recovery_id=uuid.uuid4().hex,
         scope_base_sha=scope.observed_base_sha.lower(),
         base_sha=actual_base,
         head_sha=(head if lease.head_sha.lower() == head else scope.observed_head_sha.lower()),
@@ -1269,9 +1335,13 @@ def acquire_pr_checkout_lease(
         raise RuntimeError("PR checkout lease root may not be a symlink")
     root = (lease_root.resolve(strict=True) if lease_root is not None
             else configured_pr_checkout_lease_root())
+    from .tools.budget_gate import borrowed_pr_checkout_lock
+
     directory_fd = os.open(root, os.O_RDONLY)
+    borrowed = borrowed_pr_checkout_lock(root)
     try:
-        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        if not borrowed:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX)
         prefix = f"{scope.scope_id[:16]}-"
         paths: list[Path] = []
         foreign_leases: list[PRCheckoutLease] = []
@@ -1416,7 +1486,7 @@ def acquire_pr_checkout_lease(
                 _report_retained_candidates("pr_checkout_lease_retained", scope, retained)
 
             for lease in stale:
-                cleanup_pr_checkout_lease(
+                _cleanup_pr_checkout_lease_unlocked(
                     lease, base_ref=scope.base_ref, runner=runner,
                 )
                 _report_superseded_lease(scope, lease, observed_head)
@@ -1475,7 +1545,7 @@ def acquire_pr_checkout_lease(
                     runner=runner,
                 )
             else:
-                lease = recover_pr_checkout_lease(
+                lease = _recover_pr_checkout_lease_unlocked(
                     chosen_path,
                     scope,
                     owner=owner,
@@ -1502,11 +1572,36 @@ def acquire_pr_checkout_lease(
         _report_lease_acquired(lease, acquisition="fresh", runner=runner)
         return lease, ()
     finally:
-        fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        if not borrowed:
+            fcntl.flock(directory_fd, fcntl.LOCK_UN)
         os.close(directory_fd)
 
 
 def cleanup_pr_checkout_lease(
+    lease: PRCheckoutLease, *, base_ref: str | None = None,
+    review_state: RepoReviewState | None = None,
+    runner: Runner = _default_runner,
+    deleter: Callable[[PRCheckoutLease], None] | None = None,
+    before_bundle: Callable[[], None] | None = None,
+) -> bool:
+    """Reclaim a checkout without racing an active repository handler."""
+    if lease.lease_root.is_symlink():
+        raise RuntimeError("PR checkout lease root may not be a symlink")
+    directory_fd = os.open(
+        lease.lease_root.resolve(strict=True), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        return _cleanup_pr_checkout_lease_unlocked(
+            lease, base_ref=base_ref, review_state=review_state,
+            runner=runner, deleter=deleter, before_bundle=before_bundle,
+        )
+    finally:
+        fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        os.close(directory_fd)
+
+
+def _cleanup_pr_checkout_lease_unlocked(
     lease: PRCheckoutLease,
     *,
     base_ref: str | None = None,
