@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import fcntl
 import base64
 from dataclasses import asdict, replace
 import json
@@ -54,6 +55,8 @@ from mimir.pr_checkout_lease import (
     acquire_pr_checkout_lease,
     cleanup_pr_checkout_lease,
     create_pr_checkout_lease,
+    hold_pr_checkout_lease,
+    recover_pr_checkout_lease,
 )
 from mimir.project_tests import (
     _TIMEOUT_SECONDS,
@@ -89,6 +92,33 @@ from mimir.repo_tools import (
 )
 from mimir.tools.refusals import ToolPolicyRefusal
 from mimir.worklink.worker_client import StaleWorkerExecutorError
+
+
+def test_pr_lease_is_continuous_and_identity_changes_on_reacquisition(tmp_path: Path) -> None:
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    first = state.checkout_lease
+    assert first is not None
+
+    with hold_pr_checkout_lease(first):
+        fd = os.open(first.lease_root, os.O_RDONLY)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+        assert first.is_active
+
+    second = recover_pr_checkout_lease(
+        first.path, scope, owner=scope.principal,
+        lease_root=first.lease_root, review_state=state,
+    )
+    assert second.path == first.path
+    assert second.recovery_id != first.recovery_id
+    with pytest.raises(RuntimeError, match="no longer live"):
+        with hold_pr_checkout_lease(first):
+            pass
+    with hold_pr_checkout_lease(second):
+        assert second.is_active
 
 
 def test_repo_rebase_description_matches_history_rewrite_events():

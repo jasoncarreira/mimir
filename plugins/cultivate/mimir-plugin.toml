@@ -1,4 +1,4 @@
 name = "cultivate"
-version = "0.9.9"
+version = "0.9.10"
 license = "BUSL-1.1"
-requires_mimir = "==0.9.9"
+requires_mimir = "==0.9.10"

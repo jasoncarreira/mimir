@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mimir-cultivate"
-version = "0.9.9"
+version = "0.9.10"
 description = "Cultivate coding provider for Mimir"
 requires-python = ">=3.11"
 license = "BUSL-1.1"
-dependencies = ["mimir-agent==0.9.9"]
+dependencies = ["mimir-agent==0.9.10"]
 
 [tool.uv.sources]
 mimir-agent = { workspace = true }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import ExitStack
 from dataclasses import asdict
 import os
 import re
@@ -14,7 +15,10 @@ from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
 from ..models import AuthContext, RepoReviewState, RetainedFactoryScope, SourceLabel
-from ..pr_checkout_lease import acquire_pr_checkout_lease, cleanup_pr_checkout_lease
+from ..pr_checkout_lease import (
+    PRCheckoutLease, acquire_pr_checkout_lease, cleanup_pr_checkout_lease,
+    hold_pr_checkout_lease,
+)
 from ..project_tests import ProjectTestRefusal, RepoProjectTests
 from ..repo_tools import (
     GitCommit,
@@ -278,6 +282,7 @@ def _execute(
 ) -> dict[str, Any]:
     git_tools: RepoGitTools | None = None
     state: RepoReviewState | None = None
+    lease_guard = ExitStack()
     try:
         retained = _retained_scope(runtime, repository, pull_request)
         if retained is not None:
@@ -300,6 +305,8 @@ def _execute(
                     runtime, retained, asdict(git_tools.execute(operation)),
                 )
         state = _state(runtime, repository, pull_request)
+        if isinstance(getattr(state, "checkout_lease", None), PRCheckoutLease) and state.checkout_lease.is_active:
+            lease_guard.enter_context(hold_pr_checkout_lease(state.checkout_lease))
         git_tools = RepoGitTools(
             state,
             auth_context=getattr(runtime, "context", None) if runtime is not None else None,
@@ -360,6 +367,8 @@ def _execute(
             exc,
             execution_started=execution_started,
         ) from None
+    finally:
+        lease_guard.close()
 
 
 @tool
@@ -459,8 +468,7 @@ def repo_status(
     return _execute(runtime, repository, pull_request, GitStatus(include_untracked))
 
 
-@tool
-async def repo_test(
+async def _repo_test_unlocked(
     repository: str,
     pull_request: int,
     selectors: tuple[str, ...] = (),
@@ -557,6 +565,33 @@ async def repo_test(
                 else True
             ),
         ) from exc
+
+
+@tool
+async def repo_test(
+    repository: str,
+    pull_request: int,
+    selectors: tuple[str, ...] = (),
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+    suite: str | None = None,
+    include_output: bool = False,
+) -> dict[str, Any]:
+    """Run configured tests in a contained repository snapshot under the live lease."""
+    retained = _retained_scope(runtime, repository, pull_request)
+    if retained is not None:
+        return await _repo_test_unlocked(
+            repository, pull_request, selectors, runtime, suite, include_output,
+        )
+    state = _state(runtime, repository, pull_request)
+    lease = getattr(state, "checkout_lease", None)
+    if not isinstance(lease, PRCheckoutLease) or not lease.is_active:
+        return await _repo_test_unlocked(
+            repository, pull_request, selectors, runtime, suite, include_output,
+        )
+    with hold_pr_checkout_lease(lease):
+        return await _repo_test_unlocked(
+            repository, pull_request, selectors, runtime, suite, include_output,
+        )
 
 
 def _remediation_test_guidance(code: str, *, scoped: bool) -> str:
