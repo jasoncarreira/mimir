@@ -11,7 +11,15 @@ from typing import Any
 
 from langchain_core.tools import tool
 
-from ..worklink.autonomy import chainlink_bin
+
+
+def chainlink_bin() -> str:
+    """Resolve the chainlink binary (env override, else ``chainlink`` on PATH).
+
+    Kept local: importing ``mimir.worklink`` here would load the coding plugin's
+    package into every core tool inventory, even with coding disabled.
+    """
+    return os.environ.get("CHAINLINK_BIN") or "chainlink"
 
 # Epic histories can be several MiB. Bound raw parsing separately from the
 # small, field-bounded projection returned to the model below.

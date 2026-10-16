@@ -551,7 +551,7 @@ def check_and_open_plugin_defaults_upgrade(
         try:
             safe_destination(opened.worktree, Path("scheduler.yaml"))
         except ValueError as exc:
-            abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE)
+            abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE, discard_changes=True)
             results[name] = DefaultsUpgradeResult(False, "error", version, str(exc))
             continue
         changed, conflicts, error = _apply_defaults_three_way(
@@ -559,7 +559,7 @@ def check_and_open_plugin_defaults_upgrade(
             label=branch, plugin=name,
         )
         if error:
-            abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE)
+            abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE, discard_changes=True)
             results[name] = DefaultsUpgradeResult(False, "error", version, error)
             continue
         # Scheduler entries are append-only: already present names, including
@@ -583,7 +583,7 @@ def check_and_open_plugin_defaults_upgrade(
                 _git(["add", "scheduler.yaml"], cwd=opened.worktree)
                 changed = True
         if not changed:
-            abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE)
+            abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE, discard_changes=True)
             action = "vendor_updated_no_home_diff"
         else:
             action = "proposal_opened_conflicts" if conflicts else "proposal_opened"
@@ -795,7 +795,7 @@ def check_and_open_defaults_upgrade(
         label=vendor_branch,
     )
     if merge_error:
-        abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE)
+        abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE, discard_changes=True)
         return DefaultsUpgradeResult(ok=False, action="error", version=version, detail=merge_error, proposal=opened)
 
     # Job-aware scheduler.yaml reconciliation (chainlink #666): propose any
@@ -812,7 +812,7 @@ def check_and_open_defaults_upgrade(
     has_diff = has_diff or sched_changed
 
     if not has_diff:
-        abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE)
+        abandon_proposal(home, lane=UPGRADE_PROPOSAL_LANE, discard_changes=True)
         _write_last_synced_version(home, version)
         _delete_ref(home, PENDING_PREVIOUS_REF)
         return DefaultsUpgradeResult(ok=True, action="vendor_updated_no_home_diff", version=version)

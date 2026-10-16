@@ -36,7 +36,7 @@ def test_all_frozen_core_descriptors_come_from_registrations() -> None:
     )["descriptors"]
     registry = core_policy_registry()
     assert registry.frozen
-    assert len(registry.descriptors) == len(expected) == 100
+    assert len(registry.descriptors) == len(expected) == 103
     assert set(registry.descriptors) == set(TOOL_DESCRIPTORS) == set(expected)
     for name, descriptor in TOOL_DESCRIPTORS.items():
         tool = registry.tools[name]
