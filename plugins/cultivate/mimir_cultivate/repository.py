@@ -877,6 +877,23 @@ def _safe_lease_path(root: Path, path: Path, *, must_exist: bool) -> Path:
     return path
 
 
+def assert_live_pr_checkout_lease(lease: PRCheckoutLease) -> None:
+    """Verify the recorded identity and expiry while the root is locked."""
+    if lease.lease_root.is_symlink():
+        raise RuntimeError("PR checkout lease root may not be a symlink")
+    root = lease.lease_root.resolve(strict=True)
+    path = _safe_lease_path(root, lease.path, must_exist=True)
+    recorded = _lease_from_recorded_metadata(path, root)
+    if (
+        not lease.is_active
+        or (path / _RECLAMATION_METADATA).exists()
+        or any(getattr(recorded, key) != getattr(lease, key) for key in (
+            "scope_id", "owner", "recovery_id", "expires_at", "head_sha",
+        ))
+    ):
+        raise RuntimeError("PR checkout lease is no longer live")
+
+
 @contextmanager
 def hold_pr_checkout_lease(lease: PRCheckoutLease) -> Iterator[PRCheckoutLease]:
     """Keep the host's root lock from binding through the handler's last observation.
@@ -891,18 +908,7 @@ def hold_pr_checkout_lease(lease: PRCheckoutLease) -> Iterator[PRCheckoutLease]:
     directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         fcntl.flock(directory_fd, fcntl.LOCK_SH)
-        path = _safe_lease_path(root, lease.path, must_exist=True)
-        recorded = _lease_from_recorded_metadata(path, root)
-        if (
-            not lease.is_active
-            or (path / _RECLAMATION_METADATA).exists()
-            or recorded.scope_id != lease.scope_id
-            or recorded.owner != lease.owner
-            or recorded.recovery_id != lease.recovery_id
-            or recorded.expires_at != lease.expires_at
-            or recorded.head_sha != lease.head_sha
-        ):
-            raise RuntimeError("PR checkout lease is no longer live")
+        assert_live_pr_checkout_lease(lease)
         yield lease
     finally:
         fcntl.flock(directory_fd, fcntl.LOCK_UN)
@@ -1873,9 +1879,13 @@ def acquire_pr_checkout_lease(
         raise RuntimeError("PR checkout lease root may not be a symlink")
     root = (lease_root.resolve(strict=True) if lease_root is not None
             else configured_pr_checkout_lease_root())
+    from mimir.pr_checkout_lease import _borrowed_pr_checkout_lock
+
     directory_fd = os.open(root, os.O_RDONLY)
+    borrowed = _borrowed_pr_checkout_lock(root)
     try:
-        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        if not borrowed:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX)
         prefix = f"{scope.scope_id[:16]}-"
         paths: list[Path] = []
         foreign_leases: list[PRCheckoutLease] = []
@@ -2106,7 +2116,8 @@ def acquire_pr_checkout_lease(
         _report_lease_acquired(lease, acquisition="fresh", runner=runner)
         return lease, ()
     finally:
-        fcntl.flock(directory_fd, fcntl.LOCK_UN)
+        if not borrowed:
+            fcntl.flock(directory_fd, fcntl.LOCK_UN)
         os.close(directory_fd)
 
 

@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import fcntl
 import json
+import os
 import subprocess
+import threading
 import time
 from dataclasses import asdict, fields, replace
 from pathlib import Path
@@ -78,8 +81,165 @@ from mimir.tools.budget_gate import (
     _result_labels_for_call,
 )
 from tests.auth_helpers import attach_middleware_auth_context
+from tests.test_repo_tools import _fixture_git_env, _repo_scope_and_state
 
 pytestmark = pytest.mark.usefixtures("middleware_event_logger")
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("operation", ["repo_checkout", "repo_status"])
+def test_pr_lease_stays_locked_from_handler_through_result_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_mode: bool, operation: str,
+) -> None:
+    from mimir import pr_checkout_lease
+    from mimir.tools import budget_gate
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    root = state.checkout_lease.lease_root
+    if operation == "repo_checkout":
+        root = tmp_path / "new-leases"
+        root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = replace(
+        _untainted_ifc_auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+    )
+    def runner(argv):
+        return subprocess.run(
+            argv, capture_output=True, text=True, check=False, env=_fixture_git_env(),
+        )
+    observed: list[str] = []
+    rebound: list[object] = []
+    threads: list[threading.Thread] = []
+    competitor_ready = threading.Event()
+    release_competitor = threading.Event()
+    completed = threading.Event()
+    original_finish = budget_gate._finish_tool_result
+
+    def competitor(lease):
+        assert exclusive_is_blocked()
+        competitor_ready.set()
+        assert release_competitor.wait(10)
+        rebound.append(pr_checkout_lease.recover_pr_checkout_lease(
+            lease.path, scope, owner=scope.principal, lease_root=root, runner=runner,
+        ))
+        completed.set()
+
+    def exclusive_is_blocked() -> bool:
+        fd = os.open(root, os.O_RDONLY)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
+
+    def handler(req):
+        if operation == "repo_checkout":
+            lease, _ = pr_checkout_lease.acquire_pr_checkout_lease(
+                scope, owner=scope.principal, lease_root=root,
+                review_state=state, runner=runner,
+            )
+        else:
+            lease = state.checkout_lease
+        assert exclusive_is_blocked()
+        competitor_thread = threading.Thread(target=competitor, args=(lease,))
+        threads.append(competitor_thread)
+        competitor_thread.start()
+        assert competitor_ready.wait(5)
+        observed.append("handler")
+        return ToolMessage(content='{"ok": true}', tool_call_id=req.tool_call["id"])
+
+    def finish(call, capture, result):
+        assert exclusive_is_blocked()
+        assert not completed.is_set()
+        assert state.checkout_lease.is_active
+        observed.append("observed")
+        return original_finish(call, capture, result)
+
+    monkeypatch.setattr(budget_gate, "_finish_tool_result", finish)
+    token = set_current_turn(_ifc_turn(auth))
+    try:
+        request = _make_request(
+            operation, "held", auth,
+            {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        )
+        if async_mode:
+            async def async_handler(req):
+                return handler(req)
+
+            result = asyncio.run(BudgetGateMiddleware().awrap_tool_call(request, async_handler))
+        else:
+            result = BudgetGateMiddleware().wrap_tool_call(request, handler)
+    finally:
+        release_competitor.set()
+        reset_current_turn(token)
+    assert result.status != "error", result.content
+    assert observed == ["handler", "observed"]
+    assert completed.wait(10)
+    assert rebound[0].recovery_id != state.checkout_lease.recovery_id
+    threads[0].join(timeout=10)
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("operation", ["repo_checkout", "repo_status"])
+def test_pr_lease_expiry_during_handler_refuses_post_handler_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_mode: bool, operation: str,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+    from mimir import pr_checkout_lease
+    from mimir.tools import budget_gate
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    root = state.checkout_lease.lease_root
+    if operation == "repo_checkout":
+        root = tmp_path / "new-leases"
+        root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = replace(
+        _untainted_ifc_auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+    )
+    def runner(argv):
+        return subprocess.run(
+            argv, capture_output=True, text=True, check=False, env=_fixture_git_env(),
+        )
+    observed: list[str] = []
+    monkeypatch.setattr(budget_gate, "_finish_tool_result", lambda *_: observed.append("classified"))
+
+    def handler(req):
+        if operation == "repo_checkout":
+            lease, _ = pr_checkout_lease.acquire_pr_checkout_lease(
+                scope, owner=scope.principal, lease_root=root,
+                review_state=state, runner=runner,
+            )
+        else:
+            lease = state.checkout_lease
+        object.__setattr__(lease, "expires_at", datetime.now(UTC) - timedelta(seconds=1))
+        return ToolMessage(content='{"ok": true}', tool_call_id=req.tool_call["id"])
+
+    token = set_current_turn(_ifc_turn(auth))
+    try:
+        request = _make_request(
+            operation, "expired", auth,
+            {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        )
+        if async_mode:
+            async def async_handler(req):
+                return handler(req)
+
+            result = asyncio.run(BudgetGateMiddleware().awrap_tool_call(request, async_handler))
+        else:
+            result = BudgetGateMiddleware().wrap_tool_call(request, handler)
+    finally:
+        reset_current_turn(token)
+    assert result.status == "error"
+    assert "expired or changed" in str(result.content)
+    assert observed == []
 
 
 @pytest.mark.asyncio
@@ -7554,12 +7714,14 @@ def test_real_repo_execution_fault_taints_turn(
 
 def test_repo_checkout_post_fetch_failure_taints_turn(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from dataclasses import replace
 
     from mimir.tools.repo import repo_checkout
 
     middleware = BudgetGateMiddleware()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
     scope = RepoPRActionScope(
         provenance="poller_payload",
         canonical_repo="owner/repo",

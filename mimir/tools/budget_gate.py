@@ -4113,9 +4113,7 @@ def _observe_scoped_pr_checkout(call: _PreparedToolCall, result: Any, token: obj
 
 def _hold_scoped_pr_dispatch(call: _PreparedToolCall, stack: ExitStack) -> None:
     """Pin the live checkout through result classification, not just execution."""
-    if not call.tool_name.startswith("repo_") or call.tool_name in {
-        "repo_checkout", "repo_cleanup",
-    }:
+    if not call.tool_name.startswith("repo_") or call.tool_name == "repo_cleanup":
         return
     retained = getattr(call.auth_context, "retained_factory_scope", None)
     if (retained is not None
@@ -4124,6 +4122,11 @@ def _hold_scoped_pr_dispatch(call: _PreparedToolCall, stack: ExitStack) -> None:
         return
     scope = call.authorization.repo_pr_action_scope
     if scope is None:
+        return
+    if call.tool_name == "repo_checkout":
+        from ..pr_checkout_lease import hold_pr_checkout_acquisition
+
+        stack.enter_context(hold_pr_checkout_acquisition())
         return
     registered = _plugin_tool(call.tool_name, call.policy)
     if registered is not None and registered.resource_scope != "repo_pr":
@@ -4147,6 +4150,79 @@ def _hold_scoped_pr_dispatch(call: _PreparedToolCall, stack: ExitStack) -> None:
         stack.enter_context(hold_pr_checkout_lease(lease))
     except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
         raise ToolPolicyRefusal("scoped PR checkout lease is no longer live") from exc
+
+
+def _scoped_pr_lease_observation_refusal(
+    call: _PreparedToolCall, result: Any,
+) -> ToolMessage | None:
+    """Do not classify output against a lease that expired during execution."""
+    if call.tool_name == "repo_cleanup" or not call.tool_name.startswith("repo_"):
+        return None
+    retained = getattr(call.auth_context, "retained_factory_scope", None)
+    if (retained is not None
+            and call.arguments.get("repository") == retained.repository
+            and call.arguments.get("pull_request") == retained.issue_id):
+        return None
+    scope = call.authorization.repo_pr_action_scope
+    if scope is None or (
+        call.tool_name == "repo_checkout"
+        and _result_is_error(call.tool_name, result, policy=call.policy)
+    ):
+        return None
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = (
+        discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+        if discovered is not None else None
+    )
+    if state is None and registry is not None:
+        state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    try:
+        if state is None or state.action_scope is not scope or state.checkout_lease is None:
+            raise RuntimeError("scoped checkout state changed")
+        from ..pr_checkout_lease import assert_live_pr_checkout_lease
+
+        assert_live_pr_checkout_lease(state.checkout_lease)
+        if call.tool_name == "repo_checkout":
+            from ..pr_checkout_lease import configured_pr_checkout_lease_root
+
+            if state.checkout_lease.lease_root != configured_pr_checkout_lease_root():
+                raise RuntimeError("checkout root changed")
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return _tool_call_refusal(
+            call, "scoped PR checkout lease expired or changed before observation",
+            arguments=None, record_outcome=True,
+        )
+    return None
+
+
+async def _hold_scoped_pr_dispatch_async(call: _PreparedToolCall, stack: ExitStack) -> None:
+    """Acquire potentially contended root locks without blocking the event loop."""
+    if call.tool_name == "repo_checkout" and call.authorization.repo_pr_action_scope is not None:
+        from ..pr_checkout_lease import (
+            bind_pr_checkout_acquisition, lock_pr_checkout_acquisition_root,
+        )
+
+        lock = asyncio.create_task(asyncio.to_thread(lock_pr_checkout_acquisition_root))
+        try:
+            root, fd = await asyncio.shield(lock)
+        except asyncio.CancelledError:
+            # A canceled to_thread keeps running. Take ownership of its fd before
+            # propagating cancellation so no root lock survives this invocation.
+            root, fd = await lock
+            with bind_pr_checkout_acquisition(root, fd):
+                pass
+            raise
+        stack.enter_context(bind_pr_checkout_acquisition(root, fd))
+        return
+    acquisition = asyncio.create_task(
+        asyncio.to_thread(_hold_scoped_pr_dispatch, call, stack)
+    )
+    try:
+        await asyncio.shield(acquisition)
+    except asyncio.CancelledError:
+        await acquisition
+        raise
 
 
 class BudgetGateMiddleware(AgentMiddleware):
@@ -4239,6 +4315,9 @@ class BudgetGateMiddleware(AgentMiddleware):
                         return _tool_call_refusal(call, "scoped PR checkout grant already used", arguments=None)
                 _hold_scoped_pr_dispatch(call, lease_stack)
                 result = handler(call.execution_request)
+                lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+                if lease_refusal is not None:
+                    return lease_refusal
                 if checkout_token is not None and not _observe_scoped_pr_checkout(call, result, checkout_token):
                     return _tool_call_refusal(call, "scoped PR checkout lease was not observed", arguments=None)
             _end_tool_execution(capture)
@@ -4355,8 +4434,11 @@ class BudgetGateMiddleware(AgentMiddleware):
                     checkout_token = _consume_scoped_pr_checkout(call)
                     if checkout_token is None:
                         return _tool_call_refusal(call, "scoped PR checkout grant already used", arguments=None)
-                _hold_scoped_pr_dispatch(call, lease_stack)
+                await _hold_scoped_pr_dispatch_async(call, lease_stack)
                 result = await handler(call.execution_request)
+                lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+                if lease_refusal is not None:
+                    return lease_refusal
                 if checkout_token is not None and not _observe_scoped_pr_checkout(call, result, checkout_token):
                     return _tool_call_refusal(call, "scoped PR checkout lease was not observed", arguments=None)
             _end_tool_execution(capture)
