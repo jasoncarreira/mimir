@@ -9161,13 +9161,15 @@ def authorize_repo_pr_tool(
         raise ValueError(f"not a typed pull-request tool: {tool_name}")
     if isinstance(scope, RetainedFactoryScope):
         in_scope = (
-            not registered_plugin
-            and tool_name in _RETAINED_REPO_TOOLS
+            tool_name in _RETAINED_REPO_TOOLS
             and isinstance(service_principal, ServicePrincipal)
             and service_principal.worklink_retained_checkout
             and service_principal.trigger == "poller"
             and service_principal.authority_profile == "github"
             and service_can_invoke_operation(service_principal, tool_name)
+            and (not registered_plugin or _is_worklink_retained_checkout_service(
+                service_principal, auth_context=auth_context,
+            ))
         )
         return ToolAuthorization(
             tool_name=tool_name,
@@ -9831,8 +9833,9 @@ class ToolRegistry:
                 )
                 retained_scope = getattr(auth_context, "retained_factory_scope", None)
                 retained_matches = (
-                    plugin_tool is None
-                    and isinstance(retained_scope, RetainedFactoryScope)
+                    isinstance(retained_scope, RetainedFactoryScope)
+                    and tool_name in _RETAINED_REPO_TOOLS
+                    and (plugin_tool is None or plugin_tool.resource_scope == "repo_pr")
                     and _is_worklink_retained_checkout_service(
                         preliminary_service, auth_context=auth_context,
                     )
@@ -10078,6 +10081,13 @@ class ToolRegistry:
                         channel_auth.flow_direction = flow_direction
                         return finish(channel_auth)
                     reason = "channel_target_required"
+                elif scope_kind == "repo_pr" and isinstance(repo_pr_action_scope, RetainedFactoryScope):
+                    return finish(authorize_repo_pr_tool(
+                        tool_name, repo_pr_action_scope,
+                        service_principal=service_principal, enforce=enforce,
+                        flow_direction=flow_direction, registered_plugin=True,
+                        auth_context=auth_context,
+                    ))
                 elif scope_kind == "repo_pr" and (
                     (protocol := (policy if policy is not None else selected_policy_registry())
                      .scoped_actions.get(plugin_tool.owner)) is not None
@@ -11255,6 +11265,91 @@ def _incomplete_protected_result(
     ))
 
 
+class _RetainedResultReceipt:
+    """One invocation's host-observed output under the live retained lease."""
+
+    def __init__(self, tool: str, context: Any, scope: RetainedFactoryScope,
+                 result: Any, failed: bool, policy: Any,
+                 *, execution_id: str, head: str,
+                 lease_identity: tuple[str, str, int, int]) -> None:
+        self.tool = tool
+        self.context = context
+        self.scope = scope
+        self.policy = policy
+        self.failed = failed
+        self.result = result
+        self._used = False
+        self._lock = threading.Lock()
+        self.execution_id = execution_id
+        self.head = head
+        self.lease_identity = lease_identity
+        content = getattr(result, "content", None)
+        if not isinstance(content, (str, bytes)):
+            raise ValueError("retained receipt requires captured output bytes")
+        self.digest = hashlib.sha256(content.encode() if isinstance(content, str) else content).digest()
+
+    def consume(self, tool: str, context: Any, scope: Any, result: Any,
+                failed: bool, policy: Any) -> bool:
+        with self._lock:
+            if self._used:
+                return False
+            self._used = True
+        content = getattr(result, "content", None)
+        return (
+            self.tool == tool and self.context is context and self.scope is scope
+            and self.result is result and self.failed == failed and self.policy is policy
+            and not failed and getattr(result, "status", None) != "error"
+            and isinstance(self.execution_id, str) and bool(self.execution_id)
+            and self._live_binding(context, scope, policy)
+            and isinstance(content, (str, bytes))
+            and hashlib.sha256(content.encode() if isinstance(content, str) else content).digest() == self.digest
+        )
+
+    def _live_binding(self, context: Any, scope: RetainedFactoryScope, policy: Any) -> bool:
+        binding = _retained_checkout_binding(scope)
+        return binding == (self.head, self.lease_identity)
+
+
+def _retained_checkout_binding(
+    scope: RetainedFactoryScope,
+) -> tuple[str, tuple[str, str, int, int]] | None:
+    """Observe the incident's checkout, never a numerically colliding PR lease."""
+    from .repo_tools import retained_factory_subprocess_runner
+    from .worklink.retained_scope import retained_factory_effect_lease
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return None
+    try:
+        with retained_factory_effect_lease(Path(home), scope) as lease:
+            if lease.scope is not scope:
+                return None
+            checkout = Path(scope.sandbox)
+            if checkout.resolve(strict=True) != checkout or not checkout.is_dir():
+                return None
+            identity = checkout.stat()
+
+            def git(*args: str) -> str | None:
+                result = retained_factory_subprocess_runner(
+                    ("git", "-C", str(checkout), *args), output_limit=4096,
+                )
+                return result.stdout.decode("ascii", "strict").strip() if result.returncode == 0 else None
+
+            if git("rev-parse", "--show-toplevel") != str(checkout):
+                return None
+            git_dir = git("rev-parse", "--absolute-git-dir")
+            if git_dir is None or not Path(git_dir).resolve(strict=True).is_relative_to(checkout):
+                return None
+            if git("branch", "--show-current") != scope.branch:
+                return None
+            head = git("rev-parse", "--verify", "HEAD^{commit}")
+            if head is None or len(head) != 40 or any(c not in "0123456789abcdef" for c in head.lower()):
+                return None
+            return head.lower(), (str(checkout), scope.scope_id, identity.st_dev, identity.st_ino)
+    except (OSError, RuntimeError, ValueError, UnicodeError):
+        return None
+
+
 def _single_filesystem_result_source(
     auth_context: "AuthContext | None", args: dict[str, Any], *, existing_file: bool,
 ) -> "SourceLabel | None":
@@ -11366,6 +11461,7 @@ def classify_protected_result(
     provenance: ProtectedResultProvenance | None = None,
     policy_refusal: ToolPolicyRefusal | None = None,
     failed: bool = False,
+    retained_receipt: _RetainedResultReceipt | None = None,
 ) -> "InformationFlowLabels | None":
     """Return server-authoritative labels for content a protected call may expose.
 
@@ -11380,12 +11476,32 @@ def classify_protected_result(
 
     # Plugin responses are provider-controlled even for sink-only tools and
     # claimed NON_INGESTING results; they never inherit core refusal exemptions.
-    registered = selected_policy_registry().tools.get(tool_name)
+    selected = authorization.policy if authorization.policy is not None else selected_policy_registry()
+    registered = selected.tools.get(tool_name)
+    retained_verified = False
     if registered is not None and registered.owner != "core":
-        return _incomplete_protected_result(
-            registered.result_domain or "unknown", arguments or {},
-            tool_name=tool_name, auth_context=auth_context,
+        scope = getattr(auth_context, "retained_factory_scope", None)
+        retained_verified = (
+            "retained_repo_tools" in registered.memberships
+            and isinstance(scope, RetainedFactoryScope)
+            and authorization.repo_pr_action_scope is scope
+            and (arguments or {}).get("repository") == scope.repository
+            and (arguments or {}).get("pull_request") == scope.issue_id
+            and _is_worklink_retained_checkout_service(
+                authorization.service_principal, auth_context=auth_context,
+            )
+            and not authorization.would_block
+            and authorization.allowed
+            and not failed
+            and authorization.decision == OperationDecision.RESOURCE_SCOPED
+            and isinstance(retained_receipt, _RetainedResultReceipt)
+            and retained_receipt.consume(tool_name, auth_context, scope, result, failed, selected)
         )
+        if not retained_verified:
+            return _incomplete_protected_result(
+                registered.result_domain or "unknown", arguments or {},
+                tool_name=tool_name, auth_context=auth_context,
+            )
 
     artifact = getattr(result, "artifact", None)
     if isinstance(artifact, ProtectedResultProvenance) and (
@@ -11428,10 +11544,11 @@ def classify_protected_result(
         return labels.with_channel(channel) if channel else labels
     retained_scope = getattr(auth_context, "retained_factory_scope", None)
     if (
-        tool_name in {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
+        tool_name in _RETAINED_REPO_TOOLS
         and retained_scope is not None
         and args.get("repository") == retained_scope.repository
         and args.get("pull_request") == retained_scope.issue_id
+        and (registered is None or registered.owner == "core" or retained_verified)
     ):
         principal = getattr(auth_context, "canonical_principal", None)
         if getattr(auth_context, "is_service", False) and principal:
