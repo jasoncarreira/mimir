@@ -1905,3 +1905,26 @@ def test_hands_sink_flow_and_ifc_inventory_is_exact() -> None:
             "client_provider",
         ),
     }
+def test_runtime_worklink_cli_hints_require_operator():
+    """Tool descriptions and refusal literals must not teach a guard bypass."""
+    import ast
+    import re
+    from pathlib import Path
+
+    import mimir
+    from mimir.tools.registry import worklink_run
+
+    root = Path(mimir.__file__).parent
+    hints = []
+    for module in root.rglob("*.py"):
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                text = node.value
+                if re.search(r"mimir worklink (?:run|resume)", text):
+                    hints.append((module.relative_to(root), text))
+                    assert not re.search(r"(?:use|run|try).*mimir worklink (?:run|resume).*force", text, re.I), module
+                    assert not re.search(r"force.*mimir worklink (?:run|resume)", text, re.I), module
+    assert hints  # Scan must continue to cover actual runtime literals.
+    assert "ask the operator to run `mimir worklink run`" in root.joinpath("tools/registry.py").read_text()
+    assert "Use ``mimir worklink run`` to force" not in worklink_run.description

@@ -104,6 +104,26 @@ def _run_memory_proposals(args: argparse.Namespace) -> int:
     return 1
 
 
+def _run_unforget(args: argparse.Namespace) -> int:
+    """Local operator command; the store enforces admin authority independently."""
+    import asyncio
+
+    from ..access_control import create_local_operator_auth_context
+    from ..saga.client import SagaStore
+
+    auth = create_local_operator_auth_context(
+        principal="operator", trigger="cli", channel_id=None,
+    )
+    client = SagaStore(db_path=args.db, require_existing=True)
+    try:
+        result = asyncio.run(client.unforget(ids=args.ids, reason=args.reason, auth_context=auth))
+        print(json.dumps(result))
+        return 0
+    except (ValueError, OSError, RuntimeError, PermissionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     """Register the ``mimir memory`` subcommand tree."""
     mem_p = sub.add_parser(
@@ -150,6 +170,12 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     listing = proposal_sub.add_parser("list", help="List pending or all proposals.")
     listing.add_argument("--status", choices=("pending", "all"), default="pending")
 
+    restore = mem_sub.add_parser("unforget", help="Operator restore of explicitly forgotten atoms.")
+    restore.add_argument("--db", type=Path, required=True, help="Existing SAGA SQLite database")
+    selector = restore.add_mutually_exclusive_group(required=True)
+    selector.add_argument("--ids", nargs="+", help="Atom IDs to restore")
+    selector.add_argument("--reason", help="Tombstone reason to restore")
+
     return mem_p
 
 
@@ -168,5 +194,7 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return _run_doctor(args)
     if action == "proposals":
         return _run_memory_proposals(args)
+    if action == "unforget":
+        return _run_unforget(args)
     parser.print_help()
     return 1

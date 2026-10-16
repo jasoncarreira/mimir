@@ -1442,6 +1442,8 @@ class Agent:
         # also returned "no commitments store" because the registry
         # setter was never invoked. Both paths now wired by build_app.
         self._commitments = commitments_store
+        from .commitment_proposals import configure_approvals as configure_closures
+        configure_closures(config.home, config.operator_alert_channel, commitments_store)
         # Turn lifecycle hooks (re-introduced in PR #213 after the
         # SDK-era chain was dropped in #181). Fired by
         # ``mimir.turn_hooks.fire_hooks(stage, self._hooks, ...)``
@@ -2072,6 +2074,20 @@ class Agent:
         from .approval_requests import (
             is_non_turn_bound_reply, pending as pending_approvals, resolve as resolve_approval,
         )
+        from .commitment_proposals import handle_reply as handle_closure_reply
+        closure_notice = await handle_closure_reply(self._config.home, event, self._identity_resolver)
+        if closure_notice is not None:
+            if self._dispatcher is not None:
+                await self._dispatcher._send_approval_notice(event.channel_id, closure_notice)
+            elif self._channels is not None:
+                await self._channels.send(event.channel_id, closure_notice, final=True)
+            return TurnRecord(
+                ts=datetime.now(timezone.utc).isoformat(), turn_id=turn_id or make_turn_id(),
+                session_id=session_id or event.channel_id or "default", saga_session_id=saga_session_id,
+                trigger=event.trigger, channel_id=event.channel_id, input=event.content or "",
+                output=closure_notice, kind="commitment_proposal_approval",
+            )
+
         async def report_early_failure(exc: Exception, ctx: Any, failed_turn_id: str) -> None:
             if event.trigger == "poller" and not getattr(ctx, "outcome_emitted", False):
                 try:
@@ -3994,6 +4010,13 @@ class Agent:
                     event.trigger,
                     event.channel_id,
                 )
+
+        if event.trigger == "scheduled_tick" and event.channel_id == "scheduler:commitments-review":
+            from .access_control import can_review_commitments
+            from .commitment_proposals import seal_review
+            from .commitments.store import run_store_io
+            if can_review_commitments(ctx.auth_context):
+                await run_store_io(seal_review, self._config.home, turn_id)
 
         return record
 

@@ -134,7 +134,10 @@ def test_prune_attempt_checkouts_skips_active(tmp_path: Path) -> None:
     # while it works in deep subdirs (the #840 worktree-loss race).
     import os
 
-    root = tmp_path / ".worklink"
+    # Nest under a parent whose name contains the live attempt's name, so every
+    # path (including the dead one) carries "840-1"; CI's run-id evidence root
+    # did this by accident (...-38597961840-1). Only whole-path checks pass here.
+    root = tmp_path / "evidence-38597961840-1" / ".worklink"
     live = root / "840-1"
     dead = root / "841-1"
     live.mkdir(parents=True)
@@ -151,7 +154,7 @@ def test_prune_attempt_checkouts_skips_active(tmp_path: Path) -> None:
         os.utime(path, (old_mtime, old_mtime))
 
     pruned = prune_attempt_checkouts(
-        tmp_path,
+        root.parent,
         older_than=timedelta(days=3),
         now=now,
         runner=runner,
@@ -159,7 +162,15 @@ def test_prune_attempt_checkouts_skips_active(tmp_path: Path) -> None:
     )
 
     assert pruned == [dead]  # only the inactive attempt is reaped
-    assert all("840-1" not in " ".join(c) for c in calls)  # live attempt untouched
+    # Live attempt untouched. Compare whole paths, not the bare "840-1" name:
+    # tmp_path can itself contain that substring (CI's evidence root embeds the
+    # run id, e.g. ...-38597961840-1), which also appears in the dead path.
+    assert calls, "the inactive attempt should have been removed through git"
+    live_prefix = str(live) + os.sep
+    assert all(
+        arg != str(live) and not arg.startswith(live_prefix)
+        for call in calls for arg in call
+    )
 
 
 def test_prune_attempt_checkouts_covers_relocated_isolated_checkouts(tmp_path: Path) -> None:

@@ -291,8 +291,8 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         # Note: forget-candidate count is surfaced separately as a
         # persistent line in the ## Self-state block (see
         # ``pending_forget_candidates_count``) — it stays visible until
-        # the agent acts (a saga_forget_ok event newer than this decay
-        # event clears it). Keeping it off the per-run line avoids
+        # a reviewed preview or deletion (saga_forget_reviewed or saga_forget_ok
+        # newer than this decay event clears it). Keeping it off the per-run line avoids
         # duplicating the same count adjacent to itself.
         result = ev.get("result") or {}
         if isinstance(result, dict):
@@ -318,6 +318,8 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             detail = ", ".join(parts) if parts else "no detail"
             return f"saga decay ran ({detail})"
         return "saga decay ran"
+    if rule_kind == "saga_forget_reviewed":
+        return "saga forget candidates reviewed without deletion"
     if rule_kind == "saga_forget_ok":
         dry = ev.get("dry_run")
         actions = ev.get("actions_taken")

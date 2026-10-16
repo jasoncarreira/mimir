@@ -2611,7 +2611,8 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("feedback_stream", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "admit"): 2,
         ("producer", "mimir/access_control.py", "_acp_failed_tool_error_result", "SourceLabel"): 1,
         ("producer", "mimir/access_control.py", "_incomplete_protected_result", "SourceLabel"): 1,
-        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel"): 6,
+        # Chainlink issues now have their own bounded read projection/source.
+        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel"): 7,
         ("producer", "mimir/access_control.py", "protected_result_source", "SourceLabel"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_commitments_block", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_self_state_block", "_prompt_source_labels"): 1,

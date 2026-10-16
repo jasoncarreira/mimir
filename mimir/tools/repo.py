@@ -495,6 +495,8 @@ async def repo_test(
                     )
                 )
                 result.pop("failure_summary", None)
+                if result["pytest_summary"] is None:
+                    result.pop("pytest_summary")
                 result = _retained_result(runtime, retained, result)
                 result["remediation_guidance"] = _remediation_test_guidance(
                     result["code"], scoped=bool(selectors),
@@ -505,6 +507,8 @@ async def repo_test(
             await RepoProjectTests(state).execute(selectors, suite=suite)
         )
         failure_summary = result.pop("failure_summary", None)
+        if result["pytest_summary"] is None:
+            result.pop("pytest_summary")
         _publish_attested_lease_result(runtime, state)
         if (
             result["code"] == "tests_failed" and not include_output

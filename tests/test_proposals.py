@@ -549,7 +549,7 @@ def test_social_surface_is_exclusive(home, rolling_forge):
         path.write_text("stray")
         result = finalize_proposal(home, lane="poller", poller=scope, title="t", rationale="r")
         assert result.reason == "outside_surface" and not result.pushed
-        assert abandon_proposal(home, lane="poller", poller=scope)
+        assert abandon_proposal(home, lane="poller", poller=scope, discard_changes=True)
 
 
 def test_social_base_drift_conflict_does_not_push(home, rolling_forge):
@@ -996,6 +996,43 @@ def test_abandon(home: Path) -> None:
     assert abandon_proposal(home) is True
     assert list_open_proposals(home) == []
     assert not r.worktree.exists()
+
+
+def test_abandon_refuses_dirty_worktree_until_explicit_discard(home: Path) -> None:
+    from mimir.proposals import proposal_discard_diffstat
+
+    opened = open_proposal(home)
+    assert opened.ok
+    edited = opened.worktree / "prompts" / "reflect.md"
+    edited.write_text("# changed\n", encoding="utf-8")
+    untracked = opened.worktree / "prompts" / "new.md"
+    untracked.write_text("new\n", encoding="utf-8")
+    stat = proposal_discard_diffstat(opened.worktree)
+    assert "reflect.md" in stat and "new.md | untracked" in stat
+    with pytest.raises(ValueError, match="discard_changes=true"):
+        abandon_proposal(home)
+    assert edited.exists() and untracked.exists()
+    assert abandon_proposal(home, discard_changes=True) is True
+    assert not opened.worktree.exists()
+
+
+def test_abandon_refuses_uninspectable_worktree_even_with_discard(home: Path, monkeypatch) -> None:
+    import mimir.proposals as proposals
+    from types import SimpleNamespace
+
+    opened = open_proposal(home)
+    assert opened.ok
+    original_git = proposals._git
+
+    def broken_status(args, cwd):
+        if args and args[0] == "status":
+            return SimpleNamespace(returncode=128, stdout="", stderr="status failed")
+        return original_git(args, cwd)
+
+    monkeypatch.setattr(proposals, "_git", broken_status)
+    with pytest.raises(ValueError, match="cannot inspect proposal changes"):
+        abandon_proposal(home, discard_changes=True)
+    assert opened.worktree.exists()
 
 
 # ─── resolved-branch cleanup ──────────────────────────────────────────

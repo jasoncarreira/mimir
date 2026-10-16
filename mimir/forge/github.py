@@ -333,8 +333,13 @@ class GitHubForgeClient:
                 if len(collected) >= limit:
                     break
         except requests.RequestException as exc:
+            warning = (
+                "; the write may have been applied; check pr_reviews / pr_comments "
+                "before retrying"
+                if method.upper() != "GET" else ""
+            )
             raise _GitHubRequestError(
-                f"forge transport failed: {type(exc).__name__}", retryable=True,
+                f"forge transport failed: {type(exc).__name__}{warning}", retryable=True,
             ) from exc
         finally:
             if response is not None:
@@ -516,6 +521,11 @@ class GitHubForgeClient:
             mergeable=data.get("mergeable") if isinstance(data.get("mergeable"), bool) else None,
             created_at=self._text(data.get("created_at"), 64),
             updated_at=self._text(data.get("updated_at"), 64),
+            merged_at=self._text(data.get("merged_at"), 64) if isinstance(data.get("merged_at"), str) else None,
+            body=self._text(
+                data.get("body") if isinstance(data.get("body"), str) else "",
+                _MAX_BODY_BYTES,
+            ).encode("utf-8")[:_MAX_BODY_BYTES].decode("utf-8", errors="ignore"),
         )
 
     def list_pull_requests(

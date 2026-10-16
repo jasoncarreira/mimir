@@ -383,7 +383,10 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # agent should know about so it can Read it.
     "saga_consolidate_ok": ("positive", "saga_consolidate_ok"),
     "saga_decay_ok": ("positive", "saga_decay_ok"),
+    # Reviewed-and-declined previews deserve the same feedback as deletion:
+    # reward completing the review, not the destructive choice.
     "saga_forget_ok": ("positive", "saga_forget_ok"),
+    "saga_forget_reviewed": ("positive", "saga_forget_reviewed"),
     "introspection_report_ok": ("positive", "introspection_ok"),
     # Wiki health — emitted by `mimir wiki backlinks` when the wiki has
     # orphan pages or dangling links. Clean wikis emit nothing (no spam
@@ -484,6 +487,7 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "saga_consolidate_ok",
     "saga_decay_ok",
     "saga_forget_ok",
+    "saga_forget_reviewed",
     "introspection_ok",
     "introspection_error",
     "heartbeat_health",

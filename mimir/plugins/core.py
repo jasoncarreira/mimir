@@ -221,7 +221,7 @@ _FLOWS = {
     "source": _names("""memory_query memory_get proposal_diff file_search mimir_get_turn
         get_turn bash_jobs_list bash_job_output fetch_channel_history list_channels
         list_schedules commitment_list read_file aread ls als glob aglob grep agrep
-        hands_read Read Glob Grep pr_metadata pr_spec pr_list pr_files pr_diff
+        hands_read Read Glob Grep chainlink_issue_show pr_metadata pr_spec pr_list pr_files pr_diff
         pr_file_content pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs
         pr_reviews pr_comments pr_review_requests repo_status repo_diff
         repo_unmerged"""),
@@ -229,9 +229,9 @@ _FLOWS = {
         abandon_proposal saga_feedback saga_mark_contributions saga_end_session
         saga_forget saga_record_skill_learning rebuild_index send_message
         operator_alert react defer_injected_message add_schedule
-        set_schedule_priority remove_schedule set_poller_overrides reload_pollers
-        commitment_complete commitment_snooze commitment_dismiss
-        request_mimir_update post_message webhook ntfy_send write_file edit_file
+        set_schedule_priority set_schedule_cron remove_schedule set_poller_overrides
+        reload_pollers commitment_propose_closure commitment_complete
+        commitment_snooze commitment_dismiss request_mimir_update post_message webhook ntfy_send write_file edit_file
         replace_file Write Edit harness_auto_deliver harness_resend_nudge
         activity_panel_post activity_panel_edit pr_submit_review
         pr_inline_review_comment pr_comment pr_edit_body issue_comment
@@ -249,12 +249,12 @@ _TIERS = {
     "scope-contained": _names("""write_file edit_file replace_file rebuild_index shell_exec
         bash_async bash_jobs_list bash_job_output read_file proposal_diff aread ls als
         glob aglob grep agrep file_search get_turn mimir_get_turn memory_get
-        send_message operator_alert task list_schedules pr_metadata pr_spec pr_list
-        pr_files pr_diff pr_file_content pr_checks pr_job_log ci_run_jobs ci_run
-        ci_recent_runs pr_reviews pr_comments pr_review_requests repo_status
-        repo_diff repo_unmerged"""),
-    "scoped-with-provenance": _names("""memory_store memory_propose open_proposal
-        submit_proposal abandon_proposal saga_feedback saga_mark_contributions
+        send_message operator_alert task list_schedules pr_metadata chainlink_issue_show
+        pr_spec pr_list pr_files pr_diff pr_file_content pr_checks pr_job_log
+        ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests
+        repo_status repo_diff repo_unmerged"""),
+    "scoped-with-provenance": _names("""memory_store memory_propose
+        commitment_propose_closure open_proposal submit_proposal abandon_proposal saga_feedback saga_mark_contributions
         saga_end_session saga_record_skill_learning pr_review_others pr_submit_review
         pr_inline_review_comment pr_comment pr_edit_body issue_comment
         pr_rerequest_review unsupported_operation repo_checkout repo_cleanup repo_fetch
@@ -269,7 +269,7 @@ _PROFILES = {
         saga_mark_contributions send_message saga_record_skill_learning operator_alert
         shell_exec bash_jobs_list bash_job_output fetch_url open_proposal
         submit_proposal abandon_proposal"""),
-    "github": _names("""worklink_run worklink_resume write_file edit_file replace_file
+    "github": _names("""chainlink_issue_show worklink_run worklink_resume write_file edit_file replace_file
         shell_exec bash_async bash_jobs_list bash_job_output read_file aread ls als glob
         aglob grep agrep file_search get_turn mimir_get_turn send_message operator_alert
         task memory_store saga_mark_contributions saga_end_session
@@ -284,8 +284,8 @@ _PROFILES = {
     "custom": frozenset.union(*_TIERS.values()) - _names(
         "issue_comment open_proposal submit_proposal abandon_proposal proposal_diff"
     ),
-    "heartbeat": _names("""write_file edit_file replace_file shell_exec bash_async
-        bash_jobs_list bash_job_output read_file aread ls als glob aglob grep agrep
+    "heartbeat": _names("""chainlink_issue_show write_file edit_file replace_file
+        shell_exec bash_async bash_jobs_list bash_job_output read_file aread ls als glob aglob grep agrep
         file_search get_turn mimir_get_turn memory_store saga_feedback
         saga_mark_contributions worklink_run send_message operator_alert fetch_url
         task list_schedules pr_metadata pr_spec pr_list pr_files pr_diff
@@ -348,6 +348,7 @@ _RESULT_DOMAINS = {
     "turn_history": _names("get_turn mimir_get_turn"),
     "saga": _names("memory_query memory_get saga_forget"),
     "commitments": _names("commitment_list"),
+    "chainlink": _names("chainlink_issue_show"),
     "shell": _names("shell_exec execute"),
     "web": _names("web_search"),
     "worklink": _names("worklink_run worklink_resume"),
@@ -373,8 +374,9 @@ _READABLE_DOMAINS = {
     "turn_history": _names("get_turn mimir_get_turn"),
     "saga": _names("memory_query memory_get"),
     "client_provider": _names("hands_read hands_python"),
+    "chainlink": _names("chainlink_issue_show"),
 }
-_READ_BACKEND = _names("""pr_job_log ci_run_jobs ci_run ci_recent_runs Read Glob
+_READ_BACKEND = _names("""chainlink_issue_show pr_job_log ci_run_jobs ci_run ci_recent_runs Read Glob
     Grep read_file proposal_diff aread ls als glob aglob grep agrep fetch_url
     pr_metadata pr_spec pr_list pr_files pr_diff pr_file_content pr_checks
     pr_reviews pr_comments pr_review_requests repo_checkout repo_fetch
@@ -392,19 +394,19 @@ _CATALOG_REPO_PR = _names("""pr_metadata pr_spec pr_files pr_diff pr_file_conten
 _CATALOG_RESOURCE = (_READ_RESOURCE_OPERATIONS | _WRITE_RESOURCE_OPERATIONS
                      | _CATALOG_REPO_PR
                      | _names("hands_read ci_run_jobs ci_run ci_recent_runs"))
-_CATALOG_ADMIN = _names("""pr_list issue_comment operator_alert
+_CATALOG_ADMIN = _names("""chainlink_issue_show pr_list issue_comment operator_alert
     approve_declassification list_channels list_schedules add_schedule
-    set_schedule_priority remove_schedule reload_pollers open_proposal proposal_diff
+    set_schedule_priority set_schedule_cron remove_schedule reload_pollers open_proposal proposal_diff
     submit_proposal abandon_proposal request_mimir_update shell_exec bash_async
     bash_jobs_list bash_job_output spawn_open_code task memory_store memory_propose
-    saga_feedback saga_mark_contributions saga_end_session saga_record_skill_learning
+    commitment_propose_closure saga_feedback saga_mark_contributions saga_end_session saga_record_skill_learning
     saga_forget set_poller_overrides download_files adownload_files rebuild_index
     hands_edit hands_shell hands_python hands_request_scope""")
 _PROTECTED_METADATA = _names("list_channels list_schedules bash_jobs_list bash_job_output")
 _FIXED_SERVICE_SINKS = _names("rebuild_index")
 _TAINT_INDEPENDENT_EGRESS = _names("fetch_url web_search")
 _WORKLINK_BUILD_TOOLS = _names("worklink_run worklink_resume")
-_SCHEDULE_WRITES = _names("add_schedule set_schedule_priority remove_schedule set_poller_overrides")
+_SCHEDULE_WRITES = _names("add_schedule set_schedule_priority set_schedule_cron remove_schedule set_poller_overrides")
 _REPO_PUBLISH_TOOLS = _names("repo_commit repo_merge repo_rebase repo_revert repo_push")
 _TAINTED_WRITES = _names("""repo_stage repo_commit repo_merge repo_rebase repo_revert
     repo_push repo_test hands_edit hands_shell hands_python memory_store saga_feedback
@@ -456,7 +458,7 @@ _WRITES_CODE_OR_STATE = (
     _TAINTED_FILE_WRITES | _SAGA_MUTATIONS | _SCHEDULE_WRITES | _WRITE_RESOURCE_OPERATIONS
     | _names("""Write Edit repo_checkout repo_cleanup repo_fetch repo_test repo_stage
         repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort
-        repo_revert repo_revert_abort repo_push memory_propose open_proposal
+        repo_revert repo_revert_abort repo_push memory_propose commitment_propose_closure open_proposal
         submit_proposal abandon_proposal rebuild_index reload_pollers
         commitment_complete commitment_snooze commitment_dismiss request_mimir_update
         shell_exec bash_async spawn_open_code Bash bash bash_exec execute aexecute
@@ -474,6 +476,7 @@ _WRITES_CODE_OR_STATE = (
 # must not be imported by a core-only policy or tool inventory.
 _RUNTIME_SURFACES = {
     "default": (
+        ("mimir.tools.chainlink", "chainlink_issue_show"),
         ("mimir.tools.registry", "approve_declassification request_operator_approval"),
         ("mimir.tools.memory", "memory_query memory_get"),
         ("mimir.tools.store", "memory_store"),
@@ -483,7 +486,7 @@ _RUNTIME_SURFACES = {
         ("mimir.tools.extra", "file_search rebuild_index mimir_get_turn get_turn shell_exec"),
         ("mimir.tools.shell_async", "bash_async bash_jobs_list bash_job_output"),
         ("mimir.tools.operator_alert", "operator_alert"),
-        ("mimir.tools.registry", "send_message react fetch_channel_history list_channels defer_injected_message list_schedules add_schedule set_schedule_priority remove_schedule set_poller_overrides reload_pollers commitment_complete commitment_snooze commitment_dismiss commitment_list worklink_run worklink_resume request_mimir_update"),
+        ("mimir.tools.registry", "send_message react fetch_channel_history list_channels defer_injected_message list_schedules add_schedule set_schedule_cron set_schedule_priority remove_schedule set_poller_overrides reload_pollers commitment_complete commitment_snooze commitment_dismiss commitment_list commitment_propose_closure worklink_run worklink_resume request_mimir_update"),
         ("mimir.tools.client_provider:HANDS_TOOLS", "hands_read hands_edit hands_shell hands_python hands_request_scope"),
     ),
     "web_search": (("mimir.tools.web", "web_search"),),
@@ -714,7 +717,7 @@ def register_core_principals(registry: PolicyRegistry) -> None:
         capabilities=tuple("""shell_exec bash_async bash_jobs_list bash_job_output
             write_file edit_file replace_file open_proposal submit_proposal
             abandon_proposal proposal_diff add_schedule set_schedule_priority
-            list_schedules read_file aread ls als glob aglob grep agrep send_message""".split()),
+            set_schedule_cron list_schedules read_file aread ls als glob aglob grep agrep send_message""".split()),
         readable_domains=("defaults", "proposal", "filesystem", "schedule_metadata", "shell_jobs"),
         sink_destinations=("operator_alert", "filesystem", "shell_process", "proposal", "scheduler", "message"),
         sink_policies=(

@@ -2361,6 +2361,56 @@ def test_pending_forget_clears_when_forget_after_decay(tmp_path: Path):
     assert pending_forget_candidates_count(events) is None
 
 
+def test_forget_review_and_delete_render_with_equal_positive_polarity(tmp_path: Path):
+    from mimir.feedback.rules import classify, _FIRST_OCCURRENCE_ONLY_KINDS
+
+    kinds = ("saga_forget_reviewed", "saga_forget_ok")
+    for kind in kinds:
+        assert classify(kind) == ("positive", kind)
+        assert kind in _FIRST_OCCURRENCE_ONLY_KINDS
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(2), "type": "saga_forget_reviewed"},
+        {"timestamp": _ts(1), "type": "saga_forget_ok", "actions_taken": 1},
+    ])
+    negatives, positives = log.recent()
+    assert negatives == []
+    assert {signal.kind for signal in positives} == set(kinds)
+    assert all(signal.polarity == "positive" for signal in positives)
+    block = render_feedback_block(negatives, positives)
+    assert "Positive (last 24h):" in block
+    assert "saga forget candidates reviewed without deletion" in block
+    assert "saga forget ran (1 acted on)" in block
+
+
+@pytest.mark.parametrize("kind", ["saga_forget_reviewed", "saga_forget_ok"])
+def test_forget_feedback_shows_only_latest_occurrence(tmp_path: Path, kind: str):
+    # Distinct delete details ensure content dedup cannot mask a missing
+    # first-occurrence rule; pin membership for the fixed-text review too.
+    from mimir.feedback.rules import _FIRST_OCCURRENCE_ONLY_KINDS
+
+    assert kind in _FIRST_OCCURRENCE_ONLY_KINDS
+    latest_ts = _ts(0.5)
+    log = _make_log(tmp_path, events=[
+        {"timestamp": _ts(2), "type": kind, "actions_taken": 1},
+        {"timestamp": latest_ts, "type": kind, "actions_taken": 2},
+    ])
+    negatives, positives = log.recent()
+    assert negatives == []
+    assert len(positives) == 1
+    assert positives[0].ts == latest_ts
+    assert positives[0].count == 2
+
+
+def test_pending_forget_clears_on_acknowledged_review_without_delete(tmp_path: Path):
+    events = tmp_path / "events.jsonl"
+    _write_jsonl(events, [
+        {"timestamp": _ts(2), "type": "saga_decay_ok",
+         "result": {"forgetting_candidates": 7}},
+        {"timestamp": _ts(1), "type": "saga_forget_reviewed"},
+    ])
+    assert pending_forget_candidates_count(events) is None
+
+
 def test_pending_forget_persists_when_forget_predates_decay(tmp_path: Path):
     """A forget from BEFORE the most recent decay doesn't clear the
     block — the new decay's count is the source of truth."""

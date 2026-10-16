@@ -1105,7 +1105,7 @@ def pending_forget_candidates_count(
                 cands = result.get("forgetting_candidates")
                 if isinstance(cands, (int, float)):
                     latest_decay_count = int(cands)
-        elif evtype == "saga_forget_ok" and latest_forget_ts is None:
+        elif evtype in ("saga_forget_ok", "saga_forget_reviewed") and latest_forget_ts is None:
             latest_forget_ts = ts
         if latest_decay_ts is not None and latest_forget_ts is not None:
             break

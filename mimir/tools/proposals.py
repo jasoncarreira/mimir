@@ -39,6 +39,7 @@ from ..proposals import (
     ProposalResult,
     poller_branch_name,
     poller_worktree_path,
+    proposal_discard_diffstat,
     abandon_proposal as _abandon_proposal,
     finalize_proposal as _finalize_proposal,
     list_open_proposals,
@@ -132,7 +133,7 @@ def _poller_context(
 
 def _run_poller(
     context: AuthContext, home: Path, operation: str, *,
-    source: str = "", title: str = "", rationale: str = "",
+    source: str = "", title: str = "", rationale: str = "", discard_changes: bool = False,
 ) -> OpenResult | ProposalResult | bool | tuple[str, Path] | str:
     from .._context import get_current_turn
     from ..access_control import get_trusted_service_from_auth_context
@@ -212,7 +213,7 @@ def _run_poller(
                         _log.warning("social-outbox proposal: could not summarize draft", exc_info=True)
                 result = _finalize_proposal(home, title=title, rationale=rationale, lane="poller", poller=scope)
                 return (result, additions) if scope.surface == "social-outbox" else result
-            return _abandon_proposal(home, lane="poller", poller=scope)
+            return _abandon_proposal(home, lane="poller", poller=scope, discard_changes=discard_changes)
         finally:
             if not expected.exists() and not expected.is_symlink():
                 state.deactivate()
@@ -347,7 +348,7 @@ async def open_proposal(
                 f"{'Opened' if result.ok else 'Already open'} `poller` {context.poller_proposal_state.scope.surface} proposal `{result.branch}`.\n"
                 f"Keep drafts under `{draft_root}`. Edit only `{rel}/{surface}/` "
                 "in this proposal worktree, never the live surface. "
-                "Call submit_proposal(title, rationale) for operator review and merge."
+                "Inspect with proposal_diff, then submit it or abandon it."
             )
     else:
         result = await asyncio.to_thread(_open_proposal, home, lane=lane)
@@ -365,7 +366,7 @@ async def open_proposal(
         rel = result.worktree.relative_to(home.resolve()) if result.worktree else "?"
         return (
             f"A `{lane}` change proposal is already open (`{result.branch}` at `{rel}`). "
-            f"Edit it and submit, or call abandon_proposal(lane={lane!r}) first."
+            "Inspect it with proposal_diff, then submit it or abandon it."
         )
     if result.reason == "no_remote":
         return (
@@ -481,9 +482,10 @@ async def submit_proposal(
 @tool
 async def abandon_proposal(
     lane: str = "agent",
+    discard_changes: bool = False,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
-    """Discard the open change proposal without opening a PR.
+    """Abandon the open proposal. Refuses uncommitted changes unless discard_changes=true.
 
     Removes the proposal's working copy and branch. Use this if you opened a
     proposal but decided not to propose the change after all.
@@ -491,6 +493,7 @@ async def abandon_proposal(
 
     Args:
         lane: Proposal lane to abandon. Defaults to ``agent``.
+        discard_changes: Explicitly discard staged, unstaged and untracked edits.
     """
     context = _poller_context(runtime, lane, "abandon_proposal")
     if context is not None:
@@ -503,15 +506,37 @@ async def abandon_proposal(
     if home is None:
         return "abandon_proposal failed: MIMIR_HOME not set — surface to the operator."
     if context is not None:
-        removed = await asyncio.to_thread(_run_poller, context, home, "abandon_proposal")
+        diffstat = ""
+        state = context.poller_proposal_state
+        if state is not None and state.active and state.worktree is not None and state.worktree.is_dir():
+            try:
+                diffstat = await asyncio.to_thread(proposal_discard_diffstat, state.worktree)
+            except ValueError:
+                pass  # _run_poller checks the binding and fails closed before deletion
+        try:
+            removed = await asyncio.to_thread(
+                _run_poller, context, home, "abandon_proposal", discard_changes=discard_changes,
+            )
+        except ValueError as exc:
+            return str(exc)
         branch = poller_branch_name(context.poller_proposal_state.scope)
-        return (f"Abandoned `poller` change proposal `{branch}`." if removed else
+        return (f"Abandoned `poller` change proposal `{branch}`. Discarded diffstat:\n{diffstat}" if removed and diffstat else
+                f"Abandoned `poller` change proposal `{branch}`." if removed else
                 "abandon_proposal: nothing to abandon (no `poller` proposal open).")
     open_now = await asyncio.to_thread(list_open_proposals, home, lane=lane)
-    removed = await asyncio.to_thread(_abandon_proposal, home, lane=lane)
+    try:
+        diffstat = await asyncio.to_thread(proposal_discard_diffstat, open_now[0][1]) if open_now else ""
+    except ValueError:
+        diffstat = ""  # core still refuses deletion if status cannot be inspected
+    try:
+        removed = await asyncio.to_thread(_abandon_proposal, home, lane=lane, discard_changes=discard_changes)
+    except ValueError as exc:
+        return str(exc)
     if removed:
         branch = open_now[0][0] if open_now else "?"
-        return f"Abandoned `{lane}` change proposal `{branch}`."
+        return f"Abandoned `{lane}` change proposal `{branch}`." + (
+            f" Discarded diffstat:\n{diffstat}" if diffstat else ""
+        )
     return f"abandon_proposal: nothing to abandon (no `{lane}` proposal open)."
 
 

@@ -1,13 +1,14 @@
 ---
 name: review
-description: Review a pull request and POST the review to GitHub via `gh pr review`. Use when asked to review a PR, or when the github-activity poller fires a PR-opened / PR-review-requested event. Always submits after drafting — a review that stays in turn output and never reaches GitHub is a non-review.
+description: Review a pull request and POST the review to GitHub via `pr_submit_review` on service turns or `gh pr review` on interactive turns. Always submit after drafting.
 ---
 
-<!-- desc: Review a pull request and POST the review to GitHub via gh pr review — always submits after drafting. -->
+<!-- desc: Review a pull request and submit via pr_submit_review or gh pr review. -->
 
 # PR Review
 
-Read the diff, draft a verdict, and **submit it via `gh pr review`**. The
+Read the diff, draft a verdict, and **submit via `pr_submit_review` on service
+turns or `gh pr review` on interactive operator turns**. The
 submission step is not optional — it is the definition of "done" for this
 skill.
 
@@ -20,18 +21,22 @@ and `pr_review_requests` tools instead of `gh`. Submit through
 no repository or PR selector: the immutable event authority supplies the only
 target. The CLI workflow below applies only to an interactive operator turn
 without a bound repo/PR tool surface.
+`pr_metadata` includes the bounded PR body and `merged_at`. For live Chainlink
+issue context use `chainlink_issue_show(issue_id)`; for local changes use
+`repo_diff` rather than passing arbitrary revision ranges to `git diff` on a
+`repo_review` service turn.
 
 **Trigger**: Operator asks to review a PR; or the github-activity poller fires a
 `pr_opened` / `review_requested` event for a PR authored by someone other than
 the agent itself (`$MIMIR_GITHUB_SELF_LOGIN`) — the agent doesn't self-review.
 
-**Requires**: PR number; `gh` CLI authenticated (verified by `gh auth status`);
-diff accessible — either under 20k lines via `gh pr diff`, or file list via
-`gh pr view <n> --repo <owner>/<repo> --json files` for large PRs (`gh api` is
-not admitted on a poller turn).
+**Requires**: PR number; on a service turn, bound PR tools and `pr_diff` or
+`pr_files`; on an interactive CLI turn, authenticated `gh` and an accessible
+diff (`gh pr diff` or the file-list fallback).
 
 **Guarantees**:
-- A review is posted to GitHub (not just output to turn text) via `gh pr review`.
+- A review is posted to GitHub (not just output to turn text) via the
+  authorized submission tool for the turn.
 - Verdict is one of APPROVE / REQUEST_CHANGES / COMMENT — never left unsubmitted.
 - Every blocking finding is anchored to a specific file + line in the diff.
 - Full test suite passes (or a clean explanation of why failures are pre-existing
@@ -50,7 +55,10 @@ request either capability.
 
 ## Step-by-step
 
-### 1. Get PR context
+### 1. Get PR context (CLI examples for interactive turns)
+
+On a poller or heartbeat turn, call `pr_metadata(repository, pull_request)`.
+Its body is bounded and author-attested; do not use `gh pr view --json body`.
 
 ```bash
 gh pr view <num> --json number,title,body,author,baseRefName,headRefName,headRefOid,state,additions,deletions,changedFiles
@@ -134,12 +142,17 @@ Reserve budget for submission. Once you know the verdict, stop optional
 exploration and submit before doing long validation, repeated polling, or
 extra context reads. If the tool-call counter is visibly high (around 90+
 on a 120-call budget), keep roughly 10-15 calls for the required side
-effect (`gh pr review`), submission verification, and wrap-up. A review
+effect (`pr_submit_review` or `gh pr review`), submission verification, and
+wrap-up. A review
 with perfect extra evidence that never reaches GitHub is worse than a
 bounded review that lands with an honest validation note.
 
+On a service turn, submit through `pr_submit_review` or
+`pr_inline_review_comment`, then verify via `pr_reviews`. The following CLI
+workflow is for interactive operator turns.
+
 Write the body to a file under the agent scratch root first, then submit it with
-`--body-file`. On a poller turn this is the **only** form that works: the profile
+`--body-file` when admitted by the shell profile: the profile
 execs one argv with `shell=False`, so a heredoc, a `$(...)` substitution, and an
 inline multi-line `--body` are all refused — the body is read from the file
 during authorization and never re-opened at execution.
@@ -157,15 +170,14 @@ gh pr review <num> --repo jasoncarreira/mimir --comment         --body-file <scr
 The body file must resolve beneath the agent scratch root, be a regular file
 reached without traversing a symlink, and be at most 64 KiB.
 
-**Do not use a heredoc, `$(...)`, or an inline multi-line `--body`.** All three
-are refused before execution on a poller turn, and a refused submission is how a
-completed review silently fails to reach GitHub. Write the body to the scratch
-file and pass `--body-file`: because the file is read during authorization, `$`,
+For a CLI submission with a single-argv shell profile, **do not use a heredoc,
+`$(...)`, or an inline multi-line `--body`**. Write the body to the scratch file
+and pass `--body-file`: because the file is read during authorization, `$`,
 backticks and multi-line text need no escaping at all.
 
 ### 6. Confirm submission
 
-After the `gh pr review` call completes:
+After an interactive `gh pr review` call completes:
 
 ```bash
 gh pr view <num> --repo jasoncarreira/mimir --json reviews
@@ -185,17 +197,17 @@ and your verdict.
 
 ## Non-negotiable rules
 
-1. **Always call `gh pr review` before ending the turn.** If the turn ends
-   with a drafted review in the output and no `gh pr review` call in the
-   tool sequence, the review was not submitted.
+1. **Always submit a review before ending the turn.** If the turn ends
+   with a drafted review in the output and no `pr_submit_review` or `gh pr review`
+   call in the tool sequence, the review was not submitted.
 
 2. **A failing tool call mid-review does not abort submission.** Recover:
-   note the failure in the review body, then call `gh pr review` anyway
+   note the failure in the review body, then submit anyway
    with what you have.
 
 3. **Budget exhaustion is not allowed to eat the submission step.** After
-   the verdict is known, `gh pr review` plus confirmation outranks optional
-   extra reads, broad test runs, or repeated async-job polling. When near
+   the verdict is known, `pr_submit_review` or `gh pr review` plus confirmation
+   outranks optional extra reads, broad test runs, or repeated async-job polling. When near
    the tool-call ceiling, submit first with the evidence already gathered.
 
 4. **Never use only turn output as the delivery mechanism.** The operator
@@ -208,7 +220,7 @@ and your verdict.
 When this skill fires from `poller:github-activity`, the trigger includes
 the PR number and repo. There is no human watching the turn output — the
 only way the review reaches the operator (and other contributors) is via
-`gh pr review`. Apply the same steps above; the poller context changes
+`pr_submit_review`. Apply the typed-tool steps above; the poller context changes
 nothing about the submission requirement.
 
 ---
