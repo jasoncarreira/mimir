@@ -29,7 +29,7 @@ CANCEL_SOCKET_TIMEOUT_S = 20.0
 # copy, so changing either side of the launch contract requires an image rebuild.
 EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v12-factory-cancel"
 STALE_EXECUTOR_DIAGNOSTIC = (
-    "stale root executor image: controller and mimir.worklink.worker_exec protocol "
+    "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or source identities do not match; rebuild the image and restart the container"
 )
 _PROJECTION_PATHS = frozenset({

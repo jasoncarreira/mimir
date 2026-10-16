@@ -704,8 +704,6 @@ class ChainlinkClaims:
         if effective_home is None:
             return None
 
-        from mimir.worklink.autonomy import _find_latest_evidence_file_for_issue
-
         found = _find_latest_evidence_file_for_issue(effective_home, issue_id)
         if found is None:
             return None

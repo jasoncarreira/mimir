@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .backends import ToolPin
+from mimir.worklink.backends.registry import ToolPin
 
 
 OPENCODE_VERSION = "1.18.21"

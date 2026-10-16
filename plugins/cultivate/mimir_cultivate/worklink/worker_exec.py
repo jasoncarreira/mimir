@@ -45,7 +45,7 @@ MAX_FDS = 3
 EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v12-factory-cancel"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
-    "stale root executor image: controller and mimir.worklink.worker_exec protocol "
+    "stale root executor image: controller and mimir_cultivate.worklink.worker_exec protocol "
     "or source identities do not match; rebuild the image and restart the container"
 )
 _CONTROLLER_CANCELLATION_GRACE_S = 10.0

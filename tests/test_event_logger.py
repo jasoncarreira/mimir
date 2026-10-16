@@ -667,19 +667,20 @@ def test_process_append_survives_trim_rename_window(tmp_path, monkeypatch):
         args=(path, sender, retry),
     )
     try:
-        rename_reached.wait()
+        assert rename_reached.wait(60)
         process.start()
         sender.close()
+        assert observation.poll(60), "detached append did not report lock contention"
         assert observation.recv() == "blocked", "detached append bypassed trim's lock"
     finally:
         allow_rename.set()
-        trim_thread.join()
+        trim_thread.join(timeout=60)
         retry.set()
         if process.pid is not None:
-            process.join(timeout=5.0)
+            process.join(timeout=60)
             if process.is_alive():
                 process.terminate()
-                process.join()
+                process.join(timeout=60)
         sender.close()
         observation.close()
 
@@ -737,7 +738,7 @@ def _hold_process_lock(path, ready, release):
     with path.open("a") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         ready.set()
-        release.wait(5)
+        release.wait(60)
 
 
 @pytest.mark.parametrize("contention", ["flock", "io_lock", "file_io"])
@@ -759,7 +760,7 @@ async def test_sync_logging_timer_latency(tmp_path, monkeypatch, contention, leg
             args=(logger._process_lock_path, ready, release),
         )
         process.start()
-        assert await asyncio.to_thread(ready.wait, 5)
+        assert await asyncio.to_thread(ready.wait, 60)
         unlock = release.set
     elif contention == "io_lock":
         logger._io_lock.acquire()
@@ -800,7 +801,7 @@ async def test_sync_logging_timer_latency(tmp_path, monkeypatch, contention, leg
             await asyncio.to_thread(release_timer.join)
         await asyncio.to_thread(logger.flush_sync)
         if process is not None:
-            await asyncio.to_thread(process.join, 5)
+            await asyncio.to_thread(process.join, 60)
             assert process.exitcode == 0
     assert json.loads(logger._path.read_text())["type"] == "probe"
 
