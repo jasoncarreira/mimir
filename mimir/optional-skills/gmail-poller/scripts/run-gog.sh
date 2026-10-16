@@ -3,13 +3,11 @@
 # account and credential home as the deployment, using its pinned gog binary.
 set -euo pipefail
 
-if [[ -z "${GOG_ACCOUNT:-}" ]]; then
-  echo "run-gog.sh: GOG_ACCOUNT is required" >&2
-  exit 2
-fi
-
 if [[ "${1:-}" == gmail && "${2:-}" == messages && "${3:-}" == search ]]; then
   SUBCOMMAND=(gmail messages search)
+  shift 3
+elif [[ "${1:-}" == gmail && "${2:-}" == messages && "${3:-}" == get ]]; then
+  SUBCOMMAND=(gmail get)
   shift 3
 elif [[ "${1:-}" == gmail && "${2:-}" == get ]]; then
   SUBCOMMAND=(gmail get)
@@ -27,6 +25,7 @@ fi
 
 EXPECT_VALUE=""
 ACCOUNT_PROVIDED=0
+ACCOUNT_VALUES=()
 POSITIONALS=0
 for ARG in "$@"; do
   if [[ -n "$EXPECT_VALUE" ]]; then
@@ -35,11 +34,12 @@ for ARG in "$@"; do
       exit 2
     fi
     if [[ "$EXPECT_VALUE" == "--account" ]]; then
-      if [[ "$ARG" != "$GOG_ACCOUNT" ]]; then
+      if [[ -n "${GOG_ACCOUNT:-}" && "$ARG" != "$GOG_ACCOUNT" ]]; then
         echo "run-gog.sh: --account does not match the declared account" >&2
         exit 2
       fi
       ACCOUNT_PROVIDED=1
+      ACCOUNT_VALUES+=("$ARG")
     fi
     if [[ "$EXPECT_VALUE" == "--max" && ! "$ARG" =~ ^[0-9]+$ ]]; then
       echo "run-gog.sh: invalid value for --max" >&2
@@ -76,10 +76,49 @@ if [[ "${SUBCOMMAND[0]}" == gmail && "$POSITIONALS" -ne 1 ]]; then
   exit 2
 fi
 
-if [[ "${SUBCOMMAND[0]}" == gmail && "$ACCOUNT_PROVIDED" -eq 0 ]]; then
-  set -- "$@" --account "$GOG_ACCOUNT"
+if [[ "${SUBCOMMAND[0]}" == gmail ]]; then
+  if [[ -n "${GOG_ACCOUNT:-}" ]]; then
+    if [[ "$ACCOUNT_PROVIDED" -eq 0 ]]; then
+      set -- "$@" --account "$GOG_ACCOUNT"
+    fi
+  else
+    # The poller stores account config in STATE_DIR; turns use the same
+    # persistent location under MIMIR_HOME when STATE_DIR is not injected.
+    CONFIG_DIR="${STATE_DIR:-${MIMIR_HOME:-}/state/pollers/gmail-inbox}"
+    # Bash 3.2 treats an empty array as unset under nounset. Preserve zero
+    # arguments when absent, and each quoted account argument when present.
+    /usr/bin/python3 - "$CONFIG_DIR/config.json" ${ACCOUNT_VALUES[@]+"${ACCOUNT_VALUES[@]}"} <<'PY' || exit 2
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as config_file:
+        data = json.load(config_file)
+    entries = data["accounts"]
+    if not isinstance(entries, list):
+        raise ValueError("invalid accounts")
+    accounts = {
+        entry["email"].strip(): entry["name"].strip()
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("email"), str) and entry["email"].strip()
+        and isinstance(entry.get("name"), str) and entry["name"].strip()
+    }
+except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+    accounts = {}
+
+if not sys.argv[2:] or any(account not in accounts for account in sys.argv[2:]):
+    names = ", ".join(
+        name if "@" not in name else "(unnamed)" for name in accounts.values()
+    ) or "(none)"
+    print(f"run-gog.sh: pass --account for a configured account name: {names}", file=sys.stderr)
+    sys.exit(2)
+PY
+  fi
 fi
 
-export GOG_ACCOUNT
+if [[ -n "${GOG_ACCOUNT:-}" ]]; then
+  export GOG_ACCOUNT
+fi
 export GOG_HOME="$HOME/.local/share/gog"
 exec /usr/local/bin/gog --readonly --gmail-no-send "${SUBCOMMAND[@]}" "$@"

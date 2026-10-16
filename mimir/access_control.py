@@ -521,6 +521,14 @@ def build_scheduled_tick_service_principal(
     script_roots = (
         (str((home / "scripts").resolve()),) if home is not None else ()
     )
+    if job_name == "commitments-review":
+        # Server-issued, job-specific read/proposal grant; no closure authority.
+        base = replace(
+            base,
+            capabilities=tuple(dict.fromkeys((*base.capabilities, "commitment_list", "commitment_propose_closure"))),
+            readable_domains=tuple(dict.fromkeys((*base.readable_domains, "commitments"))),
+            sink_destinations=tuple(dict.fromkeys((*base.sink_destinations, "commitment_proposals"))),
+        )
     return replace(
         base,
         filesystem_read_roots=tuple(dict.fromkeys((
@@ -4288,6 +4296,15 @@ def _service_shell_not_admitted_reason(
             "do not retry through shell or HTTP commands."
         )
     if destination == "repo_review":
+        # Name a range operand precisely; keep the review allowlist unchanged.
+        if len(argv) >= 3 and Path(argv[0]).name == "git" and argv[1] == "diff":
+            revision_range = next((token for token in argv[2:]
+                                   if ".." in token and not token.startswith("-")), None)
+            if revision_range is not None:
+                return (
+                    f"revision range {revision_range[:255]} is not bound to this lease; "
+                    "use repo_diff"
+                )
         return (
             "The repo_review shell profile admits only hardened local read-only Git "
             "inspection bound to a server-owned PR state with inspect permission. "
@@ -5810,6 +5827,16 @@ SAGA_TAINT_REFUSAL = (
 )
 
 
+def can_review_commitments(auth_context: Any) -> bool:
+    """Exact server-issued scheduled review grant, read/proposal only."""
+    service = get_trusted_service_from_auth_context(auth_context)
+    return bool(service is not None
+                and auth_context.trigger == "scheduled_tick"
+                and service.channel_memory_directory == "scheduler:commitments-review"
+                and service_can_invoke_operation(service, "commitment_propose_closure")
+                and service_can_invoke_operation(service, "commitment_list"))
+
+
 def can_propose_memory(auth_context: Any) -> bool:
     """Shared capability gate for the proposal tool and its taint-refusal hint."""
     return is_admin(auth_context) or service_can_invoke_operation(
@@ -7024,7 +7051,7 @@ class SinkGate:
                 would_block=True,
             )
 
-        if tool_name == "memory_propose":
+        if tool_name in {"memory_propose", "commitment_propose_closure"}:
             # Review queue only: no atom is written. Keep normal capability
             # checks in authorize_tool, but do not impose SAGA's trust gate.
             return ToolAuthorization(
@@ -10445,6 +10472,13 @@ def _pr_checkout_lease_attestation(
     return LeaseAttestation(ok, reason)
 
 
+# Lease attestation spawns one Git process per check, and up to two per PR
+# commit (``show`` plus ``patch-id``). Each timeout is a hang guard, not a
+# latency budget: a refusal fails closed and taints the turn, so a loaded host
+# must not turn a slow-but-healthy Git call into ``git_timeout``.
+_LEASE_GIT_TIMEOUT_S = 10
+
+
 def _lease_has_clean_lineage(
     path: Path, lease: Any, scope: Any, expected_head: str, current_head: str,
 ) -> bool:
@@ -10474,13 +10508,14 @@ def _lease_has_clean_lineage(
         )
         if protected and base != getattr(scope, "observed_base_sha", "").lower():
             ancestor = hardened_git_command(
-                path, ("merge-base", "--is-ancestor", scope.observed_base_sha, base), timeout=5,
+                path, ("merge-base", "--is-ancestor", scope.observed_base_sha, base),
+                timeout=_LEASE_GIT_TIMEOUT_S,
             )
             if not _lease_git_ok(ancestor):
                 return False
         result = hardened_git_command(
             path, ("rev-list", "--max-count=501", current_head, "--not", expected_head,
-                   *((base,) if protected else ()), "--"), timeout=5,
+                   *((base,) if protected else ()), "--"), timeout=_LEASE_GIT_TIMEOUT_S,
         )
         if not _lease_git_ok(result):
             return False
@@ -10511,7 +10546,7 @@ def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
         result = hardened_git_command(
             path,
             ("status", "--porcelain=v2", "--branch", "--untracked-files=no"),
-            timeout=5,
+            timeout=_LEASE_GIT_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError) as error:
         _lease_refuse(_lease_exception_reason(error))
@@ -10558,7 +10593,7 @@ def _lease_head_is_author_attested(
     )
 
     def run(*arguments: str):
-        return hardened_git_command(path, arguments, timeout=5)
+        return hardened_git_command(path, arguments, timeout=_LEASE_GIT_TIMEOUT_S)
 
     def patch_id(commit: str) -> str | None:
         # Read only immutable objects with hardened Git; patch-id receives the
@@ -10570,7 +10605,8 @@ def _lease_head_is_author_attested(
             return None
         result = subprocess.run(
             [str(_DEFAULT_GIT), *_BASE_CONFIG, "patch-id", "--verbatim"],
-            input=diff.stdout, capture_output=True, text=True, timeout=5,
+            input=diff.stdout, capture_output=True, text=True,
+            timeout=_LEASE_GIT_TIMEOUT_S,
             env=_sanitized_git_env(),
         )
         fields = result.stdout.split()
@@ -11203,6 +11239,27 @@ def classify_protected_result(
         return acp_error_labels
 
     args = arguments or {}
+    if tool_name == "chainlink_issue_show" and not failed:
+        issue_id = args.get("issue_id")
+        if type(issue_id) is not int or issue_id < 1:
+            return _incomplete_protected_result(
+                "chainlink", args, tool_name=tool_name, auth_context=auth_context,
+            )
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        source = SourceLabel(
+            principal=principal, domain="chainlink", resource_id=f"issue/{issue_id}",
+            bridge_instance="chainlink", sensitivity="internal",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            source_kind="protected_tool", integrity="untrusted",
+            # Match bounded Chainlink shell queries: tracker text is not trusted
+            # instruction, but a read does not taint the next Worklink action.
+            integrity_effect="informational",
+        )
+        labels = InformationFlowLabels().with_source(source)
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
     retained_scope = getattr(auth_context, "retained_factory_scope", None)
     if (
         tool_name in {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}

@@ -4572,6 +4572,13 @@ def test_service_shell_redirect_is_bounded_and_service_only(
     refusal = budget_gate._service_shell_refusal_guidance(message, "shell_exec", no_roots)
     _assert_service_shell_redirect(refusal)
     assert "Allowed read roots" not in refusal
+    metacharacters = budget_gate._service_shell_refusal_guidance(
+        f"shell_exec was refused: shell metacharacters in the {no_roots.sink_policy_for('shell_exec').destination} "
+        "trusted-service shell profile never admits pipes", "shell_exec", no_roots,
+    )
+    assert "Profile allows bounded file" in metacharacters
+    assert "Pipes, redirections and command chaining are not allowed" in metacharacters
+    assert "read_file" in metacharacters and "grep" in metacharacters
     auth = _service_auth(no_roots, InformationFlowLabels())
     refusal = budget_gate._deny_admin_tool(
         "shell_exec", "service_capability_denied", ctx=auth, enforcement_enabled=True,
@@ -5124,7 +5131,7 @@ async def test_refused_service_shell_returns_the_reason_and_executes_nothing(
     assert "one command per call" in result.content
     assert "shell=False" in result.content
     _assert_service_shell_redirect(result.content)
-    assert "Pipes, redirections and command chaining are not available on this turn" in result.content
+    assert "Pipes, redirections and command chaining are not allowed on this turn" in result.content
     assert "a single plain command is available if the profile admits it" in result.content
     # The fail-closed argv must never be what the caller reads instead.
     assert "/usr/bin/false" not in result.content
@@ -13021,16 +13028,13 @@ def test_operator_arm2_direct_execution_binds_stdin_away_from_the_agent(
 
     recorded: list[dict[str, object]] = []
 
-    class _Completed:
-        returncode = 0
-        stdout = b""
-        stderr = b""
+    original_popen = tools_extra.subprocess.Popen
 
-    def recording_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+    def recording_popen(argv, **kwargs):  # type: ignore[no-untyped-def]
         recorded.append({"argv": list(argv), **kwargs})
-        return _Completed()
+        return original_popen(argv, **kwargs)
 
-    monkeypatch.setattr(tools_extra.subprocess, "run", recording_run)
+    monkeypatch.setattr(tools_extra.subprocess, "Popen", recording_popen)
     runner = getattr(tools_extra.shell_exec, "func", tools_extra.shell_exec)
     runner("echo bound", cwd=str(tmp_path))
 
@@ -18503,7 +18507,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
         SinkCategory.NOTIFICATION: {"operator_alert", "ntfy_send"},
         SinkCategory.FILE: {"write_file", "edit_file", "replace_file", "Write", "Edit", "download_files", "adownload_files", "rebuild_index", "request_mimir_update"},
         SinkCategory.SAGA: {"memory_store", "memory_propose", "saga_record_skill_learning", "saga_feedback", "saga_mark_contributions", "saga_forget", "saga_end_session", "commitment_complete", "commitment_snooze", "commitment_dismiss", "defer_injected_message"},
-        SinkCategory.SCHEDULER: {"add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides", "reload_pollers"},
+        SinkCategory.SCHEDULER: {"add_schedule", "set_schedule_priority", "set_schedule_cron", "remove_schedule", "set_poller_overrides", "reload_pollers"},
         SinkCategory.PROPOSAL: {"open_proposal", "submit_proposal", "abandon_proposal"},
         SinkCategory.HARNESS_DISPLAY: {"activity_panel_post", "activity_panel_edit"},
         SinkCategory.FORGE: {"pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body", "issue_comment", "pr_rerequest_review", "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch", "repo_test", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
@@ -18516,6 +18520,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
         for category in expected
     }
 
+    expected[SinkCategory.SAGA].add("commitment_propose_closure")
     assert actual == expected
     categorized = {
         name for name, descriptor in access_control.TOOL_DESCRIPTORS.items()
@@ -18571,7 +18576,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
             (True, "harness_metadata_display")
             if name in display_tools
             else (True, "memory_proposal_queue")
-            if name == "memory_propose"
+            if name in {"memory_propose", "commitment_propose_closure"}
             else (False, "write_blocked_by_untrusted_ingest")
             if name in {"memory_store", "saga_record_skill_learning", "saga_feedback",
                         "saga_mark_contributions", "saga_forget", "saga_end_session",
@@ -18636,6 +18641,7 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
     }
     flows[access_control.ToolFlowDirection.SINK].add("memory_propose")
     flows[access_control.ToolFlowDirection.SINK].add("replace_file")
+    flows[access_control.ToolFlowDirection.SINK].add("set_schedule_cron")
     decisions = {
         OperationDecision.OPEN: {"commitment_list", "memory_query", "memory_get", "web_search", "fetch_url", "write_todos", "defer_injected_message", "request_operator_approval", "commitment_complete", "commitment_snooze", "commitment_dismiss"},
         OperationDecision.RESOURCE_SCOPED: {"send_message", "react", "fetch_channel_history", "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn", "write_file", "edit_file", "worklink_run", "worklink_resume", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body", "pr_rerequest_review", "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
@@ -18658,6 +18664,8 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
     admin_catalog.add("memory_propose")
     decisions[OperationDecision.ADMIN_REQUIRED].add("memory_propose")
     decisions[OperationDecision.RESOURCE_SCOPED].add("replace_file")
+    decisions[OperationDecision.ADMIN_REQUIRED].add("set_schedule_cron")
+    admin_catalog.add("set_schedule_cron")
     protected_builtins = {
         "Bash", "bash", "bash_exec", "execute", "aexecute", "shell",
         "Write", "Edit", "Read", "Glob", "Grep", "download_files",
@@ -18690,8 +18698,13 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
         for destination, names in destination_groups.items()
         for name in names
     }
+    flows[access_control.ToolFlowDirection.SINK].add("commitment_propose_closure")
+    decisions[OperationDecision.ADMIN_REQUIRED].add("commitment_propose_closure")
+    admin_catalog.add("commitment_propose_closure")
+    destinations["commitment_propose_closure"] = "commitment_proposals"
     destinations["memory_propose"] = "memory_proposals"
     destinations["replace_file"] = "filesystem"
+    destinations["set_schedule_cron"] = "scheduler"
 
     for name in ("pr_job_log", "ci_run_jobs", "ci_run", "ci_recent_runs", "pr_file_content", "pr_spec"):
         flows[access_control.ToolFlowDirection.SOURCE].add(name)
@@ -18700,6 +18713,11 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
         protected[name] = "repository"
     # Preserve both proposal and repository reads in the frozen inventories.
     flows[access_control.ToolFlowDirection.SOURCE].add("proposal_diff")
+    flows[access_control.ToolFlowDirection.SOURCE].add("chainlink_issue_show")
+    decisions[OperationDecision.ADMIN_REQUIRED].add("chainlink_issue_show")
+    admin_catalog.add("chainlink_issue_show")
+    readable["chainlink_issue_show"] = "chainlink"
+    protected["chainlink_issue_show"] = "chainlink"
     decisions[OperationDecision.ADMIN_REQUIRED].add("proposal_diff")
     admin_catalog.add("proposal_diff")
     readable["proposal_diff"] = "filesystem"

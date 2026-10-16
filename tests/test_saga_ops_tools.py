@@ -12,6 +12,7 @@ Fills gaps NOT already in test_saga_ops_wiring.py:
 from __future__ import annotations
 
 import subprocess
+import json
 import sys
 import textwrap
 import time
@@ -407,10 +408,10 @@ async def test_end_session_missing_session_id_returns_error(
 async def test_end_session_without_server_runtime_fails_closed(
     store: _StubStore,
 ) -> None:
-    out = await saga_ops.saga_end_session.ainvoke(
-        {"session_id": "sess-xyz", "summary": "wrapping up"}
-    )
-    assert "tainted" in out
+    with pytest.raises(saga_ops.ToolPolicyRefusal, match="tainted"):
+        await saga_ops.saga_end_session.ainvoke(
+            {"session_id": "sess-xyz", "summary": "wrapping up"}
+        )
     assert store.end_session_calls == []
 
 
@@ -421,12 +422,12 @@ async def test_end_session_does_not_consult_active_registry(
 ) -> None:
     token = _context._current_turn.set(None)
     try:
-        out = await saga_ops.saga_end_session.ainvoke(
-            {"session_id": "sess-abc", "summary": "wrapping up"}
-        )
+        with pytest.raises(saga_ops.ToolPolicyRefusal, match="tainted"):
+            await saga_ops.saga_end_session.ainvoke(
+                {"session_id": "sess-abc", "summary": "wrapping up"}
+            )
     finally:
         _context._current_turn.reset(token)
-    assert "tainted" in out
     assert store.end_session_calls == []
 
 
@@ -566,10 +567,10 @@ async def test_saga_feedback_no_event_on_failure(
 
     monkeypatch.setattr(_ev, "log_event", _fake_log_event)
     store.raise_on = "outcome"
-    out = await saga_ops.saga_feedback.ainvoke(
-        {"atom_id": "a" * 16, "signal": "useful"}
-    )
-    assert "failed" in out
+    with pytest.raises(saga_ops.ToolPolicyRefusal, match="tainted"):
+        await saga_ops.saga_feedback.ainvoke(
+            {"atom_id": "a" * 16, "signal": "useful"}
+        )
     assert not any(e[0] == "saga_feedback_sent" for e in captured)
 
 
@@ -605,10 +606,10 @@ async def test_record_skill_learning_without_runtime_fails_closed(
     store: _StubStore,
 ) -> None:
     """Without a server-provided runtime (AuthContext), the write must be denied."""
-    out = await saga_ops.saga_record_skill_learning.ainvoke(
-        {"skill": "test-skill", "kind": "tip", "content": "Test learning"}
-    )
-    assert "tainted" in out
+    with pytest.raises(saga_ops.ToolPolicyRefusal, match="tainted"):
+        await saga_ops.saga_record_skill_learning.ainvoke(
+            {"skill": "test-skill", "kind": "tip", "content": "Test learning"}
+        )
     assert store.store_calls == []
 
 
@@ -719,7 +720,8 @@ async def test_forget_preserves_supported_backend_arguments(
     client = Mock(spec=SagaStore) if in_process else _StubStore()
     client.forget = AsyncMock(return_value={"tombstoned_count": 0})
     monkeypatch.setitem(_MEMORY_STATE, "client", client)
-    args = {"dry_run": False, "min_retrievals": 1, "confidence_floor": 0.0, "grace_days": 0}
+    args = {"dry_run": False, "min_retrievals": 1, "activation_below": 0.0,
+            "grace_days": 0, "preview_token": "reviewed"}
     if not in_process:
         args.update(contribution_threshold=0.0, contradiction_threshold=0.0)
     result = await saga_ops.saga_forget.coroutine(
@@ -729,3 +731,45 @@ async def test_forget_preserves_supported_backend_arguments(
         **args, auth_context=turn_with_session.auth_context,
     )
     assert '"tombstoned_count": 0' in result
+
+
+def test_forget_schema_documents_log_activation_not_confidence():
+    fields = saga_ops.saga_forget.args_schema.model_fields
+    assert "confidence_floor" not in fields
+    assert "activation_below" in fields
+    description = saga_ops.saga_forget.description
+    assert "log value" in description and "-inf means never accessed" in description
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0.1, float("nan"), float("inf"), -float("inf")])
+async def test_forget_rejects_invalid_activation(store, turn_with_session, value):
+    result = await saga_ops.saga_forget.coroutine(
+        activation_below=value, runtime=_runtime(turn_with_session))
+    assert "finite and <= 0" in result
+    assert store.forget_calls == []
+
+
+@pytest.mark.asyncio
+async def test_forget_acknowledged_review_emits_clear_without_delete(
+    store, turn_with_session, monkeypatch,
+):
+    import mimir.event_logger as events
+
+    store.forget = AsyncMock(return_value={"dry_run": True, "preview_token": "binding",
+                                           "candidates": [{"id": "one"}]})
+    emitted = []
+
+    async def capture(kind, **kwargs):
+        emitted.append(kind)
+
+    monkeypatch.setattr(events, "log_event", capture)
+    wrong = await saga_ops.saga_forget.coroutine(
+        acknowledge="wrong", runtime=_runtime(turn_with_session))
+    assert "does not match" in wrong
+    assert emitted == []
+    result = await saga_ops.saga_forget.coroutine(
+        acknowledge="binding", runtime=_runtime(turn_with_session))
+    assert json.loads(result)["preview_token"] == "binding"
+    assert emitted == ["saga_forget_reviewed"]
+    assert all(call.kwargs["dry_run"] for call in store.forget.await_args_list)

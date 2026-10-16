@@ -12,6 +12,7 @@ API is the flat ``mimir.tools`` namespace.
 """
 
 from .memory import memory_get, memory_query, set_memory_client
+from .chainlink import chainlink_issue_show
 from .store import memory_store
 from .memory_propose import memory_propose
 from .operator_alert import operator_alert, set_operator_alert_dependencies
@@ -30,6 +31,7 @@ from .registry import (
     all_mimir_tools,
     approve_declassification,
     commitment_complete,
+    commitment_propose_closure,
     commitment_dismiss,
     commitment_list,
     commitment_snooze,
@@ -44,6 +46,7 @@ from .registry import (
     set_arbiter,
     set_poller_overrides,
     set_schedule_priority,
+    set_schedule_cron,
     set_channel_registry,
     set_commitments_store,
     set_current_channel_id,
@@ -109,6 +112,7 @@ def __getattr__(name: str):
 __all__ = [
     # Core tools (callable by the agent)
     "memory_query",
+    "chainlink_issue_show",
     "memory_get",
     "memory_store",
     "memory_propose",
@@ -127,10 +131,12 @@ __all__ = [
     "approve_declassification",
     "request_operator_approval",
     "set_schedule_priority",
+    "set_schedule_cron",
     "remove_schedule",
     "set_poller_overrides",
     "reload_pollers",
     "commitment_complete",
+    "commitment_propose_closure",
     "commitment_snooze",
     "commitment_dismiss",
     "commitment_list",

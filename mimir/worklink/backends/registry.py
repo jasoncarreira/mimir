@@ -444,7 +444,7 @@ class WorklinkConfig:
                 f"#832 substrate cleanup local_subprocess is the only Worklink "
                 f"compute backend; set defaults.allow_autonomous_local_subprocess: "
                 f"true in worklink.yaml to accept the blast radius for autonomous "
-                f"runs. The operator CLI `mimir worklink run` is unaffected."
+                f"runs. Ask the operator to review this configuration."
             )
         return True, None
 

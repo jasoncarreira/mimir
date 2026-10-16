@@ -462,9 +462,83 @@ def test_retained_backend_dispatches_file_effects_under_lease(
     )
     assert backend.write(str(target), "new\n").error is None
     assert backend.edit(str(target), "new", "fixed").error is None
+    target.write_text("new\n", encoding="utf-8")
     assert backend.replace(str(target), "whole new content").error is None
     assert [call[0] for call in calls] == ["write_file", "edit_file", "replace_file"]
     assert all(call[1] == ".factory-sandboxes/chainlink-1810/fix.py" for call in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_path", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("existing,new,refused", [
+    (112_545, 3_904, True),
+    (1023, 0, False),
+    (1024, 102, True),
+    (1024, 103, False),
+    (2000, 200, False),
+    (2000, 198, True),
+])
+async def test_retained_replace_shrink_guard_and_override(
+    retained_incident, monkeypatch: pytest.MonkeyPatch,
+    async_path: bool, existing: int, new: int, refused: bool,
+) -> None:
+    from mimir.readonly_backend import _replace_shrink_error
+    from mimir.worklink.worker_exec import _run_factory_file_child
+
+    case = retained_incident
+    scope = derive_retained_factory_scope(case.event, case.service).scope
+    assert scope is not None
+    backend = RetainedCheckoutFilesystemBackend(case.root)
+    target = case.sandbox / "backlog.md"
+    original = b"a" * existing
+    content = "é" * (new // 2) + "b" * (new % 2)
+    assert len(content.encode("utf-8")) == new
+    target.write_bytes(original)
+    monkeypatch.setattr(
+        backend, "_binding", lambda _path: (SimpleNamespace(), scope, target),
+    )
+    monkeypatch.setattr(
+        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+    )
+    monkeypatch.chdir(case.sandbox.parents[1])
+    calls = []
+
+    class Client:
+        def factory_file_operation(self, operation, path, **arguments):
+            # The override is controller-only, never an extra protocol field.
+            assert set(arguments) == {"run_id", "content"}
+            calls.append(operation)
+            return _run_factory_file_child({
+                "op": operation, "relative_path": path, "issue": 1810, **arguments,
+            })
+
+    monkeypatch.setattr(
+        "mimir.worklink.worker_client.WorkerClient.for_factory_checkout",
+        lambda *args, **kwargs: Client(),
+    )
+    if async_path:
+        result = await backend.areplace(str(target), content)
+    else:
+        result = backend.replace(str(target), content)
+    if refused:
+        assert result.error == _replace_shrink_error(existing, new, False)
+        assert "under 10%" in result.error
+        assert target.read_bytes() == original
+        assert calls == []
+        assert not list(target.parent.glob(".mimir-*.tmp"))
+    else:
+        assert result.error is None
+        assert target.read_bytes() == content.encode("utf-8")
+        assert calls == ["replace_file"]
+
+    target.write_bytes(original)
+    if async_path:
+        result = await backend.areplace(str(target), content, allow_shrink=True)
+    else:
+        result = backend.replace(str(target), content, allow_shrink=True)
+    assert result.error is None
+    assert target.read_bytes() == content.encode("utf-8")
+    assert len(calls) == (1 if refused else 2)
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,4 @@
-"""Frozen pre-plugin core policy oracle from 6daf3879fd0e4eb6ed1b28f871c29096126cbac4."""
+"""Frozen pre-plugin core policy oracle from bc19c6220617e8b69d458b879fb081881f501c69."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from mimir.tool_descriptors import (
 from mimir.tools import budget_gate
 
 
-BASELINE = "6daf3879fd0e4eb6ed1b28f871c29096126cbac4"
+BASELINE = "bc19c6220617e8b69d458b879fb081881f501c69"
 FIXTURE = Path(__file__).parent / "fixtures" / "plugin_core_policy_baseline.json"
 AUTHORIZATION_FIELDS = (
     "decision", "allowed", "would_block", "reason", "required_tier", "flow", "shadow",
@@ -376,6 +376,6 @@ def test_original_core_policy_matches_frozen_oracle(
     fixture_bytes = FIXTURE.read_bytes()
     expected = json.loads(fixture_bytes)
     assert expected["baseline_sha"] == BASELINE
-    assert len(expected["descriptors"]) == 100
+    assert len(expected["descriptors"]) == 103
     assert _canonical(expected, home) == fixture_bytes
     assert _canonical(_snapshot(home, monkeypatch), home) == fixture_bytes

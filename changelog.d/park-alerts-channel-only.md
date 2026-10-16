@@ -1,1 +1,0 @@
-- Factory park alerts go to the operator channel only; they no longer send an ntfy push (#1950 follow-up).
