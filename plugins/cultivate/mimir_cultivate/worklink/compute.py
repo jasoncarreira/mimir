@@ -434,10 +434,10 @@ class LocalSubprocessComputeBackend:
         command = tuple(str(arg) for arg in spec.local_argv)
         if not command:
             raise ComputeLaunchError("local_subprocess spec.local_argv must not be empty")
-        from .checkout import coding_enabled
+        from .checkout import _cultivate_selected
         if spec.backend == "feature_factory":
             return await self._launch_contained(spec, command)
-        if coding_enabled() and spec.backend == "opencode":
+        if _cultivate_selected() and spec.backend == "opencode":
             return await self._launch_enabled(spec, command)
         # chainlink #830: autonomous local_subprocess builds an allowlisted env
         # from the parent process — infra vars (HOME so a coding CLI finds its

@@ -371,7 +371,7 @@ class OpenCodeBackend:
 def _coding_enabled() -> bool:
     from .. import checkout
 
-    return checkout.coding_enabled()
+    return checkout._cultivate_selected()
 
 
 def _is_sqlite_contention(result: ComputeResult) -> bool:

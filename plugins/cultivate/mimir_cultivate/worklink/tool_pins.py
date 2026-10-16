@@ -2,7 +2,20 @@
 
 from __future__ import annotations
 
-from mimir.worklink.backends.registry import ToolPin
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ToolPin:
+    name: str
+    category: str
+    pin: str
+    smoke: str
+    source: str | None = None
+    package: str | None = None
+    repo: str | None = None
+    install: str | None = None
+    risk: str | None = None
 
 
 OPENCODE_VERSION = "1.18.21"

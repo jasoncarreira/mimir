@@ -10,13 +10,14 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
 
 from mimir_cultivate.worklink import (
-    claims, compute, control, detached_dispatch, dispatch_failures, tool_pins,
-    worker_client, worker_exec,
+    claims, compute, continuation, control, detached_dispatch, dispatch_failures,
+    merge_closure, poller_hooks, retained_scope, tool_pins, worker_client, worker_exec,
 )
 from mimir_cultivate.worklink.backends import opencode
 from mimir_cultivate.worklink.backends.base import WorkOrder
@@ -247,3 +248,168 @@ def test_provider_stop_marker_and_failure_ledger_block_dispatch(tmp_path: Path) 
     assert "unresolved Worklink incident" in dispatch_failures.autonomous_dispatch_block_reason(
         state_dir, 1949,
     )
+
+
+def test_provider_tool_pin_is_independent_of_core_backend() -> None:
+    from mimir.worklink.backends.registry import ToolPin as CoreToolPin
+
+    pin = tool_pins.default_tool_pins()[0]
+    assert type(pin) is tool_pins.ToolPin
+    assert not isinstance(pin, CoreToolPin)
+    assert pin.name == "chainlink"
+    with pytest.raises(AttributeError):
+        pin.pin = "untrusted"
+
+
+@pytest.mark.asyncio
+async def test_provider_worker_wire_fd_identity_launch_wait_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    descriptor = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+    metadata = os.fstat(descriptor)
+
+    class Capability:
+        issue_id = 1949
+        attempt = 1
+        device = metadata.st_dev
+        inode = metadata.st_ino
+
+        def verify(self, path):
+            assert path == checkout
+
+        def duplicate_fd(self):
+            return os.dup(descriptor)
+
+    # Socket pairs still carry real SCM_RIGHTS; only peer authentication is
+    # substituted because the test executor is not installed as root.
+    servers = []
+    threads = []
+
+    def connect(self, timeout_s=None):
+        client_sock, server_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        servers.append(server_sock)
+        thread = threading.Thread(target=worker_exec.handle_connection, args=(server_sock,))
+        thread.start()
+        threads.append(thread)
+        return client_sock
+
+    monkeypatch.setattr(worker_client.WorkerClient, "_connect", connect)
+    monkeypatch.setattr(worker_exec, "_executor_source_commit", lambda: "a" * 40)
+    client = worker_client.WorkerClient(Capability())
+    identifier = "00000000-0000-4000-8000-000000000002"
+    try:
+        assert await worker_client.verify_executor_identity() == "a" * 40
+        with pytest.raises(RuntimeError, match="identity does not match"):
+            wrong = worker_client.WorkerClient(Capability())
+            wrong.checkout = SimpleNamespace(
+                issue_id=1949, attempt=1, device=metadata.st_dev,
+                inode=metadata.st_ino + 1, verify=lambda path: None,
+                duplicate_fd=lambda: os.dup(descriptor),
+            )
+            await wrong.launch(
+                local_checkout=checkout, argv=("true",), env={}, identifier=identifier,
+                timeout_s=5,
+            )
+        monkeypatch.setattr(worker_exec, "_validate_checkout", lambda fd, request: checkout)
+        monkeypatch.setattr(worker_exec, "HOME_ROOT", tmp_path)
+        monkeypatch.setattr(worker_exec, "_drop_worker", lambda fd: os.fchdir(fd))
+        monkeypatch.setattr(worker_exec.os, "chown", lambda *args: None)
+        process = await client.launch(
+            local_checkout=checkout, argv=(sys.executable, "-c", "print('worker-ok')"),
+            env={}, identifier=identifier, timeout_s=10,
+        )
+        assert await process.wait() == 0
+        cancel_id = "00000000-0000-4000-8000-000000000003"
+        cancelled = []
+        monkeypatch.setattr(worker_exec, "_terminate_process_group", lambda proc: cancelled.append(proc))
+        with worker_exec._jobs_lock:
+            worker_exec._jobs[cancel_id] = SimpleNamespace(pid=42)
+        try:
+            await client.cancel(cancel_id)
+            assert len(cancelled) == 1 and cancelled[0].pid == 42
+        finally:
+            with worker_exec._jobs_lock:
+                worker_exec._jobs.pop(cancel_id, None)
+    finally:
+        os.close(descriptor)
+        for thread in threads:
+            thread.join(timeout=15)
+            assert not thread.is_alive()
+        for server in servers:
+            assert server.fileno() == -1
+
+
+@pytest.mark.asyncio
+async def test_provider_compute_launch_wait_and_cancel(tmp_path: Path) -> None:
+    backend = compute.LocalSubprocessComputeBackend()
+    def spec(command):
+        return compute.WorkSpec(
+            1949, 1, "repo", "main", "issue/1949", "prompt", None,
+            "true", "local", 30, local_checkout=tmp_path, local_argv=command,
+        )
+
+    handle = await backend.launch(spec((sys.executable, "-c", "print('computed')")))
+    result = await backend.wait(handle, timeout_s=10)
+    assert result.exit_code == 0 and result.stdout.strip() == "computed"
+    await backend.cleanup(handle)
+
+    handle = await backend.launch(spec((sys.executable, "-c", "import time; time.sleep(30)")))
+    assert backend.job_alive(handle)
+    await backend.cancel(handle)
+    result = await backend.wait(handle, timeout_s=10)
+    assert result.exit_code != 0
+    await backend.cleanup(handle)
+
+
+@pytest.mark.asyncio
+async def test_provider_redirected_incident_and_recovery_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    intervention = SimpleNamespace(trigger="poller", service_principal="poller:worklink-ready-queue", extra={
+        "poller_name": dispatch_failures.POLLER_NAME, "items": [{
+        "issue_id": 1949, "error_signature": "signature", "failure_occurrence_id": "occ",
+        "delivery_key": "worklink-run-failure:1949:signature:occ",
+    }]})
+    assert dispatch_failures.is_dispatch_failure_intervention(intervention)
+    assert continuation.maybe_create_worklink_budget_continuation(
+        home=tmp_path, event=intervention,
+        ctx=SimpleNamespace(tool_call_budget_exhausted=True), record=SimpleNamespace(),
+    ) is None
+
+    state_dir = dispatch_failures.dispatch_failure_state_dir(tmp_path)
+    state_dir.mkdir(parents=True)
+    (state_dir / dispatch_failures.STATE_FILE).write_text(json.dumps({
+        "version": 1, "issues": {"1949": {
+            "active": True, "signature": "signature", "occurrence_id": "occ",
+        }},
+    }))
+    assert await poller_hooks.recovery_relevance_check(state_dir)(intervention) is True
+    (state_dir / dispatch_failures.STATE_FILE).write_text(json.dumps({
+        "version": 1, "issues": {},
+    }))
+    assert await poller_hooks.recovery_relevance_check(state_dir)(intervention) is False
+    monkeypatch.setattr(retained_scope, "current_failure_record", lambda *args: None)
+    denied = retained_scope.derive_retained_factory_scope(
+        intervention,
+        SimpleNamespace(canonical="poller:worklink-ready-queue", trigger="poller", authority_profile="github"),
+        home=tmp_path,
+    )
+    assert denied.refusal_reason == "incident occurrence is stale"
+
+
+def test_provider_merge_closure_reads_provider_failure_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = []
+    monkeypatch.setattr(merge_closure, "resolve_completion_repository", lambda *args, **kwargs: SimpleNamespace(slug="repo"))
+    monkeypatch.setattr(merge_closure, "_pending_intents", lambda *_: {})
+    monkeypatch.setattr(merge_closure, "active_failure_identities", lambda *args, **kwargs: [(1949, "sig", "occ")])
+    monkeypatch.setattr(merge_closure, "_list_open_issue_ids", lambda *_: set())
+    monkeypatch.setattr(merge_closure, "resolve_failure_if_current", lambda *args: seen.append(args))
+    monkeypatch.setattr(merge_closure, "resolve_merge_reconciliation_notices", lambda *args, **kwargs: None)
+    assert merge_closure.reconcile_merged_leaves(
+        tmp_path, chainlink_runner=lambda args: subprocess.CompletedProcess(args, 0, ""),
+    ) == []
+    assert seen == [(dispatch_failures.dispatch_failure_state_dir(tmp_path), 1949, "sig", "occ")]
