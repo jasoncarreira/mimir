@@ -5,6 +5,7 @@ from enum import StrEnum
 import hashlib
 import json
 import subprocess
+import sys
 
 import pytest
 from langchain.agents.middleware import ToolCallRequest
@@ -260,6 +261,59 @@ async def test_follow_on_refused_before_registered_handler(
     else:
         result = gate.wrap_tool_call(request, handler)
     assert result.status == "error" and called == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_oversized_checkout_status_refused_before_registered_handler(
+    policy, tmp_path, monkeypatch, asynchronous,
+):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"])
+
+    real_popen = subprocess.Popen
+    processes = []
+
+    def oversized_status(argv, **kwargs):
+        assert argv[0] == "/usr/bin/git"
+        assert kwargs["env"]["HOME"] == "/nonexistent"
+        process = real_popen(
+            [sys.executable, "-c", "import os\nfor _ in range(16384): os.write(1, b'x' * 65536)"],
+            **kwargs,
+        )
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr("mimir_cultivate.policy.subprocess.Popen", oversized_status)
+    request = ToolCallRequest(
+        tool_call={"name": "scoped_commit", "args": {
+            "repository": scope.canonical_repo, "pull_request": scope.pr_number,
+        }, "id": "commit", "type": "tool_call"},
+        tool=policy.tools["scoped_commit"].factory(), state=None, runtime=Runtime(context=auth),
+    )
+    called = []
+
+    def handler(_request):
+        called.append(True)
+        return ToolMessage(content="ok", tool_call_id="commit")
+
+    gate = BudgetGateMiddleware(policy)
+    if asynchronous:
+        async def async_handler(tool_request):
+            return handler(tool_request)
+        result = await gate.awrap_tool_call(request, async_handler)
+    else:
+        result = gate.wrap_tool_call(request, handler)
+    assert result.status == "error" and called == []
+    assert processes and all(process.returncode == -9 for process in processes)
 
 
 @pytest.mark.asyncio
