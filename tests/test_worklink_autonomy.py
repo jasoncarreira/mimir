@@ -2116,11 +2116,12 @@ async def test_runtime_and_server_wire_worklink_arbiter_and_reaper(
     pytest.importorskip("mimir_cultivate")
     from mimir.plugins.manager import load_plugins
 
-    calls: list[tuple[str, object]] = []
-    scheduler = SimpleNamespace(
-        add_worklink_reaper_job=lambda **kwargs: calls.append(("reaper", kwargs)),
-        add_worklink_factory_park_alert_job=lambda *args: calls.append(("park", args)),
-    )
+    from mimir.scheduler import Scheduler
+
+    async def enqueue(_event):
+        return True
+
+    scheduler = Scheduler(tmp_path / "scheduler.yaml", enqueue)
     monkeypatch.setenv("MIMIR_WORKLINK_REAPER_CRON", "*/7 * * * *")
     monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
 
@@ -2130,11 +2131,10 @@ async def test_runtime_and_server_wire_worklink_arbiter_and_reaper(
     policy = load_plugins(enable="cultivate").policy
     hook = policy.server_hooks["cultivate", "configure_jobs"]
     await hook(scheduler, tmp_path, "operator", object(), event)
-    assert calls[0] == (
-        "reaper", {"home": tmp_path, "cron_expr": "*/7 * * * *"},
-    )
-    assert calls[1][0] == "park"
-    assert calls[1][1][:2] == (tmp_path, "operator")
+    assert scheduler._callables["worklink-reaper"].default_cron == "*/7 * * * *"
+    assert scheduler._scheduler.get_job("worklink-reaper") is not None
+    assert scheduler._callables["worklink-factory-park-alert"].default_cron == "*/5 * * * *"
+    assert scheduler._scheduler.get_job("worklink-factory-park-alert") is not None
 
 
 # ── ready-queue poller: discovery + cap-bounded detached dispatch ───

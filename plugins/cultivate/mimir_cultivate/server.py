@@ -83,11 +83,13 @@ def channel_drained(channel_id: str, scheduler: Any) -> None:
 
 
 async def configure_worklink(scheduler: Any, home: Path, alert_channel: str | None, channels: Any, log_event: Any) -> None:
+    from . import scheduler as jobs
+
     for job, install in (
-        ("worklink-reaper", lambda: scheduler.add_worklink_reaper_job(
-            home=home, cron_expr=os.environ.get("MIMIR_WORKLINK_REAPER_CRON", ""))),
-        ("worklink-factory-park-alert", lambda: scheduler.add_worklink_factory_park_alert_job(
-            home, alert_channel, channels)),
+        ("worklink-reaper", lambda: jobs.add_reaper_job(
+            scheduler, home, cron_expr=os.environ.get("MIMIR_WORKLINK_REAPER_CRON", ""))),
+        ("worklink-factory-park-alert", lambda: jobs.add_factory_park_alert_job(
+            scheduler, home, alert_channel, channels)),
     ):
         try:
             install()
@@ -96,9 +98,10 @@ async def configure_worklink(scheduler: Any, home: Path, alert_channel: str | No
     lease_root = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
     if lease_root:
         try:
-            from mimir.pr_checkout_lease import configured_pr_checkout_lease_root
+            from .repository import configured_pr_checkout_lease_root
 
-            scheduler.add_pr_checkout_lease_reaper_job(
+            jobs.add_pr_checkout_lease_reaper_job(
+                scheduler,
                 lease_root=configured_pr_checkout_lease_root(),
                 cron_expr=os.environ.get("MIMIR_PR_CHECKOUT_LEASE_REAPER_CRON", "*/15 * * * *"),
             )

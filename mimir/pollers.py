@@ -1180,7 +1180,10 @@ def _validate_poller_identity(
     """Bind names with special server-side authority to their shipped skill identity."""
     required_skill = reserved_skill_for_name(name)
     if required_skill is not None and (
-        plugin_owner is not None or manifest_path.parent.name != required_skill
+        manifest_path.parent.name != required_skill
+        or (plugin_owner is not None and not (
+            name == "worklink-ready-queue" and plugin_owner == "cultivate"
+        ))
     ):
         raise ValueError(
             f"reserved poller name {name!r} may only be declared by "
@@ -1760,7 +1763,7 @@ def discover_pollers(
     pollers: list[PollerConfig] = []
     if plugin_candidates is None:
         plugin_candidates = policy.selected_plugin_candidates if policy is not None else ()
-    if policy is not None and set(policy.poller_hooks) & {"github", "worklink"}:
+    if policy is not None and "github" in policy.poller_hooks:
         raise ValueError("plugin poller hooks collide with reserved core profiles")
     if not skills_dir.exists() and not plugin_candidates:
         return pollers
