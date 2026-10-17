@@ -16,9 +16,8 @@ from mimir.contained_execution import CollectedExecutionResult
 from mimir.models import RetainedFactoryScope
 from mimir.project_tests import ProjectTestResult, RepoProjectTests
 from mimir.readonly_backend import RetainedCheckoutFilesystemBackend
-from mimir.plugins.core import policy_scope
+from mimir.plugins.core import core_policy_registry, policy_scope
 from mimir.plugins.manager import load_plugins
-from mimir_cultivate.worklink import worker_client as provider_worker_client
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.backends.feature_factory import FactoryStatus
 from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
@@ -36,6 +35,7 @@ from mimir.worklink.retained_scope import (
 @pytest.fixture
 def retained_incident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from mimir.worklink import worker_client
+    provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
 
     home = tmp_path / "home"
     root = tmp_path / "worklink"
@@ -79,6 +79,21 @@ def retained_incident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     )
     with policy_scope(load_plugins(enable="cultivate").policy):
         yield case
+
+
+def test_retained_write_refuses_without_selected_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = RetainedCheckoutFilesystemBackend(tmp_path)
+    target = tmp_path / "file.txt"
+    monkeypatch.setattr(
+        backend, "_binding",
+        lambda _path: (SimpleNamespace(), SimpleNamespace(sandbox=str(tmp_path)), target),
+    )
+    with policy_scope(core_policy_registry()):
+        assert backend.write(str(target), "content").error == (
+            "retained factory checkout provider is unavailable"
+        )
 
 
 def test_scope_is_exact_ephemeral_and_current(retained_incident) -> None:
@@ -662,6 +677,7 @@ async def test_each_retained_effect_refuses_operation_time_race_without_mutation
     project_test = AsyncMock(side_effect=AssertionError("refused effect launched tests"))
     monkeypatch.setattr(worker_client, "run_factory_control", owner_rpc)
     monkeypatch.setattr(worker_client.WorkerClient, "for_factory_checkout", file_rpc)
+    provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
     monkeypatch.setattr(provider_worker_client.WorkerClient, "for_factory_checkout", file_rpc)
     monkeypatch.setattr(repo_module.RepoProjectTests, "execute", project_test)
 

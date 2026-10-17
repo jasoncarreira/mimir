@@ -35,7 +35,6 @@ from mimir.pollers import discover_pollers, run_poller
 from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file_tool_routes
 from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
-from mimir_cultivate.worklink import worker_client as provider_worker_client
 from mimir.worklink.backends.feature_factory import FactoryStatus
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.dispatch_failures import (
@@ -201,6 +200,7 @@ class _ExecutorServer:
 
 @pytest.fixture
 def remediation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
     from mimir.worklink import worker_client
 
     home = tmp_path / "home"
@@ -341,6 +341,7 @@ async def test_retained_remediation_reaches_effects_through_real_tool_surface(
     from mimir.tools.budget_gate import BudgetGateMiddleware
     from mimir.tools.registry import worklink_resume
     from mimir.worklink import autonomy, detached_dispatch, worker_client
+    provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
 
     case = remediation_case
     event, labels, auth = await _trusted_turn(case)
@@ -597,6 +598,7 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
     from mimir.worklink import worker_client, worker_exec
 
     identities = _system_identities()
+    provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
     boundary = Path("/tmp") / f"mimir-remediation-{uuid.uuid4()}"
     retained_root = boundary / "worklink"
     checkout = retained_root / "mimir" / "1811-1" / "checkout"
