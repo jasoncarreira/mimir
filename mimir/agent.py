@@ -238,11 +238,30 @@ def _report_plugin_prompt(kind: str, name: str) -> None:
         log.debug("plugin prompt telemetry unavailable", exc_info=True)
 
 
-def maybe_create_worklink_budget_continuation(**kwargs):
-    """Defer Worklink recovery until a turn actually exhausts its budget."""
-    from .worklink.continuation import maybe_create_worklink_budget_continuation as create
+def _selected_turn_hooks(policy: Any, name: str) -> tuple[Callable[..., Any], ...]:
+    """Use only callbacks published by the selected, frozen policy."""
+    return tuple(callback for (_owner, stage), callback in policy.turn_hooks.items()
+                 if stage == name)
 
-    return create(**kwargs)
+
+def _turn_tool_surface_ready(config: Config) -> bool:
+    # Plugin readiness may withhold that owner's tools; it never opts core
+    # coding tools in. The legacy surface disappears with the core catalog.
+    if (config.coding_enabled and not any(
+        tool.owner == "cultivate" for tool in config.plugin_manager.policy.tools.values()
+    )):
+        # Until the core coding catalog is retired, preserve its identity latch
+        # for deployments that still use the legacy tool surface.
+        from .tools.forge import github_identity_is_degraded
+
+        return not github_identity_is_degraded()
+    return False
+
+
+def _unready_tool_owners(policy: Any) -> frozenset[str]:
+    owners = {tool.owner for tool in policy.tools.values() if tool.owner != "core"}
+    return frozenset(owner for (owner, stage), hook in policy.turn_hooks.items()
+                     if stage == "tool_readiness" and owner in owners and hook() is False)
 
 
 def _transient_provider_failure(exc: BaseException) -> tuple[str | None, float | None]:
@@ -1585,6 +1604,7 @@ class Agent:
         self._skill_fingerprint_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._skill_fingerprint_cache: tuple[tuple, str] | None = None
         self._cached_coding_enabled: bool | None = None
+        self._cached_unready_tool_owners: frozenset[str] = frozenset()
 
         # Memory-tool dep injection — only used if saga_client is a
         # SagaStore (post-saga cutover). Wires up the @tool's
@@ -1849,11 +1869,8 @@ class Agent:
         )
         skill_sources = self._current_skill_sources()
         skill_catalog_fingerprint = await self._skill_catalog_fingerprint(skill_sources)
-        coding_enabled = self._config.coding_enabled
-        if coding_enabled:
-            from .tools.forge import github_identity_is_degraded
-
-            coding_enabled = not github_identity_is_degraded()
+        coding_enabled = _turn_tool_surface_ready(self._config)
+        unready_tool_owners = _unready_tool_owners(self._config.plugin_manager.policy)
         if self._agent is not None and self._cached_system_prompt is None:
             # Unit tests inject a fake graph directly to avoid constructing
             # deepagents. Production-built graphs always set
@@ -1865,6 +1882,7 @@ class Agent:
             and system_prompt == self._cached_system_prompt
             and skill_catalog_fingerprint == self._cached_skill_catalog_fingerprint
             and coding_enabled == self._cached_coding_enabled
+            and unready_tool_owners == self._cached_unready_tool_owners
         ):
             return self._agent
 
@@ -1879,16 +1897,14 @@ class Agent:
             )
             skill_sources = self._current_skill_sources()
             skill_catalog_fingerprint = await self._skill_catalog_fingerprint(skill_sources)
-            coding_enabled = self._config.coding_enabled
-            if coding_enabled:
-                from .tools.forge import github_identity_is_degraded
-
-                coding_enabled = not github_identity_is_degraded()
+            coding_enabled = _turn_tool_surface_ready(self._config)
+            unready_tool_owners = _unready_tool_owners(self._config.plugin_manager.policy)
             if (
                 self._agent is not None
                 and system_prompt == self._cached_system_prompt
                 and skill_catalog_fingerprint == self._cached_skill_catalog_fingerprint
                 and coding_enabled == self._cached_coding_enabled
+                and unready_tool_owners == self._cached_unready_tool_owners
             ):
                 return self._agent
 
@@ -1905,6 +1921,7 @@ class Agent:
                     and skill_catalog_fingerprint
                     == self._cached_skill_catalog_fingerprint
                     and coding_enabled == self._cached_coding_enabled
+                    and unready_tool_owners == self._cached_unready_tool_owners
                 ):
                     return self._agent
 
@@ -1973,10 +1990,12 @@ class Agent:
             if (
                 self._agent_tools is None
                 or coding_enabled != self._cached_coding_enabled
+                or unready_tool_owners != self._cached_unready_tool_owners
             ):
                 self._agent_tools = all_mimir_tools(
                     coding_enabled=coding_enabled,
                     policy=self._config.plugin_manager.policy,
+                    unready_plugin_owners=unready_tool_owners,
                 )
 
             # Skills surfaced via SkillsMiddleware: pass operator +
@@ -2056,6 +2075,7 @@ class Agent:
             self._cached_system_prompt = system_prompt
             self._cached_skill_catalog_fingerprint = skill_catalog_fingerprint
             self._cached_coding_enabled = coding_enabled
+            self._cached_unready_tool_owners = unready_tool_owners
             return self._agent
 
     @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
@@ -3537,9 +3557,9 @@ class Agent:
             # channel couldn't surface its own result — post the mechanical
             # failure notice there. (Mirrored in the outer early-failure guard
             # for crashes before the model loop; disjoint via outcome_emitted.)
-            from .worklink.dispatch_failures import is_dispatch_failure_intervention
-
-            if error or is_dispatch_failure_intervention(event):
+            if error or any(hook(event) for hook in _selected_turn_hooks(
+                self._config.plugin_manager.policy, "failure_intervention",
+            )):
                 failure_detail = (
                     error
                     or str(result_fields["result_subtype"] or result_fields["stop_reason"])
@@ -3798,9 +3818,13 @@ class Agent:
         )
         await self._turn_logger.write(record)
         # Continuation sidecars are server-owned bookkeeping, not model writes.
-        from .worklink.dispatch_failures import is_dispatch_failure_intervention
-
-        if ctx.tool_call_budget_exhausted and not is_dispatch_failure_intervention(event):
+        intervention = any(hook(event) for hook in _selected_turn_hooks(
+            self._config.plugin_manager.policy, "failure_intervention",
+        ))
+        continuation_hooks = _selected_turn_hooks(
+            self._config.plugin_manager.policy, "budget_continuation",
+        )
+        if ctx.tool_call_budget_exhausted and not intervention and continuation_hooks:
             continuation_timeout_s = _worklink_continuation_timeout_seconds(self._config)
             try:
                 try:
@@ -3813,23 +3837,24 @@ class Agent:
                         ctx.ifc_labels, event.channel_id, ctx.auth_context,
                     ),
                 )
-                await asyncio.wait_for(
-                    asyncio.to_thread(
-                        maybe_create_worklink_budget_continuation,
-                        home=self._config.home,
-                        event=continuation_event,
-                        ctx=ctx,
-                        record=record,
-                        repo=current_worktree,
-                        current_worktree=current_worktree,
-                        run_id=(
-                            continuation_event.extra.get("run_id")
-                            if isinstance(continuation_event.extra.get("run_id"), str)
-                            else None
+                for continuation_hook in continuation_hooks:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            continuation_hook,
+                            home=self._config.home,
+                            event=continuation_event,
+                            ctx=ctx,
+                            record=record,
+                            repo=current_worktree,
+                            current_worktree=current_worktree,
+                            run_id=(
+                                continuation_event.extra.get("run_id")
+                                if isinstance(continuation_event.extra.get("run_id"), str)
+                                else None
+                            ),
                         ),
-                    ),
-                    timeout=continuation_timeout_s,
-                )
+                        timeout=continuation_timeout_s,
+                    )
             except asyncio.TimeoutError:
                 log.warning(
                     "worklink continuation recovery exceeded timeout (%ss) for turn %s",

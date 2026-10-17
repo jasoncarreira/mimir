@@ -66,7 +66,9 @@ from mimir.skill_defs import home_builtin_skills_dir
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.turn_logger import TurnLogger
 from mimir.turn_event_bus import TurnEventBus
-from mimir.worklink.continuation import (
+from mimir.plugins.registry import PolicyRegistry
+from mimir.tool_descriptors import ResultOriginKind
+from mimir.http_ingress import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     HTTP_EVENT_INGRESS_EXTRA_VALUE,
     stamp_http_event_ingress_extra,
@@ -82,6 +84,116 @@ def _make_config(home: Path) -> Config:
     import os
     os.environ["MIMIR_HOME"] = str(home)
     return Config.from_env()
+
+
+def _install_turn_hooks(agent: Agent, *, continuation=None, intervention=None) -> None:
+    from mimir.plugins.core import register_core_tools
+
+    if any(plugin.candidate.name == "cultivate" for plugin in agent._config.plugin_manager.plugins):
+        from mimir_cultivate.worklink.continuation import maybe_create_worklink_budget_continuation
+        from mimir_cultivate.worklink.dispatch_failures import is_dispatch_failure_intervention
+    else:
+        maybe_create_worklink_budget_continuation = lambda **kwargs: None
+        is_dispatch_failure_intervention = lambda event: bool(
+            event.trigger == "poller" and event.extra.get("poller_name") == "worklink-ready-queue"
+            and event.extra.get("items")
+        )
+
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+    registrar = registry.registrar("cultivate")
+    registrar.register_turn_hook(
+        "budget_continuation", continuation or maybe_create_worklink_budget_continuation,
+    )
+    registrar.register_turn_hook(
+        "failure_intervention", intervention or is_dispatch_failure_intervention,
+    )
+    registry.freeze()
+    agent._config = replace(agent._config, plugin_manager=SimpleNamespace(policy=registry, plugins=()))
+
+
+@pytest.fixture
+def worklink_ready_poller():
+    """Resolve the incident consumer from its current optional-skill owner."""
+    from mimir.pollers import discover_pollers
+
+    def resolve(state_root: Path):
+        pollers = discover_pollers(
+            Path(__file__).parents[1] / "mimir" / "optional-skills",
+            state_root=state_root,
+        )
+        return next(item for item in pollers if item.name == "worklink-ready-queue")
+
+    return resolve
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["example", "cultivate"])
+async def test_selected_readiness_only_controls_owner_tool_factories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: str,
+) -> None:
+    from mimir.tools import registry as tool_registry
+
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([]))
+    agent._agent = None
+    agent._agent_model = object()
+    agent._agent_middleware = ()
+    agent._config.coding_enabled = False
+    policy = PolicyRegistry()
+    made: list[str] = []
+
+    def add_tool(name: str, tool_owner: str) -> None:
+        def factory():
+            made.append(name)
+            return SimpleNamespace(name=name)
+
+        fields = dict(
+            name=name, factory=factory, flow="source", tier="scope-contained",
+            operation_class="open", result_domain=None, result_origin=ResultOriginKind.NONE,
+            sink_category=None, sink_destination=None, sink_target_extractor=None,
+            sink_payload_extractor=None, writes_code_or_state=False, profiles=(),
+            read_backend=False,
+        )
+        if tool_owner == "core":
+            policy.register_tool(**fields)
+        else:
+            policy.registrar(tool_owner).register_tool(**fields)
+
+    add_tool("legacy_coding", "core")
+    add_tool("owned_tool", owner)
+    if owner == "cultivate":
+        add_tool("unrelated_tool", "example")
+    ready = {"value": owner != "cultivate"}
+    policy.registrar(owner).register_turn_hook("tool_readiness", lambda: ready["value"])
+    policy.freeze()
+    agent._config = replace(agent._config, plugin_manager=SimpleNamespace(policy=policy, plugins=()))
+    monkeypatch.setattr("mimir.plugins.core.core_runtime_names", lambda surface: (
+        ("legacy_coding",) if surface == "coding" else ()
+    ))
+    monkeypatch.setattr("mimir.tools.web.web_tools_enabled", lambda spec: (False, False))
+    monkeypatch.setattr("mimir.tools.mcp.get_mcp_tools", lambda: [])
+    monkeypatch.setattr("mimir.tools.all_mimir_tools", tool_registry.all_mimir_tools)
+    monkeypatch.setattr("mimir.subagents.build_mimir_subagents", lambda **kwargs: [])
+    graphs = []
+    monkeypatch.setattr("deepagents.create_deep_agent", lambda **kwargs: graphs.append(kwargs) or object())
+    monkeypatch.setattr(agent, "_current_system_prompt", lambda **kwargs: "stable prompt")
+    monkeypatch.setattr(agent, "_current_skill_sources", lambda: ())
+    monkeypatch.setattr(agent, "_skill_catalog_fingerprint", lambda sources: asyncio.sleep(0, result="stable"))
+
+    await agent._build_agent_if_needed()
+    names = {tool.name for tool in graphs[-1]["tools"]}
+    assert "legacy_coding" not in names
+    assert ("owned_tool" in names) is ready["value"]
+    if owner == "cultivate":
+        assert "unrelated_tool" in names
+        assert "owned_tool" not in made
+        ready["value"] = True
+        await agent._build_agent_if_needed()
+        assert {tool.name for tool in graphs[-1]["tools"]} == {"owned_tool", "unrelated_tool"}
+        assert made.count("owned_tool") == 1
+        ready["value"] = False
+        await agent._build_agent_if_needed()
+        assert {tool.name for tool in graphs[-1]["tools"]} == {"unrelated_tool"}
 
 
 def _make_chat_skill_registry(
@@ -443,57 +555,6 @@ class _ServicePrincipalToolProbeAgent(_FakeAgent):
             _handler,
         )
 
-        async for chunk in super().astream(
-            state, config=config, stream_mode=stream_mode,
-        ):
-            yield chunk
-
-
-class _WorklinkToolProbeAgent(_FakeAgent):
-    """Model-boundary double that executes the real Worklink tool middleware."""
-
-    def __init__(self, issue_id: int) -> None:
-        super().__init__([AIMessage(content="worklink tool probed")])
-        self.issue_id = issue_id
-        self.result: ToolMessage | None = None
-
-    async def astream(
-        self,
-        state: dict[str, Any],
-        *,
-        config: dict[str, Any],
-        context=None,
-        stream_mode: str = "values",
-    ):
-        from mimir._context import get_current_turn
-        from mimir.tools import registry
-
-        turn = get_current_turn()
-        assert turn is not None
-        gate = BudgetGateMiddleware()
-
-        async def handler(request: ToolCallRequest) -> ToolMessage:
-            content = await registry.worklink_run.ainvoke(request.tool_call["args"])
-            return ToolMessage(
-                content=content,
-                tool_call_id=request.tool_call["id"],
-                name="worklink_run",
-            )
-
-        self.result = await gate.awrap_tool_call(
-            ToolCallRequest(
-                tool_call={
-                    "name": "worklink_run",
-                    "args": {"issue_id": self.issue_id},
-                    "id": "tc-worklink-run",
-                    "type": "tool_call",
-                },
-                tool=registry.worklink_run,
-                state=None,
-                runtime=Runtime(context=turn.auth_context),
-            ),
-            handler,
-        )
         async for chunk in super().astream(
             state, config=config, stream_mode=stream_mode,
         ):
@@ -2648,6 +2709,9 @@ async def test_budget_exhaustion_creates_worklink_continuation_sidecar(
         ),
         fake_saga=None,
     )
+    if not any(plugin.candidate.name == "cultivate" for plugin in agent._config.plugin_manager.plugins):
+        pytest.skip("sidecar implementation belongs to the selected Cultivate provider")
+    _install_turn_hooks(agent)
 
     record = await agent.run_turn(
         AgentEvent(
@@ -2685,6 +2749,27 @@ async def test_budget_exhaustion_creates_worklink_continuation_sidecar(
     )
 
 
+async def test_budget_exhaustion_without_provider_does_not_create_sidecar(
+    tmp_path: Path,
+) -> None:
+    from mimir.plugins.core import core_policy_registry
+
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_BudgetExhaustingAgent(response_messages=[AIMessage(content="done")]),
+        fake_saga=None,
+    )
+    agent._config = replace(agent._config, plugin_manager=SimpleNamespace(
+        policy=core_policy_registry(), plugins=(),
+    ))
+    record = await agent.run_turn(AgentEvent(
+        trigger="scheduled_tick", channel_id="ops", content="ordinary work",
+    ))
+
+    assert record.output == "done"
+    assert not (agent._config.home / "state" / "worklink" / "continuations").exists()
+
+
 async def test_budget_exhaustion_passes_run_identity_to_continuation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2704,10 +2789,7 @@ async def test_budget_exhaustion_passes_run_identity_to_continuation(
         captured.update(kwargs)
         return None
 
-    monkeypatch.setattr(
-        "mimir.agent.maybe_create_worklink_budget_continuation",
-        _capture_continuation,
-    )
+    _install_turn_hooks(agent, continuation=_capture_continuation)
 
     await agent.run_turn(
         AgentEvent(
@@ -2738,6 +2820,9 @@ async def test_continuation_written_even_without_assistant_output(
         ),
         fake_saga=None,
     )
+    if not any(plugin.candidate.name == "cultivate" for plugin in agent._config.plugin_manager.plugins):
+        pytest.skip("sidecar implementation belongs to the selected Cultivate provider")
+    _install_turn_hooks(agent)
 
     record = await agent.run_turn(
         AgentEvent(
@@ -2814,7 +2899,7 @@ async def test_budget_continuation_timeout_logs_failure_and_still_runs_finalize_
             finished.set()
         return None
 
-    monkeypatch.setattr("mimir.agent.maybe_create_worklink_budget_continuation", _slow_continuation)
+    _install_turn_hooks(agent, continuation=_slow_continuation)
     monkeypatch.setattr("mimir.agent._worklink_continuation_timeout_seconds", lambda _cfg: 0.01)
     agent._hooks.append(_FinalizeHook())
 
@@ -6536,7 +6621,6 @@ async def test_deliver_failure_notice_fires_on_early_phase_crash(
 async def test_incident_budget_result_failure_sends_one_notice_without_continuation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.agent as agent_mod
     from mimir.access_control import CapabilityTier, build_trigger_service_principal
 
     fake_model = _BudgetExhaustingAgent(
@@ -6549,11 +6633,7 @@ async def test_incident_budget_result_failure_sends_one_notice_without_continuat
     )
     channels = _RecordingChannels()
     agent._channels = channels  # type: ignore[attr-defined]
-    monkeypatch.setattr(
-        agent_mod,
-        "maybe_create_worklink_budget_continuation",
-        lambda **kwargs: pytest.fail("incident created a continuation"),
-    )
+    _install_turn_hooks(agent, continuation=lambda **kwargs: pytest.fail("incident created a continuation"))
     authority = build_trigger_service_principal(
         canonical="poller:worklink-ready-queue",
         trigger="poller",
@@ -6600,15 +6680,17 @@ async def test_incident_budget_result_failure_sends_one_notice_without_continuat
 @pytest.mark.parametrize("worker_environment", [False, True], ids=["default", "worker-path"])
 async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_environment: bool,
+    worklink_ready_poller,
 ) -> None:
     import os
     import shlex
     import sys
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Worklink incident consumer requires selected Cultivate")
 
-    import mimir.agent as agent_mod
     from mimir.dispatcher import Dispatcher
-    from mimir.pollers import discover_pollers, run_poller
-    from mimir.worklink.dispatch_failures import (
+    from mimir.pollers import run_poller
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
         record_failure,
@@ -6621,11 +6703,7 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     repo.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
-    pollers = discover_pollers(
-        Path(__file__).parents[1] / "mimir" / "optional-skills",
-        state_root=state_root,
-    )
-    poller = next(item for item in pollers if item.name == "worklink-ready-queue")
+    poller = worklink_ready_poller(state_root)
     incident_state_dir = dispatch_failure_state_dir(home)
     log_path = home / "state" / "worklink" / "runs" / "441.log"
     transcript_path = home / "state" / "worklink" / "transcripts" / "factory-441.json"
@@ -6667,11 +6745,7 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     )
     channels = _RecordingChannels()
     agent._channels = channels  # type: ignore[attr-defined]
-    monkeypatch.setattr(
-        agent_mod,
-        "maybe_create_worklink_budget_continuation",
-        lambda **kwargs: pytest.fail("incident created a continuation"),
-    )
+    _install_turn_hooks(agent, continuation=lambda **kwargs: pytest.fail("incident created a continuation"))
     dispatcher = Dispatcher(_make_config(home), agent.run_turn)
     agent._dispatcher = dispatcher
     queued_events: list[AgentEvent] = []
@@ -6742,13 +6816,15 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
 
 
 @pytest.mark.parametrize("enforced", [False, True], ids=["advisory", "enforced"])
-async def test_model_tool_middleware_reaches_core_refusal_after_stale_poller_selection(
+async def test_stale_poller_selection_uses_selected_provider_intervention_hook(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforced: bool,
+    worklink_ready_poller,
 ) -> None:
-    from mimir.pollers import discover_pollers
-    from mimir.tools import registry
-    from mimir.worklink import autonomy
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Worklink incident hook requires selected Cultivate")
+    from mimir_cultivate.worklink.dispatch_failures import (
+        dispatch_failure_state_dir, load_failure_state, record_failure,
+    )
 
     home = tmp_path / "home"
     state_root = home / "state" / "pollers"
@@ -6761,14 +6837,7 @@ async def test_model_tool_middleware_reaches_core_refusal_after_stale_poller_sel
         monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
     else:
         monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
-    poller = next(
-        item
-        for item in discover_pollers(
-            Path(__file__).parents[1] / "mimir" / "optional-skills",
-            state_root=state_root,
-        )
-        if item.name == "worklink-ready-queue"
-    )
+    poller = worklink_ready_poller(state_root)
     authority = poller.resolved_authority()
     selected_before_incident = AgentEvent(
         trigger="poller",
@@ -6777,11 +6846,15 @@ async def test_model_tool_middleware_reaches_core_refusal_after_stale_poller_sel
         source="poller",
         service_principal=authority.canonical,
         service_authority=authority,
-        extra={"poller_name": "worklink-ready-queue"},
+        extra={
+            "poller_name": "worklink-ready-queue",
+            "deliver": authority.canonical,
+            "issue_id": 443,
+        },
     )
-    # The poller selection is already represented by the event. The ledger wins
-    # the race before the model's real tool call reaches the core executor.
-    record_failure(
+    # The event was selected before the ledger write. The provider-owned
+    # intervention hook reads the ledger when the turn completes.
+    incident = record_failure(
         dispatch_failure_state_dir(home),
         issue_id=443,
         attempt=1,
@@ -6789,27 +6862,37 @@ async def test_model_tool_middleware_reaches_core_refusal_after_stale_poller_sel
         error="retained recovery required",
         log_path="run.log",
     )
-    monkeypatch.setattr(
-        autonomy,
-        "check_concurrency",
-        lambda home, **kwargs: autonomy.ConcurrencyCheck(True, 0, 2),
-    )
-    registry.set_arbiter(None)
-    model = _WorklinkToolProbeAgent(443)
+    observed: list[int] = []
+
+    def intervention(event: AgentEvent) -> bool:
+        observed.append(event.extra["issue_id"])
+        return str(event.extra["issue_id"]) in load_failure_state(
+            dispatch_failure_state_dir(home),
+        )["issues"]
+
+    model = _BudgetExhaustingAgent(response_messages=[AIMessage(content="budget exhausted")])
     agent = _build_agent(
         tmp_path,
         fake_agent=model,
         fake_saga=_FakeSaga(query_hits=[]),
     )
-
+    channels = _RecordingChannels()
+    agent._channels = channels  # type: ignore[attr-defined]
+    _install_turn_hooks(
+        agent, intervention=intervention,
+        continuation=lambda **kwargs: pytest.fail("stale selection created a continuation"),
+    )
     record = await agent.run_turn(selected_before_incident)
 
-    assert record.result_is_error is False
+    assert record.result_is_error is True
+    assert record.result_subtype == "tool_budget_exhausted"
     assert len(model.invocations) == 1
-    assert model.result is not None
-    assert model.result.status != "error"
-    assert "worklink_run #443: refused" in str(model.result.content)
-    assert "unresolved Worklink incident" in str(model.result.content)
+    assert observed == [443, 443]
+    assert incident["issue_id"] == 443
+    assert channels.sent == [(
+        authority.canonical, "⚠️ worklink-ready-queue failed: tool_budget_exhausted",
+    )]
+    assert not (home / "state" / "worklink" / "continuations").exists()
 
 
 async def test_cross_channel_deliver_failure_notice_is_denied_under_enforcement(
