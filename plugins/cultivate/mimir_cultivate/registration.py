@@ -3,9 +3,53 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+import os
+from pathlib import Path
+import stat
 
 if TYPE_CHECKING:
     from mimir.plugins.registry import PolicyRegistrar
+
+
+def _retained_checkout_operation(
+    operation: str, file_path: str, absolute: Path, scope: object, **arguments: object,
+) -> dict[str, object]:
+    from mimir.readonly_backend import _replace_shrink_error, _write_failure_error
+    from .worklink.retained_scope import retained_factory_effect_lease
+    from .worklink.worker_client import WorkerClient, factory_checkout_for_path
+
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    binding = factory_checkout_for_path(Path(scope.sandbox))
+    if not home_value or binding is None:
+        return {"error": "retained factory checkout binding is unavailable"}
+    checkout, issue_id, attempt = binding
+    with retained_factory_effect_lease(Path(home_value), scope) as lease:
+        if lease.scope is None:
+            return {"error": lease.refusal_reason or "retained factory lease refused"}
+        relative = absolute.relative_to(checkout).as_posix()
+        if operation == "replace_file":
+            allow_shrink = arguments.pop("allow_shrink", False)
+            try:
+                metadata = absolute.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    return {"error": f"File '{file_path}' is not a regular file."}
+                content = arguments["content"]
+                if not isinstance(content, str):
+                    return {"error": "factory replace content is invalid"}
+                new_bytes = len(content.encode("utf-8"))
+            except FileNotFoundError:
+                return {"error": "file does not exist"}
+            except (OSError, UnicodeEncodeError) as exc:
+                return {"error": _write_failure_error(file_path, str(exc))}
+            shrink_error = _replace_shrink_error(metadata.st_size, new_bytes, allow_shrink)
+            if shrink_error:
+                return {"error": shrink_error}
+        client = WorkerClient.for_factory_checkout(
+            checkout, issue_id=issue_id, attempt=attempt,
+        )
+        return client.factory_file_operation(
+            operation, relative, run_id=scope.run_id, **arguments,
+        )
 
 
 class CultivateProvider:
@@ -13,6 +57,7 @@ class CultivateProvider:
         from .policy import register_action_protocol, validate_scoped_pr_action
 
         register_action_protocol(registrar, validate_scoped_pr_action)
+        registrar.register_retained_checkout_operation(_retained_checkout_operation)
 
 
 provider = CultivateProvider()

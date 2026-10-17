@@ -177,6 +177,7 @@ class PolicyRegistry:
         self._prompt_providers: dict[str, PromptBlockProvider] = {}
         self._state_slots: dict[str, type] = {}
         self._scoped_actions: dict[str, ScopedActionProtocol] = {}
+        self._retained_checkout_operation: tuple[str, Callable[..., dict[str, object]]] | None = None
         self._selected_plugin_candidates: tuple[PluginCandidate, ...] = ()
         self._selection_bound = False
         self._projected_owner: str | None = None
@@ -318,6 +319,22 @@ class PolicyRegistry:
     @property
     def scoped_actions(self) -> Mapping[str, ScopedActionProtocol]:
         return MappingProxyType(self._scoped_actions)
+
+    @property
+    def retained_checkout_operation(self) -> tuple[str, Callable[..., dict[str, object]]] | None:
+        return self._retained_checkout_operation
+
+    def register_retained_checkout_operation(
+        self, operation: Callable[..., dict[str, object]], *, owner: str = "core",
+    ) -> None:
+        self._writable()
+        if (owner == "core" or self._retained_checkout_operation is not None
+                or not callable(operation)
+                or not any(candidate.name == owner and candidate.enabled
+                           and candidate.diagnostic is None
+                           for candidate in self._selected_plugin_candidates)):
+            raise PolicyRegistrationError(f"{owner}: invalid retained checkout operation")
+        self._retained_checkout_operation = (owner, operation)
 
     def register_scoped_action(
         self, action_type: type[StrEnum], validate_scope: Callable[..., bool],
@@ -894,6 +911,11 @@ class PolicyRegistrar:
 
     def register_poller_hook(self, name: str, hook: Callable[..., Any]) -> None:
         self._registry.register_poller_hook(name, hook, owner=self.plugin)
+
+    def register_retained_checkout_operation(
+        self, operation: Callable[..., dict[str, object]],
+    ) -> None:
+        self._registry.register_retained_checkout_operation(operation, owner=self.plugin)
 
     def register_scheduler_job(self, name: str, job_id: str, callback: Callable[..., Any]) -> None:
         self._registry.register_scheduler_job(name, job_id, callback, owner=self.plugin)

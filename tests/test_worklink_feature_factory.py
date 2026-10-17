@@ -1398,7 +1398,7 @@ async def test_launch_child_environment_carries_the_publishing_identity(
     """
     _own_opencode_resolution(tmp_path, monkeypatch)
     from types import SimpleNamespace
-    from mimir.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
 
     from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
 
