@@ -1739,7 +1739,7 @@ dev = [
 
 [[package]]
 name = "mimir-cultivate"
-version = "0.9.9"
+version = "0.9.10"
 source = { editable = "plugins/cultivate" }
 dependencies = [
     { name = "mimir-agent" },

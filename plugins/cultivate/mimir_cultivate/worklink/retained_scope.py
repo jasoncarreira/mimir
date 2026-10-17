@@ -143,7 +143,7 @@ def derive_retained_factory_scope(
 
 
 def _factory_session_lock_is_fresh(record: FactoryRunRecord) -> bool:
-    from mimir.worklink.backends.feature_factory import FeatureFactoryBackend
+    from .backends.feature_factory import FeatureFactoryBackend
 
     status = FeatureFactoryBackend(entrypoint=record.launcher).status(
         record.run_id, sandbox=Path(record.sandbox), launcher=record.launcher,
