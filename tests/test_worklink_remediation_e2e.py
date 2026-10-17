@@ -33,6 +33,9 @@ from mimir.event_logger import init_logger
 from mimir.models import InformationFlowLabels, TurnContext
 from mimir.pollers import discover_pollers, run_poller
 from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file_tool_routes
+from mimir.plugins.core import policy_scope
+from mimir.plugins.manager import load_plugins
+from mimir_cultivate.worklink import worker_client as provider_worker_client
 from mimir.worklink.backends.feature_factory import FactoryStatus
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.dispatch_failures import (
@@ -228,8 +231,13 @@ def remediation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{external}:ro")
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
+    monkeypatch.setattr(provider_worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
     monkeypatch.setattr(
         "mimir.worklink.retained_scope._factory_session_lock_is_fresh",
+        lambda _record: False,
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
         lambda _record: False,
     )
 
@@ -265,7 +273,7 @@ def remediation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         controller_phase="parked",
     )
     save_factory_record(home, record)
-    return SimpleNamespace(
+    case = SimpleNamespace(
         home=home,
         state_root=state_root,
         controller_repo=controller_repo,
@@ -276,6 +284,8 @@ def remediation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         incident=incident,
         record=record,
     )
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield case
 
 
 async def _trusted_turn(case):
@@ -365,6 +375,11 @@ async def test_retained_remediation_reaches_effects_through_real_tool_surface(
     monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
     monkeypatch.setattr(
         worker_client.WorkerClient,
+        "for_factory_checkout",
+        lambda *args, **kwargs: FileClient(),
+    )
+    monkeypatch.setattr(
+        provider_worker_client.WorkerClient,
         "for_factory_checkout",
         lambda *args, **kwargs: FileClient(),
     )
@@ -683,23 +698,34 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
         monkeypatch.setenv("HOME", str(controller_home))
         monkeypatch.setenv("WORKLINK_REPO", str(controller_repo))
         monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+        monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
         case = SimpleNamespace(
             home=home,
             state_root=home / "state" / "pollers",
         )
 
         monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
+        monkeypatch.setattr(provider_worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
+        monkeypatch.setattr(provider_worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
         monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
         monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", retained_root)
         monkeypatch.setattr(worker_exec, "HOME_ROOT", executor_homes)
         monkeypatch.setattr(worker_exec, "REPO_TEST_CHECKOUT_ROOT", snapshots)
         monkeypatch.setattr(worker_exec, "REPO_TEST_UV_CACHE", uv_cache)
         monkeypatch.setattr(contained_checkout, "REPO_TEST_CHECKOUT_ROOT", snapshots)
+        from mimir_cultivate import contained_checkout as provider_checkout
+        from mimir_cultivate import contained_execution as provider_execution
+
+        monkeypatch.setattr(provider_checkout, "REPO_TEST_CHECKOUT_ROOT", snapshots)
         monkeypatch.setattr(
             "mimir.worklink.checkout._REPO_TEST_CHECKOUT_ROOT", snapshots,
         )
         monkeypatch.setattr(
             "mimir.worklink.retained_scope._factory_session_lock_is_fresh",
+            lambda _record: False,
+        )
+        monkeypatch.setattr(
+            "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
             lambda _record: False,
         )
         read_fd, write_fd = os.pipe()
@@ -718,6 +744,7 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
                     contained_execution.WorkerClient = lambda capability: worker_client.WorkerClient(
                         capability, socket_path=socket_path,
                     )
+                    provider_execution.WorkerClient = contained_execution.WorkerClient
                     event, labels, auth = asyncio.run(_trusted_turn(case))
                     scope = auth.retained_factory_scope
                     assert scope is not None, auth.retained_factory_scope_refusal
@@ -734,12 +761,13 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
                         default=WriteGuardBackend(home, ["state"], guard_outside_root=True),
                         routes=build_file_tool_routes([(str(retained_root), "retained")]),
                     )
-                    token = set_current_turn(turn)
-                    try:
-                        written = backend.write(str(sandbox / "new.txt"), "new\n")
-                        edited = backend.edit(str(sandbox / "fix.txt"), "before", "after")
-                    finally:
-                        reset_current_turn(token)
+                    with policy_scope(load_plugins(enable="cultivate").policy):
+                        token = set_current_turn(turn)
+                        try:
+                            written = backend.write(str(sandbox / "new.txt"), "new\n")
+                            edited = backend.edit(str(sandbox / "fix.txt"), "before", "after")
+                        finally:
+                            reset_current_turn(token)
                     assert written.error is None, written.error
                     assert edited.error is None, edited.error
                     tools = RepoGitTools(

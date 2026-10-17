@@ -2575,47 +2575,19 @@ class RetainedCheckoutFilesystemBackend(ReadOnlyFilesystemBackend):
         return auth, scope, absolute
 
     def _operate(self, operation: str, file_path: str, **arguments: object) -> dict[str, object]:
-        from .worklink.retained_scope import retained_factory_effect_lease
-        from .worklink.worker_client import WorkerClient, factory_checkout_for_path
+        from .plugins.core import selected_policy_registry
 
         auth, scope, absolute = self._binding(file_path)
         if scope is None:
             return {"error": "retained factory scope does not authorize this path"}
-        home_value = os.environ.get("MIMIR_HOME", "").strip()
-        binding = factory_checkout_for_path(Path(scope.sandbox))
-        if not home_value or binding is None:
-            return {"error": "retained factory checkout binding is unavailable"}
-        checkout, issue_id, attempt = binding
-        with retained_factory_effect_lease(Path(home_value), scope) as lease:
-            if lease.scope is None:
-                return {"error": lease.refusal_reason or "retained factory lease refused"}
-            relative = absolute.relative_to(checkout).as_posix()
-            if operation == "replace_file":
-                # Controller-only option: keep the executor's exact-key protocol
-                # unchanged. Inspect the target while the retained effect lease
-                # is held, before dispatching any mutating worker operation.
-                allow_shrink = arguments.pop("allow_shrink", False)
-                try:
-                    metadata = absolute.stat(follow_symlinks=False)
-                    if not stat.S_ISREG(metadata.st_mode):
-                        return {"error": f"File '{file_path}' is not a regular file."}
-                    content = arguments["content"]
-                    if not isinstance(content, str):
-                        return {"error": "factory replace content is invalid"}
-                    new_bytes = len(content.encode("utf-8"))
-                except FileNotFoundError:
-                    return {"error": "file does not exist"}
-                except (OSError, UnicodeEncodeError) as exc:
-                    return {"error": _write_failure_error(file_path, str(exc))}
-                shrink_error = _replace_shrink_error(metadata.st_size, new_bytes, allow_shrink)
-                if shrink_error:
-                    return {"error": shrink_error}
-            client = WorkerClient.for_factory_checkout(
-                checkout, issue_id=issue_id, attempt=attempt,
-            )
-            return client.factory_file_operation(
-                operation, relative, run_id=scope.run_id, **arguments,
-            )
+        registry = selected_policy_registry()
+        registered = registry.retained_checkout_operation
+        if registered is None or not any(
+            candidate.enabled and candidate.name == registered[0]
+            for candidate in registry.selected_plugin_candidates
+        ):
+            return {"error": "retained factory checkout provider is unavailable"}
+        return registered[1](operation, file_path, absolute, scope, **arguments)
 
     def write(self, file_path: str, content: str) -> WriteResult:
         result = self._operate("write_file", file_path, content=content)

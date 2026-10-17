@@ -3651,8 +3651,8 @@ import stat
 from collections.abc import Awaitable, Callable
 import uuid
 
-from mimir.contained_checkout import ContainedCheckout, create_repo_test_checkout
-from mimir.contained_execution import (
+from .contained_checkout import ContainedCheckout, create_repo_test_checkout
+from .contained_execution import (
     CollectedExecutionResult,
     SensitiveMaterialScrubber,
     base_worker_environment,

@@ -22,7 +22,7 @@ import uuid
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from mimir.output_capture import OutputSink, open_output_pair
-from mimir.contained_execution import (
+from ..contained_execution import (
     CollectedExecutionResult,
     base_worker_environment,
     execute_contained,
