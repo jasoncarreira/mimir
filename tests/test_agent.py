@@ -87,8 +87,13 @@ def _make_config(home: Path) -> Config:
 
 def _install_turn_hooks(agent: Agent, *, continuation=None, intervention=None) -> None:
     from mimir.plugins.core import register_core_tools
-    from mimir_cultivate.worklink.continuation import maybe_create_worklink_budget_continuation
-    from mimir_cultivate.worklink.dispatch_failures import is_dispatch_failure_intervention
+
+    if any(plugin.candidate.name == "cultivate" for plugin in agent._config.plugin_manager.plugins):
+        from mimir_cultivate.worklink.continuation import maybe_create_worklink_budget_continuation
+        from mimir_cultivate.worklink.dispatch_failures import is_dispatch_failure_intervention
+    else:
+        from mimir.worklink.continuation import maybe_create_worklink_budget_continuation
+        from mimir.worklink.dispatch_failures import is_dispatch_failure_intervention
 
     registry = PolicyRegistry()
     register_core_tools(registry)
