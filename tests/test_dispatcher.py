@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ from mimir.event_logger import init_logger
 from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent
 from mimir.server import _PairingNotifier
-from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY, HTTP_EVENT_INGRESS_EXTRA_VALUE
+from mimir.http_ingress import HTTP_EVENT_INGRESS_EXTRA_KEY, HTTP_EVENT_INGRESS_EXTRA_VALUE
 from tests.timing import HANG_GUARD_SECONDS, wait_until
 
 
@@ -590,8 +591,11 @@ async def test_poller_delivery_without_relevance_predicate_is_unchanged(tmp_path
 async def test_worklink_incident_relevance_drops_stale_turn_before_model(
     tmp_path: Path, transition: str,
 ) -> None:
-    from mimir.pollers import _worklink_recovery_relevance_check
-    from mimir.worklink.dispatch_failures import (
+    if "cultivate" not in os.environ.get("MIMIR_PLUGINS", "").split(","):
+        pytest.skip("Worklink recovery belongs to the selected Cultivate provider")
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink.poller_hooks import recovery_relevance_check
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         record_failure,
         record_success,
@@ -639,7 +643,7 @@ async def test_worklink_incident_relevance_drops_stale_turn_before_model(
     await entered.wait()
     assert await disp.enqueue(
         incident,
-        relevance_check=_worklink_recovery_relevance_check(state_dir),
+        relevance_check=recovery_relevance_check(state_dir),
     )
     if transition == "resolved":
         record_success(state_dir, 441)
@@ -2792,7 +2796,7 @@ async def test_http_ingress_with_client_source_does_not_skip_inbound_auth(tmp_pa
     """chainlink #890: client-supplied source on HTTP ingress cannot bypass
     inbound allowlist. Even if client sets source="api", it must go through
     authorize_inbound."""
-    from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
+    from mimir.http_ingress import HTTP_EVENT_INGRESS_EXTRA_VALUE
 
     cfg = _make_config(tmp_path, access_control_enforced=True)
     resolver = _resolver(
@@ -2838,7 +2842,7 @@ async def test_http_ingress_with_client_source_does_not_skip_inbound_auth(tmp_pa
 
 @pytest.mark.asyncio
 async def test_http_ingress_non_user_trigger_does_not_skip_inbound_auth(tmp_path: Path):
-    from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
+    from mimir.http_ingress import HTTP_EVENT_INGRESS_EXTRA_VALUE
 
     cfg = _make_config(tmp_path, access_control_enforced=True)
     resolver = _resolver(
