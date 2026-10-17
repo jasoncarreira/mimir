@@ -80,7 +80,7 @@ from mimir.pr_checkout_lease import PRCheckoutLease, _metadata
 from mimir.prompt_sources import prompt_source_label
 from mimir.skill_install import install
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
-from mimir.worklink.continuation import (
+from mimir.http_ingress import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     HTTP_EVENT_INGRESS_EXTRA_VALUE,
 )

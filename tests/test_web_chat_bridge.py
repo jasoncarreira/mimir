@@ -30,7 +30,7 @@ from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent, SessionACL
 from mimir.saga.ownership import is_user_accessible
 from mimir.web_contracts import validate_api_envelope, validate_live_event
-from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY, WORKLINK_HINT_EXTRA_KEYS
+from mimir.http_ingress import HTTP_EVENT_INGRESS_EXTRA_KEY, WORKLINK_HINT_EXTRA_KEYS
 from tests.timing import HANG_GUARD_SECONDS, wait_until
 
 
