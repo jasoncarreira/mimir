@@ -15,7 +15,6 @@ import pytest
 if "cultivate" not in os.environ.get("MIMIR_PLUGINS", "").split(","):
     pytest.skip("factory execution requires selected Cultivate", allow_module_level=True)
 
-from mimir.contained_execution import CollectedExecutionResult
 from mimir_cultivate.worklink import compute, worker_exec
 from mimir_cultivate.worklink.backends.feature_factory import FACTORY_VERSION
 from mimir_cultivate.worklink.safe_git import _git_credential_settings
@@ -92,7 +91,7 @@ async def test_factory_launch_uses_captured_trusted_scoped_helpers(
             assert matched.stdout.strip() == helper
         observed.append(env)
         capability._contained_started(SimpleNamespace(pid=None))
-        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+        return compute.CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
 
     monkeypatch.setattr(compute, "execute_contained", execute)
     backend = compute.LocalSubprocessComputeBackend(_worker_client=object())
@@ -133,7 +132,7 @@ async def test_factory_credentials_leave_enabled_leaf_environment_and_projection
     async def execute(command, capability, env, projections, **kwargs):
         observed.append((env, projections))
         capability._contained_started(SimpleNamespace(pid=None))
-        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+        return compute.CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
 
     monkeypatch.setattr(compute, "execute_contained", execute)
     backend = compute.LocalSubprocessComputeBackend(_worker_uid=os.getuid(), _worker_client=object())
@@ -251,7 +250,7 @@ def test_executor_requires_peer_credentials_before_side_effects(tmp_path, monkey
     ("repo/41-2/checkout/../elsewhere", "error"),
 ])
 def test_factory_control_path_classification(tmp_path, monkeypatch, relative, result):
-    from mimir.worklink import worker_client
+    from mimir_cultivate.worklink import worker_client
 
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
     path = tmp_path / relative
@@ -458,7 +457,7 @@ async def test_factory_projects_native_config_only_for_opencode(
         assert "GIT_CONFIG_VALUE_0" not in env
         observed.append((dict(env), {p.path: json.loads(p.document) for p in projections}))
         capability._contained_started(SimpleNamespace(pid=None))
-        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+        return compute.CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
 
     monkeypatch.setattr(compute, "execute_contained", execute)
     backend = compute.LocalSubprocessComputeBackend(_worker_client=object())

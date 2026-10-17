@@ -160,9 +160,8 @@ def _assigned_keys(block: str) -> set[str]:
     return set(re.findall(r"^\s*([A-Z][A-Z0-9_]*)=", block, re.M))
 
 
-def test_runtime_settings_go_in_compose_env_and_the_coding_toggle_in_dotenv() -> None:
+def test_runtime_settings_match_compose_and_the_runbook() -> None:
     runtime = _assigned_keys(_bash_block_after("**`compose.env` is the container's runtime environment.**"))
-    toggle = _assigned_keys(_bash_block_after("**`.env` (in the agent home) holds the coding toggle.**"))
     assert runtime == {
         "GITHUB_TOKEN",
         "MIMIR_GITHUB_SELF_LOGIN",
@@ -170,14 +169,20 @@ def test_runtime_settings_go_in_compose_env_and_the_coding_toggle_in_dotenv() ->
         "GH_USER_EMAIL",
         "MIMIR_PR_CHECKOUT_LEASE_ROOT",
     }
-    assert toggle == {"MIMIR_CODING_ENABLED"}
-
-    # Why the split is right, per the generated files: the container gets compose.env as
-    # its runtime env, the coding toggle is Compose-interpolated (from the project .env),
-    # and start.sh consumes the identity + token before mimir reads <home>/.env.
     compose = scaffold_docker.render_compose_yml(service_name="my-agent", web_port=8090, mode="pypi")
     assert "env_file:\n      - compose.env" in compose
-    assert 'MIMIR_CODING_ENABLED: "${MIMIR_CODING_ENABLED:-false}"' in compose
+    if 'MIMIR_CODING_ENABLED: "${MIMIR_CODING_ENABLED:-false}"' in compose:
+        # Until the scaffold migrates, the runbook must still explain where
+        # Compose reads the image/runtime toggle rather than omitting setup.
+        toggle = _assigned_keys(_bash_block_after("**`.env` (in the agent home) holds the coding toggle.**"))
+        assert toggle == {"MIMIR_CODING_ENABLED"}
+    else:
+        # Once the scaffold stops advertising the flag, the runbook must not
+        # recommend it anywhere, and must explain how to select the provider.
+        assert "MIMIR_CODING_ENABLED" not in compose
+        assert "MIMIR_CODING_ENABLED" not in _doc()
+        assert "MIMIR_PLUGINS" in _doc()
+        assert "cultivate" in _doc()
     start = scaffold_docker.render_start_sh(mode="pypi")
     for key in ("GH_USER_NAME", "GH_USER_EMAIL", "GITHUB_TOKEN"):
         assert key in start
