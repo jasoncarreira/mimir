@@ -55,9 +55,15 @@ def _retained_checkout_operation(
 class CultivateProvider:
     def register(self, registrar: PolicyRegistrar) -> None:
         from .policy import register_action_protocol, validate_scoped_pr_action
+        from .forge import github_identity_is_degraded
+        from .worklink.continuation import maybe_create_worklink_budget_continuation
+        from .worklink.dispatch_failures import is_dispatch_failure_intervention
 
         register_action_protocol(registrar, validate_scoped_pr_action)
         registrar.register_retained_checkout_operation(_retained_checkout_operation)
+        registrar.register_turn_hook("tool_readiness", lambda: not github_identity_is_degraded())
+        registrar.register_turn_hook("failure_intervention", is_dispatch_failure_intervention)
+        registrar.register_turn_hook("budget_continuation", maybe_create_worklink_budget_continuation)
 
 
 provider = CultivateProvider()

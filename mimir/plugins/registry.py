@@ -170,6 +170,7 @@ class PolicyRegistry:
         self._principal_owners: dict[str, str] = {}
         self._poller_properties: dict[str, Any] = {}
         self._poller_hooks: dict[str, tuple[str, Callable[..., Any]]] = {}
+        self._turn_hooks: dict[tuple[str, str], Callable[..., Any]] = {}
         self._scheduler_jobs: dict[str, SchedulerJob] = {}
         self._cli_commands: dict[str, CliCommand] = {}
         self._routes: dict[tuple[str, str], PluginRoute] = {}
@@ -291,6 +292,21 @@ class PolicyRegistry:
     @property
     def poller_hooks(self) -> Mapping[str, tuple[str, Callable[..., Any]]]:
         return MappingProxyType(self._poller_hooks)
+
+    @property
+    def turn_hooks(self) -> Mapping[tuple[str, str], Callable[..., Any]]:
+        return MappingProxyType(self._turn_hooks)
+
+    def register_turn_hook(self, name: str, hook: Callable[..., Any], *, owner: str = "core") -> None:
+        self._writable()
+        name = _name(name, "turn hook")
+        if (owner == "core" or (owner, name) in self._turn_hooks or not callable(hook)
+                or (self._selection_bound and not any(
+                    candidate.name == owner and candidate.enabled and candidate.diagnostic is None
+                    for candidate in self._selected_plugin_candidates
+                ))):
+            raise PolicyRegistrationError(f"{owner}: invalid or duplicate turn hook: {name}")
+        self._turn_hooks[owner, name] = hook
 
     @property
     def scheduler_jobs(self) -> Mapping[str, SchedulerJob]:
@@ -911,6 +927,9 @@ class PolicyRegistrar:
 
     def register_poller_hook(self, name: str, hook: Callable[..., Any]) -> None:
         self._registry.register_poller_hook(name, hook, owner=self.plugin)
+
+    def register_turn_hook(self, name: str, hook: Callable[..., Any]) -> None:
+        self._registry.register_turn_hook(name, hook, owner=self.plugin)
 
     def register_retained_checkout_operation(
         self, operation: Callable[..., dict[str, object]],

@@ -66,7 +66,8 @@ from mimir.skill_defs import home_builtin_skills_dir
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.turn_logger import TurnLogger
 from mimir.turn_event_bus import TurnEventBus
-from mimir.worklink.continuation import (
+from mimir.plugins.registry import PolicyRegistry
+from mimir.http_ingress import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     HTTP_EVENT_INGRESS_EXTRA_VALUE,
     stamp_http_event_ingress_extra,
@@ -82,6 +83,24 @@ def _make_config(home: Path) -> Config:
     import os
     os.environ["MIMIR_HOME"] = str(home)
     return Config.from_env()
+
+
+def _install_turn_hooks(agent: Agent, *, continuation=None, intervention=None) -> None:
+    from mimir.plugins.core import register_core_tools
+    from mimir_cultivate.worklink.continuation import maybe_create_worklink_budget_continuation
+    from mimir_cultivate.worklink.dispatch_failures import is_dispatch_failure_intervention
+
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+    registrar = registry.registrar("cultivate")
+    registrar.register_turn_hook(
+        "budget_continuation", continuation or maybe_create_worklink_budget_continuation,
+    )
+    registrar.register_turn_hook(
+        "failure_intervention", intervention or is_dispatch_failure_intervention,
+    )
+    registry.freeze()
+    agent._config = replace(agent._config, plugin_manager=SimpleNamespace(policy=registry, plugins=()))
 
 
 def _make_chat_skill_registry(
@@ -2648,6 +2667,7 @@ async def test_budget_exhaustion_creates_worklink_continuation_sidecar(
         ),
         fake_saga=None,
     )
+    _install_turn_hooks(agent)
 
     record = await agent.run_turn(
         AgentEvent(
@@ -2685,6 +2705,27 @@ async def test_budget_exhaustion_creates_worklink_continuation_sidecar(
     )
 
 
+async def test_budget_exhaustion_without_provider_does_not_create_sidecar(
+    tmp_path: Path,
+) -> None:
+    from mimir.plugins.core import core_policy_registry
+
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=_BudgetExhaustingAgent(response_messages=[AIMessage(content="done")]),
+        fake_saga=None,
+    )
+    agent._config = replace(agent._config, plugin_manager=SimpleNamespace(
+        policy=core_policy_registry(), plugins=(),
+    ))
+    record = await agent.run_turn(AgentEvent(
+        trigger="scheduled_tick", channel_id="ops", content="ordinary work",
+    ))
+
+    assert record.output == "done"
+    assert not (agent._config.home / "state" / "worklink" / "continuations").exists()
+
+
 async def test_budget_exhaustion_passes_run_identity_to_continuation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2704,10 +2745,7 @@ async def test_budget_exhaustion_passes_run_identity_to_continuation(
         captured.update(kwargs)
         return None
 
-    monkeypatch.setattr(
-        "mimir.agent.maybe_create_worklink_budget_continuation",
-        _capture_continuation,
-    )
+    _install_turn_hooks(agent, continuation=_capture_continuation)
 
     await agent.run_turn(
         AgentEvent(
@@ -2738,6 +2776,7 @@ async def test_continuation_written_even_without_assistant_output(
         ),
         fake_saga=None,
     )
+    _install_turn_hooks(agent)
 
     record = await agent.run_turn(
         AgentEvent(
@@ -2814,7 +2853,7 @@ async def test_budget_continuation_timeout_logs_failure_and_still_runs_finalize_
             finished.set()
         return None
 
-    monkeypatch.setattr("mimir.agent.maybe_create_worklink_budget_continuation", _slow_continuation)
+    _install_turn_hooks(agent, continuation=_slow_continuation)
     monkeypatch.setattr("mimir.agent._worklink_continuation_timeout_seconds", lambda _cfg: 0.01)
     agent._hooks.append(_FinalizeHook())
 
@@ -6536,7 +6575,6 @@ async def test_deliver_failure_notice_fires_on_early_phase_crash(
 async def test_incident_budget_result_failure_sends_one_notice_without_continuation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.agent as agent_mod
     from mimir.access_control import CapabilityTier, build_trigger_service_principal
 
     fake_model = _BudgetExhaustingAgent(
@@ -6549,11 +6587,7 @@ async def test_incident_budget_result_failure_sends_one_notice_without_continuat
     )
     channels = _RecordingChannels()
     agent._channels = channels  # type: ignore[attr-defined]
-    monkeypatch.setattr(
-        agent_mod,
-        "maybe_create_worklink_budget_continuation",
-        lambda **kwargs: pytest.fail("incident created a continuation"),
-    )
+    _install_turn_hooks(agent, continuation=lambda **kwargs: pytest.fail("incident created a continuation"))
     authority = build_trigger_service_principal(
         canonical="poller:worklink-ready-queue",
         trigger="poller",
@@ -6605,7 +6639,6 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     import shlex
     import sys
 
-    import mimir.agent as agent_mod
     from mimir.dispatcher import Dispatcher
     from mimir.pollers import discover_pollers, run_poller
     from mimir.worklink.dispatch_failures import (
@@ -6667,11 +6700,7 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     )
     channels = _RecordingChannels()
     agent._channels = channels  # type: ignore[attr-defined]
-    monkeypatch.setattr(
-        agent_mod,
-        "maybe_create_worklink_budget_continuation",
-        lambda **kwargs: pytest.fail("incident created a continuation"),
-    )
+    _install_turn_hooks(agent, continuation=lambda **kwargs: pytest.fail("incident created a continuation"))
     dispatcher = Dispatcher(_make_config(home), agent.run_turn)
     agent._dispatcher = dispatcher
     queued_events: list[AgentEvent] = []
