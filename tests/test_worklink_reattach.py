@@ -337,9 +337,14 @@ def _write_completed_evidence(
     return path
 
 
+@pytest.mark.parametrize("release_ok", [True, False])
 def test_reattach_completed_evidence_reconciles_without_worker_or_push(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, release_ok: bool,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink import orchestrator as provider_orchestrator
+    from mimir_cultivate.worklink.run_state import load_run_state
+
     repo = tmp_path / "repo"
     repo.mkdir()
     issue_id = 564
@@ -352,32 +357,37 @@ def test_reattach_completed_evidence_reconciles_without_worker_or_push(
         if isinstance(args, list) and args[:3] == ["gh", "pr", "view"]:
             calls.append(args)
             return cp(args, stdout='{"state":"OPEN","headRefOid":"abc123"}')
+        if not release_ok and isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="release denied")
         return base_runner(args, cwd=cwd)
 
     events: list[tuple[str, dict]] = []
     monkeypatch.setattr(
-        "mimir.worklink.orchestrator._log_event",
+        "mimir_cultivate.worklink.orchestrator._log_event",
         lambda event_type, **payload: events.append((event_type, payload)),
     )
-    compute = FakeRemoteCompute()
-    registry = BackendRegistry(WorklinkConfig())
-    registry.register(FakeBackend())
-    registry.register_compute(compute)
+
+    async def unexpected_wait(*args: object, **kwargs: object) -> None:
+        pytest.fail("completed evidence must not restart the worker")
+
+    monkeypatch.setattr(provider_orchestrator.LocalSubprocessComputeBackend, "wait", unexpected_wait)
 
     result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(issue_id)
+        provider_orchestrator.WorklinkRunner(home=tmp_path, repo=repo, runner=runner).reattach(issue_id)
     )
 
-    assert result.status == "completed"
-    assert result.review_ready is True
+    assert result.status == ("completed" if release_ok else "failed")
+    assert result.review_ready is release_ok
     assert result.evidence_path == evidence_path
-    assert compute.waited == []
     assert not any(isinstance(a, list) and "push" in a for a in calls)
-    assert ["chainlink", "issue", "label", str(issue_id), "worklink:review"] in calls
+    assert (["chainlink", "issue", "label", str(issue_id), "worklink:review"] in calls) is release_ok
     assert ["chainlink", "locks", "release", str(issue_id)] in calls
-    assert any(event == "worklink_reattach_reconciled" for event, _ in events)
+    assert any(event == "worklink_reattach_reconciled" for event, _ in events) is release_ok
     assert not any(event == "worklink_reattach_branch_mismatch" for event, _ in events)
-    assert load_run_state(tmp_path, issue_id) is None
+    assert (load_run_state(tmp_path, issue_id) is None) is release_ok
+    if not release_ok:
+        assert result.reason == "terminal recovery incomplete: Chainlink lock release failed"
 
 
 def test_reattach_completed_evidence_remote_head_mismatch_warns_without_push(

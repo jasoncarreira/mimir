@@ -3,24 +3,93 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
+import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
 
-from mimir_cultivate.worklink import autonomy, orchestrator, worker_client
+from mimir_cultivate.worklink import autonomy, evidence, orchestrator, worker_client, worker_exec
+from mimir_cultivate.worklink.backends.base import ComputeLaunchError
 from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend, parse_factory_status
 from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir_cultivate.worklink.checkout import CheckoutLease
 from mimir_cultivate.worklink.claims import ClaimRecord, ClaimResult
-from mimir_cultivate.worklink.compute import LaunchHandle
-from mimir_cultivate.worklink.factory_state import FactoryRunRecord
+from mimir_cultivate.worklink.compute import ComputeResult, LaunchHandle, LocalSubprocessComputeBackend, WorkSpec
+from mimir_cultivate.worklink.factory_state import load_factory_record
 from mimir_cultivate.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
+
+
+@contextmanager
+def _executor_in_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root: Path):
+    """Run the provider executor protocol without deployment-only root credentials."""
+    identities = SimpleNamespace(
+        mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid(),
+    )
+    socket_path = tmp_path / "executor.sock"
+    homes = tmp_path / "homes"
+    homes.mkdir()
+    monkeypatch.setattr(worker_client.identities, "get_identities", lambda: identities)
+    monkeypatch.setattr(worker_exec, "get_identities", lambda: identities)
+    monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setattr(worker_exec, "HOME_ROOT", homes)
+    monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
+
+    # The test has no root-owned socket or uid-changing privileges. Keep the
+    # real request, FD transfer, checkout validation, process launch and reply.
+    def connect(self: worker_client.WorkerClient, timeout_s: float | None = None) -> socket.socket:
+        peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        peer.connect(str(self.socket_path))
+        return peer
+
+    def drop(checkout_fd: int) -> None:
+        os.fchdir(checkout_fd)
+
+    monkeypatch.setattr(worker_client.WorkerClient, "_connect", connect)
+    monkeypatch.setattr(worker_exec, "_drop_worker", drop)
+    errors: list[BaseException] = []
+    requests: list[dict[str, object]] = []
+    finished = threading.Event()
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
+        listener.bind(str(socket_path))
+        listener.listen(8)
+        listener.settimeout(0.1)
+
+        def serve() -> None:
+            while not finished.is_set():
+                try:
+                    connection, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError as exc:
+                    if not finished.is_set():
+                        errors.append(exc)
+                    break
+                try:
+                    requests.append(json.loads(connection.recv(65536, socket.MSG_PEEK)))
+                    worker_exec.handle_connection(connection)
+                except BaseException as exc:
+                    errors.append(exc)
+                    connection.close()
+
+        thread = threading.Thread(target=serve, name="factory-test-executor")
+        thread.start()
+        try:
+            yield requests
+        finally:
+            finished.set()
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+            assert not errors
 
 
 def test_provider_renders_default_work_order_without_override(tmp_path: Path) -> None:
@@ -65,13 +134,17 @@ def test_provider_runner_dry_run_uses_default_work_order(tmp_path: Path, capsys:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("gate_case", ["valid", "deeper", "controller"])
+@pytest.mark.skipif(sys.platform != "linux", reason="factory executor requires Linux")
 async def test_provider_completion_uses_emitted_record_and_worker_gate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate_case: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "worklink"
     checkout = root / "repository" / "1949-1" / "checkout"
     checkout.mkdir(parents=True)
+    root.chmod(0o755)
+    checkout.parent.parent.chmod(0o755)
+    checkout.parent.chmod(0o2750)
+    checkout.chmod(0o2770)
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".factory.json").write_text(json.dumps({
@@ -99,15 +172,34 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "launch", lambda self, spec: asyncio.sleep(
         0, result=LaunchHandle("local_subprocess", "handle", 123),
     ))
+    cancelled = asyncio.Event()
+    waits: list[LaunchHandle] = []
+    cancels: list[LaunchHandle] = []
+    cleanups: list[LaunchHandle] = []
+
+    async def wait(self: object, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+        waits.append(handle)
+        await cancelled.wait()
+        return ComputeResult(0, "", "", handle=handle)
+
+    async def cancel(self: object, handle: LaunchHandle) -> None:
+        cancels.append(handle)
+        cancelled.set()
+
+    async def cleanup(self: object, handle: LaunchHandle) -> None:
+        cleanups.append(handle)
+
+    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "wait", wait)
+    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "cancel", cancel)
+    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "cleanup", cleanup)
+    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "job_alive", lambda self, handle: not cancelled.is_set())
 
     issue = json.dumps({
         "id": 1949, "title": "Factory", "description": "Build factory", "labels": ["worklink:epic"],
         "comments": [],
     })
-    observed: list[Path] = []
-    gates: list[Path] = []
-    gate_commands: list[tuple[str, ...]] = []
     branches: list[str] = []
+    heads: list[str] = []
 
     def runner(args: list[str] | str, **kwargs: object) -> subprocess.CompletedProcess[str]:
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "1949"]:
@@ -116,91 +208,82 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
             return subprocess.CompletedProcess(args, 0, json.dumps({
                 "html_url": "https://github.com/owner/repository/pull/42", "state": "open", "draft": False,
                 "base": {"repo": {"full_name": "owner/repository"}, "ref": "main"},
-                "head": {"repo": {"full_name": "owner/repository"}, "ref": branches[0], "sha": "a" * 40},
+                "head": {"repo": {"full_name": "owner/repository"}, "ref": branches[0], "sha": heads[0]},
             }), "")
         if isinstance(args, list) and args[:3] == ["git", "-C", str(repo)]:
             return subprocess.CompletedProcess(args, 0, "git@github.com:owner/repository.git\n", "")
         if isinstance(args, list) and args[:3] == ["git", "-C", str(checkout)]:
             return subprocess.CompletedProcess(args, 0, "", "")
         if isinstance(args, list) and args[:2] == ["git", "-C"]:
-            sandbox = Path(args[2])
-            observed.append(sandbox)
-            operation = args[3:]
-            if operation == ["rev-parse", "--show-toplevel"]:
-                value = str(sandbox)
-            elif operation == ["rev-parse", "--absolute-git-dir"]:
-                value = str(sandbox / ".git")
-            elif operation == ["branch", "--show-current"]:
-                value = branches[0]
-            elif operation == ["config", "--get", "remote.origin.url"]:
-                value = "git@github.com:owner/repository.git"
-            elif operation == ["rev-parse", "HEAD"]:
-                value = "a" * 40
-            elif operation[:2] == ["rev-parse", "--verify"]:
-                value = "b" * 40
-            elif operation[:2] == ["diff", "--name-only"]:
-                value = "changed.py"
-            elif operation[:2] == ["diff", "--stat"]:
-                value = " changed.py | 1 +"
-            else:
-                value = ""
-            return subprocess.CompletedProcess(args, 0, value + "\n" if value else "", "")
+            return subprocess.run(args, capture_output=True, text=True)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    def worker(path: Path, argv: tuple[str, ...], **kw: object) -> subprocess.CompletedProcess[bytes]:
-        if argv[0] == "git":
-            result = runner(list(argv))
-            return subprocess.CompletedProcess(argv, result.returncode, result.stdout.encode(), result.stderr.encode())
-        gates.append(path)
-        gate_commands.append(argv)
-        return subprocess.run(argv, capture_output=True, timeout=30)
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(sandbox), *args], capture_output=True, text=True, check=True).stdout.strip()
 
-    monkeypatch.setattr(worker_client, "run_factory_control", worker)
-
-    async def finish(self: orchestrator.WorklinkRunner, **kwargs: object) -> orchestrator.WorklinkRunResult:
-        record = kwargs["factory_record"]
-        assert isinstance(record, FactoryRunRecord)
-        branches.append(record.branch)
-        sandbox = Path(record.sandbox)
-        assert sandbox == checkout / ".factory-sandboxes" / record.run_id
-        sandbox.mkdir()
-        (sandbox / ".git").mkdir()
-        if gate_case == "deeper":
-            record = replace(record, sandbox=str(sandbox / ".factory" / "worktrees" / "leaf"))
-        if gate_case == "controller":
-            monkeypatch.setattr(orchestrator, "LocalSubprocessComputeBackend", lambda: None)
-        status = parse_factory_status({
-            "run_id": record.run_id, "issue_key": str(record.issue_id), "valid": True,
-            "sandbox_path": record.sandbox, "status": "completed", "mode": "autonomous",
-            "branch": record.branch, "pr_base": record.base_ref, "pr_draft": False,
+    def status(self: FeatureFactoryBackend, run_id: str, *, sandbox: Path, launcher: str):
+        assert sandbox == checkout / ".factory-sandboxes" / run_id
+        if not branches:
+            branches.append(f"feature/{run_id}")
+            sandbox.mkdir()
+            git("init", "-q", "-b", "main")
+            git("config", "user.email", "factory@example.org")
+            git("config", "user.name", "Factory")
+            git("remote", "add", "origin", "git@github.com:owner/repository.git")
+            (sandbox / "base.py").write_text("base\n")
+            git("add", "base.py")
+            git("commit", "-qm", "base")
+            git("checkout", "-qb", branches[0])
+            (sandbox / "changed.py").write_text("changed\n")
+            git("add", "changed.py")
+            git("commit", "-qm", "change")
+            heads.append(git("rev-parse", "HEAD"))
+        return parse_factory_status({
+            "run_id": run_id, "issue_key": "1949", "valid": True,
+            "sandbox_path": str(sandbox), "status": "completed", "mode": "autonomous",
+            "branch": branches[0], "pr_base": "main", "pr_draft": False,
             "lock": "absent", "dead_lock": False, "lock_session": None,
             "slices": [{"id": "implementation", "status": "merged", "attempts": 1,
                          "extra_attempts": 0, "retry_limit": 5}],
             "pr_url": "https://github.com/owner/repository/pull/42",
         })
-        return await self._finish_factory_070(**{
-            **{key: value for key, value in kwargs.items() if key != "autonomous"},
-            "factory_record": replace(record, status=status),
-        })
 
-    monkeypatch.setattr(orchestrator.WorklinkRunner, "_supervise_factory_070", finish)
-    result = await orchestrator.WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(1949)
-    if gate_case == "valid":
-        assert result.status == "review_ready", (result.reason, observed, result.checkout)
-        assert result.checkout == checkout / ".factory-sandboxes" / "chainlink-1949"
-        assert observed and set(observed) == {result.checkout}
-        assert gates == [result.checkout]
-        assert gate_commands[0] == (
-            "/bin/sh", "-c", f"cd {result.checkout} && {gate_command}",
+    monkeypatch.setattr(FeatureFactoryBackend, "status", status)
+    sandbox = checkout / ".factory-sandboxes" / "chainlink-1949"
+    with _executor_in_process(tmp_path, monkeypatch, root) as requests:
+        result = await orchestrator.WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(1949)
+        record = load_factory_record(tmp_path, "chainlink-1949")
+        assert record is not None and record.sandbox == str(sandbox)
+        spec = WorkSpec(
+            issue_id=record.issue_id, attempt=record.attempt, repo_url="", base_ref=record.base_ref,
+            branch=record.branch, prompt="", rules=None, test_command=gate_command,
+            backend="feature_factory", timeout_s=30, local_checkout=sandbox,
         )
-        payload = json.loads(result.evidence_path.read_text())
-        assert payload["checkout"] == str(result.checkout)
-        assert payload["tests"]["exit_code"] == 0
-        assert "1949" in payload["tests"]["summary"]
-    else:
-        assert result.status == "failed"
-        assert ("sandbox does not match run id" if gate_case == "deeper" else "worker sandbox") in (result.reason or "")
-        assert not gates
+        for invalid_checkout, compute in (
+            (sandbox / ".factory" / "worktrees" / "leaf", LocalSubprocessComputeBackend()),
+            (sandbox, None),
+        ):
+            before = len(requests)
+            with pytest.raises(ComputeLaunchError, match="recorded worker sandbox"):
+                await evidence.observe_evidence(
+                    issue=record.issue_id, attempt=record.attempt, backend="feature_factory",
+                    branch=record.branch, checkout=invalid_checkout, started_at=datetime.now(UTC),
+                    base_ref=record.base_ref, backend_status="completed", test_command=gate_command,
+                    work_spec=spec, compute=compute, factory_run_id=record.run_id,
+                )
+            assert len(requests) == before
+    assert len(waits) == len(cancels) == len(cleanups) == 1
+    assert result.status == "review_ready", result.reason
+    assert result.checkout == sandbox
+    assert requests and all(request["op"] == "launch_factory_control" for request in requests)
+    assert all(request["path"] == str(checkout) for request in requests)
+    assert any(request["argv"] == [
+        "/bin/sh", "-c", f"cd {result.checkout} && {gate_command}",
+    ] for request in requests)
+    payload = json.loads(result.evidence_path.read_text())
+    assert payload["checkout"] == str(result.checkout)
+    assert payload["tests"]["exit_code"] == 0
+    assert "1949" in payload["tests"]["summary"]
 
 
 @pytest.mark.asyncio
