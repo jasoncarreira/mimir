@@ -500,6 +500,9 @@ tool_pins:
 
 
 def test_registry_resolves_only_shipping_backends() -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig
+
     config = WorklinkConfig(routes=())
     registry = BackendRegistry(config)
 
@@ -513,6 +516,11 @@ def test_registry_resolves_only_shipping_backends() -> None:
 
 
 def test_shipping_backend_names_match_constructed_registries() -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink.backends.registry import (
+        BackendRegistry, SHIPPING_BACKENDS, SHIPPING_COMPUTE_BACKENDS,
+    )
+
     registry = BackendRegistry()
 
     assert set(registry._backends) == SHIPPING_BACKENDS

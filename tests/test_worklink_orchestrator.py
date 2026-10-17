@@ -1260,6 +1260,10 @@ def test_validate_leaf_checks_epic_target_without_requiring_leaf_template() -> N
 def test_dry_run_prints_rendered_work_order_without_mutations(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig
+    from mimir_cultivate.worklink.orchestrator import WorklinkRunner
+
     calls: list[Sequence[str] | str] = []
 
     def runner(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:

@@ -14,11 +14,12 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("mimir_cultivate")
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux", reason="Linux only: darwin has no PR_SET_CHILD_SUBREAPER"
 )
-SOURCE = Path(__file__).resolve().parents[1] / "mimir/worklink/factory_supervisor.py"
+SOURCE = Path(importlib.util.find_spec("mimir_cultivate.worklink.factory_supervisor").origin)
 spec = importlib.util.spec_from_file_location("factory_supervisor_under_test", SOURCE)
 supervisor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(supervisor)

@@ -43,6 +43,7 @@ from .compute import (
     ComputeResult,
     LaunchHandle,
     LocalSubprocessComputeBackend,
+    WorkSpec,
     with_worker_environment,
 )
 from .claims import (

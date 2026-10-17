@@ -1125,6 +1125,10 @@ def _write_worklink_yaml(
 
 
 def test_check_concurrency_allows_below_cap(tmp_path: Path) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink import autonomy
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+
     _write_worklink_yaml(tmp_path, max_concurrent=2)
     claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(active_locks=[1]))
     check = autonomy.check_concurrency(tmp_path, claims=claims)
@@ -1132,6 +1136,10 @@ def test_check_concurrency_allows_below_cap(tmp_path: Path) -> None:
 
 
 def test_check_concurrency_blocks_at_cap(tmp_path: Path) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink import autonomy
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+
     _write_worklink_yaml(tmp_path, max_concurrent=2)
     claims = ChainlinkClaims(agent_id="t", runner=FakeChainlink(active_locks=[1, 2]))
     check = autonomy.check_concurrency(tmp_path, claims=claims)

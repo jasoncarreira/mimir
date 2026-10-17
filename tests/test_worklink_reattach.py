@@ -1107,13 +1107,13 @@ def test_reattach_retains_state_when_transitioned_lock_release_fails(tmp_path: P
 
 
 def test_reattach_no_state_is_noop(tmp_path: Path) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink.orchestrator import WorklinkRunner
+
     repo = tmp_path / "repo"
     repo.mkdir()
-    registry = BackendRegistry(WorklinkConfig())
-    registry.register(FakeBackend())
-    registry.register_compute(FakeRemoteCompute())
     result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=lambda *a, **k: cp(a), registry=registry).reattach(999)
+        WorklinkRunner(home=tmp_path, repo=repo, runner=lambda *a, **k: cp(a)).reattach(999)
     )
     assert result.status == "failed"
     assert result.reason == "reattach: no run state"
