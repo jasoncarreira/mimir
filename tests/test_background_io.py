@@ -40,14 +40,20 @@ def test_jobs_complete_with_saturated_default_pool(tmp_path, monkeypatch, operat
     monkeypatch.setattr(pollers, "_github_api_attestation", lambda *a: (200, {"state": "open"}))
     sched.add_scratch_janitor_job(tmp_path)
     if operation == "worklink":
-        from mimir_cultivate.worklink import autonomy
+        from mimir.worklink import autonomy as scheduler_autonomy
+        from mimir_cultivate.worklink import autonomy as provider_autonomy
 
-        monkeypatch.setattr(autonomy, "reap_stale_claims_for_home", lambda *a: SimpleNamespace(
-            reaped=[], examined=0, skipped=0, skipped_issue_ids=[],
-        ))
+        called: list[str] = []
 
-        def reap():
-            return autonomy.reap_stale_claims_for_home(tmp_path)
+        def reap(*_args):
+            called.append("scheduler-core")
+            return SimpleNamespace(reaped=[], examined=0, skipped=0, skipped_issue_ids=[])
+
+        monkeypatch.setattr(scheduler_autonomy, "reap_stale_claims_for_home", reap)
+        monkeypatch.setattr(scheduler_autonomy, "prune_stale_attempt_checkouts_for_home", lambda *a: [])
+        monkeypatch.setattr(scheduler_autonomy, "close_merged_chainlinks_for_home", lambda *a: [])
+        monkeypatch.setattr(provider_autonomy, "reap_stale_claims_for_home", lambda *a: called.append("provider"))
+        sched.add_worklink_reaper_job(tmp_path, "* * * * *")
 
     async def exercise():
         loop = asyncio.get_running_loop()
@@ -68,10 +74,8 @@ def test_jobs_complete_with_saturated_default_pool(tmp_path, monkeypatch, operat
                 await asyncio.wait_for(sched._callables["scratch-janitor"].fn(), HANG_GUARD_SECONDS)
                 assert observed == ["caller-context"]
             elif operation == "worklink":
-                result = await asyncio.wait_for(
-                    scheduler.run_in_pool(scheduler._WORKLINK_POOL, reap), HANG_GUARD_SECONDS,
-                )
-                assert result.examined == 0
+                await asyncio.wait_for(sched._callables["worklink-reaper"].fn(), HANG_GUARD_SECONDS)
+                assert called == ["scheduler-core"]
             elif operation == "attestation":
                 check = pollers._github_recovery_relevance_check("token")
                 event = AgentEvent(trigger="poller", channel_id="test", content="PR", extra={

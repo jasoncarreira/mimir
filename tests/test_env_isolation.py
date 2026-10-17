@@ -241,6 +241,9 @@ def _assert_session_fixture_clears(
             next(fixture)
 
 
+_CODING_ENABLED = "MIMIR_CODING_ENABLED"
+
+
 def test_declared_publishing_identity_tests_ignore_the_host_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -261,6 +264,19 @@ def test_declared_publishing_identity_tests_ignore_the_host_override(
     _assert_session_fixture_clears(
         _PUBLISHING_IDENTITY, "deployment-owner", monkeypatch
     )
+
+
+def test_coding_state_tests_ignore_the_host_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Worklink gate must pass with deployment coding enabled.
+
+    The chainlink-orchestrator deliberately passes ``MIMIR_CODING_ENABLED`` to
+    every Worklink build. Without the session fixture clearing that host value,
+    disabled-default tool-registry tests and backend/evidence tests silently run
+    against the enabled worker path.
+    """
+    _assert_session_fixture_clears(_CODING_ENABLED, "true", monkeypatch)
 
 
 # ── 4. poller-injected env must not reach the suite ───────────────────
