@@ -316,8 +316,11 @@ def test_suite_does_not_write_dispatch_failures_into_an_inherited_state_dir(
     The test passes either way, which is why nothing surfaced it. The property
     worth asserting is that the store stays untouched.
     """
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir
-    from mimir.worklink import orchestrator
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Worklink incident store requires selected Cultivate")
+
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir
+    from mimir_cultivate.worklink import orchestrator
 
     probe = tmp_path / "inherited-state"
     probe.mkdir()
