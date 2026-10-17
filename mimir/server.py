@@ -1162,8 +1162,11 @@ def build_app(config: Config) -> web.Application:
         agent_id=config.agent_id,
     )
 
-    for hook in _server_hooks(config.plugin_manager.policy, "process_identity"):
-        hook(process_session_id)
+    server_generation = {
+        owner: hook(process_session_id)
+        for (owner, phase), hook in config.plugin_manager.policy.server_hooks.items()
+        if phase == "process_identity"
+    }
 
     # 10MB body cap (aiohttp default is 1MB). Mimir takes JSON-only bodies on
     # /event and /chat — long bluesky transcripts and seed payloads can run
@@ -1672,8 +1675,16 @@ def build_app(config: Config) -> web.Application:
                     error=str(exc)[:500],
                 )
 
-        for hook in _server_hooks(config.plugin_manager.policy, "workspace_hooks"):
-            await hook()
+        # The pre-push staleness guard protects core git tracking as well as
+        # optional coding; it must run without any selected provider.
+        source_repo = os.environ.get("MIMIR_SOURCE_REPO", "").strip()
+        try:
+            from .git_bootstrap import ensure_workspace_hooks
+
+            if source_repo and Path(source_repo).is_dir():
+                await asyncio.to_thread(ensure_workspace_hooks, Path(source_repo))
+        except Exception as exc:  # noqa: BLE001 - hook installation cannot block startup
+            log.warning("pre-push hook install failed for %s: %s", source_repo, exc)
 
         startup_state.phase = "indexer_start"
         startup_state.indexer_start_attempted = True
@@ -2477,9 +2488,14 @@ def build_app(config: Config) -> web.Application:
             # teardown; a slow intended stop must not look like a crash.
             if attempt_sync(persist_clean_shutdown):
                 shutdown_log("clean marker written")
-            for hook in _server_hooks(config.plugin_manager.policy, "shutdown_claims"):
+            for (owner, phase), hook in config.plugin_manager.policy.server_hooks.items():
+                if phase != "shutdown_claims":
+                    continue
                 release_result = attempt_sync(
-                    lambda: hook(config.home, config.drain_timeout_seconds)
+                    lambda: hook(
+                        config.home, config.drain_timeout_seconds,
+                        server_generation.get(owner),
+                    )
                 )
                 if release_result is not None:
                     released, failed = release_result

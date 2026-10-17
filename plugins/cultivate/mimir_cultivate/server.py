@@ -64,8 +64,10 @@ async def executor_health(app: Any) -> dict[str, object]:
     return result
 
 
-def process_identity(process_session_id: str) -> None:
-    os.environ["MIMIR_WORKLINK_AGENT_ID"] = f"mimir-worklink:{process_session_id}"
+def process_identity(process_session_id: str) -> str:
+    agent_id = f"mimir-worklink:{process_session_id}"
+    os.environ["MIMIR_WORKLINK_AGENT_ID"] = agent_id
+    return agent_id
 
 
 async def repository_binding_alerts(log_event: Any) -> None:
@@ -78,18 +80,6 @@ async def repository_binding_alerts(log_event: Any) -> None:
 def channel_drained(channel_id: str, scheduler: Any) -> None:
     if channel_id == "poller:github-activity":
         scheduler.trigger_poller("github-activity", reason="remediation_queue_drained")
-
-
-async def install_workspace_hooks() -> None:
-    from mimir.git_bootstrap import ensure_workspace_hooks
-
-    source = os.environ.get("MIMIR_SOURCE_REPO", "").strip()
-    try:
-        repo = Path(source)
-        if source and repo.is_dir():
-            await asyncio.to_thread(ensure_workspace_hooks, repo)
-    except Exception as exc:  # noqa: BLE001 - hook installation must not stop boot
-        log.warning("pre-push hook install failed for %s: %s", source, exc)
 
 
 async def configure_worklink(scheduler: Any, home: Path, alert_channel: str | None, channels: Any, log_event: Any) -> None:
@@ -244,10 +234,10 @@ async def reconcile_startup(home: Path, log_event: Any) -> None:
         await log_event("worklink_reattach_dispatch_failed", error=str(exc))
 
 
-def release_claims(home: Path, drain_timeout_seconds: float) -> tuple[list[Any], list[Any]]:
+def release_claims(home: Path, drain_timeout_seconds: float, agent_id: str | None) -> tuple[list[Any], list[Any]]:
     from .worklink.autonomy import release_claims_for_graceful_shutdown
 
     timeout = min(5.0, float(drain_timeout_seconds)) if drain_timeout_seconds > 0 else 5.0
-    return release_claims_for_graceful_shutdown(
-        home, agent_id=os.environ.get("MIMIR_WORKLINK_AGENT_ID", ""), timeout_s=timeout,
-    )
+    if not agent_id:
+        raise ValueError("Worklink server generation identity is unavailable")
+    return release_claims_for_graceful_shutdown(home, agent_id=agent_id, timeout_s=timeout)

@@ -71,7 +71,6 @@ class CultivateProvider:
         registrar.register_server_hook("process_identity", server.process_identity)
         registrar.register_server_hook("repository_alerts", server.repository_binding_alerts)
         registrar.register_server_hook("channel_drained", server.channel_drained)
-        registrar.register_server_hook("workspace_hooks", server.install_workspace_hooks)
         registrar.register_server_hook("configure_jobs", server.configure_worklink)
         registrar.register_server_hook("reconcile_startup", server.reconcile_startup)
         registrar.register_server_hook("validate_config", server.validate_worklink)

@@ -1526,11 +1526,13 @@ def _fail_mcp_client_import(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selected_plugins", ["", "cultivate"])
 async def test_source_repo_hook_uses_pushed_from_repo_not_running_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_plugins: str,
 ) -> None:
-    pytest.importorskip("mimir_cultivate")
-    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    if selected_plugins:
+        pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", selected_plugins)
     pushed_from = tmp_path / "pushed-from"
     running_source = tmp_path / "running-source"
     (pushed_from / ".git" / "hooks").mkdir(parents=True)
@@ -2527,16 +2529,25 @@ async def test_part_c_server_shutdown_summary_includes_released_and_failed(
 
     app, control = _controlled_server_app(tmp_path, monkeypatch)
     await _run_startup(app)
+    issued_agent_id = os.environ["MIMIR_WORKLINK_AGENT_ID"]
+    monkeypatch.setenv("MIMIR_WORKLINK_AGENT_ID", "mimir-worklink:another-generation")
+    observed: list[str] = []
+
+    def release(*args: Any, **kwargs: Any) -> tuple[list[Any], list[Any]]:
+        observed.append(kwargs["agent_id"])
+        return (
+            [SimpleNamespace(issue_id=1400)],
+            [ShutdownClaimFailure(issue_id=1401, reason="release denied")],
+        )
+
     monkeypatch.setattr(
         autonomy,
         "release_claims_for_graceful_shutdown",
-        lambda *args, **kwargs: (
-            [SimpleNamespace(issue_id=1400)],
-            [ShutdownClaimFailure(issue_id=1401, reason="release denied")],
-        ),
+        release,
     )
 
     await _run_cleanup(app)
+    assert observed == [issued_agent_id]
 
     assert (
         "worklink_shutdown_claims_released",
