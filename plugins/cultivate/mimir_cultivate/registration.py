@@ -64,6 +64,18 @@ class CultivateProvider:
         registrar.register_turn_hook("tool_readiness", lambda: not github_identity_is_degraded())
         registrar.register_turn_hook("failure_intervention", is_dispatch_failure_intervention)
         registrar.register_turn_hook("budget_continuation", maybe_create_worklink_budget_continuation)
+        from . import server
+
+        registrar.register_server_hook("capture_source", server.capture_controller_source_commit)
+        registrar.register_server_hook("health", server.executor_health)
+        registrar.register_server_hook("process_identity", server.process_identity)
+        registrar.register_server_hook("repository_alerts", server.repository_binding_alerts)
+        registrar.register_server_hook("channel_drained", server.channel_drained)
+        registrar.register_server_hook("workspace_hooks", server.install_workspace_hooks)
+        registrar.register_server_hook("configure_jobs", server.configure_worklink)
+        registrar.register_server_hook("reconcile_startup", server.reconcile_startup)
+        registrar.register_server_hook("validate_config", server.validate_worklink)
+        registrar.register_server_hook("shutdown_claims", server.release_claims)
 
 
 provider = CultivateProvider()

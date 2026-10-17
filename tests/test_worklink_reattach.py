@@ -1274,7 +1274,7 @@ def test_run_persists_state_for_local_compute_then_clears(tmp_path: Path) -> Non
 
 
 def test_reattach_inflight_spawns_detached(tmp_path: Path, monkeypatch) -> None:
-    from mimir import server
+    server = pytest.importorskip("mimir_cultivate.server")
 
     _save_inflight_state(tmp_path, tmp_path / "repo", issue_id=601, job="j1")
     _save_inflight_state(tmp_path, tmp_path / "repo", issue_id=602, job="j2")
@@ -1299,7 +1299,7 @@ def test_reattach_inflight_spawns_detached(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_reattach_inflight_noop_without_repo(tmp_path: Path, monkeypatch) -> None:
-    from mimir import server
+    server = pytest.importorskip("mimir_cultivate.server")
 
     _save_inflight_state(tmp_path, tmp_path / "repo", issue_id=601, job="j1")
     monkeypatch.delenv("WORKLINK_REPO", raising=False)
@@ -1386,7 +1386,7 @@ def test_factory_startup_recovery_routes_only_verified_dead_runs_through_run_epi
     # Pin run_bin: server.py reads WORKLINK_RUN_BIN and the deployment sets it to
     # "uv run mimir", which would prepend ["uv", "run"] to the asserted argv.
     monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
-    from mimir import server
+    server = pytest.importorskip("mimir_cultivate.server")
 
     _factory_restart_record(tmp_path, status=status, ticks=ticks)
     monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
@@ -1418,7 +1418,7 @@ def test_factory_startup_recovery_does_not_spawn_run_epic_for_failed_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import server
+    server = pytest.importorskip("mimir_cultivate.server")
 
     _factory_restart_record(
         tmp_path,
@@ -1443,7 +1443,7 @@ def test_factory_startup_recovery_isolates_unparseable_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import server
+    server = pytest.importorskip("mimir_cultivate.server")
 
     valid = _factory_restart_record(tmp_path, status="running", ticks=1)
     valid_path = tmp_path / "state/worklink/factory-runs/700.json"
@@ -1490,8 +1490,8 @@ def test_part_b_startup_recovery_emits_for_all_five_outcomes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import server
-    import mimir.worklink.factory_state as factory_state
+    server = pytest.importorskip("mimir_cultivate.server")
+    import mimir_cultivate.worklink.factory_state as factory_state
 
     monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
     monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")

@@ -9,7 +9,7 @@ import pytest
 from mimir import approval_requests as requests
 from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent
-from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY, HTTP_EVENT_INGRESS_EXTRA_VALUE
+from mimir.http_ingress import HTTP_EVENT_INGRESS_EXTRA_KEY, HTTP_EVENT_INGRESS_EXTRA_VALUE
 
 
 @pytest.fixture
