@@ -67,6 +67,7 @@ from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.turn_logger import TurnLogger
 from mimir.turn_event_bus import TurnEventBus
 from mimir.plugins.registry import PolicyRegistry
+from mimir.tool_descriptors import ResultOriginKind
 from mimir.http_ingress import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     HTTP_EVENT_INGRESS_EXTRA_VALUE,
@@ -92,8 +93,11 @@ def _install_turn_hooks(agent: Agent, *, continuation=None, intervention=None) -
         from mimir_cultivate.worklink.continuation import maybe_create_worklink_budget_continuation
         from mimir_cultivate.worklink.dispatch_failures import is_dispatch_failure_intervention
     else:
-        from mimir.worklink.continuation import maybe_create_worklink_budget_continuation
-        from mimir.worklink.dispatch_failures import is_dispatch_failure_intervention
+        maybe_create_worklink_budget_continuation = lambda **kwargs: None
+        is_dispatch_failure_intervention = lambda event: bool(
+            event.trigger == "poller" and event.extra.get("poller_name") == "worklink-ready-queue"
+            and event.extra.get("items")
+        )
 
     registry = PolicyRegistry()
     register_core_tools(registry)
@@ -106,6 +110,75 @@ def _install_turn_hooks(agent: Agent, *, continuation=None, intervention=None) -
     )
     registry.freeze()
     agent._config = replace(agent._config, plugin_manager=SimpleNamespace(policy=registry, plugins=()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["example", "cultivate"])
+async def test_selected_readiness_only_controls_owner_tool_factories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: str,
+) -> None:
+    from mimir.tools import registry as tool_registry
+
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([]))
+    agent._agent = None
+    agent._agent_model = object()
+    agent._agent_middleware = ()
+    agent._config.coding_enabled = False
+    policy = PolicyRegistry()
+    made: list[str] = []
+
+    def add_tool(name: str, tool_owner: str) -> None:
+        def factory():
+            made.append(name)
+            return SimpleNamespace(name=name)
+
+        fields = dict(
+            name=name, factory=factory, flow="source", tier="scope-contained",
+            operation_class="open", result_domain=None, result_origin=ResultOriginKind.NONE,
+            sink_category=None, sink_destination=None, sink_target_extractor=None,
+            sink_payload_extractor=None, writes_code_or_state=False, profiles=(),
+            read_backend=False,
+        )
+        if tool_owner == "core":
+            policy.register_tool(**fields)
+        else:
+            policy.registrar(tool_owner).register_tool(**fields)
+
+    add_tool("legacy_coding", "core")
+    add_tool("owned_tool", owner)
+    if owner == "cultivate":
+        add_tool("unrelated_tool", "example")
+    ready = {"value": owner != "cultivate"}
+    policy.registrar(owner).register_turn_hook("tool_readiness", lambda: ready["value"])
+    policy.freeze()
+    agent._config = replace(agent._config, plugin_manager=SimpleNamespace(policy=policy, plugins=()))
+    monkeypatch.setattr("mimir.plugins.core.core_runtime_names", lambda surface: (
+        ("legacy_coding",) if surface == "coding" else ()
+    ))
+    monkeypatch.setattr("mimir.tools.web.web_tools_enabled", lambda spec: (False, False))
+    monkeypatch.setattr("mimir.tools.mcp.get_mcp_tools", lambda: [])
+    monkeypatch.setattr("mimir.tools.all_mimir_tools", tool_registry.all_mimir_tools)
+    monkeypatch.setattr("mimir.subagents.build_mimir_subagents", lambda **kwargs: [])
+    graphs = []
+    monkeypatch.setattr("deepagents.create_deep_agent", lambda **kwargs: graphs.append(kwargs) or object())
+    monkeypatch.setattr(agent, "_current_system_prompt", lambda **kwargs: "stable prompt")
+    monkeypatch.setattr(agent, "_current_skill_sources", lambda: ())
+    monkeypatch.setattr(agent, "_skill_catalog_fingerprint", lambda sources: asyncio.sleep(0, result="stable"))
+
+    await agent._build_agent_if_needed()
+    names = {tool.name for tool in graphs[-1]["tools"]}
+    assert "legacy_coding" not in names
+    assert ("owned_tool" in names) is ready["value"]
+    if owner == "cultivate":
+        assert "unrelated_tool" in names
+        assert "owned_tool" not in made
+        ready["value"] = True
+        await agent._build_agent_if_needed()
+        assert {tool.name for tool in graphs[-1]["tools"]} == {"owned_tool", "unrelated_tool"}
+        assert made.count("owned_tool") == 1
+        ready["value"] = False
+        await agent._build_agent_if_needed()
+        assert {tool.name for tool in graphs[-1]["tools"]} == {"unrelated_tool"}
 
 
 def _make_chat_skill_registry(
@@ -2672,6 +2745,8 @@ async def test_budget_exhaustion_creates_worklink_continuation_sidecar(
         ),
         fake_saga=None,
     )
+    if not any(plugin.candidate.name == "cultivate" for plugin in agent._config.plugin_manager.plugins):
+        pytest.skip("sidecar implementation belongs to the selected Cultivate provider")
     _install_turn_hooks(agent)
 
     record = await agent.run_turn(
@@ -2781,6 +2856,8 @@ async def test_continuation_written_even_without_assistant_output(
         ),
         fake_saga=None,
     )
+    if not any(plugin.candidate.name == "cultivate" for plugin in agent._config.plugin_manager.plugins):
+        pytest.skip("sidecar implementation belongs to the selected Cultivate provider")
     _install_turn_hooks(agent)
 
     record = await agent.run_turn(

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mimir.agent import _selected_turn_hooks, _turn_tool_surface_ready
+from mimir.agent import _selected_turn_hooks, _turn_tool_surface_ready, _unready_tool_owners
 from mimir.models import AgentEvent
 from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry
 from mimir_cultivate import forge
@@ -32,9 +32,11 @@ def test_selected_provider_registers_owner_bound_turn_callbacks(monkeypatch) -> 
     )
     config = SimpleNamespace(plugin_manager=SimpleNamespace(policy=selected_policy), coding_enabled=False)
     monkeypatch.setattr(forge, "_github_identity_degraded", False)
-    assert _turn_tool_surface_ready(config) is True
+    assert _turn_tool_surface_ready(config) is False
+    assert _unready_tool_owners(selected_policy) == frozenset()
     monkeypatch.setattr(forge, "_github_identity_degraded", True)
     assert _turn_tool_surface_ready(config) is False
+    assert _unready_tool_owners(selected_policy) == frozenset({"cultivate"})
 
     event = AgentEvent(trigger="user_message", channel_id="web:one", content="hello")
     assert _selected_turn_hooks(registry, "failure_intervention")[0](event) is False

@@ -3213,6 +3213,7 @@ def all_mimir_tools(
     require_coding_available: bool = True,
     policy: "PolicyRegistry | None" = None,
     materialize_plugins: bool = True,
+    unready_plugin_owners: frozenset[str] = frozenset(),
 ) -> list:
     """Return the full mimir tool surface for create_deep_agent.
 
@@ -3296,7 +3297,8 @@ def all_mimir_tools(
     if coding_enabled:
         tools.extend(materialize("coding"))
     for declared in registry.tools.values() if materialize_plugins else ():
-        if declared.owner == "core" or declared.factory is None:
+        if (declared.owner == "core" or declared.factory is None
+                or declared.owner in unready_plugin_owners):
             continue
         tool = declared.factory()
         if getattr(tool, "name", None) != declared.name:
