@@ -18,6 +18,7 @@ from mimir.dispatcher import Dispatcher, TRUSTED_INTERNAL_SOURCES, _ChannelQueue
 from mimir.event_logger import init_logger
 from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent
+from mimir.plugins.discovery import _selection
 from mimir.server import _PairingNotifier
 from mimir.http_ingress import HTTP_EVENT_INGRESS_EXTRA_KEY, HTTP_EVENT_INGRESS_EXTRA_VALUE
 from tests.timing import HANG_GUARD_SECONDS, wait_until
@@ -589,17 +590,20 @@ async def test_poller_delivery_without_relevance_predicate_is_unchanged(tmp_path
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transition", ["resolved", "superseded"])
 async def test_worklink_incident_relevance_drops_stale_turn_before_model(
-    tmp_path: Path, transition: str,
+    tmp_path: Path, transition: str, synthetic_worklink_identities,
 ) -> None:
-    if "cultivate" not in os.environ.get("MIMIR_PLUGINS", "").split(","):
+    all_enabled, names = _selection(os.environ.get("MIMIR_PLUGINS", ""))
+    if not (all_enabled or "cultivate" in names):
         pytest.skip("Worklink recovery belongs to the selected Cultivate provider")
     pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink import worker_exec
     from mimir_cultivate.worklink.poller_hooks import recovery_relevance_check
     from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         record_failure,
         record_success,
     )
+    assert worker_exec.get_identities() is synthetic_worklink_identities
 
     state_dir = dispatch_failure_state_dir(tmp_path)
     entry = record_failure(

@@ -21,6 +21,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -163,29 +164,30 @@ def synthetic_worklink_identities(monkeypatch, request):
         worklink_uid=SYNTHETIC_WORKLINK_UID,
         worklink_gid=SYNTHETIC_WORKLINK_GID,
     )
-    modules = ["mimir.contained_checkout", "mimir.project_tests"]
-    if (
-        "cultivate" in os.environ.get("MIMIR_PLUGINS", "").split(",")
-        and importlib.util.find_spec("mimir_cultivate") is not None
-    ):
-        modules.extend((
+    from mimir.plugins.discovery import _selection
+
+    all_enabled, names = _selection(os.environ.get("MIMIR_PLUGINS", ""))
+    selected = all_enabled or "cultivate" in names
+    existing_modules = (
+        "mimir.contained_checkout",
+        "mimir.project_tests",
+        "mimir.worklink.checkout",
+        "mimir.worklink.worker_exec",
+    )
+    for module_name in existing_modules:
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "get_identities"):
+            monkeypatch.setattr(module, "get_identities", lambda: identities)
+    if selected and importlib.util.find_spec("mimir_cultivate") is not None:
+        for module_name in (
+            "mimir_cultivate.contained_checkout",
+            "mimir_cultivate.repository",
             "mimir_cultivate.worklink.checkout",
             "mimir_cultivate.worklink.worker_exec",
-        ))
-    # Until the legacy worker is retired, its remaining tests also need the
-    # synthetic identity. Importing it must not be required after retirement.
-    try:
-        legacy_worker = importlib.import_module("mimir.worklink.worker_exec")
-        legacy_checkout = importlib.import_module("mimir.worklink.checkout")
-    except ModuleNotFoundError as exc:
-        if exc.name not in {"mimir.worklink", "mimir.worklink.worker_exec", "mimir.worklink.checkout"}:
-            raise
-    else:
-        monkeypatch.setattr(legacy_worker, "get_identities", lambda: identities)
-        monkeypatch.setattr(legacy_checkout, "get_identities", lambda: identities)
-    for module_name in modules:
-        module = __import__(module_name, fromlist=["get_identities"])
-        monkeypatch.setattr(module, "get_identities", lambda: identities)
+        ):
+            module = importlib.import_module(module_name)
+            if hasattr(module, "get_identities"):
+                monkeypatch.setattr(module, "get_identities", lambda: identities)
     return identities
 
 
