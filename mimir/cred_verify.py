@@ -38,19 +38,20 @@ check that confirms reachability without consuming provider quota.
 from __future__ import annotations
 
 import importlib.util
+import contextlib
 import logging
 import os
+import pwd
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 import yaml
 
-from .contained_execution import base_worker_environment
 from .redaction import redact_text
-from .worklink.evidence import shell_gate_environment
 
 log = logging.getLogger(__name__)
 
@@ -113,7 +114,36 @@ def _all_env_set(*names: str) -> tuple[bool, str]:
 
 
 def _has_binary(name: str) -> bool:
-    return shutil.which(name, path=base_worker_environment("cred-verify")["PATH"]) is not None
+    return shutil.which(name, path="/usr/local/bin:/usr/bin:/bin") is not None
+
+
+@contextlib.contextmanager
+def shell_gate_environment():
+    """Give subprocess probes an isolated home and a bounded environment."""
+    with tempfile.TemporaryDirectory(prefix="cred-probe-home-") as text:
+        home = Path(text)
+        uid = os.getuid()
+        try:
+            username = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            username = f"uid-{uid}"
+        paths = {
+            "XDG_CONFIG_HOME": home / ".config",
+            "XDG_DATA_HOME": home / ".local" / "share",
+            "XDG_CACHE_HOME": home / ".cache",
+        }
+        for path in paths.values():
+            path.mkdir(parents=True, mode=0o700)
+        yield {
+            "USER": username,
+            "LOGNAME": username,
+            "SHELL": "/bin/sh",
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "HOME": str(home),
+            **{name: str(path) for name, path in paths.items()},
+        }
 
 
 def _run_quiet(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
