@@ -19,7 +19,6 @@ import pytest
 import yaml
 
 
-
 DOC = Path(__file__).resolve().parents[1] / "docs" / "agent-dev-loop.md"
 SLUG = "acme/widget"
 

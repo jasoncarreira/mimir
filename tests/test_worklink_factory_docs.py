@@ -11,9 +11,11 @@ if "cultivate" not in os.environ.get("MIMIR_PLUGINS", "").split(","):
     pytest.skip("factory documentation requires selected Cultivate", allow_module_level=True)
 
 from mimir_cultivate.worklink.backends.feature_factory import (
+    FACTORY_VERSION,
     _DEFAULT_FACTORY_MAX_RETRIES,
     _MAX_FACTORY_MAX_RETRIES,
 )
+from mimir_cultivate.worklink.tool_pins import DEFAULT_TOOL_PINS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +35,10 @@ def _image_factory_version() -> str:
 
 def test_current_factory_documentation_matches_runtime_version() -> None:
     factory_version = _image_factory_version()
+    assert FACTORY_VERSION == factory_version
+    for tool in DEFAULT_TOOL_PINS:
+        if tool.name in {"feature-factory", "opencode-feature-factory"}:
+            assert tool.pin == factory_version
     for relative_path in FACTORY_DOCS:
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         assert text.count(f"`feature-factory@{factory_version}`") == 1, relative_path

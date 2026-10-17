@@ -491,10 +491,10 @@ Per-issue flow (one `run`):
    never resets or cleans the shared base automatically.
 4. **Render the prompt** from issue fields: description, acceptance
    criteria, review criteria, parent context, repo conventions pointer.
-    Template lives at `mimir_cultivate/prompt_templates/worklink-order.md` (operator-tunable). The
+   Template lives at `mimir_cultivate/prompt_templates/worklink-order.md` (operator-tunable). The
    planner-side decomposition prompt lives at `mimir/prompt_templates/decompose.md`; its
    `{leaf_template}` slot is rendered from the single
-    `mimir_cultivate.worklink.planning.LEAF_TEMPLATE_MARKDOWN` contract, which the
+   `mimir_cultivate.worklink.planning.LEAF_TEMPLATE_MARKDOWN` contract, which the
    `chainlink-orchestrator` skill also embeds, so the executor validates the
    same template the planner emits.
 5. **Spawn the backend** (adapter `run(WorkOrder)`) under a timeout.
@@ -849,7 +849,7 @@ the autonomous refusal is the `allow_autonomous_local_subprocess: true` opt-in.
   gated** — it always proceeds. Enabled OpenCode receives the same repo-checkout
   uid protection, but not credential or cross-run isolation; other backends keep
   the agent uid. Reserve manual runs for issues you've scoped and trust. The gate
-   lives in Cultivate's executor ahead of the claim, so no model-facing caller can bypass
+  lives in Cultivate's executor ahead of the claim, so no model-facing caller can bypass
   it.
 
 ## 7. Operator runbook
