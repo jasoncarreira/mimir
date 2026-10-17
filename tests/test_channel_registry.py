@@ -19,7 +19,7 @@ from mimir.channel_registry import (
     resolve_deliver_channel,
 )
 from mimir.models import TurnInteractivity
-from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
+from mimir.http_ingress import HTTP_EVENT_INGRESS_EXTRA_VALUE
 
 
 @dataclass

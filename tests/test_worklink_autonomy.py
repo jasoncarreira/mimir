@@ -2099,7 +2099,10 @@ async def test_worklink_run_fails_closed_when_cap_unreadable(_tool_env, monkeypa
     assert dispatched == []
 
 
-def test_runtime_and_server_wire_worklink_arbiter_and_reaper() -> None:
+@pytest.mark.asyncio
+async def test_runtime_and_server_wire_worklink_arbiter_and_reaper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import inspect
     import mimir.runtime as runtime
     import mimir.server as server
@@ -2107,8 +2110,31 @@ def test_runtime_and_server_wire_worklink_arbiter_and_reaper() -> None:
     runtime_source = inspect.getsource(runtime._install_runtime_globals)
     server_source = inspect.getsource(server.build_app)
     assert "tools.set_arbiter(bundle.agent._arbiter)" in runtime_source
-    assert "scheduler.add_worklink_reaper_job(" in server_source
-    assert "MIMIR_WORKLINK_REAPER_CRON" in server_source
+    assert '_server_hooks(config.plugin_manager.policy, "configure_jobs")' in server_source
+    assert "scheduler.add_worklink_reaper_job(" not in server_source
+
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.manager import load_plugins
+
+    calls: list[tuple[str, object]] = []
+    scheduler = SimpleNamespace(
+        add_worklink_reaper_job=lambda **kwargs: calls.append(("reaper", kwargs)),
+        add_worklink_factory_park_alert_job=lambda *args: calls.append(("park", args)),
+    )
+    monkeypatch.setenv("MIMIR_WORKLINK_REAPER_CRON", "*/7 * * * *")
+    monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
+
+    async def event(*args, **kwargs):
+        pytest.fail(f"unexpected scheduler error: {args}, {kwargs}")
+
+    policy = load_plugins(enable="cultivate").policy
+    hook = policy.server_hooks["cultivate", "configure_jobs"]
+    await hook(scheduler, tmp_path, "operator", object(), event)
+    assert calls[0] == (
+        "reaper", {"home": tmp_path, "cron_expr": "*/7 * * * *"},
+    )
+    assert calls[1][0] == "park"
+    assert calls[1][1][:2] == (tmp_path, "operator")
 
 
 # ── ready-queue poller: discovery + cap-bounded detached dispatch ───
