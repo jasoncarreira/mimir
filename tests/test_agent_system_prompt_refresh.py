@@ -148,13 +148,13 @@ async def test_build_agent_routes_lease_root_created_after_first_build(
 async def test_build_agent_always_routes_worklink_root_read_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.worklink import worker_client
+    from mimir import access_control
 
     retained = tmp_path / "retained"
     retained.mkdir()
     target = retained / "issue.txt"
     target.write_text("retained", encoding="utf-8")
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+    monkeypatch.setattr(access_control, "worklink_retained_checkout_root", lambda: retained)
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
     agent = _make_agent(tmp_path, monkeypatch)
     _stub_deepagent_build(monkeypatch)
@@ -174,12 +174,12 @@ async def test_build_agent_retained_route_overrides_operator_rw_root(
     monkeypatch: pytest.MonkeyPatch,
     configured_root: str,
 ) -> None:
-    from mimir.worklink import worker_client
+    from mimir import access_control
 
     operator_root = tmp_path / "workspace"
     retained = operator_root if configured_root == "same" else operator_root / ".worklink"
     retained.mkdir(parents=True)
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+    monkeypatch.setattr(access_control, "worklink_retained_checkout_root", lambda: retained)
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{operator_root}:rw")
     agent = _make_agent(tmp_path, monkeypatch)
     _stub_deepagent_build(monkeypatch)
