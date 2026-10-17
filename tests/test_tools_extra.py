@@ -79,6 +79,7 @@ def test_shell_timeout_sends_term_then_kill_even_if_wrapper_exited(monkeypatch):
     proc = Mock(pid=os.getpgrp() + 100000)
     killpg = Mock()
     monkeypatch.setattr(extra.os, "killpg", killpg)
+    monkeypatch.setattr(extra.os, "getpgid", lambda pid: pid)
     monkeypatch.setattr(extra.time, "sleep", lambda _seconds: None)
 
     extra._kill_shell_process_group(proc)
