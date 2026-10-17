@@ -1050,7 +1050,7 @@ async def test_delivery_uses_trusted_poller_configuration_in_shadow_mode(
 
 @pytest.mark.asyncio
 async def test_http_delivery_extra_is_not_rendered(tmp_path: Path) -> None:
-    from mimir.worklink.continuation import (
+    from mimir.http_ingress import (
         HTTP_EVENT_INGRESS_EXTRA_KEY,
         HTTP_EVENT_INGRESS_EXTRA_VALUE,
     )
