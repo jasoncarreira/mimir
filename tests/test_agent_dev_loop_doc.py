@@ -18,8 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from mimir.repository_config import RepositoryInventory
-from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig
+
 
 DOC = Path(__file__).resolve().parents[1] / "docs" / "agent-dev-loop.md"
 SLUG = "acme/widget"
@@ -66,11 +65,19 @@ def _home_with_examples(tmp_path: Path, *, bash_allowlist: list[str] | None = No
 
 
 def _opencode(home: Path):
+    if "cultivate" not in os.environ.get("MIMIR_PLUGINS", "").split(","):
+        pytest.skip("documented Worklink configuration requires selected Cultivate")
+    from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig
+
     config = WorklinkConfig.load(home / "worklink.yaml")
     return config, BackendRegistry(config).get("opencode")
 
 
 def test_documented_repository_and_worklink_examples_load(tmp_path: Path) -> None:
+    if "cultivate" not in os.environ.get("MIMIR_PLUGINS", "").split(","):
+        pytest.skip("documented repository inventory requires selected Cultivate")
+    from mimir_cultivate.repository import RepositoryInventory
+
     home = _home_with_examples(tmp_path)
     inventory = RepositoryInventory.load(home / "repositories.yaml")
     assert [repo.slug for repo in inventory.repositories] == [SLUG]

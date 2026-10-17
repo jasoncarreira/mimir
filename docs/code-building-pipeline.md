@@ -5,6 +5,10 @@ leaf that is built, tested, and opened as a pull request, then explains how the
 separate GitHub poller surfaces review work. Paths below are relative to the
 agent home selected by `MIMIR_HOME`.
 
+Worklink is supplied by the optional `mimir-cultivate` package. Install the
+package and select `cultivate` in `MIMIR_PLUGINS` before following these
+instructions; core Mimir alone does not supply Worklink or coding tools.
+
 ## 1. Declare the repository
 
 Create `<MIMIR_HOME>/repositories.yaml`:
@@ -323,7 +327,7 @@ poller requires GitHub authentication (`GITHUB_TOKEN`, falling back to
 `gh auth token`) and should be given `MIMIR_GITHUB_SELF_LOGIN` when Mimir has a
 dedicated GitHub identity, so its own comments do not wake it. For repository
 remediation tools and the configured `repo_test` capability, enable the coding
-surface described in [configuration.md](configuration.md).
+surface supplied by Cultivate, described in [configuration.md](configuration.md).
 
 For each watched repository it detects new issues, new PRs, issue/PR comments,
 inline review comments, submitted reviews, pushes to open PRs, review requests,

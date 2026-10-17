@@ -31,7 +31,12 @@ from pathlib import Path
 
 import pytest
 
-from mimir.worklink.backends.feature_factory import _DEFAULT_FACTORY_MAX_RETRIES
+import os
+
+if "cultivate" not in os.environ.get("MIMIR_PLUGINS", "").split(","):
+    pytest.skip("factory backend requires selected Cultivate", allow_module_level=True)
+
+from mimir_cultivate.worklink.backends.feature_factory import _DEFAULT_FACTORY_MAX_RETRIES
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DECLARATION = REPO_ROOT / ".factory.json"

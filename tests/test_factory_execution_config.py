@@ -12,10 +12,13 @@ from unittest.mock import Mock
 
 import pytest
 
+if "cultivate" not in os.environ.get("MIMIR_PLUGINS", "").split(","):
+    pytest.skip("factory execution requires selected Cultivate", allow_module_level=True)
+
 from mimir.contained_execution import CollectedExecutionResult
-from mimir.worklink import compute, worker_exec
-from mimir.worklink.backends.feature_factory import FACTORY_VERSION
-from mimir.worklink.safe_git import _git_credential_settings
+from mimir_cultivate.worklink import compute, worker_exec
+from mimir_cultivate.worklink.backends.feature_factory import FACTORY_VERSION
+from mimir_cultivate.worklink.safe_git import _git_credential_settings
 
 
 @pytest.mark.asyncio
@@ -33,7 +36,7 @@ async def test_factory_launch_uses_captured_trusted_scoped_helpers(
     # trusted configuration, including the NOSYSTEM override above. Isolate this
     # fixture after that scrub so macOS's system osxkeychain helper cannot leak
     # into the expected repo-local settings (especially the no-helper case).
-    from mimir.worklink import safe_git
+    from mimir_cultivate.worklink import safe_git
 
     capture_environment = safe_git._capture_environment
     monkeypatch.setattr(safe_git, "_capture_environment", lambda: {
@@ -112,9 +115,8 @@ async def test_factory_launch_uses_captured_trusted_scoped_helpers(
 async def test_factory_credentials_leave_enabled_leaf_environment_and_projections_unchanged(
     tmp_path, monkeypatch,
 ):
-    from mimir.worklink.worker_client import WorkerProjection
+    from mimir_cultivate.worklink.worker_client import WorkerProjection
 
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
     identifier = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     monkeypatch.setattr(compute.uuid, "uuid4", lambda: identifier)
     projection = WorkerProjection(".config/opencode/opencode.json", b'{"model": "test"}')
@@ -144,7 +146,7 @@ async def test_factory_credentials_leave_enabled_leaf_environment_and_projection
 
 @pytest.fixture
 def factory_control_identity(monkeypatch):
-    from mimir.worklink import worker_client
+    from mimir_cultivate.worklink import worker_client
 
     # These tests fake the executor, so they must not require host accounts.
     identity = SimpleNamespace(worklink_uid=42424)
@@ -156,7 +158,7 @@ def factory_control_identity(monkeypatch):
 async def test_retained_factory_control_uses_worker_without_runtime_refresh(
     tmp_path, monkeypatch, factory_control_identity,
 ):
-    from mimir.worklink import worker_client
+    from mimir_cultivate.worklink import worker_client
 
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
     checkout = tmp_path / "repo/41-2/checkout"
@@ -192,7 +194,7 @@ async def test_retained_factory_control_uses_worker_without_runtime_refresh(
 def test_factory_control_rejects_incomplete_results(
     tmp_path, monkeypatch, failure, factory_control_identity,
 ):
-    from mimir.worklink import worker_client
+    from mimir_cultivate.worklink import worker_client
 
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
 
@@ -210,7 +212,7 @@ def test_factory_control_rejects_incomplete_results(
 
 
 def test_factory_control_socket_uses_its_bound(monkeypatch):
-    from mimir.worklink import worker_client
+    from mimir_cultivate.worklink import worker_client
 
     sock = Mock()
     sock.getsockopt.return_value = struct.pack("3i", 123, 0, 0)
@@ -224,7 +226,7 @@ def test_factory_control_socket_uses_its_bound(monkeypatch):
 
 @pytest.mark.parametrize("side", ["client", "executor"])
 def test_executor_requires_peer_credentials_before_side_effects(tmp_path, monkeypatch, side):
-    from mimir.worklink import worker_client
+    from mimir_cultivate.worklink import worker_client
 
     monkeypatch.delattr(worker_client.socket, "SO_PEERCRED", raising=False)
     create_socket = Mock(side_effect=AssertionError("unauthenticated socket created"))
@@ -265,7 +267,7 @@ def test_factory_control_path_classification(tmp_path, monkeypatch, relative, re
 
 @pytest.mark.parametrize("guard", ["owner", "directory", "nofollow"])
 def test_factory_controller_boundary_guard(tmp_path, monkeypatch, guard):
-    from mimir.worklink import orchestrator, worker_client
+    from mimir_cultivate.worklink import orchestrator, worker_client
 
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
     monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(mimir_uid=os.getuid()))
@@ -298,7 +300,7 @@ def test_factory_controller_boundary_guard(tmp_path, monkeypatch, guard):
 
 @pytest.mark.parametrize("text", [True, False])
 def test_factory_git_recovery_uses_owner_not_safe_directory(tmp_path, monkeypatch, text):
-    from mimir.worklink import orchestrator, worker_client
+    from mimir_cultivate.worklink import orchestrator, worker_client
 
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
     monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(mimir_uid=os.getuid()))
@@ -334,7 +336,7 @@ def test_factory_git_recovery_uses_owner_not_safe_directory(tmp_path, monkeypatc
 
 
 def test_legacy_factory_recovery_refuses_before_git_or_lock_mutation(tmp_path, monkeypatch):
-    from mimir.worklink import orchestrator, worker_client
+    from mimir_cultivate.worklink import orchestrator, worker_client
 
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
     launcher = tmp_path / "installed/factory.js"
@@ -362,8 +364,8 @@ def test_legacy_factory_recovery_refuses_before_git_or_lock_mutation(tmp_path, m
 
 @pytest.mark.parametrize("command", ["status", "resume", "heartbeat", "lock"])
 def test_factory_backend_controls_use_retained_owner(tmp_path, monkeypatch, command):
-    from mimir.worklink import worker_client
-    from mimir.worklink.backends import feature_factory
+    from mimir_cultivate.worklink import worker_client
+    from mimir_cultivate.worklink.backends import feature_factory
 
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
     entrypoint = tmp_path / "installed/bin/factory.js"
@@ -399,7 +401,7 @@ def test_executor_auth_path_and_exported_xdg_data_home_agree() -> None:
     OpenCode was reading a directory nobody wrote. Nothing failed at the seam,
     which is exactly why this assertion exists.
     """
-    from mimir.worklink.worker_exec import FACTORY_RUNTIME_DATA
+    from mimir_cultivate.worklink.worker_exec import FACTORY_RUNTIME_DATA
 
     checkout = Path("/var/lib/mimir-worklink/checkouts/mimir/1610-7/checkout")
     exported = checkout.parent / ".factory-runtime" / "data"
