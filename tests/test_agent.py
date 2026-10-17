@@ -547,11 +547,12 @@ class _ServicePrincipalToolProbeAgent(_FakeAgent):
 
 
 class _WorklinkToolProbeAgent(_FakeAgent):
-    """Model-boundary double that executes the real Worklink tool middleware."""
+    """Model-boundary double that executes a provider tool through middleware."""
 
-    def __init__(self, issue_id: int) -> None:
+    def __init__(self, issue_id: int, worklink_tool: Any) -> None:
         super().__init__([AIMessage(content="worklink tool probed")])
         self.issue_id = issue_id
+        self.worklink_tool = worklink_tool
         self.result: ToolMessage | None = None
 
     async def astream(
@@ -563,14 +564,13 @@ class _WorklinkToolProbeAgent(_FakeAgent):
         stream_mode: str = "values",
     ):
         from mimir._context import get_current_turn
-        from mimir.tools import registry
 
         turn = get_current_turn()
         assert turn is not None
         gate = BudgetGateMiddleware()
 
         async def handler(request: ToolCallRequest) -> ToolMessage:
-            content = await registry.worklink_run.ainvoke(request.tool_call["args"])
+            content = await self.worklink_tool.ainvoke(request.tool_call["args"])
             return ToolMessage(
                 content=content,
                 tool_call_id=request.tool_call["id"],
@@ -585,7 +585,7 @@ class _WorklinkToolProbeAgent(_FakeAgent):
                     "id": "tc-worklink-run",
                     "type": "tool_call",
                 },
-                tool=registry.worklink_run,
+                tool=self.worklink_tool,
                 state=None,
                 runtime=Runtime(context=turn.auth_context),
             ),
@@ -6720,10 +6720,12 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     import os
     import shlex
     import sys
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Worklink incident consumer requires selected Cultivate")
 
     from mimir.dispatcher import Dispatcher
     from mimir.pollers import discover_pollers, run_poller
-    from mimir.worklink.dispatch_failures import (
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
         record_failure,
@@ -6853,13 +6855,14 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
 
 
 @pytest.mark.parametrize("enforced", [False, True], ids=["advisory", "enforced"])
-async def test_model_tool_middleware_reaches_core_refusal_after_stale_poller_selection(
+async def test_model_tool_middleware_reaches_provider_refusal_after_stale_poller_selection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforced: bool,
 ) -> None:
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Worklink tool probe requires selected Cultivate")
     from mimir.pollers import discover_pollers
-    from mimir.tools import registry
-    from mimir.worklink import autonomy
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+    from mimir_cultivate.worklink import autonomy, orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
 
     home = tmp_path / "home"
     state_root = home / "state" / "pollers"
@@ -6891,7 +6894,7 @@ async def test_model_tool_middleware_reaches_core_refusal_after_stale_poller_sel
         extra={"poller_name": "worklink-ready-queue"},
     )
     # The poller selection is already represented by the event. The ledger wins
-    # the race before the model's real tool call reaches the core executor.
+    # the race before the model's tool call reaches the provider executor.
     record_failure(
         dispatch_failure_state_dir(home),
         issue_id=443,
@@ -6905,8 +6908,18 @@ async def test_model_tool_middleware_reaches_core_refusal_after_stale_poller_sel
         "check_concurrency",
         lambda home, **kwargs: autonomy.ConcurrencyCheck(True, 0, 2),
     )
-    registry.set_arbiter(None)
-    model = _WorklinkToolProbeAgent(443)
+    from langchain_core.tools import tool
+
+    @tool("worklink_run")
+    async def provider_worklink_run(issue_id: int) -> str:
+        """Dispatch a selected provider's autonomous Worklink leaf."""
+        result = await asyncio.to_thread(
+            orchestrator.run_worklink,
+            home=home, repo=repo, issue_id=issue_id, autonomous=True,
+        )
+        return f"worklink_run #{result.issue_id}: {result.status} reason={result.reason}"
+
+    model = _WorklinkToolProbeAgent(443, provider_worklink_run)
     agent = _build_agent(
         tmp_path,
         fake_agent=model,
