@@ -7,7 +7,7 @@ from collections import Counter
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1] / "mimir" / "worklink"
+ROOT = Path(__file__).resolve().parents[1] / "plugins" / "cultivate" / "mimir_cultivate" / "worklink"
 
 # Each entry is an ending or a guard, with its reason. Reconcile this inventory
 # before adding any cancellation/deletion call in the Worklink package.

@@ -7,9 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from mimir.worklink.backends.feature_factory import FactoryStatus
-from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
-from mimir.worklink import park_alerts
+pytest.importorskip("mimir_cultivate")
+
+from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
+from mimir_cultivate.worklink.factory_state import FactoryRunRecord, save_factory_record
+from mimir_cultivate.worklink import park_alerts
 
 
 def _record(home: Path, *, phase: str = "parked", attempt: int = 1,
@@ -194,6 +196,7 @@ async def test_corrupt_dedupe_state_fails_closed(tmp_path, monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_registered_job_scans_without_enqueuing_turns(tmp_path, monkeypatch) -> None:
     from mimir.scheduler import Scheduler
+    from mimir.worklink import park_alerts as core_park_alerts
 
     calls = []
 
@@ -203,7 +206,7 @@ async def test_registered_job_scans_without_enqueuing_turns(tmp_path, monkeypatc
     async def scan(home, channel, channels):
         calls.append((home, channel, channels))
 
-    monkeypatch.setattr(park_alerts, "alert_parked_factory_runs", scan)
+    monkeypatch.setattr(core_park_alerts, "alert_parked_factory_runs", scan)
     scheduler = Scheduler(tmp_path / "scheduler.yaml", enqueue, home=tmp_path)
     channels = Channels()
     scheduler.add_worklink_factory_park_alert_job(tmp_path, "operator", channels)

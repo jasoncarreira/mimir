@@ -1260,6 +1260,10 @@ def test_validate_leaf_checks_epic_target_without_requiring_leaf_template() -> N
 def test_dry_run_prints_rendered_work_order_without_mutations(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig
+    from mimir_cultivate.worklink.orchestrator import WorklinkRunner
+
     calls: list[Sequence[str] | str] = []
 
     def runner(args: Sequence[str] | str) -> subprocess.CompletedProcess[str]:
@@ -8038,6 +8042,13 @@ def test_factory_supervision_records_and_reports_park_snapshot(
     park_snapshot: str | None,
     expected_report: str,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink.backends.feature_factory import parse_factory_status
+    from mimir_cultivate.worklink.claims import ChainlinkClaims, ClaimRecord
+    from mimir_cultivate.worklink.compute import ComputeResult, LaunchHandle
+    from mimir_cultivate.worklink.factory_state import FactoryRunRecord, load_factory_record
+    from mimir_cultivate.worklink.orchestrator import IssueContext, WorklinkRunner
+
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
     handle = LaunchHandle("local_subprocess", "123", 456)
@@ -8069,11 +8080,9 @@ def test_factory_supervision_records_and_reports_park_snapshot(
 
         def status(self, *args: object, **kwargs: object) -> Any:
             assert wait_started.wait(1)
-            return _factory_lifecycle_status(
-                sandbox,
-                status="needs-human",
-                park_snapshot=park_snapshot,
-            )
+            return parse_factory_status(_factory_lifecycle_status(
+                sandbox, status="needs-human", park_snapshot=park_snapshot,
+            ).to_json())
 
         def heartbeat(self, *args: object, **kwargs: object) -> None:
             return None
@@ -8088,7 +8097,12 @@ def test_factory_supervision_records_and_reports_park_snapshot(
             ),
             backend=Backend(),
             compute=Compute(),
-            factory_record=_factory_lifecycle_record(sandbox, handle),
+            factory_record=FactoryRunRecord(
+                run_id="700", issue_id=700, attempt=1, repository="owner/repo",
+                base_ref="main", branch="epic/700", launcher="/opt/factory/bin/factory.js",
+                sandbox=str(sandbox), session="session-1", handle=handle,
+                status=None, observed_at=None, controller_phase="running",
+            ),
             test_cmd="pytest -q",
             runner=lambda args: cp(args),
             started_at=datetime.now(UTC),
@@ -11203,6 +11217,14 @@ def test_factory_checkout_repository_resolves_local_lease_or_push_url(
 
 
 def test_factory_lock_refusal_exit_parks_without_terminal_failure(tmp_path: Path) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink.backends.feature_factory import parse_factory_status
+    from mimir_cultivate.worklink.claims import ClaimRecord
+    from mimir_cultivate.worklink.compute import ComputeResult, LaunchHandle
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.worklink.factory_state import FactoryRunRecord, load_factory_record
+    from mimir_cultivate.worklink.orchestrator import IssueContext, WorklinkRunner
+
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
     handle = LaunchHandle("local_subprocess", "123", 456)
@@ -11232,7 +11254,7 @@ def test_factory_lock_refusal_exit_parks_without_terminal_failure(tmp_path: Path
         poll_interval_s = 0
 
         def status(self, *args: object, **kwargs: object) -> Any:
-            return _factory_lifecycle_status(sandbox, status="running")
+            return parse_factory_status(_factory_lifecycle_status(sandbox, status="running").to_json())
 
         def heartbeat(self, *args: object, **kwargs: object) -> None:
             return None
@@ -11248,7 +11270,12 @@ def test_factory_lock_refusal_exit_parks_without_terminal_failure(tmp_path: Path
             claims=Claims(),
             backend=Backend(),
             compute=Compute(),
-            factory_record=_factory_lifecycle_record(sandbox, handle),
+            factory_record=FactoryRunRecord(
+                run_id="700", issue_id=700, attempt=1, repository="owner/repo",
+                base_ref="main", branch="epic/700", launcher="/opt/factory/bin/factory.js",
+                sandbox=str(sandbox), session="session-1", handle=handle,
+                status=None, observed_at=None, controller_phase="running",
+            ),
             test_cmd="pytest -q",
             runner=lambda args: git_calls.append(list(args)) or cp(args),
             started_at=datetime.now(UTC),
@@ -11261,7 +11288,6 @@ def test_factory_lock_refusal_exit_parks_without_terminal_failure(tmp_path: Path
     assert sandbox.is_dir()
     assert retained is not None and retained.controller_phase == "parked"
     assert transitions[0]["status"] == "blocked"
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
     notices = list(load_failure_state(dispatch_failure_state_dir(tmp_path))["factory_transitions"].values())
     assert len(notices) == 1 and notices[0]["kind"] == "factory_needs_human"
     assert notices[0]["status"] == "needs-human"

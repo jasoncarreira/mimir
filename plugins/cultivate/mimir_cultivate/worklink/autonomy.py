@@ -1,0 +1,744 @@
+"""Slice-3 autonomy helpers for Worklink (chainlink #444).
+
+The deterministic executor (``orchestrator.py``) and claim protocol
+(``claims.py``) stay backend-shaped and operator-invokable. This module adds
+the thin *autonomous-dispatch* layer they don't need on their own:
+
+* the concurrent-claim cap (``worklink:in-progress`` count vs
+  ``defaults.max_concurrent``), enforced by both the in-turn ``worklink_run``
+  tool and the ready-queue poller before they start new work;
+* the TTL-reaper entry point the scheduler callable runs to recover claims
+  whose worker died (delegates to the already-tested
+  :meth:`ChainlinkClaims.reap_home`);
+* small config reads (autonomous priority, cap, reaper TTL) from
+  ``<home>/worklink.yaml``.
+
+Arbiter gating (``HomeostaticArbiter.should_fire``) lives at the call sites
+that can reach an arbiter — the ``worklink_run`` tool and the scheduler's
+poller-fire path — not here, so this module stays import-light and trivially
+testable with a fake chainlink runner. The operator CLI deliberately uses
+neither the cap nor the arbiter: ``mimir worklink run`` always proceeds.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import subprocess
+import time
+from typing import Callable, Sequence
+
+from mimir.event_logger import log_event_sync
+from .backends.registry import WorklinkConfig, WorklinkDefaults, WorklinkDefaultsValidationError
+from .claims import (
+    ChainlinkClaims,
+    ClaimRecord,
+    ReapResult,
+    ShutdownClaimFailure,
+    WORKLINK_EPIC_LABEL,
+)
+from .checkout import prune_attempt_checkouts, report_foreign_owned_git_objects
+from .control import _claim_mutex
+from .dispatch_failures import _find_latest_evidence_file_for_issue
+from .factory_state import (
+    LIVE_CONTROLLER_PHASES,
+    RETAINED_CONTROLLER_PHASES,
+    FACTORY_STOP_GRACE_S,
+    factory_checkout_interlock,
+    factory_process_is_verified_dead,
+    factory_run_still_going,
+    factory_run_stopped_since,
+    list_factory_records,
+)
+from .run_state import (
+    OrphanBlockRecord,
+    clear_orphan_block_record,
+    list_run_states,
+    load_orphan_block_record,
+    load_run_state,
+    list_orphan_block_records,
+)
+
+#: Chainlink agent identity the executor + reaper claim under. Mirrors
+#: ``WorklinkRunner.agent_id`` so reaped/dispatched records line up.
+DEFAULT_AGENT_ID = "mimir-worklink"
+WORKLINK_AGENT_ID_ENV = "MIMIR_WORKLINK_AGENT_ID"
+FACTORY_MAX_CONCURRENT_DEFAULT = 1
+
+log = logging.getLogger(__name__)
+
+
+def chainlink_bin() -> str:
+    """Resolve the chainlink binary (env override, else ``chainlink`` on PATH)."""
+    return os.environ.get("CHAINLINK_BIN") or "chainlink"
+
+
+def _home_runner(home: Path):
+    """A chainlink runner pinned to the home dir (the Chainlink repo cwd)."""
+
+    def run(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            args, cwd=str(home), capture_output=True, text=True, check=False,
+        )
+
+    return run
+
+
+def worklink_defaults(home: Path) -> WorklinkDefaults:
+    """Load ``<home>/worklink.yaml`` defaults (or the dataclass defaults)."""
+    return WorklinkConfig.load(home / "worklink.yaml").defaults
+
+
+def worklink_priority(home: Path) -> str:
+    """Autonomous-dispatch arbiter priority from worklink.yaml (default normal)."""
+    return worklink_defaults(home).priority
+
+
+def factory_max_concurrent() -> int:
+    """Resolve the factory concurrency cap, saying so when a set value is unusable.
+
+    Same contract as ``_factory_max_retries``: absent is ordinary and silent, but a
+    value the operator set and this cannot use is announced rather than degrading
+    quietly into the default.
+    """
+    raw = os.environ.get("MIMIR_FACTORY_MAX_CONCURRENT")
+    if raw is None:
+        return FACTORY_MAX_CONCURRENT_DEFAULT
+
+    def _unusable(reason: str) -> int:
+        log.warning(
+            "MIMIR_FACTORY_MAX_CONCURRENT=%r is %s; using the default cap %d.",
+            raw,
+            reason,
+            FACTORY_MAX_CONCURRENT_DEFAULT,
+        )
+        return FACTORY_MAX_CONCURRENT_DEFAULT
+
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return _unusable("not an integer")
+    return parsed if parsed > 0 else _unusable("not a positive integer")
+
+
+def worklink_repo() -> str:
+    """Resolve the git repo the backend works in, consistently with the
+    ready-queue poller / opt-in skill, which expose ``WORKLINK_REPO``.
+
+    ``MIMIR_WORKLINK_REPO`` is accepted as a back-compat alias. Autonomous
+    dispatch must be explicit: falling back to the server process cwd can run
+    Worklink against an unintended checkout. The operator CLI has its own
+    ``--repo`` defaulting behavior and does not use this helper.
+    """
+    repo = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    if not repo:
+        raise RuntimeError("WORKLINK_REPO is required for autonomous Worklink dispatch")
+    return repo
+
+
+def current_agent_id() -> str:
+    return os.environ.get(WORKLINK_AGENT_ID_ENV) or DEFAULT_AGENT_ID
+
+
+def make_claims(home: Path, *, agent_id: str | None = None) -> ChainlinkClaims:
+    defaults = worklink_defaults(home)
+    return ChainlinkClaims(
+        chainlink_bin=chainlink_bin(),
+        agent_id=agent_id or current_agent_id(),
+        runner=_home_runner(home),
+        home_path=home,
+        event_logger=log_event_sync,
+        max_attempts=defaults.max_claim_attempts,
+    )
+
+
+def release_claims_for_graceful_shutdown(
+    home: Path,
+    *,
+    agent_id: str,
+    timeout_s: float,
+) -> tuple[list[ClaimRecord], list[ShutdownClaimFailure]]:
+    """Release only ``agent_id`` claims within one wall-clock deadline."""
+    if timeout_s <= 0:
+        return [], []
+    deadline = time.monotonic() + timeout_s
+
+    def bounded_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(args, timeout_s)
+        return subprocess.run(
+            args,
+            cwd=str(home),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=remaining,
+        )
+
+    claims = ChainlinkClaims(
+        chainlink_bin=chainlink_bin(),
+        agent_id=agent_id,
+        runner=bounded_runner,
+        home_path=home,
+        event_logger=log_event_sync,
+        max_attempts=worklink_defaults(home).max_claim_attempts,
+    )
+    return claims.release_owned_claims_for_shutdown()
+
+
+@dataclass(frozen=True)
+class ConcurrencyCheck:
+    allowed: bool
+    active: int
+    cap: int
+
+    @property
+    def reason(self) -> str:
+        if self.allowed:
+            return f"{self.active}/{self.cap} active claims"
+        return f"concurrency cap reached ({self.active}/{self.cap} active claims)"
+
+
+def check_concurrency(
+    home: Path,
+    *,
+    agent_id: str | None = None,
+    claims: ChainlinkClaims | None = None,
+) -> ConcurrencyCheck:
+    """Whether autonomous dispatch may start one more leaf right now.
+
+    ``allowed`` is ``active < cap`` where ``active`` is the active non-epic
+    Chainlink lock count. Per-issue exclusivity and the final hard-cap reservation
+    are both enforced by ``chainlink locks claim`` inside
+    :meth:`ChainlinkClaims.claim_issue`; this preflight is advisory/fail-closed
+    so callers can skip work before entering the executor when the cap is
+    already full.
+    """
+    cap = worklink_defaults(home).max_concurrent
+    cl = claims or make_claims(home, agent_id=agent_id)
+    active = cl.active_worklink_lock_count(exclude_label=WORKLINK_EPIC_LABEL)
+    return ConcurrencyCheck(allowed=active < cap, active=active, cap=cap)
+
+
+
+def _attempt_is_active(
+    child: Path, records: Sequence[object] = (), *, now: datetime | None = None,
+) -> bool:
+    resolved = child.resolve()
+    now = now or datetime.now(timezone.utc)
+    for candidate in records:
+        matches_attempt = (
+            f"{getattr(candidate, 'issue_id', None)}-"
+            f"{getattr(candidate, 'attempt', None)}" == child.name
+        )
+        sandbox = getattr(candidate, "sandbox", None)
+        if not isinstance(sandbox, str):
+            continue
+        resolved_sandbox = Path(sandbox).resolve()
+        if resolved_sandbox != resolved and resolved not in resolved_sandbox.parents:
+            continue
+        phase = getattr(candidate, "controller_phase", None)
+        if phase in LIVE_CONTROLLER_PHASES and not factory_process_is_verified_dead(candidate):
+            return True
+        if phase not in LIVE_CONTROLLER_PHASES | RETAINED_CONTROLLER_PHASES:
+            return True
+        status = getattr(candidate, "status", None)
+        if factory_run_still_going(candidate, status, now=now):
+            return True
+        stopped = factory_run_stopped_since(candidate, status)
+        if (
+            matches_attempt and stopped is not None
+            and now < stopped + timedelta(seconds=FACTORY_STOP_GRACE_S)
+        ):
+            return True
+        if status is not None and status.is_parked:
+            return True
+        if status is not None and status.is_terminal:
+            continue
+        if not factory_process_is_verified_dead(candidate):
+            return True
+    return False
+
+
+def _attempt_held_by_factory_observation(
+    child: Path,
+    records: Sequence[object],
+    *,
+    now: datetime,
+    retention_s: int,
+) -> bool:
+    """Give a verified-dead, non-parked factory its recovery window after its last write."""
+    resolved = child.resolve()
+    held: tuple[object, datetime] | None = None
+    for record in records:
+        if f"{getattr(record, 'issue_id', None)}-{getattr(record, 'attempt', None)}" != child.name:
+            continue
+        sandbox = getattr(record, "sandbox", None)
+        if not isinstance(sandbox, str):
+            continue
+        resolved_sandbox = Path(sandbox).resolve()
+        if resolved_sandbox != resolved and resolved not in resolved_sandbox.parents:
+            continue
+        phase = getattr(record, "controller_phase", None)
+        status = getattr(record, "status", None)
+        if (
+            phase not in LIVE_CONTROLLER_PHASES | RETAINED_CONTROLLER_PHASES
+            or status is None
+            or status.status is None
+            or status.is_terminal
+            or status.is_parked
+            or not factory_process_is_verified_dead(record)
+        ):
+            continue
+        observed_at = getattr(record, "observed_at", None)
+        try:
+            observed = datetime.fromisoformat(observed_at) if observed_at else None
+            if observed is None or observed.tzinfo is None or observed.utcoffset() is None:
+                raise ValueError("missing or unparseable observation time")
+        except (TypeError, ValueError):
+            # The checkout-age gate has already passed; legacy records retain
+            # the original mtime-only policy rather than inventing a new clock.
+            try:
+                log_event_sync(
+                    "worklink_attempt_retention_clock_fallback",
+                    issue_id=record.issue_id,
+                    run_id=record.run_id,
+                )
+            except RuntimeError:
+                pass
+            continue
+        prunable_after = observed + timedelta(seconds=retention_s)
+        if now < prunable_after and (held is None or prunable_after > held[1]):
+            held = (record, prunable_after)
+    if held is None:
+        return False
+    record, prunable_after = held
+    try:
+        log_event_sync(
+            "worklink_attempt_checkout_retained",
+            issue_id=record.issue_id,
+            run_id=record.run_id,
+            attempt=record.attempt,
+            phase=record.controller_phase,
+            status=record.status.status,
+            prunable_after=prunable_after.isoformat(),
+        )
+    except RuntimeError:
+        pass
+    return True
+
+
+def prune_stale_attempt_checkouts_for_home(
+    home: Path,
+    *,
+    repo: Path | str | None = None,
+    runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None,
+) -> list[Path]:
+    """Prune retained Worklink attempt checkouts past the reaper TTL (#613).
+
+    The claim reaper recovers Chainlink labels/locks, but failed or blocked
+    local attempts intentionally leave their checkout on disk for autopsy.  Run
+    the filesystem prune on the same TTL; verified-dead resumable factories also
+    receive a retention window from their last observation. If no Worklink repo is
+    configured, return silently; homes can
+    opt into claim reaping before they opt into autonomous dispatch.
+
+    Factory controllers exclude reclamation through a cross-process interlock;
+    abandoned records are evaluated only after acquiring it and rereading state.
+    """
+    defaults = worklink_defaults(home)
+    repo_raw = repo or os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    if not repo_raw:
+        return []
+    run = runner or _home_runner(home)
+    with factory_checkout_interlock(home, pruning=True) as acquired, _claim_mutex(home):
+        if not acquired:
+            return []
+        try:
+            listing = list_factory_records(home)
+        except Exception:
+            return []
+        if listing.failures:
+            return []
+        factory_records = listing.records
+        retained_run_paths = {
+            Path(state.checkout).resolve() for state in list_run_states(home) if state.checkout
+        }
+        records = {Path(record.checkout).resolve(): record for record in list_orphan_block_records(home)}
+        now = datetime.now(timezone.utc)
+        pruned = prune_attempt_checkouts(
+            Path(repo_raw),
+            older_than=timedelta(seconds=defaults.reaper_ttl_s),
+            now=now,
+            is_active=lambda child: (
+                child.resolve() in retained_run_paths
+                or _attempt_is_active(child, factory_records, now=now)
+                or _attempt_held_by_factory_observation(
+                    child,
+                    factory_records,
+                    now=now,
+                    retention_s=defaults.factory_resumable_retention_s,
+                )
+            ),
+            can_prune=lambda child: (
+                (record := records.get(child.resolve())) is None
+                or record.publication_outcome != "determined-unpublished"
+            ),
+        )
+        for child in pruned:
+            record = records.get(child.resolve())
+            if record is not None and record.publication_outcome == "undetermined":
+                _clear_pruned_orphan_block(home, record, run=run)
+        return pruned
+
+
+def _clear_pruned_orphan_block(
+    home: Path,
+    record: OrphanBlockRecord,
+    *,
+    run: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
+) -> bool:
+    """Clear only the block whose latest block comment belongs to this attempt."""
+    current = load_orphan_block_record(home, record.issue_id)
+    if current != record:
+        return False
+    shown = run([chainlink_bin(), "issue", "show", str(record.issue_id), "--json"])
+    if shown.returncode != 0:
+        return False
+    try:
+        payload = json.loads(shown.stdout or "{}")
+    except json.JSONDecodeError:
+        return False
+    labels = {
+        str(label.get("name")) if isinstance(label, dict) else str(label)
+        for label in payload.get("labels") or ()
+    }
+    comments: list[str] = []
+    for item in payload.get("comments") or ():
+        if isinstance(item, str):
+            comments.append(item)
+        elif isinstance(item, dict):
+            text = item.get("content") or item.get("text") or item.get("body")
+            if text:
+                comments.append(str(text))
+    latest_block = next(
+        (comment for comment in reversed(comments) if comment.startswith("WORKLINK_BLOCKED")),
+        None,
+    )
+    if "worklink:blocked" not in labels:
+        clear_orphan_block_record(home, record.issue_id)
+        return True
+    if latest_block != record.comment:
+        return False
+    unlabel = run(
+        [chainlink_bin(), "issue", "unlabel", str(record.issue_id), "worklink:blocked"]
+    )
+    if unlabel.returncode != 0:
+        return False
+    ready = run([chainlink_bin(), "issue", "label", str(record.issue_id), "worklink:ready"])
+    if ready.returncode != 0:
+        run([chainlink_bin(), "issue", "label", str(record.issue_id), "worklink:blocked"])
+        return False
+    clear_orphan_block_record(home, record.issue_id)
+    try:
+        log_event_sync(
+            "worklink_orphan_block_cleared",
+            issue_id=record.issue_id,
+            attempt=record.attempt,
+            checkout=record.checkout,
+            reason="undetermined checkout pruned",
+            resulting_label="worklink:ready",
+        )
+    except RuntimeError:
+        # Direct maintenance invocations can run before the process event logger.
+        pass
+    return True
+
+
+def report_foreign_owned_git_objects_for_home(
+    home: Path,
+    *,
+    expected_uid: int,
+    repo: Path | str | None = None,
+) -> list[Path]:
+    """Run the base-repository ownership check from periodic maintenance."""
+    del home
+    repo_raw = repo or os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    if not repo_raw:
+        return []
+    return report_foreign_owned_git_objects(
+        Path(repo_raw),
+        expected_uid=expected_uid,
+        event_logger=log_event_sync,
+    )
+
+
+def reap_stale_claims_for_home(
+    home: Path,
+    *,
+    agent_id: str | None = None,
+    claims: ChainlinkClaims | None = None,
+) -> ReapResult:
+    """TTL-reaper entry point: recover claims whose worker died.
+
+    Reads ``reaper_ttl_s`` from worklink.yaml and delegates discovery +
+    staleness to :meth:`ChainlinkClaims.reap_home`. If a live config edit puts
+    the TTL below its safe floor, emit an operator-visible event and use the
+    floor for this pass; startup config loading rejects the same violation.
+    """
+    try:
+        ttl_s = worklink_defaults(home).reaper_ttl_s
+    except WorklinkDefaultsValidationError as exc:
+        if exc.field != "reaper_ttl_s":
+            raise
+        try:
+            log_event_sync(
+                "worklink_reaper_misconfigured",
+                configured_reaper_ttl_s=exc.configured_value,
+                required_reaper_ttl_s=exc.required_value,
+                action="using_required_ttl",
+            )
+        except Exception as log_exc:  # noqa: BLE001
+            log.warning("could not emit worklink reaper config event: %s", log_exc)
+        ttl_s = exc.required_value
+    ttl = timedelta(seconds=ttl_s)
+    cl = claims or make_claims(home, agent_id=agent_id)
+
+    def record_reaped_incident(record: ClaimRecord, transition: str) -> None:
+        from .dispatch_failures import dispatch_failure_state_dir, record_failure
+
+        state = load_run_state(home, record.issue_id)
+        heartbeat = record.heartbeat_at or record.claimed_at
+        record_failure(
+            dispatch_failure_state_dir(home),
+            issue_id=record.issue_id,
+            attempt=record.attempt,
+            exit_status=None,
+            error=(
+                "stale autonomous claim reaped after heartbeat expiry; "
+                f"target worklink:{transition}"
+            ),
+            log_path=os.environ.get("WORKLINK_RUN_LOG"),
+            work_path=state.checkout if state is not None else None,
+            preserved_ref=state.branch if state is not None else None,
+            now=heartbeat.astimezone(timezone.utc),
+        )
+
+    if not isinstance(cl, ChainlinkClaims):
+        return cl.reap_home(ttl=ttl)
+    return cl.reap_home(ttl=ttl, before_rearm=record_reaped_incident)
+
+
+@dataclasses.dataclass(frozen=True)
+class PrMergeState:
+    """Result of checking a PR's merge state."""
+
+    pr_url: str
+    state: str
+    merged: bool
+    merged_at: str | None = None
+    merge_commit_sha: str | None = None
+
+
+def _normalize_pr_url(value: str | None) -> str | None:
+    """Normalize a PR URL to a canonical form."""
+    if not value:
+        return None
+    match = re.match(
+        r"https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/(\d+)",
+        value.strip(),
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    owner, repo, number = match.groups()
+    return f"https://github.com/{owner.lower()}/{repo.lower()}/pull/{number}"
+
+
+def _check_pr_merged_via_gh(pr_url: str, gh_bin: str = "gh") -> PrMergeState | None:
+    """Check if a PR is merged using the gh CLI.
+
+    Returns None on any error (fail-safe: never close on uncertainty).
+    """
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    return _check_pr_merged_via_gh_runner(pr_url, runner=runner)
+
+
+def _check_pr_merged_via_gh_runner(
+    pr_url: str,
+    runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]],
+) -> PrMergeState | None:
+    """Check if a PR is merged using the gh CLI (with injectable runner)."""
+    normalized = _normalize_pr_url(pr_url)
+    if not normalized:
+        return None
+
+    match = re.match(
+        r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", normalized
+    )
+    if not match:
+        return None
+
+    repo, pr_number = match.groups()
+
+    result = runner(["gh", "pr", "view", pr_number, "--repo", repo, "--json", "state,mergedAt,mergeCommit"])
+    if result.returncode != 0:
+        return None
+
+    try:
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    state = str(data.get("state", "OPEN")).upper()
+    merged = state == "MERGED"
+
+    merged_at = data.get("mergedAt")
+    if merged_at and merged_at != "null":
+        merged_at = merged_at
+    else:
+        merged_at = None
+
+    merge_commit = data.get("mergeCommit")
+    merge_commit_sha = None
+    if merge_commit and isinstance(merge_commit, dict):
+        merge_commit_sha = merge_commit.get("oid")
+
+    return PrMergeState(
+        pr_url=normalized,
+        state=state,
+        merged=merged,
+        merged_at=merged_at,
+        merge_commit_sha=merge_commit_sha,
+    )
+
+
+def _find_latest_evidence_for_issue(home: Path, issue_id: int) -> dict | None:
+    """Return the latest active evidence payload for an issue."""
+    found = _find_latest_evidence_file_for_issue(home, issue_id)
+    return found[1] if found is not None else None
+
+
+def _find_pr_url_from_comments(comments: list[str]) -> str | None:
+    """Find PR URL from issue comments.
+
+    Looks for WORKLINK_EVIDENCE comments which contain the pr_url field.
+    Feature-factory epics historically mirrored their PR as
+    ``draft PR opened: <url>`` instead of a WORKLINK_EVIDENCE record, so accept
+    that shape too to reconcile already-stranded epic issues.
+    """
+    for comment in reversed(comments):
+        match = re.search(r"pr_url=([^\s]+)", comment)
+        if match:
+            url = match.group(1)
+            if url and url != "None":
+                normalized = _normalize_pr_url(url)
+                if normalized:
+                    return normalized
+        match = re.search(r"draft PR opened:\s*(https?://github\.com/[^\s]+)", comment)
+        if match:
+            normalized = _normalize_pr_url(match.group(1))
+            if normalized:
+                return normalized
+    return None
+
+
+def _find_latest_attempt_from_comments(comments: list[str]) -> int | None:
+    """Find the latest attempt number from issue comments."""
+    max_attempt = 0
+    for comment in comments:
+        match = re.search(r"WORKLINK_EVIDENCE.*attempt=(\d+)", comment)
+        if match:
+            attempt = int(match.group(1))
+            if attempt > max_attempt:
+                max_attempt = attempt
+    return max_attempt if max_attempt > 0 else None
+
+
+def get_pr_url_for_review_issue(
+    home: Path,
+    issue_id: int,
+    chainlink_runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None,
+) -> str | None:
+    """Get the PR URL for a worklink:review issue.
+
+    First tries the evidence file, then falls back to issue comments.
+    Returns None if no PR URL is found (fail-safe: leave issue untouched).
+    """
+    evidence = _find_latest_evidence_for_issue(home, issue_id)
+    if evidence:
+        pr_url = evidence.get("pr_url")
+        if pr_url:
+            normalized = _normalize_pr_url(pr_url)
+            if normalized:
+                return normalized
+
+    if chainlink_runner:
+        result = chainlink_runner([chainlink_bin(), "issue", "show", str(issue_id), "--json"])
+        if result.returncode == 0:
+            try:
+                data = json.loads(result.stdout)
+                comments = data.get("comments") or []
+                comment_texts = [
+                    c.get("content") or c.get("text") or c.get("body") or ""
+                    if isinstance(c, dict) else str(c)
+                    for c in comments
+                    if isinstance(c, (dict, str))
+                ]
+                return _find_pr_url_from_comments(comment_texts)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class MergedChainlinkResult:
+    """Result of closing a merged chainlink."""
+
+    issue_id: int
+    pr_url: str
+    merged_at: str | None
+    merge_commit_sha: str | None
+
+
+def close_merged_chainlinks_for_home(
+    home: Path,
+    *,
+    gh_bin: str = "gh",
+    dry_run: bool = False,
+    gh_runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None,
+) -> list[MergedChainlinkResult]:
+    """Reconcile explicitly completing merged leaf PRs through the safe closer."""
+    from .merge_closure import reconcile_merged_leaves
+
+    def default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(args, capture_output=True, text=True, check=False)
+
+    claims = make_claims(home)
+    outcomes = reconcile_merged_leaves(
+        home,
+        gh_bin=gh_bin,
+        dry_run=dry_run,
+        chainlink_runner=claims.runner,
+        gh_runner=gh_runner or default_runner,
+        git_runner=default_runner,
+    )
+    return [
+        MergedChainlinkResult(
+            issue_id=outcome.issue_id,
+            pr_url=outcome.pr_url,
+            merged_at=outcome.merged_at,
+            merge_commit_sha=outcome.merge_commit_sha,
+        )
+        for outcome in outcomes
+    ]

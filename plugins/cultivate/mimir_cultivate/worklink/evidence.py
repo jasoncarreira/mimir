@@ -267,6 +267,7 @@ async def observe_evidence(
     skip_test_reason: str | None = None,
     runner: Run | None = None,
     gate_rerun_max_failures: int = 10,
+    factory_run_id: str | None = None,
 ) -> EvidenceValidation:
     """Build evidence by observing a normalized checkout after a backend run."""
     return await _observe_evidence_from_ref(
@@ -293,6 +294,7 @@ async def observe_evidence(
         skip_test_reason=skip_test_reason,
         runner=runner,
         gate_rerun_max_failures=gate_rerun_max_failures,
+        factory_run_id=factory_run_id,
         include_checkout_status=True,
         checkout_ref=checkout_ref,
     )
@@ -641,10 +643,30 @@ async def _observe_evidence_from_ref(
     pre_commands: list[CommandResult] | None = None,
     pre_observed: bool = True,
     gate_rerun_max_failures: int = 10,
+    factory_run_id: str | None = None,
 ) -> EvidenceValidation:
     runner = runner or _run
-    worker_uid_drop = backend != "feature_factory"
-    if worker_uid_drop and test_command and not skip_test_reason:
+    worker_uid_drop = backend != "feature_factory" or compute is not None
+    if backend == "feature_factory" and factory_run_id is not None and test_command and not skip_test_reason:
+        from .worker_client import factory_checkout_for_path
+
+        binding = factory_checkout_for_path(checkout)
+        if (
+            binding is None
+            or checkout != binding[0] / ".factory-sandboxes" / factory_run_id
+            or binding[1:] != (issue, attempt)
+            or getattr(compute, "name", None) != "local_subprocess"
+            or not callable(getattr(compute, "_launch_contained", None))
+            or work_spec is None
+            or work_spec.local_checkout != checkout
+            or work_spec.issue_id != issue
+            or work_spec.attempt != attempt
+            or work_spec.branch != branch
+            or work_spec.backend != backend
+            or work_spec.test_command != test_command
+        ):
+            raise ComputeLaunchError("Cultivate factory evidence gate requires the recorded worker sandbox")
+    if backend != "feature_factory" and worker_uid_drop and test_command and not skip_test_reason:
         authorization = getattr(compute, "_authorized_checkout", None)
         worker_bound = (
             getattr(compute, "name", None) != "local_subprocess"
@@ -942,9 +964,28 @@ async def _run_compute_gate(
                 basetemp=_gate_tmp_directory(report_dir),
             ),
         )
-    # The legacy local_subprocess launch() chooses a controller subprocess when
-    # MIMIR_CODING_ENABLED is absent. Enter the contained worker path explicitly;
-    # never let a provider gate choose launch()'s controller fallback.
+    if work_spec.backend == "feature_factory":
+        from .compute import _local_child_env
+        from .worker_client import run_factory_control
+
+        # The executor authenticates the controller-owned checkout by FD; the
+        # sandbox is the factory's nested clone, not a separate issued checkout.
+        command_in_sandbox = f"cd {shlex.quote(str(checkout))} && {command}"
+        try:
+            observed = await asyncio.to_thread(
+                run_factory_control, checkout, ("/bin/sh", "-c", command_in_sandbox),
+                env={**_local_child_env(), **gate_spec.env},
+                timeout=gate_spec.timeout_s, output_limit=20_000_000,
+            )
+        except subprocess.TimeoutExpired:
+            return ComputeResult(124, "", "factory gate timed out", timed_out=True)
+        return ComputeResult(
+            observed.returncode,
+            observed.stdout.decode("utf-8", errors="replace"),
+            observed.stderr.decode("utf-8", errors="replace"),
+        )
+    # Enter the contained worker path explicitly; never let a provider gate
+    # choose launch()'s controller fallback.
     handle = await compute._launch_contained(gate_spec, tuple(gate_spec.local_argv))
     try:
         if on_launch is not None:

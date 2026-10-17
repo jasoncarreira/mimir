@@ -18,7 +18,7 @@ import yaml
 
 from mimir.redaction import redact_text
 from mimir.repository_config import RepositoryConfig, RepositoryInventory
-from mimir.worklink.backends import WorklinkConfig
+from .backends.registry import WorklinkConfig
 from .checkout import _default_runner
 from .dispatch_failures import (
     active_failure_identities,
