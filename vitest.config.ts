@@ -1,13 +1,13 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
 
 const require = createRequire(import.meta.url);
 
-// Minimal vitest config: register a global test setup that resets shared
-// client state between cases (chainlink #564). Test files keep their per-file
-// `// @vitest-environment jsdom` pragmas; this only adds setupFiles, leaving
-// vitest's default include/exclude and environment behavior intact.
+// Register a global test setup that resets shared client state between cases
+// (chainlink #564). Test files keep their per-file `// @vitest-environment jsdom`
+// pragmas; use the default include/environment and exclude nested factory
+// checkouts in addition to Vitest's default exclusions.
 export default defineConfig({
   server: {
     fs: {
@@ -18,5 +18,6 @@ export default defineConfig({
   },
   test: {
     setupFiles: ["./frontend/src/vitest.setup.ts"],
+    exclude: [...configDefaults.exclude, "**/.factory/**", "**/.factory-sandboxes/**"],
   },
 });
