@@ -15,6 +15,19 @@ from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend, Work
 from mimir_cultivate.worklink.factory_state import FactoryRunRecord
 
 
+def test_provider_renders_default_work_order_without_override(tmp_path: Path) -> None:
+    issue = orchestrator.IssueContext(1949, "Move coding", "Implement the factory", {"worklink:ready"})
+    rendered = orchestrator.render_work_order(
+        issue,
+        template_path=orchestrator._template_path(tmp_path),
+        backend_name="feature_factory",
+        test_command="uv run pytest -q",
+    )
+    assert "Chainlink issue #1949" in rendered
+    assert "Implement the factory" in rendered
+    assert "uv run pytest -q" in rendered
+
+
 def _factory_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FactoryRunRecord:
     root = tmp_path / "worklink"
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", root)
