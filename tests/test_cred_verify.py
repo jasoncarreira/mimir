@@ -660,7 +660,8 @@ def test_discovery_loads_core_then_sorted_package_skills(
 def test_selected_provider_probe_shadows_only_within_its_policy():
     from mimir.plugins.core import policy_scope
     from mimir.plugins.manager import load_plugins
-    from mimir_cultivate import github_trust
+
+    github_trust = pytest.importorskip("mimir_cultivate.github_trust")
 
     selected = load_plugins(enable="cultivate").policy
     core_probe = get_probes()["GITHUB_TOKEN"]
@@ -670,6 +671,19 @@ def test_selected_provider_probe_shadows_only_within_its_policy():
         assert provider_probe.fn is github_trust.probe_github_token
         assert provider_probe.fn is not core_probe.fn
     assert get_probes()["GITHUB_TOKEN"].source == core_probe.source
+
+
+def test_core_probe_remains_generic_without_selected_provider(monkeypatch):
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    monkeypatch.setenv("GITHUB_TOKEN", "generic-token")
+    monkeypatch.setattr("requests.Session", lambda: pytest.fail("core probe used the network"))
+    with policy_scope(load_plugins(enable="").policy):
+        probe = get_probes()["GITHUB_TOKEN"]
+        assert probe.kind == "format"
+        assert probe.source == str(cred_verify._PACKAGE_MANIFEST)
+        assert verify("GITHUB_TOKEN").ok
 
 
 def test_selected_cli_runs_provider_probe_not_core_fallback(monkeypatch, capsys):
