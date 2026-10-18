@@ -284,17 +284,36 @@ def _resolve_standing_review(
     ):
         return None
     retained_scope = getattr(auth_context, "retained_factory_scope", None)
+    from ..access_control import _is_worklink_retained_checkout_service
+
     if (
         tool_name in policy_membership("retained_repo_tools")
         and retained_scope is not None
         and arguments.get("repository") == retained_scope.repository
         and arguments.get("pull_request") == retained_scope.issue_id
+        and _is_worklink_retained_checkout_service(
+            get_trusted_service_from_auth_context(auth_context), auth_context=auth_context,
+        )
     ):
         return None
-    from .forge import (
-        revalidate_review_head_for_context,
-        resolve_review_state_for_context,
-    )
+    selected = policy if policy is not None else selected_policy_registry()
+    registered = selected.tools.get(tool_name)
+    if registered is not None and registered.owner != "core" and registered.factory is not None:
+        from importlib import import_module
+
+        provider = import_module(registered.factory.__module__)
+        resolve_review_state_for_context = getattr(provider, "resolve_review_state_for_context", None)
+        revalidate_review_head_for_context = getattr(provider, "revalidate_review_head_for_context", None)
+        if not callable(resolve_review_state_for_context) or not callable(revalidate_review_head_for_context):
+            from .forge import (
+                revalidate_review_head_for_context,
+                resolve_review_state_for_context,
+            )
+    else:
+        from .forge import (
+            revalidate_review_head_for_context,
+            resolve_review_state_for_context,
+        )
 
     try:
         resolve_review_state_for_context(

@@ -213,6 +213,18 @@ def host_membership_projection() -> dict[str, tuple[str, ...]]:
     }
 
 
+def resolve_review_state_for_context(auth_context: object, repository: object, pull_request: object) -> object:
+    from .forge import resolve_review_state_for_context as resolve
+
+    return resolve(auth_context, repository, pull_request)
+
+
+def revalidate_review_head_for_context(auth_context: object, repository: object, pull_request: object) -> object:
+    from .forge import revalidate_review_head_for_context as revalidate
+
+    return revalidate(auth_context, repository, pull_request)
+
+
 def _names(value: str) -> frozenset[str]:
     return frozenset(value.split())
 

@@ -6742,7 +6742,7 @@ class SinkGate:
                     None,
                 )
             return (
-                tool_name in {"worklink_run", "worklink_resume"}
+                tool_name in _WORKLINK_BUILD_TOOLS
                 and not has_untrusted_active_ingest,
                 None,
             )
@@ -8430,7 +8430,7 @@ class WriteResourceAdapter:
             and cls._human_target_is_allowed(target)
         )
         reason = None if in_scope else (
-            "admin_required" if tool_name in {"worklink_run", "worklink_resume"} else "write_scope"
+            "admin_required" if tool_name in _WORKLINK_BUILD_TOOLS else "write_scope"
         )
         return ToolAuthorization(
             tool_name=tool_name,
@@ -9851,6 +9851,7 @@ class ToolRegistry:
                 retained_matches = (
                     isinstance(retained_scope, RetainedFactoryScope)
                     and tool_name in _RETAINED_REPO_TOOLS
+                    and (plugin_tool is None or "retained_repo_tools" in plugin_tool.memberships)
                     and (plugin_tool is None or plugin_tool.resource_scope == "repo_pr")
                     and _is_worklink_retained_checkout_service(
                         preliminary_service, auth_context=auth_context,
