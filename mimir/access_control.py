@@ -9106,6 +9106,19 @@ def _valid_scoped_pr_grant(
              or scope is None or getattr(scope, "owner", None) != owner
              or grants.principal != getattr(auth_context, "canonical_principal", None)):
         return False
+    slot_policy = getattr(auth_context, "_plugin_slot_policy", None)
+    if (slot_policy is not None and owner in slot_policy.state_slots
+            and slot_policy.scoped_actions.get(owner) is protocol):
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        registered_state = (
+            registry.resolve(scope.canonical_repo, scope.pr_number)
+            if registry is not None else None
+        )
+        if registered_state is None and discovered is not None:
+            registered_state = discovered.resolve(scope.canonical_repo, scope.pr_number)
+        if registered_state is not review_state or review_state.action_scope is not scope:
+            return False
     grant = grants.get(owner, scope, action.value)
     if (grant is None or grant._issuer is not _SCOPED_PR_ISSUER
             or grant.owner != owner or grant.principal != grants.principal
@@ -9163,6 +9176,7 @@ def authorize_repo_pr_tool(
     if isinstance(scope, RetainedFactoryScope):
         in_scope = (
             tool_name in _RETAINED_REPO_TOOLS
+            and (not registered_plugin or getattr(auth_context, "retained_factory_scope", None) is scope)
             and isinstance(service_principal, ServicePrincipal)
             and service_principal.worklink_retained_checkout
             and service_principal.trigger == "poller"
@@ -12886,7 +12900,14 @@ def create_auth_context(
     ):
         bridge_instance = f"service:{registered_service.canonical}"
 
-    repo_pr_scope_registry = _repo_review_state_from_event(event, registered_service)
+    repo_pr_scope_registry = (
+        _repo_review_state_from_event(event, registered_service)
+        if registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and event_ingress is None
+        and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
+        else None
+    )
     carried_scope = event.repo_pr_action_scope
     if not (
         isinstance(carried_scope, RepoPRActionScope)

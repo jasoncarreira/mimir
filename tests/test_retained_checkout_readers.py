@@ -138,6 +138,12 @@ class _CapturingEnqueue:
 async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_anchor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    await exercise_real_worklink_failure_turn(tmp_path, monkeypatch)
+
+
+async def exercise_real_worklink_failure_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, selected_provider: bool = False,
+) -> None:
     from mimir.worklink import dispatch_failures as failures
     from mimir.worklink.compute import LaunchHandle
     from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
@@ -198,8 +204,13 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
     assert emitted == 1, event_log.read_text(encoding="utf-8")
     [event] = enqueued.events
     labels = _initialize_ifc_labels(event)
+    selected = None
+    if selected_provider:
+        from mimir.plugins.manager import load_plugins
+
+        selected = load_plugins(enable="cultivate").policy
     auth = _create_turn_auth_context(
-        event, None, policy_version=None, enforce=True, ifc_labels=labels,
+        event, None, policy_version=None, enforce=True, ifc_labels=labels, policy=selected,
     )
     turn = TurnContext(
         turn_id="real-worklink-remediation",
@@ -223,6 +234,46 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
             arguments={"file_path": str(retained_target)},
         )
         assert decision.allowed, (decision.reason, decision.refusal_detail)
+        if selected_provider:
+            from mimir.access_control import create_auth_context
+            from mimir.plugins.core import policy_scope
+            from mimir_cultivate.policy import CultivateState
+
+            owner_state = auth.plugin_state("cultivate")
+            assert type(owner_state) is CultivateState
+            assert owner_state.retained_factory_scope is auth.retained_factory_scope
+            assert owner_state.retained_factory_scope is not None
+            assert owner_state.retained_factory_scope_refusal is None
+            arguments = {"repository": owner_state.retained_factory_scope.repository,
+                         "pull_request": owner_state.retained_factory_scope.issue_id}
+            with policy_scope(selected):
+                retained_decision = ac.ToolRegistry().authorize_tool(
+                    "repo_status", auth, enforce=True, arguments=arguments,
+                )
+                assert retained_decision.allowed, retained_decision.reason
+                untrusted_event = create_auth_context(
+                    event, policy=selected, enforce=True, event_ingress="http_event",
+                )
+                assert untrusted_event.plugin_state("cultivate").retained_factory_scope is None
+                assert untrusted_event.plugin_state("cultivate").retained_factory_scope_refusal
+                assert ac.ToolRegistry().authorize_tool(
+                    "repo_status", untrusted_event, enforce=True, arguments=arguments,
+                ).would_block
+                original_slots = auth.plugin_slots
+                object.__setattr__(auth, "plugin_slots", (("cultivate", CultivateState()),))
+                assert ac.ToolRegistry().authorize_tool(
+                    "repo_status", auth, enforce=True, arguments=arguments,
+                ).would_block
+                shadow = ac.ToolRegistry().authorize_tool(
+                    "repo_status", auth, enforce=False, arguments=arguments,
+                )
+                assert shadow.allowed and shadow.would_block
+                unbound_read = ac.ToolRegistry().authorize_tool(
+                    "read_file", auth, enforce=True,
+                    arguments={"file_path": str(retained_target)},
+                )
+                assert unbound_read.result_integrity == "untrusted"
+                object.__setattr__(auth, "plugin_slots", original_slots)
         for tool in ("write_file", "edit_file"):
             write_target = sandbox / "fix.py"
             write_decision = ac.ToolRegistry().authorize_tool(
