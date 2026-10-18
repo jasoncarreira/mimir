@@ -1295,7 +1295,7 @@ def test_dry_run_prints_rendered_work_order_without_mutations(
 
 def test_bundled_work_order_requires_discriminating_fail_closed_mutation_test() -> None:
     issue = IssueContext(1460, "pin fail-closed guards", "Acceptance criteria", {"worklink:ready"})
-    template = Path(__file__).parent.parent / "mimir" / "prompt_templates" / "worklink-order.md"
+    template = Path(__file__).parent.parent / "plugins/cultivate/mimir_cultivate/prompt_templates/worklink-order.md"
 
     prompt = render_work_order(
         issue,
@@ -4279,7 +4279,7 @@ def test_planner_prompt_renders_single_leaf_template_constant() -> None:
     from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
 
     root = Path(__file__).parent.parent
-    prompt_path = root / "mimir" / "prompt_templates" / "decompose.md"
+    prompt_path = root / "mimir/prompt_templates/decompose.md"
     prompt = prompt_path.read_text(encoding="utf-8")
     rendered = render_decomposition_prompt(
         template_path=prompt_path,
@@ -4293,8 +4293,21 @@ def test_planner_prompt_renders_single_leaf_template_constant() -> None:
     assert "{leaf_template}" in prompt
     assert LEAF_TEMPLATE_MARKDOWN not in prompt
     assert LEAF_TEMPLATE_MARKDOWN in rendered
-    assert LEAF_TEMPLATE_MARKDOWN in bundled_defaults()["decompose.md"]
-    assert "{leaf_template}" not in bundled_defaults()["decompose.md"]
+    assert "decompose.md" not in bundled_defaults()
+    assert "worklink-order.md" not in bundled_defaults()
+
+
+def test_cultivate_planner_template_matches_legacy_fallback() -> None:
+    planning = pytest.importorskip("mimir_cultivate.worklink.planning")
+    from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
+
+    root = Path(__file__).parent.parent
+    plugin = root / "plugins/cultivate/mimir_cultivate/prompt_templates/decompose.md"
+    legacy = root / "mimir/prompt_templates/decompose.md"
+    assert plugin.read_bytes() == legacy.read_bytes()
+    assert planning.LEAF_TEMPLATE_MARKDOWN == LEAF_TEMPLATE_MARKDOWN
+    rendered = planning.render_decompose_prompt(plugin.read_text(encoding="utf-8"))
+    assert LEAF_TEMPLATE_MARKDOWN in rendered and "{leaf_template}" not in rendered
 
 
 def test_skill_embeds_single_leaf_template_constant() -> None:
@@ -4365,7 +4378,7 @@ def test_worklink_ignores_planner_suggested_test_command_by_default(
 
 
 def test_decompose_prompt_teaches_chainlink_block_argument_order() -> None:
-    prompt = (Path(__file__).parent.parent / "mimir" / "prompt_templates" / "decompose.md").read_text(
+    prompt = (Path(__file__).parent.parent / "plugins/cultivate/mimir_cultivate/prompt_templates/decompose.md").read_text(
         encoding="utf-8"
     )
 

@@ -75,12 +75,8 @@ counted against the tool-call budget).
 
 ## Spawned processes
 
-- ``spawn_open_code`` within
-  operator-documented budget caps — **autonomous only when the turn's
-  server-defined authority profile lists that exact capability**. In particular,
-  a poller-triggered PR review must complete in its current turn and must not
-  spawn a coding agent.
-- Spawn tools with elevated budget — **escalate-first**.
+- Spawn tools require the turn's server-defined authority profile to list
+  the exact capability; elevated budgets are **escalate-first**.
 - Async shell jobs for read / observe shapes (test runs, log
   scans, build watches) — **autonomous**. For write / mutate
   shapes touching shared state outside the path-confinement

@@ -245,6 +245,9 @@ class CultivateProvider:
         registrar.register_state_slot(CultivateState)
         register_action_protocol(registrar, validate_scoped_pr_action)
         register_tools(registrar)
+        from .prompts import register_prompt_provider
+
+        register_prompt_provider(registrar)
         from .worklink.retained_scope import retained_factory_effect_lease
         from .repository import retained_factory_subprocess_runner
 
