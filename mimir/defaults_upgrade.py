@@ -955,18 +955,8 @@ async def enqueue_upgrade_reconciliation_turn(
         if operator_channel
         else "No operator alert channel is configured; skip the notification."
     )
-    # Muninn's observed `gh pr view`/`gh pr list`, shell `ls` with a pipe
-    # or glob, and `list_channels` refusals were all correct and shadow-only:
-    # they carried would_block=True/is_shadow_decision=True while enforcement
-    # was disabled. This guidance prevents those calls before enforcement is enabled.
     content += (
         "\n\n## Reconciliation access boundaries\n\n"
-        "If you need to inspect the proposal PR after `submit_proposal`, parse the "
-        "repository and pull-request number from the returned PR URL and use only "
-        "`pr_metadata`, `pr_checks`, `pr_reviews`, or `pr_comments`; use `pr_list` "
-        "to find pull requests in a configured repository. Do not run "
-        "`gh pr view` or `gh pr list`; `gh` is intentionally outside this "
-        "principal's shell profile.\n\n"
         "Use the typed file tools (`read_file`, `ls`, `glob`, and `grep`) as "
         "separate calls for workspace inspection. Do not run shell `ls`, and do "
         "not compose a pipe or shell glob.\n\n"

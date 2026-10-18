@@ -19,8 +19,6 @@ Currently seeded:
   audit workflow.
 - ``upgrade.md`` — version-triggered prompts/core defaults reconciliation
   turn for startup-opened upgrade-lane proposals.
-- ``worklink-order.md`` — operator-run Worklink backend order template.
-- ``decompose.md`` — Worklink planner/decomposer prompt template.
 
 The intent: a fresh ``mimir setup`` produces a deployment that already
 has a reasonable autonomous-work cadence wired up. Operators delete
@@ -46,21 +44,14 @@ def _template_names() -> list[str]:
         entry.name
         for entry in _TEMPLATES_ROOT.iterdir()
         if entry.is_file() and entry.suffix == ".md"
+        and entry.name not in {"worklink-order.md", "decompose.md"}
     )
-
-
-def _render_template(name: str, text: str) -> str:
-    if name == "decompose.md":
-        from ..worklink.planning import render_decompose_prompt
-
-        return render_decompose_prompt(text)
-    return text
 
 
 def bundled_defaults() -> dict[str, str]:
     """Bundled prompt defaults keyed by basename."""
     return {
-        name: _render_template(name, (_TEMPLATES_ROOT / name).read_text(encoding="utf-8"))
+        name: (_TEMPLATES_ROOT / name).read_text(encoding="utf-8")
         for name in _template_names()
     }
 
@@ -114,7 +105,7 @@ def seed_prompts(home: Path) -> dict[str, str]:
             out[name] = "present"
             continue
         try:
-            text = _render_template(name, src.read_text(encoding="utf-8"))
+            text = src.read_text(encoding="utf-8")
             write_framework_file(home, dst, text.encode("utf-8"))
             out[name] = "created"
             log.info("seeded default prompt: %s", dst)

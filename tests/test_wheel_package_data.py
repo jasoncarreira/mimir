@@ -41,8 +41,8 @@ CRITICAL_RUNTIME_DATA = (
     "mimir/prompt_templates/issues-audit.md",
     "mimir/prompt_templates/commitments-review.md",
     "mimir/prompt_templates/upgrade.md",  # version-triggered defaults reconciliation
-    "mimir/prompt_templates/worklink-order.md",  # Worklink operator-run prompt
-    "mimir/prompt_templates/decompose.md",  # Worklink planner/decomposer prompt
+    "mimir/prompt_templates/worklink-order.md",  # legacy Worklink until importer retirement
+    "mimir/prompt_templates/decompose.md",  # legacy planner until importer retirement
     "mimir/memory_templates/core/00-identity.md",  # setup core-memory defaults
     "mimir/memory_templates/core/05-non-goals.md",
     "mimir/memory_templates/core/06-action-boundaries.md",
@@ -127,6 +127,21 @@ def test_gitwildmatch_to_regex_semantics() -> None:
 def test_critical_runtime_data_files_exist_in_source() -> None:
     missing = [rel for rel in CRITICAL_RUNTIME_DATA if not (REPO_ROOT / rel).is_file()]
     assert not missing, f"runtime data files absent from the source tree: {missing}"
+
+
+def test_coding_prompts_ship_in_cultivate_and_match_legacy_fallback() -> None:
+    plugin_root = REPO_ROOT / "plugins/cultivate"
+    config = tomllib.loads((plugin_root / "pyproject.toml").read_text(encoding="utf-8"))
+    wheel = config["tool"]["hatch"]["build"]["targets"]["wheel"]
+    sdist = config["tool"]["hatch"]["build"]["targets"]["sdist"]
+    assert wheel["packages"] == ["mimir_cultivate"]
+    for name in ("worklink-order.md", "decompose.md"):
+        rel = f"mimir_cultivate/prompt_templates/{name}"
+        assert (plugin_root / rel).is_file()
+        assert (REPO_ROOT / "mimir/prompt_templates" / name).read_bytes() == (plugin_root / rel).read_bytes()
+        assert "mimir_cultivate/**/*" in sdist["include"]
+        assert not any(_gitwildmatch_to_regex(pattern).match(rel)
+                       for pattern in wheel.get("exclude", ()))
 
 
 def test_wheel_include_config_covers_critical_runtime_data() -> None:
