@@ -2411,7 +2411,19 @@ def test_interrupted_claim_is_reapable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interruption: type[BaseException],
     via_cli: bool,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    if via_cli:
+        import mimir_cultivate.worklink.orchestrator as orchestrator
+        from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
+        from mimir_cultivate.worklink.claims import ChainlinkClaims
+        from mimir_cultivate.worklink.run_state import load_run_state
+        WorklinkRunner = orchestrator.WorklinkRunner
+        monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    else:
+        import mimir.worklink.orchestrator as orchestrator
+        from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
+        from mimir.worklink.claims import ChainlinkClaims
+        from mimir.worklink.run_state import load_run_state
+        WorklinkRunner = orchestrator.WorklinkRunner
     from mimir.cli import main
 
     repo = tmp_path / "repo"

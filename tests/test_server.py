@@ -401,9 +401,12 @@ def test_runtime_is_only_production_mcp_tools_writer() -> None:
 def _writer_call_sites(writer_names: set[str]) -> dict[str, set[str]]:
     root = Path(__file__).resolve().parent.parent
     sites = {name: set() for name in writer_names}
-    for path in (root / "mimir").rglob("*.py"):
+    for path in (*(root / "mimir").rglob("*.py"),
+                 *(root / "plugins" / "cultivate" / "mimir_cultivate").rglob("*.py")):
         relative = path.relative_to(root).as_posix()
         module_name = relative.removesuffix(".py").replace("/", ".")
+        if relative.startswith("plugins/cultivate/"):
+            module_name = module_name.removeprefix("plugins.cultivate.")
         package_parts = module_name.split(".")[:-1]
         tree = ast.parse(path.read_text(encoding="utf-8"))
         aliases: dict[str, str] = {}
@@ -463,11 +466,14 @@ def test_production_global_writers_are_confined() -> None:
     expected = {
         "init_logger": {
             "mimir/server.py",
-            "mimir/commands/worklink.py",
+            "plugins/cultivate/mimir_cultivate/commands.py",
             "mimir/wiki_backlinks.py",
         },
         "set_github_identity_degraded_callback": {"mimir/runtime.py"},
-        "set_forge_client": {"mimir/runtime.py", "mimir/tools/forge.py"},
+        "set_forge_client": {
+            "mimir/runtime.py", "mimir/tools/forge.py",
+            "plugins/cultivate/mimir_cultivate/forge.py",
+        },
         "set_memory_client": {"mimir/agent.py", "mimir/runtime.py"},
         "set_indexer": {"mimir/runtime.py"},
         "set_index_generator": {"mimir/runtime.py"},

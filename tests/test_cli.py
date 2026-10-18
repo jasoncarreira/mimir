@@ -16,11 +16,11 @@ from mimir.cli import _print_setup_report, main, setup_home
 
 
 CORE_COMMANDS = frozenset({
-    "setup", "run", "identities", "reflection", "memory", "worklink",
+    "setup", "run", "identities", "reflection", "memory",
     "regenerate-api-key", "stats", "verify-cred", "verify-creds",
     "viability-report", "verify-index", "rotate", "loops", "update",
     "predictions", "wiki", "skills", "plugins", "scaffold-docker",
-    "opencode-bootstrap", "commitments", "feedback", "reindex",
+    "commitments", "feedback", "reindex",
     "migrate-memory", "saga-reembed", "saga-acl-inventory",
     "saga-enforcement-replay", "saga-migrate-legacy-acl", "watchdog",
     "notify-restart",
@@ -78,7 +78,6 @@ CORE_DISPATCH_CASES = (
     ("identities", ("identities", "list", "--home", "{home}"), "mimir.commands.identities.dispatch"),
     ("reflection", ("reflection", "list-pending"), "mimir.commands.reflection.dispatch"),
     ("memory", ("memory", "status", "--home", "{home}"), "mimir.commands.memory.dispatch"),
-    ("worklink", ("worklink", "status", "--home", "{home}"), "mimir.commands.worklink.dispatch"),
     ("regenerate-api-key", ("regenerate-api-key", "--home", "{home}"), "mimir.cli.regenerate_api_key"),
     ("stats", ("stats", "--home", "{home}", "--egress-shadow"), "mimir.cli._print_egress_shadow_report"),
     ("verify-cred", ("verify-cred", "GITHUB_TOKEN"), "mimir.cred_verify.run_verify_cred_cmd"),
@@ -92,7 +91,6 @@ CORE_DISPATCH_CASES = (
     ("wiki", ("wiki", "backlinks"), "mimir.wiki_backlinks.cmd_backlinks"),
     ("skills", ("skills", "list"), "mimir.commands.skills.dispatch"),
     ("scaffold-docker", ("scaffold-docker", "--home", "{home}"), "mimir.scaffold_docker.cmd"),
-    ("opencode-bootstrap", ("opencode-bootstrap", "--home", "{home}"), "mimir.scaffold_docker.ensure_opencode_config"),
     ("commitments", ("commitments", "list", "--home", "{home}"), "mimir.commitments.cli.dispatch"),
     ("feedback", ("feedback", "emit", "test-event"), "mimir.commands.feedback.dispatch"),
     ("reindex", ("reindex",), "mimir.reindex.dispatch"),

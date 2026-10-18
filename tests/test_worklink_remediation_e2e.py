@@ -501,6 +501,10 @@ async def test_worklink_resume_shared_launcher_runs_epic_and_retires_only_target
     from mimir.tools import registry
     from mimir.worklink import autonomy, detached_dispatch
     from mimir.worklink.orchestrator import WorklinkRunResult, WorklinkRunner
+    from mimir_cultivate.worklink.orchestrator import WorklinkRunner as CultivateWorklinkRunner
+    from mimir_cultivate.worklink.detached_dispatch import FactoryRecoveryIdentity
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
 
     case = remediation_case
     _event, _labels, auth = await _trusted_turn(case)
@@ -537,7 +541,7 @@ async def test_worklink_resume_shared_launcher_runs_epic_and_retires_only_target
     async def successful_recovery(self, issue_id: int, **kwargs):
         assert issue_id == scope.issue_id
         assert kwargs["autonomous"] is True
-        assert kwargs["expected_recovery"] == detached_dispatch.FactoryRecoveryIdentity(
+        assert kwargs["expected_recovery"] == FactoryRecoveryIdentity(
             scope.signature, scope.occurrence_id, scope.run_id, scope.attempt, scope.session,
         )
         assert self.chainlink_bin == "fake-chainlink"
@@ -557,6 +561,7 @@ async def test_worklink_resume_shared_launcher_runs_epic_and_retires_only_target
         lambda **kwargs: real_launch(**kwargs, popen=popen),
     )
     monkeypatch.setattr(WorklinkRunner, "run_epic", successful_recovery)
+    monkeypatch.setattr(CultivateWorklinkRunner, "run_epic", successful_recovery)
 
     output = await registry.worklink_resume.coroutine(runtime=SimpleNamespace(context=auth))
 

@@ -78,6 +78,14 @@ class CultivateProvider:
         from .scheduler import worklink_poller_hooks
 
         registrar.register_poller_hook("worklink", worklink_poller_hooks)
+        from . import commands
+
+        registrar.register_cli_command("worklink", commands.add_argparse, commands.dispatch_worklink)
+        registrar.register_cli_command(
+            "opencode-bootstrap",
+            commands.configure_opencode_bootstrap,
+            commands.dispatch_opencode_bootstrap,
+        )
 
 
 provider = CultivateProvider()

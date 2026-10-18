@@ -20,10 +20,10 @@ from unittest import mock
 
 import pytest
 
-from mimir.worklink import orchestrator
-from mimir.worklink.backends.feature_factory import FactoryStatus
-from mimir.worklink.compute import LaunchHandle
-from mimir.worklink.factory_state import (
+from mimir_cultivate.worklink import orchestrator
+from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
+from mimir_cultivate.worklink.compute import LaunchHandle
+from mimir_cultivate.worklink.factory_state import (
     FactoryRunRecord,
     factory_checkout_interlock,
     factory_issue_resource_lock,
@@ -31,13 +31,13 @@ from mimir.worklink.factory_state import (
     factory_process_is_alive,
     save_factory_record,
 )
-from mimir.worklink.claims import (
+from mimir_cultivate.worklink.claims import (
     MAX_SHUTDOWN_ABORT_FORGIVENESS,
     ChainlinkClaims,
     ClaimRecord,
     ShutdownAbortRecord,
 )
-from mimir.worklink.run_state import process_start_ticks
+from mimir_cultivate.worklink.run_state import process_start_ticks
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 

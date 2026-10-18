@@ -124,9 +124,13 @@ with contextlib.redirect_stdout(io.StringIO()):
 print("after", flush=True)
 sys.stdin.read()
 '''
+    child_env = os.environ.copy()
+    child_env.pop("MIMIR_PLUGINS", None)
+    if subcommand == "worklink":
+        child_env["MIMIR_PLUGINS"] = "cultivate"
     sibling = subprocess.Popen(
         [sys.executable, "-c", script, subcommand], stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=child_env,
     )
     try:
         assert sibling.stdout.readline().strip() == "before"
