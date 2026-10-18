@@ -4,34 +4,96 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import json
+from dataclasses import fields
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from mimir.plugins.core import core_policy_registry, core_runtime_names
+from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
+from mimir.tool_descriptors import _PAYLOAD_EXTRACTOR_UNDECLARED, _TARGET_EXTRACTOR_UNDECLARED
 from mimir.tools.registry import all_mimir_tools
+from mimir_cultivate.policy import CODING_TOOLS
+from tests.test_plugin_policy_parity import (
+    CODING_WRITES_CODE_OR_STATE, _canonical, _extractor, _extractor_results, _prepare_inputs,
+)
 
 
-def test_selected_cultivate_owns_coding_policy_and_preserves_descriptors():
-    legacy = core_policy_registry()
+def test_selected_cultivate_matches_frozen_pre_extraction_policy(monkeypatch, tmp_path):
+    oracle = json.loads((Path(__file__).parents[3] / "tests/fixtures/plugin_core_policy_baseline.json").read_text())
+    tables = oracle["tables"]
     selected = load_plugins(enable="cultivate").policy
-    names = set(core_runtime_names("coding")) | {"worklink_run", "worklink_resume"}
-    assert len(names) == 40
-    for name in names:
-        before = legacy.tools[name]
+    assert len(CODING_TOOLS) == 40
+    for name in CODING_TOOLS:
         after = selected.tools[name]
+        before = oracle["descriptors"][name]
         assert after.owner == "cultivate"
-        for field in (
-            "flow", "tier", "operation_class", "result_domain", "readable_domain",
-            "writes_code_or_state", "profiles", "read_backend", "memberships",
+        assert after.flow == tables["flow"][name]
+        assert after.tier == tables["tier"][name]
+        assert after.operation_class == tables["catalog"][name]
+        assert after.result_domain == tables["protected_domains"].get(name)
+        assert after.readable_domain == tables["readable_domains"].get(name)
+        assert after.read_backend == (name in tables["read_backend"])
+        assert after.writes_code_or_state == (name in CODING_WRITES_CODE_OR_STATE)
+        assert after.profiles == frozenset(
+            profile for profile, members in tables["profiles"].items() if name in members
+        )
+        for membership, members in (
+            ("forge_actions", tables["forge_actions"]),
+            ("repo_actions", tables["repo_actions"]),
+            ("retained_repo_tools", tables["retained_repo_tools"]),
+            ("worklink_build_tools", tables["worklink_build_tools"]),
+            ("repo_publish_tools", tables["repo_publish_tools"]),
+            ("tainted_writes", tables["tainted_writes"]),
+            ("standing_review", tables["standing_review"]),
+            ("remediation_effect", tables["remediation_effect"]),
+            ("typed_error_signal", tables["typed_error_signal"]),
+            ("write_resource_operations", tables["write_resource_operations"]),
         ):
-            assert getattr(after, field) == getattr(before, field), (name, field)
-        assert after.descriptor == before.descriptor, name
-        assert (after.typed_action.value if after.typed_action else None) == (
-            before.typed_action.value if before.typed_action else None
-        ), name
+            assert (membership in after.memberships) == (name in members), (name, membership)
+        if name in tables["forge_actions"] or name in tables["repo_actions"]:
+            assert (after.typed_action.value if after.typed_action else None) == (
+                tables["forge_actions"].get(name, tables["repo_actions"].get(name))
+            )
+        else:
+            assert after.typed_action is None
+        assert after.descriptor is not None
+        for field in fields(after.descriptor):
+            value = getattr(after.descriptor, field.name)
+            if field.name == "result_origin":
+                value = int(value)
+            elif field.name in {"sink_target_extractor", "sink_payload_extractor"}:
+                undeclared = (_TARGET_EXTRACTOR_UNDECLARED if field.name == "sink_target_extractor"
+                              else _PAYLOAD_EXTRACTOR_UNDECLARED)
+                value = _extractor(value, undeclared)
+                for function in ("_repo_pr_target", "_spawn_target", "_worklink_target"):
+                    value = value.replace(f"mimir_cultivate.policy.{function}:",
+                                          f"mimir.tool_descriptors.{function}:")
+            assert value == before[field.name], (name, field.name)
         assert after.factory().name == name
+
+    home = tmp_path / "oracle-home"
+    _prepare_inputs(home, monkeypatch)
+    with policy_scope(selected):
+        extracted = _extractor_results(home)
+    for name in CODING_TOOLS:
+        assert json.loads(_canonical(extracted[name], home)) == oracle["extractor_results"][name], name
+
+
+def test_selected_registration_uses_immutable_provider_metadata_not_core_inventory(monkeypatch):
+    from mimir.plugins import core
+    from mimir_cultivate import policy as provider_policy
+
+    def missing_core_inventory():
+        raise AssertionError("selected registration consulted the legacy core inventory")
+
+    monkeypatch.setattr(core, "core_policy_registry", missing_core_inventory)
+    selected = load_plugins(enable="cultivate").policy
+    assert {name for name, tool in selected.tools.items() if tool.owner == "cultivate"} == CODING_TOOLS
+    with pytest.raises(TypeError):
+        provider_policy._TOOL_DECLARATIONS["repo_status"] = None
 
 
 def test_disabled_provider_is_not_imported_and_no_coding_tool_is_materialized():
