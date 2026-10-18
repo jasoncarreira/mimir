@@ -194,6 +194,8 @@ def _render_plugin_prompt(provider: Any, auth: AuthContext, event: AgentEvent,
         served.append(resource)
         return text
 
+    reader.home = home  # type: ignore[attr-defined]  # Configured by the host, never by the provider.
+
     if provider.static:
         with _STATIC_PROMPT_LOCK:
             cached = _STATIC_PROMPT_BLOCKS.get(id(provider))

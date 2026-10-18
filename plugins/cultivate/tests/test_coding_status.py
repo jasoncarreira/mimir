@@ -7,26 +7,47 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import pytest
 
-from mimir.agent import _render_plugin_prompt
-from mimir.models import AgentEvent, AuthContext, TurnInteractivity
+from mimir.agent import Agent, _render_plugin_prompt
+from mimir.config import Config
+from mimir.history import MessageBuffer
+from mimir.index import IndexGenerator
+from mimir.models import (
+    AgentEvent, AuthContext, InformationFlowLabels, Integrity, IntegrityEffect,
+    TurnContext, TurnInteractivity, ServerDiscoveredPRScopeStore,
+)
+from mimir.plugins.core import policy_scope
 from mimir.plugins.registry import PolicyRegistry
 from mimir.plugins.manager import load_plugins
 from mimir.prompts import build_turn_prompt
-from mimir_cultivate.prompts import coding_status_applies, register_prompt_provider
-from mimir_cultivate.prompts import coding_review_applies
+from mimir_cultivate.policy import RepoPRActionScope
+from mimir_cultivate.prompts import coding_review_applies, coding_status_applies, register_prompt_provider
 from mimir_cultivate.worklink.factory_state import (
     FactoryRunRecord, FactoryStatus, save_factory_record,
 )
+from mimir.turn_logger import TurnLogger
 
 
-def _operator() -> AuthContext:
+def _operator(store: ServerDiscoveredPRScopeStore | None = None) -> AuthContext:
     return AuthContext(
         principal="operator", canonical_principal="operator", roles=("admin",),
         event_ingress=None, trigger="user_message", channel_id="chat",
         interactivity=TurnInteractivity.INTERACTIVE, domain="channel", resource_id="chat",
+        server_discovered_pr_scope_store=store,
+    )
+
+
+def _remediation_scope(number: int, *, event_type: str = "pr_ci_failure") -> RepoPRActionScope:
+    return RepoPRActionScope(
+        provenance="server_discovered", canonical_repo="owner/repo",
+        canonical_root="/tmp/checkout", canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot", event_type=event_type,
+        allowed_operations=frozenset({"repo.inspect"}), pr_number=number,
+        head_repo="owner/repo", head_remote="origin", destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40, base_ref="main", observed_base_sha="b" * 40,
     )
 
 
@@ -46,7 +67,7 @@ def _record(home: Path, issue: int, *, phase: str = "running", status: str = "ru
 def test_selected_provider_renders_only_server_owned_in_flight_and_remediation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "wrong-home"))
     _record(tmp_path, 1949)
     _record(tmp_path, 1950, phase="parked", status="needs-human",
             url="https://github.com/owner/repo/pull/50")
@@ -58,19 +79,26 @@ def test_selected_provider_renders_only_server_owned_in_flight_and_remediation(
             url="https://evil.example/secret")
     _record(tmp_path, 1954, phase="parked", status="needs-human",
             url="https://github.com/unrelated/repo/pull/54")
+    _record(tmp_path, 1955, phase="running", status="needs-human",
+            url="https://github.com/owner/repo/pull/55")
+    _record(tmp_path, 1956, phase="parked", status="needs-human",
+            url="https://github.com/owner/repo/pull/56")
+    store = ServerDiscoveredPRScopeStore()
+    store.remember_server_discovery(_remediation_scope(50))
+    store.remember_server_discovery(_remediation_scope(56, event_type="pr_review"))
     registry = PolicyRegistry()
     register_prompt_provider(registry.registrar("cultivate"))
     provider = registry.prompt_providers["coding_status"]
     event = AgentEvent(trigger="user_message", channel_id="chat", content="status?")
     assert provider.owner == "cultivate" and provider.section == "self_state"
-    assert coding_status_applies(_operator(), event)
-    text, served = _render_plugin_prompt(provider, _operator(), event, tmp_path)
+    assert coding_status_applies(_operator(store), event)
+    text, served = _render_plugin_prompt(provider, _operator(store), event, tmp_path)
     assert served == ()  # no agent-writable file was read through the prompt reader
     assert "Worklink build #1949" in text
     assert "https://github.com/owner/repo/pull/50" in text
     assert "#1951" not in text and "/pull/51" not in text
     assert "/pull/52" not in text and "evil.example" not in text
-    assert "/pull/54" not in text
+    assert "/pull/54" not in text and "/pull/55" not in text and "/pull/56" not in text
     prompt = build_turn_prompt(event, plugin_blocks={"self_state": (("coding_status", text),)})
     assert "## Plugin: coding_status\n\nCoding status" in prompt
 
@@ -92,15 +120,20 @@ def test_coding_status_never_reads_for_non_operator_turns(auth, event, monkeypat
     assert text == "" and resources == ()
 
 
-def test_coding_status_empty_and_unconfigured_home(tmp_path, monkeypatch):
+def test_coding_status_uses_host_home_not_environment(tmp_path, monkeypatch):
     registry = PolicyRegistry()
     register_prompt_provider(registry.registrar("cultivate"))
     provider = registry.prompt_providers["coding_status"]
     event = AgentEvent(trigger="user_message", channel_id="chat")
-    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    assert _render_plugin_prompt(provider, _operator(), event, tmp_path) == ("", ())
+    _record(tmp_path, 1949)
+    other = tmp_path / "other"
+    _record(other, 5555)
+    monkeypatch.setenv("MIMIR_HOME", str(other))
+    text, _ = _render_plugin_prompt(provider, _operator(), event, tmp_path)
+    assert "#1949" in text and "#5555" not in text
     monkeypatch.delenv("MIMIR_HOME")
-    assert _render_plugin_prompt(provider, _operator(), event, tmp_path) == ("", ())
+    assert "#1949" in _render_plugin_prompt(provider, _operator(), event, tmp_path)[0]
+    assert _render_plugin_prompt(provider, _operator(), event, tmp_path / "absent") == ("", ())
 
 
 def test_coding_status_is_registered_only_for_selected_provider():
@@ -134,3 +167,46 @@ def test_selected_review_guidance_is_only_for_authenticated_service_poller(tmp_p
     assert "approve_declassification" in text and "`pr_spec`" in text
     assert served == ()
     assert not coding_review_applies(_operator(), event)
+
+
+@pytest.mark.asyncio
+async def test_selected_agent_assembly_labels_status_and_excludes_non_operator(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    config = Config.from_env()
+    (config.home / "logs").mkdir(exist_ok=True)
+    agent = Agent(
+        config=config, turn_logger=TurnLogger(config.turns_log),
+        message_buffer=MessageBuffer(history_path=config.home / "messages.jsonl"),
+        index_generator=IndexGenerator(config.home),
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "wrong-home"))
+    _record(config.home, 1949)
+    policy = load_plugins(enable="cultivate").policy
+    event = AgentEvent(trigger="user_message", channel_id="chat", author="operator", content="status?")
+
+    def turn(auth: AuthContext) -> TurnContext:
+        return TurnContext(
+            turn_id="coding-status-turn", session_id="chat", trigger="user_message",
+            channel_id="chat", started_at=time.monotonic(), auth_context=auth,
+            ifc_labels=InformationFlowLabels(),
+        )
+
+    with policy_scope(policy):
+        operator = turn(_operator())
+        prompt, _ = await agent._build_turn_prompt(operator, event, None)
+        ordinary = turn(replace(_operator(), roles=("user",)))
+        ordinary_prompt, _ = await agent._build_turn_prompt(ordinary, event, None)
+
+    assert "## Plugin: coding_status\n\nCoding status" in prompt
+    assert "Worklink build #1949" in prompt
+    sources = [source for source in operator.ifc_labels.sources if source.domain == "coding_status"]
+    assert len(sources) == 1
+    source = sources[0]
+    assert source.resource_id == "plugin:cultivate:coding_status"
+    assert source.principal == "operator"
+    assert source.authorized_principals == frozenset({"operator"})
+    assert source.sensitivity == "private" and source.source_kind == "agent_self"
+    assert source.integrity == Integrity.TRUSTED
+    assert source.integrity_effect == IntegrityEffect.INFORMATIONAL
+    assert "Plugin: coding_status" not in ordinary_prompt
+    assert all(source.domain != "coding_status" for source in ordinary.ifc_labels.sources)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 
@@ -10,6 +9,7 @@ from mimir.models import AuthContext, TurnInteractivity
 from mimir.prompt_safety import sanitize_prompt_field
 
 from .worklink.factory_state import list_factory_records
+from .policy import RepoPRActionScope, RepoPRScopeProvenance
 
 
 _PR_URL = re.compile(
@@ -33,20 +33,21 @@ def render_coding_status(auth: AuthContext, event: object, reader: object) -> st
     """Read only owner-checked durable controller records, never an open-PR list."""
     if not coding_status_applies(auth, event):
         return ""
-    home = os.environ.get("MIMIR_HOME", "").strip()
-    if not home or not Path(home).is_absolute():
+    home = getattr(reader, "home", None)
+    if not isinstance(home, Path) or not home.is_absolute():
         return ""
-    listing = list_factory_records(Path(home))
+    listing = list_factory_records(home)
     lines: list[str] = []
     for record in listing.records:
         status = record.status
         if status is None or not status.valid:
             continue
-        if record.controller_phase == "running" and status.status not in status.TERMINAL_STATUSES:
+        if record.controller_phase == "running" and status.status == "running":
             lines.append(f"- Worklink build #{record.issue_id} (attempt {record.attempt}): in flight")
         elif (record.controller_phase == "parked" and status.status == "needs-human"
               and status.pr_url and (match := _PR_URL.fullmatch(status.pr_url))
-              and match.group("repo") == record.repository):
+              and match.group("repo") == record.repository
+              and _remediation_scope_matches(auth, record.repository, int(status.pr_url.rsplit("/", 1)[-1]))):
             lines.append(
                 f"- PR under remediation for Worklink #{record.issue_id}: "
                 f"{sanitize_prompt_field(status.pr_url)}"
@@ -54,6 +55,19 @@ def render_coding_status(auth: AuthContext, event: object, reader: object) -> st
     if not lines:
         return ""
     return "Coding status\n" + "\n".join(lines[:20])
+
+
+def _remediation_scope_matches(auth: AuthContext, repository: str, number: int) -> bool:
+    store = auth.server_discovered_pr_scope_store
+    scope = store.resolve(repository, number) if store is not None else None
+    return (
+        isinstance(scope, RepoPRActionScope)
+        and scope.owner == "cultivate"
+        and scope.provenance == RepoPRScopeProvenance.SERVER_DISCOVERED
+        and scope.event_type in {"pr_changes_requested_stale", "pr_ci_failure"}
+        and scope.canonical_repo.lower() == repository.lower()
+        and scope.pr_number == number
+    )
 
 
 def register_prompt_provider(registrar: object) -> None:
