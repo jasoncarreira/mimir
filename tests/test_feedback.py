@@ -6,6 +6,7 @@ classifies records by polarity, renders a prompt block."""
 from __future__ import annotations
 
 import ast
+from importlib import metadata
 import inspect
 import json
 import subprocess
@@ -68,6 +69,10 @@ def cultivate_feedback_policy():
     from mimir.plugins.core import policy_scope
     from mimir.plugins.manager import load_plugins
 
+    try:
+        metadata.distribution("mimir-cultivate")
+    except metadata.PackageNotFoundError:
+        pytest.skip("Cultivate is not installed in the core-only test environment")
     with policy_scope(load_plugins(enable="cultivate").policy):
         yield
 

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mimir.feedback import FeedbackLog, classify
 from mimir.feedback.renderers import _render_event_line
-from mimir.models import AuthContext, Integrity
+from mimir.access_control import SinkGate
+from mimir.models import AuthContext, InformationFlowState, Integrity
 from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
 
@@ -87,3 +89,33 @@ def test_spawn_self_feedback_preserves_trusted_informational_label(tmp_path: Pat
         assert {source.integrity_effect for source in block.labels.sources} == {"informational"}
     with policy_scope(load_plugins(enable="").policy):
         assert log.recent_prompt_block(auth) is None
+
+
+def test_spawn_chain_keeps_every_owner_scoped_source_for_sink_check(tmp_path: Path) -> None:
+    log = _log(tmp_path, [
+        _event("claude_code_spawn_completed", 20, channel_id="shared",
+               owner_principal="bob", bridge="source-one", job_id="ok"),
+        _event("claude_code_spawn_work_failed", 10, channel_id="shared",
+               owner_principal="bob", bridge="source-two", job_id="failed", terminal_reason="max_turns"),
+    ])
+    auth = AuthContext(
+        principal="bob", canonical_principal="bob", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="shared",
+        interactivity=None, enforcement_enabled=True, bridge_instance="test",
+    )
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        block = log.recent_prompt_block(auth)
+        assert block is not None
+        assert "spawn:" in block.content
+        assert "completed" in block.content and "work-failed" in block.content
+        assert len(block.labels.sources) == 2
+        assert {source.principal for source in block.labels.sources} == {"bob"}
+        assert {source.resource_id for source in block.labels.sources} == {"shared"}
+        assert {source.bridge_instance for source in block.labels.sources} == {"source-one", "source-two"}
+        assert {source.integrity for source in block.labels.sources} == {Integrity.UNTRUSTED}
+        sink_auth = replace(auth, ifc_state=InformationFlowState(labels=block.labels))
+        decision = SinkGate.check_sink_flow(
+            "send_message", "other-channel", block.labels, sink_auth, enforce=True,
+        )
+        assert not decision.allowed
+        assert decision.reason.startswith("ifc_label_blocked:")

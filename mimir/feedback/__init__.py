@@ -966,6 +966,14 @@ class FeedbackLog:
         )
         negatives, positives = selected_log.recent(auth_context=None)
         rendered_kinds = {signal.kind for signal in (*negatives, *positives)}
+        for signal in (*negatives, *positives):
+            if not signal.kind.endswith("_chain"):
+                continue
+            group = valence_groups.get(signal.kind.removesuffix("_chain"))
+            if group is not None:
+                # The chain summarizes every run of this group, including
+                # records whose individual signals were consumed by the chain.
+                rendered_kinds.update(group.positive_kinds | group.negative_kinds)
         for kind, kind_sources in sources_by_kind.items():
             if kind not in rendered_kinds:
                 continue
