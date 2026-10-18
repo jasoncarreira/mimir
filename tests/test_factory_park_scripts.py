@@ -20,6 +20,11 @@ from unittest import mock
 
 import pytest
 
+if importlib.util.find_spec("mimir_cultivate") is None:
+    if {"cultivate", "all"}.intersection(os.environ.get("MIMIR_PLUGINS", "").split(",")):
+        pytest.fail("selected Cultivate distribution is not installed")
+    pytest.skip("factory park scripts require installed Cultivate", allow_module_level=True)
+
 from mimir_cultivate.worklink import orchestrator
 from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
 from mimir_cultivate.worklink.compute import LaunchHandle

@@ -4,6 +4,7 @@ import argparse
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import errno
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -39,9 +40,48 @@ from mimir.worklink.run_state import (
 )
 
 
+_PROVIDER_CLI_CASES = frozenset({
+    "test_worklink_run_cli_dispatches_operator_vertical",
+    "test_worklink_run_cli_requires_explicit_base_instead_of_using_cwd",
+    "test_worklink_emit_work_item_has_wire_clean_stdout",
+    "test_worklink_emit_work_item_failure_has_no_stdout",
+    "test_worklink_run_cli_forwards_base_flag",
+    "test_worklink_run_cli_forwards_autonomous_flag",
+    "test_worklink_run_cli_autonomous_refused_exits_1",
+    "test_worklink_run_epic_cli_routes_manual_and_autonomous_modes",
+    "test_worklink_run_epic_cli_rejects_base_flag",
+    "test_worklink_run_epic_cli_forwards_complete_recovery_identity",
+    "test_worklink_run_epic_cli_rejects_partial_recovery_identity",
+    "test_worklink_cli_has_no_factory_cancel_transition",
+    "test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records",
+    "test_worklink_cli_rejects_unknown_subcommand",
+    "test_worklink_run_failed_without_attempt_prints_reason",
+    "test_leaf_cli_interruption_records_once_with_retained_pointers_and_reraises",
+    "test_factory_cli_interruption_records_once_with_all_retained_pointers",
+    "test_cli_owned_inner_interruption_does_not_fallback_record",
+    "test_factory_stop_finds_production_record_and_cancels_verified_handle",
+    "test_stop_cli_no_live_run_is_successful_noop",
+    "test_stop_cli_reports_rejected_factory_identity",
+    "test_stop_cli_refuses_unverified_live_leaf",
+})
+
+
 @pytest.fixture(autouse=True)
-def _select_cultivate(monkeypatch: pytest.MonkeyPatch) -> None:
+def _select_cultivate_for_cli(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    if request.node.name.split("[", 1)[0] not in _PROVIDER_CLI_CASES:
+        return
+    if importlib.util.find_spec("mimir_cultivate") is None:
+        if {"cultivate", "all"}.intersection(os.environ.get("MIMIR_PLUGINS", "").split(",")):
+            pytest.fail("selected Cultivate distribution is not installed")
+        pytest.skip("Cultivate CLI requires the installed provider")
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+
+
+def test_core_cli_does_not_register_worklink(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "--help"])
+    assert exc.value.code == 2
 
 
 def test_worklink_run_cli_dispatches_operator_vertical(
