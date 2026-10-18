@@ -75,6 +75,9 @@ class CultivateProvider:
         registrar.register_server_hook("reconcile_startup", server.reconcile_startup)
         registrar.register_server_hook("validate_config", server.validate_worklink)
         registrar.register_server_hook("shutdown_claims", server.release_claims)
+        from .scheduler import worklink_poller_hooks
+
+        registrar.register_poller_hook("worklink", worklink_poller_hooks)
 
 
 provider = CultivateProvider()

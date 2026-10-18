@@ -1047,6 +1047,15 @@ def _controlled_server_app(
             control.hit("scheduler:bind_plugin_jobs")
             return control.plugin_jobs_installed
 
+        def register_callable(
+            self, name: str, fn: Any, default_cron: str, *, job_id: str | None = None,
+            **kwargs: Any,
+        ) -> bool:
+            assert callable(fn)
+            assert name and job_id
+            assert isinstance(default_cron, str)
+            return bool(default_cron)
+
         def start(self) -> None:
             self._started = True
             self._scheduler.running = True

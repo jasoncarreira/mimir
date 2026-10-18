@@ -171,6 +171,15 @@ def resolve_poller_hooks(
         return None
     if not isinstance(raw, str):
         raise ValueError(f"unknown poller hooks profile: {raw!r}")
+    if raw == "worklink" and plugin_owner is not None:
+        registered = policy.poller_hooks.get(raw) if policy is not None else None
+        if (plugin_owner != "cultivate" or manifest_path.parent.name != "chainlink-orchestrator"
+                or registered is None or registered[0] != plugin_owner):
+            raise ValueError(f"reserved or foreign poller hooks profile: {raw!r}")
+        hooks = registered[1]()
+        if not isinstance(hooks, PollerHooks):
+            raise ValueError(f"invalid poller hooks profile: {raw!r}")
+        return hooks
     if raw not in _CORE_HOOK_PROFILES:
         registered = policy.poller_hooks.get(raw) if policy is not None else None
         if registered is None or plugin_owner is None or registered[0] != plugin_owner:

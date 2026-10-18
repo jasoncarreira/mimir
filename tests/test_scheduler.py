@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import os
 import shutil
+import subprocess
+import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
@@ -39,6 +42,43 @@ from mimir.scheduler import (
     load_jobs_from_text,
     write_jobs,
 )
+
+
+def test_core_only_startup_has_no_worklink_jobs_or_provider_import() -> None:
+    env = os.environ.copy()
+    env.pop("MIMIR_PLUGINS", None)
+    check = subprocess.run(
+        [sys.executable, "-c", """
+import asyncio
+import os
+import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from mimir.plugins.manager import load_plugins
+from mimir.scheduler import Scheduler
+
+assert 'MIMIR_PLUGINS' not in os.environ
+manager = load_plugins(enable=os.environ.get('MIMIR_PLUGINS', ''))
+assert not manager.plugins
+assert not any(phase == 'configure_jobs' for _, phase in manager.policy.server_hooks)
+with TemporaryDirectory() as directory:
+    async def enqueue(_event):
+        return True
+
+    scheduler = Scheduler(Path(directory) / 'scheduler.yaml', enqueue, policy=manager.policy)
+    scheduler.bind_plugin_jobs(manager.policy.scheduler_jobs.values())
+    scheduler.reload()
+    assert not any(name.startswith('worklink-') or name == 'pr-checkout-lease-reaper'
+                   for name in scheduler.registered_callables())
+    assert not any(job.id.startswith('worklink-') or job.id == 'pr-checkout-lease-reaper'
+                   for job in scheduler._scheduler.get_jobs())
+assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.')
+               for name in sys.modules)
+"""],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert check.returncode == 0, check.stderr
 
 
 @pytest.fixture(autouse=True)
@@ -4853,11 +4893,12 @@ def _read_event_types(path: Path) -> list[dict]:
 
 
 def test_worklink_reaper_empty_cron_does_not_install_job(tmp_path: Path):
+    add_reaper_job = pytest.importorskip("mimir_cultivate.scheduler").add_reaper_job
     async def noop(_e):
         return True
 
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
-    assert sched.add_worklink_reaper_job(tmp_path, cron_expr="") is False
+    assert add_reaper_job(sched, tmp_path, cron_expr="") is False
     assert sched._scheduler.get_job("worklink-reaper") is None
     assert "worklink-reaper" in sched.registered_callables()
 
@@ -4866,6 +4907,9 @@ def test_worklink_reaper_empty_cron_does_not_install_job(tmp_path: Path):
 async def test_pr_checkout_lease_reaper_uses_live_turn_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
+    add_pr_checkout_lease_reaper_job = pytest.importorskip(
+        "mimir_cultivate.scheduler",
+    ).add_pr_checkout_lease_reaper_job
     async def noop(_e):
         return True
 
@@ -4879,14 +4923,14 @@ async def test_pr_checkout_lease_reaper_uses_live_turn_paths(
         return []
 
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease.reclaim_expired_pr_checkout_leases", fake_reclaim,
+        "mimir_cultivate.repository.reclaim_expired_pr_checkout_leases", fake_reclaim,
     )
     monkeypatch.setattr(
-        "mimir.scheduler.active_pr_checkout_lease_paths", lambda: active,
+        "mimir_cultivate.scheduler.active_pr_checkout_lease_paths", lambda: active,
     )
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
 
-    assert sched.add_pr_checkout_lease_reaper_job(lease_root) is True
+    assert add_pr_checkout_lease_reaper_job(sched, lease_root) is True
     job = sched._scheduler.get_job("pr-checkout-lease-reaper")
     assert job is not None
 
@@ -4899,6 +4943,7 @@ async def test_pr_checkout_lease_reaper_uses_live_turn_paths(
 async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
+    add_reaper_job = pytest.importorskip("mimir_cultivate.scheduler").add_reaper_job
     async def noop(_e):
         return True
 
@@ -4906,7 +4951,7 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
         def __init__(self, issue_id: int) -> None:
             self.issue_id = issue_id
 
-    from mimir.worklink.claims import ReapResult
+    from mimir_cultivate.worklink.claims import ReapResult
 
     calls: list[tuple[str, Path]] = []
 
@@ -4932,20 +4977,20 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
         calls.append(("close", home))
         return [Rec(844)]
 
-    monkeypatch.setattr("mimir.worklink.autonomy.reap_stale_claims_for_home", fake_reap)
+    monkeypatch.setattr("mimir_cultivate.worklink.autonomy.reap_stale_claims_for_home", fake_reap)
     monkeypatch.setattr(
-        "mimir.worklink.autonomy.report_foreign_owned_git_objects_for_home",
+        "mimir_cultivate.worklink.autonomy.report_foreign_owned_git_objects_for_home",
         fake_ownership_check,
     )
-    monkeypatch.setattr("mimir.worklink.autonomy.prune_stale_attempt_checkouts_for_home", fake_prune)
-    monkeypatch.setattr("mimir.worklink.autonomy.close_merged_chainlinks_for_home", fake_close)
+    monkeypatch.setattr("mimir_cultivate.worklink.autonomy.prune_stale_attempt_checkouts_for_home", fake_prune)
+    monkeypatch.setattr("mimir_cultivate.worklink.autonomy.close_merged_chainlinks_for_home", fake_close)
     monkeypatch.setattr(
-        "mimir.worklink.identities.get_identities",
+        "mimir_cultivate.worklink.identities.get_identities",
         lambda: SimpleNamespace(mimir_uid=1234),
     )
     monkeypatch.setenv("WORKLINK_REPO", str(tmp_path / "repo"))
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
-    assert sched.add_worklink_reaper_job(tmp_path, cron_expr="* * * * *") is True
+    assert add_reaper_job(sched, tmp_path, cron_expr="* * * * *") is True
     job = sched._scheduler.get_job("worklink-reaper")
     assert job is not None
 
@@ -4976,27 +5021,28 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
 async def test_worklink_reaper_job_logs_completed_sweep_when_nothing_reaped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
+    add_reaper_job = pytest.importorskip("mimir_cultivate.scheduler").add_reaper_job
     async def noop(_e):
         return True
 
-    from mimir.worklink.claims import ReapResult
+    from mimir_cultivate.worklink.claims import ReapResult
 
     monkeypatch.setattr(
-        "mimir.worklink.autonomy.reap_stale_claims_for_home",
+        "mimir_cultivate.worklink.autonomy.reap_stale_claims_for_home",
         lambda home: ReapResult(reaped=[], examined=0, skipped={}, skipped_issue_ids={}),
     )
     monkeypatch.setattr(
-        "mimir.worklink.autonomy.report_foreign_owned_git_objects_for_home",
+        "mimir_cultivate.worklink.autonomy.report_foreign_owned_git_objects_for_home",
         lambda home, *, expected_uid: [],
     )
-    monkeypatch.setattr("mimir.worklink.autonomy.prune_stale_attempt_checkouts_for_home", lambda home: [])
-    monkeypatch.setattr("mimir.worklink.autonomy.close_merged_chainlinks_for_home", lambda home: [])
+    monkeypatch.setattr("mimir_cultivate.worklink.autonomy.prune_stale_attempt_checkouts_for_home", lambda home: [])
+    monkeypatch.setattr("mimir_cultivate.worklink.autonomy.close_merged_chainlinks_for_home", lambda home: [])
     monkeypatch.setattr(
-        "mimir.worklink.identities.get_identities",
+        "mimir_cultivate.worklink.identities.get_identities",
         lambda: SimpleNamespace(mimir_uid=1234),
     )
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
-    assert sched.add_worklink_reaper_job(tmp_path, cron_expr="* * * * *") is True
+    assert add_reaper_job(sched, tmp_path, cron_expr="* * * * *") is True
     job = sched._scheduler.get_job("worklink-reaper")
     assert job is not None
 

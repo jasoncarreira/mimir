@@ -9,7 +9,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from tests.timing import HANG_GUARD_SECONDS
@@ -40,22 +40,31 @@ def test_jobs_complete_with_saturated_default_pool(tmp_path, monkeypatch, operat
     monkeypatch.setattr(pollers, "_github_api_attestation", lambda *a: (200, {"state": "open"}))
     sched.add_scratch_janitor_job(tmp_path)
     if operation == "worklink":
-        from mimir.worklink import autonomy as scheduler_autonomy
+        from mimir.plugins.manager import load_plugins
+        from mimir.worklink import autonomy as core_autonomy
         from mimir_cultivate.worklink import autonomy as provider_autonomy
 
         called: list[str] = []
 
-        def reap(*_args):
-            called.append("scheduler-core")
+        def provider_reap(*_args):
+            called.append("provider")
             return SimpleNamespace(reaped=[], examined=0, skipped=0, skipped_issue_ids=[])
 
-        monkeypatch.setattr(scheduler_autonomy, "reap_stale_claims_for_home", reap)
-        monkeypatch.setattr(scheduler_autonomy, "prune_stale_attempt_checkouts_for_home", lambda *a: [])
-        monkeypatch.setattr(scheduler_autonomy, "close_merged_chainlinks_for_home", lambda *a: [])
-        monkeypatch.setattr(provider_autonomy, "reap_stale_claims_for_home", lambda *a: called.append("provider"))
-        sched.add_worklink_reaper_job(tmp_path, "* * * * *")
+        core_reap = Mock(side_effect=AssertionError("core Worklink reaper invoked"))
+        monkeypatch.setattr(core_autonomy, "reap_stale_claims_for_home", core_reap)
+        monkeypatch.setattr(provider_autonomy, "reap_stale_claims_for_home", provider_reap)
+        monkeypatch.setattr(provider_autonomy, "prune_stale_attempt_checkouts_for_home", lambda *a: [])
+        monkeypatch.setattr(provider_autonomy, "close_merged_chainlinks_for_home", lambda *a: [])
+        monkeypatch.setenv("MIMIR_WORKLINK_REAPER_CRON", "* * * * *")
+        monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
+        hook = load_plugins(enable="cultivate").policy.server_hooks["cultivate", "configure_jobs"]
 
     async def exercise():
+        if operation == "worklink":
+            async def unexpected_event(*args, **kwargs):
+                pytest.fail(f"unexpected scheduler error: {args}, {kwargs}")
+
+            await hook(sched, tmp_path, "operator", object(), unexpected_event)
         loop = asyncio.get_running_loop()
         # This loop and its executor belong solely to this test.
         loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
@@ -75,7 +84,8 @@ def test_jobs_complete_with_saturated_default_pool(tmp_path, monkeypatch, operat
                 assert observed == ["caller-context"]
             elif operation == "worklink":
                 await asyncio.wait_for(sched._callables["worklink-reaper"].fn(), HANG_GUARD_SECONDS)
-                assert called == ["scheduler-core"]
+                assert called == ["provider"]
+                core_reap.assert_not_called()
             elif operation == "attestation":
                 check = pollers._github_recovery_relevance_check("token")
                 event = AgentEvent(trigger="poller", channel_id="test", content="PR", extra={
