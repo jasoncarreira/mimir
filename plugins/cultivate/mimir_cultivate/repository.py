@@ -5,6 +5,8 @@ from __future__ import annotations
 
 # Repository inventory
 import re
+import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -86,6 +88,71 @@ _GITHUB_ORIGIN = re.compile(
     r"(?:https?://github\.com/|ssh://git@github\.com/|git@github\.com:)"
     r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?"
 )
+
+
+def repo_binding_startup_alerts() -> tuple[dict[str, object], ...]:
+    """Report configured GitHub repositories without a unique writable checkout."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    inventory = RepositoryInventory.load(Path(home) / "repositories.yaml") if home else RepositoryInventory()
+    if inventory.declared:
+        repos = {repo.slug for repo in inventory.repositories}
+        configured_roots = tuple(str(repo.root) for repo in inventory.repositories)
+    else:
+        repos = {
+            item.lower() for part in os.environ.get("GITHUB_REPOS", "").split(",")
+            if (item := part.strip()) and valid_repository_slug(item)
+            and all(segment not in {".", ".."} for segment in item.split("/"))
+        }
+        from mimir.config import _parse_file_tool_roots
+
+        configured_roots = tuple(
+            path for path, mode in _parse_file_tool_roots(
+                os.environ.get("MIMIR_FILE_TOOL_ROOTS", ""), Path(home), always_rw=(),
+            ) if mode == "rw"
+        ) if home else ()
+    alerts: list[dict[str, object]] = []
+    for repo in sorted(repos):
+        matches = 0
+        if inventory.declared:
+            matches = int(inventory.repository(repo) is not None)
+        else:
+            from mimir.access_control import (
+                _MAINTENANCE_GIT_BASE_OVERRIDES, _maintenance_git_probe_env,
+                _maintenance_resolved_pin,
+            )
+
+            git = _maintenance_resolved_pin("git")
+            for configured in map(Path, configured_roots):
+                if git is None:
+                    break
+                try:
+                    root = configured.resolve(strict=True)
+                    result = subprocess.run(
+                        [str(git), "-C", str(root), *_MAINTENANCE_GIT_BASE_OVERRIDES,
+                         "config", "--local", "--get", "remote.origin.url"],
+                        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                        timeout=5, check=False, env=_maintenance_git_probe_env(),
+                    )
+                except (OSError, RuntimeError, subprocess.SubprocessError):
+                    continue
+                remote = _GITHUB_ORIGIN.fullmatch(result.stdout.strip())
+                if result.returncode == 0 and remote is not None and (
+                    f"{remote.group('owner')}/{remote.group('repo')}".lower() == repo
+                ):
+                    matches += 1
+        if matches == 1:
+            continue
+        mode = "zero roots matched" if matches == 0 else f"ambiguous: {matches} roots matched"
+        alerts.append({
+            "repository": repo, "probed_roots": list(configured_roots),
+            "match_count": matches, "operator_visible": True,
+            "error": (
+                f"pull-request operation rejected: no unique writable root matched repository "
+                f"'{repo}' in MIMIR_FILE_TOOL_ROOTS ({mode}); configure exactly one :rw "
+                "entry for the checkout directory itself, not its parent"
+            ),
+        })
+    return tuple(alerts)
 
 
 def valid_repository_slug(value: object) -> bool:
@@ -4691,7 +4758,7 @@ class RepoProjectTests:
 
 # Model-facing repository tools
 import logging
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict
 import os
 import re
@@ -4959,9 +5026,15 @@ def _execute(
             if not home_value:
                 raise ToolPolicyRefusal("repository operation rejected: MIMIR_HOME is unavailable")
             from .worklink.retained_scope import retained_factory_effect_lease
+            from mimir.access_control import retained_invocation_lease_active
 
-            with retained_factory_effect_lease(Path(home_value), retained) as lease:
-                if lease.scope is None:
+            host_held = retained_invocation_lease_active(
+                retained, getattr(runtime, "context", None),
+            )
+            lease_context = (nullcontext(retained) if host_held else
+                             retained_factory_effect_lease(Path(home_value), retained))
+            with lease_context as lease:
+                if not host_held and lease.scope is None:
                     raise ToolPolicyRefusal(
                         f"repository operation rejected: {lease.refusal_reason}"
                     )
@@ -5160,9 +5233,15 @@ async def _repo_test_unlocked(
             if not home_value:
                 raise ToolPolicyRefusal("project test rejected: MIMIR_HOME is unavailable")
             from .worklink.retained_scope import retained_factory_effect_lease
+            from mimir.access_control import retained_invocation_lease_active
 
-            with retained_factory_effect_lease(Path(home_value), retained) as lease:
-                if lease.scope is None:
+            host_held = retained_invocation_lease_active(
+                retained, getattr(runtime, "context", None),
+            )
+            lease_context = (nullcontext(retained) if host_held else
+                             retained_factory_effect_lease(Path(home_value), retained))
+            with lease_context as lease:
+                if not host_held and lease.scope is None:
                     raise ToolPolicyRefusal(f"project test rejected: {lease.refusal_reason}")
                 result = asdict(
                     await RepoProjectTests(retained_scope=retained).execute(

@@ -104,7 +104,7 @@ class PromptBlockProvider:
 _FLOW = frozenset({"source", "sink", "both", "neither"})
 _TIERS = frozenset({"scope-contained", "scoped-with-provenance", "code-execution", "unbounded"})
 _OPERATIONS = frozenset({"open", "resource_scoped", "admin_required"})
-_SCOPES = frozenset({"channel", "repo_pr"})
+_SCOPES = frozenset({"channel", "repo_pr", "worklink", "ci_run", "ci_branch"})
 _PROMPT_SECTIONS = frozenset({
     "channel_memory", "feedback", "core_proposals", "session_summaries",
     "usage", "upcoming", "commitments", "self_state",
@@ -172,6 +172,7 @@ class PolicyRegistry:
         self._poller_hooks: dict[str, tuple[str, Callable[..., Any]]] = {}
         self._turn_hooks: dict[tuple[str, str], Callable[..., Any]] = {}
         self._server_hooks: dict[tuple[str, str], Callable[..., Any]] = {}
+        self._credential_probes: dict[str, tuple[str, str, tuple[str, ...], str, Callable[..., Any]]] = {}
         self._scheduler_jobs: dict[str, SchedulerJob] = {}
         self._cli_commands: dict[str, CliCommand] = {}
         self._routes: dict[tuple[str, str], PluginRoute] = {}
@@ -180,6 +181,7 @@ class PolicyRegistry:
         self._state_slots: dict[str, type] = {}
         self._scoped_actions: dict[str, ScopedActionProtocol] = {}
         self._retained_checkout_operation: tuple[str, Callable[..., dict[str, object]]] | None = None
+        self._retained_effect_lease: tuple[str, Callable[..., Any], Callable[..., Any]] | None = None
         self._selected_plugin_candidates: tuple[PluginCandidate, ...] = ()
         self._selection_bound = False
         self._projected_owner: str | None = None
@@ -249,6 +251,26 @@ class PolicyRegistry:
     def _writable(self) -> None:
         if self._frozen:
             raise PolicyRegistrationError("policy registry is frozen")
+
+    def _selected_first_party(self, owner: str) -> bool:
+        if not self._selection_bound or owner != "cultivate":
+            return False
+        candidates = [candidate for candidate in self._selected_plugin_candidates
+                      if candidate.name == owner]
+        if len(candidates) != 1:
+            return False
+        candidate = candidates[0]
+        entry_point = getattr(candidate, "entry_point", None)
+        distribution = getattr(entry_point, "dist", None)
+        return bool(
+            getattr(candidate, "enabled", False) and getattr(candidate, "diagnostic", None) is None
+            and getattr(candidate, "distribution", None) == "mimir-cultivate"
+            and getattr(entry_point, "group", None) == "mimir.plugins"
+            and getattr(entry_point, "name", None) == owner
+            and getattr(entry_point, "value", None) == "mimir_cultivate:provider"
+            and distribution is not None
+            and distribution.metadata.get("Name", "").lower().replace("_", "-") == "mimir-cultivate"
+        )
 
     @property
     def frozen(self) -> bool:
@@ -325,6 +347,32 @@ class PolicyRegistry:
         self._server_hooks[owner, name] = hook
 
     @property
+    def credential_probes(self) -> Mapping[str, tuple[str, str, tuple[str, ...], str, Callable[..., Any]]]:
+        return MappingProxyType(self._credential_probes)
+
+    def register_credential_probe(
+        self, name: str, cred_type: str, env_vars: tuple[str, ...],
+        description: str, probe: Callable[[], tuple[bool, str]], *, owner: str = "core",
+    ) -> None:
+        self._writable()
+        selected_owner = self._selection_bound and sum(
+            candidate.name == owner and candidate.enabled and candidate.diagnostic is None
+            for candidate in self._selected_plugin_candidates
+        ) == 1
+        private_prefix = f"MIMIR_PLUGIN_{owner.upper().replace('-', '_')}_"
+        if (not selected_owner or not re.fullmatch(r"[A-Z][A-Z0-9_]*", name)
+                or not (name.startswith(private_prefix) and name != private_prefix
+                        or self._selected_first_party(owner))
+                or name in self._credential_probes or cred_type not in {"A", "B", "C", "D"}
+                or not isinstance(env_vars, tuple) or not env_vars
+                or any(not isinstance(key, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key)
+                       for key in env_vars)
+                or not isinstance(description, str) or not description
+                or not callable(probe)):
+            raise PolicyRegistrationError(f"{owner}: invalid or duplicate credential probe: {name}")
+        self._credential_probes[name] = (owner, cred_type, env_vars, description, probe)
+
+    @property
     def scheduler_jobs(self) -> Mapping[str, SchedulerJob]:
         return MappingProxyType(self._scheduler_jobs)
 
@@ -367,6 +415,19 @@ class PolicyRegistry:
                            for candidate in self._selected_plugin_candidates)):
             raise PolicyRegistrationError(f"{owner}: invalid retained checkout operation")
         self._retained_checkout_operation = (owner, operation)
+
+    @property
+    def retained_effect_lease(self) -> tuple[str, Callable[..., Any], Callable[..., Any]] | None:
+        return self._retained_effect_lease
+
+    def register_retained_effect_lease(
+        self, lease: Callable[..., Any], runner: Callable[..., Any], *, owner: str = "core",
+    ) -> None:
+        self._writable()
+        if (not self._selected_first_party(owner) or self._retained_effect_lease is not None
+                or not callable(lease) or not callable(runner)):
+            raise PolicyRegistrationError(f"{owner}: invalid retained effect lease")
+        self._retained_effect_lease = (owner, lease, runner)
 
     def register_scoped_action(
         self, action_type: type[StrEnum], validate_scope: Callable[..., bool],
@@ -548,21 +609,28 @@ class PolicyRegistry:
             )
         if resource_scope is not None and resource_scope not in _SCOPES:
             raise PolicyRegistrationError(f"{name}: unknown resource scope {resource_scope!r}")
+        if resource_scope in {"worklink", "ci_run", "ci_branch"} and not self._selected_first_party(owner):
+            raise PolicyRegistrationError(f"{owner}: selected first-party resource scope required")
         if owner != "core" and (operation_class == "resource_scoped") != (resource_scope is not None):
-            raise PolicyRegistrationError(f"{name}: resource_scoped requires explicit channel or repo_pr scope")
+            raise PolicyRegistrationError(f"{name}: resource_scoped requires an explicit resource scope")
         if not isinstance(result_origin, ResultOriginKind) or not isinstance(sink_category, (SinkCategory, type(None))):
             raise PolicyRegistrationError(f"{name}: invalid origin or sink category")
         if not isinstance(sink_destination, (str, type(None))) or (
             owner != "core" and sink_category is not None and not sink_destination
         ):
             raise PolicyRegistrationError(f"{name}: invalid sink destination")
-        if (sink_target_extractor is _TARGET_EXTRACTOR_UNDECLARED and owner != "core") or (
+        if (sink_target_extractor is _TARGET_EXTRACTOR_UNDECLARED and owner != "core"
+                and not (sink_category is None and self._selected_first_party(owner))) or (
             sink_target_extractor is not None
             and sink_target_extractor is not _TARGET_EXTRACTOR_UNDECLARED
             and not callable(sink_target_extractor)
         ):
             raise PolicyRegistrationError(f"{name}: invalid target extractor")
-        if (sink_payload_extractor is _PAYLOAD_EXTRACTOR_UNDECLARED and owner != "core") or (
+        if (sink_payload_extractor is _PAYLOAD_EXTRACTOR_UNDECLARED and owner != "core"
+                and not (self._selected_first_party(owner) and sink_category not in {
+                    SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK, SinkCategory.NOTIFICATION,
+                    SinkCategory.EXTERNAL_MCP, SinkCategory.CROSS_CHANNEL, SinkCategory.FORGE,
+                })) or (
             sink_payload_extractor is not None
             and sink_payload_extractor is not _PAYLOAD_EXTRACTOR_UNDECLARED
             and not callable(sink_payload_extractor)
@@ -585,7 +653,10 @@ class PolicyRegistry:
         if owner != "core" and sink_category in {
             SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK, SinkCategory.NOTIFICATION,
             SinkCategory.EXTERNAL_MCP, SinkCategory.CROSS_CHANNEL, SinkCategory.FORGE,
-        } and not callable(sink_payload_extractor):
+        } and not callable(sink_payload_extractor) and not (
+            sink_category == SinkCategory.FORGE and sink_payload_extractor is None
+            and self._selected_first_party(owner)
+        ):
             raise PolicyRegistrationError(f"{owner}: tool {name}: outbound sink requires a callable payload extractor")
         if service_sink_adapter is not None and not isinstance(service_sink_adapter, str):
             raise PolicyRegistrationError(f"{owner}: tool {name}: invalid service sink adapter")
@@ -789,11 +860,21 @@ class PolicyRegistry:
             SinkCategory.SPAWN: "spawn_process",
         }
 
+        first_party_worklink = {
+            "worklink_repo": "worklink",
+        }
+
         validate_tool_descriptors(self.descriptors)
         for name, companions in self._capability_companions.items():
             if not companions <= self._capabilities.keys():
                 raise PolicyRegistrationError(f"{name}: unknown companion capability")
         for name, tool in self._tools.items():
+            if tool.resource_scope == "worklink" and "worklink_build_tools" not in tool.memberships:
+                raise PolicyRegistrationError(f"{name}: worklink scope requires host-projected build membership")
+            if tool.resource_scope in {"ci_run", "ci_branch"} and (
+                tool.result_domain != "repository" or not tool.read_backend or tool.flow != "source"
+            ):
+                raise PolicyRegistrationError(f"{name}: CI scope requires repository read metadata")
             if tool.owner != "core":
                 category = tool.descriptor.sink_category if tool.descriptor else None
                 if tool.profiles and category in {SinkCategory.EXTERNAL_MCP, SinkCategory.PROPOSAL}:
@@ -801,11 +882,16 @@ class PolicyRegistry:
                         f"{tool.owner}: tool {name}: profile sink has no executable service sink adapter"
                     )
                 expected = service_adapters.get(category)
+                destination = tool.descriptor.sink_destination if tool.descriptor else None
+                if (category == SinkCategory.SPAWN and destination == "worklink"
+                        and self._selected_first_party(tool.owner)):
+                    expected = "worklink_repo"
                 if tool.service_sink_adapter is not None and tool.service_sink_adapter != expected:
                     raise PolicyRegistrationError(f"{tool.owner}: tool {name}: invalid service sink adapter {tool.service_sink_adapter!r}")
                 if tool.profiles and expected is not None and tool.service_sink_adapter is None:
                     raise PolicyRegistrationError(f"{tool.owner}: tool {name}: profile sink requires a service sink adapter")
-                if tool.service_sink_adapter is not None and tool.descriptor.sink_destination != service_destinations[category]:
+                allowed_destination = first_party_worklink.get(expected, service_destinations.get(category))
+                if tool.service_sink_adapter is not None and destination != allowed_destination:
                     raise PolicyRegistrationError(f"{tool.owner}: tool {name}: invalid service sink destination")
             for profile in tool.profiles:
                 if profile not in self._profiles or name not in self._profiles[profile].capabilities:
@@ -884,6 +970,7 @@ class PolicyRegistry:
                         "operator_alert": "MIMIR_OPERATOR_ALERT_CHANNEL",
                         "shell_profile": self._shell_profiles.get(profile, "scheduler_read_only"),
                         "spawn_workspace": "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                        "worklink_repo": "WORKLINK_REPO/MIMIR_WORKLINK_REPO",
                     }[adapter]
                     policies.append(ServiceSinkPolicy(capability, adapter, bound))
                 tier_order = (
@@ -950,10 +1037,23 @@ class PolicyRegistrar:
     def register_server_hook(self, name: str, hook: Callable[..., Any]) -> None:
         self._registry.register_server_hook(name, hook, owner=self.plugin)
 
+    def register_credential_probe(
+        self, name: str, cred_type: str, env_vars: tuple[str, ...],
+        description: str, probe: Callable[[], tuple[bool, str]],
+    ) -> None:
+        self._registry.register_credential_probe(
+            name, cred_type, env_vars, description, probe, owner=self.plugin,
+        )
+
     def register_retained_checkout_operation(
         self, operation: Callable[..., dict[str, object]],
     ) -> None:
         self._registry.register_retained_checkout_operation(operation, owner=self.plugin)
+
+    def register_retained_effect_lease(
+        self, lease: Callable[..., Any], runner: Callable[..., Any],
+    ) -> None:
+        self._registry.register_retained_effect_lease(lease, runner, owner=self.plugin)
 
     def register_scheduler_job(self, name: str, job_id: str, callback: Callable[..., Any]) -> None:
         self._registry.register_scheduler_job(name, job_id, callback, owner=self.plugin)

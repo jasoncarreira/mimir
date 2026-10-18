@@ -8,28 +8,21 @@ import pytest
 
 from mimir.agent import _selected_turn_hooks, _turn_tool_surface_ready, _unready_tool_owners
 from mimir.models import AgentEvent
+from mimir.plugins.manager import load_plugins
 from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry
 from mimir_cultivate import forge
-from mimir_cultivate.registration import provider
 
 
 def test_selected_provider_registers_owner_bound_turn_callbacks(monkeypatch) -> None:
-    registry = PolicyRegistry()
-    registry.select_plugin_candidates((SimpleNamespace(
-        name="cultivate", enabled=True, diagnostic=None,
-    ),))
-    provider.register(registry.registrar("cultivate"))
-    registry.freeze()
+    registry = load_plugins(enable="cultivate").policy
+    assert registry.tools["worklink_run"].owner == "cultivate"
 
     assert set(registry.turn_hooks) == {
         ("cultivate", "tool_readiness"),
         ("cultivate", "failure_intervention"),
         ("cultivate", "budget_continuation"),
     }
-    selected_policy = SimpleNamespace(
-        turn_hooks=registry.turn_hooks,
-        tools={"selected_tool": SimpleNamespace(owner="cultivate")},
-    )
+    selected_policy = registry
     config = SimpleNamespace(plugin_manager=SimpleNamespace(policy=selected_policy), coding_enabled=False)
     monkeypatch.setattr(forge, "_github_identity_degraded", False)
     assert _turn_tool_surface_ready(config) is False

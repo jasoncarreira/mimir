@@ -561,6 +561,60 @@ class _ServicePrincipalToolProbeAgent(_FakeAgent):
             yield chunk
 
 
+class _RegisteredWorklinkToolProbeAgent(_FakeAgent):
+    """Run the selected Worklink tool through production turn middleware."""
+
+    def __init__(self, policy: Any, *, tainted: bool) -> None:
+        super().__init__([AIMessage(content="probed")])
+        self.policy = policy
+        self.tainted = tainted
+        self.result: ToolMessage | None = None
+        self.handler_calls = 0
+        self.observed_principal: str | None = None
+
+    async def astream(
+        self, state: dict[str, Any], *, config: dict[str, Any],
+        context=None, stream_mode: str = "values",
+    ):
+        from mimir._context import get_current_turn
+        from mimir.access_control import get_trusted_service_from_auth_context
+        from mimir.models import InformationFlowLabels, SourceLabel
+
+        turn = get_current_turn()
+        assert turn is not None
+        auth = turn.auth_context
+        service = get_trusted_service_from_auth_context(auth)
+        self.observed_principal = service.canonical if service else None
+        if self.tainted:
+            source = SourceLabel(
+                principal=auth.canonical_principal, domain="channel",
+                resource_id=auth.channel_id, bridge_instance="test",
+                sensitivity="private",
+                authorized_principals=frozenset({auth.canonical_principal}),
+                source_kind="channel", integrity="untrusted",
+                integrity_effect="active_ingest",
+            )
+            auth.ifc_state.merge(InformationFlowLabels().with_source(source))
+
+        tool = self.policy.tools["worklink_run"].factory()
+        request = ToolCallRequest(
+            tool_call={
+                "name": tool.name, "args": {"issue_id": 443},
+                "id": "tc-registered-worklink", "type": "tool_call",
+            },
+            tool=tool, state=None, runtime=Runtime(context=auth),
+        )
+
+        async def run_tool(req: ToolCallRequest) -> ToolMessage:
+            self.handler_calls += 1
+            result = await req.tool.ainvoke(req.tool_call["args"])
+            return ToolMessage(content=result, tool_call_id=req.tool_call["id"])
+
+        self.result = await BudgetGateMiddleware(self.policy).awrap_tool_call(request, run_tool)
+        async for chunk in super().astream(state, config=config, stream_mode=stream_mode):
+            yield chunk
+
+
 class _ServiceMemoryReadProbeAgent(_FakeAgent):
     """Read through live tool authorization and the filesystem backend."""
 
@@ -1636,7 +1690,6 @@ async def test_user_turn_saga_query_overlaps_prompt_loaders(
     ("trigger", "tool_name", "principal", "allowed"),
     [
         ("scheduled_tick", "shell_exec", "scheduler", True),
-        ("poller", "worklink_run", "poller", False),
         ("saga_session_end", "saga_end_session", "synthesis", True),
         ("upgrade", "submit_proposal", "system", True),
     ],
@@ -1662,18 +1715,6 @@ async def test_server_owned_triggers_reach_live_tool_middleware_with_service_aut
         "saga_session_end": "synthesis",
         "upgrade": "system",
     }[trigger]
-    if trigger == "poller":
-        from mimir.access_control import CapabilityTier, build_trigger_service_principal
-        service_authority = build_trigger_service_principal(
-            canonical=event_principal,
-            trigger="poller",
-            profile="github",
-            tier=CapabilityTier.CODE_EXECUTION,
-            capabilities=("worklink_run",),
-            creation_path="test",
-        )
-        principal = event_principal
-
     record = await agent.run_turn(
         AgentEvent(
             trigger=trigger,
@@ -1702,6 +1743,84 @@ async def test_server_owned_triggers_reach_live_tool_middleware_with_service_aut
     else:
         assert fake_agent.result.status == "error"
         assert "ifc_label_blocked:spawn" in str(fake_agent.result.content)
+
+
+@pytest.mark.parametrize("enforced", [False, True], ids=["advisory", "enforced"])
+@pytest.mark.parametrize("tainted", [False, True], ids=["clean", "tainted"])
+async def test_selected_worklink_run_turn_executes_registered_tool_under_middleware(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worklink_ready_poller,
+    enforced: bool, tainted: bool,
+) -> None:
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("the selected Cultivate Worklink tool is not installed")
+    from mimir.plugins.core import policy_scope
+    from mimir.tools import registry as tool_registry
+    from mimir_cultivate import forge
+    from mimir_cultivate.worklink import autonomy, orchestrator
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(
+        autonomy, "check_concurrency", lambda _home: autonomy.ConcurrencyCheck(True, 0, 2),
+    )
+    effects: list[int] = []
+
+    def dispatch(*, issue_id, **_kwargs):
+        effects.append(issue_id)
+        return SimpleNamespace(
+            issue_id=issue_id, status="completed", attempt=1,
+            review_ready=True, pr_url=None, evidence_path=None, reason=None,
+        )
+
+    monkeypatch.setattr(orchestrator, "run_worklink", dispatch)
+    model = _RegisteredWorklinkToolProbeAgent(None, tainted=tainted)
+    agent = _build_agent(tmp_path, fake_agent=model, fake_saga=_FakeSaga())
+    agent._config.access_control_enforced = enforced
+    model.policy = agent._config.plugin_manager.policy
+    with policy_scope(model.policy):
+        poller = worklink_ready_poller(agent._config.home / "state" / "pollers")
+        authority = poller.resolved_authority()
+    tool_registry.set_arbiter(None)
+    try:
+        record = await agent.run_turn(AgentEvent(
+            trigger="poller", channel_id=authority.canonical,
+            content="run ready issue 443", source="poller",
+            service_principal=authority.canonical, service_authority=authority,
+            extra={"poller_name": "worklink-ready-queue",
+                   "deliver": authority.canonical, "issue_id": 443},
+        ))
+    finally:
+        tool_registry.set_arbiter(None)
+
+    assert record.error is None
+    assert model.observed_principal == authority.canonical
+    assert model.result is not None
+    if tainted:
+        assert model.handler_calls == 0
+        assert effects == []
+        assert model.result.status == "error"
+        reason = ("ifc_label_blocked:spawn" if enforced
+                  else "worklink_build_blocked_by_untrusted_ingest")
+        assert reason in str(model.result.content)
+    else:
+        assert model.handler_calls == 1
+        assert effects == [443]
+        assert model.result.status != "error"
+        assert "worklink_run #443: completed" in str(model.result.content)
+
+
+def test_core_only_turn_has_no_registered_cultivate_worklink_tool():
+    from mimir.plugins.manager import load_plugins
+    from mimir.tools.registry import all_mimir_tools
+
+    policy = load_plugins(enable="").policy
+    assert not any(tool.owner == "cultivate" for tool in policy.tools.values())
+    assert policy.tools["worklink_run"].owner == "core"  # until coding-policy retirement
+    assert "repo_status" not in {
+        tool.name for tool in all_mimir_tools("openai:test", policy=policy)
+    }
 
 
 async def test_poller_turn_reads_owned_channel_memory_without_boundary_denial(

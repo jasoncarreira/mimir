@@ -328,6 +328,101 @@ async def _trusted_turn(case):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("enforced", [False, True])
+@pytest.mark.parametrize("name", [
+    "repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit",
+])
+async def test_selected_retained_tools_keep_one_live_lease_through_result_classification(
+    remediation_case, monkeypatch, name, enforced, asynchronous,
+):
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain.tools import ToolRuntime
+    from langgraph.runtime import Runtime
+    from mimir.tools import budget_gate
+    from mimir_cultivate import repository
+    from mimir_cultivate.worklink import retained_scope, worker_client
+
+    case = remediation_case
+    _event, _labels, issued = await _trusted_turn(case)
+    auth = replace(issued, enforcement_enabled=enforced)
+    scope = auth.retained_factory_scope
+    assert scope is not None
+    selected = load_plugins(enable="cultivate").policy
+
+    def owner_control(checkout, argv, *, env, timeout, output_limit):
+        assert checkout == case.sandbox
+        return subprocess.run(
+            argv, env={**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"},
+            capture_output=True, check=False,
+        )
+
+    monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
+    if name == "repo_test":
+        from mimir_cultivate.repository import ProjectTestResult
+
+        async def passing_test(self, selectors=(), *, suite=None):
+            assert self._retained_scope is scope
+            return ProjectTestResult(True, "tests_passed", 0)
+
+        monkeypatch.setattr(repository.RepoProjectTests, "execute", passing_test)
+    if name in {"repo_stage", "repo_commit"}:
+        (case.sandbox / "fix.txt").write_text("changed\n", encoding="utf-8")
+    tool = selected.tools[name].factory()
+    arguments = {"repository": scope.repository, "pull_request": scope.issue_id}
+    if name in {"repo_stage", "repo_commit"}:
+        arguments["paths"] = ("fix.txt",)
+    if name == "repo_commit":
+        arguments["message"] = "retained remediation"
+    request = ToolCallRequest(
+        tool_call={"name": name, "args": arguments, "id": "retained-call", "type": "tool_call"},
+        tool=tool, state=None, runtime=Runtime(context=auth),
+    )
+    runtime = ToolRuntime(
+        state={}, context=auth, config={}, stream_writer=lambda _: None,
+        tool_call_id="retained-call", store=None,
+    )
+    captured = []
+    original_capture = budget_gate._capture_retained_result
+
+    def capture(call, execution, observed_scope, result):
+        original_capture(call, execution, observed_scope, result)
+        captured.append(execution.retained_receipt)
+
+    monkeypatch.setattr(budget_gate, "_capture_retained_result", capture)
+    invoked = []
+
+    async def execute():
+        assert ac.retained_invocation_lease_active(scope, auth)
+        with retained_scope.retained_factory_effect_lease(case.home, scope) as competing:
+            assert competing.scope is None
+        invoked.append(name)
+        if name == "repo_test":
+            return await tool.coroutine(**arguments, runtime=runtime)
+        return tool.func(**arguments, runtime=runtime)
+
+    async def async_handler(_request):
+        return ToolMessage(content=json.dumps(await execute()), tool_call_id="retained-call")
+
+    def sync_handler(_request):
+        return ToolMessage(content=json.dumps(asyncio.run(execute())), tool_call_id="retained-call")
+
+    gate = budget_gate.BudgetGateMiddleware(selected)
+    if asynchronous:
+        output = await gate.awrap_tool_call(request, async_handler)
+    else:
+        output = await asyncio.to_thread(gate.wrap_tool_call, request, sync_handler)
+    assert output.status != "error", output.content
+    assert invoked == [name]
+    assert len(captured) == 1 and captured[0] is not None
+    receipt = captured[0]
+    assert receipt._used
+    assert len(receipt.lease_identity) == 5
+    assert receipt.execution_id != receipt.lease_identity[-1]
+    assert not ac.retained_invocation_lease_active(scope, auth)
+
+
+@pytest.mark.asyncio
 async def test_retained_remediation_reaches_effects_through_real_tool_surface(
     remediation_case, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -336,11 +431,12 @@ async def test_retained_remediation_reaches_effects_through_real_tool_surface(
 
     from mimir._deepagents_patches import install_deepagents_grep_context_tool
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-    from mimir.project_tests import ProjectTestResult
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate.repository import ProjectTestResult
+    from mimir_cultivate import repository as repo_module
     from mimir.tools.budget_gate import BudgetGateMiddleware
-    from mimir.tools.registry import worklink_resume
-    from mimir.worklink import autonomy, detached_dispatch, worker_client
+    from mimir.tools import budget_gate
+    from mimir_cultivate.registration import worklink_resume
+    from mimir_cultivate.worklink import autonomy, detached_dispatch, worker_client
     provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
 
     case = remediation_case
@@ -451,11 +547,22 @@ async def test_retained_remediation_reaches_effects_through_real_tool_surface(
         tool for tool in repo_module.REPO_TOOLS
         if tool.name in {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
     ] + [worklink_resume]
+    receipts = []
+    original_capture = budget_gate._capture_retained_result
+
+    def capture_retained(call, capture, selected_scope, result):
+        original_capture(call, capture, selected_scope, result)
+        if capture.retained_receipt is not None:
+            receipts.append((call.tool_name, selected_scope is scope,
+                             capture.retained_receipt.lease_identity,
+                             capture.retained_receipt.execution_id))
+
+    monkeypatch.setattr(budget_gate, "_capture_retained_result", capture_retained)
     graph = create_deep_agent(
         model=_ScriptedModel(messages=iter(messages)),
         tools=tools,
         backend=backend,
-        middleware=[BudgetGateMiddleware()],
+        middleware=[BudgetGateMiddleware(load_plugins(enable="cultivate").policy)],
         system_prompt="repair the retained factory checkout",
         context_schema=type(auth),
     )
@@ -478,7 +585,14 @@ async def test_retained_remediation_reaches_effects_through_real_tool_surface(
 
     tool_messages = [message for message in result["messages"] if isinstance(message, ToolMessage)]
     assert len(tool_messages) == len(calls)
-    assert all(message.status != "error" for message in tool_messages)
+    for message in tool_messages:
+        assert message.status != "error", f"{message.name}: {message.content}"
+    assert [name for name, *_ in receipts] == [
+        "repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit",
+    ]
+    assert all(bound is True and len(lease_id) == 5 for _, bound, lease_id, _ in receipts)
+    assert len({lease_id[-1] for _, _, lease_id, _ in receipts}) == 5
+    assert all(execution_id != lease_id[-1] for _, _, lease_id, execution_id in receipts)
     assert not any("ifc_label_blocked:" in str(message.content) for message in tool_messages)
     assert case.sandbox.joinpath("fix.txt").read_text(encoding="utf-8") == "after\n"
     assert case.sandbox.joinpath("new.txt").read_text(encoding="utf-8") == "new\n"
@@ -943,6 +1057,7 @@ async def test_external_read_taints_the_same_retained_turn_and_blocks_every_effe
     assert (source.integrity, source.integrity_effect) == ("untrusted", "active_ingest")
     tainted = auth.ifc_state.merge(InformationFlowLabels().with_source(source))
     registry = ac.ToolRegistry()
+    selected = load_plugins(enable="cultivate").policy
     checks = (
         ("write_file", {"file_path": str(case.sandbox / "blocked.txt")}),
         ("edit_file", {"file_path": str(case.sandbox / "fix.txt")}),
@@ -958,6 +1073,7 @@ async def test_external_read_taints_the_same_retained_turn_and_blocks_every_effe
             target_channel=arguments.get("file_path"),
             arguments=arguments,
             ifc_labels=tainted,
+            policy=selected,
         )
         assert decision.allowed is False
         if name == "worklink_resume":

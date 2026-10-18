@@ -969,7 +969,9 @@ class GitHubForgeClient:
         }:
             raise ForgeError("job is not a completed failing job")
 
-        text, error = capture_job_log(
+        from .ci import capture_job_log as capture_bounded_job_log
+
+        text, error = capture_bounded_job_log(
             repository, job_id, token=self._token, limit=LOG_EXCERPT_BYTES,
             timeout=self._timeout,
         )
@@ -1240,316 +1242,8 @@ class GitHubForgeClient:
             body={"reviewers": [reviewer]},
         )
 
-import re
-from collections import Counter
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Callable, Iterable, Literal, Mapping, TypeVar
-
-Kind = Literal[
-    "comment", "review", "review_comment", "issue", "pull_request",
-    "pr_title", "pr_body", "search_result",
-]
-Reason = Literal["non_collaborator", "bot_not_allowlisted", "attestation_unavailable"]
-
-_KINDS = frozenset(Kind.__args__)
-_REASONS = frozenset(Reason.__args__)
-_LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?", re.ASCII)
-_REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", re.ASCII)
-_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", re.ASCII)
-
-
-def sanitize_login(login: object) -> str:
-    """Keep only a complete, mention-safe GitHub login."""
-    return login if isinstance(login, str) and _LOGIN.fullmatch(login) else "<invalid-login>"
-
-
-def sanitize_url(url: object, repo: object) -> str | None:
-    """Keep only a canonical issue/PR URL under the exact expected repository."""
-    if not isinstance(url, str) or not isinstance(repo, str) or not _REPO.fullmatch(repo):
-        return None
-    pattern = rf"https://github\.com/{re.escape(repo)}/(?:issues|pull)/[0-9]+(?:\#[A-Za-z0-9_-]{{1,64}})?"
-    return url if re.fullmatch(pattern, url, re.ASCII) else None
-
-
-def sanitize_timestamp(value: object) -> str | None:
-    """Keep only the fixed UTC timestamp form (no user-controlled suffixes)."""
-    if not isinstance(value, str) or not _TIMESTAMP.fullmatch(value):
-        return None
-    try:
-        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
-    except ValueError:
-        return None
-    return value
-
-
-@dataclass(frozen=True)
-class WithheldItem:
-    kind: Kind
-    author: str
-    created_at: str | None
-    html_url: str | None
-    reason: Reason
-
-
-def placeholder(item: WithheldItem) -> dict[str, object]:
-    """Project an item onto exactly the content-free, fixed-schema fields."""
-    return {
-        "kind": item.kind if item.kind in _KINDS else "search_result",
-        "author": sanitize_login(item.author),
-        "created_at": sanitize_timestamp(item.created_at),
-        # partition validates the repository; direct callers must sanitize_url
-        # against the expected repo before constructing a WithheldItem.
-        "html_url": item.html_url if isinstance(item.html_url, str) and re.fullmatch(
-            r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pull)/[0-9]+(?:\#[A-Za-z0-9_-]{1,64})?",
-            item.html_url, re.ASCII,
-        ) else None,
-        "reason": item.reason if item.reason in _REASONS else "attestation_unavailable",
-        "withheld": True,
-    }
-
-
-def summarise(items: Iterable[WithheldItem]) -> dict[str, object]:
-    """Count withheld items without incorporating any author-controlled text."""
-    counts = Counter(placeholder(item)["kind"] for item in items)
-    return {"withheld": sum(counts.values()), "by_kind": dict(counts)}
-
-
-T = TypeVar("T", bound=Mapping[str, object])
-
-
-def partition(
-    items: Iterable[T], author_of: Callable[[T], str],
-    verdict_for: Callable[[str], bool | None],
-) -> tuple[list[T], list[WithheldItem]]:
-    """Keep only attested content; a missing attestation stays retryable.
-
-    ``verdict_for`` must use the existing caller-owned trust cache. This
-    function never caches an unavailable verdict or consults GitHub itself.
-    """
-    kept: list[T] = []
-    withheld: list[WithheldItem] = []
-    for item in items:
-        author = author_of(item)
-        verdict = verdict_for(author)
-        if verdict is True:
-            kept.append(item)
-            continue
-        reason: Reason = (
-            "attestation_unavailable" if verdict is None else
-            "bot_not_allowlisted" if isinstance(author, str) and author.endswith("[bot]") else
-            "non_collaborator"
-        )
-        kind = item.get("kind")
-        withheld.append(WithheldItem(
-            kind=kind if isinstance(kind, str) and kind in _KINDS else "search_result",
-            author=sanitize_login(author),
-            created_at=sanitize_timestamp(item.get("created_at")),
-            html_url=sanitize_url(item.get("html_url"), item.get("repository")),
-            reason=reason,
-        ))
-    return kept, withheld
-
-import codecs
-import os
-import re
-import subprocess
-import tempfile
-import unicodedata
-from collections import deque
-
-from mimir.redaction import redact_text
-
-LOG_EXCERPT_BYTES = 32 * 1024
-TRUNCATION_MARKER = b"\n[truncated]\n"
-_CHUNK_BYTES = 64 * 1024
-
-
-def _clean_chunks(output):
-    """Strip controls with constant memory, including across chunk boundaries."""
-    output.seek(0)
-    state = "text"
-    decoder = codecs.getincrementaldecoder("utf-8")("replace")
-    while True:
-        chunk = output.read(_CHUNK_BYTES)
-        clean = []
-        for char in decoder.decode(chunk, final=not chunk):
-            byte = ord(char)
-            if state == "string":
-                if byte in (7, 0x9c):
-                    state = "text"
-                elif byte == 27:
-                    state = "string_escape"
-            elif state == "string_escape":
-                if byte in (92, 7, 0x9c):
-                    state = "text"
-                elif byte != 27:
-                    state = "string"
-            elif state == "csi":
-                if 0x40 <= byte <= 0x7e:
-                    state = "text"
-                elif byte == 27:
-                    state = "escape"
-            elif state == "escape":
-                if byte == 91:
-                    state = "csi"
-                elif byte in (93, 80, 88, 94, 95):
-                    state = "string"
-                elif 0x20 <= byte <= 0x2f:
-                    state = "escape_intermediate"
-                else:
-                    state = "escape" if byte == 27 else "text"
-                    if char in "\t\n" or (byte >= 0x80 and unicodedata.category(char) not in {"Cc", "Cf"}):
-                        clean.append(char)
-            elif state == "escape_intermediate":
-                if 0x30 <= byte <= 0x7e:
-                    state = "text"
-                elif byte == 27:
-                    state = "escape"
-            elif byte == 27:
-                state = "escape"
-            elif byte == 0x9b:
-                state = "csi"
-            elif byte in (0x90, 0x98, 0x9d, 0x9e, 0x9f):
-                state = "string"
-            elif char in "\t\n" or unicodedata.category(char) not in {"Cc", "Cf"}:
-                clean.append(char)
-        yield "".join(clean).encode("utf-8")
-        if not chunk:
-            return
-
-
-def clean_log_tail(output, limit: int = LOG_EXCERPT_BYTES) -> bytes:
-    """Control-only sanitizer retained for existing metadata consumers."""
-    if limit <= 0:
-        return b""
-    tail = bytearray()
-    for chunk in _clean_chunks(output):
-        tail.extend(chunk)
-        del tail[:-limit]
-    return bytes(tail).decode("utf-8", errors="ignore").encode("utf-8")
-
-
-def _select_excerpt(output, limit: int, token: str) -> bytes:
-    # Scan bounded physical lines on disk. Never split an oversized line into
-    # apparently independent credentials: omit it rather than leak a secret tail.
-    with tempfile.TemporaryFile() as clean:
-        for chunk in _clean_chunks(output):
-            clean.write(chunk)
-        size = clean.tell()
-        clean.seek(0)
-        recent = deque(maxlen=8)
-        summary = None
-        fallback = None
-        following = 0
-        in_summary = False
-        oversized = False
-        while True:
-            start = clean.tell()
-            line = clean.readline(_CHUNK_BYTES + 1)
-            if not line:
-                break
-            if len(line) > _CHUNK_BYTES or oversized:
-                oversized = not line.endswith(b"\n")
-                recent.clear()
-                continue
-            end = clean.tell()
-            if b"short test summary info" in line:
-                summary = (start, end)
-                in_summary = True
-            elif in_summary:
-                failure = re.search(rb"\b(?:FAILED|ERROR)\b", line)
-                counts = re.search(
-                    rb"\b\d+ (?:failed|passed|errors?|skipped|deselected|xfailed|xpassed|warnings?)\b",
-                    line,
-                )
-                if counts or failure:
-                    summary = (summary[0], end)
-                else:
-                    in_summary = False
-                if counts and not failure:
-                    in_summary = False
-            if re.search(rb"\b(?:FAILED|ERROR|Error|Exception|Traceback|fatal)\b", line):
-                fallback = (recent[0] if recent else start, end)
-                following = 8
-            elif following:
-                fallback = (fallback[0], end)
-                following -= 1
-            recent.append(start)
-        start, end = summary or fallback or (0, size)
-        clean.seek(start)
-        selected = bytearray()
-        omitted = start > 0 or end < size
-        while clean.tell() < end:
-            line = clean.readline(_CHUNK_BYTES + 1)
-            if len(line) > _CHUNK_BYTES or len(selected) + len(line) > LOG_EXCERPT_BYTES:
-                omitted = True
-                break
-            selected.extend(line)
-        text = selected.decode("utf-8", errors="replace")
-        if token:
-            text = text.replace(token, "[REDACTED]")
-        data = redact_text(text).encode("utf-8")
-        if omitted or len(data) > limit:
-            budget = limit - len(TRUNCATION_MARKER)
-            data = data[:budget].decode("utf-8", errors="ignore").encode("utf-8")
-            data += TRUNCATION_MARKER
-        return data
-
-
-def capture_job_log(
-    repo: str, job_id: int, *, token: str, timeout: float,
-    limit: int = LOG_EXCERPT_BYTES,
-) -> tuple[bytes, str]:
-    """Capture with gh's authenticated redirect handling; expose no raw stderr.
-
-    Callers must authorize and bind the repository/job before calling. Raw output
-    is transiently spooled, never saved as evidence or included in an event.
-    """
-    if timeout <= 0:
-        return b"", "HTTP status unavailable (poller time budget exhausted)"
-    if (
-        not isinstance(repo, str)
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+", repo) is None
-        or repo.split("/")[-1] in {".", ".."}
-        or type(job_id) is not int or job_id <= 0
-    ):
-        return b"", "HTTP status unavailable (invalid repository or job ID)"
-    if type(limit) is not int or limit < len(TRUNCATION_MARKER):
-        return b"", "HTTP status unavailable (invalid excerpt limit)"
-    limit = min(limit, LOG_EXCERPT_BYTES)
-    env = os.environ.copy()
-    if token:
-        env["GH_TOKEN"] = token
-    try:
-        with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as diagnostic:
-            result = subprocess.run(
-                ["gh", "api", "--allow-escape-sequences", f"repos/{repo}/actions/jobs/{job_id}/logs"],
-                stdout=output, stderr=diagnostic, timeout=timeout, env=env,
-            )
-            if result.returncode:
-                diagnostic.seek(0)
-                stderr = diagnostic.read(_CHUNK_BYTES)
-                if b"escape sequences" in stderr or b"--allow-escape-sequences" in stderr:
-                    return b"", "HTTP status unavailable (gh escape-sequence refusal)"
-                status = re.search(rb"HTTP\s+(\d{3})", stderr)
-                if (
-                    status and status[1] == b"401"
-                    or b"gh auth login" in stderr.lower()
-                    or b"gh_token" in stderr.lower()
-                ):
-                    label = f"HTTP {status[1].decode()}" if status else "HTTP status unavailable"
-                    return b"", f"{label} (unauthenticated gh)"
-                return b"", (
-                    f"HTTP {status[1].decode()}" if status
-                    else "HTTP status unavailable (gh failed)"
-                )
-            excerpt = _select_excerpt(output, limit, token)
-        return (excerpt, "") if excerpt else (b"", "HTTP status unavailable (empty log response)")
-    except subprocess.TimeoutExpired:
-        return b"", "HTTP status unavailable (log fetch timed out)"
-    except OSError:
-        return b"", "HTTP status unavailable (log fetch or state write failed)"
+from .github_trust import WithheldItem, placeholder, sanitize_login, sanitize_url
+from .ci import LOG_EXCERPT_BYTES, capture_job_log, clean_log_tail
 
 import asyncio
 import hashlib
@@ -2416,7 +2110,9 @@ def _withhold_thread(runtime: ToolRuntime[AuthContext], scope: RepoPRActionScope
         "review" if tool == "pr_reviews" else
         "review_comment" if item.path is not None else "comment"
     ), repository=scope.canonical_repo) for item in items]
-    kept, withheld = partition(
+    from . import github_trust
+
+    kept, withheld = github_trust.partition(
         projected, lambda item: item["author"],
         lambda author: _author_verdict(context, scope, author, client),
     )
@@ -2426,9 +2122,9 @@ def _withhold_thread(runtime: ToolRuntime[AuthContext], scope: RepoPRActionScope
     result = [{key: value for key, value in item.items() if key not in {"kind", "repository"}}
               for item in kept]
     if len(withheld) > 20:
-        result.append(summarise(withheld))
+        result.append(github_trust.summarise(withheld))
     else:
-        result.extend(placeholder(item) for item in withheld)
+        result.extend(github_trust.placeholder(item) for item in withheld)
     return result
 
 

@@ -87,6 +87,18 @@ def _generic_target(
 def _repo_pr_target(
     tool_name: str, arguments: Mapping[str, Any], auth_context: Any | None,
 ) -> tuple[str | None, ...]:
+    from .plugins.core import selected_policy_registry
+    from .models import RetainedFactoryScope
+
+    registered = selected_policy_registry().tools.get(tool_name)
+    retained = getattr(auth_context, "retained_factory_scope", None)
+    if (registered is not None and registered.owner != "core"
+            and "retained_repo_tools" in registered.memberships
+            and isinstance(retained, RetainedFactoryScope)
+            and getattr(auth_context, "is_service", False)
+            and arguments.get("repository") == retained.repository
+            and arguments.get("pull_request") == retained.issue_id):
+        return (f"{retained.repository}#issue/{retained.issue_id}@retained/{retained.scope_id}",)
     discovered = getattr(auth_context, "server_discovered_pr_states", None)
     repository = arguments.get("repository")
     pull_request = arguments.get("pull_request")

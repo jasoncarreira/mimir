@@ -66,6 +66,15 @@ def test_core_runtime_factories_cover_each_surface_without_loading_coding() -> N
     assert set(core_runtime_names("coding")) >= {"spawn_open_code", "repo_test", "pr_metadata"}
 
 
+def test_selected_owner_gets_unregistered_coding_names_before_registration() -> None:
+    registry = PolicyRegistry()
+    register_core_tools(registry, selected_owners=frozenset({"cultivate"}))
+    assert "repo_status" not in registry.tools
+    assert "worklink_run" not in registry.tools
+    assert "repo_status" in core_policy_registry().tools
+    assert "send_message" in registry.tools
+
+
 def test_core_flow_registration_includes_native_aliases_and_descriptorless_tools() -> None:
     registry = core_policy_registry()
     expected = json.loads(

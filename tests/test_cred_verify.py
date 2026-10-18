@@ -657,6 +657,51 @@ def test_discovery_loads_core_then_sorted_package_skills(
     assert probes["SHARED_KEY"].description == "zebra"
 
 
+def test_selected_provider_probe_shadows_only_within_its_policy():
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    github_trust = pytest.importorskip("mimir_cultivate.github_trust")
+
+    selected = load_plugins(enable="cultivate").policy
+    core_probe = get_probes()["GITHUB_TOKEN"]
+    with policy_scope(selected):
+        provider_probe = get_probes()["GITHUB_TOKEN"]
+        assert provider_probe.source == "plugin:cultivate"
+        assert provider_probe.fn is github_trust.probe_github_token
+        assert provider_probe.fn is not core_probe.fn
+    assert get_probes()["GITHUB_TOKEN"].source == core_probe.source
+
+
+def test_core_probe_remains_generic_without_selected_provider(monkeypatch):
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    monkeypatch.setenv("GITHUB_TOKEN", "generic-token")
+    monkeypatch.setattr("requests.Session", lambda: pytest.fail("core probe used the network"))
+    with policy_scope(load_plugins(enable="").policy):
+        probe = get_probes()["GITHUB_TOKEN"]
+        assert probe.kind == "format"
+        assert probe.source == str(cred_verify._PACKAGE_MANIFEST)
+        assert verify("GITHUB_TOKEN").ok
+
+
+def test_selected_cli_runs_provider_probe_not_core_fallback(monkeypatch, capsys):
+    github_trust = pytest.importorskip("mimir_cultivate.github_trust")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("GITHUB_TOKEN", "present")
+    calls = []
+
+    def provider_probe():
+        calls.append(True)
+        return True, "provider identity verified"
+
+    monkeypatch.setattr(github_trust, "probe_github_token", provider_probe)
+    assert run_verify_cred_cmd("GITHUB_TOKEN") == 0
+    assert calls == [True]
+    assert "provider identity verified" in capsys.readouterr().out
+
+
 def test_optional_package_manifest_not_loaded_without_home(
     package_skills: Path, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -815,6 +860,7 @@ def test_verify_creds_summary_counts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     monkeypatch.setenv("OK_KEY", "x" * 20)
     monkeypatch.delenv("BAD_KEY", raising=False)
     _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """
@@ -843,6 +889,7 @@ def test_verify_creds_filter_by_type(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     monkeypatch.setenv("D_KEY", "x" * 20)
     monkeypatch.setenv("A_KEY", "y" * 20)
     _write_manifest(tmp_path / "skills" / "fake" / "credentials.yaml", """

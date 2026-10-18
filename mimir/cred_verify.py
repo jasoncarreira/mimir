@@ -46,6 +46,7 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -472,25 +473,38 @@ def _discover_probes(home: Path | None) -> dict[str, Probe]:
 
 _probes_cache: dict[str, Probe] | None = None
 _probes_cache_home: Path | None = None
+_probes_cache_policy: object | None = None
 
 
 def get_probes(home: Path | None = None) -> dict[str, Probe]:
     """Return the merged probe registry. Cached per ``home`` value
     so repeated CLI calls don't re-walk the disk."""
-    global _probes_cache, _probes_cache_home
+    from .plugins.core import selected_policy_registry
+
+    global _probes_cache, _probes_cache_home, _probes_cache_policy
     resolved = _resolve_home(home)
-    if _probes_cache is not None and _probes_cache_home == resolved:
+    policy = selected_policy_registry()
+    if (_probes_cache is not None and _probes_cache_home == resolved
+            and _probes_cache_policy is policy):
         return _probes_cache
     _probes_cache = _discover_probes(resolved)
+    for name, (owner, cred_type, env_vars, description, fn) in policy.credential_probes.items():
+        _probes_cache[name] = Probe(
+            name=name, cred_type=cred_type, env_vars=env_vars,
+            description=description, kind="python", fn=fn,
+            source=f"plugin:{owner}",
+        )
     _probes_cache_home = resolved
+    _probes_cache_policy = policy
     return _probes_cache
 
 
 def reset_probes_cache() -> None:
     """For tests / when MIMIR_HOME changes mid-process."""
-    global _probes_cache, _probes_cache_home
+    global _probes_cache, _probes_cache_home, _probes_cache_policy
     _probes_cache = None
     _probes_cache_home = None
+    _probes_cache_policy = None
 
 
 def verify(name: str, home: Path | None = None) -> ProbeResult:
@@ -529,6 +543,22 @@ def verify_all(home: Path | None = None) -> list[ProbeResult]:
 # ── CLI entrypoints (wired in cli.py) ────────────────────────────────
 
 
+def _selected_cli_probe_policy(function):
+    @wraps(function)
+    def invoke(*args, **kwargs):
+        selected = os.environ.get("MIMIR_PLUGINS", "").strip()
+        if not selected:
+            return function(*args, **kwargs)
+        from .plugins.core import policy_scope
+        from .plugins.manager import load_plugins
+
+        with policy_scope(load_plugins(enable=selected).policy):
+            return function(*args, **kwargs)
+
+    return invoke
+
+
+@_selected_cli_probe_policy
 def run_verify_cred_cmd(name: str, home: Path | None = None) -> int:
     probes = get_probes(home)
     if name not in probes:
@@ -541,6 +571,7 @@ def run_verify_cred_cmd(name: str, home: Path | None = None) -> int:
     return 0 if result.ok or result.skipped else 1
 
 
+@_selected_cli_probe_policy
 def run_verify_creds_cmd(only_type: str | None = None, home: Path | None = None) -> int:
     results = verify_all(home=home)
     if only_type:

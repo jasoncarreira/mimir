@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from dataclasses import replace
 from contextlib import contextmanager
+import asyncio
+import json
 import subprocess
 from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import ToolException
+from langchain.agents.middleware import ToolCallRequest
+from langchain.tools import ToolRuntime
+from langgraph.runtime import Runtime
 
 from mimir.access_control import (
     AccessTier, OperationDecision, ToolAuthorization, ToolFlowDirection,
@@ -16,6 +21,111 @@ from mimir.access_control import (
 )
 from mimir.models import RetainedFactoryScope
 from mimir.tools import budget_gate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("name", [
+    "repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit",
+])
+async def test_selected_ordinary_repo_tool_holds_real_issued_pr_lease(
+    tmp_path, monkeypatch, name, enforce, asynchronous,
+):
+    from mimir.access_control import (
+        CapabilityTier, ScopedPRGrants, _SCOPED_PR_ISSUER,
+        build_trigger_service_principal,
+    )
+    from mimir.models import (
+        AuthContext, InformationFlowLabels, InformationFlowState,
+        RepoPRScopeRegistry, RepoReviewState,
+    )
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import repository
+    from mimir_cultivate.policy import RepoPRAction
+    from tests.test_pr_checkout_lease import _repo_and_scope
+
+    _repo, original_scope = _repo_and_scope(tmp_path)
+    scope = replace(original_scope, principal="poller:github")
+    state = RepoReviewState(scope)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        service = build_trigger_service_principal(
+            canonical=scope.principal, trigger="poller", profile="github",
+            tier=CapabilityTier.CODE_EXECUTION,
+            capabilities=("repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"),
+            creation_path="test_selected_ordinary_repo_tool_holds_real_issued_pr_lease",
+        )
+        grants = ScopedPRGrants(
+            scope.principal, (scope,), protocols=selected.scoped_actions,
+            _issuer=_SCOPED_PR_ISSUER,
+        )
+        labels = InformationFlowLabels()
+        auth = AuthContext(
+            principal=scope.principal, canonical_principal=scope.principal,
+            roles=("service",), event_ingress=None, trigger="poller",
+            channel_id="poller:github", interactivity=None,
+            is_service=True, service_authority=service, enforcement_enabled=enforce,
+            repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+            repo_review_state=state, repo_pr_action_scope=scope, scoped_pr_grants=grants,
+            ifc_labels=labels, ifc_state=InformationFlowState(labels),
+        )
+        token = grants.consume_checkout("cultivate", scope)
+        assert token is not None
+        lease = repository.create_pr_checkout_lease(
+            scope, owner=scope.principal, lease_root=lease_root, review_state=state,
+        )
+        assert grants.observe_checkout("cultivate", scope, lease, token)
+        if name in {"repo_stage", "repo_commit"}:
+            (lease.path / "file.txt").write_text("changed\n", encoding="utf-8")
+
+        async def passing_test(self, selectors=(), *, suite=None):
+            assert self._state is state
+            return repository.ProjectTestResult(True, "tests_passed", 0)
+
+        monkeypatch.setattr(repository.RepoProjectTests, "execute", passing_test)
+        tool = selected.tools[name].factory()
+        arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+        if name in {"repo_stage", "repo_commit"}:
+            arguments["paths"] = ("file.txt",)
+        if name == "repo_commit":
+            arguments["message"] = "test commit"
+        request = ToolCallRequest(
+            tool_call={"name": name, "args": arguments, "id": "ordinary-call", "type": "tool_call"},
+            tool=tool, state=None, runtime=Runtime(context=auth),
+        )
+        runtime = ToolRuntime(
+            state={}, context=auth, config={}, stream_writer=lambda _: None,
+            tool_call_id="ordinary-call", store=None,
+        )
+        calls = []
+
+        async def execute():
+            calls.append(lease.recovery_id)
+            if name == "repo_test":
+                return await tool.coroutine(**arguments, runtime=runtime)
+            return tool.func(**arguments, runtime=runtime)
+
+        async def async_handler(_request):
+            value = await execute()
+            return ToolMessage(content=json.dumps(value), tool_call_id="ordinary-call")
+
+        def sync_handler(_request):
+            value = asyncio.run(execute())
+            return ToolMessage(content=json.dumps(value), tool_call_id="ordinary-call")
+
+        gate = budget_gate.BudgetGateMiddleware(selected)
+        if asynchronous:
+            output = await gate.awrap_tool_call(request, async_handler)
+        else:
+            output = await asyncio.to_thread(gate.wrap_tool_call, request, sync_handler)
+        assert output.status != "error", output.content
+        assert calls == [lease.recovery_id]
+        assert state.checkout_lease is lease
 
 
 def _case(monkeypatch, tmp_path):

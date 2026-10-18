@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 import json
@@ -12,7 +13,12 @@ import selectors
 import signal
 import subprocess
 import time
+from types import MappingProxyType
 from typing import TYPE_CHECKING
+
+from mimir.tool_descriptors import (
+    ResultOriginKind, SinkCategory, ToolDescriptor, _argument_payload, _generic_target,
+)
 
 if TYPE_CHECKING:
     from mimir.plugins.registry import PolicyRegistrar
@@ -159,3 +165,298 @@ def validate_scoped_pr_action(action: RepoPRAction, scope: object, grant: object
         and getattr(grant, "owner", None) == "cultivate"
         and getattr(grant, "action", None) == action.value
     )
+
+
+_RETAINED = ("repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit")
+_BUILDS = ("worklink_run", "worklink_resume")
+_PUBLISH = ("repo_commit", "repo_merge", "repo_rebase", "repo_revert", "repo_push")
+
+
+def host_membership_projection() -> dict[str, tuple[str, ...]]:
+    return {
+        "retained_repo_tools": _RETAINED,
+        "worklink_build_tools": _BUILDS,
+        "repo_publish_tools": _PUBLISH,
+    }
+
+
+def _names(value: str) -> frozenset[str]:
+    return frozenset(value.split())
+
+
+_FORGE = _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content
+    pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments
+    pr_review_requests pr_submit_review pr_inline_review_comment pr_comment
+    pr_edit_body issue_comment pr_rerequest_review unsupported_operation""")
+_REPO = _names("""repo_checkout repo_cleanup repo_fetch repo_status repo_test
+    repo_diff repo_unmerged repo_stage repo_commit repo_merge repo_merge_abort
+    repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push""")
+CODING_TOOLS = _FORGE | _REPO | frozenset(_BUILDS) | {"spawn_open_code"}
+
+
+def _spawn_target(_name: str, arguments: dict, _context: object) -> tuple[str | None, ...]:
+    target = arguments.get("cwd") or os.environ.get("MIMIR_HOME")
+    artifact = arguments.get("artifact_root")
+    return (str(target) if target else None, str(artifact)) if artifact else (
+        str(target) if target else None,
+    )
+
+
+def _worklink_target(_name: str, _arguments: dict, _context: object) -> tuple[str | None, ...]:
+    target = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    return (str(target) if target else None,)
+
+
+def _repo_pr_target(tool_name: str, arguments: dict, context: object) -> tuple[str | None, ...]:
+    from mimir.models import RetainedFactoryScope
+    from mimir.plugins.core import selected_policy_registry
+
+    tool = selected_policy_registry().tools.get(tool_name)
+    retained = getattr(context, "retained_factory_scope", None)
+    if (tool is not None and tool.owner == "cultivate"
+            and "retained_repo_tools" in tool.memberships
+            and isinstance(retained, RetainedFactoryScope)
+            and getattr(context, "is_service", False)
+            and arguments.get("repository") == retained.repository
+            and arguments.get("pull_request") == retained.issue_id):
+        return (f"{retained.repository}#issue/{retained.issue_id}@retained/{retained.scope_id}",)
+    repository, number = arguments.get("repository"), arguments.get("pull_request")
+    discovered = getattr(context, "server_discovered_pr_states", None)
+    state = (discovered.resolve_for_tool(tool_name, repository, number)
+             if discovered is not None and isinstance(repository, str) and isinstance(number, int)
+             else None)
+    if state is None:
+        registry = getattr(context, "repo_pr_scope_registry", None)
+        state = (registry.resolve(repository, number)
+                 if registry is not None and hasattr(registry, "resolve") else None)
+    if state is None:
+        return (None,)
+    scope = state.action_scope
+    return (f"{scope.canonical_repo}#pull/{scope.pr_number}"
+            f"@{scope.observed_head_sha}:{scope.scope_id}",)
+
+
+_D = ToolDescriptor
+_E = ResultOriginKind.EXTERNAL
+_R = ResultOriginKind.REPOSITORY
+_N = ResultOriginKind.NON_INGESTING
+_DESCRIPTORS = MappingProxyType({
+    "ci_recent_runs": _D(result_origin=_E | _R),
+    "ci_run": _D(result_origin=_E | _R),
+    "ci_run_jobs": _D(result_origin=_E | _R),
+    "issue_comment": _D(SinkCategory.FORGE, _generic_target, "configured_repository_issue", sink_payload_extractor=_argument_payload("body")),
+    "pr_checks": _D(result_origin=_E | _R),
+    "pr_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
+    "pr_comments": _D(result_origin=_E | _R),
+    "pr_diff": _D(result_origin=_E | _R),
+    "pr_edit_body": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
+    "pr_file_content": _D(result_origin=_E | _R),
+    "pr_files": _D(result_origin=_E | _R),
+    "pr_inline_review_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
+    "pr_job_log": _D(result_origin=_E | _R),
+    "pr_list": _D(result_origin=_E | _R),
+    "pr_metadata": _D(result_origin=_E | _R),
+    "pr_rerequest_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
+    "pr_review_requests": _D(result_origin=_E | _R),
+    "pr_reviews": _D(result_origin=_E | _R),
+    "pr_spec": _D(result_origin=_R),
+    "pr_submit_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
+    "repo_checkout": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
+    "repo_cleanup": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
+    "repo_commit": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=_argument_payload("message")),
+    "repo_diff": _D(result_origin=_R, git_operation_result=True),
+    "repo_fetch": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_merge": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_merge_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_push": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_rebase": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_rebase_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_revert": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_revert_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_stage": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, git_operation_result=True, sink_payload_extractor=None),
+    "repo_status": _D(result_origin=_R, git_operation_result=True),
+    "repo_test": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
+    "repo_unmerged": _D(result_origin=_R, git_operation_result=True),
+    "spawn_open_code": _D(SinkCategory.SPAWN, _spawn_target, "spawn_process", ifc_delegation=True),
+    "unsupported_operation": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
+    "worklink_resume": _D(SinkCategory.SPAWN, _worklink_target, "worklink"),
+    "worklink_run": _D(SinkCategory.SPAWN, _worklink_target, "worklink"),
+})
+
+_FLOW = MappingProxyType({
+    "source": _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks
+        pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests
+        repo_status repo_diff repo_unmerged"""),
+    "both": _names("worklink_run worklink_resume spawn_open_code repo_checkout repo_fetch repo_test"),
+    "sink": _names("""pr_submit_review pr_inline_review_comment pr_comment pr_edit_body issue_comment
+        pr_rerequest_review unsupported_operation repo_cleanup repo_stage repo_commit repo_merge
+        repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push"""),
+})
+_TIER = MappingProxyType({
+    "scope-contained": _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content
+        pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments
+        pr_review_requests repo_status repo_diff repo_unmerged"""),
+    "code-execution": _names("worklink_run worklink_resume spawn_open_code repo_test"),
+    "scoped-with-provenance": _names("""pr_submit_review pr_inline_review_comment pr_comment
+        pr_edit_body issue_comment pr_rerequest_review unsupported_operation repo_checkout repo_cleanup
+        repo_fetch repo_stage repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort
+        repo_revert repo_revert_abort repo_push"""),
+})
+_RESULT_DOMAIN = MappingProxyType({
+    "worklink": frozenset(_BUILDS), "coding_worker": _names("spawn_open_code"),
+    "repository": _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks
+        pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests
+        pr_submit_review pr_inline_review_comment pr_comment pr_edit_body issue_comment
+        repo_checkout repo_fetch repo_status repo_test repo_diff repo_unmerged repo_commit
+        repo_merge repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push"""),
+})
+_READABLE_REPOSITORY = _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content
+    pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments
+    pr_review_requests repo_checkout repo_fetch repo_status repo_test repo_diff repo_unmerged""")
+_READ_BACKEND = _names("""pr_metadata pr_spec pr_list pr_files pr_diff pr_file_content pr_checks
+    pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests
+    repo_checkout repo_fetch repo_status repo_test repo_diff repo_unmerged""")
+_HEARTBEAT = _names("""worklink_run pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content
+    pr_checks pr_reviews pr_comments pr_review_requests pr_submit_review pr_inline_review_comment
+    pr_comment pr_edit_body pr_rerequest_review unsupported_operation repo_checkout repo_cleanup
+    repo_fetch repo_status repo_test repo_diff repo_unmerged repo_stage repo_commit repo_merge
+    repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push""")
+_WRITES = _names("""spawn_open_code worklink_run worklink_resume repo_checkout repo_cleanup
+    repo_fetch repo_test repo_stage repo_commit repo_merge repo_merge_abort repo_rebase
+    repo_rebase_abort repo_revert repo_revert_abort repo_push pr_submit_review
+    pr_inline_review_comment pr_comment pr_edit_body issue_comment pr_rerequest_review""")
+_MEMBERSHIPS = MappingProxyType({
+    "write_resource_operations": frozenset(_BUILDS),
+    "tainted_writes": _names("repo_stage repo_commit repo_merge repo_rebase repo_revert repo_push repo_test"),
+    "standing_review": _names("""pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks
+        pr_reviews pr_comments pr_review_requests pr_submit_review pr_inline_review_comment
+        pr_comment pr_edit_body pr_rerequest_review repo_checkout repo_cleanup repo_fetch
+        repo_status repo_test repo_diff repo_unmerged"""),
+    "remediation_effect": _names("""repo_commit repo_push pr_comment pr_edit_body
+        pr_inline_review_comment pr_rerequest_review worklink_resume"""),
+    "typed_error_signal": _names("worklink_run"),
+    "forge_actions": _FORGE - _names("pr_list ci_run_jobs ci_run ci_recent_runs issue_comment"),
+    "repo_actions": _REPO,
+})
+_ACTIONS = MappingProxyType({
+    **{name: RepoPRAction.INSPECT for name in _names("""pr_metadata pr_spec pr_files
+        pr_diff pr_file_content pr_checks pr_job_log pr_reviews pr_comments pr_review_requests
+        repo_status repo_diff repo_unmerged""")},
+    **{name: RepoPRAction.CHECKOUT for name in _names("repo_checkout repo_cleanup repo_fetch")},
+    "repo_test": RepoPRAction.TEST,
+    **{name: RepoPRAction.WRITE for name in _names("repo_stage repo_merge_abort repo_rebase_abort repo_revert_abort")},
+    **{name: RepoPRAction.COMMIT for name in _names("repo_commit repo_merge repo_rebase repo_revert")},
+    "repo_push": RepoPRAction.PUSH,
+    "pr_submit_review": RepoPRAction.PR_REVIEW,
+    "pr_inline_review_comment": RepoPRAction.PR_REVIEW,
+    "pr_comment": RepoPRAction.PR_COMMENT,
+    "pr_edit_body": RepoPRAction.PR_EDIT,
+    "pr_rerequest_review": RepoPRAction.PR_REREQUEST,
+})
+
+
+@dataclass(frozen=True)
+class _ToolDeclaration:
+    descriptor: ToolDescriptor
+    flow: str
+    tier: str
+    operation_class: str
+    result_domain: str | None
+    readable_domain: str | None
+    profiles: frozenset[str]
+    memberships: frozenset[str]
+    read_backend: bool
+    writes_code_or_state: bool
+    typed_action: RepoPRAction | None
+
+
+def _declaration(name: str, descriptor: ToolDescriptor) -> _ToolDeclaration:
+    return _ToolDeclaration(
+        descriptor=descriptor,
+        flow=next(flow for flow, names in _FLOW.items() if name in names),
+        tier=next(tier for tier, names in _TIER.items() if name in names),
+        operation_class="admin_required" if name in {"pr_list", "issue_comment", "spawn_open_code"} else "resource_scoped",
+        result_domain=next((domain for domain, names in _RESULT_DOMAIN.items() if name in names), None),
+        readable_domain="repository" if name in _READABLE_REPOSITORY else None,
+        profiles=frozenset(profile for profile, names in {
+            "github": CODING_TOOLS - {"spawn_open_code"},
+            "custom": CODING_TOOLS - {"issue_comment"},
+            "heartbeat": _HEARTBEAT,
+        }.items() if name in names),
+        memberships=frozenset(category for category, names in _MEMBERSHIPS.items() if name in names),
+        read_backend=name in _READ_BACKEND,
+        writes_code_or_state=name in _WRITES,
+        typed_action=_ACTIONS.get(name),
+    )
+
+
+_TOOL_DECLARATIONS = MappingProxyType({
+    name: _declaration(name, descriptor) for name, descriptor in _DESCRIPTORS.items()
+})
+if set(_TOOL_DECLARATIONS) != CODING_TOOLS or any(
+    sum(name in group for group in table.values()) != 1
+    for name in CODING_TOOLS for table in (_FLOW, _TIER)
+):
+    raise RuntimeError("incomplete Cultivate tool policy")
+
+
+def _factory(module: str, name: str) -> Callable[[], object]:
+    def materialize() -> object:
+        from importlib import import_module
+
+        source = import_module(module)
+        if name == "spawn_open_code":
+            return source.spawn_open_code
+        if name in _BUILDS:
+            return getattr(source, name)
+        collection = source.FORGE_TOOLS if module.endswith("forge") else source.REPO_TOOLS
+        return next(tool for tool in collection if tool.name == name)
+
+    return materialize
+
+
+def register_tools(registrar: PolicyRegistrar) -> None:
+    """Install the moved tool implementations on the selected policy before freeze."""
+    for name, declaration in sorted(_TOOL_DECLARATIONS.items()):
+        descriptor = declaration.descriptor
+        module = (
+            "mimir_cultivate.forge" if name.startswith(("pr_", "ci_", "issue_"))
+            or name == "unsupported_operation" else
+            "mimir_cultivate.repository" if name.startswith("repo_") else
+            "mimir_cultivate.registration" if name in _BUILDS else
+            "mimir.tools.registry"
+        )
+        action = declaration.typed_action
+        adapter = (
+            "worklink_repo" if name in _BUILDS else
+            "spawn_workspace" if descriptor.sink_category == SinkCategory.SPAWN else
+            None
+        )
+        registrar.register_tool(
+            name=name, factory=_factory(module, name), flow=declaration.flow,
+            tier=declaration.tier, operation_class=declaration.operation_class,
+            resource_scope=(
+                "worklink" if name in _BUILDS else
+                "ci_branch" if name == "ci_recent_runs" else
+                "ci_run" if name in {"ci_run", "ci_run_jobs"} else
+                "repo_pr" if declaration.operation_class == "resource_scoped" and action is not None
+                else "channel" if declaration.operation_class == "resource_scoped" else None
+            ),
+            typed_action=action, result_domain=declaration.result_domain,
+            result_origin=descriptor.result_origin,
+            sink_category=descriptor.sink_category,
+            sink_destination=descriptor.sink_destination,
+            sink_target_extractor=descriptor.sink_target_extractor,
+            sink_payload_extractor=descriptor.sink_payload_extractor,
+            fetch_authorization=descriptor.fetch_authorization,
+            git_operation_result=descriptor.git_operation_result,
+            ifc_delegation=descriptor.ifc_delegation,
+            budget_exempt=descriptor.budget_exempt,
+            writes_code_or_state=declaration.writes_code_or_state,
+            profiles=declaration.profiles, read_backend=declaration.read_backend,
+            readable_domain=declaration.readable_domain,
+            memberships=declaration.memberships, service_sink_adapter=adapter,
+        )
+        registrar.register_capability(name)
+        for profile in declaration.profiles:
+            registrar.add_to_profile(profile, name)

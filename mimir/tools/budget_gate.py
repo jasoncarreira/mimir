@@ -4244,11 +4244,24 @@ def _retained_execution(call: _PreparedToolCall):
     if scope is None:
         yield None
         return
-    from ..worklink.retained_scope import retained_factory_effect_lease
-
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         raise ToolException("retained factory home unavailable")
+    selected_lease = getattr(call.policy, "retained_effect_lease", None)
+    if selected_lease is not None:
+        from ..access_control import _host_retained_invocation
+
+        owner, lease_callback, _runner = selected_lease
+        if owner != "cultivate":
+            raise ToolException("retained factory lease owner mismatch")
+        with lease_callback(Path(home), scope) as lease:
+            if lease.scope is not scope:
+                raise ToolException(lease.refusal_reason or "retained factory lease unavailable")
+            with _host_retained_invocation(scope, call.auth_context):
+                yield scope
+        return
+    from ..worklink.retained_scope import retained_factory_effect_lease
+
     with retained_factory_effect_lease(Path(home), scope) as lease:
         if lease.scope is not scope:
             raise ToolException(lease.refusal_reason or "retained factory lease unavailable")
@@ -4536,7 +4549,13 @@ class BudgetGateMiddleware(AgentMiddleware):
                 _hold_scoped_pr_dispatch(call, lease_stack)
                 with _retained_execution(call) as retained_scope:
                     result = handler(call.execution_request)
-                _capture_retained_result(call, capture, retained_scope, result)
+                    if retained_scope is not None and getattr(call.policy, "retained_effect_lease", None):
+                        _capture_retained_result(call, capture, retained_scope, result)
+                        _end_tool_execution(capture)
+                        capture_ended = True
+                        return _finish_tool_result(call, capture, result)
+                if retained_scope is not None:
+                    _capture_retained_result(call, capture, retained_scope, result)
                 lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
                 if lease_refusal is not None:
                     return lease_refusal
@@ -4659,7 +4678,13 @@ class BudgetGateMiddleware(AgentMiddleware):
                 await _hold_scoped_pr_dispatch_async(call, lease_stack)
                 with _retained_execution(call) as retained_scope:
                     result = await handler(call.execution_request)
-                _capture_retained_result(call, capture, retained_scope, result)
+                    if retained_scope is not None and getattr(call.policy, "retained_effect_lease", None):
+                        _capture_retained_result(call, capture, retained_scope, result)
+                        _end_tool_execution(capture)
+                        capture_ended = True
+                        return _finish_tool_result(call, capture, result)
+                if retained_scope is not None:
+                    _capture_retained_result(call, capture, retained_scope, result)
                 lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
                 if lease_refusal is not None:
                     return lease_refusal
