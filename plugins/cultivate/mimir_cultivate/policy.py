@@ -14,6 +14,9 @@ import subprocess
 import time
 from typing import TYPE_CHECKING
 
+from mimir.plugins.core import core_policy_registry, core_runtime_names
+from mimir.tool_descriptors import SinkCategory
+
 if TYPE_CHECKING:
     from mimir.plugins.registry import PolicyRegistrar
 
@@ -159,3 +162,88 @@ def validate_scoped_pr_action(action: RepoPRAction, scope: object, grant: object
         and getattr(grant, "owner", None) == "cultivate"
         and getattr(grant, "action", None) == action.value
     )
+
+
+_RETAINED = ("repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit")
+_BUILDS = ("worklink_run", "worklink_resume")
+_PUBLISH = ("repo_commit", "repo_merge", "repo_rebase", "repo_revert", "repo_push")
+
+
+def host_membership_projection() -> dict[str, tuple[str, ...]]:
+    return {
+        "retained_repo_tools": _RETAINED,
+        "worklink_build_tools": _BUILDS,
+        "repo_publish_tools": _PUBLISH,
+    }
+
+
+def _factory(module: str, name: str) -> Callable[[], object]:
+    def materialize() -> object:
+        from importlib import import_module
+
+        source = import_module(module)
+        if name == "spawn_open_code":
+            return source.spawn_open_code
+        if name in _BUILDS:
+            return getattr(source, name)
+        collection = source.FORGE_TOOLS if module.endswith("forge") else source.REPO_TOOLS
+        return next(tool for tool in collection if tool.name == name)
+
+    return materialize
+
+
+def register_tools(registrar: PolicyRegistrar) -> None:
+    """Install the moved tool implementations on the selected policy before freeze."""
+    # The legacy core registry remains the frozen metadata oracle until the
+    # coding-policy retirement removes its compatibility declarations.
+    baseline = core_policy_registry()
+    coding = set(core_runtime_names("coding")) | set(_BUILDS)
+    for name in sorted(coding):
+        legacy = baseline.tools[name]
+        descriptor = legacy.descriptor
+        assert descriptor is not None
+        module = (
+            "mimir_cultivate.forge" if name.startswith(("pr_", "ci_", "issue_"))
+            or name == "unsupported_operation" else
+            "mimir_cultivate.repository" if name.startswith("repo_") else
+            "mimir_cultivate.registration" if name in _BUILDS else
+            "mimir.tools.registry"
+        )
+        action = (
+            RepoPRAction(legacy.typed_action.value)
+            if legacy.typed_action is not None else None
+        )
+        memberships = legacy.memberships - set(host_membership_projection())
+        adapter = (
+            "worklink_repo" if name in _BUILDS else
+            "spawn_workspace" if descriptor.sink_category == SinkCategory.SPAWN else
+            None
+        )
+        registrar.register_tool(
+            name=name, factory=_factory(module, name), flow=legacy.flow,
+            tier=legacy.tier, operation_class=legacy.operation_class,
+            resource_scope=(
+                "worklink" if name in _BUILDS else
+                "ci_branch" if name == "ci_recent_runs" else
+                "ci_run" if name in {"ci_run", "ci_run_jobs"} else
+                "repo_pr" if legacy.operation_class == "resource_scoped" and action is not None
+                else "channel" if legacy.operation_class == "resource_scoped" else None
+            ),
+            typed_action=action, result_domain=legacy.result_domain,
+            result_origin=descriptor.result_origin,
+            sink_category=descriptor.sink_category,
+            sink_destination=descriptor.sink_destination,
+            sink_target_extractor=descriptor.sink_target_extractor,
+            sink_payload_extractor=descriptor.sink_payload_extractor,
+            fetch_authorization=descriptor.fetch_authorization,
+            git_operation_result=descriptor.git_operation_result,
+            ifc_delegation=descriptor.ifc_delegation,
+            budget_exempt=descriptor.budget_exempt,
+            writes_code_or_state=legacy.writes_code_or_state,
+            profiles=legacy.profiles, read_backend=legacy.read_backend,
+            readable_domain=legacy.readable_domain,
+            memberships=memberships, service_sink_adapter=adapter,
+        )
+        registrar.register_capability(name)
+        for profile in legacy.profiles:
+            registrar.add_to_profile(profile, name)

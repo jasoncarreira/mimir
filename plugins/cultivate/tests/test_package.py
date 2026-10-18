@@ -97,17 +97,20 @@ def test_disabled_provider_is_not_imported() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_selected_provider_registers_no_future_resources() -> None:
+def test_selected_provider_registers_its_coding_resources() -> None:
     from mimir.plugins.manager import load_plugins
+    from mimir.plugins.core import core_runtime_names
 
     manager = load_plugins(enable="cultivate")
     assert [plugin.candidate.name for plugin in manager.plugins] == ["cultivate"]
-    assert not any(tool.owner == "cultivate" for tool in manager.policy.tools.values())
+    coding = set(core_runtime_names("coding")) | {"worklink_run", "worklink_resume"}
+    assert {name for name, tool in manager.policy.tools.items() if tool.owner == "cultivate"} == coding
+    assert all(manager.policy.tools[name].factory is not None for name in coding)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("named", [True, False])
-async def test_selected_empty_provider_preserves_authenticated_approval_path(
+async def test_selected_provider_preserves_authenticated_approval_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, named: bool,
 ) -> None:
     from mimir import approval_requests

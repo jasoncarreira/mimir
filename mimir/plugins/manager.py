@@ -151,8 +151,10 @@ def load_plugins(*, enable: str) -> PluginManager:
         raise PluginDiscoveryError("conflicting plugin default skins: " +
                                    ", ".join(f"{owner}:{skin}" for owner, skin in defaults))
     policy = PolicyRegistry()
-    register_core_tools(policy)
     policy.select_plugin_candidates(selected)
+    register_core_tools(policy, selected_owners=frozenset(
+        candidate.name for candidate in selected
+    ))
     loaded = []
     for candidate in selected:
         try:

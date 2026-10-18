@@ -1810,6 +1810,10 @@ class _FakeArbiter:
 
 @pytest.fixture
 def _tool_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    if os.environ.get("MIMIR_PLUGINS", "") != "cultivate":
+        pytest.skip("selected Cultivate tool requires the provider")
+    provider_autonomy = pytest.importorskip("mimir_cultivate.worklink.autonomy")
+    provider_orchestrator = pytest.importorskip("mimir_cultivate.worklink.orchestrator")
     _write_worklink_yaml(tmp_path)
     repo_dir = tmp_path / "src"  # distinct from cwd so we can prove WORKLINK_REPO is honored
     repo_dir.mkdir()
@@ -1817,6 +1821,7 @@ def _tool_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("WORKLINK_REPO", str(repo_dir))
     monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
     from mimir.tools import registry
+    from mimir.plugins.manager import load_plugins
 
     dispatched: list[dict] = []
 
@@ -1832,17 +1837,18 @@ def _tool_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "review_ready": True, "pr_url": None, "evidence_path": None, "reason": None,
         })()
 
-    import mimir.worklink.orchestrator as orch
-    monkeypatch.setattr(orch, "run_worklink", fake_run_worklink, raising=True)
+    monkeypatch.setattr(provider_orchestrator, "run_worklink", fake_run_worklink, raising=True)
     # keep concurrency below cap by default (0 active)
-    monkeypatch.setattr(autonomy, "check_concurrency", lambda home, **_: autonomy.ConcurrencyCheck(True, 0, 2))
-    yield registry, dispatched, repo_dir
+    monkeypatch.setattr(provider_autonomy, "check_concurrency", lambda home, **_: provider_autonomy.ConcurrencyCheck(True, 0, 2))
+    selected_tool = load_plugins(enable="cultivate").policy.tools["worklink_run"].factory()
+    yield (SimpleNamespace(worklink_run=selected_tool, set_arbiter=registry.set_arbiter),
+           dispatched, repo_dir, provider_autonomy, provider_orchestrator)
     registry.set_arbiter(None)
 
 
 @pytest.mark.asyncio
 async def test_worklink_run_sheds_under_tight(_tool_env) -> None:
-    registry, dispatched, _repo = _tool_env
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
     arbiter = _FakeArbiter(fire=False)  # severity TIGHT → should_fire False
     registry.set_arbiter(arbiter)
     out = await registry.worklink_run.ainvoke({"issue_id": 443})
@@ -1856,7 +1862,7 @@ async def test_worklink_run_arbiter_gate_does_not_block_loop(_tool_env) -> None:
     import asyncio
     import threading
 
-    registry, dispatched, _repo = _tool_env
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
     loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
     entered = asyncio.Event()
@@ -1905,7 +1911,7 @@ async def test_worklink_run_arbiter_gate_does_not_block_loop(_tool_env) -> None:
 
 @pytest.mark.asyncio
 async def test_worklink_run_dispatches_when_clear_using_worklink_repo(_tool_env) -> None:
-    registry, dispatched, repo_dir = _tool_env
+    registry, dispatched, repo_dir, provider_autonomy, provider_orchestrator = _tool_env
     registry.set_arbiter(_FakeArbiter(fire=True))
     out = await registry.worklink_run.ainvoke({"issue_id": 443})
     assert "443" in out and "completed" in out
@@ -1920,8 +1926,12 @@ async def test_worklink_run_dispatches_when_clear_using_worklink_repo(_tool_env)
 async def test_worklink_run_tool_reaches_core_incident_admission_in_both_modes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforced: bool,
 ) -> None:
-    from mimir.tools import registry
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+    if os.environ.get("MIMIR_PLUGINS", "") != "cultivate":
+        pytest.skip("selected Cultivate tool requires the provider")
+    provider_autonomy = pytest.importorskip("mimir_cultivate.worklink.autonomy")
+    from mimir.tools import registry as core_registry
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
 
     _write_worklink_yaml(tmp_path)
     repo = tmp_path / "repo"
@@ -1933,11 +1943,11 @@ async def test_worklink_run_tool_reaches_core_incident_admission_in_both_modes(
     else:
         monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
     monkeypatch.setattr(
-        autonomy,
+        provider_autonomy,
         "check_concurrency",
-        lambda home, **kwargs: autonomy.ConcurrencyCheck(True, 0, 2),
+        lambda home, **kwargs: provider_autonomy.ConcurrencyCheck(True, 0, 2),
     )
-    registry.set_arbiter(None)
+    core_registry.set_arbiter(None)
     record_failure(
         dispatch_failure_state_dir(tmp_path),
         issue_id=443,
@@ -1947,7 +1957,8 @@ async def test_worklink_run_tool_reaches_core_incident_admission_in_both_modes(
         log_path="run.log",
     )
 
-    output = await registry.worklink_run.ainvoke({"issue_id": 443})
+    selected = load_plugins(enable="cultivate").policy.tools["worklink_run"].factory()
+    output = await selected.ainvoke({"issue_id": 443})
 
     assert "worklink_run #443: refused" in output
     assert "unresolved Worklink incident" in output
@@ -1961,9 +1972,8 @@ async def test_worklink_run_cancellation_leaves_executor_running(
     import asyncio
     import threading
 
-    import mimir.worklink.orchestrator as orch
-
-    registry, dispatched, repo_dir = _tool_env
+    registry, dispatched, repo_dir, provider_autonomy, provider_orchestrator = _tool_env
+    orch = provider_orchestrator
     registry.set_arbiter(_FakeArbiter(fire=True))
     fake_run_worklink = orch.run_worklink
     loop = asyncio.get_running_loop()
@@ -2020,7 +2030,7 @@ async def test_worklink_run_cancellation_leaves_executor_running(
 
 @pytest.mark.asyncio
 async def test_worklink_run_tool_propagates_refused_result(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
-    registry, dispatched, _repo = _tool_env
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
     registry.set_arbiter(_FakeArbiter(fire=True))
 
     def fake_refused(*, home, repo, issue_id, backend=None, **kwargs):
@@ -2031,7 +2041,7 @@ async def test_worklink_run_tool_propagates_refused_result(_tool_env, monkeypatc
             "reason": "unsafe compute",
         })()
 
-    import mimir.worklink.orchestrator as orch
+    orch = provider_orchestrator
     monkeypatch.setattr(orch, "run_worklink", fake_refused, raising=True)
     out = await registry.worklink_run.ainvoke({"issue_id": 443})
     assert "refused" in out and "unsafe compute" in out
@@ -2042,7 +2052,7 @@ async def test_worklink_run_tool_propagates_refused_result(_tool_env, monkeypatc
 async def test_worklink_run_fails_when_worklink_repo_unset(
     _tool_env, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    registry, dispatched, _repo = _tool_env
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
     registry.set_arbiter(_FakeArbiter(fire=True))
     monkeypatch.delenv("WORKLINK_REPO", raising=False)
     monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
@@ -2053,9 +2063,9 @@ async def test_worklink_run_fails_when_worklink_repo_unset(
 
 @pytest.mark.asyncio
 async def test_worklink_run_skips_at_cap(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
-    registry, dispatched, _repo = _tool_env
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
     registry.set_arbiter(_FakeArbiter(fire=True))
-    monkeypatch.setattr(autonomy, "check_concurrency", lambda home, **_: autonomy.ConcurrencyCheck(False, 2, 2))
+    monkeypatch.setattr(provider_autonomy, "check_concurrency", lambda home, **_: provider_autonomy.ConcurrencyCheck(False, 2, 2))
     out = await registry.worklink_run.ainvoke({"issue_id": 443})
     assert "skipped" in out
     assert dispatched == []
@@ -2065,12 +2075,13 @@ async def test_worklink_run_skips_at_cap(_tool_env, monkeypatch: pytest.MonkeyPa
 async def test_worklink_run_leaf_cap_excludes_epic_locks(
     _tool_env, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    registry, dispatched, _repo = _tool_env
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
+    ProviderClaims = pytest.importorskip("mimir_cultivate.worklink.claims").ChainlinkClaims
     registry.set_arbiter(_FakeArbiter(fire=True))
     fake = FakeChainlink(active_locks=[100, 200], epic_ids={100})
-    claims = ChainlinkClaims(agent_id="t", runner=fake)
+    claims = ProviderClaims(agent_id="t", runner=fake)
     monkeypatch.setattr(
-        autonomy,
+        provider_autonomy,
         "check_concurrency",
         lambda home, **_: check_concurrency(home, claims=claims),
     )
@@ -2087,13 +2098,13 @@ async def test_worklink_run_leaf_cap_excludes_epic_locks(
 
 @pytest.mark.asyncio
 async def test_worklink_run_fails_closed_when_cap_unreadable(_tool_env, monkeypatch: pytest.MonkeyPatch) -> None:
-    registry, dispatched, _repo = _tool_env
+    registry, dispatched, _repo, provider_autonomy, provider_orchestrator = _tool_env
     registry.set_arbiter(_FakeArbiter(fire=True))
 
     def boom(home, **_):
         raise RuntimeError("chainlink unreachable")
 
-    monkeypatch.setattr(autonomy, "check_concurrency", boom)
+    monkeypatch.setattr(provider_autonomy, "check_concurrency", boom)
     out = await registry.worklink_run.ainvoke({"issue_id": 443})
     assert "concurrency check error" in out  # fail closed: surfaced, not dispatched
     assert dispatched == []

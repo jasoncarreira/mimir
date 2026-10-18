@@ -3244,7 +3244,10 @@ def all_mimir_tools(
         raise ValueError("tool assembly requires a frozen policy")
 
     def materialize(surface: str) -> list:
-        return [registry.tools[name].factory() for name in core_runtime_names(surface)]
+        return [declared.factory() for name in core_runtime_names(surface)
+                if (declared := registry.tools.get(name)) is not None
+                and declared.owner not in unready_plugin_owners
+                and (materialize_plugins or declared.owner == "core")]
 
     tools = materialize("default")
     web_search_on, fetch_url_on = web_tools_enabled(model_spec)
@@ -3296,9 +3299,10 @@ def all_mimir_tools(
         coding_enabled = not github_identity_is_degraded()
     if coding_enabled:
         tools.extend(materialize("coding"))
+    existing = {tool.name for tool in tools}
     for declared in registry.tools.values() if materialize_plugins else ():
         if (declared.owner == "core" or declared.factory is None
-                or declared.owner in unready_plugin_owners):
+                or declared.owner in unready_plugin_owners or declared.name in existing):
             continue
         tool = declared.factory()
         if getattr(tool, "name", None) != declared.name:
@@ -3307,6 +3311,7 @@ def all_mimir_tools(
                 f"{getattr(tool, 'name', None)!r}"
             )
         tools.append(tool)
+        existing.add(tool.name)
     # MCP-bridged tools (populated by server.py:_on_startup after the
     # MCP servers come up; empty when MCP is unconfigured).
     from .mcp import get_mcp_tools

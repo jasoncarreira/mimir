@@ -34,11 +34,12 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from .coding import coding_enabled
@@ -9706,6 +9707,7 @@ class ToolRegistry:
         if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return finish(_scheduled_write_denial(tool_name))
         if (plugin_tool is not None and plugin_tool.writes_code_or_state
+                and "worklink_build_tools" not in plugin_tool.memberships
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
             return finish(_tainted_write_denial(tool_name))
         if (plugin_tool is not None and plugin_tool.flow in {"sink", "both"}
@@ -10081,6 +10083,47 @@ class ToolRegistry:
                         channel_auth.flow_direction = flow_direction
                         return finish(channel_auth)
                     reason = "channel_target_required"
+                elif scope_kind == "worklink" and (
+                    "worklink_build_tools" in plugin_tool.memberships
+                    and tool_name in WriteResourceAdapter._RESOURCE_OPERATIONS
+                ):
+                    write_auth = WriteResourceAdapter.authorize_operation(
+                        tool_name, sink_target, auth_context, enforce=enforce,
+                        service_allowed=service_allowed, ifc_labels=ifc_labels,
+                    )
+                    write_auth.flow_direction = flow_direction
+                    return finish(write_auth)
+                elif scope_kind in {"ci_run", "ci_branch"}:
+                    args = arguments or {}
+                    repo, run_id = args.get("repository"), args.get("run_id")
+                    branch, workflow_id = args.get("branch"), args.get("workflow_id")
+                    run_scope = (
+                        isinstance(repo, str) and type(run_id) is int and run_id > 0
+                        and is_configured_github_repo(repo)
+                        and (repo.lower(), run_id) in getattr(auth_context, "ci_run_targets", frozenset())
+                    )
+                    branch_scope = (
+                        isinstance(repo, str) and is_configured_github_repo(repo)
+                        and isinstance(branch, str) and bool(branch)
+                        and (workflow_id is None or type(workflow_id) is int and workflow_id > 0)
+                        and any(r == repo.lower() and b == branch
+                                and (workflow_id is None or workflow_id == w)
+                                for r, b, w in getattr(auth_context, "ci_branch_targets", frozenset()))
+                    )
+                    in_scope = (
+                        (branch_scope if scope_kind == "ci_branch" else run_scope)
+                        and service_principal is not None
+                        and service_principal.has_capability(tool_name)
+                    )
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=decision,
+                        allowed=in_scope or not enforce,
+                        reason=None if in_scope else "ci_run_scope_denied",
+                        required_tier=AccessTier.USER,
+                        enforcement_enabled=enforce,
+                        is_shadow_decision=not enforce and not in_scope,
+                        would_block=not in_scope, flow_direction=flow_direction,
+                    ))
                 elif scope_kind == "repo_pr" and isinstance(repo_pr_action_scope, RetainedFactoryScope):
                     return finish(authorize_repo_pr_tool(
                         tool_name, repo_pr_action_scope,
@@ -11265,13 +11308,36 @@ def _incomplete_protected_result(
     ))
 
 
+_held_retained_lease: ContextVar[tuple[object, object, str, list[bool]] | None] = ContextVar(
+    "held_retained_invocation_lease", default=None,
+)
+
+
+@contextmanager
+def _host_retained_invocation(scope: object, context: object):
+    """Bind the live lease held by the host wrapper to this invocation only."""
+    active = [True]
+    identity = secrets.token_hex(16)
+    token = _held_retained_lease.set((scope, context, identity, active))
+    try:
+        yield identity
+    finally:
+        active[0] = False
+        _held_retained_lease.reset(token)
+
+
+def retained_invocation_lease_active(scope: object, context: object) -> bool:
+    held = _held_retained_lease.get()
+    return bool(held and held[0] is scope and held[1] is context and held[3][0])
+
+
 class _RetainedResultReceipt:
     """One invocation's host-observed output under the live retained lease."""
 
     def __init__(self, tool: str, context: Any, scope: RetainedFactoryScope,
                  result: Any, failed: bool, policy: Any,
                  *, execution_id: str, head: str,
-                 lease_identity: tuple[str, str, int, int]) -> None:
+                 lease_identity: tuple[str, str, int, int] | tuple[str, str, int, int, str]) -> None:
         self.tool = tool
         self.context = context
         self.scope = scope
@@ -11306,22 +11372,38 @@ class _RetainedResultReceipt:
         )
 
     def _live_binding(self, context: Any, scope: RetainedFactoryScope, policy: Any) -> bool:
+        if len(self.lease_identity) == 5 and not retained_invocation_lease_active(scope, context):
+            return False
         binding = _retained_checkout_binding(scope)
         return binding == (self.head, self.lease_identity)
 
 
 def _retained_checkout_binding(
     scope: RetainedFactoryScope,
-) -> tuple[str, tuple[str, str, int, int]] | None:
+) -> tuple[str, tuple[str, str, int, int] | tuple[str, str, int, int, str]] | None:
     """Observe the incident's checkout, never a numerically colliding PR lease."""
-    from .repo_tools import retained_factory_subprocess_runner
-    from .worklink.retained_scope import retained_factory_effect_lease
+    held = _held_retained_lease.get()
+    selected_lease = getattr(selected_policy_registry(), "retained_effect_lease", None)
+    if selected_lease is not None:
+        _owner, lease_callback, retained_factory_subprocess_runner = selected_lease
+    else:
+        from .repo_tools import retained_factory_subprocess_runner
+
+    if held is not None and held[0] is scope and held[3][0]:
+        lease_context = nullcontext(SimpleNamespace(scope=scope))
+    else:
+        if selected_lease is not None:
+            lease_context = lease_callback(Path(os.environ.get("MIMIR_HOME", "")), scope)
+        else:
+            from .worklink.retained_scope import retained_factory_effect_lease
+
+            lease_context = retained_factory_effect_lease(Path(os.environ.get("MIMIR_HOME", "")), scope)
 
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         return None
     try:
-        with retained_factory_effect_lease(Path(home), scope) as lease:
+        with lease_context as lease:
             if lease.scope is not scope:
                 return None
             checkout = Path(scope.sandbox)
@@ -11345,7 +11427,10 @@ def _retained_checkout_binding(
             head = git("rev-parse", "--verify", "HEAD^{commit}")
             if head is None or len(head) != 40 or any(c not in "0123456789abcdef" for c in head.lower()):
                 return None
-            return head.lower(), (str(checkout), scope.scope_id, identity.st_dev, identity.st_ino)
+            anchor = (str(checkout), scope.scope_id, identity.st_dev, identity.st_ino)
+            if held is not None and held[0] is scope and held[3][0]:
+                return head.lower(), (*anchor, held[2])
+            return head.lower(), anchor
     except (OSError, RuntimeError, ValueError, UnicodeError):
         return None
 

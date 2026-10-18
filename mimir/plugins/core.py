@@ -515,9 +515,16 @@ def _tool_factory(module_path: str, name: str):
     return materialize
 
 
-def register_core_tools(registry: PolicyRegistry) -> None:
+def register_core_tools(
+    registry: PolicyRegistry, *, selected_owners: frozenset[str] = frozenset(),
+) -> None:
     """Register core tool policy and lazy runtime factories."""
     from mimir.tool_descriptors import _CORE_DESCRIPTOR_DECLARATIONS, ResultOriginKind
+
+    delegated = (
+        frozenset(core_runtime_names("coding")) | {"worklink_run", "worklink_resume"}
+        if "cultivate" in selected_owners else frozenset()
+    )
 
     flow_by_name = {
         name: flow for flow, names in _FLOWS.items() for name in names
@@ -541,6 +548,8 @@ def register_core_tools(registry: PolicyRegistry) -> None:
         raise ValueError("core runtime factory has no policy declaration")
 
     for name, descriptor in _CORE_DESCRIPTOR_DECLARATIONS.items():
+        if name in delegated:
+            continue
         operation_class = (
             "open" if name in _CATALOG_OPEN else
             "resource_scoped" if name in _CATALOG_RESOURCE else
@@ -600,6 +609,8 @@ def register_core_tools(registry: PolicyRegistry) -> None:
     # Framework aliases and native operations without descriptors still require
     # an explicit IFC decision; they are not candidates for runtime factories.
     for name in sorted(flow_by_name.keys() - _CORE_DESCRIPTOR_DECLARATIONS.keys()):
+        if name in delegated:
+            continue
         operation_class = (
             "open" if name in _CATALOG_OPEN else
             "resource_scoped" if name in _CATALOG_RESOURCE else
@@ -659,6 +670,8 @@ def register_core_tools(registry: PolicyRegistry) -> None:
 
     for tier, names in _TIERS.items():
         for name in names:
+            if name in delegated:
+                continue
             registry.register_capability(
                 name, tier=tier, companions=_COMPANIONS.get(name, ()),
                 legacy_service_sink_tier=_LEGACY_SINK_TIERS.get(name),

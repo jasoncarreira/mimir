@@ -256,6 +256,56 @@ def selected_registry(candidate=None):
     return registry, candidate
 
 
+def test_selected_first_party_worklink_sink_has_bound_service_adapter():
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((selected_candidate(),))
+    registrar = registry.registrar("cultivate")
+    registrar.register_tool(**tool_fields(
+        name="build_job", flow="both", tier="code-execution",
+        sink_category=SinkCategory.SPAWN, sink_destination="worklink",
+        service_sink_adapter="worklink_repo", profiles=("builder",),
+    ))
+    registrar.register_capability("build_job")
+    registrar.register_authority_profile("builder", capabilities=("build_job",))
+    assert registry.freeze().tools["build_job"].service_sink_adapter == "worklink_repo"
+
+
+def test_foreign_provider_cannot_declare_worklink_sink_or_null_forge_payload():
+    registry = PolicyRegistry()
+    plugin = registry.registrar("other")
+    with pytest.raises(PolicyRegistrationError, match="outbound sink requires a callable"):
+        plugin.register_tool(**tool_fields(
+            sink_category=SinkCategory.FORGE, sink_destination="bound_pull_request",
+        ))
+    plugin.register_tool(**tool_fields(
+        name="foreign_spawn", sink_category=SinkCategory.SPAWN,
+        sink_destination="worklink", service_sink_adapter="worklink_repo",
+    ))
+    with pytest.raises(PolicyRegistrationError, match="invalid service sink adapter"):
+        registry.freeze()
+
+
+def test_selected_provider_credential_probes_are_owner_namespaced():
+    registry = PolicyRegistry()
+    candidate = SimpleNamespace(name="example", enabled=True, diagnostic=None)
+    registry.select_plugin_candidates((candidate,))
+    registrar = registry.registrar("example")
+    with pytest.raises(PolicyRegistrationError, match="credential probe"):
+        registrar.register_credential_probe(
+            "GITHUB_TOKEN", "A", ("GITHUB_TOKEN",), "foreign shadow", lambda: (True, "ok"),
+        )
+    registrar.register_credential_probe(
+        "MIMIR_PLUGIN_EXAMPLE_TOKEN", "A", ("MIMIR_PLUGIN_EXAMPLE_TOKEN",),
+        "own token", lambda: (True, "ok"),
+    )
+    with pytest.raises(PolicyRegistrationError, match="duplicate"):
+        registrar.register_credential_probe(
+            "MIMIR_PLUGIN_EXAMPLE_TOKEN", "A", ("MIMIR_PLUGIN_EXAMPLE_TOKEN",),
+            "own token", lambda: (True, "ok"),
+        )
+    assert "MIMIR_PLUGIN_EXAMPLE_TOKEN" in registry.freeze().credential_probes
+
+
 def test_first_party_projection_is_owner_bound_and_frozen():
     registry, candidate = selected_registry()
     registry._project_first_party_memberships(candidate, {
@@ -318,6 +368,9 @@ def test_first_party_projection_rejects_duplicate_selected_owner():
 
 def test_manager_projects_only_selected_first_party_provider(monkeypatch):
     candidate = selected_candidate()
+    from mimir.plugins.core import register_core_tools
+
+    monkeypatch.setattr(manager, "register_core_tools", lambda registry, **_kw: register_core_tools(registry))
 
     class Contributor:
         def register(self, registrar):

@@ -1643,11 +1643,16 @@ async def test_user_turn_saga_query_overlaps_prompt_loaders(
 )
 async def test_server_owned_triggers_reach_live_tool_middleware_with_service_authority(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     trigger: str,
     tool_name: str,
     principal: str,
     allowed: bool,
 ):
+    if tool_name == "worklink_run":
+        # This case proves the retained core flag boundary until coding-policy
+        # retires it; selected-provider dispatch is tested through its real tool.
+        monkeypatch.setenv("MIMIR_PLUGINS", "")
     fake_agent = _ServicePrincipalToolProbeAgent(tool_name)
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
     agent._config.access_control_enforced = True
