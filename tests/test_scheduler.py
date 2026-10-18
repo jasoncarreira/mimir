@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import os
 import shutil
+import subprocess
+import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
@@ -39,6 +42,43 @@ from mimir.scheduler import (
     load_jobs_from_text,
     write_jobs,
 )
+
+
+def test_core_only_startup_has_no_worklink_jobs_or_provider_import() -> None:
+    env = os.environ.copy()
+    env.pop("MIMIR_PLUGINS", None)
+    check = subprocess.run(
+        [sys.executable, "-c", """
+import asyncio
+import os
+import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from mimir.plugins.manager import load_plugins
+from mimir.scheduler import Scheduler
+
+assert 'MIMIR_PLUGINS' not in os.environ
+manager = load_plugins(enable=os.environ.get('MIMIR_PLUGINS', ''))
+assert not manager.plugins
+assert not any(phase == 'configure_jobs' for _, phase in manager.policy.server_hooks)
+with TemporaryDirectory() as directory:
+    async def enqueue(_event):
+        return True
+
+    scheduler = Scheduler(Path(directory) / 'scheduler.yaml', enqueue, policy=manager.policy)
+    scheduler.bind_plugin_jobs(manager.policy.scheduler_jobs.values())
+    scheduler.reload()
+    assert not any(name.startswith('worklink-') or name == 'pr-checkout-lease-reaper'
+                   for name in scheduler.registered_callables())
+    assert not any(job.id.startswith('worklink-') or job.id == 'pr-checkout-lease-reaper'
+                   for job in scheduler._scheduler.get_jobs())
+assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.')
+               for name in sys.modules)
+"""],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert check.returncode == 0, check.stderr
 
 
 @pytest.fixture(autouse=True)
