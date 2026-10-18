@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-from mimir.models import RetainedFactoryScope
+from ..policy import RetainedFactoryScope
 from .dispatch_failures import (
     POLLER_NAME,
     current_failure_record,
