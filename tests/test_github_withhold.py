@@ -167,11 +167,13 @@ def _assert_github_fetch_cache_closed(root: Path) -> None:
     sources = [root / "mimir/tools/forge.py", root / "mimir/pollers.py"]
     sources.extend((root / "mimir/forge").rglob("*.py"))
     sources.extend((root / "mimir/pollers").rglob("*.py"))
-    # Include both shipped GitHub pollers and any future GitHub skill scripts.
-    skills = root / "mimir/optional-skills"
+    # Include both shipped GitHub pollers and any future core GitHub skill scripts.
+    skills = root / "plugins/cultivate/mimir_cultivate/defaults/skills"
     for name in ("github-poller", "github-ci-watch"):
         assert (skills / name / "scripts/poller.py").is_file(), name
     for skill in skills.glob("github-*"):
+        sources.extend(skill.rglob("*.py"))
+    for skill in (root / "mimir/optional-skills").glob("github-*"):
         sources.extend(skill.rglob("*.py"))
     for source in sources:
         # Also catches component-built paths, not just the slash spelling.
@@ -186,8 +188,8 @@ def test_forge_and_github_pollers_do_not_read_fetch_cache() -> None:
     "mimir/tools/forge.py",
     "mimir/forge/nested/client.py",
     "mimir/pollers/nested/github.py",
-    "mimir/optional-skills/github-poller/scripts/poller.py",
-    "mimir/optional-skills/github-ci-watch/scripts/poller.py",
+    "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/scripts/poller.py",
+    "plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/scripts/poller.py",
     "mimir/optional-skills/github-future/scripts/poller.py",
 ])
 @pytest.mark.parametrize("injected_source", [
@@ -200,8 +202,8 @@ def test_fetch_cache_closure_detects_injected_path_spellings(
 ) -> None:
     for required in (
         "mimir/tools/forge.py", "mimir/pollers.py",
-        "mimir/optional-skills/github-poller/scripts/poller.py",
-        "mimir/optional-skills/github-ci-watch/scripts/poller.py",
+        "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/scripts/poller.py",
+        "plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/scripts/poller.py",
     ):
         source = tmp_path / required
         source.parent.mkdir(parents=True, exist_ok=True)

@@ -16,7 +16,8 @@ def _ensure_mimir_import_path() -> None:
     exe = Path(sys.executable)
     venv_root = exe.parent.parent
     script_path = globals().get("__file__")
-    candidates = [Path(script_path).resolve().parents[4]] if script_path else []
+    script = Path(script_path).resolve() if script_path else None
+    candidates = [script.parents[7]] if script is not None and len(script.parents) > 7 else []
     if source_dir := os.environ.get("MIMIR_SOURCE_DIR"):
         candidates.append(Path(source_dir))
     if venv_root.name in {".venv", "venv"}:
@@ -28,6 +29,12 @@ def _ensure_mimir_import_path() -> None:
         while path in sys.path:
             sys.path.remove(path)
         sys.path.insert(0, path)
+        provider = candidate / "plugins" / "cultivate"
+        if (provider / "mimir_cultivate" / "__init__.py").is_file():
+            provider_path = str(provider)
+            while provider_path in sys.path:
+                sys.path.remove(provider_path)
+            sys.path.insert(0, provider_path)
         venv = candidate / ".venv"
         if venv.is_dir():
             for site in sorted((venv / "lib").glob("python*/site-packages")):
@@ -39,12 +46,11 @@ def _ensure_mimir_import_path() -> None:
 
 _ensure_mimir_import_path()
 
-from mimir.coding import coding_enabled
-from mimir.worklink.autonomy import factory_max_concurrent
-from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
-from mimir.worklink.claims import WORKLINK_EPIC_LABEL, scope_active_worklink_lock_ids
-from mimir.worklink.continuation import consume_worklink_budget_continuations
-from mimir.worklink.dispatch_failures import (
+from mimir_cultivate.worklink.autonomy import factory_max_concurrent
+from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
+from mimir_cultivate.worklink.claims import WORKLINK_EPIC_LABEL, scope_active_worklink_lock_ids
+from mimir_cultivate.worklink.continuation import consume_worklink_budget_continuations
+from mimir_cultivate.worklink.dispatch_failures import (
     POLLER_NAME,
     _validate_merge_reconciliations,
     delivery_receipt_exists,
@@ -56,7 +62,7 @@ from mimir.worklink.dispatch_failures import (
     pending_failure_alerts,
     record_failure,
 )
-from mimir.worklink.detached_dispatch import launch_detached_worklink
+from mimir_cultivate.worklink.detached_dispatch import launch_detached_worklink
 
 
 READY_LABEL = "worklink:ready"
@@ -338,7 +344,6 @@ def _dispatch(
     leaf_cap: int,
     factory_cap: int,
 ) -> bool:
-    effective_coding_enabled = coding_enabled()
     log_path = state_dir / f"{item.command}-{item.issue_id}.log"
     try:
         launch_detached_worklink(
@@ -366,7 +371,6 @@ def _dispatch(
                 "signal": "worklink_dispatch_failed",
                 "issue_id": item.issue_id,
                 "reason": str(exc),
-                "coding_enabled": effective_coding_enabled,
             }
         )
         return False
@@ -379,7 +383,6 @@ def _dispatch(
             "active_before": active,
             "cap": leaf_cap,
             "factory_cap": factory_cap,
-            "coding_enabled": effective_coding_enabled,
         }
     )
     return True

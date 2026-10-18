@@ -26,8 +26,11 @@ def _run_script(
     (case_dir / "package.json").write_text("{}", encoding="utf-8")
     (case_dir / "package-lock.json").write_text("{}", encoding="utf-8")
     (case_dir / "mimir/optional-skills/existing/tests").mkdir(parents=True)
+    (case_dir / "mimir/optional-skills/existing/tests/test_existing.py").write_text("", encoding="utf-8")
+    (case_dir / "mimir/optional-skills/retired/tests/__pycache__").mkdir(parents=True)
     if plugin:
-        (case_dir / "plugins/cultivate/mimir_cultivate/defaults/optional-skills/moved/tests").mkdir(parents=True)
+        (case_dir / "plugins/cultivate/mimir_cultivate/defaults/skills/moved/tests").mkdir(parents=True)
+        (case_dir / "plugins/cultivate/mimir_cultivate/defaults/skills/moved/tests/test_moved.py").write_text("", encoding="utf-8")
         (case_dir / "plugins/cultivate/pyproject.toml").write_text("", encoding="utf-8")
         (case_dir / "plugins/cultivate/tests").mkdir(exist_ok=True)
 
@@ -90,7 +93,7 @@ def test_full_access_control_matrix(tmp_path: Path) -> None:
         {"command": "uv", "argv": PLUGIN, "access_control": "1", "plugins": "cultivate"},
         {"command": "uv", "argv": [*PLUGIN[:3], *CORE[2:], "mimir/optional-skills/existing/tests"],
          "access_control": None, "plugins": None},
-        {"command": "uv", "argv": [*PLUGIN[:3], *CORE[2:], "plugins/cultivate/mimir_cultivate/defaults/optional-skills/moved/tests"],
+        {"command": "uv", "argv": [*PLUGIN[:3], *CORE[2:], "plugins/cultivate/mimir_cultivate/defaults/skills/moved/tests"],
          "access_control": None, "plugins": None},
         *({"command": "npm", "argv": argv, "access_control": "inherited", "plugins": "inherited"}
           for argv in (["ci"], ["run", "test"], ["run", "build"])),

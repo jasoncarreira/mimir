@@ -22,9 +22,18 @@ if [ -f plugins/cultivate/pyproject.toml ]; then
 fi
 
 for suite in mimir/optional-skills/*/tests \
-    plugins/cultivate/mimir_cultivate/defaults/optional-skills/*/tests \
-    plugins/cultivate/optional-skills/*/tests; do
+    plugins/cultivate/mimir_cultivate/defaults/skills/*/tests; do
     if [ -d "$suite" ]; then
+        has_tests=false
+        for test_file in "$suite"/test_*.py; do
+            if [ -f "$test_file" ]; then
+                has_tests=true
+                break
+            fi
+        done
+        if [ "$has_tests" = false ]; then
+            continue
+        fi
         if [ -f plugins/cultivate/pyproject.toml ]; then
             env -u MIMIR_PLUGINS -u MIMIR_ACCESS_CONTROL_ENFORCED \
                 uv run --locked --all-packages --extra dev --extra bench \

@@ -318,15 +318,10 @@ def test_review_skill_preload_inlines_full_body_when_env_set(monkeypatch, tmp_pa
     assert "After drafting, **submit via `gh pr review`**" in ev["prompt"]
 
 
-def test_review_skill_preload_finds_bundled_builtin_skill(monkeypatch, tmp_path):
-    """``review`` is a BUNDLED skill, so on a real install it lives at
-    ``<home>/.mimir_builtin_skills/review/`` — NOT the operator
-    ``<home>/skills/`` dir. The preload must resolve it there too;
-    checking only ``skills/`` is why it silently no-op'd on mimirbot
-    (chainlink #299 follow-up — the review skill WAS installed, just in
-    the bundled location)."""
+def test_review_skill_preload_finds_provider_default(monkeypatch, tmp_path):
+    """The selected provider seeds its review skill under its own namespace."""
     mimir_home = tmp_path / "home"
-    skill_path = mimir_home / ".mimir_builtin_skills" / "review" / "SKILL.md"
+    skill_path = mimir_home / "skills" / "cultivate-review" / "SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.write_text(
         "---\nname: review\n---\n# PR Review\nBUNDLED REVIEW BODY.",

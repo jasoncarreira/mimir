@@ -56,9 +56,6 @@ CRITICAL_RUNTIME_DATA = (
     "mimir/skills/chainlink/dockerfile.fragment",  # chainlink scaffold fragment
     "mimir/skills/tool-pin-drift/scripts/check_tool_pins.py",  # declared immutable drift script
     "mimir/skills/tool-pin-drift/scripts/targets.json",  # source-controlled drift inventory
-    "mimir/optional-skills/chainlink-orchestrator/SKILL.md",  # Worklink planner skill (opt-in)
-    "mimir/optional-skills/chainlink-orchestrator/scripts/poller.py",  # ready-queue poller (#444)
-    "mimir/optional-skills/chainlink-orchestrator/pollers.json",
     "mimir/optional-skills/dependency-advisory-watch/SKILL.md",  # OSV dependency advisory poller (opt-in)
     "mimir/optional-skills/dependency-advisory-watch/scripts/poller.py",  # poller entry point
     "mimir/optional-skills/dependency-advisory-watch/pollers.json",  # poller manifest

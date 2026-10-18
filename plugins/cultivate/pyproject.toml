@@ -18,11 +18,13 @@ cultivate = "mimir_cultivate:provider"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mimir_cultivate"]
+exclude = ["mimir_cultivate/defaults/skills/**"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "LICENSE" = "mimir_cultivate/LICENSE"
 "brand/LICENSE" = "mimir_cultivate/brand/LICENSE"
 "mimir-plugin.toml" = "mimir_cultivate/mimir-plugin.toml"
+"mimir_cultivate/defaults/skills" = "mimir_cultivate/defaults/skills"
 
 [tool.hatch.build.targets.sdist]
 include = ["pyproject.toml", "LICENSE", "brand/LICENSE", "mimir-plugin.toml", "mimir_cultivate/**/*"]

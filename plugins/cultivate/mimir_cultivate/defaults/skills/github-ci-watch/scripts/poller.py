@@ -36,7 +36,8 @@ from pathlib import Path
 
 def _ensure_mimir_import_path() -> None:
     """Resolve the shared package for source and installed-skill entrypoints."""
-    candidates = [Path(__file__).resolve().parents[4]]
+    script = Path(__file__).resolve()
+    candidates = [script.parents[7]] if len(script.parents) > 7 else []
     if source_dir := os.environ.get("MIMIR_SOURCE_DIR"):
         candidates.append(Path(source_dir))
     venv_root = Path(sys.executable).parent.parent
@@ -49,6 +50,12 @@ def _ensure_mimir_import_path() -> None:
         while path in sys.path:
             sys.path.remove(path)
         sys.path.insert(0, path)
+        provider = candidate / "plugins" / "cultivate"
+        if (provider / "mimir_cultivate" / "__init__.py").is_file():
+            provider_path = str(provider)
+            while provider_path in sys.path:
+                sys.path.remove(provider_path)
+            sys.path.insert(0, provider_path)
         # System-python poller commands also need the checkout's runtime deps.
         for site in sorted((candidate / ".venv" / "lib").glob("python*/site-packages")):
             if str(site) not in sys.path:
@@ -57,8 +64,8 @@ def _ensure_mimir_import_path() -> None:
 
 
 _ensure_mimir_import_path()
-from mimir.ci_logs import LOG_EXCERPT_BYTES, capture_job_log, clean_log_tail as _clean_log_tail
-from mimir.ci_attention import classify_cancelled_run
+from mimir_cultivate.ci import LOG_EXCERPT_BYTES, capture_job_log, clean_log_tail as _clean_log_tail
+from mimir_cultivate.ci import classify_cancelled_run
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 SEEN_FILE = STATE_DIR / "seen_run_ids.json"

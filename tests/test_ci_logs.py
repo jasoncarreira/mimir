@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from io import BytesIO
 import importlib
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -10,10 +11,14 @@ import pytest
 from mimir import ci_logs
 
 
-def test_legacy_helper_is_only_a_shared_import():
-    legacy = importlib.import_module("mimir.optional-skills.github-ci-watch.scripts.ci_logs")
-    assert legacy.capture_job_log is ci_logs.capture_job_log
-    assert legacy.clean_log_tail is ci_logs.clean_log_tail
+def test_cultivate_helper_is_only_a_provider_import():
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Cultivate is not selected")
+    from mimir_cultivate import ci
+
+    legacy = importlib.import_module("mimir_cultivate.defaults.skills.github-ci-watch.scripts.ci_logs")
+    assert legacy.capture_job_log is ci.capture_job_log
+    assert legacy.clean_log_tail is ci.clean_log_tail
 
 
 def capture(monkeypatch, payload, **options):

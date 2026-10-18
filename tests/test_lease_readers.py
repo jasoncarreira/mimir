@@ -61,7 +61,7 @@ def leased_reader(tmp_path, monkeypatch, request):
         canonical="poller:github-activity", trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION,
         capabilities=json.loads((Path(__file__).resolve().parents[1] /
-            "mimir/optional-skills/github-poller/pollers.json").read_text())["pollers"][0]["authority"]["capabilities"],
+            "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json").read_text())["pollers"][0]["authority"]["capabilities"],
         creation_path="test",
     )
     auth = AuthContext(
@@ -299,7 +299,7 @@ def test_shell_refusal_names_only_held_tools(leased_reader, command, restricted)
         parse_service_shell_argv_with_diagnostics,
     )
 
-    manifest = Path(__file__).resolve().parents[1] / "mimir/optional-skills/github-poller/pollers.json"
+    manifest = Path(__file__).resolve().parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json"
     poller = next(
         item for item in json.loads(manifest.read_text())["pollers"]
         if item["name"] == "github-activity"

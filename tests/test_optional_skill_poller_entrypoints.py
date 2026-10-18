@@ -48,15 +48,24 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SKILL_ROOT = _ROOT / "mimir" / "optional-skills"
+_CULTIVATE_SKILLS = _ROOT / "plugins/cultivate/mimir_cultivate/defaults/skills"
 _IMPORT_REPAIR_POLLERS = (
-    _SKILL_ROOT / "chainlink-orchestrator" / "scripts" / "poller.py",
-    _SKILL_ROOT / "github-poller" / "scripts" / "poller.py",
+    _CULTIVATE_SKILLS / "chainlink-orchestrator" / "scripts" / "poller.py",
+    _CULTIVATE_SKILLS / "github-poller" / "scripts" / "poller.py",
 )
+
+
+def _skill_dir(name: str) -> Path:
+    moved = _CULTIVATE_SKILLS / name
+    return moved if moved.is_dir() else _SKILL_ROOT / name
 
 
 def _entrypoints() -> list[tuple[Path, Path]]:
     entries: list[tuple[Path, Path]] = []
-    for manifest in sorted(_SKILL_ROOT.glob("*/pollers.json")):
+    roots = [_SKILL_ROOT]
+    if os.environ.get("MIMIR_PLUGINS") in {"cultivate", "all"}:
+        roots.append(_CULTIVATE_SKILLS)
+    for manifest in sorted(path for root in roots for path in root.glob("*/pollers.json")):
         data = json.loads(manifest.read_text(encoding="utf-8"))
         for poller in data.get("pollers") or []:
             scripts = [Path(token) for token in shlex.split(poller["command"]) if token.endswith(".py")]
@@ -198,7 +207,9 @@ def test_poller_env_reads_are_declared(skill: Path, entrypoint: Path) -> None:
     ("chainlink-orchestrator", "CHAINLINK_BIN"),
 ])
 def test_manifest_env_check_rejects_missing_passthrough(skill_name: str, name: str) -> None:
-    skill = _SKILL_ROOT / skill_name
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Cultivate skill is not selected")
+    skill = _skill_dir(skill_name)
     poller = json.loads((skill / "pollers.json").read_text(encoding="utf-8"))["pollers"][0]
     poller["pass_env"].remove(name)
     with pytest.raises(AssertionError, match=name):
@@ -216,7 +227,9 @@ def test_chainlink_binary_selection_from_manifest(
     skill_name: str, binary: str | None, omit_passthrough: bool, expected: str,
     tmp_path: Path,
 ) -> None:
-    skill = _SKILL_ROOT / skill_name
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Cultivate skill is not selected")
+    skill = _skill_dir(skill_name)
     declared = _manifest_pass_env(skill)
     if omit_passthrough:
         declared.remove("CHAINLINK_BIN")
@@ -261,6 +274,8 @@ def test_import_repair_detects_symlinked_editable_venv(
     poller: Path, tmp_path: Path,
 ) -> None:
     """The lexical venv executable must survive a symlink to the base Python."""
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Cultivate skill is not selected")
     source = tmp_path / "non-default-source"
     (source / "mimir").mkdir(parents=True)
     (source / "mimir" / "__init__.py").write_text("", encoding="utf-8")
@@ -361,10 +376,12 @@ def test_ready_queue_pass_env_carries_every_factory_env_var_mimir_reads() -> Non
     Deriving the expected set from source rather than hard-coding it means a
     knob added later is covered without anyone remembering this file exists.
     """
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Cultivate skill is not selected")
     root = Path(__file__).resolve().parents[1] / "mimir"
     name = re.compile(r"MIMIR_FACTORY_[A-Z0-9_]+\Z")
     read_from_env: set[str] = set()
-    for path in root.rglob("*.py"):
+    for path in (*root.rglob("*.py"), *(_ROOT / "plugins/cultivate/mimir_cultivate/worklink").rglob("*.py")):
         # Parse rather than grep: a regex over source text is quote-style dependent,
         # so a name written with single quotes or containing a digit would be missed
         # and this test would report green on exactly the omission it exists to catch.
@@ -376,7 +393,7 @@ def test_ready_queue_pass_env_carries_every_factory_env_var_mimir_reads() -> Non
     assert read_from_env, "no MIMIR_FACTORY_* names found; the scan is broken, not the config"
 
     manifest = json.loads(
-        (root / "optional-skills" / "chainlink-orchestrator" / "pollers.json").read_text(
+        (_CULTIVATE_SKILLS / "chainlink-orchestrator" / "pollers.json").read_text(
             encoding="utf-8"
         )
     )

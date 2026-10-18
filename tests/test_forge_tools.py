@@ -1547,7 +1547,7 @@ def test_pr_spec_refuses_outsider_pr_and_nonadmin_user(tmp_path, monkeypatch):
 def test_shipped_poller_can_read_only_bound_pr_spec(tmp_path, monkeypatch):
     from mimir.pollers import _parse_poller_authority
 
-    manifest = Path(__file__).parents[1] / "mimir/optional-skills/github-poller/pollers.json"
+    manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json"
     record = json.loads(manifest.read_text())["pollers"][0]
     authority = _parse_poller_authority(
         record["authority"], name=record["name"], persist_dir=tmp_path,
@@ -2259,7 +2259,7 @@ def test_file_content_publishes_author_and_head_attestation(monkeypatch, trusted
 
 @pytest.mark.parametrize("skill", ["github-poller", "github-ci-watch"])
 def test_file_content_granted_in_shipped_poller_manifests(skill):
-    manifest = Path(__file__).parents[1] / "mimir" / "optional-skills" / skill / "pollers.json"
+    manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills" / skill / "pollers.json"
     capabilities = json.loads(manifest.read_text())["pollers"][0]["authority"]["capabilities"]
     assert capabilities.count("pr_file_content") == 1
 
@@ -2274,7 +2274,7 @@ def test_file_content_inventory_and_review_skill():
     assert TOOL_DESCRIPTORS["pr_file_content"].result_origin == (
         ResultOriginKind.EXTERNAL | ResultOriginKind.REPOSITORY
     )
-    skill = Path(__file__).parents[1] / "mimir/skills/review/SKILL.md"
+    skill = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/review/SKILL.md"
     assert "pr_file_content" in skill.read_text()
     assert "raw.githubusercontent.com" not in skill.read_text()
 
@@ -2366,7 +2366,7 @@ def test_job_log_missing_service_capability_denied():
 def test_job_log_shipped_manifests_accepted_with_explicit_grant(tmp_path, skill):
     from mimir.pollers import _parse_poller_authority
 
-    manifest = Path(__file__).parents[1] / "mimir" / "optional-skills" / skill / "pollers.json"
+    manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills" / skill / "pollers.json"
     record = json.loads(manifest.read_text())["pollers"][0]
     authority = _parse_poller_authority(
         record["authority"], name=record["name"], persist_dir=tmp_path,
@@ -3651,7 +3651,7 @@ def test_shipped_poller_reviews_others_with_one_audit_event(
 ) -> None:
     from mimir.pollers import _parse_poller_authority
 
-    manifest = Path(__file__).parents[1] / "mimir/optional-skills/github-poller/pollers.json"
+    manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json"
     record = next(item for item in json.loads(manifest.read_text())["pollers"]
                   if item["name"] == "github-activity")
     if case == "no-grant":
@@ -5183,8 +5183,9 @@ def test_pr_list_is_untrusted_repository_source_without_attestation(monkeypatch,
 
 def test_pr_list_guidance_replaces_shell_listing() -> None:
     skills = Path(__file__).parents[1] / "mimir" / "skills"
-    for name in ("github", "chainlink"):
-        content = (skills / name / "SKILL.md").read_text(encoding="utf-8")
+    cultivate = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
+    for skill in (skills / "chainlink", cultivate / "github"):
+        content = (skill / "SKILL.md").read_text(encoding="utf-8")
         assert "gh pr list" not in content
         assert "pr_list(" in content
 
