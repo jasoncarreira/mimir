@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import StrEnum
 import json
 import os
 from pathlib import Path
@@ -16,6 +15,16 @@ import time
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
+from mimir.models import (
+    RepoPRAction,  # Definition moves here in retire-worklink.
+    RepoPRActionScope,  # Definition moves here in retire-worklink.
+    RepoPRScopeProvenance,  # Definition moves here in retire-worklink.
+    RepoPRScopeRegistry,  # Definition moves here in retire-worklink.
+    RepoReviewState,  # Definition moves here in retire-worklink.
+    RetainedFactoryScope,  # Definition moves here in retire-worklink.
+    ServerDiscoveredPRScopeStore,  # Definition moves here in retire-worklink.
+    ServerDiscoveredPRStates,  # Definition moves here in retire-worklink.
+)
 from mimir.tool_descriptors import (
     ResultOriginKind, SinkCategory, ToolDescriptor, _argument_payload, _generic_target,
 )
@@ -24,17 +33,41 @@ if TYPE_CHECKING:
     from mimir.plugins.registry import PolicyRegistrar
 
 
-class RepoPRAction(StrEnum):
-    INSPECT = "repo.inspect"
-    CHECKOUT = "repo.checkout"
-    TEST = "repo.test"
-    WRITE = "repo.write"
-    COMMIT = "repo.commit"
-    PUSH = "repo.push"
-    PR_COMMENT = "pr.comment"
-    PR_EDIT = "pr.edit"
-    PR_REREQUEST = "pr.rerequest"
-    PR_REVIEW = "pr.review"
+@dataclass(frozen=True)
+class CultivateState:
+    """Owner-scoped turn state; these references alone confer no authority."""
+
+    repo_pr_scope_registry: RepoPRScopeRegistry | None = None
+    repo_review_state: RepoReviewState | None = None
+    repo_pr_action_scope: RepoPRActionScope | None = None
+    server_discovered_pr_states: ServerDiscoveredPRStates | None = None
+    server_discovered_pr_scope_store: ServerDiscoveredPRScopeStore | None = None
+    retained_factory_scope: RetainedFactoryScope | None = None
+    retained_factory_scope_refusal: str | None = None
+    ci_run_targets: frozenset[tuple[str, int]] = frozenset()
+    ci_branch_targets: frozenset[tuple[str, str, int | None]] = frozenset()
+
+    @classmethod
+    def project_trusted_auth(cls, auth: object) -> CultivateState | None:
+        """Copy only host-issued ingress fields, never plugin or tool arguments."""
+        values = {
+            name: object.__getattribute__(auth, name)
+            for name in cls.__dataclass_fields__
+        }
+        service = object.__getattribute__(auth, "service_authority")
+        if (
+            object.__getattribute__(auth, "trigger") == "scheduled_tick"
+            and getattr(service, "authority_profile", None) not in {"github", "heartbeat"}
+            and values["repo_pr_scope_registry"] is None
+            and values["repo_review_state"] is None
+            and values["repo_pr_action_scope"] is None
+            and not getattr(values["server_discovered_pr_states"], "review_states", ())
+            and values["retained_factory_scope"] is None
+            and not values["ci_run_targets"]
+            and not values["ci_branch_targets"]
+        ):
+            return None
+        return cls(**values)
 
 
 def register_action_protocol(registrar: PolicyRegistrar, validate_scope: Callable[..., bool]) -> None:
@@ -208,7 +241,6 @@ def _worklink_target(_name: str, _arguments: dict, _context: object) -> tuple[st
 
 
 def _repo_pr_target(tool_name: str, arguments: dict, context: object) -> tuple[str | None, ...]:
-    from mimir.models import RetainedFactoryScope
     from mimir.plugins.core import selected_policy_registry
 
     tool = selected_policy_registry().tools.get(tool_name)

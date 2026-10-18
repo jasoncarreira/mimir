@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from langchain.tools import ToolRuntime
 from langchain_core.tools import ToolException, tool
 from mimir.models import AuthContext
+from .policy import RetainedFactoryScope
 
 log = logging.getLogger(__name__)
 
@@ -91,7 +92,6 @@ worklink_run.handle_tool_error = True
 @tool
 async def worklink_resume(runtime: ToolRuntime[AuthContext] = None) -> str:
     """Resume only the server-bound retained factory incident for this turn."""
-    from mimir.models import RetainedFactoryScope
     from mimir.tools import registry as core_tools
     from .worklink.autonomy import factory_max_concurrent, make_claims, worklink_priority, worklink_repo
     from .worklink.claims import WORKLINK_EPIC_LABEL
@@ -235,11 +235,14 @@ def _retained_checkout_operation(
 
 class CultivateProvider:
     def register(self, registrar: PolicyRegistrar) -> None:
-        from .policy import register_action_protocol, register_tools, validate_scoped_pr_action
+        from .policy import (
+            CultivateState, register_action_protocol, register_tools, validate_scoped_pr_action,
+        )
         from .forge import github_identity_is_degraded
         from .worklink.continuation import maybe_create_worklink_budget_continuation
         from .worklink.dispatch_failures import is_dispatch_failure_intervention
 
+        registrar.register_state_slot(CultivateState)
         register_action_protocol(registrar, validate_scoped_pr_action)
         register_tools(registrar)
         from .worklink.retained_scope import retained_factory_effect_lease

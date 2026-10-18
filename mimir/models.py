@@ -1791,8 +1791,53 @@ class AuthContext(_AuthContextAuthoritySlot):
         object.__setattr__(self, "_channel_id", channel_id)
         object.__setattr__(self, "_resource_id", resource_id)
         object.__setattr__(self, "_audience_provider", audience_provider)
+        policy = self._plugin_slot_policy
+        if policy is not None and policy.frozen:
+            slots = dict(self.plugin_slots)
+            for owner, slot_type in policy.state_slots.items():
+                if owner not in policy.scoped_actions:
+                    continue
+                project = getattr(slot_type, "project_trusted_auth", None)
+                if project is not None and slot_type.__dataclass_fields__.keys() <= self.__dataclass_fields__.keys():
+                    state = project(self)
+                    if state is None:
+                        slots.pop(owner, None)
+                        continue
+                    if type(state) is not slot_type:
+                        raise TypeError("registered state projection returned the wrong type")
+                    slots[owner] = state
+            object.__setattr__(self, "plugin_slots", tuple(sorted(slots.items())))
 
     def __getattribute__(self, name: str) -> Any:
+        # A selected owner's state is projected from trusted ingress. It cannot
+        # override the host-issued fields via with_plugin_state or a tool result.
+        if name in {
+            "repo_pr_scope_registry", "repo_review_state", "repo_pr_action_scope",
+            "server_discovered_pr_states", "server_discovered_pr_scope_store",
+            "retained_factory_scope", "retained_factory_scope_refusal",
+            "ci_run_targets", "ci_branch_targets",
+        }:
+            policy = object.__getattribute__(self, "_plugin_slot_policy")
+            if policy is None or not policy.state_slots:
+                return object.__getattribute__(self, name)
+            if policy.frozen:
+                slots = dict(object.__getattribute__(self, "plugin_slots"))
+                for owner, slot_type in policy.state_slots.items():
+                    if (owner not in policy.scoped_actions
+                            or not hasattr(slot_type, "project_trusted_auth")
+                            or name not in slot_type.__dataclass_fields__
+                            or not slot_type.__dataclass_fields__.keys() <= type(self).__dataclass_fields__.keys()):
+                        continue
+                    state = slots.get(owner)
+                    fields = slot_type.__dataclass_fields__
+                    if type(state) is not slot_type or any(
+                        (getattr(state, key) != object.__getattribute__(self, key)
+                         if key in {"ci_run_targets", "ci_branch_targets", "retained_factory_scope_refusal"}
+                         else getattr(state, key) is not object.__getattribute__(self, key))
+                        for key in fields
+                    ):
+                        return frozenset() if name in {"ci_run_targets", "ci_branch_targets"} else None
+                    return getattr(state, name)
         hidden = {
             "audience_provider": "_audience_provider",
             "canonical_principal": "_canonical_principal",
