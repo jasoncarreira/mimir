@@ -14,12 +14,28 @@ import shutil
 import stat
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from mimir import output_capture
-from mimir.worklink import evidence as ev
-from mimir.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
+from mimir.plugins.core import policy_scope
+from mimir.plugins.manager import load_plugins
+
+if os.environ.get("MIMIR_PLUGINS") != "cultivate":
+    pytest.skip("Cultivate gate retention requires selected provider", allow_module_level=True)
+
+ev = pytest.importorskip("mimir_cultivate.worklink.evidence")
+compute_module = pytest.importorskip("mimir_cultivate.worklink.compute")
+ComputeResult, LaunchHandle, WorkSpec = (
+    compute_module.ComputeResult, compute_module.LaunchHandle, compute_module.WorkSpec,
+)
+
+
+@pytest.fixture(autouse=True)
+def selected_cultivate():
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -290,16 +306,53 @@ def test_gate_tmp_parent_walk_avoids_group_writable_checkout(tmp_path):
 
 
 async def observe(tmp_path, runner, **kwargs):
+    backend = kwargs.pop("backend", "opencode")
+    work = replace(spec(tmp_path), backend=backend, local_checkout=tmp_path)
+    compute = kwargs.pop("compute", None)
+    if compute is None:
+        class AuthorizedCompute:
+            name = "local_subprocess"
+            _authorized_checkout = SimpleNamespace(
+                path=tmp_path, issue_id=1754, attempt=4,
+                verify=lambda checkout: None, duplicate_fd=lambda: None,
+            )
+
+            async def _launch_contained(self, gate_spec, command):
+                invocation = shlex.join(["env", f"PYTEST_ADDOPTS={gate_spec.env.get('PYTEST_ADDOPTS', '')}", *command[2:]])
+                self.result = runner(invocation, cwd=tmp_path)
+                return LaunchHandle("local_subprocess", "gate")
+
+            async def wait(self, handle, timeout):
+                return ComputeResult(self.result.returncode, self.result.stdout, self.result.stderr)
+
+            async def cleanup(self, handle):
+                pass
+
+        compute = AuthorizedCompute()
+    _authorize_compute(compute, tmp_path, issue=1754, attempt=4)
     return await ev.observe_evidence(
-        issue=1754, attempt=4, backend=kwargs.pop("backend", "codex"), branch="branch",
+        issue=1754, attempt=4, backend=backend, branch="branch",
         checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
         backend_status="completed", test_command="pytest -q", runner=runner,
-        work_spec=spec(tmp_path), **kwargs,
+        work_spec=work, compute=compute, **kwargs,
     )
 
 
 def git_result(command):
     return subprocess.CompletedProcess(command, 0, "changed.py\n" if "--name-only" in command else "", "")
+
+
+def _authorize_compute(compute, checkout, *, issue, attempt):
+    compute.name = "local_subprocess"
+    compute._authorized_checkout = SimpleNamespace(
+        path=checkout, issue_id=issue, attempt=attempt,
+        verify=lambda path: None, duplicate_fd=lambda: None,
+    )
+    if not hasattr(compute, "_launch_contained"):
+        async def contained(work, command):
+            assert command == tuple(work.local_argv)
+            return await compute.launch(work)
+        compute._launch_contained = contained
 
 
 @pytest.mark.asyncio
@@ -309,8 +362,10 @@ async def test_run_gate_retains_initial_and_passing_rerun_before_cleanup(tmp_pat
     def runner(command, **kwargs):
         if not isinstance(command, str):
             return git_result(command)
-        options = shlex.split(shlex.split(command)[0].split("=", 1)[1])
+        options = shlex.split(shlex.split(command)[1].split("=", 1)[1])
         directory = Path(next(item.split("=", 1)[1] for item in options if item.startswith("--junitxml="))).parent
+        if not directory.is_absolute():
+            directory = tmp_path / directory
         reports.append(directory)
         report(directory, failed=len(reports) == 1)
         return subprocess.CompletedProcess(command, int(len(reports) == 1), "complete gate output", "")
@@ -346,6 +401,10 @@ class ExportCompute:
         self.checkout = checkout
         self.failure = failure
         self.specs = []
+
+    async def _launch_contained(self, work, command):
+        assert command == tuple(work.local_argv)
+        return await self.launch(work)
 
     async def launch(self, work):
         self.specs.append(work)
@@ -526,7 +585,6 @@ async def test_retention_entrypoint_exception_cannot_escape_run_gate(tmp_path, m
 
 @pytest.mark.asyncio
 async def test_true_compute_exception_is_not_a_retention_failure(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
     with pytest.raises(RuntimeError, match="gate execution"):
         await observe(
             tmp_path, lambda command, **kwargs: git_result(command), backend="opencode",
@@ -595,18 +653,29 @@ async def test_real_pytest_sidecars_are_retained_and_temp_directory_removed(tmp_
     )
     directories = []
 
-    def runner(command, **kwargs):
-        if not isinstance(command, str):
-            return git_result(command)
-        options = shlex.split(shlex.split(command)[0].split("=", 1)[1])
-        directories.append(Path(next(arg.split("=", 1)[1] for arg in options if arg.startswith("--basetemp="))))
-        return ev._run(command, **kwargs)
+    class Compute(ExportCompute):
+        async def wait(self, handle, timeout):
+            work = self.specs[-1]
+            if "PYTEST_ADDOPTS" not in work.env:
+                return await super().wait(handle, timeout)
+            options = shlex.split(work.env["PYTEST_ADDOPTS"])
+            directories.append(Path(next(arg.split("=", 1)[1] for arg in options if arg.startswith("--basetemp="))))
+            process = subprocess.run(
+                work.local_argv, cwd=tmp_path, env={**os.environ, **work.env},
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return ComputeResult(process.returncode, process.stdout, process.stderr)
 
+    compute = Compute(tmp_path)
+    _authorize_compute(compute, tmp_path, issue=1754, attempt=4)
     result = await ev.observe_evidence(
-        issue=1754, attempt=4, backend="codex", branch="branch", checkout=tmp_path,
+        issue=1754, attempt=4, backend="opencode", branch="branch", checkout=tmp_path,
         started_at=datetime.now(UTC), base_ref="main", backend_status="completed",
         test_command=shlex.join([sys.executable, "-m", "pytest", "-q", "test_sample.py"]),
-        runner=runner, work_spec=spec(tmp_path), gate_rerun_max_failures=0,
+        runner=lambda command, **kwargs: git_result(command),
+        work_spec=replace(spec(tmp_path), backend="opencode", local_checkout=tmp_path,
+                          test_command=shlex.join([sys.executable, "-m", "pytest", "-q", "test_sample.py"])),
+        compute=compute, gate_rerun_max_failures=0,
     )
     test = result.evidence.tests
     assert test.exit_code == 1
@@ -665,14 +734,16 @@ async def test_compute_gate_group_writable_checkout_real_pytest_xdist(tmp_path, 
             assert tree.stat().st_mode & 0o777 == 0o700
             return ComputeResult(process.returncode, process.stdout, process.stderr)
 
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
     compute = Compute(checkout)
+    _authorize_compute(compute, checkout, issue=1760, attempt=1)
     result = await ev.observe_evidence(
         issue=1760, attempt=1, backend="opencode", branch="branch", checkout=checkout,
         started_at=datetime.now(UTC), base_ref="main", backend_status="completed",
         test_command=shlex.join([sys.executable, "-m", "pytest", "-q", "-n", "6"]),
         runner=lambda command, **kwargs: git_result(command),
-        work_spec=replace(spec(tmp_path), timeout_s=60), compute=compute,
+        work_spec=replace(spec(tmp_path), issue_id=1760, attempt=1, local_checkout=checkout,
+                          timeout_s=60, test_command=shlex.join([sys.executable, "-m", "pytest", "-q", "-n", "6"])),
+        compute=compute,
         gate_rerun_max_failures=0,
     )
     test = result.evidence.tests
@@ -1058,45 +1129,30 @@ async def test_manifest_source_names_are_redacted(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("worker", [False, True])
-async def test_tmp_cleanup_failure_preserves_passing_gate(tmp_path, monkeypatch, worker):
+async def test_tmp_cleanup_failure_preserves_passing_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(ev.log, "warning", _fail_log)
     def runner(command, **kwargs):
         if not isinstance(command, str):
             return git_result(command)
         return subprocess.CompletedProcess(command, 0, "passed", "")
 
-    if worker:
-        monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    class Compute:
+        async def launch(self, work):
+            self.work = work
+            return LaunchHandle("test", "cleanup")
 
-        class Compute:
-            async def launch(self, work):
-                self.work = work
-                return LaunchHandle("test", "cleanup")
+        async def wait(self, handle, timeout):
+            if "import shutil" in self.work.local_argv[-1]:
+                return ComputeResult(1, "", "cleanup failed")
+            options = shlex.split(self.work.env["PYTEST_ADDOPTS"])
+            path = next(word.split("=", 1)[1] for word in options if word.startswith("--basetemp="))
+            (tmp_path / path).mkdir()
+            return ComputeResult(0, "passed", "")
 
-            async def wait(self, handle, timeout):
-                if "import shutil" in self.work.local_argv[-1]:
-                    return ComputeResult(1, "", "cleanup failed")
-                options = shlex.split(self.work.env["PYTEST_ADDOPTS"])
-                path = next(word.split("=", 1)[1] for word in options if word.startswith("--basetemp="))
-                (tmp_path / path).mkdir()
-                return ComputeResult(0, "passed", "")
+        async def cleanup(self, handle):
+            pass
 
-            async def cleanup(self, handle):
-                pass
-
-        kwargs = {"backend": "opencode", "compute": Compute()}
-    else:
-        rmtree = ev.shutil.rmtree
-
-        def fail(path, *args, **kwargs):
-            if str(path).endswith("-tmp"):
-                raise PermissionError("private tmp cleanup failed")
-            return rmtree(path, *args, **kwargs)
-
-        monkeypatch.setattr(ev.shutil, "rmtree", fail)
-        kwargs = {}
-    result = await observe(tmp_path, runner, **kwargs)
+    result = await observe(tmp_path, runner, compute=Compute())
     assert result.review_ready
     assert result.evidence.tests.retention_truncated
     assert result.evidence.tests.retention_error == "tmp_cleanup_failed"

@@ -461,6 +461,26 @@ def _factory(module: str, name: str) -> Callable[[], object]:
 
 def register_tools(registrar: PolicyRegistrar) -> None:
     """Install the moved tool implementations on the selected policy before freeze."""
+    from mimir.plugins.registry import PolicyConsumerHooks
+    from . import forge, repository, review_guard
+    from .worklink.retained_scope import derive_retained_factory_scope
+
+    registrar.register_policy_consumer_hooks(PolicyConsumerHooks(
+        owner="cultivate", resolve_review=forge.resolve_review_state_for_context,
+        revalidate_head=forge.revalidate_review_head_for_context,
+        resolve_issue=forge.resolve_issue_comment_target,
+        superseded_push=repository.was_superseded_by_own_push,
+        derive_retained_scope=derive_retained_factory_scope,
+        active_checkout=repository.active_pr_checkout_lease_for_path,
+        git_command=repository.hardened_git_command,
+        protected_refs=repository._PROTECTED_BRANCH_REFS,
+        lineage=repository._recorded_lineage,
+        verified_base=repository._recorded_verified_base,
+        git_binary=repository._DEFAULT_GIT, git_config=repository._BASE_CONFIG,
+        git_env=repository._sanitized_git_env, lease_metadata=repository._METADATA,
+        review_submission=review_guard.review_submission_from_request,
+        claim_review=review_guard.claim_review_submission,
+    ))
     for name, declaration in sorted(_TOOL_DECLARATIONS.items()):
         descriptor = declaration.descriptor
         module = (

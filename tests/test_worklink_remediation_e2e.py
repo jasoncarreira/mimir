@@ -383,11 +383,13 @@ async def test_selected_retained_tools_keep_one_live_lease_through_result_classi
         tool_call_id="retained-call", store=None,
     )
     captured = []
+    authorizations = []
     original_capture = budget_gate._capture_retained_result
 
     def capture(call, execution, observed_scope, result):
         original_capture(call, execution, observed_scope, result)
         captured.append(execution.retained_receipt)
+        authorizations.append(call.authorization)
 
     monkeypatch.setattr(budget_gate, "_capture_retained_result", capture)
     invoked = []
@@ -420,6 +422,68 @@ async def test_selected_retained_tools_keep_one_live_lease_through_result_classi
     assert len(receipt.lease_identity) == 5
     assert receipt.execution_id != receipt.lease_identity[-1]
     assert not ac.retained_invocation_lease_active(scope, auth)
+    with policy_scope(selected):
+        replay = ac.classify_protected_result(
+            name, arguments, auth, authorizations[0], result=output,
+            retained_receipt=receipt,
+        )
+    assert replay is not None
+    assert all(source.integrity == "untrusted" for source in replay.sources)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("enforced", [False, True])
+@pytest.mark.parametrize("mutation", ["wrong_resource", "forged_service", "missing_scope", "stale_lease"])
+async def test_selected_retained_middleware_refuses_unissued_authority_before_handler(
+    remediation_case, monkeypatch, asynchronous, enforced, mutation,
+):
+    from contextlib import contextmanager
+    from langchain.agents.middleware import ToolCallRequest
+    from langgraph.runtime import Runtime
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    _event, _labels, issued = await _trusted_turn(remediation_case)
+    scope = issued.retained_factory_scope
+    assert scope is not None
+    selected = load_plugins(enable="cultivate").policy
+    auth = replace(issued, enforcement_enabled=enforced)
+    arguments = {"repository": scope.repository, "pull_request": scope.issue_id}
+    if mutation == "wrong_resource":
+        arguments["pull_request"] += 1
+    elif mutation == "forged_service":
+        auth = replace(auth, service_authority=None)
+    elif mutation == "missing_scope":
+        auth = replace(auth, retained_factory_scope=None)
+    else:
+        owner, _lease, runner = selected.retained_effect_lease
+
+        @contextmanager
+        def stale_lease(_home, _scope):
+            yield SimpleNamespace(scope=None, refusal_reason="retained lease changed")
+
+        monkeypatch.setattr(selected, "_retained_effect_lease", (owner, stale_lease, runner))
+    request = ToolCallRequest(
+        tool_call={"name": "repo_status", "args": arguments, "id": "retained-denied", "type": "tool_call"},
+        tool=selected.tools["repo_status"].factory(), state=None,
+        runtime=Runtime(context=auth),
+    )
+    executed = []
+
+    def handler(_request):
+        executed.append(True)
+        return ToolMessage(content="should not execute", tool_call_id="retained-denied")
+
+    async def async_handler(tool_request):
+        return handler(tool_request)
+
+    gate = BudgetGateMiddleware(selected)
+    output = (
+        await gate.awrap_tool_call(request, async_handler)
+        if asynchronous else await asyncio.to_thread(gate.wrap_tool_call, request, handler)
+    )
+    assert output.status == "error"
+    assert not executed
 
 
 @pytest.mark.asyncio

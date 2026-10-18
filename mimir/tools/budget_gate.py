@@ -298,17 +298,19 @@ def _resolve_standing_review(
         return None
     selected = policy if policy is not None else selected_policy_registry()
     registered = selected.tools.get(tool_name)
-    if registered is not None and registered.owner != "core" and registered.factory is not None:
-        from importlib import import_module
+    hooks = selected.policy_consumer_hooks
+    if registered is not None and hooks is not None and registered.owner == hooks.owner:
+        resolve_review_state_for_context = hooks.resolve_review
+        revalidate_review_head_for_context = hooks.revalidate_head
+    elif registered is not None and registered.owner == getattr(selected, "_projected_owner", None):
+        return "repository review provider unavailable"
+    elif registered is not None and registered.owner != "core":
+        from ..access_control import resolve_registered_review_state
 
-        provider = import_module(registered.factory.__module__)
-        resolve_review_state_for_context = getattr(provider, "resolve_review_state_for_context", None)
-        revalidate_review_head_for_context = getattr(provider, "revalidate_review_head_for_context", None)
-        if not callable(resolve_review_state_for_context) or not callable(revalidate_review_head_for_context):
-            from .forge import (
-                revalidate_review_head_for_context,
-                resolve_review_state_for_context,
-            )
+        resolve_review_state_for_context = resolve_registered_review_state
+        if tool_name == "pr_submit_review":
+            return "repository review head validator unavailable"
+        revalidate_review_head_for_context = None
     else:
         from .forge import (
             revalidate_review_head_for_context,
@@ -3932,9 +3934,29 @@ def _prepare_tool_call_execution(
 
 
 def _review_submission_for_call(call: _PreparedToolCall) -> Any:
+    selected = call.policy if call.policy is not None else selected_policy_registry()
+    hooks = selected.policy_consumer_hooks
+    if hooks is not None:
+        return hooks.review_submission(call.execution_request)
+    if getattr(selected, "_projected_owner", None) is not None and call.tool_name in {
+        "shell_exec", "bash_async", "Bash", "bash",
+    }:
+        raise ToolException("selected review submission guard unavailable")
     from .github_review_guard import review_submission_from_request
 
     return review_submission_from_request(call.execution_request)
+
+
+def _claim_review_submission_for_call(call: _PreparedToolCall, spec: Any) -> Any:
+    selected = call.policy if call.policy is not None else selected_policy_registry()
+    hooks = selected.policy_consumer_hooks
+    if hooks is not None:
+        return hooks.claim_review(spec)
+    if getattr(selected, "_projected_owner", None) is not None:
+        raise ToolException("selected review submission guard unavailable")
+    from .github_review_guard import claim_review_submission
+
+    return claim_review_submission(spec)
 
 
 def _begin_tool_execution(
@@ -4546,9 +4568,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
-                from .github_review_guard import claim_review_submission
-
-                capture.review_claim = claim_review_submission(review_spec)
+                capture.review_claim = _claim_review_submission_for_call(call, review_spec)
             result = _begin_tool_execution(call, capture)
             if result is None:
                 permission_denial = _request_permission_sync(
@@ -4673,10 +4693,8 @@ class BudgetGateMiddleware(AgentMiddleware):
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
-                from .github_review_guard import claim_review_submission
-
                 capture.review_claim = await _claim_review_submission_async(
-                    lambda: claim_review_submission(review_spec)
+                    lambda: _claim_review_submission_for_call(call, review_spec)
                 )
             result = _begin_tool_execution(call, capture)
             if result is None:

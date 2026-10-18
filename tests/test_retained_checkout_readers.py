@@ -170,6 +170,10 @@ async def exercise_real_worklink_failure_turn(
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{external}:ro")
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+    if selected_provider:
+        from mimir_cultivate.worklink import worker_client as provider_worker_client
+
+        monkeypatch.setattr(provider_worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
 
     skills = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
     ready = next(

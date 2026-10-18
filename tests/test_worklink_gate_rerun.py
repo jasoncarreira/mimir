@@ -3,16 +3,61 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
-from mimir.worklink.compute import ComputeResult, LaunchHandle, WorkSpec, _enabled_child_env
-from mimir.worklink.evidence import _gate_tmp_directory, observe_evidence
-from tests.test_worklink_evidence import _init_gate_repo
+from mimir.plugins.core import policy_scope
+from mimir.plugins.manager import load_plugins
+
+if os.environ.get("MIMIR_PLUGINS") != "cultivate":
+    pytest.skip("Cultivate gate reruns require selected provider", allow_module_level=True)
+
+compute_module = pytest.importorskip("mimir_cultivate.worklink.compute")
+evidence = pytest.importorskip("mimir_cultivate.worklink.evidence")
+ComputeResult, LaunchHandle, WorkSpec, _enabled_child_env = (
+    compute_module.ComputeResult, compute_module.LaunchHandle,
+    compute_module.WorkSpec, compute_module._enabled_child_env,
+)
+_gate_tmp_directory, observe_evidence = evidence._gate_tmp_directory, evidence.observe_evidence
+
+
+@pytest.fixture(autouse=True)
+def selected_cultivate():
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+def _init_gate_repo(tmp_path: Path, test_source: str) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+    (repo / "test_gate_sample.py").write_text(test_source, encoding="utf-8")
+    return repo
+
+
+def _authorized(compute, checkout: Path):
+    compute.name = "local_subprocess"
+    compute._authorized_checkout = SimpleNamespace(
+        path=checkout, issue_id=1557, attempt=1,
+        verify=lambda path: None, duplicate_fd=lambda: None,
+    )
+    async def launch(work, command):
+        assert command == tuple(work.local_argv)
+        return await compute.launch(work)
+
+    compute._launch_contained = launch
+    return compute
 
 
 @pytest.mark.asyncio
@@ -64,12 +109,12 @@ async def test_enabled_gate_rerun_preserves_compute_spec(tmp_path, monkeypatch):
         def run(self, *args):
             return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
 
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    worker = _authorized(Compute(), repo)
     result = await observe_evidence(
         issue=1557, attempt=1, backend="opencode", branch=spec.branch,
         checkout=repo, started_at=datetime.now(UTC), base_ref="main",
         backend_status="completed", test_command=command, work_spec=spec,
-        compute=Compute(), safe_git=Publication(),
+        compute=worker, safe_git=Publication(),
         on_gate_launch=lambda handle: events.append(("callback", handle)),
     )
 
@@ -124,12 +169,31 @@ def test_passes():
 ''')
     (repo / "pytest.ini").write_text("[pytest]\naddopts = -W error -n 2\n")
     monkeypatch.setenv("PYTEST_ADDOPTS", "-n 2")
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "false")
+    command = f"{shlex.quote(sys.executable)} -m pytest -q test_gate_sample.py"
+
+    class Compute:
+        async def launch(self, work):
+            self.work = work
+            return LaunchHandle("local_subprocess", "gate")
+
+        async def wait(self, handle, timeout):
+            process = subprocess.run(
+                self.work.local_argv, cwd=repo, env={**os.environ, **self.work.env},
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return ComputeResult(process.returncode, process.stdout, process.stderr)
+
+        async def cleanup(self, handle):
+            pass
+
     result = await observe_evidence(
         issue=1557, attempt=1, backend="opencode", branch="issue/1557-a1",
         checkout=repo, started_at=datetime.now(UTC), base_ref="main",
         backend_status="completed",
-        test_command=f"{shlex.quote(sys.executable)} -m pytest -q test_gate_sample.py",
+        test_command=command,
+        compute=_authorized(Compute(), repo),
+        work_spec=WorkSpec(1557, 1, "url", "main", "issue/1557-a1", "prompt", None,
+                           command, "opencode", 37, local_checkout=repo),
     )
 
     tests = result.evidence.tests
