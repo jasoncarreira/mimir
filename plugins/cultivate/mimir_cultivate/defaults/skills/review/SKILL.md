@@ -1,11 +1,11 @@
 ---
-name: review
+name: cultivate-review
 description: Review a pull request and POST the review to GitHub via `pr_submit_review` on service turns or `gh pr review` on interactive turns. Always submit after drafting.
 ---
 
 <!-- desc: Review a pull request and submit via pr_submit_review or gh pr review. -->
 
-# PR Review
+# Cultivate PR Review
 
 Read the diff, draft a verdict, and **submit via `pr_submit_review` on service
 turns or `gh pr review` on interactive operator turns**. The
@@ -217,7 +217,7 @@ and your verdict.
 
 ## Poller-triggered reviews
 
-When this skill fires from `poller:github-activity`, the trigger includes
+When `/cultivate-review` fires from `poller:github-activity`, the trigger includes
 the PR number and repo. There is no human watching the turn output — the
 only way the review reaches the operator (and other contributors) is via
 `pr_submit_review`. Apply the typed-tool steps above; the poller context changes

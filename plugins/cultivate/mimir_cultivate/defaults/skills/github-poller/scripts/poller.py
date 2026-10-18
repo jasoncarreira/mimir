@@ -807,7 +807,7 @@ _REVIEW_SUBMISSION_RULE = (
     "paths with `read_file` (offset/limit for a line range) or bounded "
     "`grep` before_context/after_context; shell slicing forms and direct `curl` "
     "are intentionally refused because they bypass the bounded file/egress tools. "
-    "/review skill spells out the full flow; this rule is restated "
+    "/cultivate-review skill spells out the full flow; this rule is restated "
     "here so it's present in your context before the Skill call "
     "fires."
 )
@@ -838,7 +838,7 @@ _REVIEW_EXPECTED_TOOL_CALL: dict = {
         "mcp__claude_ai_GitHub_remote__submit_pending_pull_request_review",
     ],
     "bash_substrings": [
-        # /review skill's documented path. Trailing space discriminates
+        # /cultivate-review skill's documented path. Trailing space discriminates
         # from ``gh pr review-comment`` (the standalone-comment
         # subcommand), which is NOT a review submission — Mimir's PR
         # #236 review nit.
@@ -903,13 +903,7 @@ def _load_review_skill_body(mimir_home: str, skill_path_override: str = "") -> s
         candidates = [override]
     elif mimir_home:
         home = Path(mimir_home)
-        # mimir resolves skills from two locations, operator-first:
-        # ``<home>/skills/`` (operator-installed) then
-        # ``<home>/.mimir_builtin_skills/`` (the bundled refresh target).
-        candidates = [
-            str(home / "skills" / "review" / "SKILL.md"),
-            str(home / "skills" / "cultivate-review" / "SKILL.md"),
-        ]
+        candidates = [str(home / "skills" / "cultivate-review" / "SKILL.md")]
     else:
         return ""
     for candidate in candidates:
@@ -918,7 +912,7 @@ def _load_review_skill_body(mimir_home: str, skill_path_override: str = "") -> s
         except OSError:
             continue
         if body:
-            return "\n\n──── /review SKILL.md (pre-loaded) ────\n" + body
+            return "\n\n──── /cultivate-review SKILL.md (pre-loaded) ────\n" + body
     _eprint(
         "github-poller: review-skill preload disabled — none readable: "
         + ", ".join(candidates)

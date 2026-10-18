@@ -1,6 +1,6 @@
 ---
-name: github-poller
-description: "Watch one or more GitHub repositories for new issues, pull requests, comments, PR reviews, and inline diff comments — emits a fresh turn each time something actionable happens. Use when you've opened PRs / issues mimir should know about review activity for, when you want operator-actionable signals for repos mimir maintains, or when you need to track upstream activity on a watched repo. Filters out events authored by mimir's own GitHub identity (set ``MIMIR_GITHUB_SELF_LOGIN``) so the bot doesn't wake itself with its own comments. Companion to the ``pollers`` framework skill (mechanics) and the ``world-scanning`` skill (catalog of *what's worth polling*). Opt-in: copy this directory into ``<home>/skills/github-poller/`` then set the env vars below."
+name: cultivate-github-poller
+description: "Watch configured GitHub repositories for actionable issues, pull requests, comments and reviews. Install mimir-cultivate and select MIMIR_PLUGINS=cultivate to seed <home>/skills/cultivate-github-poller/, then configure GITHUB_REPOS and MIMIR_GITHUB_SELF_LOGIN."
 env:
   required:
     - name: GITHUB_REPOS
@@ -14,27 +14,27 @@ env:
       description: "GitHub login mimir authors as. Events from this login are filtered out."
       example: "mimir-carreira"
     - name: MIMIR_GITHUB_PRELOAD_REVIEW_SKILL
-      description: "Set to true to inline the bundled review skill's SKILL.md into PR-review prompts. Auto-resolved from <home>/skills/review/ or <home>/.mimir_builtin_skills/review/ — no path needed for a standard install (the review skill ships bundled)."
+      description: "Set to true to inline the selected Cultivate review skill from <home>/skills/cultivate-review/SKILL.md into PR-review prompts. No path override is needed after provider defaults seed the home."
       example: "true"
     - name: MIMIR_GITHUB_REVIEW_SKILL_PATH
-      description: "Optional absolute-path override for the review SKILL.md. Defaults to the auto-resolved <home>/skills|.mimir_builtin_skills/review/ location; only set this for a non-standard layout."
+      description: "Optional absolute-path override for the Cultivate review SKILL.md. Defaults to <home>/skills/cultivate-review/SKILL.md; only set this for a non-standard layout."
       example: "<absolute path to review SKILL.md on your install>"
       only_if: "MIMIR_GITHUB_PRELOAD_REVIEW_SKILL=true"
 ---
 
-# github-poller — watch GitHub repos for activity
+# Cultivate GitHub Poller — watch GitHub repos for activity
 
-This is an **opt-in poller skill** that ships with mimir under
-``mimir/optional-skills/`` but is NOT auto-installed. Most installs
-won't watch a GitHub repo, so the framework doesn't seed it by default.
+This poller ships in `mimir-cultivate`, not core. When selected with
+`MIMIR_PLUGINS=cultivate`, provider defaults seed it under
+`<home>/skills/cultivate-github-poller/`. The companion review command is
+`/cultivate-review`, seeded at `<home>/skills/cultivate-review/`.
 
 ## Installation
 
-1. Copy the directory into your agent home:
-   ```
-   cp -r mimir/optional-skills/github-poller <home>/skills/
-   ```
-   (Or run from inside the container against ``/workspace/mimir``.)
+1. Install `mimir-cultivate` and select `MIMIR_PLUGINS=cultivate`. At startup,
+   provider defaults copy `plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/`
+   into `<home>/skills/cultivate-github-poller/`; configure it there rather
+   than installing it from core's optional-skill catalog.
 
 2. Configure env vars:
 
@@ -246,17 +246,17 @@ the same claim retry-eligible after five minutes, while atomic files under
 ## Disabling temporarily
 
 - Unset `GITHUB_REPOS` — the poller exits silently.
-- Or set the cron in `pollers.json` to a far-future expression.
-- Or remove the skill directory: `rm -rf <home>/skills/github-poller/`, then arrange an operator-managed reload or restart.
+- Or set the cron in `<home>/skills/cultivate-github-poller/pollers.json`
+  to a far-future expression, then reload pollers or restart.
 
 ## Debugging
 
-Offline log-ingestion regression tests (the default suite does not discover
-optional-skill test directories):
+Offline log-ingestion regression tests (run each moved skill's suite in isolation):
 
 ```bash
-uv run pytest -q mimir/optional-skills/github-poller/tests/ mimir/optional-skills/github-ci-watch/tests/
-uv run pytest -q
+uv run --all-packages --extra dev --extra bench pytest -q plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/tests/
+uv run --all-packages --extra dev --extra bench pytest -q plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/tests/
+sh scripts/test_full_access_control.sh
 ```
 
 | Symptom | Check |

@@ -1,6 +1,6 @@
 ---
-name: chainlink-orchestrator
-description: "The two model-touching halves of Worklink, shipped as one opt-in skill. (1) Planner: decompose a parent Chainlink issue into testable worklink:ready leaf subissues (mutates Chainlink only, never executes). (2) Ready-queue poller: discovers worklink:ready leaves and dispatches them by invoking `mimir worklink run` as a detached subprocess, up to the concurrent-claim cap — it never reimplements claim/evidence/transition. Opt-in (mimirbot yes, muninn no): `mimir skills install chainlink-orchestrator`, then set the env below to enable autonomous dispatch."
+name: cultivate-chainlink-orchestrator
+description: "Cultivate Worklink planner and ready-queue poller. Decompose parent Chainlink issues into testable worklink:ready leaves and dispatch eligible leaves with `mimir worklink run`. Install mimir-cultivate, select MIMIR_PLUGINS=cultivate, and configure WORKLINK_REPO; the provider seeds <home>/skills/cultivate-chainlink-orchestrator/."
 env:
   required:
     - name: WORKLINK_REPO
@@ -14,18 +14,28 @@ env:
       description: "Legacy fallback for total concurrent Worklink claims when worklink.yaml defaults.max_concurrent is absent. Default 2."
       example: "2"
     - name: MIMIR_WORKLINK_REAPER_CRON
-      description: "Cron for the core TTL reaper that recovers stale claims (set in the agent env, not here). Empty = reaper disabled."
+      description: "Cron for the Cultivate TTL reaper that recovers stale claims (set in the agent env, not here). Empty = reaper disabled."
       example: "*/30 * * * *"
 ---
 
 <!-- desc: Planner workflow for decomposing parent Chainlink issues into Worklink-ready leaf issues with a single executor-validation template. -->
 
-# Chainlink Orchestrator
+# Cultivate Chainlink Orchestrator
 
 This skill is the planning half of Worklink. It turns a vague or multi-step
 Chainlink parent into ready leaf issues that the deterministic Worklink executor
 can safely claim. The planner is allowed to mutate Chainlink issue structure;
 it is **not** allowed to execute the implementation.
+
+Install `mimir-cultivate` and select `MIMIR_PLUGINS=cultivate`. On startup,
+provider defaults seed `<home>/skills/cultivate-chainlink-orchestrator/`;
+the source-checkout directory is
+`plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator/`.
+Configure `WORKLINK_REPO` to enable autonomous dispatch. The core
+`<home>/.mimir_builtin_skills/chainlink/` tracker skill remains separate.
+
+From the repository root, validate the poller and Worklink integration with
+`MIMIR_PLUGINS=cultivate uv run --all-packages --extra dev --extra bench pytest -q tests/test_worklink_autonomy.py tests/test_worklink_orchestrator.py`.
 
 ## Contract
 
@@ -63,7 +73,7 @@ or label vague placeholders as ready.
 
 ## Required leaf template
 
-Use this exact structure. The executor refuses new issues that do not carry it. The canonical copy is `mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN`; the planner prompt renders that constant and tests assert this skill stays in sync with it.
+Use this exact structure. The executor refuses new issues that do not carry it. The canonical copy is `mimir_cultivate.worklink.planning.LEAF_TEMPLATE_MARKDOWN`; the planner prompt renders that constant and tests assert this skill stays in sync with it.
 
 ```markdown
 Acceptance criteria:
@@ -134,11 +144,11 @@ Once installed and configured (see frontmatter env), the scheduler runs the
 3. Launches `mimir worklink run <id>` **detached** for up to that many actionable leaves,
    then returns immediately (a run can take minutes; the poller's own 60s budget
    would otherwise kill it). The detached run does the claim/evidence/transition
-   in the deterministic core executor.
+   in the deterministic Cultivate executor.
 
 The detached run inherits the **poller's** env, so `pass_env` must carry anything
 the run needs - notably **`GITHUB_TOKEN`** and
-**`MIMIR_FACTORY_PUBLISHING_IDENTITY`**: the core executor's `_open_pr`
+**`MIMIR_FACTORY_PUBLISHING_IDENTITY`**: the Cultivate executor's `_open_pr`
 (`gh pr create`) runs on the controller side in this subprocess (not in the
 worker), so without the token `gh` can't authenticate and review-ready runs fail
 at PR creation → thrash to `worklink:blocked`. (Manual `bash -lc` dispatch hides
@@ -153,7 +163,7 @@ Safety properties (do not bypass these in the poller):
   TIGHT (and worse). The in-turn `worklink_run` tool consults the arbiter
   directly; the operator CLI (`mimir worklink run`) bypasses both — it always
   proceeds.
-- **Stale recovery**: a worker that dies leaves a claim; the core TTL reaper
+- **Stale recovery**: a worker that dies leaves a claim; the Cultivate TTL reaper
   (`MIMIR_WORKLINK_REAPER_CRON`) steals it back to `worklink:ready` (or
   `worklink:blocked` once attempts are spent).
 - **Attempt exhaustion**: the executor remains the authoritative budget check.

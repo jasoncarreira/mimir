@@ -293,15 +293,15 @@ def test_non_review_events_carry_no_marker(monkeypatch):
 
 def test_review_skill_preload_inlines_full_body_when_env_set(monkeypatch, tmp_path):
     """``MIMIR_GITHUB_PRELOAD_REVIEW_SKILL=1`` inlines the
-    ``<MIMIR_HOME>/skills/review/SKILL.md`` body alongside the
+    ``<MIMIR_HOME>/skills/cultivate-review/SKILL.md`` body alongside the
     rule. This is the workaround for the reasoning-before-Skill-loads
     issue — full rule set in context before the model commits its
     output structure."""
     mimir_home = tmp_path / "home"
-    skill_path = mimir_home / "skills" / "review" / "SKILL.md"
+    skill_path = mimir_home / "skills" / "cultivate-review" / "SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.write_text(
-        "---\nname: review\n---\n"
+        "---\nname: cultivate-review\n---\n"
         "# PR Review\n"
         "After drafting, **submit via `gh pr review`**.",
         encoding="utf-8",
@@ -314,7 +314,7 @@ def test_review_skill_preload_inlines_full_body_when_env_set(monkeypatch, tmp_pa
     poller._emit("base", event_type="pr_opened")
     ev = captured[0]
     assert "REVIEW SUBMISSION RULE" in ev["prompt"]
-    assert "/review SKILL.md (pre-loaded)" in ev["prompt"]
+    assert "/cultivate-review SKILL.md (pre-loaded)" in ev["prompt"]
     assert "After drafting, **submit via `gh pr review`**" in ev["prompt"]
 
 
@@ -324,7 +324,7 @@ def test_review_skill_preload_finds_provider_default(monkeypatch, tmp_path):
     skill_path = mimir_home / "skills" / "cultivate-review" / "SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.write_text(
-        "---\nname: review\n---\n# PR Review\nBUNDLED REVIEW BODY.",
+        "---\nname: cultivate-review\n---\n# PR Review\nBUNDLED REVIEW BODY.",
         encoding="utf-8",
     )
 
@@ -334,21 +334,19 @@ def test_review_skill_preload_finds_provider_default(monkeypatch, tmp_path):
 
     poller._emit("base", event_type="pr_opened")
     ev = captured[0]
-    assert "/review SKILL.md (pre-loaded)" in ev["prompt"]
+    assert "/cultivate-review SKILL.md (pre-loaded)" in ev["prompt"]
     assert "BUNDLED REVIEW BODY." in ev["prompt"]
 
 
-def test_review_skill_preload_operator_skill_wins_over_builtin(monkeypatch, tmp_path):
-    """When the review skill exists in BOTH the operator dir and the
-    bundled dir, the operator copy wins — matches mimir's dual-location
-    last-source-wins resolution (operator overrides bundled)."""
+def test_review_skill_preload_ignores_unrelated_core_review(monkeypatch, tmp_path):
+    """A generic review skill cannot replace Cultivate's selected review flow."""
     mimir_home = tmp_path / "home"
-    op = mimir_home / "skills" / "review" / "SKILL.md"
-    op.parent.mkdir(parents=True)
-    op.write_text("---\nname: review\n---\nOPERATOR REVIEW BODY.", encoding="utf-8")
-    bundled = mimir_home / ".mimir_builtin_skills" / "review" / "SKILL.md"
-    bundled.parent.mkdir(parents=True)
-    bundled.write_text("---\nname: review\n---\nBUNDLED REVIEW BODY.", encoding="utf-8")
+    other = mimir_home / "skills" / "review" / "SKILL.md"
+    other.parent.mkdir(parents=True)
+    other.write_text("---\nname: review\n---\nUNRELATED REVIEW BODY.", encoding="utf-8")
+    selected = mimir_home / "skills" / "cultivate-review" / "SKILL.md"
+    selected.parent.mkdir(parents=True)
+    selected.write_text("---\nname: cultivate-review\n---\nCULTIVATE REVIEW BODY.", encoding="utf-8")
 
     captured = _capture_emits(monkeypatch)
     monkeypatch.setenv("MIMIR_HOME", str(mimir_home))
@@ -356,15 +354,15 @@ def test_review_skill_preload_operator_skill_wins_over_builtin(monkeypatch, tmp_
 
     poller._emit("base", event_type="pr_opened")
     ev = captured[0]
-    assert "OPERATOR REVIEW BODY." in ev["prompt"]
-    assert "BUNDLED REVIEW BODY." not in ev["prompt"]
+    assert "CULTIVATE REVIEW BODY." in ev["prompt"]
+    assert "UNRELATED REVIEW BODY." not in ev["prompt"]
 
 
 def test_review_skill_preload_off_by_default(monkeypatch, tmp_path):
     """No env var → rule only, no inline body. Default-off keeps the
     per-event token cost bounded."""
     mimir_home = tmp_path / "home"
-    skill_path = mimir_home / "skills" / "review" / "SKILL.md"
+    skill_path = mimir_home / "skills" / "cultivate-review" / "SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.write_text("SHOULD NOT APPEAR", encoding="utf-8")
 
@@ -390,7 +388,7 @@ def test_review_skill_preload_missing_file_falls_back_to_rule_only(
     poller._emit("base", event_type="pr_opened")
     ev = captured[0]
     assert "REVIEW SUBMISSION RULE" in ev["prompt"]
-    assert "/review SKILL.md (pre-loaded)" not in ev["prompt"]
+    assert "/cultivate-review SKILL.md (pre-loaded)" not in ev["prompt"]
 
 
 def test_review_skill_preload_explicit_path_override(monkeypatch, tmp_path):

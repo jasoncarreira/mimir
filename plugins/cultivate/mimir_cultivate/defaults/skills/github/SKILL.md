@@ -1,5 +1,5 @@
 ---
-name: github
+name: cultivate-github
 description: Interact with GitHub via scoped PR tools on service turns or the `gh` CLI on interactive turns. Use for issues, pull requests, CI status and workflow runs.
 success_criteria:
   # Service reads use typed tools; interactive turns may use gh.
@@ -26,7 +26,7 @@ success_criteria:
 
 <!-- desc: Read GitHub via scoped PR tools on service turns and gh on interactive turns. -->
 
-# GitHub
+# Cultivate GitHub
 
 The `gh` CLI is installed in the container and authenticated via `GITHUB_TOKEN`
 from the env. Commits the agent makes through `git push` go through the same
