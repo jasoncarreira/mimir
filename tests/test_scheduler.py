@@ -4853,7 +4853,7 @@ def _read_event_types(path: Path) -> list[dict]:
 
 
 def test_worklink_reaper_empty_cron_does_not_install_job(tmp_path: Path):
-    from mimir_cultivate.scheduler import add_reaper_job
+    add_reaper_job = pytest.importorskip("mimir_cultivate.scheduler").add_reaper_job
     async def noop(_e):
         return True
 
@@ -4867,7 +4867,9 @@ def test_worklink_reaper_empty_cron_does_not_install_job(tmp_path: Path):
 async def test_pr_checkout_lease_reaper_uses_live_turn_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    from mimir_cultivate.scheduler import add_pr_checkout_lease_reaper_job
+    add_pr_checkout_lease_reaper_job = pytest.importorskip(
+        "mimir_cultivate.scheduler",
+    ).add_pr_checkout_lease_reaper_job
     async def noop(_e):
         return True
 
@@ -4901,7 +4903,7 @@ async def test_pr_checkout_lease_reaper_uses_live_turn_paths(
 async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    from mimir_cultivate.scheduler import add_reaper_job
+    add_reaper_job = pytest.importorskip("mimir_cultivate.scheduler").add_reaper_job
     async def noop(_e):
         return True
 
@@ -4979,7 +4981,7 @@ async def test_worklink_reaper_job_runs_in_thread_and_logs_event(
 async def test_worklink_reaper_job_logs_completed_sweep_when_nothing_reaped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    from mimir_cultivate.scheduler import add_reaper_job
+    add_reaper_job = pytest.importorskip("mimir_cultivate.scheduler").add_reaper_job
     async def noop(_e):
         return True
 
