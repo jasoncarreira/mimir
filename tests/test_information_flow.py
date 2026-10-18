@@ -3388,7 +3388,7 @@ def shipped_github_fetch_context(request, tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
     monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
     manifest = (
-        Path(__file__).parents[1] / "mimir/optional-skills"
+        Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
         / request.param / "pollers.json"
     )
     raw = json.loads(manifest.read_text())["pollers"][0]

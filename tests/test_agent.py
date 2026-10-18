@@ -119,7 +119,7 @@ def worklink_ready_poller():
 
     def resolve(state_root: Path):
         pollers = discover_pollers(
-            Path(__file__).parents[1] / "mimir" / "optional-skills",
+            Path(__file__).parents[1] / "plugins" / "cultivate" / "mimir_cultivate" / "defaults" / "skills",
             state_root=state_root,
         )
         return next(item for item in pollers if item.name == "worklink-ready-queue")

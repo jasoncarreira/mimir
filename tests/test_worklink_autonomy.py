@@ -2140,7 +2140,7 @@ async def test_runtime_and_server_wire_worklink_arbiter_and_reaper(
 # ── ready-queue poller: discovery + cap-bounded detached dispatch ───
 
 
-POLLER = Path(__file__).resolve().parent.parent / "mimir" / "optional-skills" / "chainlink-orchestrator" / "scripts" / "poller.py"
+POLLER = Path(__file__).resolve().parent.parent / "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator/scripts/poller.py"
 
 
 def _fake_chainlink_script(
@@ -2343,6 +2343,8 @@ def _live_pids(pids: list[int]) -> list[int]:
 
 
 def _load_poller_module():
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Cultivate poller is not selected")
     spec = importlib.util.spec_from_file_location("chainlink_orchestrator_poller_under_test", POLLER)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -2356,9 +2358,11 @@ def _load_poller_module():
 
 
 def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
+    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+        pytest.skip("Cultivate poller is not selected")
     env = {k: v for k, v in os.environ.items() if k not in {
         "WORKLINK_REPO", "WORKLINK_RUN_BIN", "WORKLINK_MAX_CONCURRENT", "CHAINLINK_BIN",
-        "MIMIR_CODING_ENABLED", "MIMIR_FACTORY_EPICS_ENABLED",
+        "MIMIR_FACTORY_EPICS_ENABLED",
     }}
     env.update(env_extra)
     proc = subprocess.Popen(
@@ -2449,11 +2453,10 @@ def test_ready_dispatch_spawn_failure_records_intended_log_without_consuming_att
         "signal": "worklink_dispatch_failed",
         "issue_id": 201,
         "reason": "spawn unavailable",
-        "coding_enabled": poller.coding_enabled(),
     }]
 
 
-@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+@pytest.mark.skipif(os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}, reason="Cultivate poller is not selected")
 def test_poller_reads_cap_from_worklink_yaml(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
@@ -2488,7 +2491,7 @@ def test_poller_reads_cap_from_worklink_yaml(tmp_path: Path) -> None:
     ] == [11, 12]
 
 
-@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+@pytest.mark.skipif(os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}, reason="Cultivate poller is not selected")
 def test_poller_excludes_actively_locked_issue_from_candidates(tmp_path: Path) -> None:
     """A locked issue must not consume the slot its own worker already holds.
 
@@ -2516,7 +2519,7 @@ def test_poller_excludes_actively_locked_issue_from_candidates(tmp_path: Path) -
     assert 100 not in dispatched
 
 
-@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+@pytest.mark.skipif(os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}, reason="Cultivate poller is not selected")
 def test_poller_reads_flow_style_cap_through_worklink_config(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
@@ -2539,7 +2542,7 @@ def test_poller_reads_flow_style_cap_through_worklink_config(tmp_path: Path) -> 
     ] == [11, 12]
 
 
-@pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
+@pytest.mark.skipif(os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}, reason="Cultivate poller is not selected")
 def test_poller_degrades_before_dispatch_for_invalid_backend_reference(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
@@ -2589,13 +2592,7 @@ def test_poller_dispatches_up_to_free_slots(tmp_path: Path) -> None:
     assert scan["ready_count"] == 3 and scan["active"] == 1 and scan["dispatched"] == 1
 
 
-@pytest.mark.parametrize(
-    ("configured", "effective"),
-    [("true", True), ("false", False), (None, False)],
-)
-def test_poller_dispatch_reports_and_propagates_coding_state(
-    tmp_path: Path, configured: str | None, effective: bool
-) -> None:
+def test_poller_dispatch_does_not_report_retired_coding_flag(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
     env = {
@@ -2606,16 +2603,11 @@ def test_poller_dispatch_reports_and_propagates_coding_state(
         "WORKLINK_MAX_CONCURRENT": "1",
         "STATE_DIR": str(tmp_path / "state"),
     }
-    if configured is not None:
-        env["MIMIR_CODING_ENABLED"] = configured
-
     events = _run_poller(tmp_path, env)
 
     dispatched = [event for event in events if event.get("signal") == "worklink_dispatched"]
     assert len(dispatched) == 1
-    assert dispatched[0]["coding_enabled"] is effective
-    inherited = (tmp_path / "coding-enabled.txt").read_text(encoding="utf-8").splitlines()
-    assert inherited == [configured if configured is not None else "<unset>"]
+    assert "coding_enabled" not in dispatched[0]
 
 
 def test_poller_failure_escalation_dedupes_by_signature_and_recovers(

@@ -1927,7 +1927,7 @@ def test_pr_review_others_manifest_grant_is_explicit_and_tier_checked(
 def test_github_activity_manifest_explicitly_grants_pr_review_others(tmp_path: Path) -> None:
     from mimir.pollers import _parse_poller_authority
 
-    manifest = Path(access_control.__file__).parent / "optional-skills/github-poller/pollers.json"
+    manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json"
     record = next(
         item for item in json.loads(manifest.read_text())["pollers"]
         if item["name"] == "github-activity"
@@ -16461,7 +16461,7 @@ def test_review_skill_only_demonstrates_commands_the_poller_can_run() -> None:
     """
     import re
 
-    skill = Path(__file__).resolve().parent.parent / "mimir" / "skills" / "review" / "SKILL.md"
+    skill = Path(__file__).resolve().parent.parent / "plugins/cultivate/mimir_cultivate/defaults/skills/review/SKILL.md"
     text = skill.read_text(encoding="utf-8")
 
     # Shapes the trusted-service shell profile can never admit, and the reason.
@@ -16487,7 +16487,7 @@ def test_review_skill_only_demonstrates_commands_the_poller_can_run() -> None:
                     offenders.append(f"{line[:72]!r} — {why}")
 
     assert not offenders, (
-        "mimir/skills/review/SKILL.md demonstrates commands the poller cannot "
+        "Cultivate review SKILL.md demonstrates commands the poller cannot "
         "run:\n  " + "\n  ".join(offenders)
     )
 

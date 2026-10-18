@@ -1,0 +1,128 @@
+"""Cultivate owns the coding skills; core retains its Chainlink tracker."""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+import importlib.util
+import json
+from pathlib import Path
+import re
+import tomllib
+
+import pytest
+
+from mimir.chat_skills import ChatSkillError, ChatSkillInvocation, ChatSkillRegistry
+from mimir.config import Config
+from mimir.plugins.defaults import plugin_default_files, seed_plugin_defaults
+from mimir.plugins.discovery import enabled_plugins
+from mimir.skill_catalog import load_skill
+
+
+ROOT = Path(__file__).resolve().parents[3]
+SKILLS = ROOT / "plugins/cultivate/mimir_cultivate/defaults/skills"
+NAMES = {
+    "github-poller", "github-ci-watch", "chainlink-orchestrator",
+    "worklink-tool-pins", "github", "review",
+}
+
+
+def test_selected_provider_seeds_only_its_coding_skills() -> None:
+    [candidate] = enabled_plugins(enable="cultivate")
+    manifest = tomllib.loads((ROOT / "plugins/cultivate/mimir-plugin.toml").read_text())
+    assert {Path(path).name for path in manifest["defaults"]["skills"]} == NAMES
+    files = plugin_default_files(candidate)
+    for name in NAMES:
+        assert files[Path("skills") / f"cultivate-{name}" / "SKILL.md"] == (
+            SKILLS / name / "SKILL.md"
+        ).read_text()
+    assert Path("skills/cultivate-chainlink/SKILL.md") not in files
+    assert (ROOT / "mimir/skills/chainlink/SKILL.md").is_file()
+    for name in NAMES:
+        assert not (ROOT / "mimir/optional-skills" / name / "SKILL.md").exists()
+    for name in ("github", "review"):
+        assert not (ROOT / "mimir/skills" / name / "SKILL.md").exists()
+
+
+def test_unselected_provider_has_no_defaults() -> None:
+    assert enabled_plugins(enable="") == ()
+
+
+def test_moved_poller_resources_are_inventoried() -> None:
+    [candidate] = enabled_plugins(enable="cultivate")
+    files = plugin_default_files(candidate)
+    for name in NAMES - {"github", "review"}:
+        prefix = Path("skills") / f"cultivate-{name}"
+        assert (SKILLS / name / "pollers.json").is_file()
+        assert (SKILLS / name / "scripts/poller.py").is_file()
+        assert prefix / "pollers.json" in files
+        assert prefix / "scripts/poller.py" in files
+
+
+def test_selected_home_catalog_commands_and_documented_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    [candidate] = enabled_plugins(enable="cultivate")
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+    monkeypatch.setenv("MIMIR_CHAT_SKILLS_ENABLED", "true")
+    monkeypatch.setenv(
+        "MIMIR_CHAT_SKILL_ALLOWLIST",
+        ",".join(f"cultivate-{name}" for name in sorted(NAMES)),
+    )
+
+    created = seed_plugin_defaults(home, selected=(candidate,))
+    registry = ChatSkillRegistry.from_config(Config.from_env())
+    assert {skill.command for skill in registry.list_discoverable()} == {
+        f"/cultivate-{name}" for name in NAMES
+    }
+    for name in NAMES:
+        source = SKILLS / name
+        installed = home / "skills" / f"cultivate-{name}"
+        assert created[f"skills/cultivate-{name}/SKILL.md"] == "created"
+        assert installed.joinpath("SKILL.md").read_bytes() == source.joinpath("SKILL.md").read_bytes()
+        assert load_skill(installed).name == f"cultivate-{name}"
+        if name not in {"github", "review"}:
+            text = source.joinpath("SKILL.md").read_text(encoding="utf-8")
+            assert f"plugins/cultivate/mimir_cultivate/defaults/skills/{name}/" in text
+            assert f"<home>/skills/cultivate-{name}/" in text
+            assert installed.joinpath("pollers.json").is_file()
+            assert installed.joinpath("scripts/poller.py").is_file()
+            documented_tests = re.findall(r"pytest -q ([^\s`]+)", text)
+            assert documented_tests, name
+            assert all((ROOT / path).exists() for path in documented_tests)
+
+    review = registry.resolve_post_content("/cultivate-review 42")
+    assert isinstance(review, ChatSkillInvocation)
+    assert review.name == "cultivate-review"
+    block = registry.prompt_block_for_invocation(asdict(review))
+    assert block is not None and "submit via" in block
+    assert isinstance(registry.resolve_post_content("/review 42"), ChatSkillError)
+    assert (ROOT / "mimir/skills/chainlink/SKILL.md").is_file()
+
+
+def test_selected_home_github_poller_emits_resolvable_review_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    [candidate] = enabled_plugins(enable="cultivate")
+    home = tmp_path / "home"
+    seed_plugin_defaults(home, selected=(candidate,))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL", "1")
+    monkeypatch.delenv("MIMIR_GITHUB_REVIEW_SKILL_PATH", raising=False)
+    script = SKILLS / "github-poller/scripts/poller.py"
+    spec = importlib.util.spec_from_file_location("cultivate_github_poller_defaults", script)
+    assert spec is not None and spec.loader is not None
+    poller = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(poller)
+
+    poller._emit("Review this pull request", event_type="pr_opened")
+    emitted = json.loads(capsys.readouterr().out)
+    assert "/cultivate-review skill spells out the full flow" in emitted["prompt"]
+    assert "/cultivate-review SKILL.md (pre-loaded)" in emitted["prompt"]
+    assert "submit via" in emitted["prompt"]
+    assert "/review skill spells out" not in emitted["prompt"]
+    frontmatter = (SKILLS / "github-poller/SKILL.md").read_text(encoding="utf-8")
+    assert "<home>/skills/cultivate-review/SKILL.md" in frontmatter
+    assert ".mimir_builtin_skills/review/" not in frontmatter

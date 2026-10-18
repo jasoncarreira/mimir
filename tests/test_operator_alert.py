@@ -172,8 +172,7 @@ async def test_shipped_worklink_principal_can_use_real_operator_alert_sink(
 
     manifest_path = (
         Path(__file__).parents[1]
-        / "mimir"
-        / "optional-skills"
+            / "plugins/cultivate/mimir_cultivate/defaults/skills"
         / "chainlink-orchestrator"
         / "pollers.json"
     )

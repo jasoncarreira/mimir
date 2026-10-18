@@ -1259,7 +1259,7 @@ def test_migrated_factory_consumers_have_finite_legacy_free_inventory() -> None:
         "mimir/commands/worklink.py",
         "mimir/server.py",
         "mimir/web_ui.py",
-        "mimir/optional-skills/chainlink-orchestrator/scripts/poller.py",
+        "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator/scripts/poller.py",
     )
     forbidden = (
         '".opencode" / "factory"',

@@ -42,7 +42,9 @@ def test_workspace_metadata_and_manifest() -> None:
         "cultivate": "mimir_cultivate:provider"}
     assert manifest["name"] == "cultivate"
     assert manifest["requires_mimir"] == f"=={version}"
-    assert set(manifest) == {"name", "version", "license", "requires_mimir"}
+    assert set(manifest) == {"name", "version", "license", "requires_mimir", "defaults"}
+    assert manifest["defaults"]["version"] == version
+    assert len(manifest["defaults"]["skills"]) == 6
     assert (PLUGIN / "brand/LICENSE").read_bytes() == (ROOT / "brand/LICENSE").read_bytes()
 
 
@@ -66,12 +68,20 @@ def test_built_distribution_boundaries(built_packages: dict[str, Path]) -> None:
                 ):
                     assert archive.read(packaged) == (PLUGIN / source).read_bytes()
                 assert "mimir_cultivate/registration.py" in members
+                for skill in ("github-poller", "github-ci-watch", "chainlink-orchestrator",
+                              "worklink-tool-pins", "github", "review"):
+                    resource = f"mimir_cultivate/defaults/skills/{skill}/SKILL.md"
+                    assert archive.read(resource) == (
+                        PLUGIN / resource
+                    ).read_bytes()
                 assert not any(member.startswith("mimir/") for member in members)
         elif name.startswith("mimir_cultivate-") and name.endswith(".tar.gz"):
             with tarfile.open(path) as archive:
                 members = archive.getnames()
                 assert any(member.endswith("/brand/LICENSE") for member in members)
                 assert any(member.endswith("/mimir-plugin.toml") for member in members)
+                assert any(member.endswith("/defaults/skills/github-poller/scripts/poller.py")
+                           for member in members)
 
 
 def test_disabled_provider_is_not_imported() -> None:

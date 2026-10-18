@@ -164,7 +164,7 @@ def test_chainlink_issue_show_authorization_and_provenance():
 
 @pytest.mark.parametrize("name", ["chainlink-orchestrator", "github-poller"])
 def test_service_manifests_offer_typed_reader(name):
-    base = Path(__file__).resolve().parents[1] / "mimir/optional-skills" / name
+    base = Path(__file__).resolve().parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills" / name
     manifest = json.loads((base / "pollers.json").read_text())
     capabilities = manifest["pollers"][0]["authority"]["capabilities"]
     assert "chainlink_issue_show" in capabilities
@@ -193,5 +193,7 @@ def test_service_manifests_offer_typed_reader(name):
 
 def test_profile_skills_name_typed_reads():
     base = Path(__file__).resolve().parents[1] / "mimir/skills"
-    for skill in ("chainlink", "github", "review"):
-        assert "chainlink_issue_show" in (base / skill / "SKILL.md").read_text()
+    assert "chainlink_issue_show" in (base / "chainlink" / "SKILL.md").read_text()
+    plugin_skills = Path(__file__).resolve().parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
+    for skill in ("github", "review"):
+        assert "chainlink_issue_show" in (plugin_skills / skill / "SKILL.md").read_text()

@@ -50,7 +50,7 @@ def retained_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     manifest = json.loads((
         Path(__file__).parents[1]
-        / "mimir/optional-skills/chainlink-orchestrator/pollers.json"
+        / "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator/pollers.json"
     ).read_text(encoding="utf-8"))["pollers"][0]
     service = ac.build_trigger_service_principal(
         canonical="poller:worklink-ready-queue",
@@ -165,7 +165,7 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{external}:ro")
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
 
-    skills = Path(__file__).parents[1] / "mimir" / "optional-skills"
+    skills = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
     ready = next(
         config for config in discover_pollers(skills, state_root=state_root)
         if config.name == "worklink-ready-queue"
@@ -347,7 +347,7 @@ async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow
         "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
     )
 
-    skills = Path(__file__).parents[1] / "mimir" / "optional-skills"
+    skills = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
     ready = next(
         config for config in discover_pollers(skills, state_root=state_root)
         if config.name == "worklink-ready-queue"

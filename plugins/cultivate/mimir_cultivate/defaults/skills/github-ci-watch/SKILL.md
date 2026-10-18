@@ -1,6 +1,6 @@
 ---
-name: github-ci-watch
-description: "Watch the main branch of one or more GitHub repositories for new CI (GitHub Actions) workflow-run failures — emits a fresh turn the moment a build breaks and stays silent while CI is green. Use when mimir maintains repos whose CI it should react to (e.g. a failing build on main after a merge it landed). Seen-set deduped so each failed run is reported exactly once. Companion to the ``pollers`` framework skill (mechanics) and the ``world-scanning`` skill (catalog of what's worth polling). Opt-in: copy this directory into ``<home>/skills/github-ci-watch/`` then set the env vars below."
+name: cultivate-github-ci-watch
+description: "Watch GitHub Actions runs on the main branch of configured repositories; emit turns for new failures and remain silent while CI is green. Install mimir-cultivate and select MIMIR_PLUGINS=cultivate to seed <home>/skills/cultivate-github-ci-watch/, then set GITHUB_REPOS."
 env:
   required:
     - name: GITHUB_REPOS
@@ -12,11 +12,11 @@ env:
       example: "ghp_..."
 ---
 
-# github-ci-watch — react when CI breaks
+# Cultivate GitHub CI Watch — react when CI breaks
 
-An **opt-in poller skill** that ships with mimir under
-``mimir/optional-skills/`` but is NOT auto-installed — most installs
-don't watch a repo's CI, so the framework doesn't seed it by default.
+A selected Cultivate poller skill. It is absent from core; installations
+selecting `mimir-cultivate` with `MIMIR_PLUGINS=cultivate` seed it under
+`<home>/skills/cultivate-github-ci-watch/`.
 
 It watches the ``main`` branch of each ``GITHUB_REPOS`` entry, inspects
 the last few GitHub Actions workflow runs, and emits one ``ci_failure``
@@ -26,17 +26,19 @@ event per newly-failed run (conclusion ``failure`` / ``timed_out`` /
 
 ## Installation
 
-1. Copy the directory into your agent home:
-   ```
-   cp -r mimir/optional-skills/github-ci-watch <home>/skills/
-   ```
-   (Or run from inside the container against ``/workspace/mimir``.)
+1. Install `mimir-cultivate` and select `MIMIR_PLUGINS=cultivate`. On startup,
+   the provider seeds `<home>/skills/cultivate-github-ci-watch/`. In a source
+   checkout, the corresponding source is
+   `plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/`.
 
 2. Set the env vars — at minimum ``GITHUB_REPOS`` (plus ``GITHUB_TOKEN``
    if ``gh auth`` isn't already configured in the environment).
 
 3. The ``pollers`` framework discovers ``pollers.json`` and runs
    ``scripts/poller.py`` on its cron (default ``*/15 * * * *``).
+
+From the repository root, run this skill's isolated tests with
+`uv run --all-packages --extra dev --extra bench pytest -q plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/tests/`.
 
 ## State
 

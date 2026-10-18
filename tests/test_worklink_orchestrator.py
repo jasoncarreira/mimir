@@ -2417,6 +2417,7 @@ def test_interrupted_claim_is_reapable(
         if {"cultivate", "all"}.intersection(os.environ.get("MIMIR_PLUGINS", "").split(",")):
             assert importlib.util.find_spec("mimir_cultivate") is not None
         pytest.importorskip("mimir_cultivate")
+        pytest.importorskip("mimir_cultivate.commands")
         import mimir_cultivate.worklink.orchestrator as orchestrator
         from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
         from mimir_cultivate.worklink.claims import ChainlinkClaims
@@ -4300,7 +4301,7 @@ def test_skill_embeds_single_leaf_template_constant() -> None:
     from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
 
     root = Path(__file__).parent.parent
-    skill = (root / "mimir" / "optional-skills" / "chainlink-orchestrator" / "SKILL.md").read_text(
+    skill = (root / "plugins/cultivate/mimir_cultivate/defaults/skills" / "chainlink-orchestrator" / "SKILL.md").read_text(
         encoding="utf-8"
     )
 
@@ -4312,8 +4313,7 @@ def test_chainlink_orchestrator_passes_controller_environment_overrides() -> Non
     manifest = json.loads(
         (
             root
-            / "mimir"
-            / "optional-skills"
+            / "plugins/cultivate/mimir_cultivate/defaults/skills"
             / "chainlink-orchestrator"
             / "pollers.json"
         ).read_text(encoding="utf-8")

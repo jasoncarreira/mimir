@@ -108,7 +108,8 @@ def _ensure_mimir_import_path() -> None:
     # package on that same revision even if MIMIR_SOURCE_DIR points at another
     # checkout. Installed copies fail the __init__.py probe and fall through.
     script_path = globals().get("__file__")
-    candidates = [Path(script_path).resolve().parents[4]] if script_path else []
+    script = Path(script_path).resolve() if script_path else None
+    candidates = [script.parents[7]] if script is not None and len(script.parents) > 7 else []
     if source_dir := os.environ.get("MIMIR_SOURCE_DIR"):
         candidates.append(Path(source_dir))
     if venv_root.name in {".venv", "venv"}:
@@ -124,6 +125,12 @@ def _ensure_mimir_import_path() -> None:
             while path in sys.path:
                 sys.path.remove(path)
             sys.path.insert(0, path)
+            provider = candidate / "plugins" / "cultivate"
+            if (provider / "mimir_cultivate" / "__init__.py").is_file():
+                provider_path = str(provider)
+                while provider_path in sys.path:
+                    sys.path.remove(provider_path)
+                sys.path.insert(0, provider_path)
 
             # Production poller commands may run under system ``python3`` rather
             # than the mimir venv interpreter. In editable-source deployments the
@@ -147,9 +154,8 @@ _ensure_mimir_import_path()
 # the poller must fail rather than run without the filter, because "no filter"
 # means auto-reviewing every author's PR — the exact behaviour #1022 removed.
 from mimir.pollers import _github_author_is_trusted, _github_content_author
-from mimir.ci_logs import capture_job_log, clean_log_tail
-from mimir.ci_attention import classify_cancelled_run
-from mimir.github_withhold import partition, sanitize_login, sanitize_url
+from mimir_cultivate.ci import capture_job_log, clean_log_tail, classify_cancelled_run
+from mimir_cultivate.github_trust import partition, sanitize_login, sanitize_url
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "cursor.json"
@@ -801,7 +807,7 @@ _REVIEW_SUBMISSION_RULE = (
     "paths with `read_file` (offset/limit for a line range) or bounded "
     "`grep` before_context/after_context; shell slicing forms and direct `curl` "
     "are intentionally refused because they bypass the bounded file/egress tools. "
-    "/review skill spells out the full flow; this rule is restated "
+    "/cultivate-review skill spells out the full flow; this rule is restated "
     "here so it's present in your context before the Skill call "
     "fires."
 )
@@ -832,7 +838,7 @@ _REVIEW_EXPECTED_TOOL_CALL: dict = {
         "mcp__claude_ai_GitHub_remote__submit_pending_pull_request_review",
     ],
     "bash_substrings": [
-        # /review skill's documented path. Trailing space discriminates
+        # /cultivate-review skill's documented path. Trailing space discriminates
         # from ``gh pr review-comment`` (the standalone-comment
         # subcommand), which is NOT a review submission — Mimir's PR
         # #236 review nit.
@@ -871,22 +877,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def _verification_guidance() -> str:
-    """How a remediation turn should verify its fix, given this deployment.
-
-    ``repo_test`` is only registered when ``MIMIR_CODING_ENABLED`` is true, and
-    that setting defaults to false (``mimir/config.py`` ``coding_enabled``), so
-    naming the tool unconditionally would point a default deployment at
-    something it does not have. Selector wording stays runner-neutral for the
-    same reason: ``project_tests`` passes ``path::node_id`` through to whatever
-    runner ``worklink.yaml`` configures, and only pytest-style runners accept
-    that form.
-    """
-    if not _env_flag("MIMIR_CODING_ENABLED"):
-        return (
-            "verify the fix with whatever this deployment provides, and do not "
-            "present changes as verified if you could not run its tests — say "
-            "plainly what you were unable to check"
-        )
+    """Describe the selected provider's configured repository test runner."""
     return (
         "verify with the repo_test tool, which runs the deployment's own "
         "configured test command. Selectors are repo-relative paths that must "
@@ -912,20 +903,7 @@ def _load_review_skill_body(mimir_home: str, skill_path_override: str = "") -> s
         candidates = [override]
     elif mimir_home:
         home = Path(mimir_home)
-        # mimir resolves skills from two locations, operator-first:
-        # ``<home>/skills/`` (operator-installed) then
-        # ``<home>/.mimir_builtin_skills/`` (the bundled refresh target).
-        # ``review`` is a BUNDLED skill (mimir/skills/review/), so on a
-        # normal install it lives in ``.mimir_builtin_skills/`` — checking
-        # only ``skills/`` (or, pre-#516, ``.claude/skills/``) missed it,
-        # so the preload silently no-op'd on every real deployment
-        # (chainlink #299 follow-up). ``.claude/skills/`` is the Claude
-        # Code convention; the framework migrates it into ``skills/`` at
-        # startup, so it isn't checked here.
-        candidates = [
-            str(home / "skills" / "review" / "SKILL.md"),
-            str(home / ".mimir_builtin_skills" / "review" / "SKILL.md"),
-        ]
+        candidates = [str(home / "skills" / "cultivate-review" / "SKILL.md")]
     else:
         return ""
     for candidate in candidates:
@@ -934,7 +912,7 @@ def _load_review_skill_body(mimir_home: str, skill_path_override: str = "") -> s
         except OSError:
             continue
         if body:
-            return "\n\n──── /review SKILL.md (pre-loaded) ────\n" + body
+            return "\n\n──── /cultivate-review SKILL.md (pre-loaded) ────\n" + body
     _eprint(
         "github-poller: review-skill preload disabled — none readable: "
         + ", ".join(candidates)

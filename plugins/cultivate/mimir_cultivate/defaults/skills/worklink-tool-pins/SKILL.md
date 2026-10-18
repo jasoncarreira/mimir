@@ -1,6 +1,6 @@
 ---
-name: worklink-tool-pins
-description: "Optional low-priority poller that inventories Worklink tool pins from <home>/worklink.yaml and files/reuses Chainlink bump issues when upstream versions drift. Opt-in: copy this directory into <home>/skills/worklink-tool-pins/ and configure tool_pins in worklink.yaml."
+name: cultivate-worklink-tool-pins
+description: "Low-priority Worklink tool-pin drift poller. Install mimir-cultivate and select MIMIR_PLUGINS=cultivate to seed <home>/skills/cultivate-worklink-tool-pins/, then configure tool_pins in <home>/worklink.yaml."
 env:
   optional:
     - name: MIMIR_HOME
@@ -8,11 +8,11 @@ env:
       example: "/path/to/agent-home"
 ---
 
-# worklink-tool-pins — Worklink external-tool drift poller
+# Cultivate Worklink Tool Pins — external-tool drift poller
 
-This is an **opt-in poller skill** that ships under
-`mimir/optional-skills/` but is NOT auto-installed. It watches the
-`tool_pins:` section of `<home>/worklink.yaml` and files or reuses
+This selected-provider poller ships in `mimir-cultivate`, not core. Selecting
+`MIMIR_PLUGINS=cultivate` seeds `<home>/skills/cultivate-worklink-tool-pins/`.
+It watches the `tool_pins:` section of `<home>/worklink.yaml` and files or reuses
 low-priority Chainlink bump issues when an upstream version differs
 from the configured pin.
 
@@ -53,10 +53,14 @@ auto-closed because cleanup requires an operator disposition decision.
 
 ## Installation
 
-```bash
-cp -r mimir/optional-skills/worklink-tool-pins <home>/skills/
-# Ensure MIMIR_HOME points at the home containing worklink.yaml.
-```
+Install `mimir-cultivate`, select `MIMIR_PLUGINS=cultivate`, and configure
+`tool_pins:` in `<home>/worklink.yaml`. Provider defaults seed the skill from
+`plugins/cultivate/mimir_cultivate/defaults/skills/worklink-tool-pins/` to
+`<home>/skills/cultivate-worklink-tool-pins/` at startup. Ensure `MIMIR_HOME`
+points at that home.
+
+From the repository root, run the isolated poller suite with
+`uv run --all-packages --extra dev --extra bench pytest -q plugins/cultivate/mimir_cultivate/defaults/skills/worklink-tool-pins/tests/`.
 
 Operator/admin turns only: an interactive admin with the `reload_pollers`
 tool available may call it after installation to register the poller.
