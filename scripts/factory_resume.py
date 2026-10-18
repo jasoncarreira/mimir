@@ -38,12 +38,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mimir.worklink.factory_state import (  # noqa: E402
+from mimir_cultivate.worklink.factory_state import (  # noqa: E402
     factory_process_is_alive,
     factory_process_is_verified_dead,
     load_factory_record,
 )
-from mimir.worklink.orchestrator import _RECOVERABLE_FACTORY_PHASES  # noqa: E402
+from mimir_cultivate.worklink.orchestrator import _RECOVERABLE_FACTORY_PHASES  # noqa: E402
 
 PARKED = "needs-human"
 

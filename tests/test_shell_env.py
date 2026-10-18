@@ -106,6 +106,13 @@ assert "PermissionError" in result.stderr
 def test_real_cli_non_run_sibling_environment_unreadable(subcommand):
     if os.geteuid() == 0:
         pytest.skip("root may bypass procfs access controls; exercise as worker uid")
+    if subcommand == "worklink":
+        import importlib.util
+
+        if importlib.util.find_spec("mimir_cultivate") is None:
+            if {"cultivate", "all"}.intersection(os.environ.get("MIMIR_PLUGINS", "").split(",")):
+                pytest.fail("selected Cultivate distribution is not installed")
+            pytest.skip("Worklink CLI requires installed Cultivate")
     # Drive the real CLI entry in an isolated sibling process, keeping it alive
     # after --help exits. Prove readability before CLI startup to avoid a
     # vacuous pass on hosts which already restrict same-uid procfs reads.
@@ -124,9 +131,13 @@ with contextlib.redirect_stdout(io.StringIO()):
 print("after", flush=True)
 sys.stdin.read()
 '''
+    child_env = os.environ.copy()
+    child_env.pop("MIMIR_PLUGINS", None)
+    if subcommand == "worklink":
+        child_env["MIMIR_PLUGINS"] = "cultivate"
     sibling = subprocess.Popen(
         [sys.executable, "-c", script, subcommand], stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=child_env,
     )
     try:
         assert sibling.stdout.readline().strip() == "before"

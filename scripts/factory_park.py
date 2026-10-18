@@ -68,15 +68,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mimir.worklink.autonomy import DEFAULT_AGENT_ID  # noqa: E402
-from mimir.worklink.backends.feature_factory import parse_factory_status  # noqa: E402
-from mimir.worklink.claims import (  # noqa: E402
+from mimir_cultivate.worklink.autonomy import DEFAULT_AGENT_ID  # noqa: E402
+from mimir_cultivate.worklink.backends.feature_factory import parse_factory_status  # noqa: E402
+from mimir_cultivate.worklink.claims import (  # noqa: E402
     MAX_SHUTDOWN_ABORT_FORGIVENESS,
     ChainlinkClaims,
     ShutdownAbortRecord,
     claim_records_from_comments,
 )
-from mimir.worklink.factory_state import (  # noqa: E402
+from mimir_cultivate.worklink.factory_state import (  # noqa: E402
     factory_checkout_interlock,
     factory_issue_resource_lock,
     factory_process_is_alive,

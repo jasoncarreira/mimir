@@ -55,12 +55,12 @@ import os
 from pathlib import Path
 import subprocess
 
-from mimir.worklink.backends.base import WorkOrder
-from mimir.worklink.backends.opencode import OpenCodeBackend
-from mimir.worklink.checkout import cleanup_checkout, create_isolated_checkout
-from mimir.worklink.compute import LocalSubprocessComputeBackend
-from mimir.worklink.evidence import observe_evidence
-from mimir.worklink.safe_git import ControllerGitPublication
+from mimir_cultivate.worklink.backends.base import WorkOrder
+from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+from mimir_cultivate.worklink.checkout import cleanup_checkout, create_isolated_checkout
+from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+from mimir_cultivate.worklink.evidence import observe_evidence
+from mimir_cultivate.worklink.safe_git import ControllerGitPublication
 
 REPO = Path(os.environ["WORKLINK_REPO"])
 METADATA = Path("/home/mimir/worklink-publication")
@@ -72,7 +72,7 @@ async def main():
     if os.geteuid() != 1001:
         raise RuntimeError("controller proof is not running as mimir")
     os.environ.update({
-        "MIMIR_CODING_ENABLED": "true",
+        "MIMIR_PLUGINS": "cultivate",
         "MIMIR_MODEL_SPEC": "proof:model",
         "OPENCODE_CONFIG": str(CONFIG),
         "XDG_DATA_HOME": str(DATA),
@@ -338,6 +338,7 @@ def main() -> None:
         ], timeout=1200)
         run([
             "docker", "run", "--detach", "--env", "HOME=/home/mimir",
+            "--env", "MIMIR_PLUGINS=cultivate",
             "--env", f"WORKLINK_REPO={repo}", "--name", CONTAINER, IMAGE,
         ])
         wait_for_runtime()
@@ -377,7 +378,7 @@ def main() -> None:
         rows = [line.split("\t", 2) for line in process_table.splitlines() if line.count("\t") >= 2]
         if not any(uid == "1001" and "mimir run" in cmd for _, uid, cmd in rows):
             raise RuntimeError(f"live mimir service is not uid 1001\n{process_table}")
-        if not any(uid == "0" and "mimir.worklink.worker_exec" in cmd for _, uid, cmd in rows):
+        if not any(uid == "0" and "mimir_cultivate.worklink.worker_exec" in cmd for _, uid, cmd in rows):
             raise RuntimeError(f"live worker executor is not root\n{process_table}")
 
         setup = r"""
