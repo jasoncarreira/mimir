@@ -21,6 +21,7 @@ def test_selected_provider_registers_owner_bound_turn_callbacks(monkeypatch) -> 
         ("cultivate", "tool_readiness"),
         ("cultivate", "failure_intervention"),
         ("cultivate", "budget_continuation"),
+        ("cultivate", "feedback"),
     }
     selected_policy = registry
     config = SimpleNamespace(plugin_manager=SimpleNamespace(policy=selected_policy), coding_enabled=False)
@@ -58,3 +59,4 @@ def test_unselected_policy_has_no_turn_callbacks() -> None:
     registry.freeze()
     assert _selected_turn_hooks(registry, "budget_continuation") == ()
     assert _selected_turn_hooks(registry, "failure_intervention") == ()
+    assert _selected_turn_hooks(registry, "feedback") == ()

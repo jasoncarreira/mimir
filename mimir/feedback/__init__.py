@@ -73,6 +73,7 @@ from .rules import (  # noqa: F401
     _count_escalation_only_events_in_window,
     _escalated_kinds_in_window,
     _emit_new_escalations,
+    selected_feedback_extension,
 )
 from .runs import (  # noqa: F401
     _compute_group_runs,
@@ -114,12 +115,6 @@ _AGENT_SELF_EVENT_KINDS = frozenset({
     "turn_error",
     "wiki_backlinks_unhealthy",
 })
-_AGENT_SELF_EVENT_PREFIXES = ("claude_code_spawn_",)
-_VALENCE_CHAIN_INPUT_KINDS = frozenset(
-    kind
-    for group in _VALENCE_GROUPS.values()
-    for kind in (*group.positive_kinds, *group.negative_kinds)
-)
 _AGENT_SELF_CHANNEL_CARRIERS = frozenset({
     "cross_turn_send_duplicate",
     "send_message_loop_hard_stop",
@@ -196,7 +191,10 @@ def _is_agent_self_record(record: dict) -> bool:
         # turns.jsonl records express ``turn_error`` structurally rather than
         # carrying an event kind.
         return isinstance(record.get("error"), str) and bool(record["error"])
-    return kind in _AGENT_SELF_EVENT_KINDS or kind.startswith(_AGENT_SELF_EVENT_PREFIXES)
+    if kind in _AGENT_SELF_EVENT_KINDS:
+        return True
+    extension = selected_feedback_extension()
+    return extension is not None and kind in extension.agent_self_events
 
 
 def _sanitize_agent_self_record(record: dict) -> dict:
@@ -393,6 +391,10 @@ class FeedbackLog:
             )
 
         window_hours = window_hours if window_hours is not None else self.default_window_hours
+        extension = selected_feedback_extension()
+        valence_groups = dict(_VALENCE_GROUPS)
+        if extension is not None:
+            valence_groups.update(extension.valence_groups)
         limit = (
             limit_per_polarity
             if limit_per_polarity is not None
@@ -465,10 +467,10 @@ class FeedbackLog:
         # loop must skip those individual events so they don't duplicate.
         # Chain signals are always-surface (bypass the per-polarity limit).
         group_runs = _compute_group_runs(
-            event_snapshot, self.events_path, cutoff_iso, _VALENCE_GROUPS
+            event_snapshot, self.events_path, cutoff_iso, valence_groups
         )
         chain_signals, chain_consumed_kinds = _synthesize_chain_signals(
-            group_runs, _VALENCE_GROUPS
+            group_runs, valence_groups
         )
 
         negatives: list[FeedbackSignal] = []
@@ -543,7 +545,7 @@ class FeedbackLog:
                 continue
             # First-occurrence-only kinds: skip duplicates. Tail-first
             # iteration means we keep the most recent.
-            if kind in _FIRST_OCCURRENCE_ONLY_KINDS:
+            if kind in _FIRST_OCCURRENCE_ONLY_KINDS or (extension is not None and kind in extension.first_only_kinds):
                 if kind in seen_first_only:
                     continue
                 seen_first_only.add(kind)
@@ -766,6 +768,14 @@ class FeedbackLog:
         admitted_events: list[dict] = []
         admitted_turns: list[dict] = []
         chain_inputs: list[tuple[dict, str]] = []
+        extension = selected_feedback_extension()
+        valence_groups = dict(_VALENCE_GROUPS)
+        if extension is not None:
+            valence_groups.update(extension.valence_groups)
+        chain_input_kinds = frozenset(
+            kind for group in valence_groups.values()
+            for kind in (*group.positive_kinds, *group.negative_kinds)
+        )
         # Admission decides eligibility, not contribution. The arousal filter
         # suppresses a whole kind whose occurrences stay below its threshold,
         # and a suppressed kind contributes no line and no count to anything
@@ -926,7 +936,7 @@ class FeedbackLog:
                 and not record.get("channel_id")
                 and not _is_agent_self_record(record)
                 and classified is not None
-                and classified[1] in _VALENCE_CHAIN_INPUT_KINDS
+                and classified[1] in chain_input_kinds
             ):
                 chain_inputs.append(({
                     "timestamp": timestamp,
@@ -964,14 +974,14 @@ class FeedbackLog:
         if chain_inputs:
             chain_snapshot = _RecordSnapshot([record for record, _ in chain_inputs])
             group_runs = _compute_group_runs(
-                chain_snapshot, self.events_path, cutoff_iso, _VALENCE_GROUPS,
+                chain_snapshot, self.events_path, cutoff_iso, valence_groups,
             )
             chain_signals, _ = _synthesize_chain_signals(
-                group_runs, _VALENCE_GROUPS,
+                group_runs, valence_groups,
             )
             for signal in chain_signals:
                 group_key = signal.kind.removesuffix("_chain")
-                group = _VALENCE_GROUPS[group_key]
+                group = valence_groups[group_key]
                 group_kinds = group.positive_kinds | group.negative_kinds
                 sources = InformationFlowLabels()
                 for record, resource_key in chain_inputs:

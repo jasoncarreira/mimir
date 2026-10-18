@@ -14,6 +14,7 @@ from ..prompt_safety import (
     FIELD_MAX_LEN as _FIELD_MAX_LEN,
     sanitize_prompt_field as _sanitize_field,
 )
+from .rules import selected_feedback_extension
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +58,9 @@ def _render_skill_details(items: object, *, limit: int = 4) -> str:
     return _sanitize_field(str(items))
 
 def _render_event_line(rule_kind: str, ev: dict) -> str:
+    extension = selected_feedback_extension()
+    if extension is not None and rule_kind in extension.renderers:
+        return extension.renderers[rule_kind](ev)
     if rule_kind == "tool_denied":
         tool = ev.get("tool") or ev.get("name") or "?"
         reason = _sanitize_field(ev.get("reason") or ev.get("error") or "")
@@ -70,38 +74,6 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         name = _sanitize_field(ev.get("name") or "?")
         error = _sanitize_field(ev.get("error") or "(no detail)")
         return f"background task {name!r} failed: {error}"
-    if rule_kind == "worklink_tool_pin_dedupe_check_failed":
-        tool = _sanitize_field(ev.get("tool_name") or "?")
-        pin = _sanitize_field(ev.get("dedupe_key") or "?")
-        reason = _sanitize_field(ev.get("reason") or "(no detail)")
-        return (
-            f"Worklink tool-pin dedupe check failed for {tool} "
-            f"({pin}): {reason} — issue creation skipped"
-        )
-    if rule_kind == "worklink_run_orphaned":
-        issue = _sanitize_field(ev.get("issue_id") or "?")
-        label = _sanitize_field(ev.get("resulting_label") or "?")
-        branch = _sanitize_field(ev.get("branch") or "?")
-        if ev.get("publication_outcome") == "determined-unpublished" or ev.get(
-            "unpublished_commits"
-        ):
-            return (
-                f"Worklink run #{issue} died; lock released and {label} applied "
-                f"because branch {branch} has unpublished commits — recover the checkout"
-            )
-        if ev.get("publication_outcome") == "undetermined":
-            return (
-                f"Worklink run #{issue} died; publication status was undetermined and "
-                f"the issue moved to {label}"
-            )
-        return f"Worklink run #{issue} died; lock released and issue returned to {label}"
-    if rule_kind == "worklink_run_orphan_reconcile_failed":
-        issue = _sanitize_field(ev.get("issue_id") or "?")
-        reason = _sanitize_field(ev.get("reason") or "unknown failure")
-        return (
-            f"Worklink orphan reconciliation failed for #{issue}: {reason}; "
-            "run state retained for operator recovery"
-        )
     if rule_kind == "loop_stall_watchdog_fired":
         stall = ev.get("stall_s")
         threshold = ev.get("threshold_s")
@@ -604,37 +576,6 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"Slack bridge supervisor exited after {reason}. "
             f"Inbound + outbound Slack traffic is down until restart."
         )
-    if rule_kind in ("spawn_ok", "spawn_auth_fail", "spawn_work_fail"):
-        job_id = ev.get("job_id") or "?"
-        agent_name = ev.get("agent") or "?"
-        cost = ev.get("cost_usd")
-        cost_str = f" cost=${cost:.2f}" if isinstance(cost, (int, float)) else ""
-        duration = ev.get("duration_ms")
-        if isinstance(duration, (int, float)):
-            secs = duration / 1000.0
-            duration_str = f" {secs:.0f}s" if secs >= 1 else f" {secs:.2f}s"
-        else:
-            duration_str = ""
-        if rule_kind == "spawn_ok":
-            return (
-                f"claude_code spawn {job_id} ({agent_name}){duration_str}{cost_str} "
-                f"completed cleanly"
-            )
-        terminal = _sanitize_field(ev.get("terminal_reason") or "?")
-        if rule_kind == "spawn_auth_fail":
-            status = ev.get("api_error_status")
-            status_str = f" [HTTP {status}]" if status is not None else ""
-            return (
-                f"claude_code spawn {job_id} ({agent_name}){duration_str} "
-                f"auth-failed{status_str} terminal={terminal}. "
-                f"Token revoked / refresh-failed / quota-exhausted server-side."
-            )
-        # spawn_work_fail
-        return (
-            f"claude_code spawn {job_id} ({agent_name}){duration_str}{cost_str} "
-            f"work-failed terminal={terminal}. "
-            f"Spawn loop ended without a clean PR — see logs/bash-jobs/{job_id}.out."
-        )
     if rule_kind == "unknown_channel":
         return f"send_message to unknown channel {ev.get('channel_id', '?')}"
     if rule_kind == "saga_feedback":
@@ -955,31 +896,6 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         return (
             f"poller {name!r} has invalid cron {cron!r} — {outcome} "
             f"(fix pollers.json + reload_pollers)"
-        )
-    if rule_kind == "pr_merge_blocked":
-        # chainlink #214: pre-merge CHANGES_REQUESTED gate refused the merge.
-        # Include PR number + blocking reviewer(s) so the operator can see
-        # which review is blocking without reading turn transcripts.
-        # Author names come from GitHub API responses and must be sanitized
-        # before surfacing in the prompt — chainlink #224.
-        pr_num = ev.get("pr") or ev.get("pr_number") or "?"
-        blocking = ev.get("blocking_reviewers") or ev.get("blocking") or []
-        if isinstance(blocking, list) and blocking:
-            authors = ", ".join(
-                _sanitize_field(b.get("author", "?") if isinstance(b, dict) else str(b))
-                for b in blocking
-            )
-            return (
-                f"pr_merge blocked: PR #{pr_num} has CHANGES_REQUESTED "
-                f"from {authors} — resolve before merge"
-            )
-        return f"pr_merge blocked: PR #{pr_num} has CHANGES_REQUESTED review"
-    if rule_kind == "pr_auto_review_skipped_untrusted_author":
-        repo = _sanitize_field(str(ev.get("repo") or "?"))
-        number = _sanitize_field(str(ev.get("number") or "?"))
-        return (
-            f"automatic review skipped for {repo}#{number}: PR author is not "
-            "a verified collaborator or active organization member; review deliberately"
         )
     if rule_kind == "gave_up" or rule_kind.endswith("_gave_up"):
         # A poller abandoned a retried action after exhausting its budget

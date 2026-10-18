@@ -264,6 +264,9 @@ class CultivateProvider:
         registrar.register_turn_hook("tool_readiness", lambda: not github_identity_is_degraded())
         registrar.register_turn_hook("failure_intervention", is_dispatch_failure_intervention)
         registrar.register_turn_hook("budget_continuation", maybe_create_worklink_budget_continuation)
+        from .feedback import feedback_extension
+
+        registrar.register_turn_hook("feedback", feedback_extension)
         from . import server
 
         registrar.register_server_hook("capture_source", server.capture_controller_source_commit)
