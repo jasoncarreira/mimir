@@ -2,6 +2,7 @@ name = "cultivate"
 version = "0.9.10"
 license = "BUSL-1.1"
 requires_mimir = "==0.9.10"
+themes = ["skins/squashmerge.json"]
 
 [frontend]
 api_major = 1
