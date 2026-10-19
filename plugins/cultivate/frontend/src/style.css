@@ -1,14 +1,15 @@
 .cultivate {
-  --cultivate-link: #aba5ff;
-  --cultivate-selected: #7770dc;
-  --cultivate-focus: #aba5ff;
-  --cultivate-ink: #0b0c10;
-  --cultivate-action: #ffaa10;
+  --cultivate-link: var(--mimir-color-focus-ring);
+  --cultivate-selected: var(--mimir-interaction-active-background);
+  --cultivate-focus: var(--mimir-color-focus-ring);
+  --cultivate-ink: var(--mimir-color-background);
+  --cultivate-action: var(--mimir-color-chrome-accent);
   display: grid;
   gap: var(--mimir-space-4, 24px);
   min-width: 0;
   max-width: 80rem;
 }
+.cultivate-logo { display: block; width: min(100%, 400px); height: auto; }
 
 .cultivate a { color: var(--cultivate-link); text-decoration: underline; overflow-wrap: anywhere; }
 .cultivate :is(button, a, textarea, summary, [tabindex]):focus-visible {

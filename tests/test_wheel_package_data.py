@@ -19,10 +19,12 @@ no ``uv`` / ``hatchling`` / ``pathspec`` dependency.
 from __future__ import annotations
 
 import re
+import hashlib
 import shutil
 import subprocess
 import tomllib
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 
@@ -141,7 +143,26 @@ def test_coding_prompts_ship_in_cultivate_and_match_legacy_fallback() -> None:
         assert (REPO_ROOT / "mimir/prompt_templates" / name).read_bytes() == (plugin_root / rel).read_bytes()
         assert "mimir_cultivate/**/*" in sdist["include"]
         assert not any(_gitwildmatch_to_regex(pattern).match(rel)
-                       for pattern in wheel.get("exclude", ()))
+                        for pattern in wheel.get("exclude", ()))
+
+
+def test_cultivate_wheel_contains_original_logo_and_both_licenses(tmp_path: Path) -> None:
+    result = subprocess.run(
+        ["uv", "build", "--package", "mimir-cultivate", "--wheel", "--out-dir", str(tmp_path)],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    wheel, = tmp_path.glob("*.whl")
+    with ZipFile(wheel) as archive:
+        logo = "mimir_cultivate/brand/cultivate-logo-dark-v1.png"
+        assert archive.namelist().count(logo) == 1
+        assert hashlib.sha256(archive.read(logo)).digest() == hashlib.sha256(
+            (REPO_ROOT / "brand/logos/cultivate-logo-dark-v1.png").read_bytes()
+        ).digest()
+        for license_path in ("LICENSE", "brand/LICENSE"):
+            original = (REPO_ROOT / "plugins/cultivate" / license_path).read_bytes()
+            assert original in (archive.read(name) for name in archive.namelist()
+                                if name.endswith(license_path))
 
 
 def test_wheel_include_config_covers_critical_runtime_data() -> None:

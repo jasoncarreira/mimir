@@ -42,7 +42,7 @@ def test_workspace_metadata_and_manifest() -> None:
         "cultivate": "mimir_cultivate:provider"}
     assert manifest["name"] == "cultivate"
     assert manifest["requires_mimir"] == f"=={version}"
-    assert set(manifest) == {"name", "version", "license", "requires_mimir", "defaults", "frontend"}
+    assert set(manifest) == {"name", "version", "license", "requires_mimir", "defaults", "frontend", "themes"}
     assert manifest["defaults"]["version"] == version
     assert len(manifest["defaults"]["skills"]) == 6
     assert (PLUGIN / "brand/LICENSE").read_bytes() == (ROOT / "brand/LICENSE").read_bytes()
