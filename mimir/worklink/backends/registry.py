@@ -12,7 +12,6 @@ from typing import Any, Mapping
 
 import yaml
 
-from ...repository_config import valid_repository_slug
 from ..claims import DEFAULT_MAX_CLAIM_ATTEMPTS
 from ..compute import (
     ComputeBackend,
@@ -315,7 +314,10 @@ class WorklinkConfig:
             tiered_review=_parse_tiered_review_config(defaults_data.get("tiered_review")),
         )
         repository = data.get("repository")
-        if repository is not None and not valid_repository_slug(repository):
+        if repository is not None and (
+            not isinstance(repository, str)
+            or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None
+        ):
             raise ValueError("worklink repository must be owner/repository")
         if repository is not None:
             repository = repository.lower()

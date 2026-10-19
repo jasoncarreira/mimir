@@ -825,21 +825,13 @@ def _resolve_file_tool_target(
 
 
 def _repository_inventory(home: str) -> Any:
-    """Read a selected owner's inventory or the still-installed core inventory."""
+    """Read inventory only from the selected owner; never trust a missing provider."""
     policy = selected_policy_registry()
     hooks = policy.policy_consumer_hooks
     path = Path(home) / "repositories.yaml"
     if hooks is not None:
         return hooks.repository_inventory(path)
-    if getattr(policy, "_projected_owner", None) is not None:
-        return None
-    try:
-        from .repository_config import RepositoryInventory
-    except ModuleNotFoundError as exc:
-        if exc.name != "mimir.repository_config":
-            raise
-        return None
-    return RepositoryInventory.load(path)
+    return None
 
 
 def _inventory_unavailable_with_declaration(home: str, inventory: Any) -> bool:

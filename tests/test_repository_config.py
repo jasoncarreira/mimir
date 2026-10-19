@@ -10,8 +10,18 @@ import yaml
 
 from mimir import access_control
 from mimir.config import Config
-from mimir.repository_config import RepositoryConfig, RepositoryInventory, RepositoryTestSuite
+from mimir.plugins.core import policy_scope
+from mimir_cultivate.repository import RepositoryConfig, RepositoryInventory, RepositoryTestSuite
 from mimir.worklink.backends.registry import WorklinkConfig
+
+
+@pytest.fixture(autouse=True)
+def selected_repository_provider(monkeypatch: pytest.MonkeyPatch):
+    from mimir.plugins.manager import load_plugins
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
 
 
 def _git_checkout(path: Path, origin: str) -> None:

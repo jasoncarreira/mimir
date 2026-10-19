@@ -690,12 +690,13 @@ def _parse_file_tool_roots(
     return tuple(out.items())
 
 
-def _configure_declared_repositories(home: Path) -> None:
+def _configure_declared_repositories(home: Path, inventory_loader: Any = None) -> None:
     """Validate the repository inventory and reconcile its legacy projections."""
-    from .repository_config import RepositoryInventory
+    if inventory_loader is None:
+        return
     from .worklink.backends.registry import WorklinkConfig
 
-    inventory = RepositoryInventory.load(home / "repositories.yaml")
+    inventory = inventory_loader(home / "repositories.yaml")
     if not inventory.declared:
         return
     worklink = WorklinkConfig.load(home / "worklink.yaml")
@@ -1369,7 +1370,10 @@ class Config:
         if "MIMIR_UNAUTHORIZED_USER_BEHAVIOR" in os.environ and not getattr(cls, "_retired_intake_warned", False):
             log.warning("MIMIR_UNAUTHORIZED_USER_BEHAVIOR is retired; use intake.unknown_senders in identities.yaml")
             cls._retired_intake_warned = True
-        _configure_declared_repositories(home)
+        hooks = plugin_manager.policy.policy_consumer_hooks
+        _configure_declared_repositories(
+            home, hooks.repository_inventory if hooks is not None else None,
+        )
         if "MIMIR_FILE_OP_ROOTS" in os.environ:
             log.warning(
                 "MIMIR_FILE_OP_ROOTS is retired and ignored; migrate its required "

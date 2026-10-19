@@ -12,12 +12,11 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import yaml
 
 from ..redaction import redact_text
-from ..repository_config import RepositoryConfig, RepositoryInventory
 from .backends import WorklinkConfig
 from .checkout import _default_runner
 from .dispatch_failures import (
@@ -152,13 +151,18 @@ def _origin_slug(value: str) -> str | None:
     return f"{match.group(1)}/{match.group(2)}".lower() if match else None
 
 
-def resolve_completion_repository(home: Path, *, runner: Runner) -> RepositoryConfig:
+def resolve_completion_repository(home: Path, *, runner: Runner) -> Any:
     """Resolve and attest the one configured writable completion repository."""
     inventory_path = home / "repositories.yaml"
     if not inventory_path.is_file():
         raise ClosureReadError("repository trust unavailable: repositories.yaml is required")
     try:
-        inventory = RepositoryInventory.load(inventory_path)
+        from ..plugins.core import selected_policy_registry
+
+        hooks = selected_policy_registry().policy_consumer_hooks
+        if hooks is None:
+            raise ClosureReadError("repository trust unavailable: no selected repository provider")
+        inventory = hooks.repository_inventory(inventory_path)
         selected = WorklinkConfig.load(home / "worklink.yaml").repository
     except (OSError, RuntimeError, TypeError, ValueError, OverflowError, yaml.YAMLError) as exc:
         raise ClosureReadError(f"repository trust unavailable: {exc}") from exc
@@ -471,7 +475,7 @@ def _lifecycle_reason(issue: IssueSnapshot) -> str | None:
     return None
 
 
-def _intent_key(issue_id: int, repository: RepositoryConfig, pr: PrSnapshot) -> str:
+def _intent_key(issue_id: int, repository: Any, pr: PrSnapshot) -> str:
     identity = json.dumps([1, issue_id, repository.slug, pr.number], separators=(",", ":"))
     return hashlib.sha256(identity.encode()).hexdigest()
 
@@ -495,7 +499,7 @@ def _notice(
 
 
 def _validate_qualification(
-    *, issue: IssueSnapshot, pr: PrSnapshot, repository: RepositoryConfig,
+    *, issue: IssueSnapshot, pr: PrSnapshot, repository: Any,
     association: AssociationDecision,
 ) -> str | None:
     if reason := _lifecycle_reason(issue):
@@ -578,7 +582,7 @@ def _run_tracker(runner: Runner, *args: str) -> subprocess.CompletedProcess[str]
 
 
 def _revalidate(
-    home: Path, issue_id: int, pr_url: str, *, repository: RepositoryConfig,
+    home: Path, issue_id: int, pr_url: str, *, repository: Any,
     gh_bin: str, chainlink_runner: Runner, gh_runner: Runner,
 ) -> tuple[IssueSnapshot, PrSnapshot, AssociationDecision]:
     issue = _read_issue(issue_id, chainlink_runner)
@@ -593,7 +597,7 @@ def _revalidate(
 
 
 def _process_intent(
-    home: Path, state_dir: Path, key: str, *, repository: RepositoryConfig,
+    home: Path, state_dir: Path, key: str, *, repository: Any,
     gh_bin: str, chainlink_runner: Runner, gh_runner: Runner,
 ) -> ClosureOutcome | None:
     with merge_reconciliation_transaction(state_dir) as reconciliations:

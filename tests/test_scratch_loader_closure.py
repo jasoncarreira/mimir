@@ -14,7 +14,7 @@ from mimir.index import (
     build_state_index,
     build_wiki_index,
 )
-from mimir.repository_config import RepositoryInventory
+from mimir_cultivate.repository import RepositoryInventory
 from mimir.search import HashEmbedder, Indexer
 from mimir.wiki_backlinks import build_graph, build_wiki_payload, find_pages, find_slug_collisions
 

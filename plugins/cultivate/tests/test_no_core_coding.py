@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import ast
+import importlib.util
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -66,5 +69,68 @@ assert 'mimir.repo_pr_parity' not in sys.modules
     result = subprocess.run(
         [sys.executable, "-c", script], env={**os.environ, "MIMIR_PLUGINS": "cultivate"},
         capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_repository_inventory_import_closure() -> None:
+    root = Path(__file__).resolve().parents[3]
+    retired = {"mimir.repository_config", "mimir.repo_pr_parity"}
+    for source_root in (root / "mimir", root / "plugins/cultivate/mimir_cultivate"):
+        for path in source_root.rglob("*.py"):
+            module = ".".join(path.relative_to(root).with_suffix("").parts)
+            if source_root.name == "mimir_cultivate":
+                module = ".".join(("mimir_cultivate", *path.relative_to(source_root).with_suffix("").parts))
+            package = module.removesuffix(".__init__") if path.stem == "__init__" else module.rpartition(".")[0]
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Import):
+                    names = (alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    name = "." * node.level + (node.module or "")
+                    names = (importlib.util.resolve_name(name, package),) if node.level else (name,)
+                else:
+                    continue
+                assert not retired.intersection(names), f"{path}: retired module import"
+
+
+def test_core_only_config_boots_with_repository_file_without_loading_provider(tmp_path: Path) -> None:
+    (tmp_path / "repositories.yaml").write_text("repositories: []\n", encoding="utf-8")
+    script = """
+import sys
+from mimir.config import Config
+from mimir import access_control
+from mimir.worklink import orchestrator, merge_closure
+config = Config.from_env()
+assert config.plugin_manager.policy.policy_consumer_hooks is None
+assert access_control._repository_inventory(str(config.home)) is None
+assert access_control._configured_repo_write_roots() == []
+assert 'mimir.repository_config' not in sys.modules
+assert 'mimir_cultivate' not in sys.modules
+"""
+    env = {**os.environ, "MIMIR_PLUGINS": "", "MIMIR_HOME": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_selected_repository_inventory_uses_registered_owner(tmp_path: Path) -> None:
+    (tmp_path / "repositories.yaml").write_text("repositories: []\n", encoding="utf-8")
+    script = """
+import sys
+from mimir.plugins.core import policy_scope
+from mimir.plugins.manager import load_plugins
+from mimir import access_control
+selected = load_plugins(enable='cultivate').policy
+with policy_scope(selected):
+    inventory = access_control._repository_inventory(sys.argv[1])
+    assert inventory.declared
+    assert type(inventory).__module__ == 'mimir_cultivate.repository'
+assert 'mimir.repository_config' not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        env={**os.environ, "MIMIR_PLUGINS": "cultivate"},
+        capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr

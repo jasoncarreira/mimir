@@ -28,13 +28,13 @@ from tests.test_repo_tools import (
 
 
 def test_repository_implementation_is_owned_by_provider() -> None:
-    from mimir import pr_checkout_lease, project_tests, repo_tools, repository_config
+    from mimir import pr_checkout_lease, project_tests, repo_tools
     from mimir.tools import repo
 
     assert repository.RepoGitTools is not repo_tools.RepoGitTools
     assert repository.RepoProjectTests is not project_tests.RepoProjectTests
     assert repository.PRCheckoutLease is not pr_checkout_lease.PRCheckoutLease
-    assert repository.RepositoryInventory is not repository_config.RepositoryInventory
+    assert not (Path(__file__).resolve().parents[3] / "mimir" / "repository_config.py").exists()
     assert repository.repo_status is not repo.repo_status
     assert {tool.name for tool in repository.REPO_TOOLS} == {
         tool.name for tool in repo.REPO_TOOLS

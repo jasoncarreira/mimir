@@ -3521,6 +3521,9 @@ def test_unknown_leaf_target_branch_fails_without_falling_back_to_main(tmp_path:
 
 
 def test_worklink_runner_uses_repository_base_over_deployment_default(tmp_path: Path) -> None:
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     (tmp_path / "worklink.yaml").write_text(
@@ -3544,11 +3547,12 @@ repositories:
     registry = BackendRegistry(WorklinkConfig())
     registry.register(backend)
 
-    result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
-            441, backend_name="fake"
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        result = asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+                441, backend_name="fake"
+            )
         )
-    )
 
     assert result.status == "completed"
     assert ["git", "-C", str(repo), "fetch", "origin", "repository-base"] in calls

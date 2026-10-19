@@ -2489,6 +2489,16 @@ def _configure_test_suites(home: Path, state: RepoReviewState, **overrides) -> N
     (home / "repositories.yaml").write_text(yaml.safe_dump({"repositories": [record]}))
 
 
+@pytest.fixture
+def selected_repo_inventory():
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+@pytest.mark.usefixtures("selected_repo_inventory")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("suite,selectors,expected", [
     ("frontend", (), "frontend"),
@@ -2542,6 +2552,7 @@ async def test_project_suite_selection_and_snapshot_argv(
     assert not issued[0].exists()
 
 
+@pytest.mark.usefixtures("selected_repo_inventory")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("suite,selectors,overlap", [
     (None, ("frontend/example.tsx", "test_example.py"), False),
@@ -2575,6 +2586,7 @@ async def test_project_suite_selection_refuses_without_execution(
     assert "python, frontend" in str(error.value)
 
 
+@pytest.mark.usefixtures("selected_repo_inventory")
 def test_selector_helper_drives_inference_and_refusal_message(
     repo_tools, tmp_path, monkeypatch,
 ):
@@ -2604,6 +2616,7 @@ def test_selector_helper_drives_inference_and_refusal_message(
     assert matched not in str(error.value)
 
 
+@pytest.mark.usefixtures("selected_repo_inventory")
 @pytest.mark.asyncio
 async def test_unmatched_directory_selector_refusal_names_explicit_suite(
     repo_tools, tmp_path, monkeypatch,
@@ -2660,6 +2673,7 @@ def test_frontend_selector_guards(tmp_path, selector, code):
     assert error.value.code == code
 
 
+@pytest.mark.usefixtures("selected_repo_inventory")
 @pytest.mark.asyncio
 async def test_project_legacy_repository_command_keeps_argv(repo_tools, tmp_path, monkeypatch):
     state = repo_tools[-2]
@@ -2677,6 +2691,7 @@ async def test_project_legacy_repository_command_keeps_argv(repo_tools, tmp_path
     assert result.suite == "default" and result.command_source == "repository"
 
 
+@pytest.mark.usefixtures("selected_repo_inventory")
 def test_project_suite_default_and_legacy_fallback(repo_tools, tmp_path, monkeypatch):
     state = repo_tools[-2]
     home = tmp_path / "home"
@@ -2696,6 +2711,7 @@ def test_project_suite_default_and_legacy_fallback(repo_tools, tmp_path, monkeyp
     assert (command, source, suite, is_default) == (("/usr/bin/false",), "repository", "default", True)
 
 
+@pytest.mark.usefixtures("selected_repo_inventory")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_code,overflow,timed_out,code", [
     (2, False, False, "tests_failed"),
@@ -3535,6 +3551,7 @@ async def test_project_test_snapshot_credentials_are_named_refusal(
     assert refusal.value.code == "test_snapshot_credentials_refused"
 
 
+@pytest.mark.usefixtures("selected_repo_inventory")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("suite", [None, "frontend"])
 async def test_public_repo_test_credential_fault_persists_no_sensitive_material(

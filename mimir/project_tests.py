@@ -13,6 +13,7 @@ import shlex
 import shutil
 import stat
 from collections.abc import Awaitable, Callable
+from types import SimpleNamespace
 import uuid
 
 from .contained_checkout import ContainedCheckout, create_repo_test_checkout
@@ -37,7 +38,6 @@ from .repo_tools import (
     retained_factory_subprocess_runner,
     retained_factory_snapshot_bundle,
 )
-from .repository_config import RepositoryInventory, RepositoryTestSuite
 from .worklink.backends.registry import WorklinkConfig
 from .worklink.identities import get_identities
 from .worklink.worker_client import StaleWorkerExecutorError
@@ -326,7 +326,7 @@ ContainedRunner = Callable[..., Awaitable[CollectedExecutionResult]]
 CheckoutFactory = Callable[..., ContainedCheckout]
 
 
-def _selector_matches(path: str, suite: RepositoryTestSuite) -> bool:
+def _selector_matches(path: str, suite: object) -> bool:
     """Use the same path rule for suite inference and refusal diagnostics."""
     selector_path = path.partition("::")[0]
     return (
@@ -348,8 +348,14 @@ def _configured_command(
         )
     try:
         config = WorklinkConfig.load(Path(home) / "worklink.yaml")
-        inventory = RepositoryInventory.load(Path(home) / "repositories.yaml")
-        record = inventory.repository(repo_slug) if inventory.declared else None
+        from .plugins.core import selected_policy_registry
+
+        inventory_path = Path(home) / "repositories.yaml"
+        hooks = selected_policy_registry().policy_consumer_hooks
+        if hooks is None and (inventory_path.exists() or inventory_path.is_symlink()):
+            raise ValueError("repository inventory requires a selected provider")
+        inventory = hooks.repository_inventory(inventory_path) if hooks is not None else None
+        record = inventory.repository(repo_slug) if inventory is not None and inventory.declared else None
         if record is not None and record.test_command is not None:
             command = record.test_command
             source = "repository"
@@ -359,7 +365,8 @@ def _configured_command(
         suites = record.test_suites if record is not None else ()
         legacy = not suites
         if legacy or (record.test_command is not None and not any(s.default for s in suites)):
-            suites = (RepositoryTestSuite("default", command, default=True), *suites)
+            suites = (SimpleNamespace(name="default", command=command, default=True,
+                                      selector_prefixes=(), selector_suffixes=()), *suites)
         default = next((s for s in suites if s.default), None)
         if suite is not None:
             matches = [s for s in suites if s.name == suite]
