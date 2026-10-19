@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 from dataclasses import replace
@@ -157,6 +159,15 @@ def test_forge_surface_has_all_scoped_tools() -> None:
         "unsupported_operation",
     ]
     assert all(callable(item.func) and callable(item.coroutine) for item in forge.FORGE_TOOLS)
+
+
+def test_provider_forge_has_no_core_repository_fallback() -> None:
+    tree = ast.parse(Path(forge.__file__).read_text(encoding="utf-8"))
+    imports = (
+        node.module for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    )
+    assert "mimir.repo_tools" not in imports
 
 
 def test_provider_refuses_accidental_pr_body_shrink(monkeypatch) -> None:

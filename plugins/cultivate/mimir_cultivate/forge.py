@@ -1859,10 +1859,7 @@ def remediation_checkout_preflight(
         return original, None
     fresh = RepoReviewState(fresh_scope)
 
-    try:
-        from mimir_cultivate.repository import was_agent_push
-    except ImportError:  # Compatibility until the repository slice is installed.
-        from mimir.repo_tools import was_agent_push
+    from .repository import was_agent_push
 
     if not was_agent_push(
         repository, pull_request, scope.observed_head_sha, snapshot.head_sha,
@@ -1888,10 +1885,7 @@ def remediation_checkout_preflight(
 def _seed_verified_remint(
     context: AuthContext | None, old: RepoPRActionScope, new: RepoPRActionScope,
 ) -> None:
-    try:
-        from mimir_cultivate.repository import was_verified_push
-    except ImportError:  # Compatibility until the repository slice is installed.
-        from mimir.repo_tools import was_verified_push
+    from .repository import was_verified_push
 
     if (
         context is not None
@@ -2281,10 +2275,7 @@ def _pr_attestation(
         # trust; accepting a new head requires per-turn lineage recording.
         if runtime is None:
             return ("<head-mismatch>",), scope.observed_head_sha
-        try:
-            from mimir_cultivate.repository import was_verified_push
-        except ImportError:  # Compatibility until the repository slice is installed.
-            from mimir.repo_tools import was_verified_push
+        from .repository import was_verified_push
 
         if not was_verified_push(
             scope.canonical_repo, scope.pr_number, scope.observed_head_sha, metadata.head_sha,
@@ -2624,10 +2615,7 @@ def _attest_ci_runs(runtime: ToolRuntime[AuthContext] | None, repository: str,
 
 
 def _trusted_ci_head(context: AuthContext, repository: str, run: dict[str, Any]) -> bool:
-    try:
-        from mimir_cultivate.repository import _PROTECTED_BRANCH_REFS
-    except ImportError:  # Compatibility until the repository slice is installed.
-        from mimir.repo_tools import _PROTECTED_BRANCH_REFS
+    from .repository import _PROTECTED_BRANCH_REFS
 
     if not isinstance(run, dict):
         return False
