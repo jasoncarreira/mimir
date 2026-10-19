@@ -32,6 +32,9 @@ def test_web_contributions_are_selected_only() -> None:
     assert not core.routes
     assert "cultivate-factory-runs" not in core.dashboard_entries
     assert not any(name == "chainlink_board" for _, name in core.server_hooks)
+    assert "factory-runs" not in {
+        entry.id for entry in web_ui.first_party_dashboard_extensions().manifests
+    }
 
     policy = load_plugins(enable="cultivate").policy
     routes = policy.routes
@@ -66,8 +69,10 @@ async def test_plugin_routes_check_admin_on_server(tmp_path: Path) -> None:
     user_app["cultivate_home"] = tmp_path
     add_plugin_routes(user_app, load_plugins(enable="cultivate").policy)
     async with TestClient(TestServer(user_app)) as client:
-        assert (await client.get(path)).status == 403
-        assert (await client.post("/api/v1/plugins/cultivate/factory-run/archive?run_id=x")).status == 403
+        base = "/api/v1/plugins/cultivate"
+        for endpoint in ("/factory-runs", "/factory-run?run_id=x", "/pr-board"):
+            assert (await client.get(base + endpoint)).status == 403
+        assert (await client.post(f"{base}/factory-run/archive?run_id=x")).status == 403
 
     @web.middleware
     async def admin(request: web.Request, handler):
@@ -306,3 +311,92 @@ async def test_selected_factory_archive_persists_audit_and_denies_replay(
     )
     assert Path(audit["archive_path"]).read_bytes() == original
     assert Path(audit["archive_path"]) == source.parent / "archive" / "1620-attempt-2.json"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [{}, {"reason": "  "}, {"reason": 1}, [], None])
+async def test_selected_factory_archive_requires_reason(tmp_path: Path, reason: object) -> None:
+    record = FactoryRunRecord(
+        run_id="1620", issue_id=1620, attempt=1, repository="owner/repo",
+        base_ref="main", branch="worklink/1620", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(tmp_path / "sandbox"), session=None, handle=None, status=None,
+        observed_at=None, controller_phase="terminal",
+    )
+    source = save_factory_record(tmp_path, record)
+    app = web.Application(middlewares=[_admin])
+    app["cultivate_home"] = tmp_path
+    add_plugin_routes(app, load_plugins(enable="cultivate").policy)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/api/v1/plugins/cultivate/factory-run/archive?run_id=1620", json=reason,
+        )
+        assert response.status == 400
+        assert (await response.json())["error"]["code"] == "invalid_reason"
+    assert source.exists()
+
+
+@pytest.mark.asyncio
+async def test_selected_factory_archive_refuses_unverified_process(tmp_path: Path) -> None:
+    record = FactoryRunRecord(
+        run_id="1620", issue_id=1620, attempt=1, repository="owner/repo",
+        base_ref="main", branch="worklink/1620", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(tmp_path / "sandbox"), session=None, handle=None, status=None,
+        observed_at=None, controller_phase="running",
+    )
+    source = save_factory_record(tmp_path, record)
+    app = web.Application(middlewares=[_admin])
+    app["cultivate_home"] = tmp_path
+    add_plugin_routes(app, load_plugins(enable="cultivate").policy)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/api/v1/plugins/cultivate/factory-run/archive?run_id=1620",
+            json={"reason": "cleanup"},
+        )
+        assert response.status == 409
+        assert (await response.json())["error"]["code"] == "run_not_verified_dead"
+    assert source.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("process_state", [
+    "live", "permission_denied", "unreadable_ticks", "missing_handle", "missing_ticks",
+])
+async def test_selected_factory_archive_requires_verified_death(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, process_state: str,
+) -> None:
+    from mimir_cultivate.worklink import factory_state
+
+    def probe(pid: int, signal: int) -> None:
+        assert (pid, signal) == (987654, 0)
+        if process_state == "permission_denied":
+            raise PermissionError
+
+    monkeypatch.setattr(factory_state.os, "kill", probe)
+    monkeypatch.setattr(factory_state, "process_is_zombie", lambda pid: False)
+    monkeypatch.setattr(factory_state, "process_start_ticks", lambda pid: (
+        None if process_state == "unreadable_ticks" else 123
+    ))
+    record = FactoryRunRecord(
+        run_id="1620", issue_id=1620, attempt=1, repository="owner/repo",
+        base_ref="main", branch="worklink/1620", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(tmp_path / "sandbox"), session=None,
+        handle=None if process_state == "missing_handle" else LaunchHandle(
+            substrate="local_subprocess", identifier="987654", shim_pid=987654,
+            process_start_ticks=None if process_state == "missing_ticks" else 123,
+        ),
+        status=None, observed_at=None, controller_phase="running",
+    )
+    source = save_factory_record(tmp_path, record)
+    original = source.read_bytes()
+    app = web.Application(middlewares=[_admin])
+    app["cultivate_home"] = tmp_path
+    add_plugin_routes(app, load_plugins(enable="cultivate").policy)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/api/v1/plugins/cultivate/factory-run/archive?run_id=1620",
+            json={"reason": "cleanup"},
+        )
+        assert response.status == 409
+        assert (await response.json())["error"]["code"] == "run_not_verified_dead"
+    assert source.read_bytes() == original
+    assert not (source.parent / "archive").exists()
