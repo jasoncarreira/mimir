@@ -121,17 +121,7 @@ describe("ops view-model helpers", () => {
       issues: [{ id: 530, title: "Port ops" }],
       truncated: false
     });
-    expect(safe.pr_board.pull_requests).toEqual([
-      {
-        number: 9,
-        title: "Review me",
-        url: "",
-        author: "",
-        createdAt: "2026-06-18T00:00:00Z",
-        reviewDecision: "",
-        isDraft: true
-      }
-    ]);
+    expect(safe).not.toHaveProperty("pr_board");
 
     expect(tokenUsageRows(safe.token_usage_history)).toEqual([
       {
