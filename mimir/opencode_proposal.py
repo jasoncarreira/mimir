@@ -13,7 +13,6 @@ from typing import Any
 
 from .access_control import _MAINTENANCE_GIT_BASE_OVERRIDES, _maintenance_git_filter_overrides
 from .contained_execution import SensitiveMaterialScrubber
-from .repo_tools import _sanitized_git_env
 
 __all__ = (
     "OpenCodeProposal",
@@ -33,6 +32,24 @@ MAX_PROPOSAL_NAME_STREAM_BYTES = 4_097_000
 MAX_PROPOSAL_PATCH_BYTES = 1_048_576
 _SAFE_HANDLE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _PATH_TOKEN = re.compile(r"(?:file://)?/[^\s\"'<>]+")
+
+
+def _sanitized_git_env() -> dict[str, str]:
+    """Isolate proposal reads from the operator's Git configuration and credentials."""
+    return {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": "/nonexistent",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/bin/false",
+    }
 
 
 @dataclass(frozen=True)
