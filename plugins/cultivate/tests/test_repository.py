@@ -65,10 +65,7 @@ def test_core_repository_compatibility_does_not_import_provider() -> None:
 
 
 def test_repository_config_and_parity_are_provider_owned(tmp_path: Path) -> None:
-    from mimir import repo_pr_parity
-
-    assert repository.ParityProbe is not repo_pr_parity.ParityProbe
-    assert repository.run_parity is not repo_pr_parity.run_parity
+    assert not (Path(__file__).resolve().parents[3] / "mimir" / "repo_pr_parity.py").exists()
     assert repository.RepositoryInventory.load(tmp_path / "absent.yaml").declared is False
     report = repository.run_parity(repository.offline_canary_probes())
     assert report["cutover_blocked"] is False

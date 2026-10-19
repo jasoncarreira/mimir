@@ -51,3 +51,20 @@ assert 'mimir_cultivate' not in sys.modules
         text=True, timeout=20,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_offline_parity_runs_from_provider_without_core_parity_module() -> None:
+    script = """
+import sys
+from mimir_cultivate.repository import offline_canary_probes, run_parity
+assert 'mimir.repo_pr_parity' not in sys.modules
+result = run_parity(offline_canary_probes())
+assert result['cutover_blocked'] is False
+assert result['counts']['operations_matched'] == 14
+assert 'mimir.repo_pr_parity' not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], env={**os.environ, "MIMIR_PLUGINS": "cultivate"},
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr

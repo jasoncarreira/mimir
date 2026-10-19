@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from mimir.repo_pr_parity import (
+from mimir_cultivate.repository import (
     AuditEvidence,
     EffectEvidence,
     LegacyObservation,
