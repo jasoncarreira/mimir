@@ -26,7 +26,169 @@ ROOT = DOCKERFILE.parent
 
 
 def _text() -> str:
-    return DOCKERFILE.read_text(encoding="utf-8")
+    root = DOCKERFILE.read_text(encoding="utf-8")
+    fragments = ROOT / "plugins/cultivate/mimir_cultivate/docker"
+    return root + "\n" + "\n".join((fragments / name).read_text(encoding="utf-8") for name in (
+        "base.sh", "users.sh", "executor.sh", "bootstrap.sh", "service.sh"
+    ))
+
+
+def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> None:
+    fixture = (ROOT / "tests/fixtures/cultivate_docker_pre_extraction.txt").read_text()
+    assert "b421db2550853af57ba7c579d358fd62b036977c05ac177a4bd653d32d3b16f4" in fixture
+    blocks = fixture.split("\n\n")
+    assert len(blocks) == 6
+    source = ROOT / "plugins/cultivate/mimir_cultivate/docker"
+    root = DOCKERFILE.read_text()
+    assert "COPY plugins/cultivate/mimir_cultivate/docker/ /opt/cultivate-docker/" in root
+    names = ("base.sh", "users.sh", "executor.sh", "bootstrap.sh", "service.sh")
+    invocations = [root.index(f"sh /opt/cultivate-docker/{name}") for name in names]
+    assert invocations == sorted(invocations)
+    assert root.index("USER root\nARG MIMIR_GIT_URL") < invocations[2] < root.index("USER mimir", invocations[2])
+    assert root.index("COPY deploy/s6-overlay/s6-rc.d/") < invocations[4] < root.index('ENTRYPOINT ["/init"]')
+    assert f"ARG FACTORY_VERSION={FACTORY_VERSION}" in root
+    assert "ARG FACTORY_VERSION=0.10.16" in fixture  # The only version drift in the snapshot.
+
+    def normal(text: str) -> str:
+        return " ".join(text.replace("\\\n", " ").replace('"', "").replace("'", "").split())
+
+    baseline = (
+        blocks[0], blocks[1], blocks[2] + "\n" + blocks[3], blocks[4], blocks[5]
+    )
+    # Each entry is an instruction or complete command/argument sequence, not a
+    # bag of keywords: its presence and order must hold in both the original
+    # inlined block and the build script invoked at that root stage.
+    operations = (
+        ("apt-get update", "apt-get install -y --no-install-recommends",
+         "ca-certificates curl gnupg git jq procps ripgrep xz-utils",
+         "poppler-utils tesseract-ocr tesseract-ocr-eng libjemalloc2",
+         "curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash -",
+         "apt-get install -y --no-install-recommends nodejs",
+         "npm install --global --prefix /opt/mimir-opencode", "opencode-ai@1.18.21",
+         "feature-factory@${FACTORY_VERSION}", "opencode-feature-factory@${FACTORY_VERSION}",
+         "opencode-project-memory@0.1.0", "opencode-openai-codex-auth@4.4.0",
+         "opencode-anthropic-auth@0.0.13", "apt-get clean", "rm -rf /var/lib/apt/lists/*"),
+        ("groupadd --gid 1001 mimir", "groupadd --gid 1002 worklink",
+         "useradd --create-home --uid 1001 --gid mimir --groups worklink --shell /bin/bash mimir",
+         "useradd --no-create-home --uid 1002 --gid worklink --home-dir /nonexistent --shell /usr/sbin/nologin worklink",
+         "chmod 0700 /home/mimir", "install -d -o root -g root -m 0711 /var/lib/mimir-worklink",
+         "install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/checkouts",
+         "install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/repo-test-checkouts",
+         "install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/opencode-checkouts",
+         "install -d -o root -g worklink -m 0710 /var/lib/mimir-worklink/homes"),
+        ("git check-ref-format $MIMIR_GIT_REF", "git init /opt/mimir-worklink/source",
+         "git -C /opt/mimir-worklink/source remote add origin $MIMIR_GIT_URL",
+         "git -C /opt/mimir-worklink/source fetch --no-tags --depth=1 origin $MIMIR_EXECUTOR_COMMIT",
+         "git -C /opt/mimir-worklink/source fetch --no-tags --depth=1 origin $MIMIR_GIT_REF",
+         "git -C /opt/mimir-worklink/source rev-parse FETCH_HEAD",
+         "git -C /opt/mimir-worklink/source checkout --detach FETCH_HEAD",
+         "git -C /opt/mimir-worklink/source rev-parse HEAD",
+         "git -C /opt/mimir-worklink/source status --porcelain=v1",
+         "printf %s\\n $MIMIR_EXECUTOR_COMMIT > /opt/mimir-worklink/executor-source-commit",
+         "rm -rf /opt/mimir-worklink/source/.git", "python3 -m venv /opt/mimir-worklink/venv",
+         "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir --upgrade pip",
+         "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir mimir-agent[${MIMIR_EXTRAS}]",
+         "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir pypdf>=6.16",
+         "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source",
+         "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir uv",
+         "ln -s /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv",
+         "UV_CACHE_DIR=/opt/mimir-worklink/uv-cache uv sync --directory /opt/mimir-worklink/source",
+         "--locked --extra dev --extra bench --no-install-workspace",
+         "rm -rf /opt/mimir-worklink/source/.venv", "rm -rf /opt/mimir-worklink/source",
+         "chown -R root:root /opt/mimir-worklink", "chmod -R go-w /opt/mimir-worklink"),
+        ("mimir opencode-bootstrap --home /home/mimir",),
+        ("install -d -o root -g root -m 0755 /usr/local/libexec",
+         "chmod 0755 /usr/local/libexec/worklink-execd",
+         "/etc/s6-overlay/s6-rc.d/mimir/run"),
+    )
+    for name, original, expected in zip(names, baseline, operations, strict=True):
+        original_text = normal(original).replace("mimir.worklink.worker_exec", "mimir_cultivate.worklink.worker_exec")
+        script_text = normal((source / name).read_text())
+        for text in (original_text, script_text):
+            start = 0
+            for operation in expected:
+                found = text.find(operation, start)
+                assert found >= 0, f"{name}: missing or reordered instruction {operation!r}"
+                start = found + len(operation)
+        if name == "service.sh":
+            for path in ("watchdog", "worklink-execd"):
+                assert f"/etc/s6-overlay/s6-rc.d/{path}/run" in original_text
+                assert f"/etc/s6-overlay/s6-rc.d/{path}/run" in script_text
+            assert "exec /opt/mimir-worklink/venv/bin/python -m mimir_cultivate.worklink.worker_exec $@" in original_text
+            assert "exec /opt/mimir-worklink/venv/bin/python -m mimir_cultivate.worklink.worker_exec $@" in script_text
+
+    def steps(text: str) -> list[str]:
+        text = re.sub(r"\\\n\s*", " ", text)
+        text = text.replace("mimir.worklink.worker_exec", "mimir_cultivate.worklink.worker_exec")
+        text = re.sub(r"(?m)^\s*(?:#.*|ENV .*|ARG .*)$", "", text)
+        text = text.replace("&&", "\n").replace("||", "\n").replace(";", "\n")
+        commands = []
+        for line in text.splitlines():
+            command = re.sub(r"^\s*RUN\s+", "", line).strip().strip("{} ")
+            command = command.replace('"', "").replace("'", "")
+            command = command.removeprefix("then ")
+            if not command or command in {"set -eu", "fi"} or command.startswith("#!/"):
+                continue
+            if command.startswith("if [ ") or command == "then":
+                continue
+            commands.append(" ".join(command.split()))
+        return commands
+
+    for name, original in zip(names, baseline, strict=True):
+        expected_steps = steps(original)
+        actual_steps = steps((source / name).read_text())
+        if name == "service.sh":
+            # The original single chmod is intentionally split so scaffold's
+            # absent watchdog is optional. Both present services remain required.
+            original_chmod = expected_steps.pop()
+            assert original_chmod == (
+                "chmod +x /etc/s6-overlay/s6-rc.d/mimir/run "
+                "/etc/s6-overlay/s6-rc.d/watchdog/run /etc/s6-overlay/s6-rc.d/worklink-execd/run"
+            )
+            expected_steps += [
+                "chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/worklink-execd/run",
+                "chmod +x /etc/s6-overlay/s6-rc.d/watchdog/run",
+            ]
+        assert actual_steps == expected_steps, name
+
+
+@pytest.mark.parametrize("selection,packages,all_installed,keeps_service,success", [
+    ("", "", "0", False, True),
+    ("", "mimir-cultivate==0.9.10", "0", False, True),
+    ("cultivate", "mimir-cultivate==0.9.10", "0", True, True),
+    ("", "mimir-cultivate==0.9.10", "1", True, True),
+    ("cultivate", "", "0", True, False),
+])
+def test_root_service_selection_executes_verified_build_branch(
+    tmp_path, selection, packages, all_installed, keeps_service, success,
+) -> None:
+    root = DOCKERFILE.read_text()
+    selected = root.split('COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/\n', 1)[1]
+    program = selected.split('\n# Use the assembler', 1)[0]
+    assert program.startswith("RUN set -eu;")
+    s6 = tmp_path / "s6-rc.d"
+    (s6 / "worklink-execd").mkdir(parents=True)
+    marker = s6 / "user/contents.d/worklink-execd"
+    marker.parent.mkdir(parents=True)
+    marker.touch()
+    pip = tmp_path / "pip"
+    pip.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$PIP_LOG"\n')
+    pip.chmod(0o755)
+    output = tmp_path / "pip.log"
+    program = program.replace("RUN ", "", 1).replace(
+        "/opt/mimir-worklink/venv/bin/pip", str(pip)).replace(
+        "/etc/s6-overlay/s6-rc.d", str(s6))
+    result = subprocess.run(["sh", "-c", program], capture_output=True, text=True, env={
+        **os.environ, "MIMIR_PLUGIN_SELECTION": selection, "MIMIR_PLUGIN_PACKAGES": packages,
+        "MIMIR_PLUGIN_ALL_INSTALLED": all_installed, "PIP_LOG": str(output),
+    })
+    assert (result.returncode == 0) is success, result.stderr
+    if success:
+        assert (s6 / "worklink-execd").exists() is keeps_service
+        assert marker.exists() is keeps_service
+        assert output.exists() is keeps_service
+    else:
+        assert "Cultivate requires a pinned mimir-cultivate package" in result.stderr
 
 
 def test_apt_install_layer_includes_jq() -> None:
@@ -315,8 +477,8 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
     assert f"ARG FACTORY_VERSION={FACTORY_VERSION}" in text
     assert "npm install --global --prefix /opt/mimir-opencode" in text
     assert f"opencode-ai@{OPENCODE_VERSION}" in text
-    assert "            feature-factory@${FACTORY_VERSION} \\" in text
-    assert "            opencode-feature-factory@${FACTORY_VERSION} \\" in text
+    assert '"feature-factory@${FACTORY_VERSION}"' in text
+    assert '"opencode-feature-factory@${FACTORY_VERSION}"' in text
     assert "opencode-project-memory@0.1.0" in text
     assert "opencode-openai-codex-auth@4.4.0" in text
     assert "opencode-anthropic-auth@0.0.13" in text
