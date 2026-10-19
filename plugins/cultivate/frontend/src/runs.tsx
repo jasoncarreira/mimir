@@ -113,7 +113,7 @@ export function FactoryRuns() {
   }, []);
 
   return <div className="cultivate" data-testid="cultivate-factory-runs">
-    {!selected ? <img className="cultivate-logo" src="/plugins/cultivate/assets/brand/cultivate-logo-dark-v1.png?v=0.9.10" alt="" data-testid="cultivate-overview-logo" /> : null}
+    {!selected ? <div className="cultivate-identity"><img className="cultivate-logo" src="/plugins/cultivate/assets/brand/cultivate-logo-dark-v1.png?v=0.9.10" alt="Cultivate, a Mimir plugin by SquashMerge" data-testid="cultivate-overview-logo" /><span className="cultivate-mobile-name" data-testid="cultivate-mobile-name">Cultivate</span></div> : null}
     <UI.DashboardHeader title="Factory Runs">Feature factory runs and diagnostics</UI.DashboardHeader>
     {selected ? <RunDetails runId={selected} back={() => select(null)} /> : <>
       <UI.Button disabled={loading} onClick={() => void refresh()}>Refresh runs</UI.Button>

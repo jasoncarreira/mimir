@@ -10,6 +10,11 @@
   max-width: 80rem;
 }
 .cultivate-logo { display: block; width: min(100%, 400px); height: auto; }
+.cultivate-mobile-name { display: none; }
+
+.skin-root[data-skin="squashmerge"] .ui-button:active:not(:disabled) {
+  color: var(--mimir-color-background);
+}
 
 .cultivate a { color: var(--cultivate-link); text-decoration: underline; overflow-wrap: anywhere; }
 .cultivate :is(button, a, textarea, summary, [tabindex]):focus-visible {
@@ -37,6 +42,8 @@
 
 @media (max-width: 420px) {
   .cultivate { padding-inline: var(--mimir-space-3, 16px); }
+  .cultivate-logo { display: none; }
+  .cultivate-mobile-name { display: block; font-weight: var(--mimir-font-weight-strong); }
   .cultivate-card-header { align-items: stretch; flex-direction: column; }
 }
 
