@@ -207,7 +207,8 @@ RUN mkdir -p /home/mimir/agent && mimir setup --home /home/mimir/agent || true
 # OpenCode reads this XDG-global config before walking project-local
 # opencode.json files, so the registrations apply in outer repos and nested
 # Worklink worktrees alike. The bootstrap is a preserving, idempotent merge.
-RUN MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" sh /opt/cultivate-docker/bootstrap.sh
+RUN MIMIR_PLUGINS=cultivate MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" \
+    sh /opt/cultivate-docker/bootstrap.sh
 
 # Auto-update behavior on this image:
 #

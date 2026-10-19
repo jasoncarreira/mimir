@@ -615,7 +615,7 @@ def render_dockerfile(
                                 + '\nENTRYPOINT ["/init"]')
     if trusted_cultivate and mode == "pypi":
         base = base.replace("# Pre-warm the fastembed",
-                            'RUN MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" '
+                            'RUN MIMIR_PLUGINS=cultivate MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" '
                             'sh /opt/cultivate-docker/bootstrap.sh\n\n# Pre-warm the fastembed')
     if not fragments:
         body = "# (no skills installed yet ship a dockerfile.fragment)"
