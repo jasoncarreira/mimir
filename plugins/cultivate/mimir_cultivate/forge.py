@@ -45,6 +45,8 @@ class PullRequestProjection:
     mergeable: bool | None
     created_at: str
     updated_at: str
+    body: str = ""
+    merged_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -507,8 +509,13 @@ class GitHubForgeClient:
                 if len(collected) >= limit:
                     break
         except requests.RequestException as exc:
+            warning = (
+                "; the write may have been applied; check pr_reviews / pr_comments "
+                "before retrying"
+                if method.upper() != "GET" else ""
+            )
             raise _GitHubRequestError(
-                f"forge transport failed: {type(exc).__name__}", retryable=True,
+                f"forge transport failed: {type(exc).__name__}{warning}", retryable=True,
             ) from exc
         finally:
             if response is not None:
@@ -690,6 +697,11 @@ class GitHubForgeClient:
             mergeable=data.get("mergeable") if isinstance(data.get("mergeable"), bool) else None,
             created_at=self._text(data.get("created_at"), 64),
             updated_at=self._text(data.get("updated_at"), 64),
+            merged_at=self._text(data.get("merged_at"), 64) if isinstance(data.get("merged_at"), str) else None,
+            body=self._text(
+                data.get("body") if isinstance(data.get("body"), str) else "",
+                _MAX_BODY_BYTES,
+            ).encode("utf-8")[:_MAX_BODY_BYTES].decode("utf-8", errors="ignore"),
         )
 
     def list_pull_requests(
@@ -2839,12 +2851,21 @@ def pr_edit_body(
     repository: str,
     pull_request: int,
     body: str,
+    allow_shrink: bool = False,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Replace only the bound pull request description with bounded literal text."""
+    """Overwrite the full bound PR body; refuse accidental large truncations."""
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
-    _call(lambda: _client(scope).edit_pull_request_body(scope, safe_body))
+    client = _client(scope)
+    current = _call(lambda: client.get_pull_request(scope))
+    if not allow_shrink and len(safe_body.encode("utf-8")) * 2 < len(current.body.encode("utf-8")):
+        raise ToolPolicyRefusal(
+            "pr_edit_body refused: new body is under 50% of the current description; "
+            "read pr_metadata and pass the full body, or set allow_shrink=true "
+            "for a deliberate full rewrite"
+        )
+    _call(lambda: client.edit_pull_request_body(scope, safe_body))
     _publish_write_projection(runtime, scope)
     return {"status": "body_updated"}
 
