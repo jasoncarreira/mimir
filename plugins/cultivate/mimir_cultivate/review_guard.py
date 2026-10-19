@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
+import tempfile
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -12,7 +14,7 @@ from typing import Any
 
 from langchain_core.tools import ToolException
 
-from mimir.tools._shell_env import direct_exec_env
+from mimir.tools._shell_env import _DIRECT_EXEC_ARGV, direct_exec_env
 from mimir.tools.extra import _effective_shell_cwd
 from mimir.tools.refusals import ToolPolicyRefusal
 
@@ -22,6 +24,8 @@ _locks: dict[tuple[str, int, str, str, str], threading.Lock] = {}
 _lock_users: dict[tuple[str, int, str, str, str], int] = {}
 _LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
 _GH_EXECUTABLE = "gh"
+_GH_CONFIG_DIR = tempfile.mkdtemp(prefix="cultivate-gh-review-")
+Path(_GH_CONFIG_DIR).chmod(0o500)
 
 
 @dataclass(frozen=True)
@@ -199,8 +203,26 @@ def review_submission_from_request(request: Any) -> ReviewSubmission | None:
 def _run(spec: ReviewSubmission, arguments: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [_GH_EXECUTABLE, *arguments], capture_output=True, text=True, timeout=15,
-        cwd=spec.cwd, env=direct_exec_env([_GH_EXECUTABLE]), stdin=subprocess.DEVNULL,
+        cwd=spec.cwd, env=_gh_env(), stdin=subprocess.DEVNULL,
     )
+
+
+def _gh_env() -> dict[str, str]:
+    binding = _DIRECT_EXEC_ARGV.get()
+    if binding is not None and binding.operator_declared:
+        raise ToolPolicyRefusal("operator-declared gh is refused; use the forge tools")
+    env = direct_exec_env([])
+    for name in tuple(env):
+        if name == "GITHUB_TOKEN" or name.startswith("GH_"):
+            del env[name]
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if token:
+        env["GITHUB_TOKEN"] = token
+    env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
+    from .forge import confirm_github_tool_identity
+
+    confirm_github_tool_identity(os.environ.get("MIMIR_GITHUB_SELF_LOGIN", ""), token)
+    return env
 
 
 def _text(spec: ReviewSubmission, arguments: list[str]) -> str | None:

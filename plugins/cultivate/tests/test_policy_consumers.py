@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 import json
+import builtins
+import subprocess
 
 import pytest
 from langchain_core.tools import ToolException
@@ -121,6 +123,38 @@ def test_provider_review_claim_tracks_current_head_and_duplicate(monkeypatch: py
     fresh = review_guard.claim_review_submission(spec)
     assert fresh is not None and not fresh.duplicate and fresh.head == head[0]
     fresh.release()
+
+
+def test_selected_review_probe_env_uses_provider_identity_without_core_forge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools._shell_env import bind_direct_exec_argv, reset_direct_exec_argv
+    from mimir.tools.refusals import ToolPolicyRefusal
+    from mimir_cultivate import forge
+
+    monkeypatch.setenv("GITHUB_TOKEN", "bound-token")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    seen = []
+    monkeypatch.setattr(forge, "confirm_github_tool_identity", lambda principal, token: seen.append((principal, token)))
+    imported = builtins.__import__
+
+    def without_core_forge(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "forge" and level == 1 and (globals or {}).get("__package__") == "mimir.tools":
+            raise AssertionError("selected review probe imported retired core forge")
+        return imported(name, globals, locals, fromlist, level)
+
+    with monkeypatch.context() as no_core:
+        no_core.setattr(builtins, "__import__", without_core_forge)
+        env = review_guard._gh_env()
+        assert env["GITHUB_TOKEN"] == "bound-token"
+        assert env["GH_CONFIG_DIR"] == review_guard._GH_CONFIG_DIR
+        assert seen == [("reviewer", "bound-token")]
+        token = bind_direct_exec_argv(["gh"], operator_declared=True)
+        try:
+            with pytest.raises(ToolPolicyRefusal, match="operator-declared gh is refused"):
+                review_guard._gh_env()
+        finally:
+            reset_direct_exec_argv(token)
 
 
 def test_selected_checkout_attestation_uses_provider_git_and_rejects_changed_head(
@@ -247,6 +281,78 @@ def test_selected_issue_comment_requires_repository_source_and_owner_resolution(
         )
         assert unavailable.reason == "issue_destination_resolution_failed"
         assert not unavailable.allowed and unavailable.would_block
+
+
+def test_selected_repository_inventory_and_fallback_roots_do_not_import_core_repository(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import access_control as ac
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "checkout"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "remote", "add", "origin",
+                    "https://github.com/owner/repo.git"], check=True)
+    inventory = home / "repositories.yaml"
+    inventory.write_text(
+        "repositories:\n"
+        "  - slug: owner/repo\n"
+        f"    root: {root}\n"
+        "    mode: rw\n"
+        "    origin: https://github.com/owner/repo.git\n"
+        "    base_branch: main\n"
+        "    test_command: /usr/bin/true\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{tmp_path / 'other'}:rw")
+    selected = load_plugins(enable="cultivate").policy
+    imported = builtins.__import__
+
+    def no_core_repository(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "repository_config" and level == 1:
+            raise AssertionError("selected policy imported retired core repository inventory")
+        return imported(name, globals, locals, fromlist, level)
+
+    with policy_scope(selected), monkeypatch.context() as check:
+        check.setattr(builtins, "__import__", no_core_repository)
+        assert ac._configured_repo_roots() == [root]
+        assert ac._configured_repo_write_roots() == [root]
+        assert ac._configured_scope_github_repos() == {"owner/repo"}
+        assert ac._canonical_repo_binding_resolution("OWNER/REPO").binding == (
+            str(root), "https://github.com/owner/repo.git",
+        )
+        inventory.unlink()
+        (tmp_path / "other").mkdir()
+        assert ac._configured_repo_roots() == [tmp_path / "other"]
+        assert ac._configured_repo_write_roots() == [tmp_path / "other"]
+        assert ac._canonical_repo_binding_resolution("owner/repo").binding is None
+
+
+def test_selected_worklink_inventory_importers_use_provider_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir_cultivate import repository
+
+    imported = builtins.__import__
+
+    def without_core_repository(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "mimir.repository_config" or (name == "repository_config" and level == 1):
+            raise AssertionError("provider requested retired core repository inventory")
+        return imported(name, globals, locals, fromlist, level)
+
+    with monkeypatch.context() as guard:
+        guard.setattr(builtins, "__import__", without_core_repository)
+        selected = load_plugins(enable="cultivate").policy
+        from mimir_cultivate.worklink.backends import registry
+        from mimir_cultivate.worklink import merge_closure, orchestrator
+
+    assert selected.policy_consumer_hooks.repository_inventory == repository.RepositoryInventory.load
+    assert registry.valid_repository_slug("owner/repo") == repository.valid_repository_slug("owner/repo")
+    assert registry.valid_repository_slug("../repo") == repository.valid_repository_slug("../repo")
+    assert merge_closure.RepositoryConfig is repository.RepositoryConfig
+    assert merge_closure.RepositoryInventory is orchestrator.RepositoryInventory is repository.RepositoryInventory
 
 
 @pytest.mark.asyncio

@@ -480,6 +480,7 @@ def register_tools(registrar: PolicyRegistrar) -> None:
         git_env=repository._sanitized_git_env, lease_metadata=repository._METADATA,
         review_submission=review_guard.review_submission_from_request,
         claim_review=review_guard.claim_review_submission,
+        repository_inventory=repository.RepositoryInventory.load,
     ))
     for name, declaration in sorted(_TOOL_DECLARATIONS.items()):
         descriptor = declaration.descriptor

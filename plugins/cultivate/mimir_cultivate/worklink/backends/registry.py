@@ -12,7 +12,6 @@ from typing import Any, Mapping
 
 import yaml
 
-from mimir.repository_config import valid_repository_slug
 from ..tool_pins import ToolPin
 from ..claims import DEFAULT_MAX_CLAIM_ATTEMPTS
 from ..compute import (
@@ -31,6 +30,12 @@ from .opencode import (
 
 
 log = logging.getLogger(__name__)
+
+
+def valid_repository_slug(value: object) -> bool:
+    from ...repository import valid_repository_slug as validate
+
+    return validate(value)
 
 WORKLINK_MERGED_LABEL = "worklink:merged"
 SHIPPING_BACKENDS = frozenset({"feature_factory", "opencode"})

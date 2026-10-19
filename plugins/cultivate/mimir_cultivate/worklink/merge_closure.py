@@ -17,7 +17,7 @@ from typing import Callable, Sequence
 import yaml
 
 from mimir.redaction import redact_text
-from mimir.repository_config import RepositoryConfig, RepositoryInventory
+from ..repository import RepositoryConfig, RepositoryInventory
 from .backends.registry import WorklinkConfig
 from .checkout import _default_runner
 from .dispatch_failures import (

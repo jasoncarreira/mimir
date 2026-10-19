@@ -824,16 +824,39 @@ def _resolve_file_tool_target(
         return None
 
 
+def _repository_inventory(home: str) -> Any:
+    """Read a selected owner's inventory or the still-installed core inventory."""
+    policy = selected_policy_registry()
+    hooks = policy.policy_consumer_hooks
+    path = Path(home) / "repositories.yaml"
+    if hooks is not None:
+        return hooks.repository_inventory(path)
+    if getattr(policy, "_projected_owner", None) is not None:
+        return None
+    try:
+        from .repository_config import RepositoryInventory
+    except ModuleNotFoundError as exc:
+        if exc.name != "mimir.repository_config":
+            raise
+        return None
+    return RepositoryInventory.load(path)
+
+
+def _inventory_unavailable_with_declaration(home: str, inventory: Any) -> bool:
+    path = Path(home) / "repositories.yaml"
+    return inventory is None and (path.exists() or path.is_symlink())
+
+
 def _configured_repo_write_roots() -> list[Path]:
     """Return only explicit external RW roots, excluding home and implicit /tmp."""
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         return []
 
-    from .repository_config import RepositoryInventory
-
-    inventory = RepositoryInventory.load(Path(home) / "repositories.yaml")
-    if inventory.declared:
+    inventory = _repository_inventory(home)
+    if _inventory_unavailable_with_declaration(home, inventory):
+        return []
+    if inventory is not None and inventory.declared:
         return [repo.root for repo in inventory.repositories if repo.mode == "rw"]
 
     from .config import _parse_file_tool_roots
@@ -850,10 +873,10 @@ def _configured_repo_roots() -> list[Path]:
     if not home:
         return []
 
-    from .repository_config import RepositoryInventory
-
-    inventory = RepositoryInventory.load(Path(home) / "repositories.yaml")
-    if inventory.declared:
+    inventory = _repository_inventory(home)
+    if _inventory_unavailable_with_declaration(home, inventory):
+        return []
+    if inventory is not None and inventory.declared:
         return [repo.root for repo in inventory.repositories]
 
     from .config import _parse_file_tool_roots
@@ -943,10 +966,10 @@ class RepoPRScopeResolution:
 def _configured_scope_github_repos() -> frozenset[str]:
     home = os.environ.get("MIMIR_HOME", "").strip()
     if home:
-        from .repository_config import RepositoryInventory
-
-        inventory = RepositoryInventory.load(Path(home) / "repositories.yaml")
-        if inventory.declared:
+        inventory = _repository_inventory(home)
+        if _inventory_unavailable_with_declaration(home, inventory):
+            return frozenset()
+        if inventory is not None and inventory.declared:
             return frozenset(repo.slug for repo in inventory.repositories)
     return frozenset(
         f"{owner}/{name}" for owner, name in _configured_github_repos("GITHUB_REPOS")
@@ -967,10 +990,10 @@ def _canonical_repo_binding_resolution(repo: str) -> RepoBindingResolution:
     repo = repo.lower()
     home = os.environ.get("MIMIR_HOME", "").strip()
     if home:
-        from .repository_config import RepositoryInventory
-
-        inventory = RepositoryInventory.load(Path(home) / "repositories.yaml")
-        if inventory.declared:
+        inventory = _repository_inventory(home)
+        if _inventory_unavailable_with_declaration(home, inventory):
+            return RepoBindingResolution(None, (), 0)
+        if inventory is not None and inventory.declared:
             configured_roots = tuple(str(item.root) for item in inventory.repositories)
             record = inventory.repository(repo)
             if record is None:

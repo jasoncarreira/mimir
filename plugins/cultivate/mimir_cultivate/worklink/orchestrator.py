@@ -79,7 +79,7 @@ from .run_state import (
 )
 from .checkout import CheckoutLease, cleanup_checkout, _cultivate_selected, create_isolated_checkout
 from mimir.redaction import redact_text
-from mimir.repository_config import RepositoryInventory
+from ..repository import RepositoryInventory
 from mimir.secret_scan import secret_matches
 from .safe_git import ControllerGitPublication, _git_credential_settings
 from .backends.feature_factory import (

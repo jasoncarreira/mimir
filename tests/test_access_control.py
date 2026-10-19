@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import builtins
 import json
 import sys
 import os
@@ -5868,8 +5869,41 @@ _REPO_PUBLISH_NAMES = (
 )
 
 
+def test_core_repository_inventory_absent_preserves_roots_and_declared_file_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "checkout"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    imported = builtins.__import__
+
+    def absent(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "repository_config" and level == 1:
+            raise ModuleNotFoundError("retired inventory", name="mimir.repository_config")
+        return imported(name, globals, locals, fromlist, level)
+
+    with policy_scope(core_policy_registry()), monkeypatch.context() as missing:
+        missing.setattr(builtins, "__import__", absent)
+        assert access_control._configured_repo_roots() == [root]
+        assert access_control._configured_repo_write_roots() == [root]
+        assert access_control._configured_scope_github_repos() == {"owner/repo"}
+        (home / "repositories.yaml").write_text("repositories: []\n", encoding="utf-8")
+        assert access_control._configured_repo_roots() == []
+        assert access_control._configured_repo_write_roots() == []
+        assert access_control._configured_scope_github_repos() == frozenset()
+        assert access_control._canonical_repo_binding_resolution("owner/repo").binding is None
+
+
 @pytest.mark.parametrize("enforce", [False, True])
 def test_selected_publish_projection_keeps_all_five_tainted_writes_vetoed(enforce: bool) -> None:
+    if os.environ.get("MIMIR_PLUGINS") != "cultivate":
+        pytest.skip("requires selected Cultivate provider")
     from mimir.plugins.core import core_policy_registry, policy_scope
     from mimir.plugins.manager import load_plugins
 
@@ -16305,6 +16339,8 @@ def test_worklink_build_tools_refuse_untrusted_ingest_on_both_routes(
 def test_selected_worklink_build_projection_preserves_live_taint_veto(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforce: bool, tool_name: str,
 ) -> None:
+    if os.environ.get("MIMIR_PLUGINS") != "cultivate":
+        pytest.skip("requires selected Cultivate provider")
     from mimir.plugins.core import policy_scope
     from mimir.plugins.manager import load_plugins
 

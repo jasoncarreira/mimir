@@ -22,6 +22,7 @@ These tests exercise the middleware via two surfaces:
 from __future__ import annotations
 
 import asyncio
+import builtins
 import contextvars
 import fcntl
 import json
@@ -84,6 +85,57 @@ from tests.auth_helpers import attach_middleware_auth_context
 from tests.test_repo_tools import _fixture_git_env, _repo_scope_and_state
 
 pytestmark = pytest.mark.usefixtures("middleware_event_logger")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_core_only_shell_without_review_guard_keeps_generic_execution_and_refuses_review(
+    monkeypatch: pytest.MonkeyPatch, asynchronous: bool,
+) -> None:
+    from mimir.tools import budget_gate
+    from tests.auth_helpers import middleware_auth_context
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(budget_gate, "_request_for_authorized_execution", lambda request, *_: request)
+    imported = builtins.__import__
+
+    def without_retired_guard(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("mimir_cultivate"):
+            raise AssertionError("disabled Cultivate was imported")
+        if name == "github_review_guard" and level == 1:
+            raise ModuleNotFoundError("retired review guard", name="mimir.tools.github_review_guard")
+        return imported(name, globals, locals, fromlist, level)
+
+    calls = []
+
+    def handler(_request):
+        calls.append(True)
+        return ToolMessage(content="ran", tool_call_id="core-shell")
+
+    async def async_handler(request):
+        return handler(request)
+
+    with monkeypatch.context() as absent:
+        absent.setattr(builtins, "__import__", without_retired_guard)
+        gate = BudgetGateMiddleware()
+        for command in ("pwd", "gh pr review 7 --repo owner/repo --approve"):
+            request = ToolCallRequest(
+                tool_call={"name": "shell_exec", "args": {"command": command},
+                           "id": "core-shell", "type": "tool_call"},
+                tool=None, state=None, runtime=Runtime(context=middleware_auth_context()),
+            )
+            result = (
+                await gate.awrap_tool_call(request, async_handler)
+                if asynchronous else gate.wrap_tool_call(request, handler)
+            )
+            if command == "pwd":
+                assert result.status != "error", result.content
+                assert calls == [True]
+            else:
+                assert result.status == "error"
+                assert "review submission guard unavailable" in str(result.content)
+                assert calls == [True]
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
@@ -2625,10 +2677,12 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
     )
     monkeypatch.setattr(budget_gate, "_validated_arguments", validate)
     monkeypatch.setattr(
-        "mimir.tools.github_review_guard.review_submission_from_request", submission,
+        budget_gate, "_review_submission_for_call",
+        lambda call: submission(call.execution_request),
     )
     monkeypatch.setattr(
-        "mimir.tools.github_review_guard.claim_review_submission", claim,
+        budget_gate, "_claim_review_submission_for_call",
+        lambda _call, review: claim(review),
     )
     monkeypatch.setattr(
         budget_gate,

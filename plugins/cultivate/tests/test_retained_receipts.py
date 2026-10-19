@@ -129,9 +129,10 @@ async def test_selected_ordinary_repo_tool_holds_real_issued_pr_lease(
 
 
 def _case(monkeypatch, tmp_path):
-    from mimir.worklink import worker_client, factory_state, retained_scope
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
-    from mimir.worklink.compute import LaunchHandle
+    from mimir_cultivate import repository
+    from mimir_cultivate.worklink import worker_client, factory_state, retained_scope
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+    from mimir_cultivate.worklink.compute import LaunchHandle
 
     home = tmp_path / "home"
     root = tmp_path / "worklink"
@@ -179,11 +180,15 @@ def _case(monkeypatch, tmp_path):
     context.repo_pr_scope_registry = None
     policy = SimpleNamespace(frozen=True, descriptors={}, scoped_actions={
         "cultivate": SimpleNamespace(live_lease=lambda *_args: None,
-                                      checkout_action=object()),
+                                       checkout_action=object()),
     }, tools={"repo_diff": SimpleNamespace(
         owner="cultivate", result_domain="repository",
         memberships=frozenset({"retained_repo_tools"}),
-    )})
+    )}, retained_effect_lease=(
+        "cultivate", retained_scope.retained_factory_effect_lease,
+        repository.retained_factory_subprocess_runner,
+    ))
+    monkeypatch.setattr("mimir.access_control.selected_policy_registry", lambda: policy)
     authorization = ToolAuthorization(
         tool_name="repo_diff", decision=OperationDecision.RESOURCE_SCOPED,
         allowed=True, required_tier=AccessTier.USER, enforcement_enabled=True,
@@ -314,7 +319,7 @@ def test_retained_dispatch_requires_live_lease_and_captures_actual_output(tmp_pa
     )
     events = []
 
-    from mimir.worklink import retained_scope
+    from mimir_cultivate.worklink import retained_scope
     real_lease = retained_scope.retained_factory_effect_lease
 
     @contextmanager
@@ -324,14 +329,14 @@ def test_retained_dispatch_requires_live_lease_and_captures_actual_output(tmp_pa
             yield resolution
             events.append(("release", received))
 
-    monkeypatch.setattr(retained_scope, "retained_factory_effect_lease", lease)
+    policy.retained_effect_lease = ("cultivate", lease, policy.retained_effect_lease[2])
     capture = budget_gate._ToolExecutionCapture()
     with budget_gate._retained_execution(call) as live:
         assert live is scope
-        assert events == [("lease", scope), ("release", scope)]
+        assert events == [("lease", scope)]
     budget_gate._capture_retained_result(call, capture, live, result)
     assert events[-1] == ("release", scope)
-    assert len(events) >= 6
+    assert len(events) >= 4
     assert capture.retained_receipt.execution_id != result.tool_call_id
     assert capture.retained_receipt.consume("repo_diff", context, scope, result, False, policy)
     assert not capture.retained_receipt.consume("repo_diff", context, scope, result, False, policy)
@@ -346,7 +351,7 @@ def test_retained_dispatch_requires_live_lease_and_captures_actual_output(tmp_pa
     def stale(_home, _scope):
         yield SimpleNamespace(scope=None, refusal_reason="stale occurrence")
 
-    monkeypatch.setattr("mimir.worklink.retained_scope.retained_factory_effect_lease", stale)
+    policy.retained_effect_lease = ("cultivate", stale, policy.retained_effect_lease[2])
     with pytest.raises(ToolException, match="stale occurrence"):
         with budget_gate._retained_execution(call):
             pytest.fail("handler ran without a live lease")

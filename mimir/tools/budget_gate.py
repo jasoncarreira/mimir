@@ -3942,7 +3942,23 @@ def _review_submission_for_call(call: _PreparedToolCall) -> Any:
         "shell_exec", "bash_async", "Bash", "bash",
     }:
         raise ToolException("selected review submission guard unavailable")
-    from .github_review_guard import review_submission_from_request
+    if call.tool_name not in {"shell_exec", "bash_async", "Bash", "bash", "pr_submit_review"}:
+        return None
+    args = call.execution_request.tool_call.get("args") or {}
+    direct = args.get("mimir_direct_argv")
+    command = args.get("command")
+    possible_gh = (
+        isinstance(direct, list) and direct and isinstance(direct[0], str)
+        and Path(direct[0]).name == "gh"
+    ) or (isinstance(command, str) and ("gh" in command or "pr review" in command))
+    if not possible_gh and call.tool_name != "pr_submit_review":
+        return None
+    try:
+        from .github_review_guard import review_submission_from_request
+    except ModuleNotFoundError as exc:
+        if exc.name != "mimir.tools.github_review_guard":
+            raise
+        raise ToolException("GitHub review submission guard unavailable") from exc
 
     return review_submission_from_request(call.execution_request)
 
@@ -3954,7 +3970,12 @@ def _claim_review_submission_for_call(call: _PreparedToolCall, spec: Any) -> Any
         return hooks.claim_review(spec)
     if getattr(selected, "_projected_owner", None) is not None:
         raise ToolException("selected review submission guard unavailable")
-    from .github_review_guard import claim_review_submission
+    try:
+        from .github_review_guard import claim_review_submission
+    except ModuleNotFoundError as exc:
+        if exc.name != "mimir.tools.github_review_guard":
+            raise
+        raise ToolException("GitHub review submission guard unavailable") from exc
 
     return claim_review_submission(spec)
 
@@ -4301,17 +4322,7 @@ def _retained_execution(call: _PreparedToolCall):
             with _host_retained_invocation(scope, call.auth_context):
                 yield scope
         return
-    from ..worklink.retained_scope import retained_factory_effect_lease
-
-    with retained_factory_effect_lease(Path(home), scope) as lease:
-        if lease.scope is not scope:
-            raise ToolException(lease.refusal_reason or "retained factory lease unavailable")
-    yield scope
-    # Repo runners acquire the same interlock for their operation. Recheck
-    # after dispatch before the host attests the result they returned.
-    with retained_factory_effect_lease(Path(home), scope) as lease:
-        if lease.scope is not scope:
-            raise ToolException(lease.refusal_reason or "retained factory lease changed")
+    raise ToolException("retained factory lease provider unavailable")
 
 
 def _capture_retained_result(call: _PreparedToolCall, capture: _ToolExecutionCapture,

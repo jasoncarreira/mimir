@@ -71,6 +71,7 @@ class PolicyConsumerHooks:
     lease_metadata: str
     review_submission: Callable[..., Any]
     claim_review: Callable[..., Any]
+    repository_inventory: Callable[..., Any]
 
 
 @dataclass(frozen=True)
@@ -463,6 +464,7 @@ class PolicyRegistry:
                     "resolve_review", "revalidate_head", "resolve_issue", "superseded_push",
                     "derive_retained_scope", "active_checkout", "git_command", "lineage",
                     "verified_base", "git_env", "review_submission", "claim_review",
+                    "repository_inventory",
                 )) or not isinstance(hooks.protected_refs, frozenset)
                 or not isinstance(hooks.git_config, tuple) or not isinstance(hooks.lease_metadata, str)):
             raise PolicyRegistrationError(f"{owner}: invalid policy consumer hooks")

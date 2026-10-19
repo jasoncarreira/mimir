@@ -434,7 +434,9 @@ async def test_selected_retained_tools_keep_one_live_lease_through_result_classi
 @pytest.mark.asyncio
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("enforced", [False, True])
-@pytest.mark.parametrize("mutation", ["wrong_resource", "forged_service", "missing_scope", "stale_lease"])
+@pytest.mark.parametrize("mutation", [
+    "wrong_resource", "forged_service", "missing_scope", "stale_lease", "missing_lease",
+])
 async def test_selected_retained_middleware_refuses_unissued_authority_before_handler(
     remediation_case, monkeypatch, asynchronous, enforced, mutation,
 ):
@@ -455,6 +457,8 @@ async def test_selected_retained_middleware_refuses_unissued_authority_before_ha
         auth = replace(auth, service_authority=None)
     elif mutation == "missing_scope":
         auth = replace(auth, retained_factory_scope=None)
+    elif mutation == "missing_lease":
+        monkeypatch.setattr(selected, "_retained_effect_lease", None)
     else:
         owner, _lease, runner = selected.retained_effect_lease
 
