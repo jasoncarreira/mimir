@@ -18,6 +18,69 @@ from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
 
 
+@pytest.mark.parametrize("selected", [False, True])
+def test_generic_sync_and_async_shell_execute_through_middleware(
+    tmp_path: Path, selected: bool,
+) -> None:
+    if selected and os.environ.get("MIMIR_PLUGINS") != "cultivate":
+        pytest.skip("requires selected Cultivate in this process")
+    script = '''
+import asyncio, builtins, os, sys, threading
+from pathlib import Path
+old = builtins.__import__
+def no_disabled_provider(name, globals=None, locals=None, fromlist=(), level=0):
+    if os.environ.get("MIMIR_PLUGINS") != "cultivate" and name.startswith("mimir_cultivate"):
+        raise AssertionError("core-only shell imported disabled provider")
+    return old(name, globals, locals, fromlist, level)
+builtins.__import__ = no_disabled_provider
+from langchain.agents.middleware import ToolCallRequest
+from langgraph.runtime import Runtime
+from mimir.tools.budget_gate import BudgetGateMiddleware
+from mimir.tools.extra import shell_exec
+from mimir.tools import shell_async
+from mimir.shell_jobs import ShellJobRegistry
+from tests.auth_helpers import middleware_auth_context
+if os.environ.get("MIMIR_PLUGINS") == "cultivate":
+    from mimir.plugins.manager import load_plugins
+    selected = load_plugins(enable="cultivate").policy
+    assert selected.policy_consumer_hooks is not None
+else:
+    from mimir.plugins.core import core_policy_registry
+    selected = core_policy_registry()
+gate = BudgetGateMiddleware(selected)
+def request(name, tool):
+    return ToolCallRequest(tool_call={"name": name, "args": {"command": "printf direct-ok"},
+                                 "id": "generic-shell", "type": "tool_call"},
+                           tool=tool, state=None, runtime=Runtime(context=middleware_auth_context()))
+sync = gate.wrap_tool_call(request("shell_exec", shell_exec), lambda call: call.tool.invoke(call.tool_call["args"]))
+assert "direct-ok" in str(sync) and "exit=0" in str(sync), sync
+async def run():
+    registry = ShellJobRegistry(jobs_dir=Path(sys.argv[1]))
+    done = threading.Event()
+    completed = []
+    shell_async.set_shell_job_registry(registry, on_complete=lambda job: (completed.append(job), done.set()))
+    try:
+        async def execute(call):
+            return await call.tool.ainvoke(call.tool_call["args"])
+        output = await gate.awrap_tool_call(request("bash_async", shell_async.bash_async), execute)
+        assert "Spawned job" in str(output), output
+        assert await asyncio.to_thread(done.wait, 15)
+        assert completed[0].exit_code == 0
+        assert completed[0].stdout_path.read_text().strip() == "direct-ok"
+    finally:
+        shell_async.set_shell_job_registry(None)
+asyncio.run(run())
+'''
+    env = os.environ.copy()
+    env["MIMIR_PLUGINS"] = "cultivate" if selected else ""
+    env["SHELL_SECRET"] = "hidden-secret"
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "jobs")],
+        capture_output=True, text=True, timeout=45, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.asyncio
 async def test_interactive_sync_and_async_children_receive_same_scrubbed_env(
     tmp_path, monkeypatch,
@@ -640,8 +703,11 @@ def test_git_uses_minimal_env_and_repository_credentials(monkeypatch) -> None:
     } | {key for key in env if key.startswith("LC_")}
 
 
-def test_gh_env_uses_isolated_config_and_scrubs_alternate_credentials(monkeypatch) -> None:
+def test_gh_env_uses_isolated_config_and_scrubs_alternate_credentials(
+    monkeypatch,
+) -> None:
     from mimir.forge import github as github_module
+    from mimir.tools import forge as forge_tools
 
     monkeypatch.setenv("GITHUB_TOKEN", "declared-token")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
@@ -651,7 +717,6 @@ def test_gh_env_uses_isolated_config_and_scrubs_alternate_credentials(monkeypatc
     monkeypatch.setattr(github_module, "_verified_identity", (
         "reviewer", hashlib.sha256(b"declared-token").hexdigest(),
     ))
-    from mimir.tools import forge as forge_tools
     monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
     monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
 
@@ -865,7 +930,9 @@ def test_real_jq_cannot_read_parent_credentials_and_still_filters_json(
     ["pr", "view", "17"],
     ["pr", "review", "17", "--approve"],
 ])
-def test_every_gh_command_requires_cached_declared_identity(monkeypatch, arguments) -> None:
+def test_every_gh_command_requires_cached_declared_identity(
+    monkeypatch, arguments,
+) -> None:
     from mimir.forge import github as github_module
     from mimir.tools import forge as forge_tools
     from mimir.tools.refusals import ToolPolicyRefusal

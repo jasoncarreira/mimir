@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import builtins
 import json
 import sys
 import os
@@ -5866,6 +5867,64 @@ def test_repo_test_missing_labels_refuses_without_spending_grant() -> None:
 _REPO_PUBLISH_NAMES = (
     "repo_commit", "repo_merge", "repo_rebase", "repo_revert", "repo_push",
 )
+
+
+def test_core_repository_inventory_absent_preserves_roots_and_declared_file_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "checkout"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:rw")
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    imported = builtins.__import__
+
+    def absent(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "repository_config" and level == 1:
+            raise ModuleNotFoundError("retired inventory", name="mimir.repository_config")
+        return imported(name, globals, locals, fromlist, level)
+
+    with policy_scope(core_policy_registry()), monkeypatch.context() as missing:
+        missing.setattr(builtins, "__import__", absent)
+        assert access_control._configured_repo_roots() == [root]
+        assert access_control._configured_repo_write_roots() == [root]
+        assert access_control._configured_scope_github_repos() == {"owner/repo"}
+        (home / "repositories.yaml").write_text("repositories: []\n", encoding="utf-8")
+        assert access_control._configured_repo_roots() == []
+        assert access_control._configured_repo_write_roots() == []
+        assert access_control._configured_scope_github_repos() == frozenset()
+        assert access_control._canonical_repo_binding_resolution("owner/repo").binding is None
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_selected_publish_projection_keeps_all_five_tainted_writes_vetoed(enforce: bool) -> None:
+    if os.environ.get("MIMIR_PLUGINS") != "cultivate":
+        pytest.skip("requires selected Cultivate provider")
+    from mimir.plugins.core import core_policy_registry, policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    selected = load_plugins(enable="cultivate").policy
+    scope = _review_state("owner/repo", 7, "fix", "/srv/repo").action_scope
+    auth = _outsider_repo_publish_auth()
+    with policy_scope(core_policy_registry()):
+        assert all(core_policy_registry().tools[name].owner == "core" for name in _REPO_PUBLISH_NAMES)
+    with policy_scope(selected):
+        assert all(
+            selected.tools[name].owner == "cultivate"
+            and "repo_publish_tools" in selected.tools[name].memberships
+            for name in _REPO_PUBLISH_NAMES
+        )
+        for name in _REPO_PUBLISH_NAMES:
+            veto = SinkGate.check_sink_flow(
+                name, "owner/repo#pull/7", auth.ifc_labels, auth,
+                enforce=enforce, repo_pr_action_scope=scope,
+            )
+            assert not veto.allowed and veto.would_block
+            assert veto.reason == "write_blocked_by_untrusted_ingest"
 
 
 def _outsider_repo_publish_auth() -> AuthContext:
@@ -16237,6 +16296,8 @@ def test_worklink_build_tools_refuse_untrusted_ingest_on_both_routes(
         tool_name, str(repo), tainted.ifc_labels, tainted, enforce=enforce,
     )
     assert direct.allowed is False
+
+
     assert direct.is_shadow_decision is False
     assert direct.reason == (
         "ifc_label_blocked:spawn" if enforce
@@ -16271,6 +16332,40 @@ def test_worklink_build_tools_refuse_untrusted_ingest_on_both_routes(
                         tool_name, context, enforce=True, target_channel=target,
                     )
                 assert current == original
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("tool_name", ["worklink_run", "worklink_resume"])
+def test_selected_worklink_build_projection_preserves_live_taint_veto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforce: bool, tool_name: str,
+) -> None:
+    if os.environ.get("MIMIR_PLUGINS") != "cultivate":
+        pytest.skip("requires selected Cultivate provider")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    selected = load_plugins(enable="cultivate").policy
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    clean = _write_auth(admin=True)
+    taint = SourceLabel(
+        principal="external", domain="filesystem", resource_id="outside",
+        bridge_instance="filesystem", sensitivity="internal",
+        authorized_principals=frozenset({clean.canonical_principal}),
+        source_kind="protected_tool", integrity="untrusted", integrity_effect="active_ingest",
+    )
+    labels = clean.ifc_labels.with_source(taint)
+    tainted = replace(clean, ifc_labels=labels, ifc_state=InformationFlowState(labels=labels))
+    with policy_scope(selected):
+        assert selected.tools[tool_name].owner == "cultivate"
+        assert "worklink_build_tools" in selected.tools[tool_name].memberships
+        assert ToolRegistry().authorize_tool(
+            tool_name, tainted, enforce=enforce, target_channel=str(repo),
+        ).allowed is False
+        assert not SinkGate.check_sink_flow(
+            tool_name, str(repo), labels, tainted, enforce=enforce,
+        ).allowed
 
 
 def test_worklink_build_veto_does_not_catch_informational_untrusted_sources(

@@ -284,17 +284,38 @@ def _resolve_standing_review(
     ):
         return None
     retained_scope = getattr(auth_context, "retained_factory_scope", None)
+    from ..access_control import _is_worklink_retained_checkout_service
+
     if (
         tool_name in policy_membership("retained_repo_tools")
         and retained_scope is not None
         and arguments.get("repository") == retained_scope.repository
         and arguments.get("pull_request") == retained_scope.issue_id
+        and _is_worklink_retained_checkout_service(
+            get_trusted_service_from_auth_context(auth_context), auth_context=auth_context,
+        )
     ):
         return None
-    from .forge import (
-        revalidate_review_head_for_context,
-        resolve_review_state_for_context,
-    )
+    selected = policy if policy is not None else selected_policy_registry()
+    registered = selected.tools.get(tool_name)
+    hooks = selected.policy_consumer_hooks
+    if registered is not None and hooks is not None and registered.owner == hooks.owner:
+        resolve_review_state_for_context = hooks.resolve_review
+        revalidate_review_head_for_context = hooks.revalidate_head
+    elif registered is not None and registered.owner == getattr(selected, "_projected_owner", None):
+        return "repository review provider unavailable"
+    elif registered is not None and registered.owner != "core":
+        from ..access_control import resolve_registered_review_state
+
+        resolve_review_state_for_context = resolve_registered_review_state
+        if tool_name == "pr_submit_review":
+            return "repository review head validator unavailable"
+        revalidate_review_head_for_context = None
+    else:
+        from .forge import (
+            revalidate_review_head_for_context,
+            resolve_review_state_for_context,
+        )
 
     try:
         resolve_review_state_for_context(
@@ -3913,9 +3934,50 @@ def _prepare_tool_call_execution(
 
 
 def _review_submission_for_call(call: _PreparedToolCall) -> Any:
-    from .github_review_guard import review_submission_from_request
+    selected = call.policy if call.policy is not None else selected_policy_registry()
+    hooks = selected.policy_consumer_hooks
+    if hooks is not None:
+        return hooks.review_submission(call.execution_request)
+    if getattr(selected, "_projected_owner", None) is not None and call.tool_name in {
+        "shell_exec", "bash_async", "Bash", "bash",
+    }:
+        raise ToolException("selected review submission guard unavailable")
+    if call.tool_name not in {"shell_exec", "bash_async", "Bash", "bash", "pr_submit_review"}:
+        return None
+    args = call.execution_request.tool_call.get("args") or {}
+    direct = args.get("mimir_direct_argv")
+    command = args.get("command")
+    possible_gh = (
+        isinstance(direct, list) and direct and isinstance(direct[0], str)
+        and Path(direct[0]).name == "gh"
+    ) or (isinstance(command, str) and ("gh" in command or "pr review" in command))
+    if not possible_gh and call.tool_name != "pr_submit_review":
+        return None
+    try:
+        from .github_review_guard import review_submission_from_request
+    except ModuleNotFoundError as exc:
+        if exc.name != "mimir.tools.github_review_guard":
+            raise
+        raise ToolException("GitHub review submission guard unavailable") from exc
 
     return review_submission_from_request(call.execution_request)
+
+
+def _claim_review_submission_for_call(call: _PreparedToolCall, spec: Any) -> Any:
+    selected = call.policy if call.policy is not None else selected_policy_registry()
+    hooks = selected.policy_consumer_hooks
+    if hooks is not None:
+        return hooks.claim_review(spec)
+    if getattr(selected, "_projected_owner", None) is not None:
+        raise ToolException("selected review submission guard unavailable")
+    try:
+        from .github_review_guard import claim_review_submission
+    except ModuleNotFoundError as exc:
+        if exc.name != "mimir.tools.github_review_guard":
+            raise
+        raise ToolException("GitHub review submission guard unavailable") from exc
+
+    return claim_review_submission(spec)
 
 
 def _begin_tool_execution(
@@ -4260,17 +4322,7 @@ def _retained_execution(call: _PreparedToolCall):
             with _host_retained_invocation(scope, call.auth_context):
                 yield scope
         return
-    from ..worklink.retained_scope import retained_factory_effect_lease
-
-    with retained_factory_effect_lease(Path(home), scope) as lease:
-        if lease.scope is not scope:
-            raise ToolException(lease.refusal_reason or "retained factory lease unavailable")
-    yield scope
-    # Repo runners acquire the same interlock for their operation. Recheck
-    # after dispatch before the host attests the result they returned.
-    with retained_factory_effect_lease(Path(home), scope) as lease:
-        if lease.scope is not scope:
-            raise ToolException(lease.refusal_reason or "retained factory lease changed")
+    raise ToolException("retained factory lease provider unavailable")
 
 
 def _capture_retained_result(call: _PreparedToolCall, capture: _ToolExecutionCapture,
@@ -4527,9 +4579,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
-                from .github_review_guard import claim_review_submission
-
-                capture.review_claim = claim_review_submission(review_spec)
+                capture.review_claim = _claim_review_submission_for_call(call, review_spec)
             result = _begin_tool_execution(call, capture)
             if result is None:
                 permission_denial = _request_permission_sync(
@@ -4654,10 +4704,8 @@ class BudgetGateMiddleware(AgentMiddleware):
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
-                from .github_review_guard import claim_review_submission
-
                 capture.review_claim = await _claim_review_submission_async(
-                    lambda: claim_review_submission(review_spec)
+                    lambda: _claim_review_submission_for_call(call, review_spec)
                 )
             result = _begin_tool_execution(call, capture)
             if result is None:

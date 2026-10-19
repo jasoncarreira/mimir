@@ -564,7 +564,7 @@ def test_plugin_result_domain_comes_from_authorizing_policy(policy):
 async def test_plugin_standing_review_precedes_handler(
     policy, asynchronous, review_state, monkeypatch,
 ):
-    from mimir.tools import forge
+    from mimir import access_control
 
     auth = _granted(policy, _state({RepoPRAction.INSPECT.value}))
     args = {"repository": "acme/widget", "pull_request": 7}
@@ -573,7 +573,7 @@ async def test_plugin_standing_review_precedes_handler(
     elif review_state == "malformed":
         args = {"repository": [], "pull_request": 7}
     observed = []
-    original = forge.resolve_review_state_for_context
+    original = access_control.resolve_registered_review_state
 
     def resolve(context, repository, pull_request):
         observed.append((repository, pull_request))
@@ -581,7 +581,7 @@ async def test_plugin_standing_review_precedes_handler(
             raise ToolException("pull-request operation rejected: stale review state")
         return original(context, repository, pull_request)
 
-    monkeypatch.setattr(forge, "resolve_review_state_for_context", resolve)
+    monkeypatch.setattr(access_control, "resolve_registered_review_state", resolve)
     request = ToolCallRequest(
         tool_call={"name": "example_review", "args": args, "id": "review", "type": "tool_call"},
         tool=policy.tools["example_review"].factory(), state=None,

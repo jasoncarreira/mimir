@@ -53,6 +53,29 @@ class ScopedActionProtocol:
 
 
 @dataclass(frozen=True)
+class PolicyConsumerHooks:
+    owner: str
+    resolve_review: Callable[..., Any]
+    revalidate_head: Callable[..., Any]
+    resolve_issue: Callable[..., Any]
+    superseded_push: Callable[..., bool]
+    derive_retained_scope: Callable[..., Any]
+    active_checkout: Callable[..., Any]
+    git_command: Callable[..., Any]
+    protected_refs: frozenset[str]
+    lineage: Callable[..., Any]
+    verified_base: Callable[..., Any]
+    git_binary: Any
+    git_config: tuple[str, ...]
+    git_env: Callable[..., Any]
+    lease_metadata: str
+    review_submission: Callable[..., Any]
+    claim_review: Callable[..., Any]
+    repository_inventory: Callable[..., Any]
+    shell_environment: Callable[..., dict[str, str]]
+
+
+@dataclass(frozen=True)
 class AuthorityProfile:
     name: str
     owner: str
@@ -182,6 +205,7 @@ class PolicyRegistry:
         self._scoped_actions: dict[str, ScopedActionProtocol] = {}
         self._retained_checkout_operation: tuple[str, Callable[..., dict[str, object]]] | None = None
         self._retained_effect_lease: tuple[str, Callable[..., Any], Callable[..., Any]] | None = None
+        self._policy_consumer_hooks: PolicyConsumerHooks | None = None
         self._selected_plugin_candidates: tuple[PluginCandidate, ...] = ()
         self._selection_bound = False
         self._projected_owner: str | None = None
@@ -428,6 +452,24 @@ class PolicyRegistry:
                 or not callable(lease) or not callable(runner)):
             raise PolicyRegistrationError(f"{owner}: invalid retained effect lease")
         self._retained_effect_lease = (owner, lease, runner)
+
+    @property
+    def policy_consumer_hooks(self) -> PolicyConsumerHooks | None:
+        return self._policy_consumer_hooks
+
+    def register_policy_consumer_hooks(self, hooks: PolicyConsumerHooks, *, owner: str = "core") -> None:
+        self._writable()
+        if (not self._selected_first_party(owner) or self._policy_consumer_hooks is not None
+                or not isinstance(hooks, PolicyConsumerHooks) or hooks.owner != owner
+                or any(not callable(getattr(hooks, name)) for name in (
+                    "resolve_review", "revalidate_head", "resolve_issue", "superseded_push",
+                    "derive_retained_scope", "active_checkout", "git_command", "lineage",
+                    "verified_base", "git_env", "review_submission", "claim_review",
+                    "repository_inventory", "shell_environment",
+                )) or not isinstance(hooks.protected_refs, frozenset)
+                or not isinstance(hooks.git_config, tuple) or not isinstance(hooks.lease_metadata, str)):
+            raise PolicyRegistrationError(f"{owner}: invalid policy consumer hooks")
+        self._policy_consumer_hooks = hooks
 
     def register_scoped_action(
         self, action_type: type[StrEnum], validate_scope: Callable[..., bool],
@@ -1054,6 +1096,9 @@ class PolicyRegistrar:
         self, lease: Callable[..., Any], runner: Callable[..., Any],
     ) -> None:
         self._registry.register_retained_effect_lease(lease, runner, owner=self.plugin)
+
+    def register_policy_consumer_hooks(self, hooks: PolicyConsumerHooks) -> None:
+        self._registry.register_policy_consumer_hooks(hooks, owner=self.plugin)
 
     def register_scheduler_job(self, name: str, job_id: str, callback: Callable[..., Any]) -> None:
         self._registry.register_scheduler_job(name, job_id, callback, owner=self.plugin)
