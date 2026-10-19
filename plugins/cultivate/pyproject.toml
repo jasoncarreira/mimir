@@ -25,6 +25,8 @@ exclude = ["mimir_cultivate/defaults/skills/**"]
 "brand/LICENSE" = "mimir_cultivate/brand/LICENSE"
 "mimir-plugin.toml" = "mimir_cultivate/mimir-plugin.toml"
 "mimir_cultivate/defaults/skills" = "mimir_cultivate/defaults/skills"
+"mimir_cultivate/frontend/cultivate.v1.js" = "mimir_cultivate/frontend/cultivate.v1.js"
+"mimir_cultivate/frontend/cultivate.v1.css" = "mimir_cultivate/frontend/cultivate.v1.css"
 
 [tool.hatch.build.targets.sdist]
 include = ["pyproject.toml", "LICENSE", "brand/LICENSE", "mimir-plugin.toml", "mimir_cultivate/**/*"]
