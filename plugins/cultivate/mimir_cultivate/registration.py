@@ -289,6 +289,11 @@ class CultivateProvider:
             commands.configure_opencode_bootstrap,
             commands.dispatch_opencode_bootstrap,
         )
+        from .board import worklink_evidence
+        from .web import register_web
+
+        registrar.register_server_hook("chainlink_board", worklink_evidence)
+        register_web(registrar)
 
     def host_membership_projection(self) -> dict[str, tuple[str, ...]]:
         from .policy import host_membership_projection

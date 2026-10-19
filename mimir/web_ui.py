@@ -1858,6 +1858,11 @@ def register_routes(
             status=request.query.get("status", ""),
             priority=request.query.get("priority", ""),
             show_completed=completed == "true",
+            evidence_provider=next(
+                (hook for (owner, name), hook in manager.policy.server_hooks.items()
+                 if name == "chainlink_board" and owner in {plugin.candidate.name for plugin in manager.plugins}),
+                None,
+            ) if manager is not None else None,
         )
         return json_success(payload)
 

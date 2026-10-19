@@ -792,8 +792,7 @@ async def test_chainlink_board_parses_cli_json_and_worklink_evidence(
     assert board["blocked_by"] == [540]
     assert payload["selected_issue_state"] == "loaded"
     assert payload["selected_issue"]["comments"][0]["body"] == "WORKLINK_EVIDENCE attached"
-    assert board["worklink"]["attempt"] == 2
-    assert board["worklink"]["evidence_href"].endswith("state/worklink/evidence/545-2.json")
+    assert board["worklink"] is None
     assert parent["child_progress"] == {"done": 0, "total": 1}
     assert {"from": 524, "to": 545, "kind": "parent"} in payload["edges"]
     assert {"from": 540, "to": 545, "kind": "blocks"} in payload["edges"]
@@ -972,7 +971,7 @@ async def test_chainlink_board_query_parameters(tmp_path: Path, monkeypatch: pyt
         assert response.status == 200
         assert calls == [(tmp_path, {
             "offset": 250, "issue": 1214, "label": "old", "status": "blocked",
-            "priority": "high", "show_completed": False,
+            "priority": "high", "show_completed": False, "evidence_provider": None,
         })]
         for query in ("offset=-1", "offset=abc", "issue=0", "issue=-1", "issue=abc", "show_completed=maybe"):
             response = await client.get(f"/api/v1/chainlink-board?{query}")
