@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,16 @@ from aiohttp.test_utils import TestClient, TestServer
 from mimir.dashboard_extensions import add_plugin_routes
 from mimir.plugins.manager import load_plugins
 from mimir_cultivate.board import worklink_evidence
+from mimir_cultivate.worklink.compute import LaunchHandle
+from mimir_cultivate.worklink.factory_state import (
+    FactoryRunRecord, load_factory_record, save_factory_record,
+)
+
+
+@web.middleware
+async def _admin(request: web.Request, handler):
+    request["auth_is_master"] = True
+    return await handler(request)
 
 
 def test_web_contributions_are_selected_only() -> None:
@@ -115,3 +126,138 @@ async def test_selected_factory_api_projects_real_record_fields(tmp_path: Path, 
         assert detail["data"]["gates"]["brief"]["status"] == "approved"
         assert (await client.post(f"{base}/factory-run/archive?run_id=chainlink-42",
                                   json={"reason": "done"})).status == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,expected", [
+    ("missing_git", (None, "git CLI not on PATH")),
+    ("git_timeout", (None, "git remote timed out after 8.0s")),
+    ("missing_gh", ("owner/home", "gh CLI not on PATH")),
+    ("gh_timeout", ("owner/home", "gh pr list timed out after 8.0s")),
+    ("gh_auth", ("owner/home", "Bad credentials")),
+    ("gh_json", ("owner/home", "gh output:")),
+])
+async def test_selected_pr_board_reports_command_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, expected: tuple[str | None, str],
+) -> None:
+    def run(args, **kwargs):
+        command = args[0]
+        if failure == f"missing_{command}":
+            raise FileNotFoundError(command)
+        if failure == f"{command}_timeout":
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+        if command == "git":
+            return subprocess.CompletedProcess(args, 0, stdout="https://github.com/owner/home.git", stderr="")
+        if failure == "gh_auth":
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="HTTP 401: Bad credentials")
+        return subprocess.CompletedProcess(args, 0, stdout="{bad json", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    app = web.Application(middlewares=[_admin])
+    app["cultivate_home"] = tmp_path
+    add_plugin_routes(app, load_plugins(enable="cultivate").policy)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/api/v1/plugins/cultivate/pr-board")
+        assert response.status == 200
+        board = (await response.json())["data"]
+        assert board["available"] is False
+        assert board["repo"] == expected[0]
+        assert expected[1] in board["error"]
+        assert board["pull_requests"] == []
+
+
+@pytest.mark.asyncio
+async def test_selected_pr_board_normalizes_open_prs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[0] == "git":
+            return subprocess.CompletedProcess(args, 0, stdout="git@github.com:owner/home.git\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps([
+            {"number": 12, "title": "Review", "url": "https://github.com/owner/home/pull/12",
+             "author": {"login": "alice"}, "createdAt": "2026-06-27T12:00:00Z",
+             "reviewDecision": "REVIEW_REQUIRED", "isDraft": False},
+            {"number": True, "title": "invalid"},
+        ]), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    app = web.Application(middlewares=[_admin])
+    app["cultivate_home"] = tmp_path
+    add_plugin_routes(app, load_plugins(enable="cultivate").policy)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/api/v1/plugins/cultivate/pr-board")
+        assert response.status == 200
+        board = (await response.json())["data"]
+        assert board["available"] is True
+        assert board["repo"] == "owner/home"
+        assert board["total_count"] == 1
+        assert board["truncated"] is False
+        assert board["pull_requests"] == [{
+            "number": 12, "title": "Review", "url": "https://github.com/owner/home/pull/12",
+            "author": "alice", "created_at": "2026-06-27T12:00:00Z",
+            "review_decision": "REVIEW_REQUIRED", "is_draft": False,
+        }]
+    assert calls[1] == ["gh", "pr", "list", "-R", "owner/home", "--state", "open",
+                        "--json", "number,title,url,author,createdAt,reviewDecision,isDraft"]
+
+
+@pytest.mark.asyncio
+async def test_selected_factory_archive_persists_audit_and_denies_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import event_logger
+
+    home = tmp_path / "home"
+    home.mkdir()
+    record = FactoryRunRecord(
+        run_id="1620", issue_id=1620, attempt=2, repository="owner/repo",
+        base_ref="main", branch="worklink/1620", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(tmp_path / "sandbox"), session="session-1",
+        handle=LaunchHandle("local_subprocess", "987654", 123, shim_pid=987654),
+        status=None, observed_at="2026-09-11T10:00:00Z", controller_phase="running",
+    )
+    source = save_factory_record(home, record)
+    original = source.read_bytes()
+
+    def missing_process(pid, signal):
+        assert pid == 987654 and signal == 0
+        raise ProcessLookupError
+
+    monkeypatch.setattr("mimir_cultivate.worklink.factory_state.os.kill", missing_process)
+    events = tmp_path / "events.jsonl"
+    monkeypatch.setattr(event_logger, "_logger", event_logger.EventLogger(events, "test-session"))
+
+    @web.middleware
+    async def admin(request: web.Request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="bob")
+        request["auth_is_master"] = True
+        return await handler(request)
+
+    app = web.Application(middlewares=[admin])
+    app["cultivate_home"] = home
+    add_plugin_routes(app, load_plugins(enable="cultivate").policy)
+    base = "/api/v1/plugins/cultivate"
+    async with TestClient(TestServer(app)) as client:
+        listing = await client.get(f"{base}/factory-runs")
+        assert (await listing.json())["data"]["runs"][0]["clearable"] is True
+        response = await client.post(
+            f"{base}/factory-run/archive?run_id=1620",
+            json={"reason": "  clear stale run  ", "operator": "mallory"},
+        )
+        assert response.status == 200
+        assert (await response.json())["data"] == {"run_id": "1620", "archived": True}
+        assert not source.exists()
+        assert load_factory_record(home, "1620") is None
+        assert (await (await client.get(f"{base}/factory-runs")).json())["data"]["runs"] == []
+        assert (await client.post(f"{base}/factory-run/archive?run_id=1620",
+                                  json={"reason": "repeat"})).status == 404
+    audit, = [json.loads(line) for line in events.read_text().splitlines()]
+    assert audit["type"] == "worklink_factory_record_archived"
+    assert audit["source"] == "web_ui"
+    assert audit["reason"] == "web archive by bob: clear stale run"
+    assert (audit["run_id"], audit["issue_id"], audit["attempt"], audit["session"], audit["phase"]) == (
+        "1620", 1620, 2, "session-1", "running",
+    )
+    assert Path(audit["archive_path"]).read_bytes() == original
+    assert Path(audit["archive_path"]) == source.parent / "archive" / "1620-attempt-2.json"

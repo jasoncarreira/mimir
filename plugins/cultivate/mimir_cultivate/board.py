@@ -72,26 +72,36 @@ def _github_repo(remote: str) -> str | None:
 def _load_prs(home: Path) -> dict[str, Any]:
     try:
         remote = subprocess.run(["git", "remote", "get-url", "origin"], cwd=home,
-                                capture_output=True, text=True, timeout=8)
-        if remote.returncode:
-            return _empty(remote.stderr.strip()[:500] or f"git remote exit code {remote.returncode}")
-        repo = _github_repo(remote.stdout)
-        if repo is None:
-            return _empty("origin remote is not a parseable GitHub repo")
-        prs = subprocess.run(["gh", "pr", "list", "-R", repo, "--state", "open",
-                              "--json", "number,title,url,author,createdAt,reviewDecision,isDraft"],
-                             cwd=home, capture_output=True, text=True, timeout=8)
-        if prs.returncode:
-            return _empty(prs.stderr.strip()[:500] or f"gh pr list exit code {prs.returncode}") | {"repo": repo}
-        raw = json.loads(prs.stdout)
-        if not isinstance(raw, list):
-            return _empty("gh returned non-list payload") | {"repo": repo}
-    except FileNotFoundError as exc:
-        return _empty(f"{exc.filename} CLI not on PATH")
+                                 capture_output=True, text=True, timeout=8)
+    except FileNotFoundError:
+        return _empty("git CLI not on PATH")
     except subprocess.TimeoutExpired:
-        return _empty("PR board command timed out after 8s")
+        return _empty("git remote timed out after 8.0s")
     except (OSError, ValueError) as exc:
         return _empty(str(exc)[:500])
+    if remote.returncode:
+        return _empty(remote.stderr.strip()[:500] or f"git remote exit code {remote.returncode}")
+    repo = _github_repo(remote.stdout)
+    if repo is None:
+        return _empty("origin remote is not a parseable GitHub repo")
+    try:
+        prs = subprocess.run(["gh", "pr", "list", "-R", repo, "--state", "open",
+                               "--json", "number,title,url,author,createdAt,reviewDecision,isDraft"],
+                              cwd=home, capture_output=True, text=True, timeout=8)
+    except FileNotFoundError:
+        return _empty("gh CLI not on PATH") | {"repo": repo}
+    except subprocess.TimeoutExpired:
+        return _empty("gh pr list timed out after 8.0s") | {"repo": repo}
+    except (OSError, ValueError) as exc:
+        return _empty(str(exc)[:500]) | {"repo": repo}
+    if prs.returncode:
+        return _empty(prs.stderr.strip()[:500] or f"gh pr list exit code {prs.returncode}") | {"repo": repo}
+    try:
+        raw = json.loads(prs.stdout)
+    except json.JSONDecodeError as exc:
+        return _empty(f"gh output: {exc}") | {"repo": repo}
+    if not isinstance(raw, list):
+        return _empty("gh returned non-list payload") | {"repo": repo}
     rows = []
     for item in raw:
         if not isinstance(item, dict) or type(item.get("number")) is not int:
