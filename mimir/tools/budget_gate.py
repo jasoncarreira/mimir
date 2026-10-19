@@ -4000,7 +4000,7 @@ def _begin_tool_execution(
         else None
     )
     if operator_direct_argv is not None:
-        from ._shell_env import bind_direct_exec_argv
+        from .shell_environment import bind_direct_exec_argv
 
         preparation = call.operator_shell_preparation
         capture.direct_argv_token = bind_direct_exec_argv(
@@ -4010,7 +4010,7 @@ def _begin_tool_execution(
             operator_declared=preparation.declaration is not None,
         )
     elif call.tool_name in {"shell_exec", "bash_async"} and isinstance(direct_argv, list):
-        from ._shell_env import bind_direct_exec_argv
+        from .shell_environment import bind_direct_exec_argv
 
         service = get_trusted_service_from_auth_context(call.auth_context)
         capture.direct_argv_token = bind_direct_exec_argv(
@@ -4100,7 +4100,7 @@ def _end_tool_execution(capture: _ToolExecutionCapture) -> None:
     if capture.review_claim is not None:
         capture.review_claim.release()
     if capture.direct_argv_token is not None:
-        from ._shell_env import reset_direct_exec_argv
+        from .shell_environment import reset_direct_exec_argv
 
         reset_direct_exec_argv(capture.direct_argv_token)
     if capture.fetch_token is not None:

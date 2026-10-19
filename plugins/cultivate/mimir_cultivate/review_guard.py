@@ -14,7 +14,7 @@ from typing import Any
 
 from langchain_core.tools import ToolException
 
-from mimir.tools._shell_env import _DIRECT_EXEC_ARGV, direct_exec_env
+from mimir.tools.shell_environment import _DIRECT_EXEC_ARGV, direct_exec_env
 from mimir.tools.extra import _effective_shell_cwd
 from mimir.tools.refusals import ToolPolicyRefusal
 
@@ -208,10 +208,17 @@ def _run(spec: ReviewSubmission, arguments: list[str]) -> subprocess.CompletedPr
 
 
 def _gh_env() -> dict[str, str]:
+    return github_shell_environment([_GH_EXECUTABLE], direct_exec_env([]))
+
+
+def github_shell_environment(argv: list[str], env: dict[str, str]) -> dict[str, str]:
+    """Grant only the selected Cultivate identity to a constrained GitHub CLI."""
+    if not argv or Path(argv[0]).name != _GH_EXECUTABLE:
+        raise ToolPolicyRefusal("GitHub shell credential grant requires gh")
     binding = _DIRECT_EXEC_ARGV.get()
     if binding is not None and binding.operator_declared:
         raise ToolPolicyRefusal("operator-declared gh is refused; use the forge tools")
-    env = direct_exec_env([])
+    env = dict(env)
     for name in tuple(env):
         if name == "GITHUB_TOKEN" or name.startswith("GH_"):
             del env[name]

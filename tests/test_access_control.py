@@ -16471,7 +16471,7 @@ def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter(
                 "process environment through gh"
             )
 
-    from mimir.tools._shell_env import direct_exec_env
+    from mimir.tools.shell_environment import direct_exec_env
 
     sentinel_name = "JQ_ENV_SENTINEL"
     monkeypatch.setenv(sentinel_name, "super-secret-value")

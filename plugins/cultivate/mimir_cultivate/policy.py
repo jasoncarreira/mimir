@@ -481,6 +481,7 @@ def register_tools(registrar: PolicyRegistrar) -> None:
         review_submission=review_guard.review_submission_from_request,
         claim_review=review_guard.claim_review_submission,
         repository_inventory=repository.RepositoryInventory.load,
+        shell_environment=review_guard.github_shell_environment,
     ))
     for name, declaration in sorted(_TOOL_DECLARATIONS.items()):
         descriptor = declaration.descriptor

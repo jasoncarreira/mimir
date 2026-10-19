@@ -109,7 +109,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     # siblings. Protect them before parsing or dispatching any subcommand.
     # server.main reapplies this after the pending-update exec path, since exec
     # resets dumpability.
-    from .tools._shell_env import disable_process_dumpability
+    from .tools.shell_environment import disable_process_dumpability
 
     disable_process_dumpability()
     words = list(argv) if argv is not None else sys.argv[1:]

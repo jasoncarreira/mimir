@@ -128,7 +128,7 @@ def test_provider_review_claim_tracks_current_head_and_duplicate(monkeypatch: py
 def test_selected_review_probe_env_uses_provider_identity_without_core_forge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.tools._shell_env import bind_direct_exec_argv, reset_direct_exec_argv
+    from mimir.tools.shell_environment import bind_direct_exec_argv, reset_direct_exec_argv
     from mimir.tools.refusals import ToolPolicyRefusal
     from mimir_cultivate import forge
 
@@ -427,10 +427,21 @@ async def test_selected_pr_review_revalidates_head_before_middleware_handler(
         return handler(tool_request)
 
     gate = budget_gate.BudgetGateMiddleware(selected)
-    result = (
-        await gate.awrap_tool_call(request, async_handler)
-        if asynchronous else gate.wrap_tool_call(request, handler)
-    )
+    imported = builtins.__import__
+
+    def no_legacy(name, globals=None, locals=None, fromlist=(), level=0):
+        if name in {"mimir.tools._shell_env", "mimir.tools.github_review_guard"} or (
+            level and name in {"_shell_env", "github_review_guard"}
+        ):
+            raise ModuleNotFoundError(name=name)
+        return imported(name, globals, locals, fromlist, level)
+
+    with monkeypatch.context() as absent:
+        absent.setattr(builtins, "__import__", no_legacy)
+        result = (
+            await gate.awrap_tool_call(request, async_handler)
+            if asynchronous else gate.wrap_tool_call(request, handler)
+        )
     assert observed == [(scope.canonical_repo, scope.pr_number)]
     if stale:
         assert result.status == "error"

@@ -609,7 +609,7 @@ def shell_exec(
     """
     if not command or not command.strip():
         raise ToolException("shell_exec failed: command is required")
-    from ._shell_env import (
+    from .shell_environment import (
         bound_direct_exec_argv, direct_exec_env, interactive_shell_env,
         login_shell_command, refuse_protected_shell_operands,
     )
@@ -684,7 +684,7 @@ def shell_exec(
     stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
     stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
     if direct_argv is not None:
-        from ._shell_env import direct_exec_redact_names, redact_direct_exec_output
+        from .shell_environment import direct_exec_redact_names, redact_direct_exec_output
 
         names = direct_exec_redact_names(argv)
         stdout = redact_direct_exec_output(stdout, child_env, names)

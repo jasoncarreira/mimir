@@ -482,7 +482,7 @@ def test_configured_project_test_timeout_is_named_and_output_is_bounded(
     monkeypatch: pytest.MonkeyPatch,
     maintenance_pinned_executables: dict[str, Path],
 ) -> None:
-    from mimir.tools._shell_env import bind_direct_exec_argv, reset_direct_exec_argv
+    from mimir.tools.shell_environment import bind_direct_exec_argv, reset_direct_exec_argv
 
     home = tmp_path / "home"
     repo = tmp_path / "repo"
@@ -584,7 +584,7 @@ def test_login_shell_command_puts_system_tools_before_venv_bin():
     import os
     import sys
 
-    from mimir.tools._shell_env import _TRUSTED_PATH, login_shell_command
+    from mimir.tools.shell_environment import _TRUSTED_PATH, login_shell_command
 
     cmd = "mimir reflection introspection-report --days 7"
     wrapped = login_shell_command(cmd)
@@ -602,7 +602,7 @@ def test_shell_exec_puts_venv_bin_after_system_tools_on_path():
     import os
     import sys
 
-    from mimir.tools._shell_env import _TRUSTED_PATH
+    from mimir.tools.shell_environment import _TRUSTED_PATH
 
     venv_bin = os.path.dirname(sys.executable)
     expected_path = os.pathsep.join((_TRUSTED_PATH, venv_bin))
@@ -625,7 +625,7 @@ async def test_service_shell_exec_graph_executes_server_bound_argv(
     from mimir._deepagents_patches import install_deepagents_grep_context_tool
     from mimir.access_control import ToolRegistry, create_auth_context
     from mimir.models import AgentEvent, InformationFlowLabels
-    from mimir.tools._shell_env import direct_exec_env
+    from mimir.tools.shell_environment import direct_exec_env
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
     class _ToolCallingFakeModel(GenericFakeChatModel):

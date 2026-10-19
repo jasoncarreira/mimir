@@ -2625,7 +2625,7 @@ def main() -> None:
     # Apply after any update exec (exec resets dumpability), before spawning
     # any runtime children. Same-uid interactive shells must not recover the
     # server's original environment through /proc/$PPID/environ.
-    from .tools._shell_env import disable_process_dumpability
+    from .tools.shell_environment import disable_process_dumpability
 
     disable_process_dumpability()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

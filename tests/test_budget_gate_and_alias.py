@@ -4355,7 +4355,7 @@ def test_non_shell_server_args_are_stripped_before_nested_shell_exec(
     from types import SimpleNamespace
 
     from mimir.tools import extra
-    from mimir.tools._shell_env import login_shell_command
+    from mimir.tools.shell_environment import login_shell_command
 
     middleware = BudgetGateMiddleware()
     ctx = _make_ctx()
@@ -4419,7 +4419,7 @@ async def test_non_shell_server_args_are_stripped_before_nested_bash_async(
     from types import SimpleNamespace
 
     from mimir.tools import shell_async
-    from mimir.tools._shell_env import login_shell_command
+    from mimir.tools.shell_environment import login_shell_command
 
     middleware = BudgetGateMiddleware()
     ctx = _make_ctx()
@@ -4487,7 +4487,7 @@ async def test_non_shell_execution_never_binds_direct_argv(
 ) -> None:
     """Keep both middleware bind sites safe if sanitization ever drifts."""
     from mimir.tools import budget_gate
-    from mimir.tools._shell_env import bound_direct_exec_argv
+    from mimir.tools.shell_environment import bound_direct_exec_argv
 
     planted = ["/bin/sh", "-c", "planted"]
     middleware = BudgetGateMiddleware()
@@ -5371,7 +5371,7 @@ async def test_operator_binding_is_authorization_and_execution_artifact(
 
     from mimir.models import TurnInteractivity
     from mimir.tools import budget_gate
-    from mimir.tools._shell_env import bound_direct_exec_argv
+    from mimir.tools.shell_environment import bound_direct_exec_argv
 
     root = tmp_path / "operator-root"
     home = tmp_path / "home"
@@ -5592,7 +5592,7 @@ async def test_pre_ingest_soft_operator_uses_actual_bash_lc_path(
     from types import SimpleNamespace
 
     from mimir.tools import budget_gate, extra
-    from mimir.tools._shell_env import bound_direct_exec_argv, login_shell_command
+    from mimir.tools.shell_environment import bound_direct_exec_argv, login_shell_command
 
     state = _Arm2LiveState(False)
     auth = _arm2_operator_auth(state, enforcement_enabled=True)
@@ -5889,7 +5889,7 @@ async def test_operator_direct_context_restores_owned_value_on_every_completion(
 ) -> None:
     from mimir import access_control
     from mimir.tools import budget_gate
-    from mimir.tools._shell_env import (
+    from mimir.tools.shell_environment import (
         bind_direct_exec_argv,
         bound_direct_exec_argv,
         reset_direct_exec_argv,
@@ -6624,7 +6624,7 @@ async def test_bound_chainlink_live_matrix_never_shadow_executes_mutation(
 
     from mimir import access_control
     from mimir.tools import budget_gate
-    from mimir.tools._shell_env import bound_direct_exec_argv
+    from mimir.tools.shell_environment import bound_direct_exec_argv
 
     auth = replace(
         _untainted_ifc_auth(),

@@ -376,7 +376,7 @@ async def bash_async(
 
     redact_names: tuple[str, ...] = ()
     try:
-        from ._shell_env import (
+        from .shell_environment import (
             bound_direct_exec_argv,
             direct_exec_env_overlay,
             direct_exec_redact_names,

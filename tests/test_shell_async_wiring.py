@@ -33,7 +33,7 @@ from langchain_core.tools import ToolException
 
 from mimir.shell_jobs import ShellJob, ShellJobRegistry
 from mimir.tools import shell_async
-from mimir.tools._shell_env import direct_exec_env_overlay
+from mimir.tools.shell_environment import direct_exec_env_overlay
 
 
 class _FakeJob:
@@ -151,7 +151,7 @@ async def test_bash_async_direct_command_uses_trusted_environment(
 
 @pytest.mark.asyncio
 async def test_bash_async_snapshots_only_declared_values(fake_registry, monkeypatch):
-    from mimir.tools import _shell_env
+    from mimir.tools import shell_environment as _shell_env
 
     overlay = {"TOKEN": "spawn-secret", "OTHER": "not-declared", "EMPTY": "", "UNSET": None}
     monkeypatch.setattr(_shell_env, "direct_exec_pass_env", lambda argv: ("TOKEN", "EMPTY", "UNSET"))
@@ -167,7 +167,7 @@ async def test_bash_async_snapshots_only_declared_values(fake_registry, monkeypa
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_site", ["overlay", "spawn"])
 async def test_bash_async_declared_failure_hides_values(fake_registry, monkeypatch, failure_site):
-    from mimir.tools import _shell_env
+    from mimir.tools import shell_environment as _shell_env
 
     monkeypatch.setattr(_shell_env, "direct_exec_pass_env", lambda argv: ("TOKEN",))
 
@@ -186,7 +186,7 @@ async def test_bash_async_declared_failure_hides_values(fake_registry, monkeypat
 @pytest.mark.asyncio
 @pytest.mark.parametrize("value", ["child-secret", "", None])
 async def test_bash_async_snapshots_implicit_gh_child_token(fake_registry, monkeypatch, value):
-    from mimir.tools import _shell_env
+    from mimir.tools import shell_environment as _shell_env
 
     monkeypatch.setenv("GITHUB_TOKEN", "different-parent-secret")
     overlay = {"GITHUB_TOKEN": value, "GH_TOKEN": None, "HOME": "/safe/home"}
@@ -202,7 +202,7 @@ async def test_bash_async_snapshots_implicit_gh_child_token(fake_registry, monke
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_site", ["overlay", "spawn"])
 async def test_bash_async_implicit_gh_failure_hides_values(fake_registry, monkeypatch, failure_site):
-    from mimir.tools import _shell_env
+    from mimir.tools import shell_environment as _shell_env
 
     def fail(*args, **kwargs):
         raise RuntimeError("opaque-private-value-1666")
