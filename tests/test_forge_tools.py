@@ -73,6 +73,81 @@ from mimir.tools.budget_gate import BudgetGateMiddleware
 
 
 @pytest.mark.asyncio
+async def test_selected_forge_read_requires_server_observed_live_lease(tmp_path, monkeypatch):
+    from mimir.access_control import (
+        ScopedPRGrants, _SCOPED_PR_ISSUER, consume_scoped_pr_checkout,
+        observe_scoped_pr_checkout,
+    )
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge as selected_forge
+    from tests.test_repo_tools import _repo_scope_and_state
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    policy = load_plugins(enable="cultivate").policy
+    grants = ScopedPRGrants(
+        scope.principal, (scope,), protocols=policy.scoped_actions,
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    auth = AuthContext(
+        principal=scope.principal, canonical_principal=scope.principal, roles=("service",),
+        event_ingress=None, trigger="poller", channel_id="poller:github",
+        interactivity=None,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+        scoped_pr_grants=grants, enforcement_enabled=True,
+    )
+    client = FakeForge()
+    metadata = client.get_pull_request
+    monkeypatch.setattr(client, "get_pull_request", lambda target: replace(
+        metadata(target), number=scope.pr_number, head_sha=scope.observed_head_sha,
+    ))
+    selected_forge.set_forge_client(client)
+    gate = BudgetGateMiddleware(policy)
+    tool = selected_forge.pr_metadata
+    request = ToolCallRequest(
+        tool_call={"name": tool.name, "args": {
+            "repository": scope.canonical_repo, "pull_request": scope.pr_number,
+        }, "id": "selected-forge", "type": "tool_call"},
+        tool=tool, state={}, runtime=Runtime(context=auth),
+    )
+    calls = []
+
+    async def handler(call):
+        calls.append(call.tool_call["id"])
+        runtime = ToolRuntime(
+            state={}, context=auth, config={}, stream_writer=lambda _: None,
+            tool_call_id=call.tool_call["id"], store=None,
+        )
+        result = await tool.coroutine(
+            scope.canonical_repo, scope.pr_number, runtime=runtime,
+        )
+        return ToolMessage(content=json.dumps(result), tool_call_id=call.tool_call["id"])
+
+    try:
+        with policy_scope(policy):
+            refused = await gate.awrap_tool_call(request, handler)
+            assert refused.status == "error" and "repo_pr_grant_denied" in str(refused.content)
+            assert calls == []
+            token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+            assert token is not None
+            assert observe_scoped_pr_checkout(
+                auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"],
+            )
+            result = await gate.awrap_tool_call(request, handler)
+            assert result.status != "error", result.content
+            assert calls == ["selected-forge"]
+            lease.revoke()
+            stale = await gate.awrap_tool_call(request, handler)
+            assert stale.status == "error" and "repo_pr_grant_denied" in str(stale.content)
+            assert calls == ["selected-forge"]
+    finally:
+        selected_forge.set_forge_client(None)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff, pr_file_content, pr_comments, pr_reviews])
 @pytest.mark.parametrize("verdict", [True, False, None])
 async def test_author_attested_forge_results(tmp_path, monkeypatch, read_tool, verdict):
