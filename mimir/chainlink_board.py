@@ -4,19 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import subprocess
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 CHAINLINK_TIMEOUT_SECONDS = 5.0
 CHAINLINK_MAX_ISSUES = 250
 CHAINLINK_MAX_SHOWS = CHAINLINK_MAX_ISSUES
 
-_WORKLINK_EVIDENCE_RE = re.compile(r"^(\d+)-(\d+)\.json$")
 
 
 def _as_int(value: Any) -> int | None:
@@ -171,52 +169,6 @@ def _summarize_issue(
     }
 
 
-def _read_worklink_evidence(home: Path) -> dict[int, dict[str, Any]]:
-    evidence_dir = home / "state" / "worklink" / "evidence"
-    if not evidence_dir.is_dir():
-        return {}
-    latest: dict[int, dict[str, Any]] = {}
-    for path in evidence_dir.glob("*.json"):
-        match = _WORKLINK_EVIDENCE_RE.match(path.name)
-        if not match:
-            continue
-        issue_id = int(match.group(1))
-        attempt = int(match.group(2))
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        prior = latest.get(issue_id)
-        if prior and int(prior.get("attempt") or 0) > attempt:
-            continue
-        transcript = _as_text(payload.get("transcript"))
-        evidence_rel = str(path.relative_to(home))
-        latest[issue_id] = {
-            "issue": issue_id,
-            "attempt": attempt,
-            "backend": _as_text(payload.get("backend")),
-            "status": _as_text(payload.get("status")) or "unknown",
-            "branch": _as_text(payload.get("branch")),
-            "started_at": _as_text(payload.get("started_at")),
-            "finished_at": _as_text(payload.get("finished_at")),
-            "diff_stat": _as_text(payload.get("diff_stat")),
-            "tests": payload.get("tests") if isinstance(payload.get("tests"), dict) else None,
-            "pr_url": _as_text(payload.get("pr_url")),
-            "blocked_reason": _as_text(payload.get("blocked_reason")),
-            "transcript": transcript,
-            "transcript_href": _artifact_href(transcript) if transcript else "",
-            "evidence_path": evidence_rel,
-            "evidence_href": _artifact_href(evidence_rel),
-        }
-    return latest
-
-
-def _artifact_href(relative_path: str) -> str:
-    return f"/api/v1/chainlink-board/artifact?path={relative_path}"
-
-
 async def _run_chainlink_json(home: Path, args: list[str]) -> tuple[Any | None, str | None]:
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -274,6 +226,7 @@ async def _load_issue_details(home: Path, ids: list[int]) -> dict[int, dict[str,
 async def build_chainlink_board_payload(
     home: Path | None, *, label: str = "", status: str = "", priority: str = "",
     show_completed: bool = True, offset: int = 0, issue: int | None = None,
+    evidence_provider: Callable[[Path], dict[int, dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     if offset < 0 or (issue is not None and issue <= 0):
         raise ValueError("offset must be nonnegative and issue must be positive")
@@ -347,7 +300,7 @@ async def build_chainlink_board_payload(
         if issue_id is not None and parent_id is not None:
             children_by_parent[parent_id].append(issue_id)
 
-    worklink_by_issue = _read_worklink_evidence(home)
+    worklink_by_issue = await asyncio.to_thread(evidence_provider, home) if evidence_provider else {}
     summaries = [
         summary for issue in merged
         if (
