@@ -18,6 +18,20 @@ from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
 
 
+@pytest.fixture
+def selected_shell_policy():
+    from mimir.plugins.core import _selected_policy
+    from mimir.plugins.manager import load_plugins
+
+    selected = load_plugins(enable="cultivate").policy
+    assert selected.policy_consumer_hooks is not None
+    token = _selected_policy.set(selected)
+    try:
+        yield selected
+    finally:
+        _selected_policy.reset(token)
+
+
 @pytest.mark.parametrize("selected", [False, True])
 def test_generic_sync_and_async_shell_execute_through_middleware(
     tmp_path: Path, selected: bool,
@@ -270,11 +284,11 @@ def test_output_mask_includes_only_granted_child_values(monkeypatch, executable)
 @pytest.mark.parametrize("async_job", [False, True], ids=["sync", "async-job"])
 @pytest.mark.parametrize("exit_code", [0, 1])
 async def test_implicit_gh_token_is_masked_in_child_output(
-    tmp_path, monkeypatch, async_job, exit_code,
+    tmp_path, monkeypatch, selected_shell_policy, async_job, exit_code,
 ):
-    from mimir.forge import github as github_module
+    from mimir_cultivate import forge as provider_forge
     from mimir.shell_jobs import ShellJobRegistry
-    from mimir.tools import forge as forge_tools, shell_async
+    from mimir.tools import shell_async
     from mimir.tools.extra import shell_exec
 
     secret = "opaque-private-value-1666"
@@ -282,11 +296,11 @@ async def test_implicit_gh_token_is_masked_in_child_output(
     monkeypatch.setenv("GH_TOKEN", "ungranted-alternate")
     monkeypatch.setenv("UNDECLARED_TOKEN", "ungranted-private")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
-    monkeypatch.setattr(github_module, "_verified_identity", (
+    monkeypatch.setattr(provider_forge, "_verified_identity", (
         "reviewer", hashlib.sha256(secret.encode()).hexdigest(),
     ))
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setattr(provider_forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(provider_forge, "_github_identity_degraded_error", None)
     executable = tmp_path / "gh"
     executable.write_text(
         f"#!{sys.executable}\n"
@@ -658,7 +672,9 @@ def test_direct_exec_env_uv_run_uses_project_virtualenv(
     assert Path(completed.stdout.strip()).resolve() == (project / ".venv").resolve()
 
 
-def test_direct_exec_env_scrubs_git_repository_and_helper_injection(monkeypatch) -> None:
+def test_direct_exec_env_scrubs_git_repository_and_helper_injection(
+    monkeypatch, selected_shell_policy,
+) -> None:
     injected = {
         "GIT_DIR": "/outside/.git",
         "GIT_WORK_TREE": "/outside",
@@ -683,7 +699,7 @@ def test_direct_exec_env_scrubs_git_repository_and_helper_injection(monkeypatch)
     assert env["GIT_OPTIONAL_LOCKS"] == "0"
 
 
-def test_git_uses_minimal_env_and_repository_credentials(monkeypatch) -> None:
+def test_git_uses_minimal_env_and_repository_credentials(monkeypatch, selected_shell_policy) -> None:
     """Only review pull/push need auth, supplied by the configured helper.
 
     Inspection Git has ``credential.helper=`` injected into argv. Authorized
@@ -704,21 +720,21 @@ def test_git_uses_minimal_env_and_repository_credentials(monkeypatch) -> None:
 
 
 def test_gh_env_uses_isolated_config_and_scrubs_alternate_credentials(
-    monkeypatch,
+    monkeypatch, selected_shell_policy,
 ) -> None:
-    from mimir.forge import github as github_module
-    from mimir.tools import forge as forge_tools
+    from mimir_cultivate import forge as provider_forge
+    from mimir_cultivate import review_guard
 
     monkeypatch.setenv("GITHUB_TOKEN", "declared-token")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
     monkeypatch.setenv("GH_TOKEN", "stray-token")
     monkeypatch.setenv("GH_HOST", "attacker.invalid")
     monkeypatch.setenv("GH_CONFIG_DIR", "/tmp/stray-gh-config")
-    monkeypatch.setattr(github_module, "_verified_identity", (
+    monkeypatch.setattr(provider_forge, "_verified_identity", (
         "reviewer", hashlib.sha256(b"declared-token").hexdigest(),
     ))
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setattr(provider_forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(provider_forge, "_github_identity_degraded_error", None)
 
     env = direct_exec_env(["/usr/bin/gh", "api", "user"])
     overlay = direct_exec_env_overlay(["/usr/bin/gh", "api", "user"])
@@ -726,7 +742,7 @@ def test_gh_env_uses_isolated_config_and_scrubs_alternate_credentials(
     assert env["GITHUB_TOKEN"] == "declared-token"
     assert "GH_TOKEN" not in env
     assert "GH_HOST" not in env
-    assert env["GH_CONFIG_DIR"] == _shell_env._GH_CONFIG_DIR
+    assert env["GH_CONFIG_DIR"] == review_guard._GH_CONFIG_DIR
     assert env["GH_CONFIG_DIR"] != "/tmp/stray-gh-config"
     assert Path(env["GH_CONFIG_DIR"]).stat().st_mode & 0o777 == 0o500
     assert overlay["GH_TOKEN"] is None
@@ -745,6 +761,41 @@ def test_non_gh_direct_exec_scrubs_github_cli_selection(monkeypatch) -> None:
     scrubbed = ("GH_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "MIMIR_MODEL_SPEC")
     assert all(key not in env for key in scrubbed)
     assert all(overlay[key] is None for key in scrubbed)
+
+
+def test_owner_hook_is_not_applied_to_unrelated_direct_exec(selected_shell_policy, monkeypatch) -> None:
+    from dataclasses import replace
+
+    def unexpected(*args):
+        raise AssertionError("forge environment hook called for unrelated argv")
+
+    monkeypatch.setattr(selected_shell_policy, "_policy_consumer_hooks", replace(
+        selected_shell_policy.policy_consumer_hooks, shell_environment=unexpected,
+    ))
+    assert subprocess.run(
+        ["/bin/echo", "generic-ok"], capture_output=True, text=True,
+        env=direct_exec_env(["/bin/echo", "generic-ok"]), check=True,
+    ).stdout.strip() == "generic-ok"
+
+
+def test_core_only_gh_drops_declared_credential_without_selected_hook(monkeypatch) -> None:
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
+    monkeypatch.setenv("GITHUB_TOKEN", "unavailable-for-core")
+    monkeypatch.setenv("GH_HOST", "untrusted.invalid")
+    argv = ["/usr/bin/gh", "api", "user"]
+    binding = _shell_env._DIRECT_EXEC_ARGV.set(
+        _shell_env._DirectExecBinding(tuple(argv), ("GITHUB_TOKEN", "GH_HOST")),
+    )
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *args, **kwargs: None)
+    try:
+        with policy_scope(core_policy_registry()):
+            env = direct_exec_env(argv)
+            overlay = direct_exec_env_overlay(argv)
+    finally:
+        _shell_env._DIRECT_EXEC_ARGV.reset(binding)
+    assert "GITHUB_TOKEN" not in env and "GH_HOST" not in env
+    assert overlay["GITHUB_TOKEN"] is None and overlay["GH_HOST"] is None
 
 
 def test_jq_direct_exec_env_contains_only_non_secret_process_settings(
@@ -780,13 +831,13 @@ def test_jq_direct_exec_env_contains_only_non_secret_process_settings(
 def test_every_pinned_service_command_inherits_safe_default(
     monkeypatch: pytest.MonkeyPatch,
     maintenance_pinned_executables: dict[str, Path],
+    selected_shell_policy,
 ) -> None:
     from mimir import access_control
 
     monkeypatch.setenv("SERVICE_ENV_SENTINEL", "secret")
     monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
 
-    assert set(_shell_env._CREDENTIAL_ENV_BY_EXECUTABLE) == {"gh"}
     for command in access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS:
         if command == "gh":
             continue
@@ -931,24 +982,23 @@ def test_real_jq_cannot_read_parent_credentials_and_still_filters_json(
     ["pr", "review", "17", "--approve"],
 ])
 def test_every_gh_command_requires_cached_declared_identity(
-    monkeypatch, arguments,
+    monkeypatch, selected_shell_policy, arguments,
 ) -> None:
-    from mimir.forge import github as github_module
-    from mimir.tools import forge as forge_tools
+    from mimir_cultivate import forge as provider_forge
     from mimir.tools.refusals import ToolPolicyRefusal
 
     monkeypatch.setenv("GITHUB_TOKEN", "declared-token")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
-    monkeypatch.setattr(github_module, "_verified_identity", None)
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setattr(provider_forge, "_verified_identity", None)
+    monkeypatch.setattr(provider_forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(provider_forge, "_github_identity_degraded_error", None)
     argv = ["/usr/bin/gh", *arguments]
 
     with pytest.raises(ToolPolicyRefusal, match="cache is empty"):
         direct_exec_env(argv)
-    assert forge_tools.github_identity_is_degraded() is True
+    assert provider_forge.github_identity_is_degraded() is True
 
-    monkeypatch.setattr(github_module, "_verified_identity", (
+    monkeypatch.setattr(provider_forge, "_verified_identity", (
         "reviewer", hashlib.sha256(b"declared-token").hexdigest(),
     ))
     with pytest.raises(ToolPolicyRefusal, match="disabled until restart"):
