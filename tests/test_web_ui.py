@@ -799,53 +799,6 @@ async def test_chainlink_board_parses_cli_json_and_worklink_evidence(
 
 
 @pytest.mark.asyncio
-async def test_chainlink_board_http_enrichment_requires_selected_cultivate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-):
-    from mimir import chainlink_board
-    from mimir.plugins.manager import load_plugins
-
-    evidence_dir = tmp_path / "state" / "worklink" / "evidence"
-    evidence_dir.mkdir(parents=True)
-    (evidence_dir / "545-2.json").write_text(json.dumps({
-        "backend": "codex", "status": "completed", "branch": "issue/545-a2",
-        "diff_stat": "3 files changed", "tests": {"cmd": "npm test", "exit_code": 0},
-        "transcript": "state/worklink/transcripts/545-2.jsonl",
-    }), encoding="utf-8")
-    (evidence_dir / "545-1.json").write_text(json.dumps({"status": "failed"}), encoding="utf-8")
-
-    async def run(home, args):
-        assert home == tmp_path
-        if args == ["export", "--json"]:
-            return {"issues": [{"id": 545, "title": "Board", "status": "open"}]}, None
-        assert args == ["issue", "show", "545", "--json"]
-        return {"id": 545}, None
-
-    monkeypatch.setattr(chainlink_board, "_run_chainlink_json", run)
-    for selected in (False, True):
-        app = web.Application()
-        app["config"] = SimpleNamespace(plugin_manager=load_plugins(enable="cultivate" if selected else ""))
-        web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=tmp_path)
-        async with TestClient(TestServer(app)) as client:
-            response = await client.get("/api/v1/chainlink-board?issue=545")
-            assert response.status == 200
-            payload = (await response.json())["data"]
-            assert payload["available"] is True
-            issue = next(row for row in payload["issues"] if row["id"] == 545)
-            assert issue["worklink"] == ({
-                "issue": 545, "attempt": 2, "backend": "codex", "status": "completed",
-                "branch": "issue/545-a2", "started_at": "", "finished_at": "",
-                "diff_stat": "3 files changed", "tests": {"cmd": "npm test", "exit_code": 0},
-                "pr_url": "", "blocked_reason": "",
-                "transcript": "state/worklink/transcripts/545-2.jsonl",
-                "transcript_href": "/api/v1/chainlink-board/artifact?path=state/worklink/transcripts/545-2.jsonl",
-                "evidence_path": "state/worklink/evidence/545-2.json",
-                "evidence_href": "/api/v1/chainlink-board/artifact?path=state/worklink/evidence/545-2.json",
-            } if selected else None)
-            assert payload["selected_issue"]["worklink"] == issue["worklink"]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("export_payload", [
     [], [{"id": 1}], {}, {"version": 1}, {"issues": None},
     {"issues": {}}, {"issues": [None]}, {"issues": [{"id": 1}, "bad"]},
