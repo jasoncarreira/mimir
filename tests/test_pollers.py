@@ -242,7 +242,9 @@ def register(registrar):
 def test_verified_own_push_drops_stale_framework_trigger_before_scope_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.repo_tools import _record_verified_push, was_verified_push
+    from mimir.plugins.core import core_policy_registry, policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate.repository import _record_verified_push, was_verified_push
     from mimir.models import InformationFlowState
 
     events = []
@@ -258,24 +260,28 @@ def test_verified_own_push_drops_stale_framework_trigger_before_scope_binding(
         base_ref="main", observed_base_sha="b" * 40,
     )
     item = {"event_type": "pr_ci_failure", "repo": scope.canonical_repo,
-            "number": scope.pr_number, "head_sha": old}
+             "number": scope.pr_number, "head_sha": old}
     batch = [{"prompt": "stale", "extras": item}]
-    assert _drop_superseded_github_framework_items(batch) == batch
-    # Simulates record_own_push after a push that verified the remote contains
-    # the new HEAD and proved the previous head an ancestor.
-    ifc = InformationFlowState()
-    ifc.record_own_push(scope.canonical_repo, scope.pr_number, old)
-    _record_verified_push(scope, old, pushed, fast_forward=True)
-    assert was_verified_push(scope.canonical_repo, scope.pr_number, old, pushed)
-    assert _drop_superseded_github_framework_items(batch) == []
-    current = {**item, "head_sha": pushed}
-    assert _drop_superseded_github_framework_items([{"prompt": "current", "extras": current}])
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        assert _drop_superseded_github_framework_items(batch) == batch
+        # Simulates record_own_push after a push that verified the remote contains
+        # the new HEAD and proved the previous head an ancestor.
+        ifc = InformationFlowState()
+        ifc.record_own_push(scope.canonical_repo, scope.pr_number, old)
+        _record_verified_push(scope, old, pushed, fast_forward=True)
+        assert was_verified_push(scope.canonical_repo, scope.pr_number, old, pushed)
+        assert _drop_superseded_github_framework_items(batch) == []
+        current = {**item, "head_sha": pushed}
+        assert _drop_superseded_github_framework_items([{"prompt": "current", "extras": current}])
 
-    monkeypatch.setattr(access_control, "_repo_pr_scope", lambda **kwargs: scope)
-    event = AgentEvent(trigger="poller", channel_id="poller:github-activity",
-                       extra={"items": [item]})
-    service = SimpleNamespace(authority_profile="github")
-    assert access_control._repo_review_state_from_event(event, service) is None
+        monkeypatch.setattr(access_control, "_repo_pr_scope", lambda **kwargs: scope)
+        event = AgentEvent(trigger="poller", channel_id="poller:github-activity",
+                           extra={"items": [item]})
+        service = SimpleNamespace(authority_profile="github")
+        assert access_control._repo_review_state_from_event(event, service) is None
+    with policy_scope(core_policy_registry()):
+        assert _drop_superseded_github_framework_items(batch) == batch
     assert events == [
         ("github_stale_trigger_dropped", {
             "stage": stage, "reason": "superseded_by_verified_own_push",
