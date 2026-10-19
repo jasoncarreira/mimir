@@ -150,14 +150,7 @@ function TreeNode({
 
 export function WorklinkPanel({ issue }: { issue: ChainlinkBoardIssue }) {
   const worklink = issue.worklink;
-  if (!worklink) {
-    return (
-      <div className="chainlink-drawer-section">
-        <h3>Worklink</h3>
-        <p className="app-copy">No Worklink evidence found for this issue.</p>
-      </div>
-    );
-  }
+  if (!worklink) return null;
   const evidenceHref = sanitizeHref(worklink.evidence_href);
   const transcriptHref = sanitizeHref(worklink.transcript_href);
   const prHref = sanitizeHref(worklink.pr_url);
@@ -301,7 +294,7 @@ export function ChainlinkBoardRoute() {
     <div className="chainlink-route">
       <div className="ops-header-row">
         <div>
-          <p className="ui-eyebrow">Chainlink / Worklink</p>
+          <p className="ui-eyebrow">Chainlink</p>
           <h1>Kanban Board</h1>
           <p className="app-copy">
             {board.generated_at ? `Generated ${board.generated_at}` : "Read-only lifecycle board"}

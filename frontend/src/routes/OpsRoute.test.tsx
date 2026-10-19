@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type React from "react";
 
 import { opsDashboardFixture } from "../fixtures/api";
 import { getOpsDashboard } from "../api";
@@ -23,12 +24,12 @@ function renderUsageRoute(initialEntry = "/usage") {
   );
 }
 
-function renderOpsRoute(initialEntry = "/ops") {
+function renderOpsRoute(initialEntry = "/ops", PullRequests?: () => React.ReactNode) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={[initialEntry]}>
-        <OpsRoute />
+        <OpsRoute PullRequests={PullRequests} />
       </MemoryRouter>
     </QueryClientProvider>
   );
@@ -134,14 +135,20 @@ describe("OpsRoute", () => {
     expect(screen.queryByRole("link", { name: "JSON" })).toBeNull();
   });
 
-  it("renders open PR links from the ops payload safely", async () => {
+  it("does not render the legacy PR board from the ops payload", async () => {
     renderOpsRoute("/ops");
+    expect(await screen.findByRole("tab", { name: "Overview" })).toBeTruthy();
+    expect(screen.queryByText("Open PRs")).toBeNull();
+    expect(screen.queryByText("Proposal: tighten Worklink evidence")).toBeNull();
+  });
 
-    expect(await screen.findByText("Open PRs")).toBeTruthy();
-    expect(screen.getByText("Proposal: tighten Worklink evidence")).toBeTruthy();
-    const link = screen.getByRole("link", { name: "Open" });
-    expect(link.getAttribute("href")).toBe("https://github.com/example/mimir-home/pull/17");
-    expect(link.getAttribute("target")).toBe("_blank");
-    expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+  it("mounts only a selected plugin PR panel and retains keyboard tab navigation", async () => {
+    renderOpsRoute("/ops", () => <section data-testid="cultivate-pr-panel">Plugin open PRs</section>);
+    expect(await screen.findByTestId("cultivate-pr-panel")).toBeTruthy();
+    const signals = screen.getByRole("tab", { name: "Signals" });
+    signals.focus();
+    expect(document.activeElement).toBe(signals);
+    fireEvent.click(signals);
+    expect(screen.queryByTestId("cultivate-pr-panel")).toBeNull();
   });
 });
