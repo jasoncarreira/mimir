@@ -37,7 +37,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from .plugin_dockerfile import assemble_services, pinned_packages, render_stage, select_plugins, services
+from .plugin_dockerfile import (assemble_services, cultivate_scripts, has_trusted_cultivate,
+                                pinned_packages, render_stage, select_plugins, services)
 from .worklink.backends.feature_factory import FACTORY_VERSION
 from .worklink.tool_pins import OPENCODE_VERSION
 
@@ -551,8 +552,50 @@ def render_dockerfile(
     # Shared userdel/groupdel block — inlined here so the workspace
     # and pypi templates can't drift on the defensive cleanup logic.
     base = base.replace("__USERDEL_BLOCK__", _USERDEL_BLOCK)
-    base = base.replace("__OPENCODE_INSTALL__", _opencode_install_block())
+    trusted_cultivate = has_trusted_cultivate(plugins)
+    base = base.replace("__OPENCODE_INSTALL__", "" if trusted_cultivate else _opencode_install_block())
     base = base.replace("__OPENCODE_CONFIG__", _opencode_build_config_block(install_opencode))
+    if trusted_cultivate:
+        base = base.replace("# Pinned mermaid CLI", "ENV NODE_VERSION=22\n"
+                            "ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js\n"
+                            "ENV PATH=\"/opt/mimir-opencode/bin:${PATH}\"\n"
+                            "ARG MIMIR_ENABLE_OPENCODE=0\n"
+                            f"ARG FACTORY_VERSION={FACTORY_VERSION}\n"
+                            "COPY .mimir-scaffold/cultivate-docker/ /opt/cultivate-docker/\n"
+                            "RUN NODE_VERSION=\"$NODE_VERSION\" MIMIR_ENABLE_OPENCODE=\"$MIMIR_ENABLE_OPENCODE\" "
+                            "FACTORY_VERSION=\"$FACTORY_VERSION\" sh /opt/cultivate-docker/base.sh\n\n"
+                            "# Pinned mermaid CLI")
+        # The trusted worker identity is fixed; it cannot share the configurable
+        # host UID used by ordinary scaffold images.
+        base = base.replace('ARG USER_UID=1000', 'ARG USER_UID=1001').replace('ARG USER_GID=1000', 'ARG USER_GID=1001')
+        user_start = base.index('RUN groupadd --gid "${USER_GID}" mimir')
+        user_end = base.index('\n\n', user_start)
+        directory = '/workspace /mimir-home' if mode == 'workspace' else '/mimir-home'
+        base = (base[:user_start] + 'RUN sh /opt/cultivate-docker/users.sh \\\n'
+                f' && mkdir -p {directory} \\\n'
+                f' && chown -R mimir:mimir {directory}' + base[user_end:])
+        base = base.replace('ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]',
+                            _S6_SCAFFOLD_BLOCK.replace('__PLUGIN_SERVICES__', '') + '\n'
+                            'COPY .mimir-scaffold/s6-rc.d/ /etc/s6-overlay/s6-rc.d/\n'
+                            'RUN sh /opt/cultivate-docker/service.sh\nENTRYPOINT ["/init"]')
+        cultivate_pin = next(pin for pin in pinned_packages(plugins)
+                             if pin.startswith("mimir-cultivate=="))
+        executor = (
+            "USER root\nARG MIMIR_GIT_REF\nARG MIMIR_CONTROLLER_COMMIT\n"
+            "ARG MIMIR_EXECUTOR_COMMIT\nARG MIMIR_GIT_URL=https://github.com/jasoncarreira/mimir.git\n"
+            "ARG MIMIR_EXTRAS=anthropic,discord,slack,mcp\n"
+            "RUN test \"$MIMIR_EXECUTOR_COMMIT\" = \"$MIMIR_CONTROLLER_COMMIT\" "
+            "&& git check-ref-format \"$MIMIR_GIT_REF\"\n"
+            "RUN MIMIR_GIT_REF=\"$MIMIR_GIT_REF\" MIMIR_EXECUTOR_COMMIT=\"$MIMIR_EXECUTOR_COMMIT\" "
+            "MIMIR_GIT_URL=\"$MIMIR_GIT_URL\" MIMIR_EXTRAS=\"$MIMIR_EXTRAS\" "
+            "sh /opt/cultivate-docker/executor.sh\n"
+            f'RUN /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "{cultivate_pin}"\n'
+            "USER mimir\n"
+        )
+        if mode == "pypi":
+            base = base.replace("# Pre-warm the fastembed", executor + "\n# Pre-warm the fastembed")
+        else:
+            base = base.replace("EXPOSE 8080", executor + "\nEXPOSE 8080")
     if plugins:
         base = base.replace("# ===== BEGIN mimir-scaffold-docker: skill fragments =====",
                             render_stage(plugins, "base") + "\n\n# ===== BEGIN mimir-scaffold-docker: skill fragments =====")
@@ -562,10 +605,18 @@ def render_dockerfile(
         if mode == "pypi" and pins:
             install = "RUN pip install --no-cache-dir " + " ".join(f'"{pin}"' for pin in pins)
             base = base.replace("# Pre-warm the fastembed", install + "\n\n# Pre-warm the fastembed")
-        if service_list:
+        if trusted_cultivate and service_list:
+            base = base.replace('COPY .mimir-scaffold/s6-rc.d/ /etc/s6-overlay/s6-rc.d/',
+                                'COPY .mimir-scaffold/plugin-services/ /usr/local/libexec/mimir-plugin-services/\n'
+                                'COPY .mimir-scaffold/s6-rc.d/ /etc/s6-overlay/s6-rc.d/')
+        if service_list and not trusted_cultivate:
             base = base.replace('ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]',
                                 _S6_SCAFFOLD_BLOCK.replace("__PLUGIN_SERVICES__", render_stage(plugins, "services"))
                                 + '\nENTRYPOINT ["/init"]')
+    if trusted_cultivate and mode == "pypi":
+        base = base.replace("# Pre-warm the fastembed",
+                            'RUN MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" '
+                            'sh /opt/cultivate-docker/bootstrap.sh\n\n# Pre-warm the fastembed')
     if not fragments:
         body = "# (no skills installed yet ship a dockerfile.fragment)"
     else:
@@ -1362,12 +1413,37 @@ def scaffold(
 
     result = ScaffoldResult()
     plugins = select_plugins(all_installed=all_installed)
+    trusted_cultivate = has_trusted_cultivate(plugins)
     selected_services = services(plugins)
     result.plugins_with_services = [f"{service.plugin}-{service.name}" for service in selected_services]
     context = home / ".mimir-scaffold"
     if context.exists():
         import shutil
         shutil.rmtree(context)
+    if trusted_cultivate:
+        target = context / "cultivate-docker"
+        target.mkdir(parents=True)
+        candidate = next(p for p in plugins if has_trusted_cultivate((p,)))
+        for name, content in cultivate_scripts(candidate).items():
+            (target / name).write_text(content)
+        service = context / "s6-rc.d" / "worklink-execd"
+        service.mkdir(parents=True)
+        (service / "type").write_text("longrun\n")
+        (service / "run").write_text(
+            "#!/command/with-contenv sh\nset -eu\n"
+            "install -d -o root -g root -m 0711 /run/mimir-worklink\n"
+            "install -d -o root -g mimir -m 0710 /run/mimir-worklink/socket\n"
+            "exec /usr/local/libexec/worklink-execd\n"
+        )
+        bundle = context / "s6-rc.d" / "user" / "contents.d"
+        bundle.mkdir(parents=True)
+        (bundle / "worklink-execd").touch()
+        (context / "s6-rc.d" / "mimir").mkdir()
+        (context / "s6-rc.d" / "mimir" / "type").write_text("longrun\n")
+        (context / "s6-rc.d" / "mimir" / "run").write_text(
+            "#!/bin/sh\nexec s6-setuidgid mimir /usr/local/bin/start.sh\n"
+        )
+        (bundle / "mimir").touch()
     if selected_services:
         assemble_services(plugins, context / "s6-rc.d", context / "plugin-services")
         if mode == "workspace":
@@ -1388,7 +1464,7 @@ def scaffold(
             # The Mimir process installs and verifies packages before releasing
             # dependent plugin longruns; s6 resets the marker before either starts.
         mimir_service = context / "s6-rc.d" / "mimir"
-        mimir_service.mkdir(parents=True)
+        mimir_service.mkdir(exist_ok=True, parents=True)
         (mimir_service / "type").write_text("longrun\n")
         run = mimir_service / "run"
         run.write_text("#!/bin/sh\nexec s6-setuidgid mimir /usr/local/bin/start.sh\n")
@@ -1424,17 +1500,29 @@ def scaffold(
     cy_text = render_compose_yml(
         service_name=service_name, web_port=web_port, mode=mode,
     )
+    if trusted_cultivate:
+        cy_text = cy_text.replace("MIMIR_CODING_ENABLED", "MIMIR_ENABLE_OPENCODE").replace(
+            "${MIMIR_ENABLE_OPENCODE:-false}", "${MIMIR_ENABLE_OPENCODE:-0}")
+        cy_text = cy_text.replace(
+            "        MIMIR_ENABLE_OPENCODE:",
+            "        MIMIR_GIT_REF: ${MIMIR_GIT_REF:?set an immutable source ref}\n"
+            "        MIMIR_CONTROLLER_COMMIT: ${MIMIR_CONTROLLER_COMMIT:?set the full source SHA}\n"
+            "        MIMIR_EXECUTOR_COMMIT: ${MIMIR_EXECUTOR_COMMIT:?set the matching full source SHA}\n"
+            "        MIMIR_GIT_URL: ${MIMIR_GIT_URL:-https://github.com/jasoncarreira/mimir.git}\n"
+            "        MIMIR_ENABLE_OPENCODE:", 1,
+        )
     _write_if_changed(home / "compose.yml", cy_text, "compose.yml")
 
     # start.sh — full regen. Always re-chmod (cheap idempotent) so a
     # previously-corrupted mode bit gets restored even when content is
     # unchanged.
     ss_path = home / "start.sh"
-    _write_if_changed(
-        ss_path, render_start_sh(uv_extras=uv_extras, mode=mode,
-                                  plugin_pins=pinned_packages(plugins),
-                                  plugin_services=bool(selected_services)), "start.sh",
-    )
+    ss_text = render_start_sh(uv_extras=uv_extras, mode=mode,
+                              plugin_pins=pinned_packages(plugins),
+                              plugin_services=bool(selected_services))
+    if trusted_cultivate:
+        ss_text = ss_text.replace("MIMIR_CODING_ENABLED", "MIMIR_ENABLE_OPENCODE")
+    _write_if_changed(ss_path, ss_text, "start.sh")
     if ss_path.is_file():
         ss_path.chmod(0o755)
 

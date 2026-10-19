@@ -12,8 +12,16 @@ DOCKERFILE = ROOT / "Dockerfile"
 SERVICE = ROOT / "deploy/s6-overlay/s6-rc.d/worklink-execd"
 
 
+def _image_instructions() -> str:
+    scripts = ROOT / "plugins/cultivate/mimir_cultivate/docker"
+    return DOCKERFILE.read_text(encoding="utf-8") + "\n" + "\n".join(
+        (scripts / name).read_text(encoding="utf-8") for name in
+        ("base.sh", "users.sh", "executor.sh", "bootstrap.sh", "service.sh")
+    )
+
+
 def test_image_declares_distinct_fixed_controller_and_worker_identities() -> None:
-    text = DOCKERFILE.read_text(encoding="utf-8")
+    text = _image_instructions()
     assert "groupadd --gid 1001 mimir" in text
     assert "groupadd --gid 1002 worklink" in text
     assert "--uid 1001 --gid mimir --groups worklink" in text
@@ -22,7 +30,7 @@ def test_image_declares_distinct_fixed_controller_and_worker_identities() -> Non
 
 
 def test_image_provisions_protected_worklink_roots() -> None:
-    text = DOCKERFILE.read_text(encoding="utf-8")
+    text = _image_instructions()
     assert "install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/checkouts" in text
     assert "install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/repo-test-checkouts" in text
     assert "install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/opencode-checkouts" in text
@@ -30,7 +38,7 @@ def test_image_provisions_protected_worklink_roots() -> None:
 
 
 def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
-    text = DOCKERFILE.read_text(encoding="utf-8")
+    text = _image_instructions()
     assert 'ARG MIMIR_GIT_REF' in text
     assert 'ARG MIMIR_EXECUTOR_COMMIT' in text
     assert "grep -Eq '^[0-9a-f]{40}$'" in text
@@ -84,7 +92,7 @@ def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
     assert "rm -rf /opt/mimir-worklink/source" in text
     assert "chmod 0755 /usr/local/libexec/worklink-execd" in text
     assert "PYTHONPATH=" not in text
-    assert "/opt/mimir-worklink/venv/bin/python -m mimir.worklink.worker_exec" in text
+    assert "/opt/mimir-worklink/venv/bin/python -m mimir_cultivate.worklink.worker_exec" in text
     assert "chown -R root:root /opt/mimir-worklink" in text
     assert "chmod -R go-w /opt/mimir-worklink" in text
 

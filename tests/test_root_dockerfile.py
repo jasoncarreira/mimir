@@ -26,7 +26,30 @@ ROOT = DOCKERFILE.parent
 
 
 def _text() -> str:
-    return DOCKERFILE.read_text(encoding="utf-8")
+    root = DOCKERFILE.read_text(encoding="utf-8")
+    fragments = ROOT / "plugins/cultivate/mimir_cultivate/docker"
+    return root + "\n" + "\n".join((fragments / name).read_text(encoding="utf-8") for name in (
+        "base.sh", "users.sh", "executor.sh", "bootstrap.sh", "service.sh"
+    ))
+
+
+def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> None:
+    fixture = (ROOT / "tests/fixtures/cultivate_docker_pre_extraction.txt").read_text()
+    assert "b421db2550853af57ba7c579d358fd62b036977c05ac177a4bd653d32d3b16f4" in fixture
+    rendered = _text()
+    assert "COPY plugins/cultivate/mimir_cultivate/docker/ /opt/cultivate-docker/" in rendered
+    for marker in (
+        "ENV NODE_VERSION=22", "ARG MIMIR_ENABLE_OPENCODE=0",
+        "groupadd --gid 1002 worklink", "--uid 1002 --gid worklink",
+        "git check-ref-format", "MIMIR_EXECUTOR_COMMIT",
+        "rev-parse FETCH_HEAD", "--locked --extra dev --extra bench --no-install-workspace",
+        "mimir opencode-bootstrap --home /home/mimir",
+        "chmod 0755 /usr/local/libexec/worklink-execd",
+    ):
+        assert marker in fixture, marker
+        assert marker in rendered, marker
+    assert "mimir_cultivate.worklink.worker_exec" in rendered
+    assert "mimir.worklink.worker_exec" not in rendered
 
 
 def test_apt_install_layer_includes_jq() -> None:
@@ -315,8 +338,8 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
     assert f"ARG FACTORY_VERSION={FACTORY_VERSION}" in text
     assert "npm install --global --prefix /opt/mimir-opencode" in text
     assert f"opencode-ai@{OPENCODE_VERSION}" in text
-    assert "            feature-factory@${FACTORY_VERSION} \\" in text
-    assert "            opencode-feature-factory@${FACTORY_VERSION} \\" in text
+    assert '"feature-factory@${FACTORY_VERSION}"' in text
+    assert '"opencode-feature-factory@${FACTORY_VERSION}"' in text
     assert "opencode-project-memory@0.1.0" in text
     assert "opencode-openai-codex-auth@4.4.0" in text
     assert "opencode-anthropic-auth@0.0.13" in text

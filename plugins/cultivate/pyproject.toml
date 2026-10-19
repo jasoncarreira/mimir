@@ -18,7 +18,7 @@ cultivate = "mimir_cultivate:provider"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mimir_cultivate"]
-exclude = ["mimir_cultivate/defaults/skills/**"]
+exclude = ["mimir_cultivate/defaults/skills/**", "mimir_cultivate/docker/**"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "LICENSE" = "mimir_cultivate/LICENSE"
@@ -29,6 +29,7 @@ exclude = ["mimir_cultivate/defaults/skills/**"]
 "mimir_cultivate/frontend/cultivate.v1.css" = "mimir_cultivate/frontend/cultivate.v1.css"
 "mimir_cultivate/skins/squashmerge.json" = "mimir_cultivate/skins/squashmerge.json"
 "mimir_cultivate/brand/cultivate-logo-dark-v1.png" = "mimir_cultivate/brand/cultivate-logo-dark-v1.png"
+"mimir_cultivate/docker" = "mimir_cultivate/docker"
 
 [tool.hatch.build.targets.sdist]
 include = ["pyproject.toml", "LICENSE", "brand/LICENSE", "mimir-plugin.toml", "mimir_cultivate/**/*"]

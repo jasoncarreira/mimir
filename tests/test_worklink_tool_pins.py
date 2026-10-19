@@ -70,6 +70,7 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     root = Path(__file__).resolve().parents[1]
     install_paths = (
         "Dockerfile",
+        "plugins/cultivate/mimir_cultivate/docker/base.sh",
         "mimir/scaffold_docker.py",
         "mimir/skills/chainlink/dockerfile.fragment",
         "mimir/optional-skills/gmail-poller/dockerfile.fragment",
@@ -91,8 +92,9 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     factory_arg = re.search(r"(?m)^ARG FACTORY_VERSION=([^\s]+)$", dockerfile)
     assert factory_arg is not None
     assert FACTORY_VERSION == pins["feature-factory"].pin == factory_arg.group(1)
-    assert "feature-factory@${FACTORY_VERSION}" in dockerfile
-    assert "opencode-feature-factory@${FACTORY_VERSION}" in dockerfile
+    cultivate = install_sources["plugins/cultivate/mimir_cultivate/docker/base.sh"]
+    assert "feature-factory@${FACTORY_VERSION}" in cultivate
+    assert "opencode-feature-factory@${FACTORY_VERSION}" in cultivate
     scaffold = install_sources["mimir/scaffold_docker.py"]
     assert "feature-factory@{FACTORY_VERSION}" in scaffold
     assert "opencode-feature-factory@{FACTORY_VERSION}" in scaffold

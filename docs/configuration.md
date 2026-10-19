@@ -877,20 +877,23 @@ These are consumed by the Docker scaffold / build (`start.sh`, Dockerfiles,
 | `MIMIR_GIT_URL` | str | `https://github.com/jasoncarreira/mimir.git` | `start.sh` clone URL for the runtime source (change for forks). |
 | `MIMIR_DEFAULT_BRANCH` | str | `main` | Branch `start.sh` clones. |
 | `MIMIR_ENABLE_CLAUDE_CODE` | bool (`0`/`1`) | `0` | Build arg: `1` installs the Claude Code model adapter; the CLI is operator-provided. |
+| `MIMIR_ENABLE_OPENCODE` | bool (`0`/`1`) | `0` | Root Dockerfile build arg: `1` installs pinned OpenCode and bootstraps its config. Selected Cultivate scaffold images use the same build argument and pass it to runtime bootstrap; this is not the runtime plugin selection (`MIMIR_PLUGINS`). |
 | `MIMIR_CODING_ENABLED` | bool | `false` | Single runtime/build flag: true installs the pinned OpenCode runtime and bundled plugins in scaffold images and bootstraps their config at runtime. |
 | `MIMIR_EXTRAS` | csv-list | `anthropic,discord,slack,mcp` | pip extras build arg (`mimir-agent[...]`) in the PyPI-mode Dockerfile. |
 | `MIMIR_QUOTA_POLL_ENABLED` | bool (`0`/`1`) | unset | Setup-generated compatibility marker for subscription routes. Provider-side polling is not implemented for all routes, so do not treat this marker alone as evidence that quota polling is active. |
 
 ### Coding prerequisites
 
-Coding stays disabled by default. `MIMIR_CODING_ENABLED` is the single operator
-flag for the coding tool surface, scaffold image installation, and runtime
-OpenCode bootstrap. Both workspace and PyPI scaffolds pass the same value from
-the Compose project `.env` or shell to `build.args` and `environment`.
-Compose interpolation does not read `compose.env`; putting this flag only there
-does not configure the build. The old scaffold `MIMIR_ENABLE_OPENCODE` knob is no
-longer used. `--opencode` only optionally bakes the home's config into the image;
-it is not required to install OpenCode when coding is enabled.
+Coding stays disabled by default. In the current core-only deployment,
+`MIMIR_CODING_ENABLED` remains the runtime coding flag and the legacy scaffold
+build/bootstrap flag until coding-flag retirement. The old independent scaffold
+`MIMIR_ENABLE_OPENCODE` knob was removed; the root Dockerfile uses that name as
+a build argument, and newly selected Cultivate scaffolds use it for both build
+and bootstrap. Select the installed provider separately with `MIMIR_PLUGINS`.
+Scaffold Compose passes its image switch from the project `.env` or shell to
+`build.args` and `environment`. Compose interpolation does not read `compose.env`;
+putting the switch only there does not configure the build. `--opencode` only
+optionally bakes the home's config into the image.
 
 Before an operator chooses to enable coding, provision all prerequisites:
 
