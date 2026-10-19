@@ -12,7 +12,7 @@ from typing import Any
 
 from langchain_core.tools import ToolException
 
-from .shell_environment import direct_exec_env
+from ._shell_env import direct_exec_env
 from .extra import _effective_shell_cwd
 from .refusals import ToolPolicyRefusal
 

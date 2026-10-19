@@ -14,7 +14,7 @@ from typing import Any
 
 from langchain_core.tools import ToolException
 
-from mimir.tools.shell_environment import _DIRECT_EXEC_ARGV, direct_exec_env
+from mimir.tools._shell_env import _DIRECT_EXEC_ARGV, direct_exec_env
 from mimir.tools.extra import _effective_shell_cwd
 from mimir.tools.refusals import ToolPolicyRefusal
 

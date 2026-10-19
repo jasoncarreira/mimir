@@ -200,7 +200,7 @@ class OpenCodeBackend:
             env[key] = ""
         # Model selection is consumed above by the backend. Do not expose it to
         # the executor or repository-controlled test processes it launches.
-        from ...tools.shell_environment import scrub_model_selection_env
+        from ...tools._shell_env import scrub_model_selection_env
 
         env["OPENCODE_PERMISSION"] = _permission_override(self.bash_allowlist)
         backend_config: dict[str, object] = {

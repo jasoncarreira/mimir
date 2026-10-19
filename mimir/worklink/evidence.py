@@ -1221,7 +1221,7 @@ def _run(
     args: Sequence[str] | str, *, cwd: Path | None = None, timeout: float = 1800,
     text: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    from ..tools.shell_environment import scrub_model_selection_env
+    from ..tools._shell_env import scrub_model_selection_env
 
     env = os.environ.copy()
     scrub_model_selection_env(env)
