@@ -1127,7 +1127,6 @@ def _repo_pr_scope_resolution(
     root, origin = binding_resolution.binding
     if principal != self_login and pr_author_is_trusted is not True:
         from .event_logger import log_event_sync
-        from .github_withhold import sanitize_login
 
         reason = (
             "attestation_unavailable" if pr_author_is_trusted is None
@@ -1137,7 +1136,9 @@ def _repo_pr_scope_resolution(
         try:
             log_event_sync(
                 "github_outsider_pr_refused", repo=repo, number=number,
-                author=sanitize_login(principal), reason=reason,
+                author=principal if re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?", principal, re.ASCII,
+                ) else "<invalid-login>", reason=reason,
             )
             log_event_sync(
                 "github_content_withheld", tool="pr_scope", kind="pull_request",
