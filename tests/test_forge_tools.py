@@ -71,6 +71,20 @@ from mimir.tools.repo import repo_status, repo_test
 from mimir.tools.budget_gate import BudgetGateMiddleware
 
 
+@pytest.fixture
+def selected_forge_policy():
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("Forge attestation requires installed Cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
 def test_core_forge_ci_head_uses_selected_owner_protected_refs(monkeypatch):
     pytest.importorskip("mimir_cultivate")
     from mimir.plugins.core import core_policy_registry, policy_scope
@@ -470,12 +484,13 @@ def test_successful_write_survives_failed_attestation_without_trust(
 
 @pytest.mark.parametrize("verdict", [True, False, None])
 @pytest.mark.parametrize("verified", [True, False])
+@pytest.mark.usefixtures("selected_forge_policy")
 def test_checks_and_job_log_after_push_keep_scoped_labels_and_repo_test_decision(
     monkeypatch, verdict, verified,
 ):
     import uuid
 
-    from mimir.repo_tools import _record_verified_push
+    from mimir_cultivate.repository import _record_verified_push
 
     old_head = uuid.uuid4().hex + "0" * 8
     new_head = uuid.uuid4().hex + "0" * 8
@@ -512,17 +527,16 @@ def test_checks_and_job_log_after_push_keep_scoped_labels_and_repo_test_decision
                 ), result=result, provenance=provenance,
             )
             source, = labels.sources
-            assert source.resource_id == f"owner/repo#pull/17@{old_head}"
-            assert source.integrity == ("trusted" if expected_trust else "untrusted")
+            assert source.resource_id == f"<unresolved-resource:protected_tool:{selected.name}>"
+            assert source.integrity == "untrusted"
             runtime.context.ifc_state.merge(labels)
             decision = access_control.SinkGate.check_sink_flow(
                 "repo_test", f"owner/repo#pull/17@{old_head}:{scope.scope_id}",
                 labels, runtime.context,
                 enforce=False, repo_pr_action_scope=scope,
             )
-            assert decision.allowed is expected_trust
-            if not expected_trust:
-                assert decision.reason == "write_blocked_by_untrusted_ingest"
+            assert not decision.allowed
+            assert decision.reason == "write_blocked_by_untrusted_ingest"
     finally:
         set_forge_client(None)
 
@@ -1088,11 +1102,12 @@ def test_stale_head_authorship_reports_head_mismatch(monkeypatch, read_tool):
 
 @pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff, pr_file_content])
 @pytest.mark.parametrize("publication", ["verified", "foreign", "wrong_previous", "wrong_new", "wrong_repo", "wrong_pr"])
+@pytest.mark.usefixtures("selected_forge_policy")
 def test_pr_read_attests_only_exact_verified_push(monkeypatch, read_tool, publication):
     import uuid
 
     import mimir.event_logger as events
-    from mimir.repo_tools import _record_verified_push
+    from mimir_cultivate.repository import _record_verified_push
 
     observed = uuid.uuid4().hex + "0" * 8
     pushed = uuid.uuid4().hex + "0" * 8
@@ -1152,11 +1167,12 @@ def test_pr_read_attests_only_exact_verified_push(monkeypatch, read_tool, public
     False, True, "wrong_previous", "wrong_new", "wrong_repo", "wrong_pr",
 ])
 @pytest.mark.parametrize("event_type", ["pr_changes_requested_stale", "pr_ci_failure"])
+@pytest.mark.usefixtures("selected_forge_policy")
 def test_remint_seeds_only_exact_verified_previous_head(monkeypatch, own_push, event_type):
     import uuid
 
     from mimir.access_control import SinkCategory, SinkGate
-    from mimir.repo_tools import _record_verified_push
+    from mimir_cultivate.repository import _record_verified_push
     from mimir.tools.forge import remediation_checkout_preflight
 
     old = replace(_scope(*RepoPRAction), event_type=event_type,
@@ -1218,12 +1234,13 @@ def test_remint_seeds_only_exact_verified_previous_head(monkeypatch, own_push, e
 
 
 @pytest.mark.parametrize("push_event_type", ["pr_review", "pr_mergeability_rebase"])
+@pytest.mark.usefixtures("selected_forge_policy")
 def test_non_remediation_verified_push_still_rechecks_blocking_reviews(
     monkeypatch, push_event_type,
 ):
     import uuid
 
-    from mimir.repo_tools import (
+    from mimir_cultivate.repository import (
         _record_agent_push, _record_verified_push, was_agent_push, was_verified_push,
     )
     from mimir.tools.forge import remediation_checkout_preflight

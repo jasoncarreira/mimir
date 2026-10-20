@@ -1145,6 +1145,7 @@ def test_forge_error_before_scope_resolution_remains_untrusted(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("tool_name", ["ci_run", "ci_run_jobs", "ci_recent_runs"])
+@pytest.mark.usefixtures("selected_repository_policy")
 @pytest.mark.parametrize("branch,sha,trusted", [
     ("main", "c" * 40, True), ("worklink/7", "attested", True),
     ("worklink/7", "unattested", False),
@@ -1154,7 +1155,7 @@ def test_forge_error_before_scope_resolution_remains_untrusted(tmp_path, monkeyp
 def test_ci_run_provenance_requires_protected_or_attested_head(
     tmp_path, monkeypatch, tool_name, branch, sha, trusted,
 ):
-    from mimir.tools import forge
+    from mimir_cultivate import forge
 
     auth, scope, _, _, _ = _real_attested_lease(tmp_path)
     if sha == "unattested":
@@ -1185,7 +1186,11 @@ def test_ci_run_provenance_requires_protected_or_attested_head(
         tool_name, args, auth, ToolAuthorization(tool_name=tool_name, decision="resource_scoped", allowed=True),
         result=result, provenance=provenance,
     )
-    assert labels.sources[0].integrity == ("trusted" if trusted else "untrusted")
+    assert labels.sources[0].integrity == "untrusted"
+    assert labels.sources[0].resource_id == f"<unresolved-resource:protected_tool:{tool_name}>"
+    if trusted:
+        assert provenance is not None
+        assert provenance.sources[0].integrity == "trusted"
 
 
 @pytest.mark.parametrize("tool_name", ["ci_run", "ci_run_jobs", "ci_recent_runs"])
@@ -1285,11 +1290,12 @@ def test_temporary_ci_guard_mutants_are_killed(monkeypatch, tool_name, failed, f
         test_ci_classifier_requires_exact_provenance(monkeypatch, tool_name, failed, field)
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_ci_jobs_api_error_after_run_attestation_keeps_turn_clean(tmp_path, monkeypatch):
     from langchain_core.tools import ToolException
     from mimir import event_logger
-    from mimir.forge import ForgeError
-    from mimir.tools import forge
+    from mimir_cultivate.forge import ForgeError
+    from mimir_cultivate import forge
 
     auth, scope, _, _, _ = _real_attested_lease(tmp_path)
     object.__setattr__(auth, "ci_run_targets", frozenset({("owner/repo", 42)}))
@@ -1312,13 +1318,16 @@ def test_ci_jobs_api_error_after_run_attestation_keeps_turn_clean(tmp_path, monk
         ToolAuthorization(tool_name="ci_run_jobs", decision="resource_scoped", allowed=True),
         result=raised.value, provenance=provenance, failed=True,
     )
-    assert labels.sources[0].integrity == "trusted"
+    assert provenance is not None and provenance.sources[0].integrity == "trusted"
+    assert labels.sources[0].integrity == "untrusted"
+    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:ci_run_jobs>"
     auth.ifc_state.merge(labels)
-    assert SinkGate.check_sink_flow(
+    decision = SinkGate.check_sink_flow(
         "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
         auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
-    ).allowed
-    assert len(events) == 1
+    )
+    assert not decision.allowed
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
     assert "distinctive" not in str(events)
 
 
@@ -1772,8 +1781,10 @@ def test_replayed_patch_consumes_one_original_match(tmp_path, _self_login, origi
 
 
 @pytest.mark.parametrize("count, trusted", [(500, True), (501, False)])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_original_patch_range_budget_fails_before_patch_subprocesses(monkeypatch, _self_login, count, trusted):
-    from mimir import repo_tools
+    from mimir_cultivate import repository as repo_tools
+    from mimir.plugins.core import selected_policy_registry
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
 
     head, base, replay, original = (c * 40 for c in "abcd")
@@ -1803,6 +1814,11 @@ def test_original_patch_range_budget_fails_before_patch_subprocesses(monkeypatch
         return SimpleNamespace(returncode=0, stdout=f"{'f' * 40} {'0' * 40}\n")
 
     monkeypatch.setattr(repo_tools, "hardened_git_command", run)
+    selected = selected_policy_registry()
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks,
+        git_command=lambda *args, **kwargs: repo_tools.hardened_git_command(*args, **kwargs),
+    ))
     monkeypatch.setattr(access_control_module.subprocess, "run", patch_run)
     scope = SimpleNamespace(observed_base_sha=base, destination_ref="refs/heads/main")
     lease = SimpleNamespace(base_sha=base)

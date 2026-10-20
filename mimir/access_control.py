@@ -1321,14 +1321,10 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             "pr_mergeability_rebase", "pr_mergeability_conflicting",
         } and isinstance(item.get("repo"), str) and type(item.get("number")) is int and isinstance(item.get("head_sha"), str):
             hooks = getattr(policy or selected_policy_registry(), "policy_consumer_hooks", None)
-            if hooks is not None:
-                was_superseded_by_own_push = hooks.superseded_push
-            elif getattr(policy or selected_policy_registry(), "_projected_owner", None) is not None:
+            if hooks is None:
                 continue
-            else:
-                from .repo_tools import was_superseded_by_own_push
 
-            if was_superseded_by_own_push(item["repo"], item["number"], item["head_sha"]):
+            if hooks.superseded_push(item["repo"], item["number"], item["head_sha"]):
                 # A queued event may outlive the poller fire that generated it.
                 # Never issue a stale authority even when it was already queued.
                 from .event_logger import log_event_sync
@@ -10814,16 +10810,12 @@ def _lease_has_clean_lineage(
 ) -> bool:
     """Check every local commit against the atomically recorded producing turns."""
     hooks = selected_policy_registry().policy_consumer_hooks
-    if hooks is not None:
-        _METADATA, _recorded_lineage, _recorded_verified_base = (
-            hooks.lease_metadata, hooks.lineage, hooks.verified_base,
-        )
-        _PROTECTED_BRANCH_REFS, hardened_git_command = hooks.protected_refs, hooks.git_command
-    elif getattr(selected_policy_registry(), "_projected_owner", None) is not None:
+    if hooks is None:
         return False
-    else:
-        from .pr_checkout_lease import _METADATA, _recorded_lineage, _recorded_verified_base
-        from .repo_tools import _PROTECTED_BRANCH_REFS, hardened_git_command
+    _METADATA, _recorded_lineage, _recorded_verified_base = (
+        hooks.lease_metadata, hooks.lineage, hooks.verified_base,
+    )
+    _PROTECTED_BRANCH_REFS, hardened_git_command = hooks.protected_refs, hooks.git_command
 
     try:
         raw = json.loads((path / _METADATA).read_text(encoding="utf-8"))
@@ -10930,18 +10922,12 @@ def _lease_head_is_author_attested(
 
     from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
     hooks = selected_policy_registry().policy_consumer_hooks
-    if hooks is not None:
-        _BASE_CONFIG, _DEFAULT_GIT, _PROTECTED_BRANCH_REFS = (
-            hooks.git_config, hooks.git_binary, hooks.protected_refs,
-        )
-        _sanitized_git_env, hardened_git_command = hooks.git_env, hooks.git_command
-    elif getattr(selected_policy_registry(), "_projected_owner", None) is not None:
+    if hooks is None:
         return False
-    else:
-        from .repo_tools import (
-            _BASE_CONFIG, _DEFAULT_GIT, _PROTECTED_BRANCH_REFS,
-            _sanitized_git_env, hardened_git_command,
-        )
+    _BASE_CONFIG, _DEFAULT_GIT, _PROTECTED_BRANCH_REFS = (
+        hooks.git_config, hooks.git_binary, hooks.protected_refs,
+    )
+    _sanitized_git_env, hardened_git_command = hooks.git_env, hooks.git_command
 
     def run(*arguments: str):
         return hardened_git_command(path, arguments, timeout=_LEASE_GIT_TIMEOUT_S)
@@ -11522,20 +11508,14 @@ def _retained_checkout_binding(
     """Observe the incident's checkout, never a numerically colliding PR lease."""
     held = _held_retained_lease.get()
     selected_lease = getattr(selected_policy_registry(), "retained_effect_lease", None)
-    if selected_lease is not None:
-        _owner, lease_callback, retained_factory_subprocess_runner = selected_lease
-    else:
-        from .repo_tools import retained_factory_subprocess_runner
+    if selected_lease is None:
+        return None
+    _owner, lease_callback, retained_factory_subprocess_runner = selected_lease
 
     if held is not None and held[0] is scope and held[3][0]:
         lease_context = nullcontext(SimpleNamespace(scope=scope))
     else:
-        if selected_lease is not None:
-            lease_context = lease_callback(Path(os.environ.get("MIMIR_HOME", "")), scope)
-        else:
-            from .worklink.retained_scope import retained_factory_effect_lease
-
-            lease_context = retained_factory_effect_lease(Path(os.environ.get("MIMIR_HOME", "")), scope)
+        lease_context = lease_callback(Path(os.environ.get("MIMIR_HOME", "")), scope)
 
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:

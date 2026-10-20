@@ -47,6 +47,21 @@ def _reset_forge_client() -> None:
     set_forge_client(None)
 
 
+@pytest.fixture
+def selected_repo_policy():
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("repository remediation requires installed Cultivate")
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        yield selected
+
+
 def _scope(
     *actions: RepoPRAction,
     number: int = 7,
@@ -552,14 +567,29 @@ def _remediation_runtime(monkeypatch: pytest.MonkeyPatch, client: _RemediationFo
     return old_scope, context, SimpleNamespace(context=context)
 
 
+def test_core_only_head_advance_cannot_remint_without_owner_push_reader(monkeypatch):
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
+    client = _RemediationForge(_snapshot("c" * 40))
+    old_scope, context, _runtime = _remediation_runtime(monkeypatch, client)
+    with policy_scope(core_policy_registry()):
+        state, stopped = remediation_checkout_preflight(context, "owner/repo", 7)
+    assert stopped is None
+    assert state.action_scope is old_scope
+    assert client.review_calls == 0
+    assert context.ifc_state.own_push_lineage() == {}
+
+
 def test_stale_own_remediation_head_is_reminted_and_checked_out(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_repo_policy,
 ) -> None:
     fresh_head = "c" * 40
     old_scope, context, runtime = _remediation_runtime(
         monkeypatch, _RemediationForge(_snapshot(fresh_head)),
     )
-    monkeypatch.setattr("mimir.repo_tools.was_agent_push", lambda *_args: True)
+    monkeypatch.setattr(selected_repo_policy, "_policy_consumer_hooks", replace(
+        selected_repo_policy.policy_consumer_hooks, agent_push=lambda *_args: True,
+    ))
     checked_out: list[RepoPRActionScope] = []
 
     def fake_checkout(scope, *, owner, review_state):  # type: ignore[no-untyped-def]
@@ -607,13 +637,15 @@ def test_merged_remediation_pr_stops_before_checkout(
 
 
 def test_remediation_head_advancing_twice_does_not_remint_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_repo_policy,
 ) -> None:
     second_head = "c" * 40
     third_head = "d" * 40
     client = _RemediationForge(_snapshot(second_head), _snapshot(third_head))
     old_scope, context, runtime = _remediation_runtime(monkeypatch, client)
-    monkeypatch.setattr("mimir.repo_tools.was_agent_push", lambda *_args: True)
+    monkeypatch.setattr(selected_repo_policy, "_policy_consumer_hooks", replace(
+        selected_repo_policy.policy_consumer_hooks, agent_push=lambda *_args: True,
+    ))
     reminted_heads: list[str] = []
 
     def mint(repository, snapshot, *, event_type):  # type: ignore[no-untyped-def]
@@ -731,14 +763,16 @@ def test_repo_cleanup_redacts_git_url_userinfo(
 
 
 def test_external_head_advance_rereads_review_state_before_checkout(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, selected_repo_policy,
 ) -> None:
     client = _RemediationForge(_snapshot("c" * 40))
     client.reviews = (
         ReviewProjection("2", "reviewer", "APPROVED", "ok", "later", "c" * 40),
     )
     _old_scope, _context, runtime = _remediation_runtime(monkeypatch, client)
-    monkeypatch.setattr("mimir.repo_tools.was_agent_push", lambda *_args: False)
+    monkeypatch.setattr(selected_repo_policy, "_policy_consumer_hooks", replace(
+        selected_repo_policy.policy_consumer_hooks, agent_push=lambda *_args: False,
+    ))
     monkeypatch.setattr(
         "mimir.tools.repo.acquire_pr_checkout_lease",
         lambda *_args, **_kwargs: pytest.fail("cleared review reached checkout"),

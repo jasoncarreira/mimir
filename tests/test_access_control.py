@@ -92,6 +92,20 @@ assert not any(name.startswith('mimir_cultivate') for name in sys.modules)
     assert child.returncode == 0, child.stderr
 
 
+@pytest.fixture
+def selected_repository_policy():
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("repository scope requires installed Cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
 def _egress_shadow_auth(*, tainted: bool = True) -> AuthContext:
     labels = InformationFlowLabels().with_source(SourceLabel(
         principal="owner", domain="channel", resource_id="web:origin",
@@ -10187,6 +10201,7 @@ async def test_repo_review_shell_checkout_cannot_unlock_same_branch_push(
     assert "typed repo_* tools" in str(pushed.content)
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_github_poller_binds_review_scope_from_server_event_and_origin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10254,6 +10269,7 @@ def test_github_poller_binds_review_scope_from_server_event_and_origin(
     assert create_auth_context(steered, enforce=True).repo_review_state is None
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_replayed_github_poller_payload_cannot_mint_repo_pr_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10589,6 +10605,7 @@ def test_poller_scope_forged_or_wrong_authority_fields_fail_closed(
     assert create_auth_context(event, enforce=True).repo_pr_action_scope is None
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_poller_scope_derives_each_valid_batched_item_and_requires_configured_repo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10616,6 +10633,7 @@ def test_poller_scope_derives_each_valid_batched_item_and_requires_configured_re
     assert create_auth_context(unconfigured, enforce=True).repo_pr_scope_registry is None
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_batched_pr_results_are_bound_to_each_call_and_cannot_cross_forge_scopes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10653,6 +10671,8 @@ def test_batched_pr_results_are_bound_to_each_call_and_cannot_cross_forge_scopes
     second_authorization = registry.authorize_tool(
         "pr_diff", auth, enforce=True, arguments=second_args,
     )
+    assert first_authorization.repo_pr_action_scope is not None
+    assert second_authorization.repo_pr_action_scope is not None
     first_labels = classify_protected_result(
         "pr_diff", first_args, auth, first_authorization,
     )
@@ -10661,23 +10681,30 @@ def test_batched_pr_results_are_bound_to_each_call_and_cannot_cross_forge_scopes
     )
     assert first_labels is not None and second_labels is not None
     assert {source.resource_id for source in first_labels.sources} == {
-        f"o/r#pull/42@{'a' * 40}",
+        "<unresolved-resource:protected_tool:pr_diff>",
     }
     assert {source.resource_id for source in second_labels.sources} == {
-        f"o/r#pull/43@{'c' * 40}",
+        "<unresolved-resource:protected_tool:pr_diff>",
     }
+    assert first_labels.has_untrusted_active_ingest
+    assert second_labels.has_untrusted_active_ingest
 
-    labels_from_first = channel_labels
-    for source in first_labels.sources:
-        labels_from_first = labels_from_first.with_source(source)
+    first_scope = first_authorization.repo_pr_action_scope
+    principal = "service:poller:github-activity"
+    labels_from_first = channel_labels.with_source(SourceLabel(
+        principal=principal, domain="repository",
+        resource_id=f"o/r#pull/42@{'a' * 40}", bridge_instance="forge",
+        sensitivity="internal", authorized_principals=frozenset({principal}),
+        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+    ))
     second_scope = second_authorization.repo_pr_action_scope
     second_target = (
         f"{second_scope.canonical_repo}#pull/{second_scope.pr_number}"
         f"@{second_scope.observed_head_sha}:{second_scope.scope_id}"
     )
-    denied = registry.authorize_tool(
-        "pr_comment", auth, enforce=True, target_channel=second_target,
-        ifc_labels=labels_from_first, arguments=second_args,
+    denied = SinkGate.check_sink_flow(
+        "pr_comment", second_target, labels_from_first, auth, enforce=True,
+        repo_pr_action_scope=second_scope,
     )
     assert denied.allowed is False
     assert denied.reason == "ifc_label_blocked:forge"
@@ -10685,7 +10712,6 @@ def test_batched_pr_results_are_bound_to_each_call_and_cannot_cross_forge_scopes
     assert "o/r#42" in denied.refusal_detail
     assert "o/r#43" in denied.refusal_detail
 
-    first_scope = first_authorization.repo_pr_action_scope
     first_target = (
         f"{first_scope.canonical_repo}#pull/{first_scope.pr_number}"
         f"@{first_scope.observed_head_sha}:{first_scope.scope_id}"
@@ -12098,6 +12124,7 @@ def test_repo_write_authority_is_resolved_per_pr_without_scope_union(
         assert second.allowed is True
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_pr_scope_is_frozen_deterministic_and_auditable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

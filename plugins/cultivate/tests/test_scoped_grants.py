@@ -114,7 +114,10 @@ def test_checkout_action_follow_on_is_bound_to_designated_tool_and_live_lease(
     )
 
 
-def test_trusted_poller_issues_checkout_grant_but_http_ingress_does_not(policy, tmp_path, monkeypatch):
+def test_trusted_poller_issues_checkout_grant_but_http_ingress_does_not(tmp_path, monkeypatch):
+    from mimir.plugins.manager import load_plugins
+
+    policy = load_plugins(enable="cultivate").policy
     _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
     event = AgentEvent(
         trigger="poller", channel_id="poller:github-activity",
@@ -131,7 +134,7 @@ def test_trusted_poller_issues_checkout_grant_but_http_ingress_does_not(policy, 
     assert _valid_scoped_pr_grant(
         trusted, "cultivate", RepoPRAction.CHECKOUT, protocol,
         trusted.repo_pr_action_scope, trusted.repo_review_state,
-        tool_name="scoped_checkout",
+        tool_name="repo_checkout",
     )
     assert not _valid_scoped_pr_grant(
         trusted, "cultivate", RepoPRAction.COMMIT, protocol,
