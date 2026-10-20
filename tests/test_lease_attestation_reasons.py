@@ -43,6 +43,31 @@ def attested(tmp_path):
     return auth, scope, lease
 
 
+def test_selected_checkout_state_uses_only_owner_git_reader(attested, monkeypatch):
+    from mimir.plugins.core import selected_policy_registry
+
+    _auth, scope, lease = attested
+    selected = selected_policy_registry()
+    assert ac._observed_checkout_state(lease.path) == (
+        scope.head_ref, scope.observed_head_sha,
+    )
+    commands = []
+
+    def unavailable(path, argv, *, timeout):
+        commands.append((path, argv, timeout))
+        return GitProcessResult(-9, timed_out=True)
+
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks, git_command=unavailable,
+    ))
+    assert ac._observed_checkout_state(lease.path) is None
+    assert commands == [(
+        lease.path, ("status", "--porcelain=v2", "--branch", "--untracked-files=no"),
+        ac._LEASE_GIT_TIMEOUT_S,
+    )]
+    assert ac._lease_refusal_reason.get() is ac.LeaseAttestationReason.GIT_TIMEOUT
+
+
 def _ahead(attested, monkeypatch):
     auth, scope, lease = attested
     head = "f" * 40

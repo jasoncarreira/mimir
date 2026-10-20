@@ -74,6 +74,24 @@ def test_repo_review_git_range_refusal_names_token(revision: str) -> None:
     assert f"revision range {revision} is not bound to this lease; use repo_diff" in reason
 
 
+def test_core_checkout_observation_does_not_import_repository_provider(tmp_path: Path) -> None:
+    script = """
+import sys
+from pathlib import Path
+from mimir.access_control import _observed_checkout_state
+assert _observed_checkout_state(Path(sys.argv[1])) is None
+assert 'mimir.repo_tools' not in sys.modules
+assert not any(name.startswith('mimir_cultivate') for name in sys.modules)
+"""
+    environment = os.environ.copy()
+    environment.pop("MIMIR_PLUGINS", None)
+    child = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)], env=environment,
+        capture_output=True, text=True, timeout=20,
+    )
+    assert child.returncode == 0, child.stderr
+
+
 def _egress_shadow_auth(*, tainted: bool = True) -> AuthContext:
     labels = InformationFlowLabels().with_source(SourceLabel(
         principal="owner", domain="channel", resource_id="web:origin",

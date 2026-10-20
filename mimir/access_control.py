@@ -10880,12 +10880,9 @@ def _scope_has_protected_base(scope: Any, protected_refs: frozenset[str]) -> boo
 def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
     """Read the checkout's actual branch and HEAD with one hardened Git command."""
     hooks = selected_policy_registry().policy_consumer_hooks
-    if hooks is not None:
-        hardened_git_command = hooks.git_command
-    elif getattr(selected_policy_registry(), "_projected_owner", None) is not None:
+    if hooks is None:
         return None
-    else:
-        from .repo_tools import hardened_git_command
+    hardened_git_command = hooks.git_command
 
     try:
         result = hardened_git_command(
