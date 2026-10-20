@@ -832,10 +832,11 @@ def _github_framework_trigger_is_trusted(
 
 def _drop_superseded_github_framework_items(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Discard stale framework snapshots after our own verified fast-forward."""
-    from .repo_tools import was_superseded_by_own_push
+    from .plugins.core import selected_policy_registry
 
     from .event_logger import log_event_sync
 
+    hooks = selected_policy_registry().policy_consumer_hooks
     retained = []
     for item in batch:
         extras = item["extras"]
@@ -844,7 +845,8 @@ def _drop_superseded_github_framework_items(batch: list[dict[str, Any]]) -> list
             and isinstance(extras.get("repo"), str)
             and type(extras.get("number")) is int
             and isinstance(extras.get("head_sha"), str)
-            and was_superseded_by_own_push(extras["repo"], extras["number"], extras["head_sha"])
+            and hooks is not None
+            and hooks.superseded_push(extras["repo"], extras["number"], extras["head_sha"])
         ):
             log_event_sync(
                 "github_stale_trigger_dropped", stage="poller_fire",

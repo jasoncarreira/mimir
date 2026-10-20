@@ -825,21 +825,13 @@ def _resolve_file_tool_target(
 
 
 def _repository_inventory(home: str) -> Any:
-    """Read a selected owner's inventory or the still-installed core inventory."""
+    """Read inventory only from the selected owner; never trust a missing provider."""
     policy = selected_policy_registry()
     hooks = policy.policy_consumer_hooks
     path = Path(home) / "repositories.yaml"
     if hooks is not None:
         return hooks.repository_inventory(path)
-    if getattr(policy, "_projected_owner", None) is not None:
-        return None
-    try:
-        from .repository_config import RepositoryInventory
-    except ModuleNotFoundError as exc:
-        if exc.name != "mimir.repository_config":
-            raise
-        return None
-    return RepositoryInventory.load(path)
+    return None
 
 
 def _inventory_unavailable_with_declaration(home: str, inventory: Any) -> bool:
@@ -1329,14 +1321,10 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             "pr_mergeability_rebase", "pr_mergeability_conflicting",
         } and isinstance(item.get("repo"), str) and type(item.get("number")) is int and isinstance(item.get("head_sha"), str):
             hooks = getattr(policy or selected_policy_registry(), "policy_consumer_hooks", None)
-            if hooks is not None:
-                was_superseded_by_own_push = hooks.superseded_push
-            elif getattr(policy or selected_policy_registry(), "_projected_owner", None) is not None:
+            if hooks is None:
                 continue
-            else:
-                from .repo_tools import was_superseded_by_own_push
 
-            if was_superseded_by_own_push(item["repo"], item["number"], item["head_sha"]):
+            if hooks.superseded_push(item["repo"], item["number"], item["head_sha"]):
                 # A queued event may outlive the poller fire that generated it.
                 # Never issue a stale authority even when it was already queued.
                 from .event_logger import log_event_sync
@@ -9092,11 +9080,15 @@ class ScopedPRGrants:
             _SCOPED_PR_ISSUER,
         )
 
-    def get(self, owner: str, scope: Any, action: str) -> ScopedPRGrant | None:
+    def get(
+        self, owner: str, scope: Any, action: str, *, checkout: bool | None = None,
+    ) -> ScopedPRGrant | None:
         with self._lock:
             key = (owner, scope.scope_id)
             protocol = self._protocols.get(owner)
-            if protocol is not None and action == getattr(protocol.checkout_action, "value", None):
+            if checkout is None:
+                checkout = protocol is not None and action == getattr(protocol.checkout_action, "value", None)
+            if checkout:
                 return self._prelease.get(key)
             return self._follow.get(key, {}).get(action)
 
@@ -9119,14 +9111,15 @@ class ScopedPRGrants:
             del self._pending[key]
             self._follow[key] = {
                 action: self._grant(owner, scope, action, lease)
-                for action in scope.allowed_operations if action != protocol.checkout_action.value
+                for action in scope.allowed_operations
+                if action != protocol.checkout_action.value or getattr(protocol, "checkout_tool", None) is not None
             }
             return True
 
 
 def _valid_scoped_pr_grant(
     auth_context: AuthContext | None, owner: str | None, action: Any,
-    protocol: Any, scope: Any, review_state: Any,
+    protocol: Any, scope: Any, review_state: Any, *, tool_name: str | None = None,
 ) -> bool:
     grants = getattr(auth_context, "scoped_pr_grants", None)
     if (not isinstance(grants, ScopedPRGrants)
@@ -9149,14 +9142,20 @@ def _valid_scoped_pr_grant(
             registered_state = discovered.resolve(scope.canonical_repo, scope.pr_number)
         if registered_state is not review_state or review_state.action_scope is not scope:
             return False
-    grant = grants.get(owner, scope, action.value)
+    designated_checkout = getattr(protocol, "checkout_tool", None)
+    if designated_checkout is not None and tool_name is None:
+        return False
+    is_checkout = action is protocol.checkout_action and (
+        designated_checkout is None or tool_name == designated_checkout
+    )
+    grant = grants.get(owner, scope, action.value, checkout=is_checkout)
     if (grant is None or grant._issuer is not _SCOPED_PR_ISSUER
             or grant.owner != owner or grant.principal != grants.principal
             or grant.turn_nonce != grants.nonce or time.monotonic() >= grant.expires_at
             or grant.scope_id != scope.scope_id or grant.repository != scope.canonical_repo
             or grant.pull_request != scope.pr_number or grant.head != scope.observed_head_sha):
         return False
-    if action is protocol.checkout_action:
+    if is_checkout:
         if grant.lease_identity is not None:
             return False
     else:
@@ -9266,7 +9265,7 @@ def authorize_repo_pr_tool(
     from .models import RepoPRActionScope
 
     grant_valid = not registered_plugin or _valid_scoped_pr_grant(
-        auth_context, owner, action, protocol, scope, review_state,
+        auth_context, owner, action, protocol, scope, review_state, tool_name=tool_name,
     )
     in_scope = (
         (isinstance(scope, RepoPRActionScope) if registered_plugin else scope is not None)
@@ -9728,12 +9727,33 @@ class ToolRegistry:
             )
             return finish(auth)
 
-        from .plugins.core import core_policy_registry
+        from .plugins.core import _FORGE_ACTIONS, _REPO_ACTIONS, core_policy_registry
 
         policy = policy if policy is not None else selected_policy_registry()
         if not policy.frozen:
             raise ValueError("authorization requires a frozen policy")
         tool_policy = policy.tools.get(tool_name)
+        retired_forge = _FORGE_ACTIONS.keys() | {
+            "pr_list", "ci_run_jobs", "ci_run", "ci_recent_runs", "issue_comment",
+        }
+        if tool_policy is None and tool_name in retired_forge:
+            return finish(ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=False,
+                reason="forge_tool_unavailable",
+                enforcement_enabled=True,
+                would_block=True,
+            ))
+        if tool_policy is None and tool_name in _REPO_ACTIONS:
+            return finish(ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=False,
+                reason="repository_tool_unavailable",
+                enforcement_enabled=True,
+                would_block=True,
+            ))
         plugin_tool = (
             tool_policy if tool_policy is not None and tool_policy.owner != "core"
             else None
@@ -9878,7 +9898,11 @@ class ToolRegistry:
                         flow_direction=flow_direction,
                     ))
                 else:
-                    from .tools.forge import resolve_issue_comment_target
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=False, reason="issue_destination_resolution_failed",
+                        enforcement_enabled=True, would_block=True,
+                    ))
 
                 try:
                     issue_target = resolve_issue_comment_target(
@@ -10003,7 +10027,11 @@ class ToolRegistry:
                             flow_direction=flow_direction,
                         ))
                     else:
-                        from .tools.forge import resolve_review_state_for_context
+                        return finish(ToolAuthorization(
+                            tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
+                            allowed=False, reason="repo_pr_scope_denied",
+                            enforcement_enabled=True, would_block=True,
+                        ))
 
                     try:
                         state = resolve_review_state_for_context(
@@ -10811,16 +10839,12 @@ def _lease_has_clean_lineage(
 ) -> bool:
     """Check every local commit against the atomically recorded producing turns."""
     hooks = selected_policy_registry().policy_consumer_hooks
-    if hooks is not None:
-        _METADATA, _recorded_lineage, _recorded_verified_base = (
-            hooks.lease_metadata, hooks.lineage, hooks.verified_base,
-        )
-        _PROTECTED_BRANCH_REFS, hardened_git_command = hooks.protected_refs, hooks.git_command
-    elif getattr(selected_policy_registry(), "_projected_owner", None) is not None:
+    if hooks is None:
         return False
-    else:
-        from .pr_checkout_lease import _METADATA, _recorded_lineage, _recorded_verified_base
-        from .repo_tools import _PROTECTED_BRANCH_REFS, hardened_git_command
+    _METADATA, _recorded_lineage, _recorded_verified_base = (
+        hooks.lease_metadata, hooks.lineage, hooks.verified_base,
+    )
+    _PROTECTED_BRANCH_REFS, hardened_git_command = hooks.protected_refs, hooks.git_command
 
     try:
         raw = json.loads((path / _METADATA).read_text(encoding="utf-8"))
@@ -10877,12 +10901,9 @@ def _scope_has_protected_base(scope: Any, protected_refs: frozenset[str]) -> boo
 def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
     """Read the checkout's actual branch and HEAD with one hardened Git command."""
     hooks = selected_policy_registry().policy_consumer_hooks
-    if hooks is not None:
-        hardened_git_command = hooks.git_command
-    elif getattr(selected_policy_registry(), "_projected_owner", None) is not None:
+    if hooks is None:
         return None
-    else:
-        from .repo_tools import hardened_git_command
+    hardened_git_command = hooks.git_command
 
     try:
         result = hardened_git_command(
@@ -10930,18 +10951,12 @@ def _lease_head_is_author_attested(
 
     from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
     hooks = selected_policy_registry().policy_consumer_hooks
-    if hooks is not None:
-        _BASE_CONFIG, _DEFAULT_GIT, _PROTECTED_BRANCH_REFS = (
-            hooks.git_config, hooks.git_binary, hooks.protected_refs,
-        )
-        _sanitized_git_env, hardened_git_command = hooks.git_env, hooks.git_command
-    elif getattr(selected_policy_registry(), "_projected_owner", None) is not None:
+    if hooks is None:
         return False
-    else:
-        from .repo_tools import (
-            _BASE_CONFIG, _DEFAULT_GIT, _PROTECTED_BRANCH_REFS,
-            _sanitized_git_env, hardened_git_command,
-        )
+    _BASE_CONFIG, _DEFAULT_GIT, _PROTECTED_BRANCH_REFS = (
+        hooks.git_config, hooks.git_binary, hooks.protected_refs,
+    )
+    _sanitized_git_env, hardened_git_command = hooks.git_env, hooks.git_command
 
     def run(*arguments: str):
         return hardened_git_command(path, arguments, timeout=_LEASE_GIT_TIMEOUT_S)
@@ -11181,10 +11196,8 @@ def protected_result_source(
         hooks = selected_policy_registry().policy_consumer_hooks
         if hooks is not None:
             active_pr_checkout_lease_for_path = hooks.active_checkout
-        elif getattr(selected_policy_registry(), "_projected_owner", None) is not None:
-            active_pr_checkout_lease_for_path = lambda _path: None
         else:
-            from .pr_checkout_lease import active_pr_checkout_lease_for_path
+            active_pr_checkout_lease_for_path = lambda _path: None
 
         lease = active_pr_checkout_lease_for_path(resource_id)
         registry = getattr(auth_context, "repo_pr_scope_registry", None)
@@ -11522,20 +11535,14 @@ def _retained_checkout_binding(
     """Observe the incident's checkout, never a numerically colliding PR lease."""
     held = _held_retained_lease.get()
     selected_lease = getattr(selected_policy_registry(), "retained_effect_lease", None)
-    if selected_lease is not None:
-        _owner, lease_callback, retained_factory_subprocess_runner = selected_lease
-    else:
-        from .repo_tools import retained_factory_subprocess_runner
+    if selected_lease is None:
+        return None
+    _owner, lease_callback, retained_factory_subprocess_runner = selected_lease
 
     if held is not None and held[0] is scope and held[3][0]:
         lease_context = nullcontext(SimpleNamespace(scope=scope))
     else:
-        if selected_lease is not None:
-            lease_context = lease_callback(Path(os.environ.get("MIMIR_HOME", "")), scope)
-        else:
-            from .worklink.retained_scope import retained_factory_effect_lease
-
-            lease_context = retained_factory_effect_lease(Path(os.environ.get("MIMIR_HOME", "")), scope)
+        lease_context = lease_callback(Path(os.environ.get("MIMIR_HOME", "")), scope)
 
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
@@ -11701,6 +11708,21 @@ def classify_protected_result(
     # claimed NON_INGESTING results; they never inherit core refusal exemptions.
     selected = authorization.policy if authorization.policy is not None else selected_policy_registry()
     registered = selected.tools.get(tool_name)
+    if registered is None:
+        from .plugins.core import _FORGE_ACTIONS, _REPO_ACTIONS
+
+        if tool_name in (_FORGE_ACTIONS.keys() | {
+            "pr_list", "ci_run_jobs", "ci_run", "ci_recent_runs", "issue_comment",
+        }):
+            return _incomplete_protected_result(
+                "repository", arguments or {}, tool_name=tool_name,
+                auth_context=auth_context,
+            )
+        if tool_name in _REPO_ACTIONS:
+            return _incomplete_protected_result(
+                "repository", arguments or {}, tool_name=tool_name,
+                auth_context=auth_context,
+            )
     retained_verified = False
     if registered is not None and registered.owner != "core":
         scope = getattr(auth_context, "retained_factory_scope", None)

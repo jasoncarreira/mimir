@@ -3704,6 +3704,14 @@ class RepoGitTools:
         return GitOperationResult(True, "ok", result.stdout, result.stderr)
 
 
+def is_tracked_file_in_pr_checkout(state: RepoReviewState, path: Path) -> bool:
+    """Check index membership under the selected owner's lease and Git policy."""
+    try:
+        return RepoGitTools(state).is_tracked_file(path)
+    except (GitRefusal, OSError, RuntimeError, ValueError):
+        return False
+
+
 # Contained project tests
 import ast
 import asyncio

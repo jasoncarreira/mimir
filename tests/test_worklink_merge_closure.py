@@ -10,6 +10,8 @@ from typing import Sequence
 
 import pytest
 
+pytest.importorskip("mimir_cultivate", reason="repository-bound merge closure requires Cultivate")
+
 from mimir.worklink import merge_closure as closure
 from mimir.worklink import dispatch_failures
 from mimir.worklink.dispatch_failures import (
@@ -17,6 +19,16 @@ from mimir.worklink.dispatch_failures import (
     dispatch_failure_state_dir,
     load_failure_state,
 )
+
+
+@pytest.fixture(autouse=True)
+def selected_repository_provider(monkeypatch: pytest.MonkeyPatch):
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
 
 
 HISTORICAL_IDS = (1295, 1296, 1297, 1298, 1299, 1300, 1301, 1762, 1780, 1781, 1766)
@@ -1324,6 +1336,8 @@ def test_overlapping_process_sweeps_are_serialized(
 import os, subprocess, sys, time
 from pathlib import Path
 from mimir.worklink.merge_closure import reconcile_merged_leaves
+from mimir.plugins.core import policy_scope
+from mimir.plugins.manager import load_plugins
 home, repo, journal = map(Path, sys.argv[1:])
 def cp(out=""):
     return subprocess.CompletedProcess([], 0, out, "")
@@ -1338,7 +1352,8 @@ def git(args):
     return cp("https://github.com/example/project.git\n")
 def chainlink(args):
     return cp("[]")
-reconcile_merged_leaves(home, chainlink_runner=chainlink, gh_runner=lambda a: cp("{}"), git_runner=git)
+with policy_scope(load_plugins(enable="cultivate").policy):
+    reconcile_merged_leaves(home, chainlink_runner=chainlink, gh_runner=lambda a: cp("{}"), git_runner=git)
 '''
     env = {**os.environ, "WORKLINK_REPO": str(repo)}
     processes = [

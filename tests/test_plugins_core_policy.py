@@ -30,13 +30,24 @@ def _extractor(value: object, undeclared: object) -> str:
     return f"{value.__module__}.{value.__qualname__}:{json.dumps(captured, sort_keys=True)}"
 
 
+def _retired_forge_and_repository(oracle: dict) -> frozenset[str]:
+    return (frozenset(oracle["tables"]["repo_actions"])
+            | frozenset(oracle["tables"]["forge_actions"])
+            | {"pr_list", "ci_run_jobs", "ci_run", "ci_recent_runs", "issue_comment"})
+
+
 def test_all_frozen_core_descriptors_come_from_registrations() -> None:
-    expected = json.loads(
+    oracle = json.loads(
         (Path(__file__).parent / "fixtures" / "plugin_core_policy_baseline.json").read_text()
-    )["descriptors"]
+    )
+    expected = {
+        name: row for name, row in oracle["descriptors"].items()
+        if name not in _retired_forge_and_repository(oracle)
+    }
     registry = core_policy_registry()
     assert registry.frozen
-    assert len(registry.descriptors) == len(expected) == 103
+    assert len(oracle["descriptors"]) == 103
+    assert len(registry.descriptors) == len(expected)
     assert set(registry.descriptors) == set(TOOL_DESCRIPTORS) == set(expected)
     for name, descriptor in TOOL_DESCRIPTORS.items():
         tool = registry.tools[name]
@@ -63,15 +74,18 @@ def test_core_runtime_factories_cover_each_surface_without_loading_coding() -> N
     assert len(names) == len(set(names))
     assert all(registry.tools[name].factory is not None for name in names)
     assert all(registry.tools[name].policy_only for name in registry.tools if name not in names)
-    assert set(core_runtime_names("coding")) >= {"spawn_open_code", "repo_test", "pr_metadata"}
+    assert core_runtime_names("coding") == ("spawn_open_code",)
+    assert "repo_test" not in registry.tools
+    assert "pr_metadata" not in registry.tools
 
 
 def test_selected_owner_gets_unregistered_coding_names_before_registration() -> None:
     registry = PolicyRegistry()
     register_core_tools(registry, selected_owners=frozenset({"cultivate"}))
     assert "repo_status" not in registry.tools
+    assert "pr_metadata" not in registry.tools
     assert "worklink_run" not in registry.tools
-    assert "repo_status" in core_policy_registry().tools
+    assert "repo_status" not in core_policy_registry().tools
     assert "send_message" in registry.tools
 
 
@@ -79,7 +93,10 @@ def test_core_flow_registration_includes_native_aliases_and_descriptorless_tools
     registry = core_policy_registry()
     expected = json.loads(
         (Path(__file__).parent / "fixtures" / "plugin_core_policy_baseline.json").read_text()
-    )["tables"]["flow"]
+    )
+    removed = _retired_forge_and_repository(expected)
+    expected = {name: flow for name, flow in expected["tables"]["flow"].items()
+                if name not in removed}
     assert dict(registry.flow) == expected
     assert set(policy._TOOL_FLOW_MAP) == set(expected)
     descriptorless = set(expected) - set(TOOL_DESCRIPTORS)
@@ -308,9 +325,6 @@ def test_sink_and_taint_views_are_exact_registry_memberships() -> None:
 
 
 def test_typed_action_and_retained_views_are_exact_registry_projections() -> None:
-    from mimir.plugins.core import policy_scope
-    from mimir.models import RepoPRAction
-
     tools = core_policy_registry().tools
     for membership, view in (
         ("forge_actions", policy._FORGE_TOOL_ACTIONS),
@@ -328,43 +342,24 @@ def test_typed_action_and_retained_views_are_exact_registry_projections() -> Non
     assert dict(policy._TYPED_REPO_PR_TOOL_ACTIONS) == {
         **policy._FORGE_TOOL_ACTIONS, **policy._REPO_TOOL_ACTIONS,
     }
-    assert policy._FORGE_TOOL_ACTIONS["unsupported_operation"] is None
+    assert not policy._FORGE_TOOL_ACTIONS
 
-    # Changing declarations without changing the canonical tool names must
-    # change every consumer. A hard-coded or cached core table fails here.
-    registry = PolicyRegistry()
-    register_core_tools(registry)
-    registry._tools["pr_metadata"] = replace(
-        registry.tools["pr_metadata"], typed_action=RepoPRAction.PR_COMMENT,
-    )
-    registry._tools["repo_status"] = replace(
-        registry.tools["repo_status"], typed_action=RepoPRAction.PR_COMMENT,
-        memberships=registry.tools["repo_status"].memberships - {"retained_repo_tools"},
-    )
-    with policy_scope(registry.freeze()):
-        assert policy._FORGE_TOOL_ACTIONS["pr_metadata"] == RepoPRAction.PR_COMMENT.value
-        assert policy._REPO_TOOL_ACTIONS["repo_status"] == RepoPRAction.PR_COMMENT.value
-        assert policy._TYPED_REPO_PR_TOOL_ACTIONS["pr_metadata"] == RepoPRAction.PR_COMMENT.value
-        assert policy._TYPED_REPO_PR_TOOL_ACTIONS["repo_status"] == RepoPRAction.PR_COMMENT.value
-        assert "repo_status" not in policy._RETAINED_REPO_TOOLS
-    assert policy._FORGE_TOOL_ACTIONS["pr_metadata"] == tools["pr_metadata"].typed_action.value
-    assert "repo_status" in policy._RETAINED_REPO_TOOLS
+    assert "pr_metadata" not in tools
+    assert "repo_status" not in policy._RETAINED_REPO_TOOLS
+    assert not policy._REPO_TOOL_ACTIONS
 
 
 @pytest.mark.parametrize("name", """
-    write_file edit_file Write Edit upload repo_checkout repo_cleanup repo_fetch
-    repo_test repo_stage repo_commit repo_merge repo_merge_abort repo_rebase
-    repo_rebase_abort repo_revert repo_revert_abort repo_push memory_store
+    write_file edit_file Write Edit upload memory_store
     saga_end_session commitment_complete commitment_snooze commitment_dismiss
     open_proposal submit_proposal reload_pollers shell_exec bash_async
-    pr_comment pr_edit_body pr_submit_review pr_rerequest_review
 """.split())
 def test_core_mutating_tools_truthfully_declare_write_potential(name) -> None:
     assert core_policy_registry().tools[name].writes_code_or_state is True
 
 
 @pytest.mark.parametrize("name", """
-    read_file ls grep glob repo_status repo_diff repo_unmerged pr_metadata pr_diff
+    read_file ls grep glob
     memory_query memory_get commitment_list
 """.split())
 def test_core_observation_tools_do_not_claim_write_potential(name) -> None:
@@ -385,5 +380,6 @@ def test_budget_policy_views_are_frozen_core_memberships() -> None:
             name for name, tool in tools.items() if membership in tool.memberships
         ), membership
     assert "pr_job_log" not in budget_gate._STANDING_REVIEW_TOOLS
-    assert "repo_commit" in budget_gate._REMEDIATION_EFFECT_TOOLS
+    assert "repo_commit" not in budget_gate._REMEDIATION_EFFECT_TOOLS
+    assert "pr_comment" not in budget_gate._REMEDIATION_EFFECT_TOOLS
     assert "worklink_run" in budget_gate._TYPED_ERROR_SIGNAL_TOOLS

@@ -33,13 +33,35 @@ pwd.getpwnam = lambda name: (_ for _ in ()).throw(AssertionError(name))
 grp.getgrnam = lambda name: (_ for _ in ()).throw(AssertionError(name))
 
 import mimir.contained_checkout
-import mimir.project_tests
 import mimir.worklink.checkout
 import mimir.worklink.worker_exec
 print("safe")
 """
     )
 
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "safe"
+
+
+def test_selected_repository_import_does_not_resolve_system_accounts() -> None:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("selected repository requires installed Cultivate")
+    result = _run_identity_import(
+        """
+import grp
+import pwd
+
+pwd.getpwnam = lambda name: (_ for _ in ()).throw(AssertionError(name))
+grp.getgrnam = lambda name: (_ for _ in ()).throw(AssertionError(name))
+
+import mimir_cultivate.repository
+print("safe")
+"""
+    )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "safe"
 

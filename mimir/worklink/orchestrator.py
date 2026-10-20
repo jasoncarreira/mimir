@@ -29,7 +29,6 @@ from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
 from .._atomic import atomic_write_json
 from .._rmtree import rmtree_missing_ok
-from ..forge.github import GitHubForgeClient, GitHubIdentityVerificationError
 from .backends import (
     BackendRegistry,
     CheckoutShape,
@@ -79,7 +78,6 @@ from .run_state import (
 )
 from .checkout import CheckoutLease, cleanup_checkout, coding_enabled, create_isolated_checkout
 from ..redaction import redact_text
-from ..repository_config import RepositoryInventory
 from ..secret_scan import secret_matches
 from .safe_git import ControllerGitPublication, _git_credential_settings
 from .backends.feature_factory import (
@@ -104,6 +102,19 @@ from .factory_state import (
 from .detached_dispatch import FactoryRecoveryIdentity
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+GitHubForgeClient: Any = None
+
+
+def _repository_inventory(home: Path) -> Any:
+    from ..plugins.core import selected_policy_registry
+
+    hooks = selected_policy_registry().policy_consumer_hooks
+    path = home / "repositories.yaml"
+    if hooks is None:
+        if path.exists() or path.is_symlink():
+            raise RuntimeError("repository inventory requires a selected provider")
+        return None
+    return hooks.repository_inventory(path)
 _CLAIM_HEARTBEAT_INTERVAL_S = 60.0
 _PR_BODY_SECTION_FILE = ".worklink-pr-body.md"
 _PR_BODY_SECTION_MAX_BYTES = 4000
@@ -975,11 +986,11 @@ class WorklinkRunner:
                 )
             raise
         config = WorklinkConfig.load(self.home / "worklink.yaml")
-        inventory = RepositoryInventory.load(self.home / "repositories.yaml")
+        inventory = _repository_inventory(self.home)
         registry = self.registry or BackendRegistry(config)
         repo_url = _repo_remote_url(self.repo, runner=runner)
         repo_slug = _repo_slug_from_url(repo_url)
-        repository_config = inventory.repository(repo_slug) if inventory.declared else None
+        repository_config = inventory.repository(repo_slug) if inventory is not None and inventory.declared else None
         backend = (
             registry.get(backend_name)
             if backend_name
@@ -2423,8 +2434,8 @@ class WorklinkRunner:
                 )
                 return WorklinkRunResult(issue_id, None, "refused", reason=reason)
         launcher = selected.admit()
-        inventory = RepositoryInventory.load(self.home / "repositories.yaml")
-        repository_config = inventory.repository(repo_slug) if inventory.declared else None
+        inventory = _repository_inventory(self.home)
+        repository_config = inventory.repository(repo_slug) if inventory is not None and inventory.declared else None
         base = (
             target_branch_from_description(issue.description)
             or (repository_config.base_branch if repository_config is not None else None)
@@ -2914,8 +2925,15 @@ class WorklinkRunner:
             _read_factory_publishing_identity(self.repo)
         )
         github_token, github_env = _resolve_factory_github_credential(os.environ)
+        from mimir_cultivate.forge import (
+            GitHubForgeClient as SelectedGitHubForgeClient,
+            GitHubIdentityVerificationError,
+        )
+
         try:
-            GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
+            (GitHubForgeClient or SelectedGitHubForgeClient)(token=github_token).verify_identity(
+                publishing_identity,
+            )
         except GitHubIdentityVerificationError as exc:
             raise WorklinkError(
                 f"{exc}; selected identity {publishing_identity} "

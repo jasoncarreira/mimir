@@ -312,10 +312,7 @@ def _resolve_standing_review(
             return "repository review head validator unavailable"
         revalidate_review_head_for_context = None
     else:
-        from .forge import (
-            revalidate_review_head_for_context,
-            resolve_review_state_for_context,
-        )
+        return "repository review provider unavailable"
 
     try:
         resolve_review_state_for_context(
@@ -3939,28 +3936,28 @@ def _review_submission_for_call(call: _PreparedToolCall) -> Any:
     if hooks is not None:
         return hooks.review_submission(call.execution_request)
     if getattr(selected, "_projected_owner", None) is not None and call.tool_name in {
-        "shell_exec", "bash_async", "Bash", "bash",
+        "shell_exec", "bash_async", "Bash", "bash", "pr_submit_review",
     }:
         raise ToolException("selected review submission guard unavailable")
     if call.tool_name not in {"shell_exec", "bash_async", "Bash", "bash", "pr_submit_review"}:
+        return None
+    if call.tool_name == "pr_submit_review":
         return None
     args = call.execution_request.tool_call.get("args") or {}
     direct = args.get("mimir_direct_argv")
     command = args.get("command")
     possible_gh = (
-        isinstance(direct, list) and direct and isinstance(direct[0], str)
-        and Path(direct[0]).name == "gh"
-    ) or (isinstance(command, str) and ("gh" in command or "pr review" in command))
-    if not possible_gh and call.tool_name != "pr_submit_review":
-        return None
-    try:
-        from .github_review_guard import review_submission_from_request
-    except ModuleNotFoundError as exc:
-        if exc.name != "mimir.tools.github_review_guard":
-            raise
-        raise ToolException("GitHub review submission guard unavailable") from exc
-
-    return review_submission_from_request(call.execution_request)
+        isinstance(direct, list) and len(direct) >= 3
+        and isinstance(direct[0], str) and Path(direct[0]).name == "gh"
+        and direct[1:3] == ["pr", "review"]
+    ) or (
+        isinstance(command, str) and re.search(
+            r"(?:^|[\s;&|])(?:[^\s;&|]*/)?gh\s+pr\s+review(?:\s|$)", command,
+        ) is not None
+    )
+    if possible_gh:
+        raise ToolException("GitHub review submission guard unavailable")
+    return None
 
 
 def _claim_review_submission_for_call(call: _PreparedToolCall, spec: Any) -> Any:
@@ -3970,14 +3967,7 @@ def _claim_review_submission_for_call(call: _PreparedToolCall, spec: Any) -> Any
         return hooks.claim_review(spec)
     if getattr(selected, "_projected_owner", None) is not None:
         raise ToolException("selected review submission guard unavailable")
-    try:
-        from .github_review_guard import claim_review_submission
-    except ModuleNotFoundError as exc:
-        if exc.name != "mimir.tools.github_review_guard":
-            raise
-        raise ToolException("GitHub review submission guard unavailable") from exc
-
-    return claim_review_submission(spec)
+    raise ToolException("GitHub review submission guard unavailable")
 
 
 def _begin_tool_execution(
@@ -4231,6 +4221,8 @@ def _scoped_pr_checkout_call(call: _PreparedToolCall) -> bool:
         registered is not None and protocol is not None
         and registered.resource_scope == "repo_pr"
         and registered.typed_action is protocol.checkout_action
+        and (getattr(protocol, "checkout_tool", None) is None
+             or registered.name == protocol.checkout_tool)
     )
 
 
@@ -4264,7 +4256,7 @@ def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
     if (state is None or state.action_scope is not scope
             or not _valid_scoped_pr_grant(
                 call.auth_context, registered.owner, registered.typed_action,
-                protocol, scope, state,
+                protocol, scope, state, tool_name=call.tool_name,
             )):
         _emit_hard_boundary_denied(
             tool=call.tool_name, boundary="scoped_pr_grant",

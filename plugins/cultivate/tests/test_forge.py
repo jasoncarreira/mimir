@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import requests
 from langchain.tools import ToolRuntime
 
 from mimir import access_control
@@ -157,6 +161,74 @@ def test_forge_surface_has_all_scoped_tools() -> None:
     assert all(callable(item.func) and callable(item.coroutine) for item in forge.FORGE_TOOLS)
 
 
+def test_provider_forge_has_no_core_repository_fallback() -> None:
+    tree = ast.parse(Path(forge.__file__).read_text(encoding="utf-8"))
+    imports = (
+        node.module for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    )
+    assert "mimir.repo_tools" not in imports
+
+
+def test_provider_refuses_accidental_pr_body_shrink(monkeypatch) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    client = _Forge()
+    original = client.get_pull_request
+
+    def current(scope):
+        return replace(original(scope), body="Existing description and Closes #1949" * 4)
+
+    client.get_pull_request = current
+    forge.set_forge_client(client)
+    try:
+        args = ("owner/repo", 17, "replacement")
+        with pytest.raises(ToolPolicyRefusal, match="under 50%"):
+            forge.pr_edit_body.func(*args, runtime=_runtime())
+        assert not any(name == "edit" for name, _ in client.calls)
+        assert forge.pr_edit_body.func(*args, allow_shrink=True, runtime=_runtime()) == {
+            "status": "body_updated",
+        }
+        assert any(name == "edit" for name, _ in client.calls)
+    finally:
+        forge.set_forge_client(None)
+
+
+def test_provider_pr_metadata_bounds_body_and_preserves_merged_at(monkeypatch) -> None:
+    class Session:
+        def request(self, *args, **kwargs):
+            payload = {
+                "number": 17, "merged_at": "2026-10-19T12:00:00Z",
+                "body": "é" * 60_000,
+            }
+            return SimpleNamespace(
+                status_code=200, headers={"Content-Type": "application/json"},
+                iter_content=lambda **_: (json.dumps(payload).encode("utf-8"),),
+                close=lambda: None,
+            )
+
+    scope = _runtime().context.repo_pr_action_scope
+    monkeypatch.setattr(forge.GitHubForgeClient, "_target", lambda self, _: ("owner/repo", 17))
+    result = forge.GitHubForgeClient(token="token", session=Session()).get_pull_request(scope)
+    assert result.merged_at == "2026-10-19T12:00:00Z"
+    assert len(result.body.encode("utf-8")) <= forge._MAX_BODY_BYTES
+    assert result.body and result.body.endswith("é")
+
+
+@pytest.mark.parametrize("method,warning", [
+    ("GET", False), ("POST", True), ("PATCH", True),
+])
+def test_provider_transport_warning_distinguishes_ambiguous_writes(method, warning) -> None:
+    class FailingSession:
+        def request(self, *args, **kwargs):
+            raise requests.ConnectionError("private transport detail")
+
+    client = forge.GitHubForgeClient(token="token", session=FailingSession())
+    with pytest.raises(forge.ForgeError) as error:
+        client._request(method, "/repos/owner/repo/pulls/17")
+    assert ("write may have been applied" in str(error.value)) is warning
+    assert "private transport detail" not in str(error.value)
+
+
 @pytest.mark.parametrize("name,arguments,operation,expected", [
     ("pr_list", {"repository": "owner/repo"}, "list", "withheld"),
     ("pr_metadata", {"pull_request": 17}, "metadata", "Title"),
@@ -249,6 +321,7 @@ async def test_plugin_call_site_preserves_scope_head_and_untrusted_taint() -> No
     assert client.calls == [
         ("metadata", runtime.context.repo_pr_action_scope),
         ("attest", ("owner/repo", "author")),
+        ("metadata", runtime.context.repo_pr_action_scope),
     ]
     assert provenance.sources[0].resource_id == "owner/repo#pull/17@" + "a" * 40
     assert provenance.sources[0].integrity == "untrusted"
@@ -398,9 +471,11 @@ def test_unsupported_operation_escalates_once_and_persists(tmp_path, monkeypatch
         "operator_visible": True,
     })]
     persisted = tmp_path / "state" / "unsupported_operations.json"
-    assert json.loads(persisted.read_text(encoding="utf-8")) == [
-        runtime.context.repo_pr_action_scope.scope_id + ":" + result["operation"]
-    ]
+    assert json.loads(persisted.read_text(encoding="utf-8")) == {
+        "owner/repo#17": (
+            runtime.context.repo_pr_action_scope.observed_head_sha + ":" + result["operation"]
+        ),
+    }
     assert forge.unsupported_operation.func(**arguments)["escalated"] is False
     assert len(events) == 1
     with pytest.raises(ToolPolicyRefusal, match="outside this turn's scope"):

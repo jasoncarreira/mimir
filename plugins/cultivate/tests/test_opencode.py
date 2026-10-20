@@ -12,8 +12,7 @@ import pytest
 from mimir import opencode_config as core_config
 from mimir import opencode_proposal as core_proposal
 from mimir.contained_execution import SensitiveMaterialScrubber
-from mimir.repo_tools import _sanitized_git_env
-from mimir_cultivate import opencode
+from mimir_cultivate import opencode, repository
 
 
 def _auth(home: Path, provider: str, entry: dict[str, str]) -> None:
@@ -106,7 +105,8 @@ def test_proposal_is_lossless_and_stays_in_checkout(tmp_path: Path) -> None:
     assert result.reason_code == baseline.reason_code == "proposal_created"
     assert result.proposal is not None and baseline.proposal is not None
     assert result.proposal.as_dict() == baseline.proposal.as_dict()
-    assert opencode._sanitized_git_env() == _sanitized_git_env()
+    assert opencode._sanitized_git_env() == repository._sanitized_git_env()
+    assert opencode._sanitized_git_env() == core_proposal._sanitized_git_env()
     assert b"after" in base64.b64decode(result.proposal.patch, validate=True)
     assert (repo / "file.txt").read_text() == "after\n"
 

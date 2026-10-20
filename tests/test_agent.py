@@ -115,13 +115,22 @@ def _install_turn_hooks(agent: Agent, *, continuation=None, intervention=None) -
 @pytest.fixture
 def worklink_ready_poller():
     """Resolve the incident consumer from its current optional-skill owner."""
+    from importlib.metadata import PackageNotFoundError, version
     from mimir.pollers import discover_pollers
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
 
     def resolve(state_root: Path):
-        pollers = discover_pollers(
-            Path(__file__).parents[1] / "plugins" / "cultivate" / "mimir_cultivate" / "defaults" / "skills",
-            state_root=state_root,
-        )
+        try:
+            version("mimir-cultivate")
+        except PackageNotFoundError:
+            pytest.skip("shipped Worklink poller requires installed Cultivate")
+        selected = load_plugins(enable="cultivate").policy
+        with policy_scope(selected):
+            pollers = discover_pollers(
+                Path(__file__).parents[1] / "plugins" / "cultivate" / "mimir_cultivate" / "defaults" / "skills",
+                state_root=state_root, policy=selected, plugin_candidates=(),
+            )
         return next(item for item in pollers if item.name == "worklink-ready-queue")
 
     return resolve

@@ -49,6 +49,8 @@ assert not loaded, loaded
 
 @pytest.mark.parametrize("coding_enabled", [False, True])
 def test_runtime_construction_coding_imports(tmp_path, coding_enabled: bool) -> None:
+    if coding_enabled:
+        pytest.importorskip("mimir_cultivate")
     script = textwrap.dedent("""
         import asyncio
         import sys
@@ -91,8 +93,11 @@ def test_runtime_construction_coding_imports(tmp_path, coding_enabled: bool) -> 
 
         async def main():
             home = Path(sys.argv[1])
+            from mimir.plugins.manager import load_plugins
+            enabled = sys.argv[2] == '1'
             config = SimpleNamespace(
-                home=home, coding_enabled=sys.argv[2] == '1',
+                home=home, coding_enabled=enabled,
+                plugin_manager=None,
                 turns_log=home / 'logs' / 'turns.jsonl', max_turns_kept=100,
                 history_global_max=50, history_per_channel_max=25,
                 cross_platform_pull=True, saga_session_idle_minutes=10,
@@ -101,13 +106,14 @@ def test_runtime_construction_coding_imports(tmp_path, coding_enabled: bool) -> 
                 operator_alert_channel='', opencode_config_path=None,
             )
             if config.coding_enabled:
-                from mimir.tools import forge
+                from mimir_cultivate import forge
                 initialized = []
                 identity_patch = patch.object(
                     forge, 'initialize_github_forge_identity',
                     side_effect=lambda: initialized.append(True) or True,
                 )
                 identity_patch.start()
+            config.plugin_manager = load_plugins(enable='cultivate' if enabled else '')
             core = CoreServices(
                 identity_resolver=SimpleNamespace(), aliases_loaded=0,
                 saga_db_path=home / '.mimir' / 'saga.db',
@@ -128,7 +134,7 @@ def test_runtime_construction_coding_imports(tmp_path, coding_enabled: bool) -> 
                                 if any(name == prefix or name.startswith(prefix + '.')
                                        for prefix in forbidden))
                 if config.coding_enabled:
-                    assert 'mimir.tools.forge' in loaded, loaded
+                    assert not loaded, loaded
                     assert initialized == [True]
                     assert forge._github_identity_degraded_callback is not None
                 else:

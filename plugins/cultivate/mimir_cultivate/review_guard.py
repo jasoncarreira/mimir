@@ -212,8 +212,12 @@ def _gh_env() -> dict[str, str]:
 
 
 def github_shell_environment(argv: list[str], env: dict[str, str]) -> dict[str, str]:
-    """Grant only the selected Cultivate identity to a constrained GitHub CLI."""
-    if not argv or Path(argv[0]).name != _GH_EXECUTABLE:
+    """Isolate Git or grant the verified Cultivate GitHub CLI identity."""
+    executable = Path(argv[0]).name if argv else ""
+    if executable == "git":
+        return {**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_PAGER": "cat",
+                "GIT_OPTIONAL_LOCKS": "0"}
+    if executable != _GH_EXECUTABLE:
         raise ToolPolicyRefusal("GitHub shell credential grant requires gh")
     binding = _DIRECT_EXEC_ARGV.get()
     if binding is not None and binding.operator_declared:

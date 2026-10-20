@@ -469,9 +469,9 @@ def test_production_global_writers_are_confined() -> None:
             "plugins/cultivate/mimir_cultivate/commands.py",
             "mimir/wiki_backlinks.py",
         },
-        "set_github_identity_degraded_callback": {"mimir/runtime.py"},
+        "set_github_identity_degraded_callback": {"plugins/cultivate/mimir_cultivate/registration.py"},
         "set_forge_client": {
-            "mimir/runtime.py", "mimir/tools/forge.py",
+            "plugins/cultivate/mimir_cultivate/registration.py",
             "plugins/cultivate/mimir_cultivate/forge.py",
         },
         "set_memory_client": {"mimir/agent.py", "mimir/runtime.py"},

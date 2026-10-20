@@ -17,9 +17,15 @@ from typing import Any, Sequence
 
 import pytest
 import asyncio
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    version("mimir-cultivate")
+except PackageNotFoundError:
+    pytest.skip("Worklink publishing requires installed Cultivate", allow_module_level=True)
 
 from mimir.event_logger import _reset_logger_for_tests, init_logger
-from mimir.forge.github import GitHubIdentityVerificationError
+from mimir_cultivate.forge import GitHubIdentityVerificationError
 from mimir.worklink.backends import (
     Caps,
     ComputeCaps,
@@ -3521,6 +3527,9 @@ def test_unknown_leaf_target_branch_fails_without_falling_back_to_main(tmp_path:
 
 
 def test_worklink_runner_uses_repository_base_over_deployment_default(tmp_path: Path) -> None:
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     (tmp_path / "worklink.yaml").write_text(
@@ -3544,11 +3553,13 @@ repositories:
     registry = BackendRegistry(WorklinkConfig())
     registry.register(backend)
 
-    result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
-            441, backend_name="fake"
+    pytest.importorskip("mimir_cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        result = asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+                441, backend_name="fake"
+            )
         )
-    )
 
     assert result.status == "completed"
     assert ["git", "-C", str(repo), "fetch", "origin", "repository-base"] in calls
@@ -5301,7 +5312,7 @@ def test_inherited_credential_clears_a_prebound_identity_memo(
     preflight even when both credentials belonged to the declared publisher.
     Inheriting the process credential removes the second fingerprint entirely.
     """
-    from mimir.forge import github as github_module
+    from mimir_cultivate import forge as github_module
 
     token, child = _resolve_factory_github_credential(
         {"GITHUB_TOKEN": "process-token", "GH_TOKEN": "process-token"}
@@ -10497,7 +10508,7 @@ def test_factory_recovery_rejection_command_matrix(
                 pass
 
             def verify_identity(self, login: str) -> str:
-                raise orchestrator.GitHubIdentityVerificationError("credential is not factory-owner")
+                raise GitHubIdentityVerificationError("credential is not factory-owner")
 
         monkeypatch.setattr(orchestrator, "GitHubForgeClient", RefusingForge)
 

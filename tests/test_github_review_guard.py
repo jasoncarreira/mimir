@@ -5,6 +5,7 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,10 +15,30 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import ToolException
 from langgraph.runtime import Runtime
 
-from mimir.tools import github_review_guard as guard
+try:
+    version("mimir-cultivate")
+except PackageNotFoundError:
+    pytest.skip("GitHub review guard belongs to installed Cultivate", allow_module_level=True)
+
+guard = pytest.importorskip("mimir_cultivate.review_guard")
 from mimir.tools import extra
 from mimir.tools.refusals import ToolPolicyRefusal
 from tests.auth_helpers import middleware_auth_context
+
+
+@pytest.fixture(autouse=True)
+def selected_review_policy(monkeypatch: pytest.MonkeyPatch):
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks,
+        review_submission=lambda request: guard.review_submission_from_request(request),
+        claim_review=lambda spec: guard.claim_review_submission(spec),
+    ))
+    with policy_scope(selected):
+        yield
 
 
 def _request(
@@ -356,8 +377,8 @@ def test_guard_probe_uses_server_gh_and_direct_exec_environment(
     env = {"PATH": "/usr/bin", "GH_CONFIG_DIR": "/isolated"}
     monkeypatch.setattr(
         guard,
-        "direct_exec_env",
-        lambda argv: env if argv == ["gh"] else pytest.fail(str(argv)),
+        "_gh_env",
+        lambda: env,
     )
     monkeypatch.setattr(
         guard.subprocess,
@@ -605,6 +626,9 @@ def test_wrap_tool_call_recovered_poller_and_manual_race_has_one_side_effect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.tools import budget_gate
+    from mimir.plugins.core import selected_policy_registry
+
+    selected = selected_policy_registry()
 
     monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *args, **kwargs: None)
     # The service authorization layer authored this argv before the review guard.
@@ -634,7 +658,7 @@ def test_wrap_tool_call_recovered_poller_and_manual_race_has_one_side_effect(
             github.submit(spec)
             return ToolMessage(content="submitted", tool_call_id=request.tool_call["id"])
 
-        return budget_gate.BudgetGateMiddleware().wrap_tool_call(request, handler)
+        return budget_gate.BudgetGateMiddleware(selected).wrap_tool_call(request, handler)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(execute, [manual, poller]))

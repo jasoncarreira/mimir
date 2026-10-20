@@ -2,22 +2,28 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from langchain_core.tools import ToolException
 import requests
 
-from mimir.forge import ForgeError, ForgeResponseTooLarge, ReviewVerdict
-from mimir.forge.github import (
+try:
+    version("mimir-cultivate")
+except PackageNotFoundError:
+    pytest.skip("Forge adapter requires installed Cultivate", allow_module_level=True)
+
+from mimir_cultivate.forge import (
+    ForgeError, ForgeResponseTooLarge, ReviewVerdict,
     GitHubForgeClient,
     GitHubIdentityFailureKind,
     GitHubIdentityVerificationError,
     bound_diff,
 )
-from mimir.forge import github as github_module
+from mimir_cultivate import forge as github_module
 from mimir.models import RepoPRActionScope
-from mimir.tools.forge import initialize_github_forge_identity, pr_list, set_forge_client
+from mimir_cultivate.forge import initialize_github_forge_identity, pr_list, set_forge_client
 
 
 def _scope() -> RepoPRActionScope:
@@ -212,7 +218,7 @@ def test_list_run_jobs_caps_more_than_100_jobs_without_fetching_third_page():
 
 @pytest.fixture(autouse=True)
 def reset_verified_identity(monkeypatch) -> None:
-    from mimir.tools import forge as forge_tools
+    from mimir_cultivate import forge as forge_tools
 
     monkeypatch.setattr(github_module, "_verified_identity", None)
     monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
@@ -252,7 +258,7 @@ def test_metadata_target_and_auth_are_adapter_constructed() -> None:
     (42, ""),
 ])
 def test_pr_metadata_body_is_bounded_by_writer_utf8_limit(body, expected) -> None:
-    from mimir.tools.forge import _BODY_MAX_BYTES
+    from mimir_cultivate.forge import _BODY_MAX_BYTES
 
     assert github_module._MAX_BODY_BYTES == _BODY_MAX_BYTES == 65_536
     session = Session([Response({"number": 17, "body": body})])
@@ -696,7 +702,7 @@ def _run_metadata():
 @pytest.mark.parametrize("run_id", [None, 123])
 @pytest.mark.parametrize("repo_case", ["owner/repo", "Owner/Repo"])
 def test_job_log_binds_metadata_before_capture(monkeypatch, conclusion, run_id, repo_case):
-    from mimir import ci_logs
+    from mimir_cultivate import ci as ci_logs
 
     job = {**_job_metadata(), "conclusion": conclusion}
     job["run_url"] = f"https://api.github.com/repos/{repo_case}/actions/runs/123"
@@ -739,7 +745,7 @@ def test_job_log_binds_metadata_before_capture(monkeypatch, conclusion, run_id, 
     ("run", "status", "in_progress"), ("run", "status", "queued"), ("run", "status", None),
 ])
 def test_job_log_rejects_each_independent_binding_or_state(monkeypatch, target, field, value):
-    from mimir import ci_logs
+    from mimir_cultivate import ci as ci_logs
 
     job, run = _job_metadata(), _run_metadata()
     (job if target == "job" else run)[field] = value
@@ -748,7 +754,7 @@ def test_job_log_rejects_each_independent_binding_or_state(monkeypatch, target, 
     message = "run is still in progress" if target == "run" and field == "status" else None
     if target == "job" and field in {"status", "conclusion"}:
         message = "^job is not a completed failing job$"
-    from mimir.forge.client import ForgeReadUnavailable
+    from mimir_cultivate.forge import ForgeReadUnavailable
 
     with pytest.raises(ForgeError, match=message) as raised:
         GitHubForgeClient(session=session).get_job_log(_scope(), 456)
@@ -770,7 +776,7 @@ def test_job_log_invalid_ids_do_not_fetch(job_id, run_id):
 @pytest.mark.parametrize("target", ["job", "run"])
 @pytest.mark.parametrize("payload", [None, [], "invalid"])
 def test_job_log_rejects_non_mapping_metadata(monkeypatch, target, payload):
-    from mimir import ci_logs
+    from mimir_cultivate import ci as ci_logs
 
     monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: pytest.fail("invalid metadata captured"))
     responses = [Response(payload)] if target == "job" else [Response(_job_metadata()), Response(payload)]
@@ -780,7 +786,7 @@ def test_job_log_rejects_non_mapping_metadata(monkeypatch, target, payload):
 
 @pytest.mark.parametrize("observed_run", [0, -1, True, 123.0])
 def test_job_log_rejects_self_consistent_invalid_run_id(monkeypatch, observed_run):
-    from mimir import ci_logs
+    from mimir_cultivate import ci as ci_logs
 
     job = {**_job_metadata(), "run_id": observed_run,
            "run_url": f"https://api.github.com/repos/owner/repo/actions/runs/{observed_run}"}
@@ -807,7 +813,7 @@ def test_job_log_metadata_refusals_are_distinct(status, message):
 
 
 def test_job_log_capture_error_not_returned_as_evidence(monkeypatch):
-    from mimir import ci_logs
+    from mimir_cultivate import ci as ci_logs
 
     monkeypatch.setattr(ci_logs, "capture_job_log", lambda *a, **k: (b"", "unauthenticated gh"))
     session = Session([Response(_job_metadata()), Response(_run_metadata())])
@@ -965,7 +971,7 @@ def test_mismatched_authenticated_identity_refuses_effect_without_post() -> None
 
 
 def test_midflight_forge_identity_change_returns_execution_fault_and_latches(monkeypatch) -> None:
-    from mimir.tools import forge as forge_tools
+    from mimir_cultivate import forge as forge_tools
 
     error = github_module.GitHubIdentityVerificationError(
         "github identity verification cache does not match active credential",
@@ -1003,7 +1009,7 @@ def test_matching_identity_is_cached_for_multiple_effects() -> None:
 
 
 def test_startup_identity_verification_degrades_coding_on_mismatch(monkeypatch) -> None:
-    from mimir.tools import forge as forge_tools
+    from mimir_cultivate import forge as forge_tools
 
     class MismatchedClient:
         def verify_identity(self, declared_login):
@@ -1059,7 +1065,7 @@ def test_invalid_github_credential_is_permanent(status: int) -> None:
 
 
 def test_startup_identity_verification_registers_matching_client(monkeypatch) -> None:
-    from mimir.tools import forge as forge_tools
+    from mimir_cultivate import forge as forge_tools
 
     monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
     monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
@@ -1073,7 +1079,7 @@ def test_startup_identity_verification_registers_matching_client(monkeypatch) ->
 
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
     monkeypatch.setattr(github_module, "GitHubForgeClient", MatchingClient)
-    monkeypatch.setattr("mimir.tools.forge.set_forge_client", registered.append)
+    monkeypatch.setattr("mimir_cultivate.forge.set_forge_client", registered.append)
 
     assert initialize_github_forge_identity() is True
 

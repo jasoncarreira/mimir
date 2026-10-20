@@ -11,7 +11,6 @@ import os
 import re
 import shlex
 import sys
-import tempfile
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,17 +28,12 @@ _TRUSTED_PATH_DIRS = (
     "/bin",
 )
 _TRUSTED_PATH = os.pathsep.join(_TRUSTED_PATH_DIRS)
-_GH_CONFIG_DIR = tempfile.mkdtemp(prefix="mimir-gh-config-")
-Path(_GH_CONFIG_DIR).chmod(0o500)
 _MODEL_SELECTION_ENV = "MIMIR_MODEL_SPEC"
 _MINIMAL_ENV_NAMES = frozenset({"HOME", "LANG", "TZ"})
 _INTERACTIVE_ENV_NAMES = _MINIMAL_ENV_NAMES | frozenset({
     "TERM", "TMPDIR", "USER", "LOGNAME", "MIMIR_HOME",
 })
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_CREDENTIAL_ENV_BY_EXECUTABLE = {
-    "gh": frozenset({"GITHUB_TOKEN"}),
-}
 
 
 @dataclass(frozen=True)
@@ -101,7 +95,7 @@ def direct_exec_redact_names(argv: list[str] | None) -> tuple[str, ...]:
     executable = Path(argv[0]).name if argv else ""
     return tuple(dict.fromkeys((
         *direct_exec_pass_env(argv),
-        *sorted(_CREDENTIAL_ENV_BY_EXECUTABLE.get(executable, ())),
+        *(("GITHUB_TOKEN",) if executable == "gh" else ()),
     )))
 
 
@@ -131,17 +125,6 @@ def login_shell_command(command: str) -> str:
         part for part in (_TRUSTED_PATH, venv_bin) if part
     )
     return f"export PATH={shlex.quote(path)}\n{command}"
-
-
-def _is_git_argv(argv: list[str] | None) -> bool:
-    """Return whether *argv* invokes the server-pinned maintenance Git binary."""
-    return bool(argv) and Path(argv[0]).name == "git"
-
-
-def _is_gh_argv(argv: list[str] | None) -> bool:
-    # Authorization replaces the command with an operator-pinned absolute path,
-    # which may differ from the image default used in production.
-    return bool(argv) and Path(argv[0]).name == "gh"
 
 
 def _minimal_direct_exec_env() -> dict[str, str]:
@@ -281,9 +264,8 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     workspace virtualenv. The project test executable and fixed arguments come
     from operator configuration rather than language-specific inference here.
     Children receive only non-secret process settings by default. Executables
-    can receive exact names from the matching operator declaration. The legacy
-    gh credential grant retains its config isolation and identity confirmation
-    for non-declared service commands.
+    can receive exact names from the matching operator declaration. Forge
+    credentials are granted only by the selected provider's owner-bound hook.
     """
     binding = _DIRECT_EXEC_ARGV.get()
     if binding is not None and binding.operator_declared:
@@ -306,7 +288,8 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
         for name in os.environ.get("MIMIR_SHELL_PASS_ENV", "").split(","):
             name = name.strip()
             if (name != "PATH" and _ENV_NAME.fullmatch(name) and name in os.environ
-                    and not (_is_gh_argv(argv) and (name == "GITHUB_TOKEN" or name.startswith("GH_")))):
+                    and not (argv and Path(argv[0]).name == "gh"
+                             and (name == "GITHUB_TOKEN" or name.startswith("GH_")))):
                 env[name] = os.environ[name]
     names = direct_exec_pass_env(argv)
     passed = [key for key in names if key in os.environ]
@@ -316,29 +299,18 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
         from ..event_logger import log_event_sync
 
         log_event_sync("service_shell_env_passthrough", pass_env=passed)
-    executable = Path(argv[0]).name if argv else ""
-    for key in (() if binding is not None and binding.operator_declared
-                else _CREDENTIAL_ENV_BY_EXECUTABLE.get(executable, ())):
-        if key in os.environ:
-            env[key] = os.environ[key]
-    if _is_gh_argv(argv):
-        # Non-declared gh must not discover ambient on-disk auth.
-        env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
-        from .forge import confirm_github_tool_identity
+    if argv and Path(argv[0]).name in {"gh", "git"}:
+        # The hook is installed only for an authenticated, selected first-party
+        # owner; importing this core module cannot load a disabled provider.
+        from ..plugins.core import selected_policy_registry
 
-        confirm_github_tool_identity(
-            os.environ.get("MIMIR_GITHUB_SELF_LOGIN", ""),
-            env.get("GITHUB_TOKEN", ""),
-        )
-    if _is_git_argv(argv):
-        # The maintenance profile binds Git to a configured -C root and injects
-        # config-neutralizing argv. Inherited GIT_* variables must not select a
-        # different repository, config source, helper executable, or diff tool.
-        env.update({
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_PAGER": "cat",
-            "GIT_OPTIONAL_LOCKS": "0",
-        })
+        hooks = selected_policy_registry().policy_consumer_hooks
+        if Path(argv[0]).name == "gh":
+            # A declaration cannot smuggle forge credentials around selection.
+            env = {key: value for key, value in env.items()
+                   if key != "GITHUB_TOKEN" and not key.startswith("GH_")}
+        if hooks is not None:
+            env = hooks.shell_environment(argv, env)
     return env
 
 

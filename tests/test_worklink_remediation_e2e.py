@@ -200,6 +200,12 @@ class _ExecutorServer:
 
 @pytest.fixture
 def remediation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
     provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
     from mimir.worklink import worker_client
 
@@ -772,21 +778,21 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Run the production remediation effect paths across real Linux identities."""
+    provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
     from mimir import contained_checkout, contained_execution
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-    from mimir.project_tests import RepoProjectTests
-    from mimir.repo_tools import (
+    from mimir_cultivate.repository import (
         GitCommit,
         GitDiff,
         GitStage,
         GitStatus,
         RepoGitTools,
+        RepoProjectTests,
         retained_factory_git_runner,
     )
     from mimir.worklink import worker_client, worker_exec
 
     identities = _system_identities()
-    provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
     boundary = Path("/tmp") / f"mimir-remediation-{uuid.uuid4()}"
     retained_root = boundary / "worklink"
     checkout = retained_root / "mimir" / "1811-1" / "checkout"

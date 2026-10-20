@@ -23,7 +23,7 @@ from mimir.models import (
     ServerDiscoveredPRStates, TurnInteractivity,
 )
 from mimir.plugins.registry import PolicyRegistry
-from mimir.pr_checkout_lease import active_pr_checkout_lease_for_path, create_pr_checkout_lease
+from mimir_cultivate.repository import active_pr_checkout_lease_for_path, create_pr_checkout_lease
 from mimir.tool_descriptors import ResultOriginKind
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir_cultivate.policy import RepoPRAction, register_action_protocol, validate_scoped_pr_action
@@ -39,8 +39,11 @@ def _tool(repository: str, pull_request: int) -> str:
 def policy():
     registry = PolicyRegistry()
     registrar = registry.registrar("cultivate")
-    register_action_protocol(registrar, validate_scoped_pr_action)
+    register_action_protocol(
+        registrar, validate_scoped_pr_action, checkout_tool="scoped_checkout",
+    )
     for name, action in (("scoped_checkout", RepoPRAction.CHECKOUT),
+                         ("scoped_fetch", RepoPRAction.CHECKOUT),
                          ("scoped_commit", RepoPRAction.COMMIT)):
         registrar.register_tool(
             name=name, factory=lambda name=name: StructuredTool.from_function(
@@ -72,7 +75,49 @@ def _auth(policy, state, enforce, *, discovered=False):
     )
 
 
-def test_trusted_poller_issues_checkout_grant_but_http_ingress_does_not(policy, tmp_path, monkeypatch):
+def test_checkout_action_follow_on_is_bound_to_designated_tool_and_live_lease(
+    policy, tmp_path, monkeypatch,
+):
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    protocol = policy.scoped_actions["cultivate"]
+    assert protocol.checkout_tool == "scoped_checkout"
+    assert _valid_scoped_pr_grant(
+        auth, "cultivate", RepoPRAction.CHECKOUT, protocol, scope, state,
+        tool_name="scoped_checkout",
+    )
+    assert not _valid_scoped_pr_grant(
+        auth, "cultivate", RepoPRAction.CHECKOUT, protocol, scope, state,
+        tool_name="scoped_fetch",
+    )
+
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    assert not _valid_scoped_pr_grant(
+        auth, "cultivate", RepoPRAction.CHECKOUT, protocol, scope, state,
+        tool_name="scoped_checkout",
+    )
+    assert _valid_scoped_pr_grant(
+        auth, "cultivate", RepoPRAction.CHECKOUT, protocol, scope, state,
+        tool_name="scoped_fetch",
+    )
+    lease.revoke()
+    assert not _valid_scoped_pr_grant(
+        auth, "cultivate", RepoPRAction.CHECKOUT, protocol, scope, state,
+        tool_name="scoped_fetch",
+    )
+
+
+def test_trusted_poller_issues_checkout_grant_but_http_ingress_does_not(tmp_path, monkeypatch):
+    from mimir.plugins.manager import load_plugins
+
+    policy = load_plugins(enable="cultivate").policy
     _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
     event = AgentEvent(
         trigger="poller", channel_id="poller:github-activity",
@@ -82,9 +127,14 @@ def test_trusted_poller_issues_checkout_grant_but_http_ingress_does_not(policy, 
     trusted = create_auth_context(event, policy=policy, enforce=True)
     protocol = policy.scoped_actions["cultivate"]
     assert trusted.repo_pr_action_scope is not None
+    assert not _valid_scoped_pr_grant(
+        trusted, "cultivate", RepoPRAction.CHECKOUT, protocol,
+        trusted.repo_pr_action_scope, trusted.repo_review_state,
+    )
     assert _valid_scoped_pr_grant(
         trusted, "cultivate", RepoPRAction.CHECKOUT, protocol,
         trusted.repo_pr_action_scope, trusted.repo_review_state,
+        tool_name="repo_checkout",
     )
     assert not _valid_scoped_pr_grant(
         trusted, "cultivate", RepoPRAction.COMMIT, protocol,
@@ -334,7 +384,7 @@ async def test_heartbeat_scope_and_profile_refused_before_handler(
         def resolve(*_args):
             return state
         monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "someone-else")
-    monkeypatch.setattr("mimir.tools.forge.resolve_review_state_for_context", resolve)
+    monkeypatch.setattr("mimir_cultivate.forge.resolve_review_state_for_context", resolve)
     calls = []
     request = ToolCallRequest(
         tool_call={"name": "scoped_checkout", "args": {

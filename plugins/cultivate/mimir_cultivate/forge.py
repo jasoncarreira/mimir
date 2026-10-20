@@ -45,6 +45,8 @@ class PullRequestProjection:
     mergeable: bool | None
     created_at: str
     updated_at: str
+    body: str = ""
+    merged_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -507,8 +509,13 @@ class GitHubForgeClient:
                 if len(collected) >= limit:
                     break
         except requests.RequestException as exc:
+            warning = (
+                "; the write may have been applied; check pr_reviews / pr_comments "
+                "before retrying"
+                if method.upper() != "GET" else ""
+            )
             raise _GitHubRequestError(
-                f"forge transport failed: {type(exc).__name__}", retryable=True,
+                f"forge transport failed: {type(exc).__name__}{warning}", retryable=True,
             ) from exc
         finally:
             if response is not None:
@@ -690,6 +697,11 @@ class GitHubForgeClient:
             mergeable=data.get("mergeable") if isinstance(data.get("mergeable"), bool) else None,
             created_at=self._text(data.get("created_at"), 64),
             updated_at=self._text(data.get("updated_at"), 64),
+            merged_at=self._text(data.get("merged_at"), 64) if isinstance(data.get("merged_at"), str) else None,
+            body=self._text(
+                data.get("body") if isinstance(data.get("body"), str) else "",
+                _MAX_BODY_BYTES,
+            ).encode("utf-8")[:_MAX_BODY_BYTES].decode("utf-8", errors="ignore"),
         )
 
     def list_pull_requests(
@@ -1847,10 +1859,7 @@ def remediation_checkout_preflight(
         return original, None
     fresh = RepoReviewState(fresh_scope)
 
-    try:
-        from mimir_cultivate.repository import was_agent_push
-    except ImportError:  # Compatibility until the repository slice is installed.
-        from mimir.repo_tools import was_agent_push
+    from .repository import was_agent_push
 
     if not was_agent_push(
         repository, pull_request, scope.observed_head_sha, snapshot.head_sha,
@@ -1876,10 +1885,7 @@ def remediation_checkout_preflight(
 def _seed_verified_remint(
     context: AuthContext | None, old: RepoPRActionScope, new: RepoPRActionScope,
 ) -> None:
-    try:
-        from mimir_cultivate.repository import was_verified_push
-    except ImportError:  # Compatibility until the repository slice is installed.
-        from mimir.repo_tools import was_verified_push
+    from .repository import was_verified_push
 
     if (
         context is not None
@@ -2135,13 +2141,7 @@ def _publish_trusted_projection(runtime: ToolRuntime[AuthContext] | None, scope:
     bounded projections belong to the authorized scope, not a later live head;
     _pr_content_authors still rejects an unrelated live-head change.
     """
-    client = _client(scope)
-    if not callable(getattr(client, "author_is_trusted", None)):
-        return
-    authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
-    _publish_author_attestation(
-        runtime, scope, authors, "forge_projection", head_sha=scope.observed_head_sha,
-    )
+    _attest_scoped_read(runtime, scope, _client(scope), "forge_projection", scoped_head=True)
 
 
 def _publish_write_projection(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope) -> None:
@@ -2269,10 +2269,7 @@ def _pr_attestation(
         # trust; accepting a new head requires per-turn lineage recording.
         if runtime is None:
             return ("<head-mismatch>",), scope.observed_head_sha
-        try:
-            from mimir_cultivate.repository import was_verified_push
-        except ImportError:  # Compatibility until the repository slice is installed.
-            from mimir.repo_tools import was_verified_push
+        from .repository import was_verified_push
 
         if not was_verified_push(
             scope.canonical_repo, scope.pr_number, scope.observed_head_sha, metadata.head_sha,
@@ -2292,6 +2289,46 @@ def _pr_content_authors(
 ) -> tuple[tuple[str, ...], str]:
     """Bind PR-owned diff/file text to API authorship at its verified head."""
     return _pr_attestation(client.get_pull_request(scope), scope, runtime)
+
+
+def _attest_scoped_read(
+    runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope,
+    client: ForgeClient, tool: str, *, scoped_head: bool = False,
+) -> tuple[tuple[str, ...], str] | None:
+    if not callable(getattr(client, "author_is_trusted", None)):
+        return None
+    if (scope.head_repo == scope.canonical_repo
+            or scope.head_remote == "origin" and scope.checkout_ref is None) and (
+        scope.head_repo != scope.canonical_repo
+        or scope.head_remote != "origin"
+        or not _github_origin_matches(scope)
+        or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
+    ):
+        return None
+    authors, head_sha = _call(
+        lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope,
+    )
+    _publish_author_attestation(
+        runtime, scope, authors, tool,
+        head_sha=scope.observed_head_sha if scoped_head else head_sha,
+    )
+    return authors, head_sha
+
+
+def _verify_scoped_read_head(
+    runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope,
+    client: ForgeClient, tool: str, before: tuple[tuple[str, ...], str] | None,
+) -> None:
+    if before is None:
+        return
+    try:
+        after = _call(
+            lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope,
+        )
+    except (ToolException, ToolPolicyRefusal):
+        after = None
+    if after != before:
+        _publish_author_attestation(runtime, scope, ("<head-mismatch>",), tool)
 
 
 @tool
@@ -2390,9 +2427,16 @@ def pr_metadata(
 ) -> dict[str, Any]:
     """Read metadata for an exact pull request authorized by this turn."""
     scope = _scope(runtime, repository, pull_request)
-    metadata = _call(lambda: _client(scope).get_pull_request(scope), runtime=runtime, scope=scope)
+    client = _client(scope)
+    before = _attest_scoped_read(runtime, scope, client, "pr_metadata")
+    try:
+        metadata = _call(lambda: client.get_pull_request(scope), runtime=runtime, scope=scope)
+    except (ToolException, ToolPolicyRefusal):
+        _verify_scoped_read_head(runtime, scope, client, "pr_metadata", before)
+        raise
     authors, head_sha = _pr_attestation(metadata, scope, runtime)
-    _publish_author_attestation(runtime, scope, authors, "pr_metadata", head_sha=head_sha)
+    if before is None or (authors, head_sha) != before:
+        _publish_author_attestation(runtime, scope, authors, "pr_metadata", head_sha=head_sha)
     return asdict(metadata)
 
 
@@ -2488,10 +2532,11 @@ def pr_files(
     """List bounded file projections for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    items = _call(lambda: client.list_files(scope), runtime=runtime, scope=scope)
-    if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
-        _publish_author_attestation(runtime, scope, authors, "pr_files", head_sha=head_sha)
+    before = _attest_scoped_read(runtime, scope, client, "pr_files")
+    try:
+        items = _call(lambda: client.list_files(scope), runtime=runtime, scope=scope)
+    finally:
+        _verify_scoped_read_head(runtime, scope, client, "pr_files", before)
     return [asdict(item) for item in items]
 
 
@@ -2504,10 +2549,11 @@ def pr_diff(
     """Read the bounded unified diff for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    diff = _call(lambda: client.get_diff(scope), runtime=runtime, scope=scope)
-    if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
-        _publish_author_attestation(runtime, scope, authors, "pr_diff", head_sha=head_sha)
+    before = _attest_scoped_read(runtime, scope, client, "pr_diff")
+    try:
+        diff = _call(lambda: client.get_diff(scope), runtime=runtime, scope=scope)
+    finally:
+        _verify_scoped_read_head(runtime, scope, client, "pr_diff", before)
     return diff
 
 
@@ -2521,10 +2567,11 @@ def pr_file_content(
     """Read one regular file at the pull request's verified head."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    content = _call(lambda: client.get_file_content(scope, path), runtime=runtime, scope=scope)
-    if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
-        _publish_author_attestation(runtime, scope, authors, "pr_file_content", head_sha=head_sha)
+    before = _attest_scoped_read(runtime, scope, client, "pr_file_content")
+    try:
+        content = _call(lambda: client.get_file_content(scope, path), runtime=runtime, scope=scope)
+    finally:
+        _verify_scoped_read_head(runtime, scope, client, "pr_file_content", before)
     return content
 
 
@@ -2536,9 +2583,14 @@ def pr_checks(
 ) -> list[dict[str, Any]]:
     """List bounded check projections for the bound pull request head."""
     scope = _scope(runtime, repository, pull_request)
-    checks = _call(lambda: _client(scope).list_checks(scope), runtime=runtime, scope=scope)
-    if all(_safe_check_projection(item, scope) for item in checks):
-        _publish_trusted_projection(runtime, scope)
+    client = _client(scope)
+    before = _attest_scoped_read(runtime, scope, client, "forge_projection", scoped_head=True)
+    try:
+        checks = _call(lambda: client.list_checks(scope), runtime=runtime, scope=scope)
+    finally:
+        _verify_scoped_read_head(runtime, scope, client, "forge_projection", before)
+    if not all(_safe_check_projection(item, scope) for item in checks):
+        _publish_author_attestation(runtime, scope, ("",), "pr_checks")
     return [asdict(item) for item in checks]
 
 
@@ -2579,13 +2631,11 @@ def pr_job_log(
         state = resolve_review_state_for_context(context, repository, pull_request)
     scope = state.action_scope
     client = _client(scope)
-    excerpt = _call(lambda: client.get_job_log(scope, job_id, run_id), runtime=runtime, scope=scope)
-    if callable(getattr(client, "author_is_trusted", None)):
-        authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
-        # get_job_log independently pins job/run metadata to this exact head.
-        _publish_author_attestation(
-            runtime, scope, authors, "pr_job_log", head_sha=scope.observed_head_sha,
-        )
+    before = _attest_scoped_read(runtime, scope, client, "pr_job_log", scoped_head=True)
+    try:
+        excerpt = _call(lambda: client.get_job_log(scope, job_id, run_id), runtime=runtime, scope=scope)
+    finally:
+        _verify_scoped_read_head(runtime, scope, client, "pr_job_log", before)
     return excerpt
 
 
@@ -2612,10 +2662,7 @@ def _attest_ci_runs(runtime: ToolRuntime[AuthContext] | None, repository: str,
 
 
 def _trusted_ci_head(context: AuthContext, repository: str, run: dict[str, Any]) -> bool:
-    try:
-        from mimir_cultivate.repository import _PROTECTED_BRANCH_REFS
-    except ImportError:  # Compatibility until the repository slice is installed.
-        from mimir.repo_tools import _PROTECTED_BRANCH_REFS
+    from mimir.plugins.core import selected_policy_registry
 
     if not isinstance(run, dict):
         return False
@@ -2627,7 +2674,9 @@ def _trusted_ci_head(context: AuthContext, repository: str, run: dict[str, Any])
         or re.fullmatch(r"[0-9a-f]{40,64}", sha) is None
     ):
         return False
-    if isinstance(branch, str) and f"refs/heads/{branch}" in _PROTECTED_BRANCH_REFS:
+    hooks = selected_policy_registry().policy_consumer_hooks
+    if (hooks is not None and hooks.owner == "cultivate"
+            and isinstance(branch, str) and f"refs/heads/{branch}" in hooks.protected_refs):
         return True
     for inventory in (context.server_discovered_pr_states, context.repo_pr_scope_registry):
         for state in getattr(inventory, "review_states", ()):
@@ -2770,12 +2819,17 @@ def pr_review_requests(
 ) -> list[dict[str, Any]]:
     """List bounded pending review requests for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
-    items = _call(lambda: _client(scope).list_review_requests(scope), runtime=runtime, scope=scope)
-    if all(
+    client = _client(scope)
+    before = _attest_scoped_read(runtime, scope, client, "forge_projection", scoped_head=True)
+    try:
+        items = _call(lambda: client.list_review_requests(scope), runtime=runtime, scope=scope)
+    finally:
+        _verify_scoped_read_head(runtime, scope, client, "forge_projection", before)
+    if not all(
         item.kind in {"user", "team"} and isinstance(item.reviewer, str)
         and _REVIEWER.fullmatch(item.reviewer) is not None for item in items
     ):
-        _publish_trusted_projection(runtime, scope)
+        _publish_author_attestation(runtime, scope, ("",), "pr_review_requests")
     return [asdict(item) for item in items]
 
 
@@ -2839,12 +2893,24 @@ def pr_edit_body(
     repository: str,
     pull_request: int,
     body: str,
+    allow_shrink: bool = False,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Replace only the bound pull request description with bounded literal text."""
+    """Overwrite the ENTIRE bound PR description. Read pr_metadata first and pass
+    the full body including existing sections and Closes lines. A body under 50%
+    of the current body's length is refused unless allow_shrink=true.
+    """
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
-    _call(lambda: _client(scope).edit_pull_request_body(scope, safe_body))
+    client = _client(scope)
+    current = _call(lambda: client.get_pull_request(scope))
+    if not allow_shrink and len(safe_body.encode("utf-8")) * 2 < len(current.body.encode("utf-8")):
+        raise ToolPolicyRefusal(
+            "pr_edit_body refused: new body is under 50% of the current description; "
+            "read pr_metadata and pass the full body, or set allow_shrink=true "
+            "for a deliberate full rewrite"
+        )
+    _call(lambda: client.edit_pull_request_body(scope, safe_body))
     _publish_write_projection(runtime, scope)
     return {"status": "body_updated"}
 
@@ -2936,16 +3002,18 @@ def _emit_unsupported(
     description: str,
     attempted_operations: list[str],
 ) -> bool:
-    key = f"{scope.scope_id}:{operation}"
+    key = f"{scope.canonical_repo}#{scope.pr_number}"
+    fingerprint = f"{scope.observed_head_sha}:{operation}"
     state_path = _escalation_state_path()
     with _escalation_lock:
         try:
-            known = set(json.loads(state_path.read_text(encoding="utf-8")))
+            stored = json.loads(state_path.read_text(encoding="utf-8"))
+            known = stored if isinstance(stored, dict) else {}
         except FileNotFoundError:
-            known = set()
+            known = {}
         except (OSError, ValueError, TypeError) as exc:
             raise ToolException("unsupported operation escalation state is unreadable") from exc
-        if key in known:
+        if known.get(key) == fingerprint:
             return False
 
         from mimir.event_logger import log_durable_event_sync
@@ -2964,7 +3032,7 @@ def _emit_unsupported(
             state_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = state_path.with_suffix(".tmp")
             temporary.write_text(
-                json.dumps(sorted(known | {key}), separators=(",", ":")),
+                json.dumps({**known, key: fingerprint}, sort_keys=True, separators=(",", ":")),
                 encoding="utf-8",
             )
             with temporary.open("rb") as handle:

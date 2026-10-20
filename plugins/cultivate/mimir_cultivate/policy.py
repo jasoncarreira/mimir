@@ -70,11 +70,14 @@ class CultivateState:
         return cls(**values)
 
 
-def register_action_protocol(registrar: PolicyRegistrar, validate_scope: Callable[..., bool]) -> None:
+def register_action_protocol(
+    registrar: PolicyRegistrar, validate_scope: Callable[..., bool], *,
+    checkout_tool: str | None = None,
+) -> None:
     """Bind the vocabulary and grant validator to this selected registrar."""
     registrar.register_scoped_action(
         RepoPRAction, validate_scope, checkout_action=RepoPRAction.CHECKOUT,
-        live_lease=_live_scoped_pr_lease,
+        live_lease=_live_scoped_pr_lease, checkout_tool=checkout_tool,
     )
 
 
@@ -470,6 +473,9 @@ def register_tools(registrar: PolicyRegistrar) -> None:
         revalidate_head=forge.revalidate_review_head_for_context,
         resolve_issue=forge.resolve_issue_comment_target,
         superseded_push=repository.was_superseded_by_own_push,
+        verified_push=repository.was_verified_push,
+        agent_push=repository.was_agent_push,
+        tracked_file=repository.is_tracked_file_in_pr_checkout,
         derive_retained_scope=derive_retained_factory_scope,
         active_checkout=repository.active_pr_checkout_lease_for_path,
         git_command=repository.hardened_git_command,

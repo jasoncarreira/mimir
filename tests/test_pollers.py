@@ -242,7 +242,10 @@ def register(registrar):
 def test_verified_own_push_drops_stale_framework_trigger_before_scope_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.repo_tools import _record_verified_push, was_verified_push
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import core_policy_registry, policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate.repository import _record_verified_push, was_verified_push
     from mimir.models import InformationFlowState
 
     events = []
@@ -258,24 +261,28 @@ def test_verified_own_push_drops_stale_framework_trigger_before_scope_binding(
         base_ref="main", observed_base_sha="b" * 40,
     )
     item = {"event_type": "pr_ci_failure", "repo": scope.canonical_repo,
-            "number": scope.pr_number, "head_sha": old}
+             "number": scope.pr_number, "head_sha": old}
     batch = [{"prompt": "stale", "extras": item}]
-    assert _drop_superseded_github_framework_items(batch) == batch
-    # Simulates record_own_push after a push that verified the remote contains
-    # the new HEAD and proved the previous head an ancestor.
-    ifc = InformationFlowState()
-    ifc.record_own_push(scope.canonical_repo, scope.pr_number, old)
-    _record_verified_push(scope, old, pushed, fast_forward=True)
-    assert was_verified_push(scope.canonical_repo, scope.pr_number, old, pushed)
-    assert _drop_superseded_github_framework_items(batch) == []
-    current = {**item, "head_sha": pushed}
-    assert _drop_superseded_github_framework_items([{"prompt": "current", "extras": current}])
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        assert _drop_superseded_github_framework_items(batch) == batch
+        # Simulates record_own_push after a push that verified the remote contains
+        # the new HEAD and proved the previous head an ancestor.
+        ifc = InformationFlowState()
+        ifc.record_own_push(scope.canonical_repo, scope.pr_number, old)
+        _record_verified_push(scope, old, pushed, fast_forward=True)
+        assert was_verified_push(scope.canonical_repo, scope.pr_number, old, pushed)
+        assert _drop_superseded_github_framework_items(batch) == []
+        current = {**item, "head_sha": pushed}
+        assert _drop_superseded_github_framework_items([{"prompt": "current", "extras": current}])
 
-    monkeypatch.setattr(access_control, "_repo_pr_scope", lambda **kwargs: scope)
-    event = AgentEvent(trigger="poller", channel_id="poller:github-activity",
-                       extra={"items": [item]})
-    service = SimpleNamespace(authority_profile="github")
-    assert access_control._repo_review_state_from_event(event, service) is None
+        monkeypatch.setattr(access_control, "_repo_pr_scope", lambda **kwargs: scope)
+        event = AgentEvent(trigger="poller", channel_id="poller:github-activity",
+                           extra={"items": [item]})
+        service = SimpleNamespace(authority_profile="github")
+        assert access_control._repo_review_state_from_event(event, service) is None
+    with policy_scope(core_policy_registry()):
+        assert _drop_superseded_github_framework_items(batch) == batch
     assert events == [
         ("github_stale_trigger_dropped", {
             "stage": stage, "reason": "superseded_by_verified_own_push",
@@ -358,6 +365,20 @@ def poller_named_secrets(monkeypatch):
     seen = set()
     monkeypatch.setattr("mimir.pollers._poller_named_secrets_seen", seen)
     return seen
+
+
+@pytest.fixture
+def selected_cultivate_policy():
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("shipped Cultivate poller requires installed Cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
 
 
 @pytest.fixture
@@ -910,6 +931,7 @@ def test_github_approved_urls_rejects_other_hosts_with_named_error(
     assert "approved_urls requires a GitHub host" in caplog.text
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_ci_watch_shipped_manifest_authorizes_only_approved_urls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -940,6 +962,7 @@ def test_ci_watch_shipped_manifest_authorizes_only_approved_urls(
 
 
 @pytest.mark.parametrize("manifest_approval", ["declared", "missing", "empty", "nonmatching"])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_github_activity_shipped_manifest_authorizes_scoped_actions_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manifest_approval: str,
 ) -> None:
@@ -1195,6 +1218,7 @@ def test_manifest_rejects_shell_authority_without_job_inspection_companions(
         )
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_github_activity_observed_operations_are_admitted_when_enforced(
     tmp_path: Path,
     repo_review_state: RepoReviewState,
@@ -1264,6 +1288,7 @@ def test_github_activity_observed_operations_are_admitted_when_enforced(
 
 
 @pytest.mark.parametrize("enforce", [True, False])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforce: bool,
 ) -> None:
@@ -1483,6 +1508,7 @@ def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
 @pytest.fixture
 def worklink_incident_github_read_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
+    selected_cultivate_policy,
 ):
     home = (tmp_path / "home").resolve()
     state = home / "state"
@@ -1569,6 +1595,7 @@ def test_worklink_incident_missing_operator_secret_is_denied(
         assert decision.would_block and decision.reason == "read_scope"
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2820,7 +2847,8 @@ def test_github_author_trust_is_server_attested_and_fail_closed(
     monkeypatch.setattr("mimir.pollers._github_api_attestation", fake_api)
 
     if entrypoint == "forge":
-        from mimir.forge.github import GitHubForgeClient
+        pytest.importorskip("mimir_cultivate")
+        from mimir_cultivate.forge import GitHubForgeClient
 
         client = GitHubForgeClient(token="server-token", timeout=2.5)
         verdict = client.author_is_trusted("acme/widget", "alice")
@@ -3723,6 +3751,7 @@ def test_packaged_trusted_system_classification_is_worklink_only() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("factory_kind", ["factory_start", "factory_success"])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 async def test_worklink_turn_kinds_are_trusted_without_ifc_shell_refusal(
     tmp_path: Path,
     home: Path,
@@ -3807,6 +3836,7 @@ consumer["_deliver_factory_transitions"](state, budget)
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("selected_cultivate_policy")
 async def test_external_poller_prose_is_refused_by_ifc_shell_gate(
     tmp_path: Path,
     home: Path,
@@ -5573,7 +5603,7 @@ print(json.dumps({"poller": "x", "prompt": "repair", "delivery_key": "ci:key"}))
 
 
 @pytest.fixture
-def worklink_receipts(home: Path, monkeypatch: pytest.MonkeyPatch):
+def worklink_receipts(home: Path, monkeypatch: pytest.MonkeyPatch, selected_cultivate_policy):
     from mimir.worklink import dispatch_failures as failures
 
     shipped = (
@@ -7996,6 +8026,7 @@ def test_worklink_ready_queue_manifest_forwards_model_and_reasoning_effort() -> 
     ("agent_effort", "override", "source"),
     [("high", None, "agent"), ("low", "high", "worklink_override")],
 )
+@pytest.mark.usefixtures("selected_cultivate_policy")
 async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_spec(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
     agent_effort: str, override: str | None, source: str,
@@ -8104,6 +8135,7 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("selected_cultivate_policy")
 async def test_shipped_github_poller_forwards_operator_bot_allowlist(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

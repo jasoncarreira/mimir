@@ -160,7 +160,9 @@ def test_selected_review_probe_env_uses_provider_identity_without_core_forge(
 def test_selected_checkout_attestation_uses_provider_git_and_rejects_changed_head(
     tmp_path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import access_control as ac, repo_tools
+    import importlib.util
+
+    from mimir import access_control as ac
     from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, RepoReviewState
     from mimir_cultivate import repository
     from tests.test_pr_checkout_lease import _repo_and_scope
@@ -183,25 +185,34 @@ def test_selected_checkout_attestation_uses_provider_git_and_rejects_changed_hea
         ifc_labels=labels, ifc_state=InformationFlowState(labels),
     )
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
-    def core_git_forbidden(*_args, **_kwargs):
-        raise AssertionError("selected checkout consulted retired core Git")
+    assert importlib.util.find_spec("mimir.repo_tools") is None
+    git_command = selected.policy_consumer_hooks.git_command
+    calls = []
 
-    monkeypatch.setattr(repo_tools, "hardened_git_command", core_git_forbidden)
+    def observed_git(*args, **kwargs):
+        calls.append((args, kwargs))
+        return git_command(*args, **kwargs)
+
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks, git_command=observed_git,
+    ))
     with policy_scope(selected):
         assert ac.pr_checkout_lease_attestation(auth, scope, lease).ok
         changed = replace(scope, observed_head_sha="0" * 40)
         assert not ac.pr_checkout_lease_attestation(auth, changed, lease).ok
+    assert calls
 
 
 @pytest.mark.parametrize("enforced", [False, True])
 def test_selected_issue_comment_requires_repository_source_and_owner_resolution(
     monkeypatch: pytest.MonkeyPatch, enforced: bool,
 ) -> None:
+    import importlib.util
+
     from mimir.access_control import (
         CapabilityTier, ToolRegistry, build_trigger_service_principal,
     )
     from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel
-    from mimir.tools import forge as core_forge
     from mimir_cultivate.forge import IssueTarget
 
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo,other/repo")
@@ -212,10 +223,7 @@ def test_selected_issue_comment_requires_repository_source_and_owner_resolution(
         resolved.append((repository, issue))
         return IssueTarget(repository, issue)
 
-    def core_forbidden(*_args):
-        raise AssertionError("selected issue resolution imported retired core forge")
-
-    monkeypatch.setattr(core_forge, "resolve_issue_comment_target", core_forbidden)
+    assert importlib.util.find_spec("mimir.tools.forge") is None
     monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
         selected.policy_consumer_hooks, resolve_issue=owner_resolve,
     ))
@@ -349,6 +357,9 @@ def test_selected_worklink_inventory_importers_use_provider_repository(
         from mimir_cultivate.worklink import merge_closure, orchestrator
 
     assert selected.policy_consumer_hooks.repository_inventory == repository.RepositoryInventory.load
+    assert selected.policy_consumer_hooks.tracked_file is repository.is_tracked_file_in_pr_checkout
+    assert selected.policy_consumer_hooks.verified_push is repository.was_verified_push
+    assert selected.policy_consumer_hooks.agent_push is repository.was_agent_push
     assert registry.valid_repository_slug("owner/repo") == repository.valid_repository_slug("owner/repo")
     assert registry.valid_repository_slug("../repo") == repository.valid_repository_slug("../repo")
     assert merge_closure.RepositoryConfig is repository.RepositoryConfig
@@ -500,3 +511,47 @@ async def test_selected_review_submission_uses_owner_guard_at_middleware_boundar
         assert result.status == "error"
         assert "selected review submission guard unavailable" in str(result.content)
         assert executed == []
+
+
+def test_selected_typed_review_never_uses_legacy_guard_when_owner_hook_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", None)
+    call = SimpleNamespace(
+        policy=selected, tool_name="pr_submit_review",
+        execution_request=SimpleNamespace(tool_call={
+            "name": "pr_submit_review", "args": {
+                "repository": "owner/repo", "pull_request": 152,
+                "verdict": "approve", "body": "Looks good",
+            },
+        }),
+    )
+
+    with pytest.raises(ToolException, match="selected review submission guard unavailable"):
+        budget_gate._review_submission_for_call(call)
+
+
+def test_selected_typed_review_dispatches_through_owner_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = load_plugins(enable="cultivate").policy
+    observed = []
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks,
+        review_submission=lambda request: observed.append(request) or None,
+    ))
+    request = SimpleNamespace(tool_call={
+        "name": "pr_submit_review", "args": {
+            "repository": "owner/repo", "pull_request": 152,
+            "verdict": "approve", "body": "Looks good",
+        },
+    })
+    call = SimpleNamespace(
+        policy=selected, tool_name="pr_submit_review", execution_request=request,
+    )
+
+    assert budget_gate._review_submission_for_call(call) is None
+    assert observed == [request]

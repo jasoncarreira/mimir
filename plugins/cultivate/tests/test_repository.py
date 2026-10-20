@@ -20,24 +20,28 @@ from langchain_core.messages import ToolMessage
 from mimir_cultivate import repository
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.models import RepoPRScopeRegistry
+from mimir.plugins.manager import load_plugins
 from mimir.tools.budget_gate import BudgetGateMiddleware
-from tests.test_budget_gate_and_alias import _ifc_turn, _make_request, _untainted_ifc_auth
+from tests.test_budget_gate_and_alias import (
+    _ifc_turn, _make_request, _repo_granted_auth, _untainted_ifc_auth,
+)
 from tests.test_repo_tools import (
     _configure_worklink_test, _fixture_git_env, _repo_scope_and_state,
 )
 
 
 def test_repository_implementation_is_owned_by_provider() -> None:
-    from mimir import pr_checkout_lease, project_tests, repo_tools, repository_config
-    from mimir.tools import repo
-
-    assert repository.RepoGitTools is not repo_tools.RepoGitTools
-    assert repository.RepoProjectTests is not project_tests.RepoProjectTests
-    assert repository.PRCheckoutLease is not pr_checkout_lease.PRCheckoutLease
-    assert repository.RepositoryInventory is not repository_config.RepositoryInventory
-    assert repository.repo_status is not repo.repo_status
+    root = Path(__file__).resolve().parents[3] / "mimir"
+    for retired in (
+        "repository_config.py", "repo_tools.py", "project_tests.py",
+        "tools/repo.py", "pr_checkout_lease.py",
+    ):
+        assert not (root / retired).exists()
     assert {tool.name for tool in repository.REPO_TOOLS} == {
-        tool.name for tool in repo.REPO_TOOLS
+        "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
+        "repo_diff", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge",
+        "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
+        "repo_revert_abort", "repo_push",
     }
 
     tree = ast.parse(Path(repository.__file__).read_text(encoding="utf-8"))
@@ -50,25 +54,19 @@ def test_repository_implementation_is_owned_by_provider() -> None:
             pytest.fail(f"provider imports retired core repository module: {node.module}")
 
 
-def test_core_repository_compatibility_does_not_import_provider() -> None:
+def test_surviving_core_shell_does_not_import_provider() -> None:
     root = Path(__file__).resolve().parents[3]
-    for name in ("pr_checkout_lease", "repo_tools", "project_tests", "tools/repo"):
-        tree = ast.parse((root / "mimir" / f"{name}.py").read_text(encoding="utf-8"))
-        modules = [
-            node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
-        ]
-        modules.extend(
-            alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
-            for alias in node.names
-        )
-        assert all(not (module or "").startswith("mimir_cultivate") for module in modules)
+    tree = ast.parse((root / "mimir/tools/_shell_env.py").read_text(encoding="utf-8"))
+    modules = [node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
+    modules.extend(
+        alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+        for alias in node.names
+    )
+    assert all(not (module or "").startswith("mimir_cultivate") for module in modules)
 
 
 def test_repository_config_and_parity_are_provider_owned(tmp_path: Path) -> None:
-    from mimir import repo_pr_parity
-
-    assert repository.ParityProbe is not repo_pr_parity.ParityProbe
-    assert repository.run_parity is not repo_pr_parity.run_parity
+    assert not (Path(__file__).resolve().parents[3] / "mimir" / "repo_pr_parity.py").exists()
     assert repository.RepositoryInventory.load(tmp_path / "absent.yaml").declared is False
     report = repository.run_parity(repository.offline_canary_probes())
     assert report["cutover_blocked"] is False
@@ -97,7 +95,9 @@ def test_provider_reacquires_and_inspects_an_exact_pr_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.tools.budget_gate import _hold_scoped_pr_dispatch
+    from mimir.plugins.core import policy_scope
 
+    selected = load_plugins(enable="cultivate").policy
     _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
     previous = state.checkout_lease
     assert previous is not None
@@ -112,12 +112,12 @@ def test_provider_reacquires_and_inspects_an_exact_pr_checkout(
     with pytest.raises(RuntimeError, match="no longer live"):
         with repository.hold_pr_checkout_lease(previous):
             pass
-    with repository.hold_pr_checkout_lease(acquired):
+    with policy_scope(selected), repository.hold_pr_checkout_lease(acquired):
         result = repository.RepoGitTools(state).execute(repository.GitStatus())
     assert result.ok is True
     assert result.code == "ok"
     call = SimpleNamespace(
-        tool_name="repo_status", policy=None,
+        tool_name="repo_status", policy=selected,
         authorization=SimpleNamespace(repo_pr_action_scope=scope),
         auth_context=SimpleNamespace(
             server_discovered_pr_states=None,
@@ -158,9 +158,9 @@ def test_provider_checkout_handoff_and_live_result_observation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     async_mode: bool, operation: str, expiry_point: str | None,
 ) -> None:
-    from mimir import pr_checkout_lease
     from mimir.tools import budget_gate
 
+    selected = load_plugins(enable="cultivate").policy
     _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
     root = state.checkout_lease.lease_root
     if operation == "repo_checkout":
@@ -170,6 +170,9 @@ def test_provider_checkout_handoff_and_live_result_observation(
     auth = replace(
         _untainted_ifc_auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
         repo_review_state=state, repo_pr_action_scope=scope,
+    )
+    auth = _repo_granted_auth(
+        auth, scope, state, follow_on=operation != "repo_checkout", policy=selected,
     )
     calls: list[str] = []
     completed = threading.Event()
@@ -238,8 +241,7 @@ def test_provider_checkout_handoff_and_live_result_observation(
             assert repository.RepoGitTools(state).execute(repository.GitStatus()).ok
         assert lock_is_held()
         if expiry_point is not None:
-            lease_module = repository if operation == "repo_checkout" else pr_checkout_lease
-            monkeypatch.setattr(lease_module, "datetime", LeaseClock)
+            monkeypatch.setattr(repository, "datetime", LeaseClock)
             clock["now"] = lease.expires_at + timedelta(
                 seconds=(1 if expiry_point == "handler" else -1),
             )
@@ -269,9 +271,9 @@ def test_provider_checkout_handoff_and_live_result_observation(
             async def async_handler(req):
                 return handler(req)
 
-            result = asyncio.run(BudgetGateMiddleware().awrap_tool_call(request, async_handler))
+            result = asyncio.run(BudgetGateMiddleware(selected).awrap_tool_call(request, async_handler))
         else:
-            result = BudgetGateMiddleware().wrap_tool_call(request, handler)
+            result = BudgetGateMiddleware(selected).wrap_tool_call(request, handler)
     finally:
         release_competitor.set()
         reset_current_turn(token)

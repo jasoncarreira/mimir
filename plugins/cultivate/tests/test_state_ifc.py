@@ -24,7 +24,7 @@ from mimir.access_control import (
 )
 from mimir.plugins.core import policy_scope
 from mimir.plugins.registry import PolicyRegistry
-from mimir.pr_checkout_lease import create_pr_checkout_lease
+from mimir_cultivate.repository import create_pr_checkout_lease
 from mimir.tools import registry as core_tools
 from tests.test_agent import _FakeAgent, _build_agent
 from tests.test_access_control import _github_scope_test_setup
@@ -318,9 +318,10 @@ def test_selected_ci_ingress_checks_exact_server_issued_target(
 
 @pytest.mark.asyncio
 async def test_selected_retained_ingress_and_ifc_reader(tmp_path, monkeypatch) -> None:
-    await exercise_real_worklink_failure_turn(
-        tmp_path, monkeypatch, selected_provider=True,
-    )
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        await exercise_real_worklink_failure_turn(
+            tmp_path, monkeypatch, selected_provider=True,
+        )
 
 
 def test_rejected_action_cannot_widen_provider_scope() -> None:

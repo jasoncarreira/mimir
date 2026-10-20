@@ -50,6 +50,7 @@ class ScopedActionProtocol:
     validate_scope: Callable[..., bool]
     checkout_action: StrEnum | None = None
     live_lease: Callable[..., Any] | None = None
+    checkout_tool: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,9 @@ class PolicyConsumerHooks:
     revalidate_head: Callable[..., Any]
     resolve_issue: Callable[..., Any]
     superseded_push: Callable[..., bool]
+    verified_push: Callable[..., bool]
+    agent_push: Callable[..., bool]
+    tracked_file: Callable[..., bool]
     derive_retained_scope: Callable[..., Any]
     active_checkout: Callable[..., Any]
     git_command: Callable[..., Any]
@@ -463,6 +467,7 @@ class PolicyRegistry:
                 or not isinstance(hooks, PolicyConsumerHooks) or hooks.owner != owner
                 or any(not callable(getattr(hooks, name)) for name in (
                     "resolve_review", "revalidate_head", "resolve_issue", "superseded_push",
+                    "verified_push", "agent_push", "tracked_file",
                     "derive_retained_scope", "active_checkout", "git_command", "lineage",
                     "verified_base", "git_env", "review_submission", "claim_review",
                     "repository_inventory", "shell_environment",
@@ -474,7 +479,8 @@ class PolicyRegistry:
     def register_scoped_action(
         self, action_type: type[StrEnum], validate_scope: Callable[..., bool],
         *, checkout_action: StrEnum | None = None,
-        live_lease: Callable[..., Any] | None = None, owner: str = "core",
+        live_lease: Callable[..., Any] | None = None,
+        checkout_tool: str | None = None, owner: str = "core",
     ) -> None:
         self._writable()
         if (owner == "core" or owner in self._scoped_actions
@@ -482,11 +488,15 @@ class PolicyRegistry:
                 or not tuple(action_type) or not callable(validate_scope)
                 or (checkout_action is None) != (live_lease is None)
                 or (checkout_action is not None and type(checkout_action) is not action_type)
+                or (checkout_tool is not None and (
+                    checkout_action is None or not isinstance(checkout_tool, str)
+                    or not checkout_tool or checkout_tool != checkout_tool.strip()
+                ))
                 or (live_lease is not None and not callable(live_lease))
                 or any(protocol.action_type is action_type for protocol in self._scoped_actions.values())):
             raise PolicyRegistrationError(f"{owner}: invalid or duplicate scoped action protocol")
         self._scoped_actions[owner] = ScopedActionProtocol(
-            owner, action_type, validate_scope, checkout_action, live_lease,
+            owner, action_type, validate_scope, checkout_action, live_lease, checkout_tool,
         )
 
     def register_poller_hook(self, name: str, hook: Callable[..., Any], *, owner: str = "core") -> None:
@@ -907,6 +917,13 @@ class PolicyRegistry:
         }
 
         validate_tool_descriptors(self.descriptors)
+        for owner, protocol in self._scoped_actions.items():
+            if protocol.checkout_tool is not None:
+                checkout = self._tools.get(protocol.checkout_tool)
+                if (checkout is None or checkout.owner != owner
+                        or checkout.resource_scope != "repo_pr"
+                        or checkout.typed_action is not protocol.checkout_action):
+                    raise PolicyRegistrationError(f"{owner}: invalid checkout tool designation")
         for name, companions in self._capability_companions.items():
             if not companions <= self._capabilities.keys():
                 raise PolicyRegistrationError(f"{name}: unknown companion capability")
@@ -1123,8 +1140,9 @@ class PolicyRegistrar:
         self, action_type: type[StrEnum], validate_scope: Callable[..., bool],
         *, checkout_action: StrEnum | None = None,
         live_lease: Callable[..., Any] | None = None,
+        checkout_tool: str | None = None,
     ) -> None:
         self._registry.register_scoped_action(
             action_type, validate_scope, checkout_action=checkout_action,
-            live_lease=live_lease, owner=self.plugin,
+            live_lease=live_lease, checkout_tool=checkout_tool, owner=self.plugin,
         )
