@@ -23,7 +23,7 @@ from mimir.models import (
     ServerDiscoveredPRStates, TurnInteractivity,
 )
 from mimir.plugins.registry import PolicyRegistry
-from mimir.pr_checkout_lease import active_pr_checkout_lease_for_path, create_pr_checkout_lease
+from mimir_cultivate.repository import active_pr_checkout_lease_for_path, create_pr_checkout_lease
 from mimir.tool_descriptors import ResultOriginKind
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir_cultivate.policy import RepoPRAction, register_action_protocol, validate_scoped_pr_action

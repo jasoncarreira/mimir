@@ -24,7 +24,7 @@ from mimir.access_control import (
 )
 from mimir.plugins.core import policy_scope
 from mimir.plugins.registry import PolicyRegistry
-from mimir.pr_checkout_lease import create_pr_checkout_lease
+from mimir_cultivate.repository import create_pr_checkout_lease
 from mimir.tools import registry as core_tools
 from tests.test_agent import _FakeAgent, _build_agent
 from tests.test_access_control import _github_scope_test_setup
