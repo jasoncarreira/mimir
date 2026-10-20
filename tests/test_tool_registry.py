@@ -180,6 +180,7 @@ def test_coding_tool_is_registered_only_when_enabled_and_available(
 def test_identity_degradation_removes_coding_tools_and_does_not_auto_recover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
     from mimir.tools import all_mimir_tools
     from mimir.plugins.core import policy_scope
     from mimir.plugins.manager import load_plugins
@@ -276,6 +277,7 @@ def test_coding_startup_aggregates_missing_prerequisites(
 
 @pytest.mark.parametrize("degraded", [False, True])
 def test_coding_startup_writable_root_and_identity_gate(monkeypatch, tmp_path, degraded):
+    pytest.importorskip("mimir_cultivate")
     from mimir.tools import all_mimir_tools
     from mimir.tools import registry
     from mimir.plugins.core import policy_scope
@@ -341,14 +343,21 @@ def test_declarative_coding_inventory_does_not_probe_cli_availability(
     assert "spawn_open_code" in names
 
 
+def test_core_only_policy_exposes_no_typed_repo_pr_tools() -> None:
+    from mimir.access_control import _TYPED_REPO_PR_TOOL_ACTIONS
+    from mimir.plugins.core import core_policy_registry
+
+    assert not _TYPED_REPO_PR_TOOL_ACTIONS
+    assert not {name for name, tool in core_policy_registry().tools.items()
+                if tool.resource_scope == "repo_pr"}
+
+
 def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled() -> None:
+    pytest.importorskip("mimir_cultivate")
     from mimir.access_control import (
-        OperationDecision,
         SinkCategory,
         ToolFlowDirection,
         _TYPED_REPO_PR_TOOL_ACTIONS,
-        get_sink_category,
-        get_tool_flow_direction,
     )
     from mimir.tools import all_mimir_tools
     from mimir.plugins.core import policy_scope

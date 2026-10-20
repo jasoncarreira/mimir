@@ -49,6 +49,8 @@ assert not loaded, loaded
 
 @pytest.mark.parametrize("coding_enabled", [False, True])
 def test_runtime_construction_coding_imports(tmp_path, coding_enabled: bool) -> None:
+    if coding_enabled:
+        pytest.importorskip("mimir_cultivate")
     script = textwrap.dedent("""
         import asyncio
         import sys

@@ -9,6 +9,55 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
+
+_RETIRED_CORE_MODULES = {
+    "mimir.forge": "mimir/forge/__init__.py",
+    "mimir.forge.client": "mimir/forge/client.py",
+    "mimir.forge.github": "mimir/forge/github.py",
+    "mimir.pr_checkout_lease": "mimir/pr_checkout_lease.py",
+    "mimir.project_tests": "mimir/project_tests.py",
+    "mimir.repo_pr_parity": "mimir/repo_pr_parity.py",
+    "mimir.repo_tools": "mimir/repo_tools.py",
+    "mimir.repository_config": "mimir/repository_config.py",
+    "mimir.tools.forge": "mimir/tools/forge.py",
+    "mimir.tools.github_review_guard": "mimir/tools/github_review_guard.py",
+    "mimir.tools.repo": "mimir/tools/repo.py",
+}
+
+
+def _imported_names(node: ast.AST, package: str) -> tuple[str, ...]:
+    if isinstance(node, ast.Import):
+        return tuple(alias.name for alias in node.names)
+    if isinstance(node, ast.ImportFrom):
+        name = "." * node.level + (node.module or "")
+        origin = importlib.util.resolve_name(name, package) if node.level else name
+        return (origin, *(f"{origin}.{alias.name}" for alias in node.names))
+    return ()
+
+
+def _retired_import(name: str) -> bool:
+    return any(name == module or name.startswith(module + ".")
+               for module in _RETIRED_CORE_MODULES)
+
+
+@pytest.mark.parametrize(("source", "package", "imported"), [
+    ("from mimir import forge", "mimir", "mimir.forge"),
+    ("from mimir.tools import repo", "mimir.tools", "mimir.tools.repo"),
+    ("from . import github_review_guard", "mimir.tools", "mimir.tools.github_review_guard"),
+    ("from ..forge import github", "mimir.worklink", "mimir.forge.github"),
+    ("import mimir.pr_checkout_lease", "mimir", "mimir.pr_checkout_lease"),
+    ("from mimir import project_tests", "mimir", "mimir.project_tests"),
+])
+def test_retired_coding_import_aliases_are_detected(
+    source: str, package: str, imported: str,
+) -> None:
+    names = {name for node in ast.walk(ast.parse(source))
+             for name in _imported_names(node, package)}
+    assert imported in names
+    assert any(_retired_import(name) for name in names)
+
 
 def test_proposal_git_environment_is_core_only() -> None:
     script = """
@@ -57,6 +106,7 @@ assert 'mimir_cultivate' not in sys.modules
 
 
 def test_offline_parity_runs_from_provider_without_core_parity_module() -> None:
+    pytest.importorskip("mimir_cultivate")
     script = """
 import sys
 from mimir_cultivate.repository import offline_canary_probes, run_parity
@@ -73,9 +123,11 @@ assert 'mimir.repo_pr_parity' not in sys.modules
     assert result.returncode == 0, result.stderr
 
 
-def test_repository_inventory_import_closure() -> None:
+def test_retired_coding_modules_have_no_surviving_importers() -> None:
     root = Path(__file__).resolve().parents[3]
-    retired = {"mimir.repository_config", "mimir.repo_pr_parity"}
+    for module, relative_path in _RETIRED_CORE_MODULES.items():
+        assert not (root / relative_path).exists(), module
+    assert not list((root / "mimir/forge").rglob("*.py"))
     for source_root in (root / "mimir", root / "plugins/cultivate/mimir_cultivate"):
         for path in source_root.rglob("*.py"):
             module = ".".join(path.relative_to(root).with_suffix("").parts)
@@ -83,14 +135,8 @@ def test_repository_inventory_import_closure() -> None:
                 module = ".".join(("mimir_cultivate", *path.relative_to(source_root).with_suffix("").parts))
             package = module.removesuffix(".__init__") if path.stem == "__init__" else module.rpartition(".")[0]
             for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-                if isinstance(node, ast.Import):
-                    names = (alias.name for alias in node.names)
-                elif isinstance(node, ast.ImportFrom):
-                    name = "." * node.level + (node.module or "")
-                    names = (importlib.util.resolve_name(name, package),) if node.level else (name,)
-                else:
-                    continue
-                assert not retired.intersection(names), f"{path}: retired module import"
+                for name in _imported_names(node, package):
+                    assert not _retired_import(name), f"{path}: retired module import {name}"
 
 
 def test_core_only_config_boots_with_repository_file_without_loading_provider(tmp_path: Path) -> None:
@@ -115,6 +161,7 @@ assert 'mimir_cultivate' not in sys.modules
 
 
 def test_selected_repository_inventory_uses_registered_owner(tmp_path: Path) -> None:
+    pytest.importorskip("mimir_cultivate")
     (tmp_path / "repositories.yaml").write_text("repositories: []\n", encoding="utf-8")
     script = """
 import sys

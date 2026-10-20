@@ -420,6 +420,7 @@ def test_selected_repo_result_requires_receipt_despite_attested_lease(
     assert auth.ifc_state.has_untrusted_active_ingest()
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_result_without_author_verdict_stays_blocking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login,
 ) -> None:
@@ -581,6 +582,7 @@ async def test_repo_test_post_execution_refusal_labels(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("selected_repository_policy")
 async def test_missing_selector_is_pre_execution_policy_refusal_and_allows_rerun(
     tmp_path, monkeypatch,
 ):
@@ -674,6 +676,7 @@ def test_failed_pr_rerequest_review_keeps_plugin_result_incomplete():
 
 
 @pytest.mark.parametrize("change", ["wrong_scope"])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_failed_repo_test_provenance_is_incomplete_even_for_exact_bounded_summary(change, tmp_path):
     from copy import deepcopy
     from mimir.access_control import ProtectedResultProvenance
@@ -762,6 +765,7 @@ def test_failed_repo_test_provenance_is_incomplete_even_for_exact_bounded_summar
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("selected_repository_policy")
 async def test_repo_test_scope_resolution_fault_publishes_no_attestation(monkeypatch):
     from langchain_core.tools import ToolException
     from mimir_cultivate import repository as repo
@@ -928,6 +932,7 @@ def test_failed_git_operation_keeps_only_attested_origin(
 
 
 @pytest.mark.parametrize("binding", ["remote", "origin_url"])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_failed_git_operation_rejects_misbound_remote_and_unresolved_scope(tmp_path, monkeypatch, binding):
     from langchain_core.tools import ToolException
     from mimir_cultivate.repository import GitRefusal
@@ -1275,6 +1280,7 @@ def test_ci_classifier_refuses_nonretained_plugin_provenance(monkeypatch, tool_n
     ("checkout_ref", "refs/pull/8/head",
      'or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")'),
 ])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_temporary_forge_guard_mutants_are_killed(tmp_path, monkeypatch, field, value, guard):
     import inspect
     from mimir_cultivate import forge
@@ -2344,6 +2350,7 @@ def test_retired_repository_refusal_cannot_claim_content_free_trust() -> None:
     assert exact.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_status>"
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_interpolated_git_output_cannot_claim_fixed_pre_execution_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2383,6 +2390,7 @@ def test_interpolated_git_output_cannot_claim_fixed_pre_execution_refusal(
     assert labels is not None and labels.has_untrusted_active_ingest
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_git_started_cannot_publish_fixed_refusal_as_content_free(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

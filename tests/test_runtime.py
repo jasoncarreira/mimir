@@ -897,6 +897,7 @@ async def test_runtime_preflight_recovers_after_bounded_transient_retries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
     import mimir.event_logger
     from mimir_cultivate.forge import (
         GitHubIdentityFailureKind,
@@ -1040,6 +1041,7 @@ async def test_runtime_preflight_never_retries_permanent_identity_latch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
     import mimir.event_logger
     from mimir_cultivate.forge import GitHubIdentityVerificationError
     from mimir_cultivate import forge as forge_tools
@@ -1927,6 +1929,7 @@ async def test_factory_rollback_task_timeout_continues_reverse_closers_and_rerai
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
     import mimir.background_tasks
     import mimir.event_logger
     import mimir.saga_client
@@ -2166,6 +2169,7 @@ async def test_non_web_entrypoint_builds_and_closes_real_agent_graph(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:test")
     from mimir.channel_registry import ChannelRegistry

@@ -699,6 +699,7 @@ def test_github_text_credentials_are_refused_on_both_paths(
     tool_name: str,
     argument: str,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
     monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
     monkeypatch.setattr(
@@ -713,16 +714,11 @@ def test_github_text_credentials_are_refused_on_both_paths(
     }
     executed: list[bool] = []
 
-    from importlib.metadata import PackageNotFoundError, version
     from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
     from mimir.models import RepoPRScopeRegistry
     from mimir.plugins.manager import load_plugins
     from tests.test_repo_tools import _repo_scope_and_state
 
-    try:
-        version("mimir-cultivate")
-    except PackageNotFoundError:
-        pytest.skip("repository tools require installed Cultivate")
     _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
     selected = load_plugins(enable="cultivate").policy

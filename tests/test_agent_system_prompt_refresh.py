@@ -221,6 +221,7 @@ async def test_build_agent_does_not_route_invalid_lease_root(
 async def test_build_agent_rebuilds_without_coding_tools_after_identity_latch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     agent = _make_agent(tmp_path, monkeypatch)
     from mimir.plugins.manager import load_plugins
