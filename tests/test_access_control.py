@@ -64,6 +64,16 @@ from mimir.pr_checkout_lease import PRCheckoutLease, _metadata
 from mimir.tool_descriptors import TOOL_DESCRIPTORS
 
 
+@pytest.mark.parametrize("revision", ["HEAD~4..HEAD", "origin/feature/plugins...HEAD"])
+def test_repo_review_git_range_refusal_names_token(revision: str) -> None:
+    from mimir.access_control import _service_shell_not_admitted_reason
+
+    reason = _service_shell_not_admitted_reason(
+        ["git", "diff", "--stat", revision], "repo_review",
+    )
+    assert f"revision range {revision} is not bound to this lease; use repo_diff" in reason
+
+
 def _egress_shadow_auth(*, tainted: bool = True) -> AuthContext:
     labels = InformationFlowLabels().with_source(SourceLabel(
         principal="owner", domain="channel", resource_id="web:origin",

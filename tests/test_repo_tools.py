@@ -5,6 +5,7 @@ import errno
 import fcntl
 import base64
 from dataclasses import asdict, replace
+from importlib.metadata import PackageNotFoundError, version
 import json
 import functools
 import grp
@@ -34,15 +35,11 @@ from langchain_core.tools import ToolException
 
 from tests.lease_attestation_helper import assert_lease_attested
 
+try:
+    version("mimir-cultivate")
+except PackageNotFoundError:
+    pytest.skip("repository tooling requires installed Cultivate", allow_module_level=True)
 
-@pytest.mark.parametrize("revision", ["HEAD~4..HEAD", "origin/feature/plugins...HEAD"])
-def test_repo_review_git_range_refusal_names_token(revision):
-    from mimir.access_control import _service_shell_not_admitted_reason
-
-    reason = _service_shell_not_admitted_reason(
-        ["git", "diff", "--stat", revision], "repo_review",
-    )
-    assert f"revision range {revision} is not bound to this lease; use repo_diff" in reason
 
 from mimir.contained_execution import (
     CollectedExecutionResult,
@@ -58,7 +55,7 @@ from mimir.pr_checkout_lease import (
     hold_pr_checkout_lease,
     recover_pr_checkout_lease,
 )
-from mimir.project_tests import (
+from mimir_cultivate.repository import (
     _TIMEOUT_SECONDS,
     ProjectTestRefusal,
     ProjectTestResult,
@@ -91,7 +88,14 @@ from mimir.repo_tools import (
     was_agent_push,
 )
 from mimir.tools.refusals import ToolPolicyRefusal
-from mimir.worklink.worker_client import StaleWorkerExecutorError
+
+
+@pytest.fixture(autouse=True)
+def provider_test_identities(monkeypatch, synthetic_worklink_identities):
+    if synthetic_worklink_identities is not None:
+        from mimir_cultivate import repository
+
+        monkeypatch.setattr(repository, "get_identities", lambda: synthetic_worklink_identities)
 
 
 def test_pr_lease_is_continuous_and_identity_changes_on_reacquisition(tmp_path: Path) -> None:
@@ -236,7 +240,7 @@ def test_bounded_subprocess_runner_killpg_guard(monkeypatch, error):
     ("test_snapshot_credentials_refused", False, "refuse"),
 ])
 async def test_remediation_publication_decision_table(monkeypatch, code, scoped, decision):
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate import repository as repo_module
 
     result_codes = {
         "tests_passed", "tests_failed", "test_timeout",
@@ -2527,7 +2531,7 @@ async def test_project_suite_selection_and_snapshot_argv(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("// fixture\n")
     # Resolve npm independently of the host's installation and symlink layout.
-    monkeypatch.setattr("mimir.project_tests.shutil.which", lambda *a, **k: "/usr/bin/true")
+    monkeypatch.setattr("mimir_cultivate.repository.shutil.which", lambda *a, **k: "/usr/bin/true")
     issued = []
     calls = []
 
@@ -2591,7 +2595,7 @@ async def test_project_suite_selection_refuses_without_execution(
 def test_selector_helper_drives_inference_and_refusal_message(
     repo_tools, tmp_path, monkeypatch,
 ):
-    import mimir.project_tests as project_tests
+    from mimir_cultivate import repository as project_tests
 
     state = repo_tools[-2]
     home = tmp_path / "home"
@@ -2727,7 +2731,7 @@ async def test_frontend_result_preserves_bounded_failure_reporting(
     home = tmp_path / "home"
     _configure_test_suites(home, state)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.setattr("mimir.project_tests.shutil.which", lambda *a, **k: "/usr/bin/true")
+    monkeypatch.setattr("mimir_cultivate.repository.shutil.which", lambda *a, **k: "/usr/bin/true")
 
     async def runner(*args, **kwargs):
         return CollectedExecutionResult(exit_code, b"x" * 9000, b"e" * 5000, timed_out, overflow, 0, 0)
@@ -3436,7 +3440,7 @@ def test_project_test_missing_selector_has_named_non_disclosing_refusal(
 
 
 def test_pytest_failure_summary_is_bounded_and_uses_last_section_only():
-    from mimir.project_tests import pytest_failure_summary
+    from mimir_cultivate.repository import pytest_failure_summary
 
     ids = "".join(f"FAILED tests/test_a.py::test_{i} - reason\n" for i in range(55))
     output = (
@@ -3563,14 +3567,14 @@ async def test_public_repo_test_credential_fault_persists_no_sensitive_material(
     suite,
 ) -> None:
     import mimir.event_logger as event_logger
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate import repository as repo_module
 
     state = repo_tools[-2]
     home = tmp_path / "controller-config"
     _configure_worklink_test(home)
     if suite is not None:
         _configure_test_suites(home, state)
-        monkeypatch.setattr("mimir.project_tests.shutil.which", lambda *a, **k: "/usr/bin/true")
+        monkeypatch.setattr("mimir_cultivate.repository.shutil.which", lambda *a, **k: "/usr/bin/true")
     monkeypatch.setenv("MIMIR_HOME", str(home))
     credential_path = state.checkout_lease.path / "nested" / "credentials.json"
     credential_path.parent.mkdir()
@@ -3643,7 +3647,7 @@ async def test_project_test_containment_unavailable_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     failure: Exception,
 ) -> None:
-    from mimir import project_tests as project_tests_module
+    from mimir_cultivate import repository as project_tests_module
 
     state = repo_tools[-2]
     home = tmp_path / "home"
@@ -3680,7 +3684,8 @@ async def test_project_test_names_stale_root_executor_and_rebuild_action(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import project_tests as project_tests_module
+    from mimir_cultivate import repository as project_tests_module
+    from mimir_cultivate.worklink.worker_client import StaleWorkerExecutorError
 
     state = repo_tools[-2]
     home = tmp_path / "home"
@@ -3718,7 +3723,7 @@ async def test_project_test_permission_refusal_names_path_metadata_and_identity(
     monkeypatch: pytest.MonkeyPatch,
     synthetic_worklink_identities,
 ) -> None:
-    from mimir import project_tests as project_tests_module
+    from mimir_cultivate import repository as project_tests_module
 
     state = repo_tools[-2]
     home = tmp_path / "home"
@@ -3916,7 +3921,7 @@ async def test_project_test_snapshot_is_removed_after_execution(
 async def test_project_test_snapshot_cleanup_failure_is_not_silent(
     repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import project_tests as project_tests_module
+    from mimir_cultivate import repository as project_tests_module
 
     state = repo_tools[-2]
     home = tmp_path / "home"
@@ -4565,7 +4570,7 @@ async def _red_run_after_lineage(monkeypatch, scope, state, turn):
         classify_protected_result, end_protected_result_capture,
     )
     from mimir.models import InformationFlowLabels
-    from mimir.project_tests import ProjectTestResult, pytest_failure_summary, remember_node_inventory, pytest_node_inventory
+    from mimir_cultivate.repository import ProjectTestResult, pytest_failure_summary, remember_node_inventory, pytest_node_inventory
     from mimir.tools import repo
     lease = state.checkout_lease
     (lease.path / "tests").mkdir(exist_ok=True)
