@@ -157,7 +157,7 @@ def test_middleware_dispatch_holds_checkout_through_observation(tmp_path: Path) 
 
 
 def test_repo_rebase_description_matches_history_rewrite_events():
-    from mimir.tools.repo import repo_rebase
+    from mimir_cultivate.repository import repo_rebase
 
     description = repo_rebase.description  # The description exposed to the model.
     assert "Available only on turns for history-rewrite event types" in description
@@ -171,7 +171,7 @@ def test_repo_rebase_description_matches_history_rewrite_events():
 
 
 def test_repo_merge_description_is_default_base_update_path():
-    from mimir.tools.repo import repo_merge
+    from mimir_cultivate.repository import repo_merge
 
     description = repo_merge.description
     assert "default way to update a PR branch with its base" in description
@@ -191,7 +191,7 @@ def test_repo_merge_description_is_default_base_update_path():
 @pytest.mark.parametrize("error", [PermissionError, ProcessLookupError, OSError],
                          ids=["EPERM", "ESRCH", "EINVAL"])
 def test_bounded_subprocess_runner_killpg_guard(monkeypatch, error):
-    from mimir import repo_tools
+    from mimir_cultivate import repository as repo_tools
 
     process = Mock(pid=12345)
     process.wait.return_value = -signal.SIGKILL
@@ -3001,7 +3001,7 @@ async def test_project_test_short_output_and_missing_summary(
 async def test_repo_test_raw_result_leads_with_parsed_summary_when_available(
     repo_tools, monkeypatch, complete,
 ):
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate import repository as repo_module
 
     state = repo_tools[-2]
     monkeypatch.setattr(repo_module, "_state", lambda *args: state)
@@ -4611,7 +4611,7 @@ def test_inactive_checkout_refusal_does_not_veto_next_lease_write(
 def test_repo_wrapper_git_stderr_redacts_embedded_remote_credential(
     repo_tools, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate import repository as repo_module
 
     secret_url = "https://agent:super-secret-password@example.invalid/owner/repo.git"
 
@@ -4775,7 +4775,7 @@ def test_recorded_inventory_unresolvable_key_fails_closed(tmp_path, monkeypatch)
     <= 3.12, where Path.resolve raises) must fail closed, never crash result
     classification. Simulated so the test does not depend on the Python
     version's resolve() semantics (3.13 returns the looped path instead)."""
-    from mimir import project_tests
+    from mimir_cultivate import repository as project_tests
 
     project_tests.remember_node_inventory(tmp_path, "scope-loop", frozenset({"x"}))
 
