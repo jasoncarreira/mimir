@@ -775,59 +775,6 @@ async def test_repo_test_non_summary_results_keep_original_shape(tmp_path, monke
 
 
 @pytest.mark.parametrize("verdict", [True, False, None])
-@pytest.mark.parametrize("operation", [
-    "repo_status", "repo_diff", "repo_unmerged", "repo_stage",
-    "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase",
-    "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push",
-])
-def test_successful_git_operations_publish_only_attested_lease(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login, verdict, operation,
-) -> None:
-    from mimir.repo_tools import GitOperationResult
-    from mimir.tools import repo
-
-    monkeypatch.setattr(access_control_module, "_lease_head_is_author_attested", _self_login)
-    auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
-    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
-    state = auth.repo_review_state
-    assert state is not None
-    monkeypatch.setattr(repo, "_state", lambda *_: state)
-
-    class FakeGit:
-        execution_started = False
-
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def execute(self, _operation):
-            return GitOperationResult(True, "ok")
-
-    monkeypatch.setattr(repo, "RepoGitTools", FakeGit)
-    arguments = {
-        "repo_stage": {"paths": ("work.py",)},
-        "repo_commit": {"paths": ("work.py",), "message": "update"},
-        "repo_rebase": {}, "repo_revert": {"commit": scope.observed_head_sha},
-    }.get(operation, {})
-    tool = getattr(repo, operation)
-    token = begin_protected_result_capture()
-    try:
-        result = tool.func("owner/repo", 7, runtime=SimpleNamespace(context=auth), **arguments)
-    finally:
-        provenance = end_protected_result_capture(token)
-    labels = classify_protected_result(
-        operation, {"repository": "owner/repo", "pull_request": 7}, auth,
-        ToolAuthorization(tool_name=operation, decision="resource_scoped", allowed=True,
-                          repo_pr_action_scope=scope), result=result, provenance=provenance,
-    )
-    if operation == "repo_stage" and verdict is not True:
-        assert labels is None  # stage acknowledgements do not ingest without provenance
-        return
-    assert len(labels.sources) == 1
-    assert labels.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
-    assert labels.sources[0].integrity == ("trusted" if verdict is True else "untrusted")
-
-
-@pytest.mark.parametrize("verdict", [True, False, None])
 def test_selected_repo_fetch_requires_follow_on_grant_and_stays_incomplete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: bool | None,
 ) -> None:
@@ -838,10 +785,10 @@ def test_selected_repo_fetch_requires_follow_on_grant_and_stays_incomplete(
     except PackageNotFoundError:
         pytest.skip("requires installed Cultivate")
     from mimir_cultivate.policy import RepoPRAction
-    from tests.test_repo_tools import _selected_checkout_and_fetch_with_live_grants
+    from tests.test_repo_tools import _selected_checkout_and_follow_on_with_live_grants
 
     selected, scope, checkout_auth, follow_on, checked_out, fetched = (
-        _selected_checkout_and_fetch_with_live_grants(
+        _selected_checkout_and_follow_on_with_live_grants(
             tmp_path, monkeypatch, author_trust=verdict,
         )
     )
@@ -863,71 +810,77 @@ def test_selected_repo_fetch_requires_follow_on_grant_and_stays_incomplete(
     assert source.resource_id == "<unresolved-resource:protected_tool:repo_fetch>"
 
 
+@pytest.mark.parametrize("operation", [
+    "repo_status", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
+    "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
+    "repo_revert", "repo_revert_abort", "repo_push",
+])
+@pytest.mark.parametrize("verdict", [True, False, None])
+def test_selected_git_operations_require_live_owner_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, verdict: bool | None,
+) -> None:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
+    from tests.test_repo_tools import _selected_checkout_and_follow_on_with_live_grants
+
+    selected, scope, checkout_auth, follow_on, checked_out, result = (
+        _selected_checkout_and_follow_on_with_live_grants(
+            tmp_path, monkeypatch, operation=operation, author_trust=verdict,
+        )
+    )
+    assert selected.tools[operation].owner == "cultivate"
+    assert checked_out.status != "error"
+    assert result.status != "error", result.content
+    action = selected.tools[operation].typed_action
+    grant = follow_on.scoped_pr_grants.get("cultivate", scope, action.value, checkout=False)
+    lease = follow_on.repo_review_state.checkout_lease
+    assert grant is not None
+    assert grant.lease_identity == (str(lease.path), lease.recovery_id)
+    assert checkout_auth.ifc_state.has_untrusted_active_ingest()
+    (source,) = follow_on.ifc_state.current(follow_on.ifc_labels).sources
+    assert (source.integrity, source.resource_id) == (
+        "untrusted", f"<unresolved-resource:protected_tool:{operation}>",
+    )
+
+
 @pytest.mark.parametrize("operation", ["repo_merge", "repo_rebase", "repo_push"])
 @pytest.mark.parametrize("verdict", [True, False])
 def test_failed_git_operation_keeps_only_attested_origin(
     tmp_path, monkeypatch, operation, verdict,
 ):
-    from mimir.repo_tools import GitOperationResult
-    from mimir.tools import repo
-    from mimir import event_logger
+    from importlib.metadata import PackageNotFoundError, version
 
-    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
-    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
-    monkeypatch.setattr(repo, "_state", lambda *_: auth.repo_review_state)
-    events = []
-    monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **fields: events.append((name, fields)))
-
-    class FailedGit:
-        execution_started = True
-
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def execute(self, _operation):
-            return GitOperationResult(False, "merge_conflict", stderr="distinctive SECRET error text")
-
-    monkeypatch.setattr(repo, "RepoGitTools", FailedGit)
-    token = begin_protected_result_capture()
     try:
-        result = getattr(repo, operation).func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
-    finally:
-        provenance = end_protected_result_capture(token)
-    labels = classify_protected_result(
-        operation, {"repository": "owner/repo", "pull_request": 7}, auth,
-        ToolAuthorization(tool_name=operation, decision="resource_scoped", allowed=True,
-                          repo_pr_action_scope=scope), result=result, provenance=provenance, failed=True,
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
+    from tests.test_repo_tools import _selected_checkout_and_follow_on_with_live_grants
+
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda name, **fields: events.append((name, fields)),
     )
-    assert labels.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
-    assert labels.sources[0].integrity == ("trusted" if verdict else "untrusted")
-    auth.ifc_state.merge(labels)
+    selected, scope, _, follow_on, _, result = _selected_checkout_and_follow_on_with_live_grants(
+        tmp_path, monkeypatch, operation=operation, author_trust=verdict, git_ok=False,
+    )
+    assert selected.tools[operation].owner == "cultivate"
+    assert result.status != "error", result.content
+    assert json.loads(result.content)["ok"] is False
+    (source,) = follow_on.ifc_state.current(follow_on.ifc_labels).sources
+    assert (source.integrity, source.resource_id) == (
+        "untrusted", f"<unresolved-resource:protected_tool:{operation}>",
+    )
     decision = SinkGate.check_sink_flow(
         "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
-        auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
+        follow_on.ifc_labels, follow_on, enforce=False, repo_pr_action_scope=scope,
     )
-    assert decision.allowed is verdict
-    if not verdict:
-        assert decision.reason == "write_blocked_by_untrusted_ingest"
-        assert decision.refusal_detail == access_control_module._TAINTED_WRITE_REFUSAL
-        assert events == [
-            ("pr_checkout_lease_attestation_refused", {
-                "scope_id": scope.scope_id, "reason": "no_author_trust",
-            }),
-            ("repository_result_untrusted_default", {
-                "tool": operation, "scope_id": scope.scope_id,
-                "pr_number": scope.pr_number, "observed_head_sha": scope.observed_head_sha,
-                "reason": "no_published_provenance",
-            }),
-            ("write_blocked_by_untrusted_ingest", {
-                "tool": "repo_test", "sources": [{
-                    "domain": "repository",
-                    "resource_id": f"owner/repo#pull/7@{scope.observed_head_sha}",
-                }], "remaining_sources": 0,
-            }),
-        ]
-    else:
-        assert len(events) == 1
-        assert events[0][0] == "repository_failure_provenance_retained"
+    assert not decision.allowed
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
     assert "distinctive" not in str(events)
 
 

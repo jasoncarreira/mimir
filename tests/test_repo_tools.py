@@ -421,8 +421,10 @@ def _lineage_turn(scope, state, *, tainted=False):
     )
 
 
-def _selected_checkout_and_fetch_with_live_grants(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, author_trust: bool | None = True,
+def _selected_checkout_and_follow_on_with_live_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *,
+    operation: str = "repo_fetch", author_trust: bool | None = True,
+    git_ok: bool = True,
 ):
     from langchain.agents.middleware import ToolCallRequest
     from langchain_core.messages import ToolMessage
@@ -457,33 +459,48 @@ def _selected_checkout_and_fetch_with_live_grants(
     )
     monkeypatch.setattr(selected_forge, "remediation_checkout_preflight", lambda *_: (state, None))
     monkeypatch.setattr(selected_forge, "_client", lambda _: object())
+    git_operations = []
+    if operation != "repo_fetch":
+        def execute(_tools, git_operation):
+            git_operations.append(type(git_operation).__name__)
+            return repository.GitOperationResult(
+                git_ok, "ok" if git_ok else "merge_conflict",
+                stderr="" if git_ok else "distinctive SECRET error text",
+            )
 
-    def request_for(tool, identifier, context):
+        monkeypatch.setattr(repository.RepoGitTools, "execute", execute)
+
+    arguments = {
+        "repo_stage": {"paths": ("tracked.txt",)},
+        "repo_commit": {"paths": ("tracked.txt",), "message": "update"},
+        "repo_revert": {"commit": scope.observed_head_sha},
+    }.get(operation, {})
+
+    def request_for(tool, identifier, context, *, extra=None):
         return ToolCallRequest(
             tool_call={"name": tool.name, "args": {
                 "repository": scope.canonical_repo, "pull_request": scope.pr_number,
+                **(extra or {}),
             }, "id": identifier, "type": "tool_call"},
             tool=tool, state={}, runtime=Runtime(context=context),
         )
 
     calls = []
     def handler(call):
-        tool = (
-            repository.repo_checkout if call.tool_call["name"] == "repo_checkout"
-            else repository.repo_fetch
-        )
+        tool = getattr(repository, call.tool_call["name"])
         calls.append(tool.name)
         runtime = ToolRuntime(
             state={}, context=call.runtime.context, config={}, stream_writer=lambda _: None,
             tool_call_id=call.tool_call["id"], store=None,
         )
-        result = tool.func(scope.canonical_repo, scope.pr_number, runtime=runtime)
+        result = tool.func(**call.tool_call["args"], runtime=runtime)
         return ToolMessage(content=json.dumps(result), tool_call_id=call.tool_call["id"])
 
     with policy_scope(selected):
         gate = BudgetGateMiddleware(selected)
+        follow_on_tool = getattr(repository, operation)
         before_checkout = gate.wrap_tool_call(
-            request_for(repository.repo_fetch, "prelease-fetch", auth), handler,
+            request_for(follow_on_tool, "prelease-operation", auth, extra=arguments), handler,
         )
         assert before_checkout.status == "error"
         assert "repo_pr_grant_denied" in str(before_checkout.content)
@@ -509,18 +526,20 @@ def _selected_checkout_and_fetch_with_live_grants(
         assert observe_scoped_pr_checkout(
             follow_on, scope, state, token, "cultivate", selected.scoped_actions["cultivate"],
         )
-        fetched = gate.wrap_tool_call(
-            request_for(repository.repo_fetch, "selected-fetch", follow_on), handler,
+        executed = gate.wrap_tool_call(
+            request_for(follow_on_tool, "selected-operation", follow_on, extra=arguments), handler,
         )
-        assert fetched.status != "error", fetched.content
-        assert calls == ["repo_checkout", "repo_fetch"]
-    return selected, scope, auth, follow_on, checked_out, fetched
+        assert executed.status != "error", executed.content
+        assert calls == ["repo_checkout", operation]
+        if operation != "repo_fetch":
+            assert len(git_operations) == 1
+    return selected, scope, auth, follow_on, checked_out, executed
 
 
 def test_selected_checkout_and_fetch_use_live_owner_grants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, _, _, _, checked_out, fetched = _selected_checkout_and_fetch_with_live_grants(
+    _, _, _, _, checked_out, fetched = _selected_checkout_and_follow_on_with_live_grants(
         tmp_path, monkeypatch,
     )
     assert checked_out.status != "error", checked_out.content
