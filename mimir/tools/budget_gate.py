@@ -3939,7 +3939,7 @@ def _review_submission_for_call(call: _PreparedToolCall) -> Any:
     if hooks is not None:
         return hooks.review_submission(call.execution_request)
     if getattr(selected, "_projected_owner", None) is not None and call.tool_name in {
-        "shell_exec", "bash_async", "Bash", "bash",
+        "shell_exec", "bash_async", "Bash", "bash", "pr_submit_review",
     }:
         raise ToolException("selected review submission guard unavailable")
     if call.tool_name not in {"shell_exec", "bash_async", "Bash", "bash", "pr_submit_review"}:

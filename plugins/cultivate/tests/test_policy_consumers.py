@@ -503,3 +503,47 @@ async def test_selected_review_submission_uses_owner_guard_at_middleware_boundar
         assert result.status == "error"
         assert "selected review submission guard unavailable" in str(result.content)
         assert executed == []
+
+
+def test_selected_typed_review_never_uses_legacy_guard_when_owner_hook_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import budget_gate
+
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", None)
+    call = SimpleNamespace(
+        policy=selected, tool_name="pr_submit_review",
+        execution_request=SimpleNamespace(tool_call={
+            "name": "pr_submit_review", "args": {
+                "repository": "owner/repo", "pull_request": 152,
+                "verdict": "approve", "body": "Looks good",
+            },
+        }),
+    )
+
+    with pytest.raises(ToolException, match="selected review submission guard unavailable"):
+        budget_gate._review_submission_for_call(call)
+
+
+def test_selected_typed_review_dispatches_through_owner_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = load_plugins(enable="cultivate").policy
+    observed = []
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks,
+        review_submission=lambda request: observed.append(request) or None,
+    ))
+    request = SimpleNamespace(tool_call={
+        "name": "pr_submit_review", "args": {
+            "repository": "owner/repo", "pull_request": 152,
+            "verdict": "approve", "body": "Looks good",
+        },
+    })
+    call = SimpleNamespace(
+        policy=selected, tool_name="pr_submit_review", execution_request=request,
+    )
+
+    assert budget_gate._review_submission_for_call(call) is None
+    assert observed == [request]
