@@ -65,7 +65,7 @@ from mimir_cultivate.repository import (
     _validated_selectors,
     _configured_command,
 )
-from mimir.repo_tools import (
+from mimir_cultivate.repository import (
     GitCommit,
     GitDiff,
     GitFetch,
@@ -952,7 +952,7 @@ def test_rebase_refuses_unprotected_base_ref(tmp_path: Path) -> None:
 
 def test_lineage_refuses_attested_base_not_descending_from_observed(tmp_path: Path) -> None:
     from mimir import access_control
-    from mimir.pr_checkout_lease import _METADATA, _metadata
+    from mimir_cultivate.repository import _METADATA, _metadata
 
     _origin, source, scope, state = _repo_scope_and_state(tmp_path)
     lease = state.checkout_lease
@@ -1663,11 +1663,11 @@ def test_wrapper_records_only_successful_verified_head_transition(
     tmp_path, monkeypatch, event_type,
 ) -> None:
     from mimir.access_control import ToolRegistry
-    from mimir import repo_tools as git_module
+    from mimir_cultivate import repository as git_module
     from mimir.models import (
         AuthContext, InformationFlowLabels, RepoPRScopeRegistry, SourceLabel, TurnInteractivity,
     )
-    from mimir.tools import repo as wrapper
+    from mimir_cultivate import repository as wrapper
 
     origin, _source, scope, state = _repo_scope_and_state(tmp_path, event_type=event_type)
     tools = RepoGitTools(state)
@@ -1717,7 +1717,9 @@ def test_wrapper_records_only_successful_verified_head_transition(
     target = _git(state.checkout_lease.path, "rev-parse", "HEAD")
     assert not git_module.was_verified_push(scope.canonical_repo, scope.pr_number, initial, target)
 
-    class FailedPush(git_module.RepoGitTools):
+    original_repo_git_tools = git_module.RepoGitTools
+
+    class FailedPush(original_repo_git_tools):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, runner=lambda argv, **kw: (
                 GitProcessResult(1, stderr="failed") if "push" in argv
@@ -1730,7 +1732,7 @@ def test_wrapper_records_only_successful_verified_head_transition(
     assert context.ifc_state.own_push_lineage() == {}
     assert not git_module.was_verified_push(scope.canonical_repo, scope.pr_number, initial, target)
 
-    class UnverifiedPush(git_module.RepoGitTools):
+    class UnverifiedPush(original_repo_git_tools):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, runner=lambda argv, **kw: (
                 GitProcessResult(0, stdout="up to date") if "push" in argv
@@ -1754,7 +1756,7 @@ def test_wrapper_records_only_successful_verified_head_transition(
         assert not denied.allowed
         assert denied.forge_scope_mismatch["component"] == "observed_head_sha"
 
-    monkeypatch.setattr(wrapper, "RepoGitTools", git_module.RepoGitTools)
+    monkeypatch.setattr(wrapper, "RepoGitTools", original_repo_git_tools)
     assert wrapper._execute(runtime, scope.canonical_repo, scope.pr_number, GitPush())["ok"]
     assert context.ifc_state.own_push_lineage() == {
         (scope.canonical_repo, scope.pr_number): frozenset({initial}),
@@ -2115,7 +2117,7 @@ def test_https_push_uses_invocation_scoped_auth_without_credential_leak(
     token = "never-expose-this-token"
     monkeypatch.setenv("GITHUB_TOKEN", token)
     monkeypatch.setattr(
-        "mimir.forge.github.confirm_github_identity",
+        "mimir_cultivate.forge.confirm_github_identity",
         lambda principal, credential: principal,
     )
     calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
@@ -3050,8 +3052,8 @@ def _snapshot_checkout_factory(root: Path, issued: list[Path]):
 def test_retained_snapshot_bundle_is_removed_on_success_and_creation_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, creation_returncode: int,
 ) -> None:
-    from mimir import repo_tools as repo_tools_module
-    from mimir.worklink import worker_client
+    from mimir_cultivate import repository as repo_tools_module
+    from mimir_cultivate.worklink import worker_client
 
     source = tmp_path / "checkout"
     source.mkdir()
@@ -4535,7 +4537,7 @@ def test_repo_wrapper_failure_classes_have_distinct_stable_codes(
     expected_code: str,
     exception_type: type[Exception],
 ) -> None:
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate import repository as repo_module
 
     state = repo_tools[-2]
     if isinstance(failure, ToolPolicyRefusal):
