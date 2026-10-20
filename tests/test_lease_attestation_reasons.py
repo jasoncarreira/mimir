@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import inspect
 import json
 import subprocess
@@ -11,11 +12,26 @@ from types import SimpleNamespace
 import pytest
 
 from mimir import access_control as ac
-from mimir import event_logger, repo_tools
+from mimir import event_logger
+from mimir_cultivate import repository as repo_tools
 from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-from mimir.repo_tools import GitProcessResult
+from mimir_cultivate.repository import GitProcessResult
 from tests.lease_attestation_helper import assert_lease_attested
 from tests.test_lease_source_labels import _real_attested_lease
+
+
+@pytest.fixture(autouse=True)
+def selected_attestation_policy(monkeypatch):
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks,
+        git_command=lambda *args, **kwargs: repo_tools.hardened_git_command(*args, **kwargs),
+    ))
+    with policy_scope(selected):
+        yield
 
 
 @pytest.fixture
