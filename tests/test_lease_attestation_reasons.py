@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("mimir_cultivate", reason="checkout lease belongs to Cultivate")
+
 from mimir import access_control as ac
 from mimir import event_logger
 from mimir_cultivate import repository as repo_tools

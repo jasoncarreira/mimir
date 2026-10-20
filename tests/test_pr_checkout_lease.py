@@ -1968,6 +1968,13 @@ def test_review_state_refuses_mismatched_or_inactive_checkout_lease(
 
 @pytest.fixture
 def selected_tracked_file_policy():
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
+    pytest.importorskip("mimir_cultivate")
     from mimir.plugins.core import policy_scope
     from mimir.plugins.manager import load_plugins
 

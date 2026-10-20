@@ -2491,6 +2491,7 @@ def _configure_test_suites(home: Path, state: RepoReviewState, **overrides) -> N
 
 @pytest.fixture
 def selected_repo_inventory():
+    pytest.importorskip("mimir_cultivate")
     from mimir.plugins.core import policy_scope
     from mimir.plugins.manager import load_plugins
 

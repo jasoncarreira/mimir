@@ -10,6 +10,8 @@ from typing import Sequence
 
 import pytest
 
+pytest.importorskip("mimir_cultivate", reason="repository-bound merge closure requires Cultivate")
+
 from mimir.worklink import merge_closure as closure
 from mimir.worklink import dispatch_failures
 from mimir.worklink.dispatch_failures import (

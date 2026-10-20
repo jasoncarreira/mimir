@@ -8,6 +8,8 @@ import subprocess
 import pytest
 import yaml
 
+pytest.importorskip("mimir_cultivate", reason="repository inventory belongs to Cultivate")
+
 from mimir import access_control
 from mimir.config import Config
 from mimir.plugins.core import policy_scope

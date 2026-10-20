@@ -14,7 +14,6 @@ from mimir.index import (
     build_state_index,
     build_wiki_index,
 )
-from mimir_cultivate.repository import RepositoryInventory
 from mimir.search import HashEmbedder, Indexer
 from mimir.wiki_backlinks import build_graph, build_wiki_payload, find_pages, find_slug_collisions
 
@@ -267,6 +266,9 @@ def test_repository_inventory_fails_closed(
     tmp_path: Path, shape: str, reject_scratch_reads: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.repository import RepositoryInventory
+
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     scratch = tmp_path / "scratch"
     scratch.mkdir()
@@ -440,6 +442,9 @@ def test_scratch_pages_do_not_create_slug_collisions(
 def test_repository_inventory_accepts_live_aliases(
     tmp_path: Path, shape: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.repository import RepositoryInventory
+
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     live = tmp_path / "live"
     live.mkdir()

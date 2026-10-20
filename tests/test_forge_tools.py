@@ -73,6 +73,7 @@ from mimir.tools.budget_gate import BudgetGateMiddleware
 
 
 def test_core_forge_ci_head_uses_selected_owner_protected_refs(monkeypatch):
+    pytest.importorskip("mimir_cultivate")
     from mimir.plugins.core import core_policy_registry, policy_scope
     from mimir.plugins.manager import load_plugins
     from mimir.tools import forge as core_forge
@@ -93,6 +94,7 @@ def test_core_forge_ci_head_uses_selected_owner_protected_refs(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_selected_forge_read_requires_server_observed_live_lease(tmp_path, monkeypatch):
+    pytest.importorskip("mimir_cultivate")
     from mimir.access_control import (
         ScopedPRGrants, _SCOPED_PR_ISSUER, consume_scoped_pr_checkout,
         observe_scoped_pr_checkout,

@@ -20,6 +20,7 @@ from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
 
 @pytest.fixture
 def selected_shell_policy():
+    pytest.importorskip("mimir_cultivate")
     from mimir.plugins.core import _selected_policy
     from mimir.plugins.manager import load_plugins
 

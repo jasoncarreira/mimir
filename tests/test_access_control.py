@@ -11756,6 +11756,7 @@ def test_github_review_scope_cannot_write_inside_its_active_lease(
 def test_batched_pr_reads_resolve_each_exact_checkout_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
     from mimir.read_policy import result_is_protected
     from mimir.plugins.core import core_policy_registry, policy_scope
     from mimir.plugins.manager import load_plugins

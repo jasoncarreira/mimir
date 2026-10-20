@@ -200,6 +200,12 @@ class _ExecutorServer:
 
 @pytest.fixture
 def remediation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
     provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
     from mimir.worklink import worker_client
 

@@ -4,6 +4,8 @@ import subprocess
 
 import pytest
 
+pytest.importorskip("mimir_cultivate", reason="project test parsing belongs to Cultivate")
+
 from mimir_cultivate.repository import (
     _PYTEST_FAILING_BYTES,
     _pytest_terminal_summary,

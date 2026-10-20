@@ -14,7 +14,6 @@ import pytest
 from mimir import access_control as ac
 from mimir.contained_execution import CollectedExecutionResult
 from mimir.models import RetainedFactoryScope
-from mimir_cultivate.repository import ProjectTestResult, RepoProjectTests
 from mimir.readonly_backend import RetainedCheckoutFilesystemBackend
 from mimir.plugins.core import core_policy_registry, policy_scope
 from mimir.plugins.manager import load_plugins
@@ -34,6 +33,12 @@ from mimir.worklink.retained_scope import (
 
 @pytest.fixture
 def retained_incident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
     from mimir.worklink import worker_client
     provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
 
@@ -868,6 +873,8 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
     assert "+after" in diff["stdout"]
 
     async def passing_test(self, selectors, *, suite):
+        from mimir_cultivate.repository import ProjectTestResult
+
         assert self._retained_scope == scope
         return ProjectTestResult(True, "tests_passed", 0)
 
@@ -968,6 +975,8 @@ async def test_retained_repo_test_runs_source_git_through_owner_control(
         assert stat.S_IMODE(capability.path.parent.stat().st_mode) == 0o700
         return CollectedExecutionResult(0, b"passed", b"", False, False, 0, 0)
 
+    from mimir_cultivate.repository import RepoProjectTests
+
     result = await RepoProjectTests(retained_scope=scope, runner=runner).execute()
 
     assert result.ok is True
@@ -1020,6 +1029,8 @@ async def test_retained_repo_test_excludes_only_factory_control_plane(
         return CollectedExecutionResult(0, b"passed", b"", False, False, 0, 0)
 
     monkeypatch.setattr(project_tests, "RepoGitTools", GitTools)
+    from mimir_cultivate.repository import RepoProjectTests
+
     result = await RepoProjectTests(
         retained_scope=scope, runner=runner, checkout_factory=checkout_factory,
     ).execute()

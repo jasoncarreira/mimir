@@ -3547,6 +3547,7 @@ repositories:
     registry = BackendRegistry(WorklinkConfig())
     registry.register(backend)
 
+    pytest.importorskip("mimir_cultivate")
     with policy_scope(load_plugins(enable="cultivate").policy):
         result = asyncio.run(
             WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(

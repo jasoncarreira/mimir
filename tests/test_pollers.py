@@ -242,6 +242,7 @@ def register(registrar):
 def test_verified_own_push_drops_stale_framework_trigger_before_scope_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
     from mimir.plugins.core import core_policy_registry, policy_scope
     from mimir.plugins.manager import load_plugins
     from mimir_cultivate.repository import _record_verified_push, was_verified_push
