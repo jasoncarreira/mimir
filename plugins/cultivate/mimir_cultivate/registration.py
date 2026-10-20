@@ -243,7 +243,9 @@ class CultivateProvider:
         from .worklink.dispatch_failures import is_dispatch_failure_intervention
 
         registrar.register_state_slot(CultivateState)
-        register_action_protocol(registrar, validate_scoped_pr_action)
+        register_action_protocol(
+            registrar, validate_scoped_pr_action, checkout_tool="repo_checkout",
+        )
         register_tools(registrar)
         from .prompts import register_prompt_provider
 

@@ -421,6 +421,113 @@ def _lineage_turn(scope, state, *, tainted=False):
     )
 
 
+def _selected_checkout_and_fetch_with_live_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, author_trust: bool | None = True,
+):
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langgraph.runtime import Runtime
+    from langchain.tools import ToolRuntime
+    from mimir.access_control import (
+        ScopedPRGrants, _SCOPED_PR_ISSUER, consume_scoped_pr_checkout,
+        observe_scoped_pr_checkout,
+    )
+    from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, RepoPRScopeRegistry
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir_cultivate import forge as selected_forge, repository
+
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
+    selected = load_plugins(enable="cultivate").policy
+    labels = InformationFlowLabels()
+    ifc_state = InformationFlowState(labels=labels)
+    ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    auth = AuthContext(
+        principal=scope.principal, canonical_principal=scope.principal, roles=("service",),
+        event_ingress=None, trigger="poller", channel_id="poller:github",
+        interactivity=None, repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+        ifc_labels=labels, ifc_state=ifc_state,
+        scoped_pr_grants=ScopedPRGrants(
+            scope.principal, (scope,), protocols=selected.scoped_actions,
+            _issuer=_SCOPED_PR_ISSUER,
+        ), enforcement_enabled=True,
+    )
+    monkeypatch.setattr(selected_forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(selected_forge, "_client", lambda _: object())
+
+    def request_for(tool, identifier, context):
+        return ToolCallRequest(
+            tool_call={"name": tool.name, "args": {
+                "repository": scope.canonical_repo, "pull_request": scope.pr_number,
+            }, "id": identifier, "type": "tool_call"},
+            tool=tool, state={}, runtime=Runtime(context=context),
+        )
+
+    calls = []
+    def handler(call):
+        tool = (
+            repository.repo_checkout if call.tool_call["name"] == "repo_checkout"
+            else repository.repo_fetch
+        )
+        calls.append(tool.name)
+        runtime = ToolRuntime(
+            state={}, context=call.runtime.context, config={}, stream_writer=lambda _: None,
+            tool_call_id=call.tool_call["id"], store=None,
+        )
+        result = tool.func(scope.canonical_repo, scope.pr_number, runtime=runtime)
+        return ToolMessage(content=json.dumps(result), tool_call_id=call.tool_call["id"])
+
+    with policy_scope(selected):
+        gate = BudgetGateMiddleware(selected)
+        before_checkout = gate.wrap_tool_call(
+            request_for(repository.repo_fetch, "prelease-fetch", auth), handler,
+        )
+        assert before_checkout.status == "error"
+        assert "repo_pr_grant_denied" in str(before_checkout.content)
+        assert calls == []
+        checked_out = gate.wrap_tool_call(
+            request_for(repository.repo_checkout, "selected-checkout", auth), handler,
+        )
+        assert checked_out.status != "error", checked_out.content
+        assert calls == ["repo_checkout"]
+        assert auth.ifc_state.has_untrusted_active_ingest()
+
+        clean_labels = InformationFlowLabels()
+        follow_on = replace(
+            auth, ifc_labels=clean_labels, ifc_state=InformationFlowState(labels=clean_labels),
+            scoped_pr_grants=ScopedPRGrants(
+                scope.principal, (scope,), protocols=selected.scoped_actions,
+                _issuer=_SCOPED_PR_ISSUER,
+            ),
+        )
+        follow_on.ifc_state.pr_checkout_author_trust[scope.scope_id] = author_trust
+        token = consume_scoped_pr_checkout(follow_on, scope, "cultivate")
+        assert token is not None
+        assert observe_scoped_pr_checkout(
+            follow_on, scope, state, token, "cultivate", selected.scoped_actions["cultivate"],
+        )
+        fetched = gate.wrap_tool_call(
+            request_for(repository.repo_fetch, "selected-fetch", follow_on), handler,
+        )
+        assert fetched.status != "error", fetched.content
+        assert calls == ["repo_checkout", "repo_fetch"]
+    return selected, scope, auth, follow_on, checked_out, fetched
+
+
+def test_selected_checkout_and_fetch_use_live_owner_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, _, _, checked_out, fetched = _selected_checkout_and_fetch_with_live_grants(
+        tmp_path, monkeypatch,
+    )
+    assert checked_out.status != "error", checked_out.content
+    assert fetched.status != "error", fetched.content
+    assert json.loads(fetched.content)["ok"] is True
+
+
 @pytest.mark.parametrize("case", ["collaborator", "outsider", "head_mismatch", "git_timeout"])
 def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str,

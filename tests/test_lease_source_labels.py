@@ -776,7 +776,7 @@ async def test_repo_test_non_summary_results_keep_original_shape(tmp_path, monke
 
 @pytest.mark.parametrize("verdict", [True, False, None])
 @pytest.mark.parametrize("operation", [
-    "repo_fetch", "repo_status", "repo_diff", "repo_unmerged", "repo_stage",
+    "repo_status", "repo_diff", "repo_unmerged", "repo_stage",
     "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase",
     "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push",
 ])
@@ -825,6 +825,42 @@ def test_successful_git_operations_publish_only_attested_lease(
     assert len(labels.sources) == 1
     assert labels.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
     assert labels.sources[0].integrity == ("trusted" if verdict is True else "untrusted")
+
+
+@pytest.mark.parametrize("verdict", [True, False, None])
+def test_selected_repo_fetch_requires_follow_on_grant_and_stays_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: bool | None,
+) -> None:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
+    from mimir_cultivate.policy import RepoPRAction
+    from tests.test_repo_tools import _selected_checkout_and_fetch_with_live_grants
+
+    selected, scope, checkout_auth, follow_on, checked_out, fetched = (
+        _selected_checkout_and_fetch_with_live_grants(
+            tmp_path, monkeypatch, author_trust=verdict,
+        )
+    )
+    assert selected.tools["repo_fetch"].owner == "cultivate"
+    assert selected.tools["repo_fetch"].typed_action is RepoPRAction.CHECKOUT
+    assert selected.tools["repo_cleanup"].typed_action is RepoPRAction.CHECKOUT
+    assert checked_out.status != "error"
+    assert fetched.status != "error", fetched.content
+    grant = follow_on.scoped_pr_grants.get(
+        "cultivate", scope, RepoPRAction.CHECKOUT.value, checkout=False,
+    )
+    lease = follow_on.repo_review_state.checkout_lease
+    assert grant is not None
+    assert grant.lease_identity == (str(lease.path), lease.recovery_id)
+    assert checkout_auth.ifc_state.has_untrusted_active_ingest()
+    assert follow_on.ifc_state.has_untrusted_active_ingest()
+    (source,) = follow_on.ifc_state.current(follow_on.ifc_labels).sources
+    assert source.integrity == "untrusted"
+    assert source.resource_id == "<unresolved-resource:protected_tool:repo_fetch>"
 
 
 @pytest.mark.parametrize("operation", ["repo_merge", "repo_rebase", "repo_push"])

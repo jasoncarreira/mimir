@@ -4224,6 +4224,8 @@ def _scoped_pr_checkout_call(call: _PreparedToolCall) -> bool:
         registered is not None and protocol is not None
         and registered.resource_scope == "repo_pr"
         and registered.typed_action is protocol.checkout_action
+        and (getattr(protocol, "checkout_tool", None) is None
+             or registered.name == protocol.checkout_tool)
     )
 
 
@@ -4257,7 +4259,7 @@ def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
     if (state is None or state.action_scope is not scope
             or not _valid_scoped_pr_grant(
                 call.auth_context, registered.owner, registered.typed_action,
-                protocol, scope, state,
+                protocol, scope, state, tool_name=call.tool_name,
             )):
         _emit_hard_boundary_denied(
             tool=call.tool_name, boundary="scoped_pr_grant",

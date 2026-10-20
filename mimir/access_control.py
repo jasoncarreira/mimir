@@ -9084,11 +9084,15 @@ class ScopedPRGrants:
             _SCOPED_PR_ISSUER,
         )
 
-    def get(self, owner: str, scope: Any, action: str) -> ScopedPRGrant | None:
+    def get(
+        self, owner: str, scope: Any, action: str, *, checkout: bool | None = None,
+    ) -> ScopedPRGrant | None:
         with self._lock:
             key = (owner, scope.scope_id)
             protocol = self._protocols.get(owner)
-            if protocol is not None and action == getattr(protocol.checkout_action, "value", None):
+            if checkout is None:
+                checkout = protocol is not None and action == getattr(protocol.checkout_action, "value", None)
+            if checkout:
                 return self._prelease.get(key)
             return self._follow.get(key, {}).get(action)
 
@@ -9111,14 +9115,15 @@ class ScopedPRGrants:
             del self._pending[key]
             self._follow[key] = {
                 action: self._grant(owner, scope, action, lease)
-                for action in scope.allowed_operations if action != protocol.checkout_action.value
+                for action in scope.allowed_operations
+                if action != protocol.checkout_action.value or getattr(protocol, "checkout_tool", None) is not None
             }
             return True
 
 
 def _valid_scoped_pr_grant(
     auth_context: AuthContext | None, owner: str | None, action: Any,
-    protocol: Any, scope: Any, review_state: Any,
+    protocol: Any, scope: Any, review_state: Any, *, tool_name: str | None = None,
 ) -> bool:
     grants = getattr(auth_context, "scoped_pr_grants", None)
     if (not isinstance(grants, ScopedPRGrants)
@@ -9141,14 +9146,20 @@ def _valid_scoped_pr_grant(
             registered_state = discovered.resolve(scope.canonical_repo, scope.pr_number)
         if registered_state is not review_state or review_state.action_scope is not scope:
             return False
-    grant = grants.get(owner, scope, action.value)
+    designated_checkout = getattr(protocol, "checkout_tool", None)
+    if designated_checkout is not None and tool_name is None:
+        return False
+    is_checkout = action is protocol.checkout_action and (
+        designated_checkout is None or tool_name == designated_checkout
+    )
+    grant = grants.get(owner, scope, action.value, checkout=is_checkout)
     if (grant is None or grant._issuer is not _SCOPED_PR_ISSUER
             or grant.owner != owner or grant.principal != grants.principal
             or grant.turn_nonce != grants.nonce or time.monotonic() >= grant.expires_at
             or grant.scope_id != scope.scope_id or grant.repository != scope.canonical_repo
             or grant.pull_request != scope.pr_number or grant.head != scope.observed_head_sha):
         return False
-    if action is protocol.checkout_action:
+    if is_checkout:
         if grant.lease_identity is not None:
             return False
     else:
@@ -9258,7 +9269,7 @@ def authorize_repo_pr_tool(
     from .models import RepoPRActionScope
 
     grant_valid = not registered_plugin or _valid_scoped_pr_grant(
-        auth_context, owner, action, protocol, scope, review_state,
+        auth_context, owner, action, protocol, scope, review_state, tool_name=tool_name,
     )
     in_scope = (
         (isinstance(scope, RepoPRActionScope) if registered_plugin else scope is not None)

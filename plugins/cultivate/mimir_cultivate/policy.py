@@ -70,11 +70,14 @@ class CultivateState:
         return cls(**values)
 
 
-def register_action_protocol(registrar: PolicyRegistrar, validate_scope: Callable[..., bool]) -> None:
+def register_action_protocol(
+    registrar: PolicyRegistrar, validate_scope: Callable[..., bool], *,
+    checkout_tool: str | None = None,
+) -> None:
     """Bind the vocabulary and grant validator to this selected registrar."""
     registrar.register_scoped_action(
         RepoPRAction, validate_scope, checkout_action=RepoPRAction.CHECKOUT,
-        live_lease=_live_scoped_pr_lease,
+        live_lease=_live_scoped_pr_lease, checkout_tool=checkout_tool,
     )
 
 
