@@ -800,7 +800,7 @@ def test_repo_checkout_after_half_reclaimed_lease_uses_fresh_git_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.models import InformationFlowState
-    from mimir.tools.repo import repo_checkout
+    from mimir_cultivate.repository import repo_checkout
 
     _repo, scope = _repo_and_scope(tmp_path)
     root = tmp_path / "leases"
@@ -812,14 +812,14 @@ def test_repo_checkout_after_half_reclaimed_lease_uses_fresh_git_checkout(
     state = RepoReviewState(scope)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
     monkeypatch.setattr(
-        "mimir.tools.forge.remediation_checkout_preflight",
+        "mimir_cultivate.forge.remediation_checkout_preflight",
         lambda *_args: (state, None),
     )
     monkeypatch.setattr(
-        "mimir.tools.forge._client",
+        "mimir_cultivate.forge._client",
         lambda *_args: SimpleNamespace(author_is_trusted=None),
     )
-    monkeypatch.setattr("mimir.tools.repo._publish_attested_lease_result", lambda *_args: None)
+    monkeypatch.setattr("mimir_cultivate.repository._publish_attested_lease_result", lambda *_args: None)
 
     result = repo_checkout.func(
         repository=scope.canonical_repo, pull_request=scope.pr_number,
@@ -2131,7 +2131,7 @@ def test_discovered_pr_protected_read(
     from mimir.read_policy import (
         file_contains_secret, non_admin_read_filter_enabled, protected_read_denial_reason,
     )
-    from mimir.repo_tools import RepoGitTools
+    from mimir_cultivate.repository import RepoGitTools
 
     repo, initial_scope = _repo_and_scope(tmp_path)
     credential = "ghp_" + "Synthetic9" * 4

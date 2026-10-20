@@ -160,7 +160,9 @@ def test_selected_review_probe_env_uses_provider_identity_without_core_forge(
 def test_selected_checkout_attestation_uses_provider_git_and_rejects_changed_head(
     tmp_path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import access_control as ac, repo_tools
+    import importlib.util
+
+    from mimir import access_control as ac
     from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, RepoReviewState
     from mimir_cultivate import repository
     from tests.test_pr_checkout_lease import _repo_and_scope
@@ -183,14 +185,22 @@ def test_selected_checkout_attestation_uses_provider_git_and_rejects_changed_hea
         ifc_labels=labels, ifc_state=InformationFlowState(labels),
     )
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
-    def core_git_forbidden(*_args, **_kwargs):
-        raise AssertionError("selected checkout consulted retired core Git")
+    assert importlib.util.find_spec("mimir.repo_tools") is None
+    git_command = selected.policy_consumer_hooks.git_command
+    calls = []
 
-    monkeypatch.setattr(repo_tools, "hardened_git_command", core_git_forbidden)
+    def observed_git(*args, **kwargs):
+        calls.append((args, kwargs))
+        return git_command(*args, **kwargs)
+
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks, git_command=observed_git,
+    ))
     with policy_scope(selected):
         assert ac.pr_checkout_lease_attestation(auth, scope, lease).ok
         changed = replace(scope, observed_head_sha="0" * 40)
         assert not ac.pr_checkout_lease_attestation(auth, changed, lease).ok
+    assert calls
 
 
 @pytest.mark.parametrize("enforced", [False, True])

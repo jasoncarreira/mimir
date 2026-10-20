@@ -711,7 +711,8 @@ def test_clean_attested_lease_cannot_relax_tainted_commit_or_push(
 ) -> None:
     import inspect
 
-    from mimir import access_control, repo_tools
+    from mimir import access_control
+    from mimir_cultivate import repository as repo_tools
     from mimir.access_control import SinkGate
     from mimir.models import SourceLabel
 
@@ -4604,7 +4605,7 @@ def test_inactive_checkout_refusal_from_selected_provider_is_not_trusted(
     from langchain_core.messages import ToolMessage
     from mimir import access_control
     from mimir.access_control import ToolAuthorization, ToolRegistry
-    from mimir.tools import repo
+    from mimir_cultivate import repository as repo
 
     _origin, _source, scope, state, _tools = repo_tools
     lease = state.checkout_lease

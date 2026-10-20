@@ -780,13 +780,13 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
     """Run the production remediation effect paths across real Linux identities."""
     from mimir import contained_checkout, contained_execution
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-    from mimir.project_tests import RepoProjectTests
-    from mimir.repo_tools import (
+    from mimir_cultivate.repository import (
         GitCommit,
         GitDiff,
         GitStage,
         GitStatus,
         RepoGitTools,
+        RepoProjectTests,
         retained_factory_git_runner,
     )
     from mimir.worklink import worker_client, worker_exec

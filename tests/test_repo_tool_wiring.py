@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,8 +31,13 @@ from mimir.models import (
     SourceLabel,
 )
 from mimir.forge import CheckProjection, ReviewProjection
-from mimir.tools.forge import remediation_checkout_preflight, set_forge_client
-from mimir.tools.repo import (
+from mimir_cultivate.forge import remediation_checkout_preflight, set_forge_client
+try:
+    version("mimir-cultivate")
+except PackageNotFoundError:
+    pytest.skip("repository tool wiring requires installed Cultivate", allow_module_level=True)
+
+from mimir_cultivate.repository import (
     _enforcement_enabled,
     repo_checkout,
     repo_cleanup,
@@ -251,8 +257,8 @@ def test_repo_cleanup_refuses_without_active_lease() -> None:
 def test_repository_read_wrappers_publish_lease_attestation(
     tool_name: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.repo_tools import GitOperationResult
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate.repository import GitOperationResult
+    from mimir_cultivate import repository as repo_module
 
     scope = _scope(RepoPRAction.INSPECT)
     context = _auth(scope)
@@ -285,8 +291,8 @@ def test_repository_read_wrappers_publish_lease_attestation(
 async def test_repo_test_wrapper_publishes_lease_attestation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.project_tests import ProjectTestResult
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate.repository import ProjectTestResult
+    from mimir_cultivate import repository as repo_module
 
     scope = _scope(RepoPRAction.INSPECT)
     context = _auth(scope)
@@ -328,7 +334,7 @@ def test_checkout_proof_is_isolated_to_named_pr(
         review_state.attach_checkout_lease(lease)
         return lease, ()
 
-    monkeypatch.setattr("mimir.tools.repo.acquire_pr_checkout_lease", fake_checkout)
+    monkeypatch.setattr("mimir_cultivate.repository.acquire_pr_checkout_lease", fake_checkout)
     runtime = SimpleNamespace(context=context)
     repo_checkout.func(repository="owner/repo", pull_request=7, runtime=runtime)
 
@@ -406,7 +412,7 @@ def test_ci_remediation_rechecks_live_state_before_checkout(
     context = _auth(scope)
     set_forge_client(_CIRemediationForge(snapshot, conclusion))
     monkeypatch.setattr(
-        "mimir.tools.repo.acquire_pr_checkout_lease",
+        "mimir_cultivate.repository.acquire_pr_checkout_lease",
         lambda *_args, **_kwargs: pytest.fail("stale CI event reached checkout"),
     )
 
@@ -505,7 +511,7 @@ def test_remediation_preflight_does_not_refresh_other_scopes(monkeypatch, event_
     original = context.repo_pr_scope_registry.resolve("owner/repo", 7)
     client = _RemediationForge(_snapshot("c" * 40))
     set_forge_client(client)
-    monkeypatch.setattr("mimir.tools.forge.resolve_review_state_for_context", lambda *args: original)
+    monkeypatch.setattr("mimir_cultivate.forge.resolve_review_state_for_context", lambda *args: original)
     assert remediation_checkout_preflight(context, "owner/repo", 7) == (original, None)
     assert client.snapshot_calls == 0
     assert context.server_discovered_pr_states.begin_remint("owner/repo", 7)
@@ -571,11 +577,13 @@ def _remediation_runtime(monkeypatch: pytest.MonkeyPatch, client: _RemediationFo
 
 def test_core_only_head_advance_cannot_remint_without_owner_push_reader(monkeypatch):
     from mimir.plugins.core import core_policy_registry, policy_scope
+    from mimir.tools import forge as core_forge
 
     client = _RemediationForge(_snapshot("c" * 40))
     old_scope, context, _runtime = _remediation_runtime(monkeypatch, client)
+    monkeypatch.setattr(core_forge, "_default_client", client)
     with policy_scope(core_policy_registry()):
-        state, stopped = remediation_checkout_preflight(context, "owner/repo", 7)
+        state, stopped = core_forge.remediation_checkout_preflight(context, "owner/repo", 7)
     assert stopped is None
     assert state.action_scope is old_scope
     assert client.review_calls == 0
@@ -603,7 +611,7 @@ def test_stale_own_remediation_head_is_reminted_and_checked_out(
         review_state.attach_checkout_lease(lease)
         return lease, ()
 
-    monkeypatch.setattr("mimir.tools.repo.acquire_pr_checkout_lease", fake_checkout)
+    monkeypatch.setattr("mimir_cultivate.repository.acquire_pr_checkout_lease", fake_checkout)
 
     result = repo_checkout.func(
         repository="owner/repo", pull_request=7, runtime=runtime,
@@ -624,7 +632,7 @@ def test_merged_remediation_pr_stops_before_checkout(
         monkeypatch, _RemediationForge(_snapshot("c" * 40, state="closed")),
     )
     monkeypatch.setattr(
-        "mimir.tools.repo.acquire_pr_checkout_lease",
+        "mimir_cultivate.repository.acquire_pr_checkout_lease",
         lambda *_args, **_kwargs: pytest.fail("closed PR reached checkout"),
     )
 
@@ -680,7 +688,7 @@ def test_remediation_head_advancing_twice_does_not_remint_again(
         review_state.attach_checkout_lease(lease)
         return lease, ()
 
-    monkeypatch.setattr("mimir.tools.repo.acquire_pr_checkout_lease", fake_checkout)
+    monkeypatch.setattr("mimir_cultivate.repository.acquire_pr_checkout_lease", fake_checkout)
     repo_checkout.func(repository="owner/repo", pull_request=7, runtime=runtime)
 
     with pytest.raises(ToolException) as raised:
@@ -719,7 +727,7 @@ def test_failed_remint_preserves_existing_stale_head_refusal(
             "'https://x-access-token:synthetic-secret@github.com/o/r/': rate limited"
         )
 
-    monkeypatch.setattr("mimir.tools.repo.acquire_pr_checkout_lease", stale_checkout)
+    monkeypatch.setattr("mimir_cultivate.repository.acquire_pr_checkout_lease", stale_checkout)
 
     with pytest.raises(ToolException) as raised:
         repo_checkout.func(repository="owner/repo", pull_request=7, runtime=runtime)
@@ -744,7 +752,7 @@ def test_repo_cleanup_redacts_git_url_userinfo(
         path="/tmp/synthetic-checkout",
     ))
     monkeypatch.setattr(
-        "mimir.tools.repo.cleanup_pr_checkout_lease",
+        "mimir_cultivate.repository.cleanup_pr_checkout_lease",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(
             "fatal: unable to access "
             "'https://x-access-token:synthetic-secret@github.com/o/r/': authentication failed"
@@ -776,7 +784,7 @@ def test_external_head_advance_rereads_review_state_before_checkout(
         selected_repo_policy.policy_consumer_hooks, agent_push=lambda *_args: False,
     ))
     monkeypatch.setattr(
-        "mimir.tools.repo.acquire_pr_checkout_lease",
+        "mimir_cultivate.repository.acquire_pr_checkout_lease",
         lambda *_args, **_kwargs: pytest.fail("cleared review reached checkout"),
     )
 
@@ -1016,9 +1024,21 @@ def test_tool_modules_do_not_decide_pr_scope_policy_locally() -> None:
 
 
 def test_repo_tools_does_not_decide_pr_scope_policy_locally() -> None:
-    source = (Path(__file__).parents[1] / "mimir" / "repo_tools.py").read_text(
+    import ast
+
+    source = (Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/repository.py").read_text(
         encoding="utf-8",
     )
-
-    assert "allowed_operations" not in source
-    assert "authorize_repo_pr_tool(" in source
+    tree = ast.parse(source)
+    git_tools = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "RepoGitTools"
+    )
+    require = next(
+        node for node in git_tools.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_require"
+    )
+    policy_check = ast.get_source_segment(source, require)
+    assert policy_check is not None
+    assert "allowed_operations" not in policy_check
+    assert "authorize_repo_pr_tool(" in policy_check

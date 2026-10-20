@@ -65,13 +65,13 @@ def _self_login(monkeypatch: pytest.MonkeyPatch):
 
 def _remember_inventory(lease, scope):
     """Mirror the runner: capture the lease's test inventory before classification."""
-    from mimir.project_tests import pytest_node_inventory, remember_node_inventory
+    from mimir_cultivate.repository import pytest_node_inventory, remember_node_inventory
 
     remember_node_inventory(lease.path, scope.scope_id, pytest_node_inventory(lease.path))
 
 
 def _recorded(lease, scope):
-    from mimir.project_tests import recorded_node_inventory
+    from mimir_cultivate.repository import recorded_node_inventory
 
     return recorded_node_inventory(lease.path, scope.scope_id)
 
@@ -417,7 +417,7 @@ def test_selected_repo_result_requires_receipt_despite_attested_lease(
 def test_repo_result_without_author_verdict_stays_blocking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login,
 ) -> None:
-    from mimir.tools.repo import _publish_attested_lease_result
+    from mimir_cultivate.repository import _publish_attested_lease_result
 
     monkeypatch.setattr(
         access_control_module, "_lease_head_is_author_attested", _self_login,
@@ -578,8 +578,8 @@ async def test_repo_test_post_execution_refusal_labels(
 async def test_missing_selector_is_pre_execution_policy_refusal_and_allows_rerun(
     tmp_path, monkeypatch,
 ):
-    from mimir import project_tests
-    from mimir.tools import repo
+    from mimir_cultivate import repository as project_tests
+    from mimir_cultivate import repository as repo
     from mimir.tools.refusals import ToolPolicyRefusal
 
     auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
@@ -746,11 +746,11 @@ def test_failed_repo_test_provenance_is_incomplete_even_for_exact_bounded_summar
     elif change == "lease_head_moved":
         lease.head_sha = "c" * 40
     elif change == "inventory_not_recorded":
-        from mimir import project_tests
+        from mimir_cultivate import repository as project_tests
         project_tests._NODE_INVENTORIES.pop(project_tests._inventory_key(lease.path, scope.scope_id), None)
     elif change == "inventory_not_recorded_empty_failing":
         # Empty ``failing`` must not pass vacuously when no run recorded an inventory.
-        from mimir import project_tests
+        from mimir_cultivate import repository as project_tests
         project_tests._NODE_INVENTORIES.pop(project_tests._inventory_key(lease.path, scope.scope_id), None)
         altered["summary"]["failing"] = []
     if change == "wrong_scope":
@@ -761,7 +761,7 @@ def test_failed_repo_test_provenance_is_incomplete_even_for_exact_bounded_summar
 @pytest.mark.asyncio
 async def test_repo_test_scope_resolution_fault_publishes_no_attestation(monkeypatch):
     from langchain_core.tools import ToolException
-    from mimir.tools import repo
+    from mimir_cultivate import repository as repo
 
     def no_state(*_args):
         raise ToolException("scope unavailable")
@@ -927,8 +927,8 @@ def test_failed_git_operation_keeps_only_attested_origin(
 @pytest.mark.parametrize("binding", ["remote", "origin_url"])
 def test_failed_git_operation_rejects_misbound_remote_and_unresolved_scope(tmp_path, monkeypatch, binding):
     from langchain_core.tools import ToolException
-    from mimir.repo_tools import GitRefusal
-    from mimir.tools import repo
+    from mimir_cultivate.repository import GitRefusal
+    from mimir_cultivate import repository as repo
 
     auth, scope, _, _, _ = _real_attested_lease(tmp_path)
     monkeypatch.setattr(repo, "_state", lambda *_: auth.repo_review_state)
@@ -1372,14 +1372,15 @@ def test_non_author_content_repository_results_remain_untrusted(
      (True, "number"), (True, "head_sha"), (True, "verified_own_push"),
      (True, "author"), (True, "missing_author"), (True, "no_attestation")],
 )
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_checkout_records_native_author_trust_for_file_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     verdict: bool | None, mismatch: str | None,
 ) -> None:
     from dataclasses import replace
 
-    from mimir.forge import PullRequestProjection
-    from mimir.tools import forge, repo
+    from mimir_cultivate.forge import PullRequestProjection
+    from mimir_cultivate import forge, repository as repo
 
     author = "" if mismatch == "missing_author" else "collaborator"
     scope = _scope(author=author)
@@ -1414,7 +1415,7 @@ def test_checkout_records_native_author_trust_for_file_reads(
             "owner/repo", "collaborator", lambda: True,
         )
     if mismatch == "verified_own_push":
-        from mimir.repo_tools import _record_verified_push, was_verified_push
+        from mimir_cultivate.repository import _record_verified_push, was_verified_push
 
         _record_verified_push(scope, scope.observed_head_sha, metadata.head_sha)
         assert was_verified_push(
@@ -1499,6 +1500,11 @@ def test_checkout_records_native_author_trust_for_file_reads(
     finally:
         provenance = end_protected_result_capture(token)
     assert provenance is not None
+    raw_source, = provenance.sources
+    assert raw_source.resource_id == f"owner/repo#pull/7@{'a' * 40}"
+    assert (raw_source.domain, raw_source.integrity, raw_source.integrity_effect) == (
+        "repository", "trusted" if trusted else "untrusted", "active_ingest",
+    )
     labels = classify_protected_result(
         "pr_diff", {"repository": "owner/repo", "pull_request": 7}, auth,
         ToolAuthorization(
@@ -1511,11 +1517,11 @@ def test_checkout_records_native_author_trust_for_file_reads(
     assert len(labels.sources) == 1
     source = labels.sources[0]
     assert (source.domain, source.integrity, source.integrity_effect) == (
-        "repository", "trusted" if trusted else "untrusted", "active_ingest",
+        "repository", "untrusted", "active_ingest",
     )
-    assert source.resource_id == f"owner/repo#pull/7@{'a' * 40}"
+    assert source.resource_id == "<unresolved-resource:protected_tool:pr_diff>"
     auth.ifc_state.merge(labels)
-    assert auth.ifc_state.has_untrusted_active_ingest() is (not trusted)
+    assert auth.ifc_state.has_untrusted_active_ingest()
     assert len(calls) == (3 if verdict is None else 1)
 
 
@@ -1525,12 +1531,13 @@ def test_checkout_records_native_author_trust_for_file_reads(
     ("dependabot[bot]", "DEPENDABOT[BOT]", True),
     ("dependabot[bot]", "renovate[bot]", False),
 ])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_checkout_bot_attestation_requires_exact_operator_login(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allowlist, author, trusted,
 ) -> None:
     from dataclasses import replace
-    from mimir.forge import PullRequestProjection
-    from mimir.tools import forge, repo
+    from mimir_cultivate.forge import PullRequestProjection
+    from mimir_cultivate import forge, repository as repo
 
     monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", allowlist)
     scope = _scope(author=author)
@@ -1875,6 +1882,7 @@ def test_lease_without_recorded_verdict_fails_closed(
 
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_metadata_failure_after_acquisition_clears_recorded_trust(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1884,8 +1892,8 @@ def test_metadata_failure_after_acquisition_clears_recorded_trust(
     fetch fails closed. Forge ConnectionErrors are observed in production, so
     this is a reachable path, not a theoretical one.
     """
-    from mimir.forge import PullRequestProjection
-    from mimir.tools import forge, repo
+    from mimir_cultivate.forge import PullRequestProjection
+    from mimir_cultivate import forge, repository as repo
 
     scope = _scope(author="collaborator")
     auth = _auth(scope=scope)
@@ -2332,8 +2340,8 @@ def test_retired_repository_refusal_cannot_claim_content_free_trust() -> None:
 def test_interpolated_git_output_cannot_claim_fixed_pre_execution_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.repo_tools import GitRefusal, GitStatus
-    from mimir.tools import repo
+    from mimir_cultivate.repository import GitRefusal, GitStatus
+    from mimir_cultivate import repository as repo
 
     auth, scope, _lease, _target, _ = _real_attested_lease(tmp_path)
     monkeypatch.setattr(repo, "_state", lambda *_args: auth.repo_review_state)
@@ -2371,8 +2379,8 @@ def test_interpolated_git_output_cannot_claim_fixed_pre_execution_refusal(
 def test_git_started_cannot_publish_fixed_refusal_as_content_free(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.repo_tools import GitRefusal, GitStatus
-    from mimir.tools import repo
+    from mimir_cultivate.repository import GitRefusal, GitStatus
+    from mimir_cultivate import repository as repo
 
     auth, scope, _lease, _target, _ = _real_attested_lease(tmp_path)
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False

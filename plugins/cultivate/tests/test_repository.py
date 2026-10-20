@@ -31,16 +31,17 @@ from tests.test_repo_tools import (
 
 
 def test_repository_implementation_is_owned_by_provider() -> None:
-    from mimir import pr_checkout_lease, project_tests, repo_tools
-    from mimir.tools import repo
+    from mimir import pr_checkout_lease
 
-    assert repository.RepoGitTools is not repo_tools.RepoGitTools
-    assert repository.RepoProjectTests is not project_tests.RepoProjectTests
     assert repository.PRCheckoutLease is not pr_checkout_lease.PRCheckoutLease
-    assert not (Path(__file__).resolve().parents[3] / "mimir" / "repository_config.py").exists()
-    assert repository.repo_status is not repo.repo_status
+    root = Path(__file__).resolve().parents[3] / "mimir"
+    for retired in ("repository_config.py", "repo_tools.py", "project_tests.py", "tools/repo.py"):
+        assert not (root / retired).exists()
     assert {tool.name for tool in repository.REPO_TOOLS} == {
-        tool.name for tool in repo.REPO_TOOLS
+        "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
+        "repo_diff", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge",
+        "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
+        "repo_revert_abort", "repo_push",
     }
 
     tree = ast.parse(Path(repository.__file__).read_text(encoding="utf-8"))
@@ -53,18 +54,15 @@ def test_repository_implementation_is_owned_by_provider() -> None:
             pytest.fail(f"provider imports retired core repository module: {node.module}")
 
 
-def test_core_repository_compatibility_does_not_import_provider() -> None:
+def test_surviving_core_lease_does_not_import_provider() -> None:
     root = Path(__file__).resolve().parents[3]
-    for name in ("pr_checkout_lease", "repo_tools", "project_tests", "tools/repo"):
-        tree = ast.parse((root / "mimir" / f"{name}.py").read_text(encoding="utf-8"))
-        modules = [
-            node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
-        ]
-        modules.extend(
-            alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
-            for alias in node.names
-        )
-        assert all(not (module or "").startswith("mimir_cultivate") for module in modules)
+    tree = ast.parse((root / "mimir/pr_checkout_lease.py").read_text(encoding="utf-8"))
+    modules = [node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
+    modules.extend(
+        alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+        for alias in node.names
+    )
+    assert all(not (module or "").startswith("mimir_cultivate") for module in modules)
 
 
 def test_repository_config_and_parity_are_provider_owned(tmp_path: Path) -> None:

@@ -393,7 +393,7 @@ def test_reason_codes_are_closed_against_source_and_cases():
 
 
 def test_refusal_event_is_content_free_and_deduped_per_turn(attested, monkeypatch):
-    from mimir.tools.repo import _publish_attested_lease_result
+    from mimir_cultivate.repository import _publish_attested_lease_result
 
     auth, scope, lease = attested
     auth.ifc_state.pr_checkout_author_trust.clear()

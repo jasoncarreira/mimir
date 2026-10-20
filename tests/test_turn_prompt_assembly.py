@@ -2636,10 +2636,6 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/tools/forge.py", "_attest_ci_runs", "SourceLabel"): 1,
             ("producer", "mimir/tools/forge.py", "pr_list", "SourceLabel"): 1,
             ("producer", "mimir/tools/forge.py", "pr_spec", "SourceLabel"): 1,
-        # Retained remediation results preserve their exact factory authority.
-        ("producer", "mimir/tools/repo.py", "_publish_retained_result", "SourceLabel"): 1,
-        # PR checkout reads inherit exact-scope author attestation.
-            ("producer", "mimir/tools/repo.py", "_publish_attested_scope_result", "SourceLabel"): 1,
         # Operator-declared shell output remains active ingest even after
         # a successful bounded read.
         ("producer", "mimir/tools/budget_gate.py", "_result_labels_for_call", "SourceLabel"): 1,
@@ -2660,6 +2656,22 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         f"unexpected channel-bearing sources: {observed - expected}; "
         f"missing inventory entries: {expected - observed}"
     )
+    provider = root.parent / "plugins/cultivate/mimir_cultivate/repository.py"
+    provider_sources: Counter[tuple[str, str, str, str]] = Counter()
+    Visitor("plugins/cultivate/mimir_cultivate/repository.py").visit(
+        ast.parse(provider.read_text(encoding="utf-8"))
+    )
+    provider_sources.update({
+        row: count for row, count in observed.items()
+        if row[1] == "plugins/cultivate/mimir_cultivate/repository.py"
+        and row[0] == "producer" and row[3] == "SourceLabel"
+    })
+    assert provider_sources == Counter({
+        ("producer", "plugins/cultivate/mimir_cultivate/repository.py",
+         "_publish_retained_result", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/repository.py",
+         "_publish_attested_scope_result", "SourceLabel"): 1,
+    })
 
 
 @pytest.mark.asyncio

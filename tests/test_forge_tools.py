@@ -67,7 +67,6 @@ from mimir.tools.forge import (
     set_forge_client,
     unsupported_operation,
 )
-from mimir.tools.repo import repo_status, repo_test
 from mimir.tools.budget_gate import BudgetGateMiddleware
 
 
@@ -280,7 +279,7 @@ def test_pr_comment_after_push_keeps_original_forge_scope(
 ):
     import uuid
 
-    from mimir.repo_tools import _record_verified_push
+    from mimir_cultivate.repository import _record_verified_push
 
     old_head = uuid.uuid4().hex + "0" * 8
     new_head = uuid.uuid4().hex + "0" * 8
@@ -338,7 +337,7 @@ def test_verified_push_result_requires_turn_lineage_and_exact_resource(
 ):
     import uuid
 
-    from mimir.repo_tools import _record_verified_push
+    from mimir_cultivate.repository import _record_verified_push
     from mimir.tools.forge import _publish_author_attestation
 
     old_head = uuid.uuid4().hex + "0" * 8
@@ -4073,11 +4072,14 @@ def test_ci_remediation_scope_requires_checkout_before_every_mutation(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("suite", [None, "frontend"])
-async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
+@pytest.mark.usefixtures("selected_forge_policy")
+async def test_operator_turn_discovers_live_review_scope_before_repo_test_grant(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
     suite: str | None,
 ) -> None:
+    from mimir_cultivate import repository as selected_repo
+
     client = FakeForge()
     set_forge_client(client)
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
@@ -4089,32 +4091,13 @@ async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
             ("/server/configured/repo",), 1,
         ),
     )
-    calls = []
-
-    class Tests:
-        async def execute(self, selectors, *, suite=None):
-            from mimir.project_tests import ProjectTestResult
-
-            calls.append((selectors, suite))
-            return ProjectTestResult(True, "tests_passed", 0, suite=suite or "default")
-
-    monkeypatch.setattr("mimir.tools.repo.RepoProjectTests", lambda state: Tests())
     context = _production_auth_context(tmp_path, "operator_user")
     runtime = ToolRuntime(
         state={}, context=context, config={}, stream_writer=lambda _: None,
         tool_call_id="operator-review", store=None,
     )
 
-    result = await repo_test.coroutine(
-        repository="OWNER/REPO", pull_request=1291, runtime=runtime,
-        **({"suite": suite} if suite is not None else {}),
-    )
-    assert result["ok"] is True
-    assert result["code"] == "tests_passed"
-    assert result["suite"] == (suite or "default")
-    assert "Scoped tests must pass before pushing" in result["remediation_guidance"]
-    assert calls == [((), suite)]
-    state = context.server_discovered_pr_states.resolve("owner/repo", 1291)
+    state = resolve_review_state_for_context(context, "owner/repo", 1291)
     assert state is not None
     scope = state.action_scope
     assert scope.provenance == "server_discovered"
@@ -4126,6 +4109,11 @@ async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
     assert scope.observed_base_sha == "d" * 40
     assert scope.checkout_ref == "refs/pull/1291/head"
     assert client.calls == [("snapshot", "owner/repo", 1291)]
+    with pytest.raises(ToolException, match="active matching checkout lease"):
+        await selected_repo.repo_test.coroutine(
+            repository="OWNER/REPO", pull_request=1291, runtime=runtime,
+            **({"suite": suite} if suite is not None else {}),
+        )
 
 
 @pytest.mark.usefixtures("selected_forge_policy")

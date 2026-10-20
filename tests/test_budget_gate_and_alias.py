@@ -7720,12 +7720,9 @@ async def test_unsupported_repo_action_records_typed_boundary_without_trusting_r
 
 
 @pytest.mark.asyncio
-async def test_real_repo_test_policy_refusal_does_not_taint_turn(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_core_only_repo_test_refusal_does_not_taint_turn() -> None:
     from dataclasses import replace
-
-    from mimir.tools.repo import repo_test
+    from mimir.plugins.core import core_policy_registry, policy_scope
 
     middleware = BudgetGateMiddleware()
     scope = RepoPRActionScope(
@@ -7754,67 +7751,33 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
     ctx = _ifc_turn(auth)
     calls: list[str] = []
 
-    original_authorize = ToolRegistry.authorize_tool
-
-    def authorize_without_action_gate(
-        self,
-        tool_name,
-        auth_context=None,
-        *,
-        enforce=False,
-        target_channel=None,
-        ifc_labels=None,
-        mcp_tool=None,
-        arguments=None,
-    ):  # type: ignore[no-untyped-def]
-        decision = original_authorize(
-            self,
-            tool_name,
-            auth_context,
-            enforce=enforce,
-            target_channel=target_channel,
-            ifc_labels=ifc_labels,
-            mcp_tool=mcp_tool,
-            arguments=arguments,
-        )
-        if tool_name != "repo_test":
-            return decision
-        return replace(decision, allowed=True, reason=None)
-
-    monkeypatch.setattr(ToolRegistry, "authorize_tool", authorize_without_action_gate)
-
     async def handler(request: ToolCallRequest) -> ToolMessage:
         calls.append(request.tool_call["id"])
-        if request.tool_call["id"] == "repo-refused":
-            await repo_test.coroutine(
-                repository="owner/repo",
-                pull_request=17,
-                runtime=Runtime(context=auth),
-            )
         return ToolMessage(content="adapted", tool_call_id=request.tool_call["id"])
 
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
     token = set_current_turn(ctx)
     try:
-        refusal = await middleware.awrap_tool_call(
-            _make_request(
-                "repo_test", "repo-refused", auth,
-                {"repository": "owner/repo", "pull_request": 17},
-            ),
-            handler,
-        )
-        assert not auth.ifc_state.current(auth.ifc_labels).sources
-        adapted = await middleware.awrap_tool_call(
-            _make_request("shell_exec", "adapted", auth, {"command": "pwd"}),
-            handler,
-        )
+        with policy_scope(core_policy_registry()):
+            refusal = await middleware.awrap_tool_call(
+                _make_request(
+                    "repo_test", "repo-refused", auth,
+                    {"repository": "owner/repo", "pull_request": 17},
+                ),
+                handler,
+            )
+            assert not auth.ifc_state.current(auth.ifc_labels).sources
+            adapted = await middleware.awrap_tool_call(
+                _make_request("shell_exec", "adapted", auth, {"command": "pwd"}),
+                handler,
+            )
     finally:
         reset_current_turn(token)
 
     assert refusal.status == "error"
-    assert "scope does not grant repo.test" in str(refusal.content)
+    assert "repository_tool_unavailable" in str(refusal.content)
     assert adapted.content == "adapted"
-    assert calls == ["repo-refused", "adapted"]
+    assert calls == ["adapted"]
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
 
 

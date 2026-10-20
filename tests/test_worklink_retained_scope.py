@@ -640,7 +640,7 @@ async def test_each_retained_effect_refuses_operation_time_race_without_mutation
     race: str,
 ) -> None:
     """Every mutating seam reacquires the exact lease before its downstream effect."""
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate import repository as repo_module
     from mimir.worklink import worker_client
 
     case = retained_incident
@@ -829,7 +829,7 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
     retained_incident, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate import repository as repo_module
     from mimir.worklink import worker_client
 
     case = retained_incident
@@ -841,6 +841,10 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
     assert scope is not None
     monkeypatch.setattr(
         "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
+        lambda _record: False,
     )
     calls: list[tuple[str, ...]] = []
 
@@ -855,6 +859,9 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
         )
 
     monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
+    from mimir_cultivate.worklink import worker_client as provider_worker_client
+
+    monkeypatch.setattr(provider_worker_client, "run_factory_control", owner_control)
     runtime = _retained_runtime(scope)
     marker = case.sandbox / "controller-executed"
     helper = case.sandbox / "malicious.sh"
@@ -1060,7 +1067,7 @@ async def test_retained_repo_test_excludes_only_factory_control_plane(
 def test_retained_scope_refuses_excluded_repo_operations(
     retained_incident, monkeypatch: pytest.MonkeyPatch, name: str, arguments: tuple[str, ...],
 ) -> None:
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate import repository as repo_module
 
     case = retained_incident
     scope = derive_retained_factory_scope(case.event, case.service).scope
@@ -1075,7 +1082,7 @@ def test_retained_scope_refuses_excluded_repo_operations(
 async def test_each_retained_repo_operation_refuses_stale_occurrence_before_execution(
     retained_incident, monkeypatch: pytest.MonkeyPatch, operation: str,
 ) -> None:
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate import repository as repo_module
     from mimir.worklink import worker_client
 
     case = retained_incident

@@ -92,12 +92,6 @@ _CODING_EXPORTS = {
         "pr_rerequest_review", "pr_review_requests", "pr_reviews", "pr_submit_review",
         "register_forge_client", "set_forge_client", "unsupported_operation",
     )},
-    **{name: "repo" for name in (
-        "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
-        "repo_diff", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge",
-        "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
-        "repo_revert_abort", "repo_push",
-    )},
 }
 
 
@@ -184,22 +178,6 @@ __all__ = [
     "unsupported_operation",
     "register_forge_client",
     "set_forge_client",
-    "repo_checkout",
-    "repo_cleanup",
-    "repo_fetch",
-    "repo_status",
-    "repo_test",
-    "repo_diff",
-    "repo_unmerged",
-    "repo_stage",
-    "repo_commit",
-    "repo_merge",
-    "repo_merge_abort",
-    "repo_rebase",
-    "repo_rebase_abort",
-    "repo_revert",
-    "repo_revert_abort",
-    "repo_push",
     # Dep-injection setters (called by server.py:build_app)
     "set_memory_client",
     "set_indexer",
