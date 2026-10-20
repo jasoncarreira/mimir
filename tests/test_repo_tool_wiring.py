@@ -169,7 +169,9 @@ def test_repo_enforcement_state_preserves_explicit_flag() -> None:
 
 
 @pytest.mark.parametrize("enforce", [False, True])
-def test_repo_test_registry_vetoes_untrusted_checkout_even_in_shadow(enforce: bool) -> None:
+def test_repo_test_registry_vetoes_untrusted_checkout_even_in_shadow(
+    enforce: bool, selected_repo_policy,
+) -> None:
     scope = _scope(RepoPRAction.INSPECT, RepoPRAction.TEST)
     context = _auth(scope)
     source = SourceLabel(
@@ -788,8 +790,7 @@ def test_external_head_advance_rereads_review_state_before_checkout(
 
 
 @pytest.mark.parametrize("tool_name", [
-    "pr_diff", "pr_comments", "pr_metadata", "pr_reviews", "repo_status",
-    "repo_test", "repo_checkout", "repo_push", "pr_submit_review",
+    "pr_diff", "pr_comments", "pr_metadata", "pr_reviews", "pr_submit_review",
 ])
 @pytest.mark.parametrize("failed", [False, True])
 def test_repo_source_label_is_exact_and_survives_to_bound_forge_sink(
@@ -824,6 +825,81 @@ def test_repo_source_label_is_exact_and_survives_to_bound_forge_sink(
         repo_pr_action_scope=scope,
     )
     assert allowed.allowed is True
+
+
+@pytest.mark.parametrize("tool_name", [
+    "repo_status", "repo_test", "repo_checkout", "repo_push",
+])
+@pytest.mark.parametrize("failed", [False, True])
+def test_unattested_selected_repository_results_never_claim_an_exact_source(
+    tool_name: str, failed: bool, selected_repo_policy,
+) -> None:
+    from mimir.plugins.core import selected_policy_registry
+
+    scope = _scope(RepoPRAction.INSPECT, RepoPRAction.PR_COMMENT)
+    auth = _auth(scope)
+    labels = classify_protected_result(
+        tool_name, {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        auth, ToolAuthorization(
+            tool_name=tool_name, decision="resource_scoped", allowed=True,
+            repo_pr_action_scope=scope, policy=selected_policy_registry(),
+        ), result="unattested tool output", failed=failed,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+    assert labels.sources[0].resource_id == f"<unresolved-resource:protected_tool:{tool_name}>"
+    target = f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}:{scope.scope_id}"
+    decision = SinkGate.check_sink_flow(
+        "pr_comment", target, labels, auth, enforce=True,
+        repo_pr_action_scope=scope,
+    )
+    assert not decision.allowed
+    assert decision.reason == "ifc_label_blocked:forge"
+    assert decision.forge_scope_mismatch["component"] == "resource_id"
+
+
+def test_selected_repo_status_raw_lease_evidence_is_exact_but_host_result_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_repo_policy,
+) -> None:
+    from langgraph.runtime import Runtime
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import repository
+    from tests.test_repo_tools import _lineage_turn, _repo_scope_and_state
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
+    monkeypatch.setattr(
+        access_control, "_github_repo_from_remote",
+        lambda remote: scope.canonical_repo if remote == scope.canonical_origin else None,
+    )
+    auth = replace(
+        _lineage_turn(scope, state), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    capture = access_control.begin_protected_result_capture()
+    try:
+        result = repository.repo_status.func(
+            scope.canonical_repo, scope.pr_number, runtime=Runtime(context=auth),
+        )
+    finally:
+        provenance = access_control.end_protected_result_capture(capture)
+
+    assert provenance is not None and len(provenance.sources) == 1
+    source = provenance.sources[0]
+    assert source.resource_id == f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}"
+    assert source.integrity == "trusted"
+    labels = classify_protected_result(
+        "repo_status", {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        auth, ToolAuthorization(
+            tool_name="repo_status", decision="resource_scoped", allowed=True,
+            repo_pr_action_scope=scope, policy=selected_policy_registry(),
+        ), result=result, provenance=provenance,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_status>"
+    assert not SinkGate.check_sink_flow(
+        "pr_comment", f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}:{scope.scope_id}",
+        labels, auth, enforce=True, repo_pr_action_scope=scope,
+    ).allowed
 
 
 def test_mixed_repo_input_denies_bound_forge_sink() -> None:
@@ -887,8 +963,8 @@ async def test_pr_scope_policy_shadows_then_enforces_with_the_same_reason(
 
 
 @pytest.mark.asyncio
-async def test_repo_scope_policy_shadows_then_enforces_with_the_same_reason(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_selected_repo_grant_shadows_then_enforces_with_the_same_reason(
+    monkeypatch: pytest.MonkeyPatch, selected_repo_policy,
 ) -> None:
     scope = _scope(RepoPRAction.INSPECT)
     registry = ToolRegistry()
@@ -920,7 +996,7 @@ async def test_repo_scope_policy_shadows_then_enforces_with_the_same_reason(
     assert shadow.allowed is True
     assert shadow.would_block is True
     assert enforced.allowed is False
-    assert shadow.reason == enforced.reason == "repo_pr_scope_denied"
+    assert shadow.reason == enforced.reason == "repo_pr_grant_denied"
     events = [fields for kind, fields in captured if kind == "shadow_tool_decision"]
     assert len(events) == 1
     assert events[0]["tool"] == "repo_stage"

@@ -197,9 +197,10 @@ def test_descriptors_are_equivalent_to_all_pre_migration_policy_tables() -> None
         _OLD_SPECIAL_EXTRACTORS,
         {"fetch_channel_history"},
     )
+    repo_names = {name for name in known_names if name.startswith("repo_")}
 
     # The frozen inventory predates the server-side proposal diff read.
-    assert set(TOOL_DESCRIPTORS) == known_names | {
+    assert set(TOOL_DESCRIPTORS) == (known_names - repo_names) | {
         "proposal_diff", "pr_spec", "set_schedule_cron",
         "commitment_propose_closure", "chainlink_issue_show",
     }
@@ -209,7 +210,7 @@ def test_descriptors_are_equivalent_to_all_pre_migration_policy_tables() -> None
     assert TOOL_DESCRIPTORS["set_schedule_cron"].sink_category is SinkCategory.SCHEDULER
     assert TOOL_DESCRIPTORS["proposal_diff"].sink_category is None
     assert TOOL_DESCRIPTORS["proposal_diff"].result_origin is ResultOriginKind.NONE
-    for name in sorted(known_names):
+    for name in sorted(known_names - repo_names):
         descriptor = TOOL_DESCRIPTORS[name]
         expected_origin = ResultOriginKind.NONE
         if name in _OLD_EXTERNAL_RESULTS:

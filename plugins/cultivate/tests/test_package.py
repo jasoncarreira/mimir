@@ -42,7 +42,7 @@ def test_workspace_metadata_and_manifest() -> None:
         "cultivate": "mimir_cultivate:provider"}
     assert manifest["name"] == "cultivate"
     assert manifest["requires_mimir"] == f"=={version}"
-    assert set(manifest) == {"name", "version", "license", "requires_mimir", "defaults"}
+    assert set(manifest) == {"name", "version", "license", "requires_mimir", "defaults", "frontend", "themes"}
     assert manifest["defaults"]["version"] == version
     assert len(manifest["defaults"]["skills"]) == 6
     assert (PLUGIN / "brand/LICENSE").read_bytes() == (ROOT / "brand/LICENSE").read_bytes()
@@ -100,10 +100,14 @@ def test_disabled_provider_is_not_imported() -> None:
 def test_selected_provider_registers_its_coding_resources() -> None:
     from mimir.plugins.manager import load_plugins
     from mimir.plugins.core import core_runtime_names
+    from mimir_cultivate.repository import REPO_TOOLS
 
     manager = load_plugins(enable="cultivate")
     assert [plugin.candidate.name for plugin in manager.plugins] == ["cultivate"]
-    coding = set(core_runtime_names("coding")) | {"worklink_run", "worklink_resume"}
+    repository = {tool.name for tool in REPO_TOOLS}
+    assert len(repository) == 16
+    assert repository.isdisjoint(core_runtime_names("coding"))
+    coding = set(core_runtime_names("coding")) | {"worklink_run", "worklink_resume"} | repository
     assert {name for name, tool in manager.policy.tools.items() if tool.owner == "cultivate"} == coding
     assert all(manager.policy.tools[name].factory is not None for name in coding)
 

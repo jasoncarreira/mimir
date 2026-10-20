@@ -385,36 +385,50 @@ def test_verified_push_result_requires_turn_lineage_and_exact_resource(
     (pr_inline_review_comment, {"path": "src/app.py", "line": 1, "body": "posted"}),
     (pr_submit_review, {"verdict": ReviewVerdict.COMMENT, "body": "posted"}),
 ])
+@pytest.mark.usefixtures("selected_forge_policy")
 def test_first_projection_attests_without_metadata_warmup(monkeypatch, verdict, selected, kwargs):
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import forge as selected_forge
+
     client = FakeForge()
     monkeypatch.setattr(client, "author_is_trusted", lambda *_: verdict, raising=False)
     scope = _scope(RepoPRAction.INSPECT)
     runtime = _runtime(scope)
-    set_forge_client(client)
+    selected_forge.set_forge_client(client)
     try:
         token = access_control.begin_protected_result_capture()
         try:
-            result = selected.func("owner/repo", 17, runtime=runtime, **kwargs)
+            result = getattr(selected_forge, selected.name).func(
+                "owner/repo", 17, runtime=runtime, **kwargs,
+            )
         finally:
             provenance = access_control.end_protected_result_capture(token)
+        assert provenance is not None and len(provenance.sources) == 1
+        assert provenance.sources[0].resource_id == (
+            f"owner/repo#pull/17@{scope.observed_head_sha}"
+        )
+        assert provenance.sources[0].integrity == ("trusted" if verdict is True else "untrusted")
+        assert provenance.sources[0].integrity_effect == "active_ingest"
         labels = access_control.classify_protected_result(
             selected.name, {}, runtime.context,
             access_control.ToolAuthorization(tool_name=selected.name, decision="resource_scoped",
-                                             allowed=True, repo_pr_action_scope=scope),
+                                             allowed=True, repo_pr_action_scope=scope,
+                                             policy=selected_policy_registry()),
             result=result, provenance=provenance,
         )
-        assert labels.has_untrusted_active_ingest is (verdict is not True)
-        assert labels.sources[0].resource_id == f"owner/repo#pull/17@{scope.observed_head_sha}"
+        assert labels.has_untrusted_active_ingest
+        assert labels.sources[0].resource_id == (
+            f"<unresolved-resource:protected_tool:{selected.name}>"
+        )
         runtime.context.ifc_state.merge(labels)
         decision = access_control.SinkGate.check_sink_flow(
             "repo_test", f"owner/repo#pull/17@{scope.observed_head_sha}:{scope.scope_id}",
             labels, runtime.context, enforce=False, repo_pr_action_scope=scope,
         )
-        assert decision.allowed is (verdict is True)
-        if verdict is not True:
-            assert decision.reason == "write_blocked_by_untrusted_ingest"
+        assert not decision.allowed
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
     finally:
-        set_forge_client(None)
+        selected_forge.set_forge_client(None)
 
 
 @pytest.mark.parametrize("selected,kwargs,operation", [
@@ -426,19 +440,22 @@ def test_first_projection_attests_without_metadata_warmup(monkeypatch, verdict, 
 @pytest.mark.parametrize("failure_phase,prewarmed", [
     ("metadata", False), ("metadata", True), ("author", False),
 ])
+@pytest.mark.usefixtures("selected_forge_policy")
 def test_successful_write_survives_failed_attestation_without_trust(
     monkeypatch, selected, kwargs, operation, failure_phase, prewarmed,
 ):
-    from mimir.forge import ForgeError
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import forge as selected_forge
+    from mimir_cultivate.forge import ForgeError
 
     client = FakeForge()
     monkeypatch.setattr(client, "author_is_trusted", lambda *_: True, raising=False)
     scope = _scope(RepoPRAction.INSPECT)
     runtime = _runtime(scope)
-    set_forge_client(client)
+    selected_forge.set_forge_client(client)
     try:
         if prewarmed:
-            pr_metadata.func("owner/repo", 17, runtime=runtime)
+            selected_forge.pr_metadata.func("owner/repo", 17, runtime=runtime)
 
         def fail(*_):
             raise ForgeError("attestation transport failed")
@@ -448,12 +465,14 @@ def test_successful_write_survives_failed_attestation_without_trust(
         )
         if selected is pr_edit_body and failure_phase == "metadata":
             with pytest.raises(ToolException, match="attestation transport failed"):
-                selected.func("owner/repo", 17, runtime=runtime, **kwargs)
+                selected_forge.pr_edit_body.func("owner/repo", 17, runtime=runtime, **kwargs)
             assert not any(call[0] == "edit_body" for call in client.calls)
             return
         token = access_control.begin_protected_result_capture()
         try:
-            result = selected.func("owner/repo", 17, runtime=runtime, **kwargs)
+            result = getattr(selected_forge, selected.name).func(
+                "owner/repo", 17, runtime=runtime, **kwargs,
+            )
         finally:
             provenance = access_control.end_protected_result_capture(token)
         assert sum(call[0] == operation for call in client.calls) == 1
@@ -466,11 +485,14 @@ def test_successful_write_survives_failed_attestation_without_trust(
             selected.name, {"repository": "owner/repo", "pull_request": 17}, runtime.context,
             access_control.ToolAuthorization(
                 tool_name=selected.name, decision="resource_scoped", allowed=True,
-                repo_pr_action_scope=scope,
+                repo_pr_action_scope=scope, policy=selected_policy_registry(),
             ), result=result, provenance=provenance,
         )
         assert labels.has_untrusted_active_ingest
         assert labels.sources[0].integrity == "untrusted"
+        assert labels.sources[0].resource_id == (
+            f"<unresolved-resource:protected_tool:{selected.name}>"
+        )
         runtime.context.ifc_state.merge(labels)
         decision = access_control.SinkGate.check_sink_flow(
             "repo_test", f"owner/repo#pull/17@{scope.observed_head_sha}:{scope.scope_id}",
@@ -479,7 +501,7 @@ def test_successful_write_survives_failed_attestation_without_trust(
         assert not decision.allowed
         assert decision.reason == "write_blocked_by_untrusted_ingest"
     finally:
-        set_forge_client(None)
+        selected_forge.set_forge_client(None)
 
 
 @pytest.mark.parametrize("verdict", [True, False, None])
@@ -752,41 +774,47 @@ def test_job_log_publishes_explicit_scoped_head(monkeypatch):
 
 
 @pytest.mark.parametrize("verdict", [True, False, None])
+@pytest.mark.usefixtures("selected_forge_policy")
 def test_job_log_attestation_controls_repo_test(monkeypatch, verdict):
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import forge as selected_forge
+
     client = FakeForge()
     monkeypatch.setattr(client, "author_is_trusted", lambda *_: verdict, raising=False)
     monkeypatch.setattr(client, "get_job_log", lambda *_: "redacted excerpt", raising=False)
     scope = _scope(RepoPRAction.INSPECT)
     runtime = _runtime(scope)
-    set_forge_client(client)
+    selected_forge.set_forge_client(client)
     try:
         token = access_control.begin_protected_result_capture()
         try:
-            result = pr_job_log.func("owner/repo", 17, 123, runtime=runtime)
+            result = selected_forge.pr_job_log.func("owner/repo", 17, 123, runtime=runtime)
         finally:
             provenance = access_control.end_protected_result_capture(token)
         assert result == "redacted excerpt"
+        assert provenance is not None and len(provenance.sources) == 1
+        assert provenance.sources[0].resource_id == f"owner/repo#pull/17@{scope.observed_head_sha}"
+        assert provenance.sources[0].integrity == ("trusted" if verdict is True else "untrusted")
         labels = access_control.classify_protected_result(
             "pr_job_log", {"repository": "owner/repo", "pull_request": 17, "job_id": 123},
             runtime.context,
             access_control.ToolAuthorization(
                 tool_name="pr_job_log", decision="resource_scoped", allowed=True,
-                repo_pr_action_scope=scope,
+                repo_pr_action_scope=scope, policy=selected_policy_registry(),
             ), result=result, provenance=provenance,
         )
-        assert labels.sources[0].resource_id == f"owner/repo#pull/17@{scope.observed_head_sha}"
-        assert labels.sources[0].integrity == ("trusted" if verdict is True else "untrusted")
+        assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:pr_job_log>"
+        assert labels.sources[0].integrity == "untrusted"
         runtime.context.ifc_state.merge(labels)
-        assert runtime.context.ifc_state.has_untrusted_active_ingest() is (verdict is not True)
+        assert runtime.context.ifc_state.has_untrusted_active_ingest()
         decision = access_control.SinkGate.check_sink_flow(
             "repo_test", f"owner/repo#pull/17@{scope.observed_head_sha}:{scope.scope_id}",
             labels, runtime.context, enforce=False, repo_pr_action_scope=scope,
         )
-        assert decision.allowed is (verdict is True)
-        if verdict is not True:
-            assert decision.reason == "write_blocked_by_untrusted_ingest"
+        assert not decision.allowed
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
     finally:
-        set_forge_client(None)
+        selected_forge.set_forge_client(None)
 
 
 @pytest.mark.asyncio
@@ -1656,8 +1684,13 @@ def test_pr_spec_refuses_outsider_pr_and_nonadmin_user(tmp_path, monkeypatch):
     assert not decision.allowed
 
 
+@pytest.mark.usefixtures("selected_forge_policy")
 def test_shipped_poller_can_read_only_bound_pr_spec(tmp_path, monkeypatch):
+    from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
+    from mimir.plugins.core import selected_policy_registry
     from mimir.pollers import _parse_poller_authority
+    from mimir_cultivate import forge as selected_forge
+    from tests.test_repo_tools import _repo_scope_and_state
 
     manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json"
     record = json.loads(manifest.read_text())["pollers"][0]
@@ -1669,21 +1702,34 @@ def test_shipped_poller_can_read_only_bound_pr_spec(tmp_path, monkeypatch):
         trigger="poller", channel_id=authority.canonical,
         service_principal=authority.canonical, service_authority=authority,
     )
-    scope = _scope(RepoPRAction.INSPECT)
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    _origin, _source, scope, state = _repo_scope_and_state(repository_root)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
     context = replace(access_control.create_auth_context(
         event, IdentityResolver(tmp_path), enforce=True, ifc_labels=InformationFlowLabels(),
-    ), repo_pr_scope_registry=RepoPRScopeRegistry((RepoReviewState(scope),)))
+    ), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+       repo_review_state=state, repo_pr_action_scope=scope)
+    grants = ScopedPRGrants(
+        context.canonical_principal, (scope,),
+        protocols=selected_policy_registry().scoped_actions,
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    checkout_token = grants.consume_checkout("cultivate", scope)
+    assert checkout_token is not None
+    assert grants.observe_checkout("cultivate", scope, state.checkout_lease, checkout_token)
+    context = replace(context, scoped_pr_grants=grants)
     registry = access_control.ToolRegistry()
-    arguments = {"repository": "owner/repo", "pull_request": 17}
+    arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
     assert registry.authorize_tool("pr_spec", context, enforce=True, arguments=arguments).allowed
     assert not registry.authorize_tool(
         "pr_spec", context, enforce=True,
-        arguments={"repository": "owner/repo", "pull_request": 18},
+        arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number + 1},
     ).allowed
     root = tmp_path / "state" / "worklink" / "evidence"
     root.mkdir(parents=True)
     (root / "42-build.json").write_text(json.dumps({
-        "pr_url": "https://github.com/owner/repo/pull/17",
+        "pr_url": f"https://github.com/{scope.canonical_repo}/pull/{scope.pr_number}",
     }))
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
 
@@ -1694,8 +1740,8 @@ def test_shipped_poller_can_read_only_bound_pr_spec(tmp_path, monkeypatch):
         }).encode())
         return SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr("mimir.tools.forge.subprocess.run", run)
-    assert pr_spec.func(**arguments, runtime=Runtime(context=context))["description"] == "do the work"
+    monkeypatch.setattr(selected_forge.subprocess, "run", run)
+    assert selected_forge.pr_spec.func(**arguments, runtime=Runtime(context=context))["description"] == "do the work"
 
 
 class FakeForge:
@@ -2475,6 +2521,7 @@ def test_job_log_missing_service_capability_denied():
 
 
 @pytest.mark.parametrize("skill", ["github-poller", "github-ci-watch"])
+@pytest.mark.usefixtures("selected_forge_policy")
 def test_job_log_shipped_manifests_accepted_with_explicit_grant(tmp_path, skill):
     from mimir.pollers import _parse_poller_authority
 
@@ -2982,7 +3029,7 @@ def test_only_server_discovered_scope_can_enter_later_turn_store() -> None:
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_heartbeat_git_fresh_own_pr_all_typed_actions(tmp_path, monkeypatch, enabled):
+def test_heartbeat_git_fresh_own_pr_all_typed_actions(tmp_path, monkeypatch, enabled, request):
     client = FakeForge()
     client.snapshot_author = "reviewer"
     _configure_live_review(monkeypatch, client)
@@ -2995,6 +3042,10 @@ def test_heartbeat_git_fresh_own_pr_all_typed_actions(tmp_path, monkeypatch, ena
             resolve_review_state_for_context(context, "owner/repo", 17)
         assert client.calls == []
         return
+    request.getfixturevalue("selected_forge_policy")
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import repository
+
     state = resolve_review_state_for_context(context, "OWNER/REPO", 17)
     scope = state.action_scope
     assert scope.allowed_operations == access_control._REPO_PR_REMEDIATION_ACTIONS
@@ -3004,20 +3055,19 @@ def test_heartbeat_git_fresh_own_pr_all_typed_actions(tmp_path, monkeypatch, ena
     assert scope.observed_base_sha == "d" * 40
     assert scope.checkout_ref is None
     assert scope.pull_request_author == scope.principal == "reviewer"
-    for name in access_control._REPO_TOOL_ACTIONS:
+    names = {tool.name for tool in repository.REPO_TOOLS}
+    assert names
+    for name in names:
+        assert selected_policy_registry().tools[name].typed_action.value in scope.allowed_operations
         decision = access_control.ToolRegistry().authorize_tool(
             name, context, enforce=True,
             arguments={"repository": "owner/repo", "pull_request": 17},
         )
-        assert decision.allowed, (name, decision)
+        assert not decision.allowed, (name, decision)
     assert resolve_review_state_for_context(context, "owner/repo", 17) is state
     client.snapshot_heads = ["e" * 40]
-    decision = access_control.ToolRegistry().authorize_tool(
-        "repo_push", context, enforce=True,
-        arguments={"repository": "owner/repo", "pull_request": 17},
-    )
-    assert not decision.allowed
-    assert "stale_scope" in decision.refusal_detail
+    with pytest.raises(ToolException, match="stale_scope: heartbeat PR SHA/ref"):
+        resolve_review_state_for_context(context, "owner/repo", 17)
 
 
 @pytest.mark.parametrize("source", ["cache", "registry"])
@@ -3078,6 +3128,7 @@ def test_heartbeat_authority_predicate_boundaries(tmp_path, monkeypatch, field):
 
 
 @pytest.mark.parametrize("field", ["login", "principal", "author", "repository", "capability"])
+@pytest.mark.usefixtures("selected_forge_policy")
 def test_heartbeat_direct_authorization_boundaries(tmp_path, monkeypatch, field):
     client = FakeForge()
     client.snapshot_author = "reviewer"
@@ -3220,6 +3271,7 @@ def test_heartbeat_checkout_rejects_poller_preflight_shortcut(tmp_path, monkeypa
 
 @pytest.mark.parametrize("source", ["store", "cache", "registry", "escalation"])
 @pytest.mark.parametrize("route", ["resolve", "authorize", "checkout", "escalate", "job_log"])
+@pytest.mark.usefixtures("selected_forge_policy")
 def test_heartbeat_git_rejects_other_author_scope_reuse(tmp_path, monkeypatch, source, route):
     import mimir.tools.forge as forge
 
@@ -3250,7 +3302,10 @@ def test_heartbeat_git_rejects_other_author_scope_reuse(tmp_path, monkeypatch, s
             arguments={"repository": "owner/repo", "pull_request": 17},
         )
         assert not decision.allowed
-        assert "heartbeat_other_author" in decision.refusal_detail
+        if source in {"store", "escalation"}:
+            assert decision.reason == "sink_target_required"
+        else:
+            assert "heartbeat_other_author" in decision.refusal_detail
     else:
         runtime = SimpleNamespace(context=context)
         operations = {
@@ -3294,6 +3349,7 @@ def test_heartbeat_git_validates_provider_identity(tmp_path, monkeypatch, mutati
     {"canonical_principal": "impostor"}, {"trigger": "poller"},
 ])
 @pytest.mark.parametrize("route", ["resolve", "authorize", "checkout", "escalate", "job_log"])
+@pytest.mark.usefixtures("selected_forge_policy")
 def test_heartbeat_git_rejects_untrusted_context_even_with_cached_scope(tmp_path, monkeypatch, mutation, route):
     import mimir.tools.forge as forge
 
@@ -3758,7 +3814,8 @@ def test_poller_turn_own_merged_pr_yields_terminal_state(
 
 
 @pytest.mark.parametrize("case", ["open", "closed", "wrong-repo", "invalid-head", "no-grant"])
-def test_shipped_poller_reviews_others_with_one_audit_event(
+@pytest.mark.usefixtures("selected_forge_policy")
+def test_shipped_poller_reviews_others_scope_requires_live_owner_grant(
     tmp_path, monkeypatch: pytest.MonkeyPatch, case: str,
 ) -> None:
     from mimir.pollers import _parse_poller_authority
@@ -3809,10 +3866,6 @@ def test_shipped_poller_reviews_others_with_one_audit_event(
     assert resolved.action_scope.allowed_operations == frozenset({
         "repo.inspect", "repo.checkout", "repo.test", "pr.review", "pr.comment",
     })
-    runtime = ToolRuntime(
-        state={}, context=context, config={}, stream_writer=lambda _: None,
-        tool_call_id="manifest-review", store=None,
-    )
     arguments = {"repository": "owner/repo", "pull_request": 1291}
     registry = access_control.ToolRegistry()
     for tool in (pr_metadata, pr_files, pr_diff, pr_checks, pr_reviews,
@@ -3823,8 +3876,8 @@ def test_shipped_poller_reviews_others_with_one_audit_event(
         decision = registry.authorize_tool(
             tool.name, context, enforce=True, arguments=tool_args,
         )
-        assert decision.allowed, decision
-        tool.func(**tool_args, runtime=runtime)
+        assert not decision.allowed
+        assert decision.reason == "repo_pr_grant_denied", (tool.name, decision.reason)
     assert resolve_review_state_for_context(context, "owner/repo", 1291) is resolved
     assert events == [("forge_review_others_scope_resolved", {
         "repository": "owner/repo", "pull_request": 1291,
@@ -4075,7 +4128,8 @@ async def test_operator_turn_discovers_live_review_scope_and_reaches_repo_test(
     assert client.calls == [("snapshot", "owner/repo", 1291)]
 
 
-def test_server_discovered_changes_requested_review_reaches_repo_write_authority(
+@pytest.mark.usefixtures("selected_forge_policy")
+def test_server_discovered_changes_requested_review_requires_live_write_grant(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4113,8 +4167,8 @@ def test_server_discovered_changes_requested_review_reaches_repo_write_authority
             tool_name, context, enforce=True,
             arguments={"repository": "owner/repo", "pull_request": 1291},
         )
-        assert decision.allowed is True
-        assert decision.reason is None
+        assert not decision.allowed
+        assert decision.reason == "repo_pr_grant_denied"
     assert [call[0] for call in client.calls] == ["snapshot", "reviews"]
 
 
@@ -4139,12 +4193,17 @@ def test_standing_review_refuses_unconfigured_repo_before_live_fetch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("selected_forge_policy")
 async def test_enforced_middleware_resolves_standing_review_before_authorization(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import forge as selected_forge
+
     client = FakeForge()
     set_forge_client(client)
+    monkeypatch.setattr(selected_forge, "_default_client", client)
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
@@ -4171,10 +4230,11 @@ async def test_enforced_middleware_resolves_standing_review_before_authorization
         called = True
         return ToolMessage(content="tested", tool_call_id="standing-review")
 
-    result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+    result = await BudgetGateMiddleware(selected_policy_registry()).awrap_tool_call(request, handler)
 
-    assert result.status != "error"
-    assert called is True
+    assert result.status == "error"
+    assert "repo_pr_grant_denied" in str(result.content)
+    assert called is False
     assert context.server_discovered_pr_states.resolve("owner/repo", 1291) is not None
     assert client.calls == [("snapshot", "owner/repo", 1291)]
 
@@ -4657,7 +4717,7 @@ async def test_poller_review_keeps_poller_scope_and_uses_same_stale_head_refusal
             {"repository": "owner/repo", "pull_request": 7, "verdict": "approve"},
             "body",
         ),
-        (repo_status, {"repository": "owner/repo"}, "pull_request"),
+        ("repo_status", {"repository": "owner/repo"}, "pull_request"),
     ],
 )
 @pytest.mark.parametrize("is_async", [False, True])
@@ -4668,6 +4728,17 @@ async def test_schema_invalid_standing_review_call_is_recoverable(
     missing_field: str,
     is_async: bool,
 ) -> None:
+    selected = None
+    if forge_tool == "repo_status":
+        from importlib.metadata import PackageNotFoundError, version
+        from mimir.plugins.manager import load_plugins
+
+        try:
+            version("mimir-cultivate")
+        except PackageNotFoundError:
+            pytest.skip("repo_status schema belongs to installed Cultivate")
+        selected = load_plugins(enable="cultivate").policy
+        forge_tool = selected.tools["repo_status"].factory()
     context = AuthContext(
         principal="operator", canonical_principal="operator", roles=("admin",),
         event_ingress=None, trigger="user_message", channel_id="operator", interactivity=None,
@@ -4680,7 +4751,7 @@ async def test_schema_invalid_standing_review_call_is_recoverable(
         },
         tool=forge_tool, state={}, runtime=Runtime(context=context),
     )
-    middleware = BudgetGateMiddleware()
+    middleware = BudgetGateMiddleware(selected)
 
     if is_async:
         async def handler(_tool_request):

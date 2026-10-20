@@ -318,9 +318,10 @@ def test_selected_ci_ingress_checks_exact_server_issued_target(
 
 @pytest.mark.asyncio
 async def test_selected_retained_ingress_and_ifc_reader(tmp_path, monkeypatch) -> None:
-    await exercise_real_worklink_failure_turn(
-        tmp_path, monkeypatch, selected_provider=True,
-    )
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        await exercise_real_worklink_failure_turn(
+            tmp_path, monkeypatch, selected_provider=True,
+        )
 
 
 def test_rejected_action_cannot_widen_provider_scope() -> None:

@@ -20,8 +20,11 @@ from langchain_core.messages import ToolMessage
 from mimir_cultivate import repository
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.models import RepoPRScopeRegistry
+from mimir.plugins.manager import load_plugins
 from mimir.tools.budget_gate import BudgetGateMiddleware
-from tests.test_budget_gate_and_alias import _ifc_turn, _make_request, _untainted_ifc_auth
+from tests.test_budget_gate_and_alias import (
+    _ifc_turn, _make_request, _repo_granted_auth, _untainted_ifc_auth,
+)
 from tests.test_repo_tools import (
     _configure_worklink_test, _fixture_git_env, _repo_scope_and_state,
 )
@@ -94,7 +97,9 @@ def test_provider_reacquires_and_inspects_an_exact_pr_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.tools.budget_gate import _hold_scoped_pr_dispatch
+    from mimir.plugins.core import policy_scope
 
+    selected = load_plugins(enable="cultivate").policy
     _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
     previous = state.checkout_lease
     assert previous is not None
@@ -109,12 +114,12 @@ def test_provider_reacquires_and_inspects_an_exact_pr_checkout(
     with pytest.raises(RuntimeError, match="no longer live"):
         with repository.hold_pr_checkout_lease(previous):
             pass
-    with repository.hold_pr_checkout_lease(acquired):
+    with policy_scope(selected), repository.hold_pr_checkout_lease(acquired):
         result = repository.RepoGitTools(state).execute(repository.GitStatus())
     assert result.ok is True
     assert result.code == "ok"
     call = SimpleNamespace(
-        tool_name="repo_status", policy=None,
+        tool_name="repo_status", policy=selected,
         authorization=SimpleNamespace(repo_pr_action_scope=scope),
         auth_context=SimpleNamespace(
             server_discovered_pr_states=None,
@@ -155,9 +160,9 @@ def test_provider_checkout_handoff_and_live_result_observation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     async_mode: bool, operation: str, expiry_point: str | None,
 ) -> None:
-    from mimir import pr_checkout_lease
     from mimir.tools import budget_gate
 
+    selected = load_plugins(enable="cultivate").policy
     _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
     root = state.checkout_lease.lease_root
     if operation == "repo_checkout":
@@ -167,6 +172,9 @@ def test_provider_checkout_handoff_and_live_result_observation(
     auth = replace(
         _untainted_ifc_auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
         repo_review_state=state, repo_pr_action_scope=scope,
+    )
+    auth = _repo_granted_auth(
+        auth, scope, state, follow_on=operation != "repo_checkout", policy=selected,
     )
     calls: list[str] = []
     completed = threading.Event()
@@ -235,8 +243,7 @@ def test_provider_checkout_handoff_and_live_result_observation(
             assert repository.RepoGitTools(state).execute(repository.GitStatus()).ok
         assert lock_is_held()
         if expiry_point is not None:
-            lease_module = repository if operation == "repo_checkout" else pr_checkout_lease
-            monkeypatch.setattr(lease_module, "datetime", LeaseClock)
+            monkeypatch.setattr(repository, "datetime", LeaseClock)
             clock["now"] = lease.expires_at + timedelta(
                 seconds=(1 if expiry_point == "handler" else -1),
             )
@@ -266,9 +273,9 @@ def test_provider_checkout_handoff_and_live_result_observation(
             async def async_handler(req):
                 return handler(req)
 
-            result = asyncio.run(BudgetGateMiddleware().awrap_tool_call(request, async_handler))
+            result = asyncio.run(BudgetGateMiddleware(selected).awrap_tool_call(request, async_handler))
         else:
-            result = BudgetGateMiddleware().wrap_tool_call(request, handler)
+            result = BudgetGateMiddleware(selected).wrap_tool_call(request, handler)
     finally:
         release_competitor.set()
         reset_current_turn(token)

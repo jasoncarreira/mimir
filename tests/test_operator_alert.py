@@ -164,9 +164,23 @@ async def test_tainted_service_alert_uses_configured_destination_and_other_sinks
     assert denied_calls == 0
 
 
+@pytest.fixture
+def selected_repository_policy():
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("shipped Cultivate poller requires installed Cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
 @pytest.mark.asyncio
 async def test_shipped_worklink_principal_can_use_real_operator_alert_sink(
-    tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, selected_repository_policy,
 ) -> None:
     from mimir.pollers import _parse_poller_authority
 

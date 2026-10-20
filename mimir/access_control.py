@@ -9727,12 +9727,21 @@ class ToolRegistry:
             )
             return finish(auth)
 
-        from .plugins.core import core_policy_registry
+        from .plugins.core import _REPO_ACTIONS, core_policy_registry
 
         policy = policy if policy is not None else selected_policy_registry()
         if not policy.frozen:
             raise ValueError("authorization requires a frozen policy")
         tool_policy = policy.tools.get(tool_name)
+        if tool_policy is None and tool_name in _REPO_ACTIONS:
+            return finish(ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=False,
+                reason="repository_tool_unavailable",
+                enforcement_enabled=True,
+                would_block=True,
+            ))
         plugin_tool = (
             tool_policy if tool_policy is not None and tool_policy.owner != "core"
             else None
@@ -11681,6 +11690,14 @@ def classify_protected_result(
     # claimed NON_INGESTING results; they never inherit core refusal exemptions.
     selected = authorization.policy if authorization.policy is not None else selected_policy_registry()
     registered = selected.tools.get(tool_name)
+    if registered is None:
+        from .plugins.core import _REPO_ACTIONS
+
+        if tool_name in _REPO_ACTIONS:
+            return _incomplete_protected_result(
+                "repository", arguments or {}, tool_name=tool_name,
+                auth_context=auth_context,
+            )
     retained_verified = False
     if registered is not None and registered.owner != "core":
         scope = getattr(auth_context, "retained_factory_scope", None)

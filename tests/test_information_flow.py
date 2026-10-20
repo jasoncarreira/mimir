@@ -1087,6 +1087,7 @@ def _runtime_operator_context(
 
 @pytest.mark.parametrize("visibility", [None, "private"])
 @pytest.mark.parametrize("tool_name", ["pr_comment", "repo_push"])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_operator_runtime_ingress_admits_scoped_forge(
     ingress_resolver: IdentityResolver, visibility: str | None, tool_name: str,
 ) -> None:
@@ -3379,7 +3380,21 @@ def test_heartbeat_fetches_multiple_approved_exact_urls_after_untrusted_ingest(
 
 
 @pytest.fixture
-def shipped_github_fetch_context(request, tmp_path, monkeypatch):
+def selected_cultivate_policy():
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("selected coding policy requires installed Cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+@pytest.fixture
+def shipped_github_fetch_context(request, tmp_path, monkeypatch, selected_cultivate_policy):
     from mimir.pollers import _parse_poller_authority
     from mimir.models import RepoPRActionScope, RepoReviewState
     import mimir.access_control as access_control
@@ -4879,6 +4894,7 @@ def test_failed_first_party_file_read_keeps_incomplete_label(
     assert source.authorized_principals == frozenset()
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_review_skill_read_admits_scoped_forge_sinks_under_enforcement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5796,6 +5812,7 @@ def test_file_and_shell_sinks_still_refuse_untrusted_active_ingest(
 ])
 @pytest.mark.parametrize("enforce", [False, True])
 @pytest.mark.parametrize("stale_snapshot", [False, True])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_tainted_code_and_live_mutations_have_uniform_refusal(
     tool_name: str, enforce: bool, stale_snapshot: bool,
 ) -> None:
@@ -7024,6 +7041,7 @@ def test_exact_file_grant_refuses_tainted_write_without_clearing_or_spending(
     ("write_file", "registry_file_path"), ("write_file", "registry_path"),
     ("repo_commit", "sink"), ("repo_push", "sink"), ("repo_test", "sink"),
 ])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_live_declassification_cannot_bypass_tainted_write_veto(
     tmp_path: Path, bind_approval_turn, origin: str, enforce: bool,
     tool_name: str, gate: str,

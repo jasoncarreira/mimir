@@ -398,7 +398,27 @@ def test_original_core_policy_matches_frozen_oracle(
     assert expected["baseline_sha"] == BASELINE
     assert len(expected["descriptors"]) == 103
     assert _canonical(expected, home) == fixture_bytes
-    assert _canonical(_snapshot(home, monkeypatch), home) == fixture_bytes
+    retired = frozenset(expected["tables"]["repo_actions"])
+
+    def without_retired(value):
+        if isinstance(value, dict):
+            return {key: without_retired(item) for key, item in value.items()
+                    if key not in retired}
+        if isinstance(value, list):
+            return [without_retired(item) for item in value
+                    if not (isinstance(item, str) and item in retired)]
+        return value
+
+    observed = without_retired(json.loads(_canonical(_snapshot(home, monkeypatch), home)))
+    projected = without_retired(expected)
+    assert observed.keys() == projected.keys()
+    for category, value in observed.items():
+        if isinstance(value, dict):
+            assert value.keys() == projected[category].keys(), category
+            for name, item in value.items():
+                assert item == projected[category][name], (category, name)
+        else:
+            assert value == projected[category], category
 
 
 def test_pre_extraction_coding_policy_is_frozen(
@@ -409,18 +429,20 @@ def test_pre_extraction_coding_policy_is_frozen(
     frozen = json.loads(FIXTURE.read_bytes())
     tables = frozen["tables"]
     registry = core_policy_registry()
+    retired = frozenset(tables["repo_actions"])
 
     assert len(CODING_TOOLS) == 40
     assert CODING_TOOLS <= frozen["descriptors"].keys()
     assert CODING_TOOLS <= frozen["authorization"].keys()
     assert CODING_TOOLS <= frozen["extractor_results"].keys()
-    assert CODING_TOOLS <= registry.tools.keys()
+    assert retired.isdisjoint(registry.tools)
+    assert CODING_TOOLS - retired <= registry.tools.keys()
     required_memberships = (
         "retained_repo_tools", "worklink_build_tools", "repo_publish_tools",
         "tainted_writes",
     )
     assert set(required_memberships) <= tables.keys()
-    for name in sorted(CODING_TOOLS):
+    for name in sorted(CODING_TOOLS - retired):
         tool = registry.tools[name]
         descriptor = frozen["descriptors"][name]
         assert tool.flow == tables["flow"].get(name)
@@ -439,5 +461,5 @@ def test_pre_extraction_coding_policy_is_frozen(
             assert (membership in tool.memberships) == (name in tables[membership])
         assert len(frozen["authorization"][name]) == 18
     observed = _outcomes(home)
-    for name in CODING_TOOLS:
+    for name in CODING_TOOLS - retired:
         assert observed[name] == frozen["authorization"][name]

@@ -47,7 +47,7 @@ from mimir.contained_execution import (
 )
 from mimir.contained_snapshot import SnapshotCredentialsRefused, create_git_snapshot
 from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
-from mimir.pr_checkout_lease import (
+from mimir_cultivate.repository import (
     PRCheckoutLease,
     acquire_pr_checkout_lease,
     cleanup_pr_checkout_lease,
@@ -92,10 +92,15 @@ from mimir.tools.refusals import ToolPolicyRefusal
 
 @pytest.fixture(autouse=True)
 def provider_test_identities(monkeypatch, synthetic_worklink_identities):
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
     if synthetic_worklink_identities is not None:
         from mimir_cultivate import repository
 
         monkeypatch.setattr(repository, "get_identities", lambda: synthetic_worklink_identities)
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
 
 
 def test_pr_lease_is_continuous_and_identity_changes_on_reacquisition(tmp_path: Path) -> None:
@@ -1399,7 +1404,7 @@ def test_retained_non_fast_forward_fix_can_resume_and_publish_next_turn(
     _git(lease.path, "fetch", "origin", "main")
     _git(lease.path, "-c", "user.name=Test", "-c", "user.email=test@example.com", "rebase", "origin/main")
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: scope.observed_head_sha,
     )
     state = RepoReviewState(scope)
@@ -1669,7 +1674,8 @@ def test_push_argv_has_only_bound_non_force_non_delete_branch_form(repo_tools) -
 def test_wrapper_records_only_successful_verified_head_transition(
     tmp_path, monkeypatch, event_type,
 ) -> None:
-    from mimir.access_control import ToolRegistry
+    from mimir.access_control import ScopedPRGrants, ToolRegistry, _SCOPED_PR_ISSUER
+    from mimir.plugins.core import selected_policy_registry
     from mimir_cultivate import repository as git_module
     from mimir.models import (
         AuthContext, InformationFlowLabels, RepoPRScopeRegistry, SourceLabel, TurnInteractivity,
@@ -1677,6 +1683,7 @@ def test_wrapper_records_only_successful_verified_head_transition(
     from mimir_cultivate import repository as wrapper
 
     origin, _source, scope, state = _repo_scope_and_state(tmp_path, event_type=event_type)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
     tools = RepoGitTools(state)
     initial = scope.observed_head_sha
     ingress = SourceLabel(
@@ -1705,6 +1712,15 @@ def test_wrapper_records_only_successful_verified_head_transition(
         )
 
     context = context_for_turn()
+    grants = ScopedPRGrants(
+        "operator", (scope,), protocols=selected_policy_registry().scoped_actions,
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    checkout_token = grants.consume_checkout("cultivate", scope)
+    assert checkout_token is not None
+    assert grants.observe_checkout("cultivate", scope, state.checkout_lease, checkout_token)
+    assert grants.get("cultivate", scope, RepoPRAction.PR_COMMENT.value, checkout=False) is not None
+    assert selected_policy_registry().scoped_actions["cultivate"].live_lease(scope, state) is state.checkout_lease
     authorization_context = AuthContext(
         principal="slack-U1", canonical_principal="operator", roles=("user", "admin"),
         event_ingress=None, trigger="user_message", channel_id="slack-C1",
@@ -1712,7 +1728,7 @@ def test_wrapper_records_only_successful_verified_head_transition(
         domain="channel", resource_id="slack-C1", bridge_instance="slack",
         ifc_labels=labels, repo_review_state=state, repo_pr_action_scope=scope,
         repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
-        ifc_state=context.ifc_state,
+        ifc_state=context.ifc_state, scoped_pr_grants=grants,
     )
     registry = ToolRegistry()
     arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
@@ -1781,6 +1797,16 @@ def test_wrapper_records_only_successful_verified_head_transition(
         GitPush(),
     )["ok"]
     assert fresh_context.ifc_state.own_push_lineage() == {}
+    assert state.action_scope is scope
+    assert selected_policy_registry().scoped_actions["cultivate"].live_lease(scope, state) is state.checkout_lease
+    updated_grants = ScopedPRGrants(
+        "operator", (scope,), protocols=selected_policy_registry().scoped_actions,
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    updated_token = updated_grants.consume_checkout("cultivate", scope)
+    assert updated_token is not None
+    assert updated_grants.observe_checkout("cultivate", scope, state.checkout_lease, updated_token)
+    authorization_context = replace(authorization_context, scoped_pr_grants=updated_grants)
     for tool_name in ("pr_comment", "pr_rerequest_review", "repo_cleanup"):
         decision = registry.authorize_tool(
             tool_name, authorization_context, enforce=True, arguments=arguments,
@@ -4571,7 +4597,7 @@ def test_repo_wrapper_failure_classes_have_distinct_stable_codes(
         assert "local commit remains unpushed in preserved checkout" in str(refusal.value)
 
 
-def test_inactive_checkout_refusal_does_not_veto_next_lease_write(
+def test_inactive_checkout_refusal_from_selected_provider_is_not_trusted(
     repo_tools, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from datetime import UTC, datetime, timedelta
@@ -4604,15 +4630,17 @@ def test_inactive_checkout_refusal_does_not_veto_next_lease_write(
         result=ToolMessage(content=f"Error: {refusal.value}", tool_call_id="refusal", status="error"),
         provenance=provenance, failed=True,
     )
-    assert labels is None
-    assert not auth.ifc_state.has_untrusted_active_ingest()
+    assert labels is not None and labels.has_untrusted_active_ingest
+    auth.ifc_state.merge(labels, fallback=auth.ifc_labels)
+    assert auth.ifc_state.has_untrusted_active_ingest()
     object.__setattr__(state, "checkout_lease", lease)
     target = lease.path / "tracked.txt"
     decision = ToolRegistry().authorize_tool(
         "edit_file", auth, enforce=True, target_channel=str(target),
         arguments={"file_path": str(target)},
     )
-    assert decision.allowed, decision.reason
+    assert not decision.allowed
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
 
 
 def test_repo_wrapper_git_stderr_redacts_embedded_remote_credential(

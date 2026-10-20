@@ -278,7 +278,7 @@ def test_coding_startup_writable_root_and_identity_gate(monkeypatch, tmp_path, d
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
     names = {tool.name for tool in all_mimir_tools(coding_enabled=True)}
     assert ("spawn_open_code" in names) is not degraded
-    assert ("repo_test" in names) is not degraded
+    assert "repo_test" not in names
     assert list(tmp_path.iterdir()) == []
 
 
@@ -396,15 +396,16 @@ def test_typed_repo_pr_schemas_only_name_exact_registry_selectors() -> None:
 
 
 def test_repo_test_schema_exposes_no_execution_authority() -> None:
-    from mimir.tools import all_mimir_tools
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.manager import load_plugins
 
-    tools = {
-        tool.name: tool
-        for tool in all_mimir_tools(
-            coding_enabled=True, require_coding_available=False,
-        )
-    }
-    schema = tools["repo_test"].tool_call_schema.model_json_schema()
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("repo_test schema belongs to installed Cultivate")
+    selected = load_plugins(enable="cultivate").policy
+    assert selected.tools["repo_test"].owner == "cultivate"
+    schema = selected.tools["repo_test"].factory().tool_call_schema.model_json_schema()
     properties = schema["properties"]
     assert set(properties) == {"repository", "pull_request", "selectors", "suite", "include_output"}
     assert properties["include_output"]["default"] is False

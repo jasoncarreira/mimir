@@ -494,7 +494,6 @@ _RUNTIME_SURFACES = {
     "coding": (
         ("mimir.tools.registry", "spawn_open_code"),
         ("mimir.tools.forge:FORGE_TOOLS", "pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests pr_submit_review pr_inline_review_comment pr_comment pr_edit_body issue_comment pr_rerequest_review unsupported_operation"),
-        ("mimir.tools.repo:REPO_TOOLS", "repo_checkout repo_cleanup repo_fetch repo_status repo_test repo_diff repo_unmerged repo_stage repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push"),
     ),
 }
 
@@ -521,10 +520,11 @@ def register_core_tools(
     """Register core tool policy and lazy runtime factories."""
     from mimir.tool_descriptors import _CORE_DESCRIPTOR_DECLARATIONS, ResultOriginKind
 
+    retired_repo = frozenset(_REPO_ACTIONS)
     delegated = (
         frozenset(core_runtime_names("coding")) | {"worklink_run", "worklink_resume"}
         if "cultivate" in selected_owners else frozenset()
-    )
+    ) | retired_repo
 
     flow_by_name = {
         name: flow for flow, names in _FLOWS.items() for name in names
@@ -678,7 +678,7 @@ def register_core_tools(
             )
     for name, capabilities in _PROFILES.items():
         registry.register_authority_profile(
-            name, capabilities=capabilities, bounded_capabilities=_BOUNDS.get(name, ()),
+            name, capabilities=capabilities - retired_repo, bounded_capabilities=_BOUNDS.get(name, ()),
             capability_companions=(
                 {"worklink_run": _names("read_file ls shell_exec")}
                 if name == "heartbeat" else {}

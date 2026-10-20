@@ -368,6 +368,20 @@ def poller_named_secrets(monkeypatch):
 
 
 @pytest.fixture
+def selected_cultivate_policy():
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("shipped Cultivate poller requires installed Cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+@pytest.fixture
 def home(tmp_path: Path) -> Path:
     """Standard MIMIR_HOME with logger initialized so log_event won't crash."""
     (tmp_path / "logs").mkdir()
@@ -917,6 +931,7 @@ def test_github_approved_urls_rejects_other_hosts_with_named_error(
     assert "approved_urls requires a GitHub host" in caplog.text
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_ci_watch_shipped_manifest_authorizes_only_approved_urls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -947,6 +962,7 @@ def test_ci_watch_shipped_manifest_authorizes_only_approved_urls(
 
 
 @pytest.mark.parametrize("manifest_approval", ["declared", "missing", "empty", "nonmatching"])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_github_activity_shipped_manifest_authorizes_scoped_actions_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manifest_approval: str,
 ) -> None:
@@ -1202,6 +1218,7 @@ def test_manifest_rejects_shell_authority_without_job_inspection_companions(
         )
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_github_activity_observed_operations_are_admitted_when_enforced(
     tmp_path: Path,
     repo_review_state: RepoReviewState,
@@ -1271,6 +1288,7 @@ def test_github_activity_observed_operations_are_admitted_when_enforced(
 
 
 @pytest.mark.parametrize("enforce", [True, False])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforce: bool,
 ) -> None:
@@ -1490,6 +1508,7 @@ def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
 @pytest.fixture
 def worklink_incident_github_read_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
+    selected_cultivate_policy,
 ):
     home = (tmp_path / "home").resolve()
     state = home / "state"
@@ -1576,6 +1595,7 @@ def test_worklink_incident_missing_operator_secret_is_denied(
         assert decision.would_block and decision.reason == "read_scope"
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3730,6 +3750,7 @@ def test_packaged_trusted_system_classification_is_worklink_only() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("factory_kind", ["factory_start", "factory_success"])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 async def test_worklink_turn_kinds_are_trusted_without_ifc_shell_refusal(
     tmp_path: Path,
     home: Path,
@@ -3814,6 +3835,7 @@ consumer["_deliver_factory_transitions"](state, budget)
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("selected_cultivate_policy")
 async def test_external_poller_prose_is_refused_by_ifc_shell_gate(
     tmp_path: Path,
     home: Path,
@@ -5580,7 +5602,7 @@ print(json.dumps({"poller": "x", "prompt": "repair", "delivery_key": "ci:key"}))
 
 
 @pytest.fixture
-def worklink_receipts(home: Path, monkeypatch: pytest.MonkeyPatch):
+def worklink_receipts(home: Path, monkeypatch: pytest.MonkeyPatch, selected_cultivate_policy):
     from mimir.worklink import dispatch_failures as failures
 
     shipped = (
@@ -8003,6 +8025,7 @@ def test_worklink_ready_queue_manifest_forwards_model_and_reasoning_effort() -> 
     ("agent_effort", "override", "source"),
     [("high", None, "agent"), ("low", "high", "worklink_override")],
 )
+@pytest.mark.usefixtures("selected_cultivate_policy")
 async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_spec(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
     agent_effort: str, override: str | None, source: str,
@@ -8111,6 +8134,7 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("selected_cultivate_policy")
 async def test_shipped_github_poller_forwards_operator_bot_allowlist(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -290,6 +290,9 @@ async def test_worklink_resume_preflight_refuses_changed_state_without_launch(
 
 
 def test_central_policy_grants_only_five_retained_repo_tools(retained_incident) -> None:
+    from mimir.plugins.core import selected_policy_registry
+
+    selected = selected_policy_registry()
     scope = derive_retained_factory_scope(
         retained_incident.event, retained_incident.service,
     ).scope
@@ -301,10 +304,10 @@ def test_central_policy_grants_only_five_retained_repo_tools(retained_incident) 
         canonical="poller:worklink-ready-queue", trigger="poller",
         profile="github", tier=ac.CapabilityTier.CODE_EXECUTION,
         capabilities=tuple(sorted(allowed)), creation_path="test",
-        policy=ac.core_policy_registry(),
+        policy=selected,
     )
     assert service.worklink_retained_checkout is True
-    for tool in ac._REPO_TOOL_ACTIONS:
+    for tool in (name for name in selected.tools if name.startswith("repo_")):
         decision = ac.authorize_repo_pr_tool(
             tool, scope, service_principal=service, enforce=True,
             flow_direction=ac.get_tool_flow_direction(tool),
@@ -317,7 +320,7 @@ def test_central_policy_grants_only_five_retained_repo_tools(retained_incident) 
         canonical="poller:other", trigger="poller",
         profile="github", tier=ac.CapabilityTier.CODE_EXECUTION,
         capabilities=tuple(sorted(allowed)), creation_path="test",
-        policy=ac.core_policy_registry(),
+        policy=selected,
     )
     assert wrong_service.worklink_retained_checkout is False
     missing_property = replace(service, worklink_retained_checkout=False)

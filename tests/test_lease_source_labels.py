@@ -614,7 +614,14 @@ async def test_missing_selector_is_pre_execution_policy_refusal_and_allows_rerun
 @pytest.mark.parametrize("tool_name", ["repo_fetch", "repo_push", "pr_metadata", "pr_files",
     "pr_diff", "pr_file_content", "pr_job_log", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "pr_list",
     "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body"])
-def test_failed_repository_results_inherit_only_exact_provenance(tool_name):
+def test_failed_repository_results_inherit_only_exact_provenance(tool_name, request):
+    if tool_name.startswith("repo_"):
+        request.getfixturevalue("selected_repository_policy")
+        from mimir.plugins.core import selected_policy_registry
+
+        selected = selected_policy_registry()
+    else:
+        selected = None
     auth = _auth()
     scope = auth.repo_pr_action_scope
     source = SourceLabel(principal="operator", domain="repository",
@@ -625,7 +632,7 @@ def test_failed_repository_results_inherit_only_exact_provenance(tool_name):
                          integrity_effect="active_ingest")
     from mimir.access_control import ProtectedResultProvenance
     authorization = ToolAuthorization(tool_name=tool_name, decision="resource_scoped", allowed=True,
-                                      repo_pr_action_scope=scope)
+                                       repo_pr_action_scope=scope, policy=selected)
     arguments = {"repository": "owner/repo", "pull_request": 7}
     result = {"ok": False, "code": "tests_failed", "summary": {}}
     baseline = classify_protected_result(
@@ -636,7 +643,10 @@ def test_failed_repository_results_inherit_only_exact_provenance(tool_name):
         provenance=ProtectedResultProvenance((source,)), failed=True,
     )
     assert baseline.sources[0].integrity == "untrusted"
-    assert labels.sources[0].integrity == "trusted"
+    assert source.resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
+    assert labels.sources[0].integrity == ("untrusted" if selected else "trusted")
+    if selected:
+        assert labels.sources[0].resource_id == f"<unresolved-resource:protected_tool:{tool_name}>"
 
 
 def test_failed_pr_rerequest_review_keeps_native_non_repository_labelling():
@@ -661,7 +671,7 @@ def test_failed_pr_rerequest_review_keeps_native_non_repository_labelling():
 
 
 @pytest.mark.parametrize("change", ["wrong_scope"])
-def test_failed_repo_test_provenance_requires_exact_bounded_summary(change, tmp_path):
+def test_failed_repo_test_provenance_is_incomplete_even_for_exact_bounded_summary(change, tmp_path):
     from copy import deepcopy
     from mimir.access_control import ProtectedResultProvenance
 
@@ -697,7 +707,7 @@ def test_failed_repo_test_provenance_requires_exact_bounded_summary(change, tmp_
         )
         return labels.sources[0].integrity
 
-    assert integrity(result) == "trusted"
+    assert integrity(result) == "untrusted"
     altered = deepcopy(result)
     if change in {"stdout", "stderr", "git_context"}:
         altered[change] = "network-derived text"
@@ -881,6 +891,7 @@ def test_failed_git_operation_keeps_only_attested_origin(
     tmp_path, monkeypatch, operation, verdict,
 ):
     from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
 
     try:
         version("mimir-cultivate")
@@ -903,10 +914,11 @@ def test_failed_git_operation_keeps_only_attested_origin(
     assert (source.integrity, source.resource_id) == (
         "untrusted", f"<unresolved-resource:protected_tool:{operation}>",
     )
-    decision = SinkGate.check_sink_flow(
-        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
-        follow_on.ifc_labels, follow_on, enforce=False, repo_pr_action_scope=scope,
-    )
+    with policy_scope(selected):
+        decision = SinkGate.check_sink_flow(
+            "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+            follow_on.ifc_labels, follow_on, enforce=False, repo_pr_action_scope=scope,
+        )
     assert not decision.allowed
     assert decision.reason == "write_blocked_by_untrusted_ingest"
     assert "distinctive" not in str(events)
@@ -1443,9 +1455,15 @@ def test_checkout_records_native_author_trust_for_file_reads(
                           repo_pr_action_scope=scope),
         result=result, provenance=checkout_provenance,
     )
-    assert checkout_labels.sources[0].integrity == (
-        "trusted" if verdict is True and mismatch is None else "untrusted"
-    )
+    if checkout_provenance is not None and checkout_provenance.sources:
+        assert checkout_provenance.sources[0].resource_id == (
+            f"owner/repo#pull/7@{scope.observed_head_sha}"
+        )
+        assert checkout_provenance.sources[0].integrity == (
+            "trusted" if verdict is True and mismatch is None else "untrusted"
+        )
+    assert checkout_labels.sources[0].integrity == "untrusted"
+    assert checkout_labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_checkout>"
 
     def no_attestation(*args):
         pytest.fail("filesystem read attempted author attestation")
@@ -1548,7 +1566,11 @@ def test_checkout_bot_attestation_requires_exact_operator_login(
         ToolAuthorization(tool_name="repo_checkout", decision="resource_scoped", allowed=True,
                           repo_pr_action_scope=scope), result=result, provenance=provenance,
     )
-    assert (labels.sources[0].integrity == "trusted") is trusted
+    if provenance is not None and provenance.sources:
+        assert provenance.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
+        assert (provenance.sources[0].integrity == "trusted") is trusted
+    assert labels.sources[0].integrity == "untrusted"
+    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_checkout>"
 
 
 def _git_commit(path: Path, target: Path, message: str, author: str, committer: str) -> str:
@@ -2272,7 +2294,7 @@ def test_filesystem_error_requires_exact_nonempty_backend_attestation(tmp_path: 
         ),), content_free_error="not found")
 
 
-def test_repository_refusal_requires_exact_empty_fixed_error_attestation() -> None:
+def test_retired_repository_refusal_cannot_claim_content_free_trust() -> None:
     auth = _auth()
     authorization = ToolAuthorization(
         tool_name="repo_status", decision=OperationDecision.RESOURCE_SCOPED,
@@ -2297,12 +2319,14 @@ def test_repository_refusal_requires_exact_empty_fixed_error_attestation() -> No
             provenance=provenance, failed=True,
         )
         assert labels is not None and labels.has_untrusted_active_ingest
-    assert classify_protected_result(
+    exact = classify_protected_result(
         "repo_status", {"repository": "owner/repo", "pull_request": 7},
         auth, authorization,
         result=ToolMessage(content=fixed, tool_call_id="refusal", status="error"),
         provenance=ProtectedResultProvenance((), fixed), failed=True,
-    ) is None
+    )
+    assert exact is not None and exact.has_untrusted_active_ingest
+    assert exact.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_status>"
 
 
 def test_interpolated_git_output_cannot_claim_fixed_pre_execution_refusal(
@@ -2594,6 +2618,7 @@ def test_lease_path_symlink_escape_is_untrusted(
     )
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_lease_repository_sources_only_flow_to_their_own_forge_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

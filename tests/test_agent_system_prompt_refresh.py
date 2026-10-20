@@ -261,7 +261,9 @@ async def test_build_agent_restores_and_executes_real_repo_tool_after_recovery(
     from mimir_cultivate import forge as forge_tools
     from mimir_cultivate import repository as repo_tools
     from langchain.tools import ToolRuntime
+    from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
     from mimir.models import AuthContext, RepoPRScopeRegistry, RepoReviewState
+    from mimir.plugins.core import policy_scope
     from tests.test_pr_checkout_lease import _repo_and_scope
     from mimir.tools import registry
 
@@ -289,21 +291,31 @@ async def test_build_agent_restores_and_executes_real_repo_tool_after_recovery(
     lease = repo_tools.create_pr_checkout_lease(
         scope, owner=scope.principal, lease_root=lease_root, review_state=state,
     )
+    selected = agent._config.plugin_manager.policy
+    grants = ScopedPRGrants(
+        scope.principal, (scope,), protocols=selected.scoped_actions,
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    checkout_token = grants.consume_checkout("cultivate", scope)
+    assert checkout_token is not None
+    assert grants.observe_checkout("cultivate", scope, lease, checkout_token)
     auth = AuthContext(
         principal=scope.principal, canonical_principal=scope.principal,
         roles=("user",), event_ingress=None, trigger="user_message",
         channel_id="web:recovery", interactivity=None, enforcement_enabled=True,
         repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
         repo_review_state=state, repo_pr_action_scope=scope,
+        scoped_pr_grants=grants,
     )
     runtime = ToolRuntime(
         state={}, context=auth, config={}, stream_writer=lambda _: None,
         tool_call_id="recovered-tool", store=None,
     )
-    result = restored["repo_status"].invoke({
-        "repository": scope.canonical_repo, "pull_request": scope.pr_number,
-        "runtime": runtime,
-    })
+    with policy_scope(selected):
+        result = restored["repo_status"].invoke({
+            "repository": scope.canonical_repo, "pull_request": scope.pr_number,
+            "runtime": runtime,
+        })
     assert result["code"] == "ok"
     assert state.checkout_lease is lease
 
