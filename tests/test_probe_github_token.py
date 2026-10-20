@@ -15,6 +15,12 @@ from mimir import cred_verify
 
 @pytest.fixture
 def provider():
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
     return pytest.importorskip("mimir_cultivate.github_trust")
 
 

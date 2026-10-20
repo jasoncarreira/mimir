@@ -658,6 +658,12 @@ def test_discovery_loads_core_then_sorted_package_skills(
 
 
 def test_selected_provider_probe_shadows_only_within_its_policy():
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
     from mimir.plugins.core import policy_scope
     from mimir.plugins.manager import load_plugins
 
@@ -687,6 +693,12 @@ def test_core_probe_remains_generic_without_selected_provider(monkeypatch):
 
 
 def test_selected_cli_runs_provider_probe_not_core_fallback(monkeypatch, capsys):
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
     github_trust = pytest.importorskip("mimir_cultivate.github_trust")
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setenv("GITHUB_TOKEN", "present")
