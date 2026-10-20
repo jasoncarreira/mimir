@@ -3944,23 +3944,23 @@ def _review_submission_for_call(call: _PreparedToolCall) -> Any:
         raise ToolException("selected review submission guard unavailable")
     if call.tool_name not in {"shell_exec", "bash_async", "Bash", "bash", "pr_submit_review"}:
         return None
+    if call.tool_name == "pr_submit_review":
+        return None
     args = call.execution_request.tool_call.get("args") or {}
     direct = args.get("mimir_direct_argv")
     command = args.get("command")
     possible_gh = (
-        isinstance(direct, list) and direct and isinstance(direct[0], str)
-        and Path(direct[0]).name == "gh"
-    ) or (isinstance(command, str) and ("gh" in command or "pr review" in command))
-    if not possible_gh and call.tool_name != "pr_submit_review":
-        return None
-    try:
-        from .github_review_guard import review_submission_from_request
-    except ModuleNotFoundError as exc:
-        if exc.name != "mimir.tools.github_review_guard":
-            raise
-        raise ToolException("GitHub review submission guard unavailable") from exc
-
-    return review_submission_from_request(call.execution_request)
+        isinstance(direct, list) and len(direct) >= 3
+        and isinstance(direct[0], str) and Path(direct[0]).name == "gh"
+        and direct[1:3] == ["pr", "review"]
+    ) or (
+        isinstance(command, str) and re.search(
+            r"(?:^|[\s;&|])(?:[^\s;&|]*/)?gh\s+pr\s+review(?:\s|$)", command,
+        ) is not None
+    )
+    if possible_gh:
+        raise ToolException("GitHub review submission guard unavailable")
+    return None
 
 
 def _claim_review_submission_for_call(call: _PreparedToolCall, spec: Any) -> Any:
@@ -3970,14 +3970,7 @@ def _claim_review_submission_for_call(call: _PreparedToolCall, spec: Any) -> Any
         return hooks.claim_review(spec)
     if getattr(selected, "_projected_owner", None) is not None:
         raise ToolException("selected review submission guard unavailable")
-    try:
-        from .github_review_guard import claim_review_submission
-    except ModuleNotFoundError as exc:
-        if exc.name != "mimir.tools.github_review_guard":
-            raise
-        raise ToolException("GitHub review submission guard unavailable") from exc
-
-    return claim_review_submission(spec)
+    raise ToolException("GitHub review submission guard unavailable")
 
 
 def _begin_tool_execution(

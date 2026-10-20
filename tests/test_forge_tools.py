@@ -18,7 +18,6 @@ from langgraph.runtime import Runtime
 
 import mimir.access_control as access_control
 import mimir.tools.budget_gate as budget_gate
-import mimir.tools.github_review_guard as github_review_guard
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.event_logger import _reset_logger_for_tests, init_logger
 from mimir.forge import (
@@ -4749,9 +4748,15 @@ async def test_model_supplied_runtime_cannot_bypass_standing_review_gates(
 def test_model_supplied_runtime_reaches_remaining_post_authorization_gates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import core_policy_registry, policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge as selected_forge
+
     client = FakeForge()
     client.snapshot_heads = ["c" * 40]
     set_forge_client(client)
+    selected_forge.set_forge_client(client)
     runtime = _runtime(_scope(RepoPRAction.PR_REVIEW, head_sha="c" * 40))
     context = runtime.context
     request = ToolCallRequest(
@@ -4785,23 +4790,21 @@ def test_model_supplied_runtime_reaches_remaining_post_authorization_gates(
     monkeypatch.setattr(budget_gate, "_check_prohibited", capture_prohibited)
     monkeypatch.setattr(budget_gate, "_check_and_increment_or_deny", capture_budget)
     monkeypatch.setattr(budget_gate, "_merge_result_labels", capture_merge)
-    monkeypatch.setattr(
-        github_review_guard,
-        "review_submission_from_request",
-        lambda _request: SimpleNamespace(),
-    )
-    monkeypatch.setattr(
-        github_review_guard,
-        "claim_review_submission",
-        lambda _spec: reached.append("duplicate_claim"),
-    )
+    core = core_policy_registry()
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(core, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks,
+        review_submission=lambda _request: SimpleNamespace(),
+        claim_review=lambda _spec: reached.append("duplicate_claim"),
+    ))
 
-    result = BudgetGateMiddleware().wrap_tool_call(
-        request,
-        lambda tool_request: ToolMessage(
-            content="submitted", tool_call_id=tool_request.tool_call["id"],
-        ),
-    )
+    with policy_scope(core):
+        result = BudgetGateMiddleware(core).wrap_tool_call(
+            request,
+            lambda tool_request: ToolMessage(
+                content="submitted", tool_call_id=tool_request.tool_call["id"],
+            ),
+        )
 
     assert result.status == "success"
     assert client.calls == [("snapshot", "owner/repo", 17)]

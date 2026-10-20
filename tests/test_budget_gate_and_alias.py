@@ -2628,7 +2628,6 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
 ) -> None:
     from mimir.access_control import protected_result_source, publish_protected_result
     from mimir.tools import budget_gate
-    from mimir.tools.github_review_guard import ReviewSubmission
     from mimir.tools.web import _record_fetched_body
 
     home = tmp_path / "home"
@@ -2653,15 +2652,15 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
                 released_claims.append(self.key)
                 self.released = True
 
-    def submission(request: ToolCallRequest) -> ReviewSubmission | None:
+    def submission(request: ToolCallRequest) -> SimpleNamespace | None:
         if request.tool_call["id"] not in {"review", "review_permission_denied"}:
             return None
-        return ReviewSubmission(
+        return SimpleNamespace(
             executable="gh", repo="owner/repo", number=17,
             state="APPROVED", cwd=None,
         )
 
-    def claim(review: ReviewSubmission) -> Claim:
+    def claim(review: SimpleNamespace) -> Claim:
         key = f"{review.repo}#{review.number}"
         claims.append(key)
         return Claim(key)
@@ -6428,6 +6427,34 @@ def test_operator_shell_live_taint_refusal_names_only_working_remedies() -> None
         assert dead_end not in text
 
 
+def test_core_shell_review_without_provider_guard_fails_closed() -> None:
+    from mimir.plugins.core import core_policy_registry
+    from mimir.tools import budget_gate
+
+    policy = core_policy_registry()
+
+    def call(name: str, args: dict[str, object]) -> SimpleNamespace:
+        return SimpleNamespace(
+            policy=policy, tool_name=name,
+            execution_request=SimpleNamespace(tool_call={"name": name, "args": args}),
+        )
+
+    with pytest.raises(ToolException, match="GitHub review submission guard unavailable"):
+        budget_gate._review_submission_for_call(call(
+            "shell_exec", {"command": "gh pr review 17 --approve"},
+        ))
+    with pytest.raises(ToolException, match="GitHub review submission guard unavailable"):
+        budget_gate._review_submission_for_call(call(
+            "bash_async", {"mimir_direct_argv": ["/usr/bin/gh", "pr", "review", "17"]},
+        ))
+    assert budget_gate._review_submission_for_call(call(
+        "shell_exec", {"command": "printf 'gh pr review is not running'"},
+    )) is None
+    assert budget_gate._review_submission_for_call(call(
+        "pr_submit_review", {"repository": "owner/repo", "pull_request": 17},
+    )) is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("middleware_path", ["sync", "async"])
 @pytest.mark.parametrize("enforcement_enabled", [False, True])
@@ -6441,7 +6468,6 @@ async def test_operator_soft_fallback_rechecks_transitions_after_blocking_steps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.tools import budget_gate
-    from mimir.tools.github_review_guard import ReviewClaim, ReviewSubmission
 
     state = _Arm2LiveState(False)
     auth = _arm2_operator_auth(state, enforcement_enabled=enforcement_enabled)
@@ -6458,8 +6484,8 @@ async def test_operator_soft_fallback_rechecks_transitions_after_blocking_steps(
             state.outcome = final_outcome
         return result
 
-    def submission(_request: ToolCallRequest) -> ReviewSubmission:
-        return ReviewSubmission(
+    def submission(_request: ToolCallRequest) -> SimpleNamespace:
+        return SimpleNamespace(
             executable="gh",
             repo="owner/repo",
             number=1,
@@ -6467,18 +6493,19 @@ async def test_operator_soft_fallback_rechecks_transitions_after_blocking_steps(
             cwd=None,
         )
 
-    def claim(_submission: ReviewSubmission) -> ReviewClaim:
+    def claim(_submission: SimpleNamespace) -> SimpleNamespace:
         nonlocal claim_calls
         claim_calls += 1
         if transition_point == "review_claim":
             state.outcome = final_outcome
-        return ReviewClaim(
+        return SimpleNamespace(
             repo="owner/repo",
             number=1,
             head="a" * 40,
             reviewer="operator",
             state="APPROVED",
             duplicate=False,
+            release=lambda: None,
         )
 
     def sync_handler(request: ToolCallRequest) -> ToolMessage:
@@ -6491,10 +6518,12 @@ async def test_operator_soft_fallback_rechecks_transitions_after_blocking_steps(
 
     monkeypatch.setattr(ToolRegistry, "authorize_tool", authorize)
     monkeypatch.setattr(
-        "mimir.tools.github_review_guard.review_submission_from_request", submission,
+        budget_gate, "_review_submission_for_call",
+        lambda call: submission(call.execution_request),
     )
     monkeypatch.setattr(
-        "mimir.tools.github_review_guard.claim_review_submission", claim,
+        budget_gate, "_claim_review_submission_for_call",
+        lambda _call, spec: claim(spec),
     )
     request = _make_request(
         "shell_exec",
