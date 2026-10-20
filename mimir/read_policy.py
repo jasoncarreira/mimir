@@ -630,7 +630,7 @@ def is_tracked_file_in_current_pr_lease(path: Path) -> bool:
         resolve_repository_review_state,
     )
     from .models import RepoPRScopeRegistry, ServerDiscoveredPRStates
-    from .repo_tools import GitRefusal, RepoGitTools
+    from .plugins.core import selected_policy_registry
 
     auth_context = getattr(get_current_turn(), "auth_context", None)
     if not getattr(auth_context, "is_service", False):
@@ -653,10 +653,8 @@ def is_tracked_file_in_current_pr_lease(path: Path) -> bool:
         return False
     if not _target_within_active_pr_checkout_lease(str(path), state):
         return False
-    try:
-        return RepoGitTools(state).is_tracked_file(path)
-    except (GitRefusal, OSError, RuntimeError, ValueError):
-        return False
+    hooks = selected_policy_registry().policy_consumer_hooks
+    return hooks.tracked_file(state, path) if hooks is not None else False
 
 
 def protected_read_result_reason(path: Path, *, text: str | None = None) -> str | None:

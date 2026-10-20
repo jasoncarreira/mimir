@@ -11757,6 +11757,9 @@ def test_batched_pr_reads_resolve_each_exact_checkout_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.read_policy import result_is_protected
+    from mimir.plugins.core import core_policy_registry, policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import repository
 
     source = tmp_path / "source"
     lease_root = tmp_path / "leases"
@@ -11784,7 +11787,7 @@ def test_batched_pr_reads_resolve_each_exact_checkout_lease(
                 and path.parent == Path(self.state.checkout_lease.path)
             )
 
-    monkeypatch.setattr("mimir.repo_tools.RepoGitTools", TrackedRepoGitTools)
+    monkeypatch.setattr(repository, "RepoGitTools", TrackedRepoGitTools)
     service = build_trigger_service_principal(
         canonical="poller:github-activity", trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION,
@@ -11795,20 +11798,27 @@ def test_batched_pr_reads_resolve_each_exact_checkout_lease(
         _service_auth(service, InformationFlowLabels()),
         repo_pr_scope_registry=RepoPRScopeRegistry(states),
     )
-    token = set_current_turn(_turn("batch-read", "batch-read", auth))
-    try:
-        assert all(not result_is_protected(path) for path in files)
-        assert result_is_protected(
-            lease_root / "neither" / "published.txt",
-            text="-----BEGIN PRIVATE KEY-----\nprotected\n",
-        )
-        symlink = checkouts[0] / "linked.txt"
-        symlink.symlink_to(files[0])
-        # Even an in-lease target is refused through a symlink: the lease
-        # containment proof and Git publication proof both apply to the path read.
-        assert result_is_protected(symlink)
-    finally:
-        reset_current_turn(token)
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        token = set_current_turn(_turn("batch-read", "batch-read", auth))
+        try:
+            assert all(not result_is_protected(path) for path in files)
+            assert result_is_protected(
+                lease_root / "neither" / "published.txt",
+                text="-----BEGIN PRIVATE KEY-----\nprotected\n",
+            )
+            symlink = checkouts[0] / "linked.txt"
+            symlink.symlink_to(files[0])
+            # Even an in-lease target is refused through a symlink: the lease
+            # containment proof and Git publication proof both apply to the path read.
+            assert result_is_protected(symlink)
+        finally:
+            reset_current_turn(token)
+    with policy_scope(core_policy_registry()):
+        token = set_current_turn(_turn("core-only-read", "core-only-read", auth))
+        try:
+            assert result_is_protected(files[0])
+        finally:
+            reset_current_turn(token)
 
 
 @pytest.mark.asyncio

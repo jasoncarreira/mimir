@@ -1966,6 +1966,16 @@ def test_review_state_refuses_mismatched_or_inactive_checkout_lease(
         assert state.checked_out is False
 
 
+@pytest.fixture
+def selected_tracked_file_policy():
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+@pytest.mark.usefixtures("selected_tracked_file_policy")
 @pytest.mark.asyncio
 async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -2099,6 +2109,7 @@ async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_l
     assert revoked.error == result_refusal
 
 
+@pytest.mark.usefixtures("selected_tracked_file_policy")
 @pytest.mark.parametrize(
     "case",
     ["own", "no_active_lease", "different_pr", "outside", "untracked", "same_pr_other_state"],

@@ -349,6 +349,9 @@ def test_selected_worklink_inventory_importers_use_provider_repository(
         from mimir_cultivate.worklink import merge_closure, orchestrator
 
     assert selected.policy_consumer_hooks.repository_inventory == repository.RepositoryInventory.load
+    assert selected.policy_consumer_hooks.tracked_file is repository.is_tracked_file_in_pr_checkout
+    assert selected.policy_consumer_hooks.verified_push is repository.was_verified_push
+    assert selected.policy_consumer_hooks.agent_push is repository.was_agent_push
     assert registry.valid_repository_slug("owner/repo") == repository.valid_repository_slug("owner/repo")
     assert registry.valid_repository_slug("../repo") == repository.valid_repository_slug("../repo")
     assert merge_closure.RepositoryConfig is repository.RepositoryConfig

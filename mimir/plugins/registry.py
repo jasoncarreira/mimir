@@ -59,6 +59,9 @@ class PolicyConsumerHooks:
     revalidate_head: Callable[..., Any]
     resolve_issue: Callable[..., Any]
     superseded_push: Callable[..., bool]
+    verified_push: Callable[..., bool]
+    agent_push: Callable[..., bool]
+    tracked_file: Callable[..., bool]
     derive_retained_scope: Callable[..., Any]
     active_checkout: Callable[..., Any]
     git_command: Callable[..., Any]
@@ -463,6 +466,7 @@ class PolicyRegistry:
                 or not isinstance(hooks, PolicyConsumerHooks) or hooks.owner != owner
                 or any(not callable(getattr(hooks, name)) for name in (
                     "resolve_review", "revalidate_head", "resolve_issue", "superseded_push",
+                    "verified_push", "agent_push", "tracked_file",
                     "derive_retained_scope", "active_checkout", "git_command", "lineage",
                     "verified_base", "git_env", "review_submission", "claim_review",
                     "repository_inventory", "shell_environment",
