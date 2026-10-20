@@ -14,7 +14,7 @@ import pytest
 from mimir import access_control as ac
 from mimir.contained_execution import CollectedExecutionResult
 from mimir.models import RetainedFactoryScope
-from mimir.project_tests import ProjectTestResult, RepoProjectTests
+from mimir_cultivate.repository import ProjectTestResult, RepoProjectTests
 from mimir.readonly_backend import RetainedCheckoutFilesystemBackend
 from mimir.plugins.core import core_policy_registry, policy_scope
 from mimir.plugins.manager import load_plugins
@@ -901,8 +901,9 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
 async def test_retained_repo_test_runs_source_git_through_owner_control(
     retained_incident, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import contained_checkout, contained_snapshot, project_tests
-    from mimir.worklink import worker_client
+    from mimir import contained_snapshot
+    from mimir_cultivate import contained_checkout, repository as project_tests
+    from mimir_cultivate.worklink import worker_client
 
     case = retained_incident
     _initialize_retained_repository(case)
@@ -987,7 +988,7 @@ async def test_retained_repo_test_runs_source_git_through_owner_control(
 async def test_retained_repo_test_excludes_only_factory_control_plane(
     retained_incident, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import project_tests
+    from mimir_cultivate import repository as project_tests
 
     case = retained_incident
     _initialize_retained_repository(case)

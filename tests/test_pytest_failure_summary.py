@@ -4,7 +4,7 @@ import subprocess
 
 import pytest
 
-from mimir.project_tests import (
+from mimir_cultivate.repository import (
     _PYTEST_FAILING_BYTES,
     _pytest_terminal_summary,
     pytest_failure_summary,
@@ -141,7 +141,7 @@ def test_inventory_skips_parse_bomb_without_crashing(tmp_path):
 
 
 def test_recorded_inventory_is_bounded_and_misses_trust_nothing(tmp_path):
-    from mimir import project_tests
+    from mimir_cultivate import repository as project_tests
 
     project_tests._NODE_INVENTORIES.clear()
     for index in range(project_tests._NODE_INVENTORY_CACHE_SIZE + 5):
@@ -153,7 +153,7 @@ def test_recorded_inventory_is_bounded_and_misses_trust_nothing(tmp_path):
 
 
 def test_recorded_empty_inventory_is_distinct_from_a_miss(tmp_path):
-    from mimir import project_tests
+    from mimir_cultivate import repository as project_tests
 
     project_tests.remember_node_inventory(tmp_path, "scope-empty", frozenset())
     assert project_tests.recorded_node_inventory(tmp_path, "scope-empty") == frozenset()
@@ -161,7 +161,7 @@ def test_recorded_empty_inventory_is_distinct_from_a_miss(tmp_path):
 
 
 def test_recorded_inventory_key_normalises_symlinked_roots(tmp_path):
-    from mimir import project_tests
+    from mimir_cultivate import repository as project_tests
 
     real = tmp_path / "real"
     real.mkdir()
