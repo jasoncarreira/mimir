@@ -207,11 +207,12 @@ def test_selected_checkout_attestation_uses_provider_git_and_rejects_changed_hea
 def test_selected_issue_comment_requires_repository_source_and_owner_resolution(
     monkeypatch: pytest.MonkeyPatch, enforced: bool,
 ) -> None:
+    import importlib.util
+
     from mimir.access_control import (
         CapabilityTier, ToolRegistry, build_trigger_service_principal,
     )
     from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel
-    from mimir.tools import forge as core_forge
     from mimir_cultivate.forge import IssueTarget
 
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo,other/repo")
@@ -222,10 +223,7 @@ def test_selected_issue_comment_requires_repository_source_and_owner_resolution(
         resolved.append((repository, issue))
         return IssueTarget(repository, issue)
 
-    def core_forbidden(*_args):
-        raise AssertionError("selected issue resolution imported retired core forge")
-
-    monkeypatch.setattr(core_forge, "resolve_issue_comment_target", core_forbidden)
+    assert importlib.util.find_spec("mimir.tools.forge") is None
     monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
         selected.policy_consumer_hooks, resolve_issue=owner_resolve,
     ))

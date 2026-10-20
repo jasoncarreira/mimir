@@ -2629,13 +2629,6 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/poller_recovery.py", "_restore_event", "SourceLabel"): 1,
         ("producer", "mimir/pollers.py", "run_poller", "SourceLabel"): 1,
         ("producer", "mimir/prompt_sources.py", "prompt_source_label", "SourceLabel"): 1,
-        # Native forge reads publish exact-PR/head author-attested provenance.
-        # _publish_trusted_projection delegates to this producer; it no longer
-        # constructs a separate SourceLabel after a cached author verdict.
-        ("producer", "mimir/tools/forge.py", "_publish_author_attestation", "SourceLabel"): 1,
-        ("producer", "mimir/tools/forge.py", "_attest_ci_runs", "SourceLabel"): 1,
-            ("producer", "mimir/tools/forge.py", "pr_list", "SourceLabel"): 1,
-            ("producer", "mimir/tools/forge.py", "pr_spec", "SourceLabel"): 1,
         # Operator-declared shell output remains active ingest even after
         # a successful bounded read.
         ("producer", "mimir/tools/budget_gate.py", "_result_labels_for_call", "SourceLabel"): 1,
@@ -2671,6 +2664,23 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
          "_publish_retained_result", "SourceLabel"): 1,
         ("producer", "plugins/cultivate/mimir_cultivate/repository.py",
          "_publish_attested_scope_result", "SourceLabel"): 1,
+    })
+    forge = root.parent / "plugins/cultivate/mimir_cultivate/forge.py"
+    Visitor("plugins/cultivate/mimir_cultivate/forge.py").visit(
+        ast.parse(forge.read_text(encoding="utf-8"))
+    )
+    forge_sources = Counter({
+        row: count for row, count in observed.items()
+        if row[1] == "plugins/cultivate/mimir_cultivate/forge.py"
+        and row[0] == "producer" and row[3] == "SourceLabel"
+    })
+    assert forge_sources == Counter({
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py",
+         "_publish_author_attestation", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py",
+         "_attest_ci_runs", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py", "pr_list", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py", "pr_spec", "SourceLabel"): 1,
     })
 
 

@@ -133,7 +133,16 @@ def test_named_root_decision_fails_closed(tmp_path, monkeypatch, configuration):
 
 @pytest.mark.parametrize("mismatch", [None, "verdict", "scope_id", "canonical_repo", "pr_number", "observed_head_sha", "no_lease"])
 def test_named_author_anchor_requires_bound_attestation(tmp_path, monkeypatch, mismatch):
-    from mimir import pr_checkout_lease
+    from dataclasses import replace
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("author-anchored checkout requires installed Cultivate")
+    selected = load_plugins(enable="cultivate").policy
 
     home = tmp_path / "home"
     target = home / "state" / "pollers" / "event"
@@ -155,7 +164,10 @@ def test_named_author_anchor_requires_bound_attestation(tmp_path, monkeypatch, m
         canonical_principal="reader", repo_pr_action_scope=scope,
         ifc_state=SimpleNamespace(pr_checkout_author_trust={scope.scope_id: mismatch != "verdict"}),
     )
-    monkeypatch.setattr(pr_checkout_lease, "active_pr_checkout_lease_for_path", lambda _: None if mismatch == "no_lease" else lease)
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks,
+        active_checkout=lambda _: None if mismatch == "no_lease" else lease,
+    ))
     monkeypatch.setattr(ac, "_lease_head_is_author_attested", lambda *args, **kwargs: True)
     decisions = []
     classify = ac._filesystem_read_trust_anchor
@@ -166,10 +178,11 @@ def test_named_author_anchor_requires_bound_attestation(tmp_path, monkeypatch, m
         return decision
 
     monkeypatch.setattr(ac, "_filesystem_read_trust_anchor", capture)
-    source = ac.protected_result_source(
-        auth, principal="filesystem", domain="filesystem",
-        resource_id=str(target), bridge_instance="filesystem",
-    )
+    with policy_scope(selected):
+        source = ac.protected_result_source(
+            auth, principal="filesystem", domain="filesystem",
+            resource_id=str(target), bridge_instance="filesystem",
+        )
     expected = ac.FilesystemReadTrust.AUTHOR_ATTESTATION if mismatch is None else ac.FilesystemReadTrust.HOME_CARVE_OUT
     assert decisions == [expected]
     assert (source.integrity, source.integrity_effect) == expected.integrity

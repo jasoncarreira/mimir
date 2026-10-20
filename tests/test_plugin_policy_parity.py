@@ -191,11 +191,10 @@ def _middleware_results(home: Path) -> dict[str, object]:
 
 
 def _conditional_surface(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
-    from mimir.tools import forge, mcp, registry
+    from mimir.tools import mcp, registry
 
     result = {}
     with monkeypatch.context() as controlled:
-        controlled.setattr(forge, "github_identity_is_degraded", lambda: False)
         controlled.setattr(mcp, "get_mcp_tools", lambda: ())
         controlled.setenv("TAVILY_API_KEY", "oracle-key")
         controlled.delenv("MIMIR_FETCH_URL_DISABLED", raising=False)
@@ -398,7 +397,8 @@ def test_original_core_policy_matches_frozen_oracle(
     assert expected["baseline_sha"] == BASELINE
     assert len(expected["descriptors"]) == 103
     assert _canonical(expected, home) == fixture_bytes
-    retired = frozenset(expected["tables"]["repo_actions"])
+    retired = (frozenset(CODING_TOOLS)
+               - {"spawn_open_code", "worklink_run", "worklink_resume"})
 
     def without_retired(value):
         if isinstance(value, dict):
@@ -429,7 +429,8 @@ def test_pre_extraction_coding_policy_is_frozen(
     frozen = json.loads(FIXTURE.read_bytes())
     tables = frozen["tables"]
     registry = core_policy_registry()
-    retired = frozenset(tables["repo_actions"])
+    retired = (frozenset(CODING_TOOLS)
+               - {"spawn_open_code", "worklink_run", "worklink_resume"})
 
     assert len(CODING_TOOLS) == 40
     assert CODING_TOOLS <= frozen["descriptors"].keys()

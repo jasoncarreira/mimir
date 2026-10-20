@@ -245,7 +245,8 @@ async def create_agent_runtime(
     sessions: SessionManager | None = None
 
     try:
-        _clear_runtime_globals()
+        manager = getattr(config, "plugin_manager", None)
+        _clear_runtime_globals(manager.policy if manager is not None else None)
 
         from .tools import all_mimir_tools
 
@@ -259,7 +260,7 @@ async def create_agent_runtime(
             nonlocal degradation_recorded, degradation_alert_scheduled
             nonlocal transient_failures, next_identity_retry_at
             from .event_logger import log_event, log_event_sync
-            from .forge.github import GitHubIdentityFailureKind
+            from mimir_cultivate.forge import GitHubIdentityFailureKind
 
             declared_login = getattr(exc, "declared_login", "")
             authenticated_login = getattr(exc, "authenticated_login", "")
@@ -341,19 +342,15 @@ async def create_agent_runtime(
                 runtime_loop.call_soon_threadsafe(schedule_alert)
 
         coding_enabled = getattr(config, "coding_enabled", False)
-        if coding_enabled:
-            from .tools.forge import (
-                github_identity_recovery_pending,
-                initialize_github_forge_identity,
-                set_github_identity_degraded_callback,
-            )
-
-            set_github_identity_degraded_callback(
-                github_identity_degraded,
-                notify_current=True,
-            )
-            initialize_github_forge_identity()
-        manager = getattr(config, "plugin_manager", None)
+        identity_hooks = {
+            name: hook for (owner, name), hook in manager.policy.server_hooks.items()
+            if owner != "core" and name.startswith("github_identity_")
+        } if manager is not None else {}
+        initialize_identity = identity_hooks.get("github_identity_initialize")
+        identity_recovery_pending = identity_hooks.get("github_identity_recovery_pending")
+        if initialize_identity is not None:
+            identity_hooks["github_identity_callback"](github_identity_degraded)
+            initialize_identity()
         if manager is None:
             all_mimir_tools(coding_enabled=coding_enabled)
         else:
@@ -638,6 +635,7 @@ async def create_agent_runtime(
             sessions=sessions,
             runtime_background_tasks=runtime_background_tasks,
             owned_closers=owned_closers,
+            policy=manager.policy if manager is not None else None,
         )
         if cleanup_errors:
             _log_cleanup_errors(cleanup_errors)
@@ -650,17 +648,17 @@ async def create_agent_runtime(
         nonlocal degradation_recorded, degradation_alert_scheduled
         nonlocal transient_failures, next_identity_retry_at
         if (
-            coding_enabled
-            and github_identity_recovery_pending()
+            identity_recovery_pending is not None
+            and identity_recovery_pending()
             and time.monotonic() >= next_identity_retry_at
         ):
             async with identity_retry_lock:
                 if (
-                    github_identity_recovery_pending()
+                    identity_recovery_pending()
                     and time.monotonic() >= next_identity_retry_at
                 ):
                     recovered = await asyncio.to_thread(
-                        initialize_github_forge_identity
+                        initialize_identity
                     )
                     if recovered:
                         from .event_logger import log_event
@@ -730,7 +728,7 @@ def _install_runtime_globals(bundle: AgentRuntimeBundle) -> None:
     tools.set_mcp_tools([])
 
 
-def _clear_runtime_globals() -> None:
+def _clear_runtime_globals(policy: Any = None) -> None:
     from . import tools
     from .history import set_global_buffer
     from .tools import web as web_tools
@@ -753,16 +751,13 @@ def _clear_runtime_globals() -> None:
         lambda: web_tools.set_home(None),
         lambda: tools.set_mcp_tools([]),
     )
-    forge = sys.modules.get("mimir.tools.forge")
-    if forge is not None:
-        from .tools.forge import (
-            set_forge_client,
-            set_github_identity_degraded_callback,
-        )
-
+    if policy is not None:
         resetters = (
-            lambda: set_github_identity_degraded_callback(None),
-            lambda: set_forge_client(None),
+            *(lambda hook=hook: hook(None)
+              for (owner, name), hook in policy.server_hooks.items()
+              if owner != "core" and name == "github_identity_callback"),
+            *(hook for (owner, name), hook in policy.server_hooks.items()
+              if owner != "core" and name == "forge_client_clear"),
             *resetters,
         )
     errors = _run_sync_cleanup(resetters)
@@ -771,11 +766,13 @@ def _clear_runtime_globals() -> None:
 
 
 async def _close_bundle(bundle: AgentRuntimeBundle) -> None:
+    manager = getattr(getattr(bundle, "config", None), "plugin_manager", None)
     errors = await _cleanup_runtime(
         adapters=bundle.adapters,
         sessions=bundle.sessions,
         runtime_background_tasks=bundle._runtime_background_tasks,
         owned_closers=bundle._owned_closers,
+        policy=manager.policy if manager is not None else None,
     )
     if errors:
         _log_cleanup_errors(errors)
@@ -788,6 +785,7 @@ async def _cleanup_runtime(
     sessions: SessionManager | None,
     runtime_background_tasks: set[asyncio.Task[Any]],
     owned_closers: list[tuple[str, Callable[[], Awaitable[None]]]],
+    policy: Any = None,
 ) -> list[Exception]:
     errors: list[Exception] = []
     dispatcher = adapters.dispatcher
@@ -823,7 +821,7 @@ async def _cleanup_runtime(
         errors.extend(_cleanup_exception(exc) for exc in task_errors)
 
     try:
-        _clear_runtime_globals()
+        _clear_runtime_globals(policy)
     except BaseExceptionGroup as group:
         errors.extend(_flatten_cleanup_group(group))
     except BaseException as exc:

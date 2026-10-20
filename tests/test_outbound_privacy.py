@@ -702,7 +702,7 @@ def test_github_text_credentials_are_refused_on_both_paths(
     monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
     monkeypatch.setattr(
-        "mimir.tools.forge.revalidate_review_head_for_context",
+        "mimir_cultivate.forge.revalidate_review_head_for_context",
         lambda *_args, **_kwargs: None,
     )
     events = _capture_events(monkeypatch)
@@ -713,41 +713,36 @@ def test_github_text_credentials_are_refused_on_both_paths(
     }
     executed: list[bool] = []
 
-    selected = None
-    if tool_name == "repo_commit":
-        from importlib.metadata import PackageNotFoundError, version
-        from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
-        from mimir.models import RepoPRScopeRegistry
-        from mimir.plugins.manager import load_plugins
-        from tests.test_repo_tools import _repo_scope_and_state
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
+    from mimir.models import RepoPRScopeRegistry
+    from mimir.plugins.manager import load_plugins
+    from tests.test_repo_tools import _repo_scope_and_state
 
-        try:
-            version("mimir-cultivate")
-        except PackageNotFoundError:
-            pytest.skip("repo_commit requires installed Cultivate")
-        _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
-        monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
-        selected = load_plugins(enable="cultivate").policy
-        auth = replace(
-            _auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
-            repo_review_state=state, repo_pr_action_scope=scope,
-        )
-        grants = ScopedPRGrants(
-            auth.canonical_principal, (scope,), protocols=selected.scoped_actions,
-            _issuer=_SCOPED_PR_ISSUER,
-        )
-        token = grants.consume_checkout("cultivate", scope)
-        assert token is not None
-        assert grants.observe_checkout("cultivate", scope, state.checkout_lease, token)
-        auth = replace(auth, scoped_pr_grants=grants)
-        arguments["pull_request"] = scope.pr_number
-    else:
-        auth = _repo_auth()
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("repository tools require installed Cultivate")
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
+    selected = load_plugins(enable="cultivate").policy
+    auth = replace(
+        _auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+    )
+    grants = ScopedPRGrants(
+        auth.canonical_principal, (scope,), protocols=selected.scoped_actions,
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    token = grants.consume_checkout("cultivate", scope)
+    assert token is not None
+    assert grants.observe_checkout("cultivate", scope, state.checkout_lease, token)
+    auth = replace(auth, scoped_pr_grants=grants)
+    arguments["pull_request"] = scope.pr_number
 
-    from contextlib import nullcontext
     from mimir.plugins.core import policy_scope
 
-    with policy_scope(selected) if selected is not None else nullcontext():
+    with policy_scope(selected):
         middleware_result = _run_sync(tool_name, arguments, auth, executed, policy=selected)
         claude_result = _claude_code_pre_tool_enforcement(
             f"mcp__langchain-tools__{tool_name}",
@@ -769,8 +764,7 @@ def test_github_text_credentials_are_refused_on_both_paths(
 
 
 def test_non_text_github_tools_remain_unscanned() -> None:
-    descriptor = get_tool_descriptor("pr_rerequest_review")
-    assert descriptor is not None and descriptor.sink_payload_extractor is None
+    assert get_tool_descriptor("pr_rerequest_review") is None
     from importlib.metadata import PackageNotFoundError, version
 
     try:
@@ -780,8 +774,9 @@ def test_non_text_github_tools_remain_unscanned() -> None:
     from mimir.plugins.manager import load_plugins
 
     selected = load_plugins(enable="cultivate").policy
-    descriptor = get_tool_descriptor("repo_push", policy=selected)
-    assert descriptor is not None and descriptor.sink_payload_extractor is None
+    for name in ("pr_rerequest_review", "repo_push"):
+        descriptor = get_tool_descriptor(name, policy=selected)
+        assert descriptor is not None and descriptor.sink_payload_extractor is None
 
 
 def test_github_private_term_shadows_then_enforces(
@@ -807,9 +802,10 @@ def test_github_private_term_shadows_then_enforces(
     assert any(event == "shadow_tool_decision" for event, _fields in events) is (selected is not None)
 
     monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1")
-    assert _outbound_privacy_refusal(
-        "mcp__langchain-tools__pr_comment", {"body": PRIVATE_TERM}, _auth(),
-    ) is not None
+    if selected is not None:
+        assert _outbound_privacy_refusal(
+            "pr_comment", {"body": PRIVATE_TERM}, _auth(), policy=selected,
+        ) is not None
 
 
 @pytest.mark.parametrize(

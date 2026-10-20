@@ -404,7 +404,6 @@ def test_operator_declared_gh_refused_before_identity_or_credentials(
     tmp_path, monkeypatch, overlay, gh_name,
 ):
     from mimir.access_control import parse_declared_shell_commands
-    from mimir.tools import forge as forge_tools
     from mimir.tools.refusals import ToolPolicyRefusal
 
     # Construct a binding via the job parser to exercise execution even if a
@@ -417,11 +416,10 @@ def test_operator_declared_gh_refused_before_identity_or_credentials(
         "pass_env": ["GITHUB_TOKEN"],
     }])
     monkeypatch.setenv("GITHUB_TOKEN", "explicit-test-token")
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
-    checks = []
-    monkeypatch.setattr(forge_tools, "confirm_github_tool_identity",
-                        lambda *args: checks.append(args))
+    monkeypatch.setattr(
+        "mimir.plugins.core.selected_policy_registry",
+        lambda: pytest.fail("declared gh reached selected owner"),
+    )
     monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *a, **kw: None)
     argv = [str(executable), "issue", "list"]
     token = _shell_env.bind_direct_exec_argv(
@@ -431,8 +429,6 @@ def test_operator_declared_gh_refused_before_identity_or_credentials(
         assert _shell_env.direct_exec_pass_env(argv) == ("GITHUB_TOKEN",)
         with pytest.raises(ToolPolicyRefusal, match="operator-declared gh is refused"):
             direct_exec_env_overlay(argv) if overlay else direct_exec_env(argv)
-        assert checks == []
-        assert not forge_tools.github_identity_is_degraded()
     finally:
         _shell_env.reset_direct_exec_argv(token)
 
@@ -450,7 +446,6 @@ def test_operator_declared_wrapped_gh_refused_before_env_or_identity(
     tmp_path, monkeypatch, overlay, wrapper, prefix, args, gh_name,
 ):
     from mimir.access_control import parse_declared_shell_commands
-    from mimir.tools import forge as forge_tools
     from mimir.tools.refusals import ToolPolicyRefusal
 
     prefix = [token.replace("gh", gh_name) for token in prefix]
@@ -464,12 +459,11 @@ def test_operator_declared_wrapped_gh_refused_before_env_or_identity(
     }])
     monkeypatch.setenv("HOME", str(tmp_path / "ambient-home"))
     monkeypatch.setenv("GITHUB_TOKEN", "explicit-test-token")
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
-    checks = []
+    monkeypatch.setattr(
+        "mimir.plugins.core.selected_policy_registry",
+        lambda: pytest.fail("wrapped declared gh reached selected owner"),
+    )
     env_builds = []
-    monkeypatch.setattr(forge_tools, "confirm_github_tool_identity",
-                        lambda *args: checks.append(args))
     monkeypatch.setattr(_shell_env, "_minimal_direct_exec_env",
                         lambda: env_builds.append(True) or {})
     argv = [str(executable), *args]
@@ -484,8 +478,6 @@ def test_operator_declared_wrapped_gh_refused_before_env_or_identity(
         index = next(i for i, value in enumerate(argv) if Path(value).name == gh_name)
         assert f"argv[{index}]={argv[index]!r}" in str(caught.value)
         assert env_builds == []
-        assert checks == []
-        assert not forge_tools.github_identity_is_degraded()
     finally:
         _shell_env.reset_direct_exec_argv(token)
 

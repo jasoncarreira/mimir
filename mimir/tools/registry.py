@@ -3242,11 +3242,12 @@ def all_mimir_tools(
     registry = policy if policy is not None else selected_policy_registry()
     if not registry.frozen:
         raise ValueError("tool assembly requires a frozen policy")
+    unavailable_owners = set(unready_plugin_owners)
 
     def materialize(surface: str) -> list:
         return [declared.factory() for name in core_runtime_names(surface)
                 if (declared := registry.tools.get(name)) is not None
-                and declared.owner not in unready_plugin_owners
+                and declared.owner not in unavailable_owners
                 and (materialize_plugins or declared.owner == "core")]
 
     tools = materialize("default")
@@ -3295,14 +3296,18 @@ def all_mimir_tools(
                     "MIMIR_CODING_ENABLED is true, but coding prerequisites are missing:\n- "
                     + "\n- ".join(missing)
                 )
-        from .forge import github_identity_is_degraded
-        coding_enabled = not github_identity_is_degraded()
+        ready = True
+        for (owner, stage), hook in registry.turn_hooks.items():
+            if owner != "core" and stage == "tool_readiness" and hook() is False:
+                unavailable_owners.add(owner)
+                ready = False
+        coding_enabled = ready
     if coding_enabled:
         tools.extend(materialize("coding"))
     existing = {tool.name for tool in tools}
     for declared in registry.tools.values() if materialize_plugins else ():
         if (declared.owner == "core" or declared.factory is None
-                or declared.owner in unready_plugin_owners or declared.name in existing):
+                or declared.owner in unavailable_owners or declared.name in existing):
             continue
         tool = declared.factory()
         if getattr(tool, "name", None) != declared.name:

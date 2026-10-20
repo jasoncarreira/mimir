@@ -2847,7 +2847,8 @@ def test_github_author_trust_is_server_attested_and_fail_closed(
     monkeypatch.setattr("mimir.pollers._github_api_attestation", fake_api)
 
     if entrypoint == "forge":
-        from mimir.forge.github import GitHubForgeClient
+        pytest.importorskip("mimir_cultivate")
+        from mimir_cultivate.forge import GitHubForgeClient
 
         client = GitHubForgeClient(token="server-token", timeout=2.5)
         verdict = client.author_is_trusted("acme/widget", "alice")

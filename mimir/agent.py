@@ -247,16 +247,7 @@ def _selected_turn_hooks(policy: Any, name: str) -> tuple[Callable[..., Any], ..
 
 
 def _turn_tool_surface_ready(config: Config) -> bool:
-    # Plugin readiness may withhold that owner's tools; it never opts core
-    # coding tools in. The legacy surface disappears with the core catalog.
-    if (config.coding_enabled and not any(
-        tool.owner == "cultivate" for tool in config.plugin_manager.policy.tools.values()
-    )):
-        # Until the core coding catalog is retired, preserve its identity latch
-        # for deployments that still use the legacy tool surface.
-        from .tools.forge import github_identity_is_degraded
-
-        return not github_identity_is_degraded()
+    # Selected plugins supply their own factories and readiness hooks.
     return False
 
 

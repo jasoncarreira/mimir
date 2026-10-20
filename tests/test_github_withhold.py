@@ -164,8 +164,11 @@ def test_marker_probe_reads_events_jsonl(tmp_path: Path) -> None:
 
 
 def _assert_github_fetch_cache_closed(root: Path) -> None:
-    sources = [root / "mimir/tools/forge.py", root / "mimir/pollers.py"]
-    sources.extend((root / "mimir/forge").rglob("*.py"))
+    provider = root / "plugins/cultivate/mimir_cultivate"
+    sources = [
+        provider / "forge.py", provider / "ci.py", provider / "github_trust.py",
+        root / "mimir/pollers.py",
+    ]
     sources.extend((root / "mimir/pollers").rglob("*.py"))
     # Include both shipped GitHub pollers and any future core GitHub skill scripts.
     skills = root / "plugins/cultivate/mimir_cultivate/defaults/skills"
@@ -185,8 +188,9 @@ def test_forge_and_github_pollers_do_not_read_fetch_cache() -> None:
 
 
 @pytest.mark.parametrize("relative_path", [
-    "mimir/tools/forge.py",
-    "mimir/forge/nested/client.py",
+    "plugins/cultivate/mimir_cultivate/forge.py",
+    "plugins/cultivate/mimir_cultivate/ci.py",
+    "plugins/cultivate/mimir_cultivate/github_trust.py",
     "mimir/pollers/nested/github.py",
     "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/scripts/poller.py",
     "plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/scripts/poller.py",
@@ -201,7 +205,10 @@ def test_fetch_cache_closure_detects_injected_path_spellings(
     tmp_path: Path, relative_path: str, injected_source: str,
 ) -> None:
     for required in (
-        "mimir/tools/forge.py", "mimir/pollers.py",
+        "plugins/cultivate/mimir_cultivate/forge.py",
+        "plugins/cultivate/mimir_cultivate/ci.py",
+        "plugins/cultivate/mimir_cultivate/github_trust.py",
+        "mimir/pollers.py",
         "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/scripts/poller.py",
         "plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/scripts/poller.py",
     ):

@@ -321,6 +321,7 @@ async def test_plugin_call_site_preserves_scope_head_and_untrusted_taint() -> No
     assert client.calls == [
         ("metadata", runtime.context.repo_pr_action_scope),
         ("attest", ("owner/repo", "author")),
+        ("metadata", runtime.context.repo_pr_action_scope),
     ]
     assert provenance.sources[0].resource_id == "owner/repo#pull/17@" + "a" * 40
     assert provenance.sources[0].integrity == "untrusted"
@@ -470,9 +471,11 @@ def test_unsupported_operation_escalates_once_and_persists(tmp_path, monkeypatch
         "operator_visible": True,
     })]
     persisted = tmp_path / "state" / "unsupported_operations.json"
-    assert json.loads(persisted.read_text(encoding="utf-8")) == [
-        runtime.context.repo_pr_action_scope.scope_id + ":" + result["operation"]
-    ]
+    assert json.loads(persisted.read_text(encoding="utf-8")) == {
+        "owner/repo#17": (
+            runtime.context.repo_pr_action_scope.observed_head_sha + ":" + result["operation"]
+        ),
+    }
     assert forge.unsupported_operation.func(**arguments)["escalated"] is False
     assert len(events) == 1
     with pytest.raises(ToolPolicyRefusal, match="outside this turn's scope"):

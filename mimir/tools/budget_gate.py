@@ -312,10 +312,7 @@ def _resolve_standing_review(
             return "repository review head validator unavailable"
         revalidate_review_head_for_context = None
     else:
-        from .forge import (
-            revalidate_review_head_for_context,
-            resolve_review_state_for_context,
-        )
+        return "repository review provider unavailable"
 
     try:
         resolve_review_state_for_context(

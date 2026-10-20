@@ -766,7 +766,7 @@ def test_resumed_local_commit_requires_clean_producing_turn(
     # The local bare remote stands in for the configured GitHub origin.
     monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda _: "owner/repo")
     from mimir.models import InformationFlowLabels
-    from mimir.pr_checkout_lease import _METADATA
+    from mimir_cultivate.repository import _METADATA
     from mimir_cultivate.repository import _publish_attested_lease_result
 
     _origin, _source, scope, first = _repo_scope_and_state(tmp_path)
@@ -882,7 +882,7 @@ def test_resumed_local_commit_requires_clean_producing_turn(
 
 def test_rebase_cannot_clean_up_tainted_local_commit(tmp_path: Path) -> None:
     from mimir import access_control
-    from mimir.pr_checkout_lease import _METADATA
+    from mimir_cultivate.repository import _METADATA
 
     _origin, source, scope, state = _repo_scope_and_state(tmp_path)
     lease = state.checkout_lease
@@ -919,7 +919,7 @@ def test_rebase_onto_live_advanced_protected_base_stays_attested(tmp_path: Path)
     lease = state.checkout_lease
     assert lease.base_sha == lease.verified_base_sha == advanced
     assert_lease_attested(turn, scope, lease)
-    from mimir.pr_checkout_lease import _METADATA
+    from mimir_cultivate.repository import _METADATA
     record = json.loads((lease.path / _METADATA).read_text())
     record["verified_base_sha"] = scope.observed_base_sha
     (lease.path / _METADATA).write_text(json.dumps(record))
@@ -1918,7 +1918,7 @@ def test_changes_requested_rebase_push_uses_exact_head_lease(tmp_path: Path) -> 
 @pytest.mark.parametrize("stale", [False, True, "race"])
 def test_heartbeat_live_scope_executes_git_remediation(tmp_path, monkeypatch, operation, stale):
     import mimir.access_control as access
-    import mimir.tools.forge as forge
+    import mimir_cultivate.forge as forge
     from mimir.models import AgentEvent, InformationFlowLabels, NormalizedPullRequestSnapshot
 
     origin, source, previous, previous_state = _repo_scope_and_state(tmp_path)
@@ -2145,7 +2145,7 @@ def test_https_push_uses_invocation_scoped_auth_without_credential_leak(
     state = RepoReviewState(https_scope)
     state.attach_checkout_lease(lease)
     state.record_git_head(https_scope.scope_id, scope.observed_head_sha)
-    from mimir.pr_checkout_lease import _METADATA, _metadata
+    from mimir_cultivate.repository import _METADATA, _metadata
     (lease.path / _METADATA).write_text(json.dumps(_metadata(lease)) + "\n")
     (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
     token = "never-expose-this-token"
@@ -2245,9 +2245,9 @@ def test_https_push_refuses_when_acting_identity_is_unverified(
     def refuse(_principal, _token):
         raise ForgeError("github identity verification cache is empty")
 
-    from mimir.forge import ForgeError
+    from mimir_cultivate.forge import ForgeError
 
-    monkeypatch.setattr("mimir.forge.github.confirm_github_identity", refuse)
+    monkeypatch.setattr("mimir_cultivate.forge.confirm_github_identity", refuse)
     with pytest.raises(GitRefusal) as refusal:
         RepoGitTools(state)._push_remote()
 

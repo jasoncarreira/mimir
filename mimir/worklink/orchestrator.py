@@ -29,7 +29,6 @@ from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
 from .._atomic import atomic_write_json
 from .._rmtree import rmtree_missing_ok
-from ..forge.github import GitHubForgeClient, GitHubIdentityVerificationError
 from .backends import (
     BackendRegistry,
     CheckoutShape,
@@ -103,6 +102,7 @@ from .factory_state import (
 from .detached_dispatch import FactoryRecoveryIdentity
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+GitHubForgeClient: Any = None
 
 
 def _repository_inventory(home: Path) -> Any:
@@ -2925,8 +2925,15 @@ class WorklinkRunner:
             _read_factory_publishing_identity(self.repo)
         )
         github_token, github_env = _resolve_factory_github_credential(os.environ)
+        from mimir_cultivate.forge import (
+            GitHubForgeClient as SelectedGitHubForgeClient,
+            GitHubIdentityVerificationError,
+        )
+
         try:
-            GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
+            (GitHubForgeClient or SelectedGitHubForgeClient)(token=github_token).verify_identity(
+                publishing_identity,
+            )
         except GitHubIdentityVerificationError as exc:
             raise WorklinkError(
                 f"{exc}; selected identity {publishing_identity} "

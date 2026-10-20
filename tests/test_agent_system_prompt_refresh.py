@@ -118,16 +118,11 @@ async def test_build_agent_routes_lease_root_created_after_first_build(
 
     agent._config.plugin_manager = load_plugins(enable="")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
-    monkeypatch.setattr("mimir.tools.forge._github_identity_degraded", False)
     monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
     agent._config.coding_enabled = failed_first_build
     monkeypatch.setattr("mimir.tools.all_mimir_tools", registry.all_mimir_tools)
 
-    if failed_first_build:
-        with pytest.raises(RuntimeError, match="lease root is unavailable"):
-            await agent._build_agent_if_needed()
-    else:
-        await agent._build_agent_if_needed()
+    await agent._build_agent_if_needed()
     previous_backend = agent._backend
     checkout = lease_root / "checkout"
     checkout.mkdir(parents=True)
@@ -135,8 +130,7 @@ async def test_build_agent_routes_lease_root_created_after_first_build(
     target.write_text("leased checkout content\n", encoding="utf-8")
     assert "outside_file_tool_roots" in previous_backend.read(str(target)).error
 
-    if not failed_first_build:
-        _write_core(agent._config.home, "<!-- desc: test -->\n# Changed core\n")
+    _write_core(agent._config.home, "<!-- desc: test -->\n# Changed core\n")
     graph = await agent._build_agent_if_needed()
     result = agent._backend.read(str(target))
     assert result.error is None
@@ -227,10 +221,11 @@ async def test_build_agent_does_not_route_invalid_lease_root(
 async def test_build_agent_rebuilds_without_coding_tools_after_identity_latch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     agent = _make_agent(tmp_path, monkeypatch)
     from mimir.plugins.manager import load_plugins
 
-    agent._config.plugin_manager = load_plugins(enable="")
+    agent._config.plugin_manager = load_plugins(enable="cultivate")
     agent._config.coding_enabled = True
     capture = _stub_deepagent_build(monkeypatch)
     requested: list[bool] = []
@@ -238,7 +233,7 @@ async def test_build_agent_rebuilds_without_coding_tools_after_identity_latch(
         "mimir.tools.all_mimir_tools",
         lambda **kwargs: requested.append(kwargs.get("coding_enabled", False)) or [],
     )
-    from mimir.tools import forge as forge_tools
+    from mimir_cultivate import forge as forge_tools
     monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
 
     first = await agent._build_agent_if_needed()
@@ -246,8 +241,9 @@ async def test_build_agent_rebuilds_without_coding_tools_after_identity_latch(
     second = await agent._build_agent_if_needed()
 
     assert first is not second
-    assert requested == [True, False]
+    assert requested == [False, False]
     assert agent._cached_coding_enabled is False
+    assert "cultivate" in agent._cached_unready_tool_owners
 
 
 @pytest.mark.asyncio

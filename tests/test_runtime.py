@@ -103,6 +103,7 @@ async def test_factory_unknown_sender_real_delivery(
     events = []
     _patch_factory(monkeypatch, events)
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     cfg = replace(Config.from_env(), operator_alert_channel="slack-COPS",
                   access_control_enforced=True, coding_enabled=False,
                   pairing_operator_digest_delay_seconds=3600,
@@ -344,7 +345,6 @@ def _patch_factory(
     import mimir.search
     import mimir.session_manager
     import mimir.tools
-    import mimir.tools.forge
     import mimir.turn_event_bus
     import mimir.turn_logger
 
@@ -450,42 +450,17 @@ def _patch_factory(
     monkeypatch.setattr(mimir.turn_event_bus, "TurnEventBus", TurnEventBus)
     monkeypatch.setattr(mimir.agent, "Agent", Agent)
     monkeypatch.setattr(mimir.tools, "all_mimir_tools", lambda **kwargs: events.append(("tools", kwargs)))
-    set_degraded_callback = mimir.tools.forge.set_github_identity_degraded_callback
-
-    def record_degraded_callback(callback: Any, **kwargs: Any) -> None:
-        events.append(("forge_callback", callback))
-        set_degraded_callback(callback, **kwargs)
-
-    monkeypatch.setattr(
-        mimir.tools.forge,
-        "set_github_identity_degraded_callback",
-        record_degraded_callback,
-    )
-
-    def initialize_forge() -> bool:
-        mimir.tools.forge.set_forge_client(object())
-        events.append(("call", "initialize_forge"))
-        return True
-
-    monkeypatch.setattr(
-        mimir.tools.forge,
-        "initialize_github_forge_identity",
-        initialize_forge,
-    )
 
 
 def _assert_runtime_globals_cleared() -> None:
     import mimir.history
     import mimir.tools.extra
-    import mimir.tools.forge
     import mimir.tools.mcp
     import mimir.tools.memory
     import mimir.tools.registry
     import mimir.tools.shell_async
     import mimir.tools.web
 
-    assert mimir.tools.forge._github_identity_degraded_callback is None
-    assert mimir.tools.forge._default_client is None
     assert mimir.tools.memory._MEMORY_STATE == {"client": None}
     assert mimir.tools.extra._SEARCH_STATE == {"indexer": None}
     assert mimir.tools.extra._INDEX_GEN_STATE == {"generator": None}
@@ -923,11 +898,12 @@ async def test_runtime_preflight_recovers_after_bounded_transient_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import mimir.event_logger
-    from mimir.forge.github import (
+    from mimir_cultivate.forge import (
         GitHubIdentityFailureKind,
         GitHubIdentityVerificationError,
     )
-    from mimir.tools import forge as forge_tools
+    from mimir_cultivate import forge as forge_tools
+    from mimir.plugins.manager import load_plugins
 
     events: list[tuple[str, Any]] = []
     original_initialize = forge_tools.initialize_github_forge_identity
@@ -952,7 +928,7 @@ async def test_runtime_preflight_recovers_after_bounded_transient_retries(
                 )
             return declared_login
 
-    monkeypatch.setattr("mimir.forge.github.GitHubForgeClient", Client)
+    monkeypatch.setattr(forge_tools, "GitHubForgeClient", Client)
     now = [0.0]
     monkeypatch.setattr(runtime.time, "monotonic", lambda: now[0])
     logged: list[tuple[str, dict[str, Any]]] = []
@@ -995,6 +971,7 @@ async def test_runtime_preflight_recovers_after_bounded_transient_retries(
         spawn_background_task=adapters.spawn_background_task,
     )
     config = _config(tmp_path)
+    config.plugin_manager = load_plugins(enable="cultivate")
     config.coding_enabled = True
     config.operator_alert_channel = "ops"
     bundle = await runtime.create_agent_runtime(config, _core(tmp_path), adapters)
@@ -1064,8 +1041,9 @@ async def test_runtime_preflight_never_retries_permanent_identity_latch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import mimir.event_logger
-    from mimir.forge.github import GitHubIdentityVerificationError
-    from mimir.tools import forge as forge_tools
+    from mimir_cultivate.forge import GitHubIdentityVerificationError
+    from mimir_cultivate import forge as forge_tools
+    from mimir.plugins.manager import load_plugins
 
     events: list[tuple[str, Any]] = []
     original_initialize = forge_tools.initialize_github_forge_identity
@@ -1087,9 +1065,10 @@ async def test_runtime_preflight_never_retries_permanent_identity_latch(
                 authenticated_login="other-bot",
             )
 
-    monkeypatch.setattr("mimir.forge.github.GitHubForgeClient", Client)
+    monkeypatch.setattr(forge_tools, "GitHubForgeClient", Client)
     monkeypatch.setattr(mimir.event_logger, "log_event_sync", lambda *a, **kw: None)
     config = _config(tmp_path)
+    config.plugin_manager = load_plugins(enable="cultivate")
     config.coding_enabled = True
     bundle = await runtime.create_agent_runtime(
         config, _core(tmp_path), _adapters(events),
@@ -1101,7 +1080,11 @@ async def test_runtime_preflight_never_retries_permanent_identity_latch(
     assert attempts == ["reviewer"]
     assert forge_tools.github_identity_is_degraded() is True
     assert forge_tools.github_identity_recovery_pending() is False
-    assert ("tools", {"coding_enabled": True}) in events
+    assert any(
+        kind == "tools" and options.get("coding_enabled") is True
+        and options.get("policy") is config.plugin_manager.policy
+        for kind, options in events if isinstance(options, dict)
+    )
     await bundle.aclose()
 
 
@@ -1524,7 +1507,6 @@ async def test_runtime_global_matrix_is_installed_and_reset_in_order(
     import mimir.history
     import mimir.tools
     import mimir.tools.extra
-    import mimir.tools.forge
     import mimir.tools.mcp
     import mimir.tools.memory
     import mimir.tools.registry
@@ -1534,8 +1516,6 @@ async def test_runtime_global_matrix_is_installed_and_reset_in_order(
     events: list[tuple[str, Any]] = []
     _patch_factory(monkeypatch, events)
     stale = object()
-    mimir.tools.forge.set_github_identity_degraded_callback(stale)
-    mimir.tools.forge.set_forge_client(stale)
     mimir.tools.set_memory_client(stale)
     mimir.tools.set_indexer(stale)
     mimir.tools.set_index_generator(stale)
@@ -1564,8 +1544,6 @@ async def test_runtime_global_matrix_is_installed_and_reset_in_order(
 
         monkeypatch.setattr(module, attribute, recorder)
 
-    wrap(mimir.tools.forge, "set_github_identity_degraded_callback", "forge_callback")
-    wrap(mimir.tools.forge, "set_forge_client", "forge_client")
     wrap(mimir.tools, "set_memory_client", "memory")
     wrap(mimir.tools, "set_indexer", "indexer")
     wrap(mimir.tools, "set_index_generator", "indexes")
@@ -1583,8 +1561,6 @@ async def test_runtime_global_matrix_is_installed_and_reset_in_order(
     wrap(mimir.tools, "set_mcp_tools", "mcp")
 
     reset_labels = [
-        "forge_callback",
-        "forge_client",
         "memory",
         "indexer",
         "indexes",
@@ -1607,15 +1583,11 @@ async def test_runtime_global_matrix_is_installed_and_reset_in_order(
     core = _core(tmp_path)
     bundle = await runtime.create_agent_runtime(config, core, adapters)
 
-    assert [label for label, _ in calls[:17]] == reset_labels
+    assert [label for label, _ in calls[:15]] == reset_labels
     assert all(value is None for _, value in calls[:14])
-    assert calls[14] == ("shell", None)
-    assert calls[15] == ("web", None)
-    assert calls[16] == ("mcp", [])
-    install_labels = [label for label, _ in calls[17:]]
+    assert calls[14] == ("mcp", [])
+    install_labels = [label for label, _ in calls[15:]]
     assert install_labels == [
-        "forge_callback",
-        "forge_client",
         "memory",
         "indexer",
         "indexes",
@@ -1633,8 +1605,6 @@ async def test_runtime_global_matrix_is_installed_and_reset_in_order(
         "mcp",
     ]
 
-    assert mimir.tools.forge._github_identity_degraded_callback is not None
-    assert mimir.tools.forge._default_client is not None
     assert mimir.tools.memory._MEMORY_STATE["client"] is bundle.agent._memory_client
     assert mimir.tools.extra._SEARCH_STATE["indexer"] is bundle.indexer
     assert mimir.tools.extra._INDEX_GEN_STATE["generator"] is bundle.indexes
@@ -1667,9 +1637,7 @@ async def test_runtime_global_matrix_is_installed_and_reset_in_order(
     close_calls = calls[calls_before_close:]
     assert [label for label, _ in close_calls] == reset_labels
     assert all(value is None for _, value in close_calls[:14])
-    assert close_calls[14] == ("shell", None)
-    assert close_calls[15] == ("web", None)
-    assert close_calls[16] == ("mcp", [])
+    assert close_calls[14] == ("mcp", [])
     _assert_runtime_globals_cleared()
 
 
@@ -1965,7 +1933,8 @@ async def test_factory_rollback_task_timeout_continues_reverse_closers_and_rerai
     import mimir.search
     import mimir.session_manager
     import mimir.tools
-    import mimir.tools.forge
+    from mimir_cultivate import forge as selected_forge
+    from mimir.plugins.manager import load_plugins
 
     events: list[tuple[str, Any]] = []
     _patch_factory(monkeypatch, events)
@@ -2023,7 +1992,7 @@ async def test_factory_rollback_task_timeout_continues_reverse_closers_and_rerai
             await resistant_close("sessions")
 
     monkeypatch.setattr(mimir.session_manager, "SessionManager", ResistantSessions)
-    set_callback = mimir.tools.forge.set_github_identity_degraded_callback
+    set_callback = selected_forge.set_github_identity_degraded_callback
 
     def invoke_current(callback: Any, *, notify_current: bool = False) -> None:
         set_callback(callback)
@@ -2031,10 +2000,11 @@ async def test_factory_rollback_task_timeout_continues_reverse_closers_and_rerai
             callback(RuntimeError("forge degraded"))
 
     monkeypatch.setattr(
-        mimir.tools.forge,
+        selected_forge,
         "set_github_identity_degraded_callback",
         invoke_current,
     )
+    monkeypatch.setattr(selected_forge, "initialize_github_forge_identity", lambda: True)
     monkeypatch.setattr(mimir.event_logger, "log_event_sync", lambda *args, **kwargs: None)
 
     async def log_event(*args: Any, **kwargs: Any) -> None:
@@ -2060,6 +2030,7 @@ async def test_factory_rollback_task_timeout_continues_reverse_closers_and_rerai
     )
     monkeypatch.setattr(runtime, "RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS", 0.01)
     config = _config(tmp_path)
+    config.plugin_manager = load_plugins(enable="cultivate")
     config.coding_enabled = True
     config.operator_alert_channel = "ops"
     adapters = _adapters(events)
@@ -2253,6 +2224,7 @@ from pathlib import Path
 home = Path(tempfile.mkdtemp())
 os.environ[\"MIMIR_HOME\"] = str(home)
 os.environ[\"MIMIR_MODEL_SPEC\"] = \"anthropic:test\"
+os.environ.pop(\"MIMIR_PLUGINS\", None)
 
 from mimir import runtime
 from mimir.channel_registry import ChannelRegistry

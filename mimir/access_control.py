@@ -9727,12 +9727,24 @@ class ToolRegistry:
             )
             return finish(auth)
 
-        from .plugins.core import _REPO_ACTIONS, core_policy_registry
+        from .plugins.core import _FORGE_ACTIONS, _REPO_ACTIONS, core_policy_registry
 
         policy = policy if policy is not None else selected_policy_registry()
         if not policy.frozen:
             raise ValueError("authorization requires a frozen policy")
         tool_policy = policy.tools.get(tool_name)
+        retired_forge = _FORGE_ACTIONS.keys() | {
+            "pr_list", "ci_run_jobs", "ci_run", "ci_recent_runs", "issue_comment",
+        }
+        if tool_policy is None and tool_name in retired_forge:
+            return finish(ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=False,
+                reason="forge_tool_unavailable",
+                enforcement_enabled=True,
+                would_block=True,
+            ))
         if tool_policy is None and tool_name in _REPO_ACTIONS:
             return finish(ToolAuthorization(
                 tool_name=tool_name,
@@ -9886,7 +9898,11 @@ class ToolRegistry:
                         flow_direction=flow_direction,
                     ))
                 else:
-                    from .tools.forge import resolve_issue_comment_target
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=False, reason="issue_destination_resolution_failed",
+                        enforcement_enabled=True, would_block=True,
+                    ))
 
                 try:
                     issue_target = resolve_issue_comment_target(
@@ -10011,7 +10027,11 @@ class ToolRegistry:
                             flow_direction=flow_direction,
                         ))
                     else:
-                        from .tools.forge import resolve_review_state_for_context
+                        return finish(ToolAuthorization(
+                            tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
+                            allowed=False, reason="repo_pr_scope_denied",
+                            enforcement_enabled=True, would_block=True,
+                        ))
 
                     try:
                         state = resolve_review_state_for_context(
@@ -11176,10 +11196,8 @@ def protected_result_source(
         hooks = selected_policy_registry().policy_consumer_hooks
         if hooks is not None:
             active_pr_checkout_lease_for_path = hooks.active_checkout
-        elif getattr(selected_policy_registry(), "_projected_owner", None) is not None:
-            active_pr_checkout_lease_for_path = lambda _path: None
         else:
-            from .pr_checkout_lease import active_pr_checkout_lease_for_path
+            active_pr_checkout_lease_for_path = lambda _path: None
 
         lease = active_pr_checkout_lease_for_path(resource_id)
         registry = getattr(auth_context, "repo_pr_scope_registry", None)
@@ -11691,8 +11709,15 @@ def classify_protected_result(
     selected = authorization.policy if authorization.policy is not None else selected_policy_registry()
     registered = selected.tools.get(tool_name)
     if registered is None:
-        from .plugins.core import _REPO_ACTIONS
+        from .plugins.core import _FORGE_ACTIONS, _REPO_ACTIONS
 
+        if tool_name in (_FORGE_ACTIONS.keys() | {
+            "pr_list", "ci_run_jobs", "ci_run", "ci_recent_runs", "issue_comment",
+        }):
+            return _incomplete_protected_result(
+                "repository", arguments or {}, tool_name=tool_name,
+                auth_context=auth_context,
+            )
         if tool_name in _REPO_ACTIONS:
             return _incomplete_protected_result(
                 "repository", arguments or {}, tool_name=tool_name,

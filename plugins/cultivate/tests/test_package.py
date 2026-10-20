@@ -100,14 +100,18 @@ def test_disabled_provider_is_not_imported() -> None:
 def test_selected_provider_registers_its_coding_resources() -> None:
     from mimir.plugins.manager import load_plugins
     from mimir.plugins.core import core_runtime_names
+    from mimir_cultivate.forge import FORGE_TOOLS
     from mimir_cultivate.repository import REPO_TOOLS
 
     manager = load_plugins(enable="cultivate")
     assert [plugin.candidate.name for plugin in manager.plugins] == ["cultivate"]
     repository = {tool.name for tool in REPO_TOOLS}
+    forge = {tool.name for tool in FORGE_TOOLS}
     assert len(repository) == 16
-    assert repository.isdisjoint(core_runtime_names("coding"))
-    coding = set(core_runtime_names("coding")) | {"worklink_run", "worklink_resume"} | repository
+    assert len(forge) == 21
+    assert repository.isdisjoint(forge)
+    assert (repository | forge).isdisjoint(core_runtime_names("coding"))
+    coding = set(core_runtime_names("coding")) | {"worklink_run", "worklink_resume"} | repository | forge
     assert {name for name, tool in manager.policy.tools.items() if tool.owner == "cultivate"} == coding
     assert all(manager.policy.tools[name].factory is not None for name in coding)
 

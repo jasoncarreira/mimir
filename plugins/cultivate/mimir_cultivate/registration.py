@@ -238,7 +238,11 @@ class CultivateProvider:
         from .policy import (
             CultivateState, register_action_protocol, register_tools, validate_scoped_pr_action,
         )
-        from .forge import github_identity_is_degraded
+        from .forge import (
+            github_identity_is_degraded, github_identity_recovery_pending,
+            initialize_github_forge_identity, set_forge_client,
+            set_github_identity_degraded_callback,
+        )
         from .worklink.continuation import maybe_create_worklink_budget_continuation
         from .worklink.dispatch_failures import is_dispatch_failure_intervention
 
@@ -264,6 +268,15 @@ class CultivateProvider:
         )
         registrar.register_retained_checkout_operation(_retained_checkout_operation)
         registrar.register_turn_hook("tool_readiness", lambda: not github_identity_is_degraded())
+        registrar.register_server_hook(
+            "github_identity_callback",
+            lambda callback: set_github_identity_degraded_callback(
+                callback, notify_current=callback is not None,
+            ),
+        )
+        registrar.register_server_hook("github_identity_initialize", initialize_github_forge_identity)
+        registrar.register_server_hook("github_identity_recovery_pending", github_identity_recovery_pending)
+        registrar.register_server_hook("forge_client_clear", lambda: set_forge_client(None))
         registrar.register_turn_hook("failure_intervention", is_dispatch_failure_intervention)
         registrar.register_turn_hook("budget_continuation", maybe_create_worklink_budget_continuation)
         from .feedback import feedback_extension

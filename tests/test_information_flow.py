@@ -76,7 +76,6 @@ from mimir.models import (
     TurnContext,
     TurnInteractivity,
 )
-from mimir.pr_checkout_lease import PRCheckoutLease, _metadata
 from mimir.prompt_sources import prompt_source_label
 from mimir.skill_install import install
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
@@ -1819,6 +1818,9 @@ def _lease_read_auth(
     *,
     pull_request_author: str,
 ) -> AuthContext:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.repository import PRCheckoutLease, _metadata
+
     scope = RepoPRActionScope(
         provenance="server_discovered",
         canonical_repo="o/r",
@@ -1864,6 +1866,7 @@ def _lease_read_auth(
     return replace(_auth(), repo_review_state=state, repo_pr_action_scope=scope)
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_attested_author_active_lease_is_trusted_but_arbitrary_root_is_not(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1941,6 +1944,7 @@ def test_non_self_authored_active_lease_is_untrusted_active_ingest(
     )
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_active_lease_does_not_trust_sibling_path_within_lease_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2004,6 +2008,7 @@ def test_invalid_configured_lease_root_is_rejected(
     assert _configured_pr_checkout_lease_root() is None
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_active_lease_record_supersedes_generic_file_integrity_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2467,6 +2472,7 @@ def test_every_known_label_can_flow_to_compatible_same_channel(label: str):
     assert decision.reason == "ifc_allowed"
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_source_only_carrier_obeys_forge_allowed_sinks():
     source = SourceLabel(
         principal="user-1", domain="channel", resource_id="slack-C1",
@@ -2493,6 +2499,7 @@ def test_source_only_carrier_obeys_forge_allowed_sinks():
 
 
 @pytest.mark.parametrize("labelled", [False, True])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_sourceless_carrier_only_skips_sink_gate_when_unlabelled(labelled):
     labels = InformationFlowLabels(
         labels=frozenset({"private"}) if labelled else frozenset(),
@@ -6629,11 +6636,12 @@ def test_service_shell_policy_rejects_write_read_and_exec_flags(command: str):
 @pytest.mark.parametrize("source", [
     "collaborator_pr", "noncollaborator_pr", "noncollaborator_pr_diff", "fetch_url", "channel",
 ])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_shell_gate_after_real_source_labelling(
     tmp_path, monkeypatch, maintenance_git_home, tool_name, profile, source,
 ):
     from mimir import access_control
-    from mimir.tools import forge
+    from mimir_cultivate import forge
 
     if profile in {"user", "admin"}:
         auth = _auth(roles=(profile,))
@@ -6675,6 +6683,10 @@ def test_shell_gate_after_real_source_labelling(
             )
         finally:
             provenance = access_control.end_protected_result_capture(token)
+        assert provenance is not None
+        assert provenance.sources[0].integrity == (
+            "trusted" if source == "collaborator_pr" else "untrusted"
+        )
         forge_tool = "pr_diff" if source == "noncollaborator_pr_diff" else "pr_metadata"
         added = classify_protected_result(
             forge_tool, {}, auth,
@@ -6706,27 +6718,14 @@ def test_shell_gate_after_real_source_labelling(
             content="untrusted channel content",
         ))
     assert added is not None
-    assert added.has_untrusted_active_ingest is (source != "collaborator_pr")
+    assert added.has_untrusted_active_ingest
     current = auth.ifc_state.merge(added, fallback=labels)
     decision = SinkGate.check_sink_flow(
         tool_name, "git status --short" if profile == "github" else "printf gate",
         current, auth, enforce=True, repo_review_state=review_state,
     )
-    assert decision.allowed is (source == "collaborator_pr"), (decision.reason, decision.refusal_detail)
-    if source == "collaborator_pr":
-        output = classify_protected_result(
-            tool_name, {}, auth, decision, result="ordinary shell output",
-        )
-        if output is not None:
-            assert all(item.integrity == "untrusted" for item in output.sources)
-            auth.ifc_state.merge(output, fallback=current)
-        second = SinkGate.check_sink_flow(
-            tool_name, "git status --short" if profile == "github" else "printf gate",
-            current, auth, enforce=True, repo_review_state=review_state,
-        )
-        assert second.allowed, second.reason
-        assert not auth.ifc_state.has_untrusted_active_ingest(current)
-    if source != "collaborator_pr":
+    assert not decision.allowed, (decision.reason, decision.refusal_detail)
+    if source in {"collaborator_pr", "noncollaborator_pr", "noncollaborator_pr_diff", "fetch_url", "channel"}:
         # Native shells retain their existing IFC reason and detail, rather than
         # the uniform code/live-state refusal used by the hands entry points.
         assert decision.reason == "ifc_label_blocked:shell_process"
@@ -6782,13 +6781,10 @@ def test_service_shell_policy_rejects_multicommand_line_breaks(separator: str):
     assert decision.reason == "service_sink_destination_denied"
 
 
-@pytest.mark.parametrize(("kind", "reason", "fields"), [
-    ("none", "no_published_provenance", None),
-    ("mismatch", "provenance_field_mismatch", ["resource_id", "principal"]),
-    ("untrusted", "published_untrusted", None),
-])
-def test_repository_result_fallback_records_closed_reason_once_per_turn(
-    monkeypatch: pytest.MonkeyPatch, kind: str, reason: str, fields: list[str] | None,
+@pytest.mark.parametrize("kind", ["none", "mismatch", "untrusted"])
+@pytest.mark.usefixtures("selected_cultivate_policy")
+def test_nonretained_plugin_result_never_issues_repository_fallback_receipt(
+    monkeypatch: pytest.MonkeyPatch, kind: str,
 ) -> None:
     from mimir import event_logger
 
@@ -6824,11 +6820,8 @@ def test_repository_result_fallback_records_closed_reason_once_per_turn(
             "pr_metadata", {}, auth, authorization, provenance=published,
         )
         assert result.sources[0].integrity == "untrusted"
-    assert events == [("repository_result_untrusted_default", {
-        "tool": "pr_metadata", "scope_id": scope.scope_id, "pr_number": 2364,
-        "observed_head_sha": "a" * 40, "reason": reason,
-        **({"mismatched_fields": fields} if fields is not None else {}),
-    })]
+        assert result.sources[0].resource_id == "<unresolved-resource:protected_tool:pr_metadata>"
+    assert events == []
 
 
 @pytest.mark.parametrize("field", ["resource_id", "principal"])

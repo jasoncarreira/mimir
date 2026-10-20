@@ -31,11 +31,11 @@ from tests.test_repo_tools import (
 
 
 def test_repository_implementation_is_owned_by_provider() -> None:
-    from mimir import pr_checkout_lease
-
-    assert repository.PRCheckoutLease is not pr_checkout_lease.PRCheckoutLease
     root = Path(__file__).resolve().parents[3] / "mimir"
-    for retired in ("repository_config.py", "repo_tools.py", "project_tests.py", "tools/repo.py"):
+    for retired in (
+        "repository_config.py", "repo_tools.py", "project_tests.py",
+        "tools/repo.py", "pr_checkout_lease.py",
+    ):
         assert not (root / retired).exists()
     assert {tool.name for tool in repository.REPO_TOOLS} == {
         "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
@@ -54,9 +54,9 @@ def test_repository_implementation_is_owned_by_provider() -> None:
             pytest.fail(f"provider imports retired core repository module: {node.module}")
 
 
-def test_surviving_core_lease_does_not_import_provider() -> None:
+def test_surviving_core_shell_does_not_import_provider() -> None:
     root = Path(__file__).resolve().parents[3]
-    tree = ast.parse((root / "mimir/pr_checkout_lease.py").read_text(encoding="utf-8"))
+    tree = ast.parse((root / "mimir/tools/_shell_env.py").read_text(encoding="utf-8"))
     modules = [node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
     modules.extend(
         alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)

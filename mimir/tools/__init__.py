@@ -85,13 +85,6 @@ from .proposals import proposal_diff
 
 _CODING_EXPORTS = {
     "spawn_open_code": "registry",
-    **{name: "forge" for name in (
-        "pr_checks", "pr_job_log", "ci_run_jobs", "ci_run", "ci_recent_runs",
-        "pr_comment", "pr_comments", "pr_diff", "pr_file_content", "pr_edit_body",
-        "pr_files", "pr_inline_review_comment", "pr_metadata", "pr_spec", "pr_list",
-        "pr_rerequest_review", "pr_review_requests", "pr_reviews", "pr_submit_review",
-        "register_forge_client", "set_forge_client", "unsupported_operation",
-    )},
 }
 
 
@@ -155,29 +148,7 @@ __all__ = [
     "saga_end_session",
     "saga_forget",
     "saga_record_skill_learning",
-    "pr_metadata",
-    "pr_spec",
-    "pr_list",
-    "pr_files",
-    "pr_diff",
     "proposal_diff",
-    "pr_file_content",
-    "pr_checks",
-    "pr_job_log",
-    "ci_run_jobs",
-    "ci_run",
-    "ci_recent_runs",
-    "pr_reviews",
-    "pr_comments",
-    "pr_review_requests",
-    "pr_submit_review",
-    "pr_inline_review_comment",
-    "pr_comment",
-    "pr_edit_body",
-    "pr_rerequest_review",
-    "unsupported_operation",
-    "register_forge_client",
-    "set_forge_client",
     # Dep-injection setters (called by server.py:build_app)
     "set_memory_client",
     "set_indexer",

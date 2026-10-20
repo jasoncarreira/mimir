@@ -384,7 +384,7 @@ async def test_heartbeat_scope_and_profile_refused_before_handler(
         def resolve(*_args):
             return state
         monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "someone-else")
-    monkeypatch.setattr("mimir.tools.forge.resolve_review_state_for_context", resolve)
+    monkeypatch.setattr("mimir_cultivate.forge.resolve_review_state_for_context", resolve)
     calls = []
     request = ToolCallRequest(
         tool_call={"name": "scoped_checkout", "args": {

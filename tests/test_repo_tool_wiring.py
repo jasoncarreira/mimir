@@ -30,13 +30,14 @@ from mimir.models import (
     ServerDiscoveredPRStates,
     SourceLabel,
 )
-from mimir.forge import CheckProjection, ReviewProjection
-from mimir_cultivate.forge import remediation_checkout_preflight, set_forge_client
 try:
     version("mimir-cultivate")
 except PackageNotFoundError:
     pytest.skip("repository tool wiring requires installed Cultivate", allow_module_level=True)
 
+from mimir_cultivate.forge import (
+    CheckProjection, ReviewProjection, remediation_checkout_preflight, set_forge_client,
+)
 from mimir_cultivate.repository import (
     _enforcement_enabled,
     repo_checkout,
@@ -575,17 +576,19 @@ def _remediation_runtime(monkeypatch: pytest.MonkeyPatch, client: _RemediationFo
     return old_scope, context, SimpleNamespace(context=context)
 
 
-def test_core_only_head_advance_cannot_remint_without_owner_push_reader(monkeypatch):
-    from mimir.plugins.core import core_policy_registry, policy_scope
-    from mimir.tools import forge as core_forge
+def test_core_only_head_advance_cannot_dispatch_without_owner(monkeypatch):
+    from mimir.plugins.core import core_policy_registry
 
     client = _RemediationForge(_snapshot("c" * 40))
     old_scope, context, _runtime = _remediation_runtime(monkeypatch, client)
-    monkeypatch.setattr(core_forge, "_default_client", client)
-    with policy_scope(core_policy_registry()):
-        state, stopped = core_forge.remediation_checkout_preflight(context, "owner/repo", 7)
-    assert stopped is None
-    assert state.action_scope is old_scope
+    decision = ToolRegistry().authorize_tool(
+        "repo_checkout", context, enforce=True,
+        arguments={"repository": "owner/repo", "pull_request": 7},
+        policy=core_policy_registry(),
+    )
+    assert not decision.allowed
+    assert decision.reason == "repository_tool_unavailable"
+    assert old_scope.observed_head_sha == "a" * 40
     assert client.review_calls == 0
     assert context.ifc_state.own_push_lineage() == {}
 
@@ -802,7 +805,7 @@ def test_external_head_advance_rereads_review_state_before_checkout(
 ])
 @pytest.mark.parametrize("failed", [False, True])
 def test_repo_source_label_is_exact_and_survives_to_bound_forge_sink(
-    tool_name: str, failed: bool,
+    tool_name: str, failed: bool, selected_repo_policy,
 ) -> None:
     scope = _scope(RepoPRAction.INSPECT, RepoPRAction.PR_COMMENT)
     auth = _auth(scope)
@@ -818,7 +821,7 @@ def test_repo_source_label_is_exact_and_survives_to_bound_forge_sink(
     added = classify_protected_result(tool_name, {}, auth, authorization, failed=failed)
     assert added is not None
     source = next(source for source in added.sources if source.domain == "repository")
-    assert source.resource_id == f"owner/repo#pull/7@{'a' * 40}"
+    assert source.resource_id == f"<unresolved-resource:protected_tool:{tool_name}>"
     assert source.integrity == "untrusted"
     assert source.integrity_effect == "active_ingest"
     assert added.has_untrusted_active_ingest
@@ -832,7 +835,9 @@ def test_repo_source_label_is_exact_and_survives_to_bound_forge_sink(
         "pr_comment", target, merged, auth, enforce=True,
         repo_pr_action_scope=scope,
     )
-    assert allowed.allowed is True
+    assert not allowed.allowed
+    assert allowed.reason == "ifc_label_blocked:forge"
+    assert allowed.forge_scope_mismatch["component"] == "resource_id"
 
 
 @pytest.mark.parametrize("tool_name", [
@@ -910,7 +915,7 @@ def test_selected_repo_status_raw_lease_evidence_is_exact_but_host_result_is_inc
     ).allowed
 
 
-def test_mixed_repo_input_denies_bound_forge_sink() -> None:
+def test_mixed_repo_input_denies_bound_forge_sink(selected_repo_policy) -> None:
     scope = _scope(RepoPRAction.PR_COMMENT)
     auth = _auth(scope)
     labels = auth.ifc_labels
@@ -933,7 +938,7 @@ def test_mixed_repo_input_denies_bound_forge_sink() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pr_scope_policy_shadows_then_enforces_with_the_same_reason(
+async def test_core_only_pr_scope_policy_refuses_in_both_modes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scope = _scope(RepoPRAction.PR_COMMENT)
@@ -960,14 +965,12 @@ async def test_pr_scope_policy_shadows_then_enforces_with_the_same_reason(
         arguments=arguments,
     )
 
-    assert shadow.allowed is True
+    assert not shadow.allowed
     assert shadow.would_block is True
     assert enforced.allowed is False
-    assert shadow.reason == enforced.reason == "repo_pr_scope_denied"
+    assert shadow.reason == enforced.reason == "forge_tool_unavailable"
     events = [fields for kind, fields in captured if kind == "shadow_tool_decision"]
-    assert len(events) == 1
-    assert events[0]["reason"] == enforced.reason
-    assert events[0]["would_block"] is True
+    assert not events
 
 
 @pytest.mark.asyncio
