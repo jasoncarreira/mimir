@@ -616,7 +616,13 @@ def remediation_checkout_preflight(
         return original, None
     fresh = RepoReviewState(fresh_scope)
 
-    from ..repo_tools import was_agent_push
+    from ..plugins.core import selected_policy_registry
+
+    hooks = selected_policy_registry().policy_consumer_hooks
+    if hooks is not None:
+        was_agent_push = hooks.agent_push
+    else:
+        from ..repo_tools import was_agent_push
 
     if not was_agent_push(
         repository, pull_request, scope.observed_head_sha, snapshot.head_sha,
@@ -642,7 +648,13 @@ def remediation_checkout_preflight(
 def _seed_verified_remint(
     context: AuthContext | None, old: RepoPRActionScope, new: RepoPRActionScope,
 ) -> None:
-    from ..repo_tools import was_verified_push
+    from ..plugins.core import selected_policy_registry
+
+    hooks = selected_policy_registry().policy_consumer_hooks
+    if hooks is not None:
+        was_verified_push = hooks.verified_push
+    else:
+        from ..repo_tools import was_verified_push
 
     if (
         context is not None
@@ -1030,7 +1042,13 @@ def _pr_attestation(
         # trust; accepting a new head requires per-turn lineage recording.
         if runtime is None:
             return ("<head-mismatch>",), scope.observed_head_sha
-        from ..repo_tools import was_verified_push
+        from ..plugins.core import selected_policy_registry
+
+        hooks = selected_policy_registry().policy_consumer_hooks
+        if hooks is not None:
+            was_verified_push = hooks.verified_push
+        else:
+            from ..repo_tools import was_verified_push
 
         if not was_verified_push(
             scope.canonical_repo, scope.pr_number, scope.observed_head_sha, metadata.head_sha,
@@ -1398,7 +1416,13 @@ def _attest_ci_runs(runtime: ToolRuntime[AuthContext] | None, repository: str,
 
 
 def _trusted_ci_head(context: AuthContext, repository: str, run: dict[str, Any]) -> bool:
-    from ..repo_tools import _PROTECTED_BRANCH_REFS
+    from ..plugins.core import selected_policy_registry
+
+    hooks = selected_policy_registry().policy_consumer_hooks
+    if hooks is not None:
+        _PROTECTED_BRANCH_REFS = hooks.protected_refs
+    else:
+        from ..repo_tools import _PROTECTED_BRANCH_REFS
 
     if not isinstance(run, dict):
         return False

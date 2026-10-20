@@ -72,6 +72,25 @@ from mimir.tools.repo import repo_status, repo_test
 from mimir.tools.budget_gate import BudgetGateMiddleware
 
 
+def test_core_forge_ci_head_uses_selected_owner_protected_refs(monkeypatch):
+    from mimir.plugins.core import core_policy_registry, policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir.tools import forge as core_forge
+
+    context = _runtime(_scope(RepoPRAction.INSPECT)).context
+    run = {"head_repository": "owner/repo", "head_branch": "owner-branch", "head_sha": "c" * 40}
+    with policy_scope(core_policy_registry()):
+        assert not core_forge._trusted_ci_head(context, "owner/repo", run)
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks,
+        protected_refs=frozenset({"refs/heads/owner-branch"}),
+    ))
+    with policy_scope(selected):
+        assert core_forge._trusted_ci_head(context, "owner/repo", run)
+        assert not core_forge._trusted_ci_head(context, "other/repo", run)
+
+
 @pytest.mark.asyncio
 async def test_selected_forge_read_requires_server_observed_live_lease(tmp_path, monkeypatch):
     from mimir.access_control import (
