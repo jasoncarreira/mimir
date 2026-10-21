@@ -1056,6 +1056,7 @@ def _repo_binding_refusal_reason(repo: str, match_count: int) -> str:
 
 def _repo_pr_scope_resolution(
     *,
+    policy: Any = None,
     provenance: str,
     repo: object,
     principal: object,
@@ -1168,7 +1169,7 @@ def _repo_pr_scope_resolution(
         )
     from .models import RepoPRActionScope
 
-    policy = selected_policy_registry()
+    policy = policy if policy is not None else selected_policy_registry()
     constructors = next(
         (protocol.trusted_scope for protocol in policy.scoped_actions.values()
          if protocol.trusted_scope is not None), None,
@@ -1363,6 +1364,7 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
                 )
                 continue
         scope = _repo_pr_scope(
+            policy=policy,
             provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
             repo=item.get("repo"),
             principal=(item.get("pr_author") if item.get("event_type") == "pr_synchronize"

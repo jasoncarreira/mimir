@@ -1089,7 +1089,7 @@ class AgentEvent:
     service_authority: Any = None
     # Optional server-discovered heartbeat authority. Poller scopes are always
     # rebuilt from their trusted payload items and never accepted here.
-    repo_pr_action_scope: "RepoPRActionScope | None" = None
+    repo_pr_action_scope: Any = None
     # Server-carried IFC state for continuations/resumed events. This must be
     # propagated from a trusted TurnContext; generic ingress must not accept a
     # client assertion as a declassification or authority signal.
@@ -1725,9 +1725,7 @@ class AuthContext(_AuthContextAuthoritySlot):
     ci_branch_targets: frozenset[tuple[str, str, int | None]] = frozenset()
     # Standing review authority is resolved lazily from a live server fetch.
     # This cache is per turn and stores only immutable server-issued scopes.
-    server_discovered_pr_states: ServerDiscoveredPRStates = field(
-        default_factory=ServerDiscoveredPRStates, repr=False, compare=False,
-    )
+    server_discovered_pr_states: Any = field(default=None, repr=False, compare=False)
     # Agent-owned server provenance retained across turns. It contains only
     # immutable scopes, never mutable checkout state, and is not model input.
     server_discovered_pr_scope_store: ServerDiscoveredPRScopeStore | None = field(
@@ -1793,6 +1791,11 @@ class AuthContext(_AuthContextAuthoritySlot):
         object.__setattr__(self, "_audience_provider", audience_provider)
         policy = self._plugin_slot_policy
         if policy is not None and policy.frozen:
+            if object.__getattribute__(self, "server_discovered_pr_states") is None:
+                for protocol in policy.scoped_actions.values():
+                    constructors = getattr(protocol, "trusted_scope", None)
+                    if constructors is not None:
+                        object.__setattr__(self, "server_discovered_pr_states", constructors.discovered())
             slots = dict(self.plugin_slots)
             for owner, slot_type in policy.state_slots.items():
                 if owner not in policy.scoped_actions:
