@@ -485,19 +485,19 @@ def _opencode_install_block() -> str:
     """Dockerfile block installing OpenCode runtime when enabled.
 
     Installs the pinned OpenCode runtime (opencode-ai + plugins) when
-    MIMIR_CODING_ENABLED is true. The plugins provide feature-factory and
+    MIMIR_ENABLE_OPENCODE is set. The plugins provide feature-factory and
     project-memory functionality for Worklink backends.
     """
     return (
-        "# OpenCode runtime - single build/runtime opt-in: MIMIR_CODING_ENABLED.\n"
+        "# OpenCode runtime - optional build dependency, not plugin activation.\n"
         f"# Pins: opencode-ai@{OPENCODE_VERSION}, feature-factory@{FACTORY_VERSION},\n"
         f"# opencode-feature-factory@{FACTORY_VERSION},\n"
         "# opencode-project-memory@0.1.0, opencode-openai-codex-auth@4.4.0,\n"
         "# opencode-anthropic-auth@0.0.13.\n"
         "ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js\n"
         "ENV PATH=\"/opt/mimir-opencode/bin:${PATH}\"\n"
-        "ARG MIMIR_CODING_ENABLED=false\n"
-        "RUN if python3 -c 'import os, sys; sys.exit(os.environ.get(\"MIMIR_CODING_ENABLED\", \"\").strip().lower() not in {\"1\", \"true\", \"yes\", \"on\", \"y\"})'; then \\\n"
+        "ARG MIMIR_ENABLE_OPENCODE=0\n"
+        "RUN if python3 -c 'import os, sys; sys.exit(os.environ.get(\"MIMIR_ENABLE_OPENCODE\", \"\").strip().lower() not in {\"1\", \"true\", \"yes\", \"on\", \"y\"})'; then \\\n"
         "        npm install --global --prefix /opt/mimir-opencode \\\n"
         f"            opencode-ai@{OPENCODE_VERSION} \\\n"
         f"            feature-factory@{FACTORY_VERSION} \\\n"
@@ -529,7 +529,7 @@ def render_dockerfile(
     ``UV_EXTRAS`` there).
 
     ``install_opencode`` retains the existing config-baking option. The
-    install step is always emitted and gated by ``MIMIR_CODING_ENABLED``
+    install step is always emitted and gated by ``MIMIR_ENABLE_OPENCODE``
     at build time, so no scaffold-time opt-in is required.
     """
     if mode == "pypi":
@@ -680,8 +680,8 @@ services:
         # Install the Claude Code model adapter. Its CLI is operator-provided.
         MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}
         # Install the pinned OpenCode runtime + plugins. start.sh merges
-        # their config into OpenCode's XDG path when the same flag is set.
-        MIMIR_CODING_ENABLED: "${MIMIR_CODING_ENABLED:-false}"
+        # their config into OpenCode's XDG path when Cultivate is selected.
+        MIMIR_ENABLE_OPENCODE: "${MIMIR_ENABLE_OPENCODE:-0}"
     container_name: {SERVICE_NAME}
     restart: unless-stopped
     # Stop grace > MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS (5s) +
@@ -690,11 +690,10 @@ services:
     env_file:
       - compose.env
     environment:
-      # These use the same interpolation as build.args so build-time and
-      # runtime switches cannot disagree. Set them in .env or the shell;
+      # Build switches live in .env or the shell;
       # Compose interpolation does not read env_file.
       MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}
-      MIMIR_CODING_ENABLED: "${MIMIR_CODING_ENABLED:-false}"
+      MIMIR_PLUGINS: "${MIMIR_PLUGINS:-}"
       MIMIR_HOME: /mimir-home
       MIMIR_WEB_PORT: 8080
       # Inside-container bind. Must be 0.0.0.0 so Docker's port-forward
@@ -751,8 +750,8 @@ services:
         # Install the Claude Code model adapter. Its CLI is operator-provided.
         MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}
         # Install the pinned OpenCode runtime + plugins. start.sh merges
-        # their config into OpenCode's XDG path when the same flag is set.
-        MIMIR_CODING_ENABLED: "${MIMIR_CODING_ENABLED:-false}"
+        # their config into OpenCode's XDG path when Cultivate is selected.
+        MIMIR_ENABLE_OPENCODE: "${MIMIR_ENABLE_OPENCODE:-0}"
     container_name: {SERVICE_NAME}
     restart: unless-stopped
     # Stop grace > MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS (5s) +
@@ -761,11 +760,10 @@ services:
     env_file:
       - compose.env
     environment:
-      # These use the same interpolation as build.args so build-time and
-      # runtime switches cannot disagree. Set them in .env or the shell;
+      # Build switches live in .env or the shell;
       # Compose interpolation does not read env_file.
       MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}
-      MIMIR_CODING_ENABLED: "${MIMIR_CODING_ENABLED:-false}"
+      MIMIR_PLUGINS: "${MIMIR_PLUGINS:-}"
       MIMIR_HOME: /mimir-home
       MIMIR_WEB_PORT: 8080
       # Inside-container bind. Must be 0.0.0.0 so Docker's port-forward
@@ -910,7 +908,7 @@ echo "[start.sh] mimir setup (idempotent)"
 uv run mimir setup --home "${MIMIR_HOME}" || {
     echo "[start.sh] WARNING: mimir setup non-zero — home may be partial" >&2
 }
-if python3 -c 'import os, sys; sys.exit(os.environ.get("MIMIR_CODING_ENABLED", "").strip().lower() not in {"1", "true", "yes", "on", "y"})'; then
+if python3 -c 'import os, sys; sys.exit(not any(part.strip() in {"cultivate", "all"} for part in os.environ.get("MIMIR_PLUGINS", "").split(",")))'; then
     echo "[start.sh] merging OpenCode plugin config into the XDG config path"
     uv run mimir opencode-bootstrap --home "$HOME"
 fi
@@ -965,7 +963,7 @@ echo "[start.sh] mimir setup (idempotent)"
 mimir setup --home "${MIMIR_HOME}" || {
     echo "[start.sh] WARNING: mimir setup non-zero — home may be partial" >&2
 }
-if python3 -c 'import os, sys; sys.exit(os.environ.get("MIMIR_CODING_ENABLED", "").strip().lower() not in {"1", "true", "yes", "on", "y"})'; then
+if python3 -c 'import os, sys; sys.exit(not any(part.strip() in {"cultivate", "all"} for part in os.environ.get("MIMIR_PLUGINS", "").split(",")))'; then
     echo "[start.sh] merging OpenCode plugin config into the XDG config path"
     mimir opencode-bootstrap --home "$HOME"
 fi
@@ -1065,9 +1063,10 @@ _COMPOSE_ENV_HEADER = """\
 # values for the keys below. Re-running scaffold-docker preserves your
 # values; new keys (added by newly-installed pollers) get appended as
 # commented placeholders.
-# Build toggles MIMIR_ENABLE_CLAUDE_CODE and MIMIR_CODING_ENABLED belong
+# Build toggles MIMIR_ENABLE_CLAUDE_CODE and MIMIR_ENABLE_OPENCODE belong
 # in project .env (or the shell), because Compose interpolation does not
-# read env_file. compose.yml passes that one value to build and runtime.
+# read env_file. compose.yml passes the build args separately from runtime
+# MIMIR_PLUGINS selection.
 #
 # NEVER commit this file to a public repo. .gitignore should exclude
 # compose.env at the repo root.
@@ -1501,8 +1500,6 @@ def scaffold(
         service_name=service_name, web_port=web_port, mode=mode,
     )
     if trusted_cultivate:
-        cy_text = cy_text.replace("MIMIR_CODING_ENABLED", "MIMIR_ENABLE_OPENCODE").replace(
-            "${MIMIR_ENABLE_OPENCODE:-false}", "${MIMIR_ENABLE_OPENCODE:-0}")
         cy_text = cy_text.replace(
             "        MIMIR_ENABLE_OPENCODE:",
             "        MIMIR_GIT_REF: ${MIMIR_GIT_REF:?set an immutable source ref}\n"
@@ -1520,8 +1517,6 @@ def scaffold(
     ss_text = render_start_sh(uv_extras=uv_extras, mode=mode,
                               plugin_pins=pinned_packages(plugins),
                               plugin_services=bool(selected_services))
-    if trusted_cultivate:
-        ss_text = ss_text.replace("MIMIR_CODING_ENABLED", "MIMIR_ENABLE_OPENCODE")
     _write_if_changed(ss_path, ss_text, "start.sh")
     if ss_path.is_file():
         ss_path.chmod(0o755)
@@ -1612,8 +1607,8 @@ def add_argparse(parser) -> None:
         help=(
             "Bake the home OpenCode config into the image (optional). "
             "Use --no-opencode to omit that copy; omission preserves an existing "
-            "scaffold. Runtime installation and bootstrap use only "
-            "MIMIR_CODING_ENABLED in project .env, regardless of this option."
+            "scaffold. Installation uses MIMIR_ENABLE_OPENCODE at build time; "
+            "bootstrap runs when Cultivate is selected in MIMIR_PLUGINS."
         ),
     )
     parser.add_argument(

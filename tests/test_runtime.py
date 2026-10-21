@@ -2229,6 +2229,7 @@ home = Path(tempfile.mkdtemp())
 os.environ[\"MIMIR_HOME\"] = str(home)
 os.environ[\"MIMIR_MODEL_SPEC\"] = \"anthropic:test\"
 os.environ.pop(\"MIMIR_PLUGINS\", None)
+os.environ[\"MIMIR_CODING_ENABLED\"] = \"true\"
 
 from mimir import runtime
 from mimir.channel_registry import ChannelRegistry
@@ -2240,6 +2241,8 @@ from mimir.scheduler import Scheduler
 assert \"mimir.server\" not in sys.modules
 _config_io.reload_config()
 config = Config.from_env()
+assert not config.coding_enabled
+assert not any(name == \"mimir_cultivate\" or name.startswith(\"mimir_cultivate.\") for name in sys.modules)
 core = runtime.create_core_services(config)
 dispatcher = Dispatcher(config, resolver=core.identity_resolver)
 scheduler = Scheduler(
@@ -2263,6 +2266,7 @@ async def main():
     )
     assert \"mimir.server\" not in sys.modules
     await bundle.aclose()
+    assert not any(name == \"mimir_cultivate\" or name.startswith(\"mimir_cultivate.\") for name in sys.modules)
 
 asyncio.run(main())
 """

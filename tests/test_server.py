@@ -1804,7 +1804,9 @@ async def test_startup_logs_effective_lease_read_scope(tmp_path, monkeypatch, en
     home.mkdir()
     root = tmp_path / "leases"
     root.mkdir()
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1" if enabled else "0")
+    if enabled:
+        pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if enabled else "")
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
     app, control = _controlled_server_app(home, monkeypatch)

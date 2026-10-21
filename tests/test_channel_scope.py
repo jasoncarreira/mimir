@@ -215,6 +215,7 @@ async def test_protected_file_wired_through_both_live_bridge_handlers(
     protected_file, monkeypatch,
 ):
     from mimir import server
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     policy, home = protected_file
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("DISCORD_TOKEN", "test")
@@ -301,6 +302,7 @@ def test_bad_file_refuses_both_bridges_and_logs_content_free(
     monkeypatch.setenv("SLACK_APP_TOKEN", "test")
     monkeypatch.setenv("MIMIR_HOME", str(home))
     events = []
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     monkeypatch.setattr("mimir.event_logger.log_event_sync",
                         lambda kind, **fields: events.append((kind, fields)))
     app = server.build_app(Config.from_env())

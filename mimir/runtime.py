@@ -260,13 +260,12 @@ async def create_agent_runtime(
             nonlocal degradation_recorded, degradation_alert_scheduled
             nonlocal transient_failures, next_identity_retry_at
             from .event_logger import log_event, log_event_sync
-            from mimir_cultivate.forge import GitHubIdentityFailureKind
 
             declared_login = getattr(exc, "declared_login", "")
             authenticated_login = getattr(exc, "authenticated_login", "")
             transient = (
                 getattr(exc, "failure_kind", None)
-                == GitHubIdentityFailureKind.TRANSIENT
+                == "transient"
             )
             if transient:
                 transient_failures += 1
@@ -341,7 +340,9 @@ async def create_agent_runtime(
             else:
                 runtime_loop.call_soon_threadsafe(schedule_alert)
 
-        coding_enabled = getattr(config, "coding_enabled", False)
+        coding_enabled = any(
+            plugin.candidate.name == "cultivate" for plugin in manager.plugins
+        ) if manager is not None else False
         identity_hooks = {
             name: hook for (owner, name), hook in manager.policy.server_hooks.items()
             if owner != "core" and name.startswith("github_identity_")

@@ -337,7 +337,7 @@ async def test_default_gate_bounds_checkout_environment(tmp_path, monkeypatch, b
     from mimir.worklink.checkout import coding_enabled
     from mimir.worklink.orchestrator import _runner_for_home
 
-    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     assert not coding_enabled()
     credentials = (
         "ANTHROPIC_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "SLACK_BOT_TOKEN",
@@ -494,7 +494,7 @@ def test_candidate(request):
 def test_passes():
     pass
 ''')
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "false")
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     command = f"{shlex.quote(sys.executable)} -m pytest -q -n 2"
     result = await observe_evidence(
         issue=1692, attempt=1, backend="codex", branch="issue/1692-a1",
@@ -697,7 +697,8 @@ async def test_worker_timeout_with_complete_reports_fails_closed(tmp_path, monke
         assert not isinstance(command, str), "gate must use worker compute"
         return subprocess.CompletedProcess(command, 0, "test_sample.py\n" if "--name-only" in command else "", "")
 
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     result = await observe_evidence(
         issue=1696, attempt=1, backend="opencode", branch="branch",
         checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
@@ -1070,7 +1071,8 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
         local_argv=("opencode",),
     )
     compute = Compute()
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
 
     class Publication:
         def run(self, *args, check=False):
@@ -1130,7 +1132,8 @@ async def test_gate_diagnostic_deadline_isolation(monkeypatch, tmp_path, blocked
     from mimir.contained_execution import CollectedExecutionResult
     from mimir.worklink import compute as cp
 
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     entered = asyncio.Event()
     release = asyncio.Event()
     specs = {}
@@ -1285,7 +1288,8 @@ async def test_compute_gate_budget_selection(tmp_path, budget, diagnostic):
 async def test_enabled_opencode_evidence_uses_controller_git_without_fd_publication(
     monkeypatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     calls: list[object] = []
 
     def runner(args, **_kwargs):

@@ -2474,7 +2474,7 @@ def all_mimir_tools(
     surface before the agent is constructed. Runtime callers may omit it and
     use ``MIMIR_MODEL_SPEC`` as before.
 
-    ``coding_enabled`` is the operator's explicit opt-in to the coding-assistant
+    ``coding_enabled`` reflects the installed, selected coding provider's
     surface. Runtime assembly validates all local coding prerequisites before
     identity degradation can hide registration. Declarative inventory
     checks may pass ``require_coding_available=False`` to enumerate the enabled
@@ -2539,7 +2539,7 @@ def all_mimir_tools(
                     )
             if missing:
                 raise RuntimeError(
-                    "MIMIR_CODING_ENABLED is true, but coding prerequisites are missing:\n- "
+                    "selected coding plugin prerequisites are missing:\n- "
                     + "\n- ".join(missing)
                 )
         ready = True

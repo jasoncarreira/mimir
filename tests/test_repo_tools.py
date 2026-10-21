@@ -1933,7 +1933,8 @@ def test_heartbeat_live_scope_executes_git_remediation(tmp_path, monkeypatch, op
         head_sha=previous.observed_head_sha, base_ref="main",
         base_sha=_git(source, "rev-parse", "HEAD"),
     )
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
     monkeypatch.setattr(access, "_configured_scope_github_repos", lambda: frozenset({"owner/repo"}))
     monkeypatch.setattr(access, "_canonical_repo_binding_resolution", lambda repo: access.RepoBindingResolution(

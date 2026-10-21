@@ -1,15 +1,10 @@
-"""Canonical deployment switch for coding capabilities."""
+"""Coding availability from installed, process-selected plugin metadata."""
 
 from __future__ import annotations
 
-import logging
-
-from .env import env_bool
-
-
-log = logging.getLogger(__name__)
+from .plugins.discovery import enabled_plugins
 
 
 def coding_enabled() -> bool:
-    """Return the operator-configured coding capability state."""
-    return env_bool("MIMIR_CODING_ENABLED", False, logger=log)
+    """Check selection without importing a disabled provider."""
+    return any(candidate.name == "cultivate" for candidate in enabled_plugins())

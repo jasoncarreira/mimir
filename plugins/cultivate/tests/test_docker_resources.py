@@ -99,7 +99,9 @@ def test_selected_scaffold_writes_worker_resources(tmp_path: Path, monkeypatch, 
     assert "RUN sh /opt/cultivate-docker/service.sh" in dockerfile
     assert 'ENTRYPOINT ["/init"]' in dockerfile
     assert "MIMIR_ENABLE_OPENCODE" in (tmp_path / "compose.yml").read_text()
-    assert "MIMIR_ENABLE_OPENCODE" in (tmp_path / "start.sh").read_text()
+    start = (tmp_path / "start.sh").read_text()
+    assert 'os.environ.get("MIMIR_PLUGINS", "")' in start
+    assert "MIMIR_CODING_ENABLED" not in start
 
 
 @pytest.mark.parametrize("mode", ["root", "pypi"])

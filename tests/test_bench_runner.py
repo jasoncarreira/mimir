@@ -74,6 +74,7 @@ def test_suppress_production_bridges_in_env_blocks_live_bridge_registration(
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-fake-bot-token")
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-fake-app-token")
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
 
     # Step 2: invoke the bench-runner's env-clear helper. This is the

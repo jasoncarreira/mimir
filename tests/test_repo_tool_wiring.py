@@ -48,7 +48,10 @@ from mimir_cultivate.repository import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_forge_client() -> None:
+def _reset_forge_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These checks exercise explicit provider tools and scoped policy without
+    # selecting the independent heartbeat coding runtime for the whole process.
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     set_forge_client(None)
     yield
     set_forge_client(None)
