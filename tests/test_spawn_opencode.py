@@ -17,10 +17,9 @@ import pytest
 from mimir.contained_execution import CollectedExecutionResult
 from mimir_cultivate import contained_execution as provider_contained_execution
 from mimir_cultivate import opencode as provider_opencode
-from mimir_cultivate.worklink.worker_client import WorkerProjection
+from mimir_cultivate.opencode import _spawn_open_code_impl
 from mimir.tools.registry import (
     _SPAWN_DEPTH_ENV,
-    _spawn_open_code_impl,
     _spawn_reset_for_tests,
     set_spawn_config,
 )
@@ -108,9 +107,6 @@ async def invoke(seed: Path, tmp_path: Path, record: dict, **kwargs):
         kwargs.pop("artifact_root", None),
         contained_runner=kwargs.pop("runner", runner_for(record)),
         checkout_factory=kwargs.pop("factory", factory_for(tmp_path, record)),
-        opencode_backend=provider_opencode,
-        contained_backend=provider_contained_execution,
-        worker_projection=WorkerProjection,
     ))
 
 

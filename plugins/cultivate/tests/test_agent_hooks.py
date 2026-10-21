@@ -10,7 +10,7 @@ from mimir.agent import _selected_turn_hooks, _turn_tool_surface_ready, _unready
 from mimir.models import AgentEvent
 from mimir.plugins.manager import load_plugins
 from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry
-from mimir_cultivate import forge
+from mimir_cultivate import forge, opencode
 
 
 def test_selected_provider_registers_owner_bound_turn_callbacks(monkeypatch) -> None:
@@ -22,7 +22,16 @@ def test_selected_provider_registers_owner_bound_turn_callbacks(monkeypatch) -> 
         ("cultivate", "failure_intervention"),
         ("cultivate", "budget_continuation"),
         ("cultivate", "feedback"),
+        ("cultivate", "startup_prerequisites"),
     }
+    prerequisite = registry.turn_hooks["cultivate", "startup_prerequisites"]
+    assert prerequisite is opencode.startup_prerequisites
+    with monkeypatch.context() as probe:
+        probe.setattr(opencode, "opencode_available", lambda: False)
+        assert prerequisite() == ("the opencode CLI is not installed or is not on PATH",)
+    with monkeypatch.context() as probe:
+        probe.setattr(opencode, "opencode_available", lambda: True)
+        assert prerequisite() == ()
     selected_policy = registry
     config = SimpleNamespace(plugin_manager=SimpleNamespace(policy=selected_policy), coding_enabled=False)
     monkeypatch.setattr(forge, "_github_identity_degraded", False)

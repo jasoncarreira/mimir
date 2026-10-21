@@ -80,6 +80,24 @@ assert 'mimir.opencode_proposal' not in sys.modules
     assert result.returncode == 0, result.stderr
 
 
+def test_core_spawn_inventory_does_not_import_disabled_provider() -> None:
+    script = """
+import sys
+from mimir.tools.registry import all_mimir_tools
+all_mimir_tools(model_spec='openai:test')
+assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.')
+               for name in sys.modules)
+assert 'mimir.opencode_proposal' not in sys.modules
+assert 'mimir.contained_checkout' not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "MIMIR_PLUGINS": ""},
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_core_shell_does_not_import_provider_or_grant_forge_credentials() -> None:
     script = """
 import os, subprocess, sys

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 import hashlib
@@ -11,8 +12,9 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import shlex
+import stat
 import subprocess
-import sys
 import uuid
 from typing import Any
 
@@ -20,9 +22,22 @@ from langchain_core.tools import tool
 
 from mimir.access_control import _MAINTENANCE_GIT_BASE_OVERRIDES, _maintenance_git_filter_overrides
 from mimir.model_registry import DEFAULT_MODEL_SPEC
+from mimir.contained_snapshot import (
+    SnapshotCredentialsRefused, SnapshotEmbeddedRepository, SnapshotSourceChanged,
+    SnapshotUnsafeEntry,
+)
+from mimir import event_logger
+from mimir.tools.registry import (
+    _STATE, _spawn_acquire_rate_slot, _spawn_current_depth, _spawn_guard_init,
+    _spawn_release_rate_slot,
+)
+
+from . import contained_execution
+from .worklink.worker_client import WorkerProjection
 
 
 _REDACTION = b"<redacted>"
+log = logging.getLogger(__name__)
 
 
 def opencode_available() -> bool:
@@ -857,6 +872,341 @@ def cleanup_failure_event(run_id: str) -> dict[str, str]:
     return {"type": "spawn_open_code_cleanup_failed", "run_id": run_id, "reason_code": "cleanup_failed"}
 
 
+def _confined_artifact_base(artifact_root: str, home: str | Path) -> Path:
+    base = Path(artifact_root).expanduser().resolve()
+    home_resolved = Path(home).expanduser().resolve()
+    if base != home_resolved and not base.is_relative_to(home_resolved):
+        raise ValueError(
+            "artifact_root must be within the agent home "
+            f"({home_resolved}); got {base}"
+        )
+    return base
+
+
+async def _spawn_open_code_impl(
+    prompt: str,
+    cwd: str | None = None,
+    timeout_s: int = 1800,
+    name: str | None = None,
+    model: str | None = None,
+    agent: str | None = None,
+    artifact_root: str | None = None,
+    *,
+    contained_runner: Any,
+    checkout_factory: Any,
+    execution_identifier: str | None = None,
+) -> str:
+    cfg = _STATE["spawn_config"]
+    if cfg is None:
+        return "spawn_open_code failed: no spawn config"
+    if not prompt or not prompt.strip():
+        return "spawn_open_code failed: prompt is required"
+
+    guard = _spawn_guard_init()
+    current_depth = _spawn_current_depth()
+    if current_depth >= guard.max_depth:
+        return (
+            "spawn_open_code refused: recursion depth cap reached "
+            f"({current_depth} >= MIMIR_SPAWN_MAX_DEPTH={guard.max_depth})."
+        )
+    rate_token, rate_err = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
+    if rate_err is not None:
+        return rate_err
+
+    run_id = f"opencode-{uuid.uuid4().hex[:12]}"
+    default_cwd = Path(cfg.get("default_cwd") or os.environ.get("HOME", "."))
+    seed = Path(cwd).expanduser() if cwd else default_cwd
+    home = Path(os.environ.get("HOME", str(default_cwd))).expanduser()
+    config_path = opencode_config_path(override=cfg.get("opencode_config_path"))
+    auth_path = opencode_auth_path()
+    scrubber = contained_execution.SensitiveMaterialScrubber(
+        home=home, checkout=seed, artifact_root=artifact_root,
+        source_paths=(config_path, auth_path),
+    )
+    selected_artifact_root = Path(
+        artifact_root or cfg.get("artifact_root") or (home / ".factory" / "runs")
+    ).expanduser()
+    artifact_directory_fd = -1
+    try:
+        artifact_base = _confined_artifact_base(str(selected_artifact_root), home)
+        artifact_base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        artifact_directory = resolve_artifact_handle(artifact_base, run_id)
+        artifact_directory.mkdir(mode=0o700, exist_ok=False)
+        for artifact_name in ("prompt.md", "stdout.txt", "stderr.txt", "manifest.json"):
+            artifact_path = artifact_directory / artifact_name
+            artifact_path.write_bytes(b"")
+            artifact_path.chmod(0o600)
+        artifact_directory_fd = os.open(
+            artifact_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except (OSError, RuntimeError, ValueError):
+        if artifact_directory_fd >= 0:
+            os.close(artifact_directory_fd)
+        terminal = classify_spawn_terminal_state(artifact_available=False)
+        await event_logger.safe_log_event(
+            terminal.event_type, run_id=run_id, status=terminal.status,
+            reason_code=terminal.reason_code,
+        )
+        await _spawn_release_rate_slot(guard, rate_token)
+        return json.dumps({
+            "run_id": run_id, "status": terminal.status,
+            "reason_code": terminal.reason_code, "exit_code": None,
+            "stdout": "", "result": "", "stderr": "Artifact storage unavailable",
+            "artifact_dir": None, "name": name, "proposal": None,
+        }, indent=2)
+
+    stdout = b""
+    stderr = b""
+    invocation = None
+    checkout = None
+    execution = None
+    terminal = None
+    seed_tree = None
+    try:
+        try:
+            invocation = resolve_opencode_invocation(model, config_path=cfg.get("opencode_config_path"))
+            documents = opencode_worker_documents(invocation)
+            scrubber = documents.scrubber
+            scrubber.add_path(seed)
+            scrubber.add_path(artifact_base)
+        except OpenCodeAuthError as exc:
+            terminal = classify_spawn_terminal_state(authentication_reason=exc.reason_code)
+        except OpenCodeConfigError as exc:
+            terminal = classify_spawn_terminal_state(configuration_reason=exc.reason_code)
+
+        if terminal is None and invocation is not None:
+            prompt_reason = prompt_contains_sensitive_source_path(
+                prompt, agent_home=home,
+                source_paths=(invocation.config_path, invocation.auth_path),
+            )
+            if prompt_reason is not None:
+                terminal = classify_spawn_terminal_state(prompt_reason=prompt_reason)
+        if terminal is None and invocation is not None and agent:
+            agent_reason = prompt_contains_sensitive_source_path(
+                agent, agent_home=home,
+                source_paths=(invocation.config_path, invocation.auth_path),
+            )
+            if agent_reason is not None:
+                terminal = classify_spawn_terminal_state(prompt_reason=agent_reason)
+
+        if terminal is None and invocation is not None:
+            try:
+                spawn_arguments = shlex.split(os.environ.get("MIMIR_OPENCODE_SPAWN_ARGS", ""))
+                argv = ["opencode", "run", "--dir", ".", *spawn_arguments]
+                argv += ["-m", invocation.model]
+                if agent:
+                    argv += ["--agent", agent]
+                argv += ["--", prompt]
+                selectors = {
+                    "MIMIR_SPAWN_DEPTH": str(current_depth + 1),
+                    "OPENCODE_MODEL": invocation.model,
+                    "OPENCODE_PROVIDER": invocation.provider,
+                }
+                if agent:
+                    selectors["OPENCODE_AGENT"] = agent
+                worker_env = contained_execution.opencode_worker_environment(
+                    contained_execution.base_worker_environment(run_id), selectors,
+                )
+            except ValueError:
+                terminal = classify_spawn_terminal_state(configuration_reason="config_provider_selection")
+
+        if terminal is None and invocation is not None:
+            sensitive_execution_value = any(
+                prompt_contains_sensitive_source_path(
+                    value, agent_home=home,
+                    source_paths=(invocation.config_path, invocation.auth_path),
+                ) is not None
+                for value in (*argv, *worker_env.values())
+            )
+            if sensitive_execution_value:
+                terminal = classify_spawn_terminal_state(configuration_reason="config_provider_selection")
+
+        if terminal is None and invocation is not None:
+            try:
+                checkout = checkout_factory(
+                    seed, default_cwd=default_cwd,
+                    known_sensitive=tuple(
+                        document for document in (
+                            documents.config_document, documents.auth_document,
+                        ) if document is not None
+                    ),
+                )
+                seed_tree = checkout.base_tree
+            except SnapshotCredentialsRefused:
+                terminal = classify_spawn_terminal_state(provisioning_reason="seed_credentials")
+            except SnapshotEmbeddedRepository:
+                terminal = classify_spawn_terminal_state(provisioning_reason="embedded_seed_repository")
+            except SnapshotUnsafeEntry:
+                terminal = classify_spawn_terminal_state(provisioning_reason="unsafe_seed_entry")
+            except SnapshotSourceChanged:
+                terminal = classify_spawn_terminal_state(provisioning_reason="seed_changed")
+            except ValueError:
+                terminal = classify_spawn_terminal_state(provisioning_reason="invalid_seed")
+            except (OSError, RuntimeError):
+                terminal = classify_spawn_terminal_state(provisioning_reason="provisioning_unavailable")
+
+        if terminal is None and invocation is not None and checkout is not None:
+            projections = [WorkerProjection(
+                path=".config/opencode/opencode.json",
+                document=documents.config_document,
+            )]
+            if documents.auth_document is not None:
+                projections.append(WorkerProjection(
+                    path=".local/share/opencode/auth.json",
+                    document=documents.auth_document,
+                ))
+            assert guard.sem is not None
+            try:
+                async with guard.sem:
+                    execution = await contained_runner(
+                        argv, checkout.capability, worker_env, tuple(projections),
+                        identifier=execution_identifier or run_id,
+                        timeout_s=timeout_s,
+                        stdout_limit=1024 * 1024,
+                        stderr_limit=1024 * 1024,
+                        scrubber=scrubber,
+                    )
+                stdout = execution.stdout
+                stderr = execution.stderr
+            except (OSError, RuntimeError, ValueError):
+                terminal = classify_spawn_terminal_state(containment_available=False)
+
+        if terminal is None and execution is not None and checkout is not None:
+            proposal_result = None
+            if execution.exit_code == 0 and not execution.timed_out and not execution.output_overflow:
+                proposal_result = build_opencode_proposal(
+                    checkout.path, scrubber=scrubber, base_tree=seed_tree,
+                )
+            auth_required = False
+            if execution.exit_code not in (None, 0):
+                blob = scrubber.scrub_text(stderr + b"\n" + stdout).lower()
+                auth_required = any(marker in blob for marker in (
+                    "unauthorized", "not logged in", "credential", "auth", "401",
+                ))
+            terminal = classify_spawn_terminal_state(
+                timed_out=execution.timed_out,
+                output_overflow=execution.output_overflow,
+                exit_code=execution.exit_code,
+                worker_authentication_required=auth_required,
+                proposal_result=proposal_result,
+            )
+    except BaseException:
+        os.close(artifact_directory_fd)
+        artifact_directory_fd = -1
+        if execution is None:
+            await _spawn_release_rate_slot(guard, rate_token)
+        raise
+    finally:
+        if checkout is not None:
+            try:
+                checkout.close()
+            except (OSError, RuntimeError):
+                event = cleanup_failure_event(run_id)
+                await event_logger.safe_log_event(
+                    event["type"], run_id=event["run_id"], reason_code=event["reason_code"],
+                )
+                log.warning("spawn_open_code cleanup failed")
+
+    assert terminal is not None
+    if execution is None:
+        await _spawn_release_rate_slot(guard, rate_token)
+    manifest = {
+        "schema_version": 2, "run_id": run_id, "launcher": "mimir.spawn_open_code",
+        "name": scrubber.scrub_text(name) if name is not None else None,
+        "model": scrubber.scrub_text(invocation.model) if invocation is not None else None,
+        "agent": scrubber.scrub_text(agent) if agent is not None else None,
+        "status": terminal.status, "reason_code": terminal.reason_code,
+        "exit_code": terminal.exit_code, "seed_tree": seed_tree,
+        "timed_out": bool(execution and execution.timed_out),
+        "output_overflow": bool(execution and execution.output_overflow),
+        "stdout_dropped_bytes": execution.stdout_dropped_bytes if execution else 0,
+        "stderr_dropped_bytes": execution.stderr_dropped_bytes if execution else 0,
+    }
+    artifact_handle = run_id
+    try:
+        directory_state = os.stat(artifact_directory, follow_symlinks=False)
+        anchored_state = os.fstat(artifact_directory_fd)
+        if not stat.S_ISDIR(directory_state.st_mode) or not os.path.samestat(directory_state, anchored_state):
+            raise OSError("artifact directory identity changed")
+
+        def write_existing_artifact(artifact_name: str, document: bytes) -> None:
+            descriptor = os.open(
+                artifact_name, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+                dir_fd=artifact_directory_fd,
+            )
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise OSError("artifact is not a regular file")
+                with os.fdopen(descriptor, "wb", closefd=False) as destination:
+                    destination.write(document)
+            finally:
+                os.close(descriptor)
+
+        write_existing_artifact("prompt.md", scrubber.scrub_text(prompt).encode("utf-8"))
+        write_existing_artifact("stdout.txt", scrubber.scrub_text(stdout).encode("utf-8"))
+        write_existing_artifact("stderr.txt", scrubber.scrub_text(stderr).encode("utf-8"))
+        scrubbed_manifest = json.loads(
+            scrubber.scrub_text(json.dumps(manifest, ensure_ascii=False))
+        )
+        write_existing_artifact(
+            "manifest.json",
+            (json.dumps(scrubbed_manifest, ensure_ascii=True, sort_keys=True) + "\n").encode("utf-8"),
+        )
+        if terminal.proposal is not None:
+            proposal_document = (
+                json.dumps(terminal.proposal.as_dict(), ensure_ascii=True, sort_keys=True) + "\n"
+            ).encode("utf-8")
+            proposal_descriptor = os.open(
+                ".proposal.json.tmp",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600, dir_fd=artifact_directory_fd,
+            )
+            try:
+                with os.fdopen(proposal_descriptor, "wb", closefd=False) as destination:
+                    destination.write(proposal_document)
+            finally:
+                os.close(proposal_descriptor)
+            os.replace(
+                ".proposal.json.tmp", "proposal.json",
+                src_dir_fd=artifact_directory_fd, dst_dir_fd=artifact_directory_fd,
+            )
+    except (OSError, RuntimeError, ValueError):
+        log.warning("spawn_open_code artifact write failed")
+        for failed_proposal_name in ("proposal.json", ".proposal.json.tmp"):
+            try:
+                os.unlink(failed_proposal_name, dir_fd=artifact_directory_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        terminal = classify_spawn_terminal_state(artifact_available=False)
+        artifact_handle = None
+    finally:
+        os.close(artifact_directory_fd)
+
+    await event_logger.safe_log_event(
+        terminal.event_type, run_id=run_id, status=terminal.status,
+        reason_code=terminal.reason_code,
+    )
+    safe_stdout = scrubber.scrub_text(stdout).strip()[:2000]
+    safe_stderr = scrubber.scrub_text(stderr).strip()[:500]
+    if terminal.status == "configuration_refused":
+        safe_stderr = "OpenCode configuration unavailable"
+    elif terminal.status == "authentication_refused":
+        safe_stderr = "OpenCode authentication unavailable"
+    elif terminal.status == "prompt_refused":
+        safe_stderr = "Prompt contains a sensitive controller path"
+    elif terminal.status == "containment_unavailable":
+        safe_stderr = "Contained execution unavailable"
+    return json.dumps({
+        "run_id": run_id, "status": terminal.status,
+        "reason_code": terminal.reason_code, "exit_code": terminal.exit_code,
+        "stdout": safe_stdout, "result": safe_stdout, "stderr": safe_stderr,
+        "artifact_dir": artifact_handle, "name": name,
+        "proposal": terminal.proposal.as_dict() if terminal.proposal else None,
+    }, indent=2)
+
+
 @tool
 async def spawn_open_code(
     prompt: str,
@@ -868,18 +1218,12 @@ async def spawn_open_code(
     artifact_root: str | None = None,
 ) -> str:
     """Run OpenCode in a fresh contained checkout and return a bounded proposal."""
-    from mimir.tools.registry import _spawn_open_code_impl
-
     from .contained_checkout import create_opencode_checkout
-    from . import contained_execution
-    from .worklink.worker_client import WorkerProjection
+    from .contained_execution import execute_contained
 
     return await _spawn_open_code_impl(
         prompt, cwd, timeout_s, name, model, agent, artifact_root,
-        contained_runner=contained_execution.execute_contained,
+        contained_runner=execute_contained,
         checkout_factory=create_opencode_checkout,
-        opencode_backend=sys.modules[__name__],
-        contained_backend=contained_execution,
-        worker_projection=WorkerProjection,
         execution_identifier=str(uuid.uuid4()),
     )
