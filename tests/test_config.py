@@ -469,24 +469,21 @@ class TestConfigFromEnv:
         assert cfg.chat_skill_allowlist == ("memory", "github", "review")
 
     def test_coding_capability_requires_selected_installed_plugin(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+        self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         self._base(monkeypatch)
         monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
         from mimir.config import Config
 
-        with caplog.at_level(logging.INFO, logger="mimir.config"):
-            assert Config.from_env().coding_enabled is False
-        assert "coding assistant capability: disabled" in caplog.text
+        assert not Config.from_env().plugin_manager.plugins
 
-        caplog.clear()
         monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
-        assert Config.from_env().coding_enabled is False
+        assert not Config.from_env().plugin_manager.plugins
         pytest.importorskip("mimir_cultivate")
         monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
-        with caplog.at_level(logging.INFO, logger="mimir.config"):
-            assert Config.from_env().coding_enabled is True
-        assert "coding assistant capability: enabled" in caplog.text
+        selected = Config.from_env().plugin_manager
+        assert {plugin.candidate.name for plugin in selected.plugins} == {"cultivate"}
+        assert selected.policy.policy_consumer_hooks is not None
 
     def test_opencode_config_uses_native_surface(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -496,7 +493,11 @@ class TestConfigFromEnv:
         monkeypatch.setenv("OPENCODE_CONFIG", str(path))
         from mimir.config import Config
 
-        assert Config.from_env().opencode_config_path == path
+        assert not hasattr(Config.from_env(), "opencode_config_path")
+        pytest.importorskip("mimir_cultivate")
+        from mimir_cultivate.opencode import opencode_config_path
+
+        assert opencode_config_path() == path
 
     def test_enforced_coding_config_does_not_require_opencode_on_path(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -520,7 +521,7 @@ class TestConfigFromEnv:
 
         config = Config.from_env()
         assert config.access_control_enforced is True
-        assert config.coding_enabled is True
+        assert config.plugin_manager.policy.policy_consumer_hooks is not None
 
     def test_startup_logs_effective_file_roots_with_origin(
         self,

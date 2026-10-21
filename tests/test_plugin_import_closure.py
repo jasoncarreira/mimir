@@ -20,6 +20,7 @@ from mimir.access_control import HTTP_EVENT_INGRESS_EXTRA_KEY
 FORBIDDEN = (
     "mimir.worklink", "mimir.forge", "mimir.tools.forge", "mimir.tools.repo",
     "mimir.pr_checkout_lease", "mimir.project_tests", "mimir.repo_tools",
+    "mimir.contained_execution", "mimir.opencode_config", "mimir.coding",
 )
 
 
@@ -96,16 +97,16 @@ def test_runtime_construction_coding_imports(tmp_path, coding_enabled: bool) -> 
             from mimir.plugins.manager import load_plugins
             enabled = sys.argv[2] == '1'
             config = SimpleNamespace(
-                home=home, coding_enabled=enabled,
+                home=home,
                 plugin_manager=None,
                 turns_log=home / 'logs' / 'turns.jsonl', max_turns_kept=100,
                 history_global_max=50, history_per_channel_max=25,
                 cross_platform_pull=True, saga_session_idle_minutes=10,
                 saga_session_max_turns=10,
                 commitments_log=home / '.mimir' / 'commitments.jsonl',
-                operator_alert_channel='', opencode_config_path=None,
+                operator_alert_channel='',
             )
-            if config.coding_enabled:
+            if enabled:
                 from mimir_cultivate import forge
                 initialized = []
                 identity_patch = patch.object(
@@ -133,15 +134,17 @@ def test_runtime_construction_coding_imports(tmp_path, coding_enabled: bool) -> 
                 loaded = sorted(name for name in sys.modules
                                 if any(name == prefix or name.startswith(prefix + '.')
                                        for prefix in forbidden))
-                if config.coding_enabled:
+                if enabled:
                     assert not loaded, loaded
                     assert initialized == [True]
                     assert forge._github_identity_degraded_callback is not None
                 else:
                     assert not loaded, loaded
+                    assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.')
+                                   for name in sys.modules)
             finally:
                 await bundle.aclose()
-                if config.coding_enabled:
+                if enabled:
                     identity_patch.stop()
 
         asyncio.run(main())

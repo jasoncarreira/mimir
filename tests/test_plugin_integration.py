@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
+import secrets
 from types import SimpleNamespace
 
 import pytest
@@ -18,14 +20,73 @@ from mimir.access_control import (
     observe_scoped_pr_checkout, consume_scoped_pr_checkout,
 )
 from mimir.models import (
-    AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState, RepoPRAction,
-    RepoPRActionScope, RepoPRScopeRegistry,
-    RepoReviewState, RetainedFactoryScope, SourceLabel,
+    AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel,
 )
 from mimir.plugins.core import ServicePrincipal, register_core_tools
 from mimir.plugins.registry import PolicyRegistrar, PolicyRegistry
 from mimir.tool_descriptors import ResultOriginKind, SinkCategory, get_tool_descriptor
 from mimir.tools.budget_gate import BudgetGateMiddleware, _authorize_tool_call
+
+
+class ExampleAction(StrEnum):
+    CHECKOUT = "repo.checkout"
+    INSPECT = "repo.inspect"
+    WRITE = "repo.write"
+    PR_COMMENT = "pr.comment"
+
+
+@dataclass(frozen=True)
+class ExampleScope:
+    provenance: str
+    canonical_repo: str
+    canonical_root: str
+    canonical_origin: str
+    principal: str
+    event_type: str
+    allowed_operations: frozenset[str]
+    pr_number: int
+    head_repo: str
+    head_remote: str
+    destination_ref: str
+    observed_head_sha: str
+    base_ref: str
+    observed_base_sha: str
+    owner: str = "example"
+    checkout_ref: str | None = None
+    pull_request_author: str | None = None
+    scope_id: str = field(default_factory=lambda: secrets.token_hex(16))
+
+
+@dataclass
+class ExampleReviewState:
+    action_scope: ExampleScope
+    checkout_lease: object | None = None
+
+    @property
+    def repo(self) -> str:
+        return self.action_scope.canonical_repo
+
+    @property
+    def pr_number(self) -> int:
+        return self.action_scope.pr_number
+
+    def attach_checkout_lease(self, lease: object) -> None:
+        if (getattr(lease, "scope_id", None) != self.action_scope.scope_id
+                or getattr(lease, "owner", None) != self.action_scope.principal
+                or not getattr(lease, "is_active", False)):
+            raise ValueError("checkout lease does not match review scope")
+        self.checkout_lease = lease
+
+
+@dataclass(frozen=True)
+class ExampleScopeRegistry:
+    review_states: tuple[ExampleReviewState, ...]
+
+    def resolve(self, repository: object, pull_request: object) -> ExampleReviewState | None:
+        if not isinstance(repository, str) or type(pull_request) is not int:
+            return None
+        return next((state for state in self.review_states
+                     if state.repo.lower() == repository.lower() and state.pr_number == pull_request), None)
 
 
 def _channel_target(_name, arguments, _context):
@@ -52,16 +113,16 @@ def policy():
     register_core_tools(registry)
     registrar = PolicyRegistrar(registry, "example")
     registrar.register_scoped_action(
-        RepoPRAction, lambda *_: True, checkout_action=RepoPRAction.CHECKOUT,
+        ExampleAction, lambda *_: True, checkout_action=ExampleAction.CHECKOUT,
         live_lease=lambda _scope, state: state.checkout_lease,
     )
     for name, scope, extractor, category, flow, action, writes in (
         ("example_channel", "channel", _channel_target, SinkCategory.SAME_CHANNEL, "sink", None, False),
-        ("example_checkout", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.CHECKOUT, False),
-        ("example_repo", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.INSPECT, False),
-        ("example_pr", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.PR_COMMENT, False),
-        ("example_write", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.WRITE, True),
-        ("example_review", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.INSPECT, False),
+        ("example_checkout", "repo_pr", _repo_target, SinkCategory.FORGE, "source", ExampleAction.CHECKOUT, False),
+        ("example_repo", "repo_pr", _repo_target, SinkCategory.FORGE, "source", ExampleAction.INSPECT, False),
+        ("example_pr", "repo_pr", _repo_target, SinkCategory.FORGE, "source", ExampleAction.PR_COMMENT, False),
+        ("example_write", "repo_pr", _repo_target, SinkCategory.FORGE, "source", ExampleAction.WRITE, True),
+        ("example_review", "repo_pr", _repo_target, SinkCategory.FORGE, "source", ExampleAction.INSPECT, False),
     ):
         registrar.register_tool(
             name=name,
@@ -95,11 +156,11 @@ def _auth(**updates):
 
 
 def _state(operations):
-    return RepoReviewState(RepoPRActionScope(
+    return ExampleReviewState(ExampleScope(
         provenance="poller_payload", canonical_repo="acme/widget",
         canonical_root="/tmp/checkout", canonical_origin="https://github.com/acme/widget.git",
         principal="mimir-bot", event_type="pr_changes_requested_stale",
-        allowed_operations=frozenset(operations) | {RepoPRAction.CHECKOUT.value}, pr_number=7,
+        allowed_operations=frozenset(operations) | {ExampleAction.CHECKOUT.value}, pr_number=7,
         head_repo="acme/widget", head_remote="origin", destination_ref="refs/heads/fix",
         observed_head_sha="a" * 40, base_ref="main", observed_base_sha="b" * 40,
         owner="example",
@@ -114,7 +175,7 @@ def _granted(policy, state):
     )
     auth = _auth(
         canonical_principal="poller:example",
-        repo_pr_scope_registry=RepoPRScopeRegistry((state,)), scoped_pr_grants=grants,
+        repo_pr_scope_registry=ExampleScopeRegistry((state,)), scoped_pr_grants=grants,
     )
     token = consume_scoped_pr_checkout(auth, state.action_scope, "example")
     assert token is not None
@@ -490,7 +551,7 @@ def test_plugin_channel_requires_one_explicit_same_scope_target(policy, enforce)
 
 @pytest.mark.parametrize("enforce", [True, False])
 def test_plugin_repo_and_pr_require_exact_server_scope_and_action(policy, enforce, tmp_path):
-    state = _state({RepoPRAction.INSPECT.value})
+    state = _state({ExampleAction.INSPECT.value})
     auth = _granted(policy, state)
     registry = ToolRegistry()
 
@@ -511,11 +572,11 @@ def test_plugin_repo_and_pr_require_exact_server_scope_and_action(policy, enforc
         refusal = decide(name, context, repository, number)
         assert refusal.reason == "repo_pr_grant_denied" and refusal.would_block
         assert refusal.allowed is not enforce
-    comment_state = _state({RepoPRAction.INSPECT.value, RepoPRAction.PR_COMMENT.value})
+    comment_state = _state({ExampleAction.INSPECT.value, ExampleAction.PR_COMMENT.value})
     with_comment = _granted(policy, comment_state)
     assert decide("example_pr", with_comment).allowed
     assert decide("example_checkout", with_comment).reason == "repo_pr_grant_denied"
-    retained = RetainedFactoryScope(
+    retained = SimpleNamespace(
         issue_id=7, signature="sig", occurrence_id="occ", run_id="run", attempt=1,
         session="session", repository="acme/widget", branch="fix", sandbox=str(tmp_path),
     )
@@ -544,7 +605,7 @@ def test_plugin_channel_sink_ifc_and_middleware_policy(policy):
 
 
 def test_plugin_result_domain_comes_from_authorizing_policy(policy):
-    auth = _granted(policy, _state({RepoPRAction.INSPECT.value}))
+    auth = _granted(policy, _state({ExampleAction.INSPECT.value}))
     args = {"repository": "acme/widget", "pull_request": 7}
     decision = ToolRegistry().authorize_tool(
         "example_repo", auth, enforce=True, arguments=args, policy=policy,
@@ -566,7 +627,7 @@ async def test_plugin_standing_review_precedes_handler(
 ):
     from mimir import access_control
 
-    auth = _granted(policy, _state({RepoPRAction.INSPECT.value}))
+    auth = _granted(policy, _state({ExampleAction.INSPECT.value}))
     args = {"repository": "acme/widget", "pull_request": 7}
     if review_state == "missing":
         auth = replace(auth, repo_pr_scope_registry=None)
@@ -613,7 +674,7 @@ async def test_plugin_standing_review_precedes_handler(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("asynchronous", [False, True])
 async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous, monkeypatch):
-    auth = _granted(policy, _state({RepoPRAction.INSPECT.value}))
+    auth = _granted(policy, _state({ExampleAction.INSPECT.value}))
     request = ToolCallRequest(
         tool_call={"name": "example_repo", "args": {
             "repository": "acme/widget", "pull_request": 7,
@@ -647,8 +708,8 @@ async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous
 
 @pytest.mark.parametrize("enforce", [False, True])
 def test_plugin_result_taint_vetoes_subsequent_write(policy, enforce):
-    auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
-        _state({RepoPRAction.INSPECT.value, RepoPRAction.WRITE.value}),
+    auth = _auth(repo_pr_scope_registry=ExampleScopeRegistry((
+        _state({ExampleAction.INSPECT.value, ExampleAction.WRITE.value}),
     )))
     args = {"repository": "acme/widget", "pull_request": 7}
     read = ToolRegistry().authorize_tool(
@@ -929,9 +990,9 @@ async def test_selected_plugin_resource_calls_cross_model_middleware_boundary(
     monkeypatch.setattr(ToolRegistry, "authorize_tool", observe_authorization)
     monkeypatch.setattr(ToolRegistry, "_emit_shadow_decision", observe_shadow)
 
-    inspect = replace(_granted(policy, _state({RepoPRAction.INSPECT.value})), enforcement_enabled=enforce)
-    comment = replace(_granted(policy, _state({RepoPRAction.PR_COMMENT.value})), enforcement_enabled=enforce)
-    retained = RetainedFactoryScope(
+    inspect = replace(_granted(policy, _state({ExampleAction.INSPECT.value})), enforcement_enabled=enforce)
+    comment = replace(_granted(policy, _state({ExampleAction.PR_COMMENT.value})), enforcement_enabled=enforce)
+    retained = SimpleNamespace(
         issue_id=7, signature="sig", occurrence_id="occ", run_id="run", attempt=1,
         session="session", repository="acme/widget", branch="fix", sandbox=str(tmp_path),
     )

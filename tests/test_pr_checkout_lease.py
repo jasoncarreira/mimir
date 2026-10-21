@@ -2233,6 +2233,7 @@ def _service_auth(service) -> AuthContext:
     )
 
 
+@pytest.mark.usefixtures("selected_tracked_file_policy")
 def test_github_activity_write_grant_is_exactly_active_lease_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

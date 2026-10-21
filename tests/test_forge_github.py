@@ -22,7 +22,7 @@ from mimir_cultivate.forge import (
     bound_diff,
 )
 from mimir_cultivate import forge as github_module
-from mimir.models import RepoPRActionScope
+from mimir_cultivate.policy import RepoPRActionScope
 from mimir_cultivate.forge import initialize_github_forge_identity, pr_list, set_forge_client
 
 

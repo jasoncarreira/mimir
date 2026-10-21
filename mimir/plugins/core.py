@@ -404,7 +404,6 @@ _RUNTIME_SURFACES = {
     ),
     "web_search": (("mimir.tools.web", "web_search"),),
     "fetch_url": (("mimir.tools.web", "fetch_url"),),
-    "coding": (),
 }
 
 

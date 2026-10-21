@@ -8,8 +8,9 @@ import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 from tests.timing import HANG_GUARD_SECONDS
@@ -41,18 +42,18 @@ def test_jobs_complete_with_saturated_default_pool(tmp_path, monkeypatch, operat
     sched.add_scratch_janitor_job(tmp_path)
     if operation == "worklink":
         from mimir.plugins.manager import load_plugins
-        from mimir.worklink import autonomy as core_autonomy
+        from mimir_cultivate import scheduler as cultivate_scheduler
         from mimir_cultivate.worklink import autonomy as provider_autonomy
 
+        assert not (Path(__file__).parents[1] / "mimir/worklink/autonomy.py").exists()
         called: list[str] = []
 
         def provider_reap(*_args):
             called.append("provider")
             return SimpleNamespace(reaped=[], examined=0, skipped=0, skipped_issue_ids=[])
 
-        core_reap = Mock(side_effect=AssertionError("core Worklink reaper invoked"))
-        monkeypatch.setattr(core_autonomy, "reap_stale_claims_for_home", core_reap)
         monkeypatch.setattr(provider_autonomy, "reap_stale_claims_for_home", provider_reap)
+        monkeypatch.setattr(cultivate_scheduler, "log_event", logger.log)
         monkeypatch.setattr(provider_autonomy, "prune_stale_attempt_checkouts_for_home", lambda *a: [])
         monkeypatch.setattr(provider_autonomy, "close_merged_chainlinks_for_home", lambda *a: [])
         monkeypatch.setenv("MIMIR_WORKLINK_REAPER_CRON", "* * * * *")
@@ -85,7 +86,6 @@ def test_jobs_complete_with_saturated_default_pool(tmp_path, monkeypatch, operat
             elif operation == "worklink":
                 await asyncio.wait_for(sched._callables["worklink-reaper"].fn(), HANG_GUARD_SECONDS)
                 assert called == ["provider"]
-                core_reap.assert_not_called()
             elif operation == "attestation":
                 check = pollers._github_recovery_relevance_check("token")
                 event = AgentEvent(trigger="poller", channel_id="test", content="PR", extra={

@@ -21,16 +21,18 @@ from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
-from mimir.worklink import control, worker_client, worker_exec
-from mimir.worklink.compute import LaunchHandle
-from mimir.worklink.control import stop_worklink
-from mimir.worklink.factory_state import (
+pytest.importorskip("mimir_cultivate", reason="Worklink stop control belongs to Cultivate")
+
+from mimir_cultivate.worklink import control, worker_client, worker_exec
+from mimir_cultivate.worklink.compute import LaunchHandle
+from mimir_cultivate.worklink.control import stop_worklink
+from mimir_cultivate.worklink.factory_state import (
     FactoryRunRecord,
     factory_process_is_alive,
     load_factory_record,
     save_factory_record,
 )
-from mimir.worklink.run_state import (
+from mimir_cultivate.worklink.run_state import (
     WorklinkRunState,
     load_run_state,
     process_is_alive,
@@ -41,11 +43,11 @@ from mimir.worklink.run_state import (
 
 @pytest.mark.asyncio
 async def test_operator_stop_records_terminal_evidence_without_incident(tmp_path, monkeypatch):
-    from mimir.worklink import orchestrator
-    from mimir.worklink.checkout import CheckoutLease
-    from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, OPERATOR_STOP_PREFIX
-    from mimir.worklink.compute import ComputeResult
-    from mimir.worklink.dispatch_failures import (
+    from mimir_cultivate.worklink import orchestrator
+    from mimir_cultivate.worklink.checkout import CheckoutLease
+    from mimir_cultivate.worklink.claims import ChainlinkClaims, ClaimRecord, OPERATOR_STOP_PREFIX
+    from mimir_cultivate.worklink.compute import ComputeResult
+    from mimir_cultivate.worklink.dispatch_failures import (
         autonomous_dispatch_block_reason, dispatch_failure_state_dir, load_failure_state,
     )
 
@@ -78,7 +80,7 @@ async def test_operator_stop_records_terminal_evidence_without_incident(tmp_path
             raise AssertionError(action)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    from mimir.worklink import control
+    from mimir_cultivate.worklink import control
     monkeypatch.setattr(control, "process_is_alive", lambda state: True)
     monkeypatch.setattr(control, "process_identity_verified", lambda state: True)
 
@@ -127,13 +129,13 @@ async def test_operator_stop_records_terminal_evidence_without_incident(tmp_path
 
 @pytest.mark.asyncio
 async def test_external_sigterm_still_fails_and_rearms(tmp_path, monkeypatch):
-    from mimir.worklink import orchestrator
-    from mimir.worklink.backends.base import RawResult
-    from mimir.worklink.checkout import CheckoutLease
-    from mimir.worklink.claims import ChainlinkClaims, ClaimRecord
-    from mimir.worklink.compute import ComputeResult
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
-    from mimir.worklink.evidence import EvidenceValidation, WorklinkEvidence
+    from mimir_cultivate.worklink import orchestrator
+    from mimir_cultivate.worklink.backends.base import RawResult
+    from mimir_cultivate.worklink.checkout import CheckoutLease
+    from mimir_cultivate.worklink.claims import ChainlinkClaims, ClaimRecord
+    from mimir_cultivate.worklink.compute import ComputeResult
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.worklink.evidence import EvidenceValidation, WorklinkEvidence
 
     labels = {"worklink:in-progress"}
     comments = []
@@ -189,16 +191,16 @@ async def test_external_sigterm_still_fails_and_rearms(tmp_path, monkeypatch):
 @pytest.mark.parametrize("known_reset", [True, False])
 @pytest.mark.asyncio
 async def test_opencode_quota_hold_resumes_without_charging_and_escalates(tmp_path, monkeypatch, known_reset, prior_used):
-    from mimir.worklink import orchestrator
-    from mimir.worklink.backends.base import RawResult
-    from mimir.worklink.checkout import CheckoutLease
-    from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, QUOTA_HOLD_PREFIX
-    from mimir.worklink.compute import ComputeResult
-    from mimir.worklink.dispatch_failures import (
+    from mimir_cultivate.worklink import orchestrator
+    from mimir_cultivate.worklink.backends.base import RawResult
+    from mimir_cultivate.worklink.checkout import CheckoutLease
+    from mimir_cultivate.worklink.claims import ChainlinkClaims, ClaimRecord, QUOTA_HOLD_PREFIX
+    from mimir_cultivate.worklink.compute import ComputeResult
+    from mimir_cultivate.worklink.dispatch_failures import (
         autonomous_dispatch_block_reason, dispatch_failure_state_dir,
         load_failure_state, pending_failure_alerts,
     )
-    from mimir.worklink.evidence import EvidenceValidation, WorklinkEvidence
+    from mimir_cultivate.worklink.evidence import EvidenceValidation, WorklinkEvidence
 
     reset = datetime.now(UTC) + timedelta(hours=5)
     if known_reset:
@@ -300,7 +302,7 @@ async def test_opencode_quota_hold_resumes_without_charging_and_escalates(tmp_pa
 
 
 def test_worklink_quota_reset_fallback_and_absurd_reset(tmp_path):
-    from mimir.worklink.orchestrator import _worklink_quota_reset
+    from mimir_cultivate.worklink.orchestrator import _worklink_quota_reset
 
     before = datetime.now(UTC)
     reset, source = _worklink_quota_reset(tmp_path, "Error: The usage limit has been reached")
@@ -319,7 +321,7 @@ def test_worklink_quota_reset_fallback_and_absurd_reset(tmp_path):
 
 
 def test_worklink_quota_reset_rejects_past_tracker_reset(tmp_path):
-    from mimir.worklink.orchestrator import _worklink_quota_reset
+    from mimir_cultivate.worklink.orchestrator import _worklink_quota_reset
 
     before = datetime.now(UTC)
     pause_file = tmp_path / ".mimir" / "quota_pause.json"
@@ -345,7 +347,7 @@ def test_worklink_quota_reset_rejects_past_tracker_reset(tmp_path):
     ("2030-99-99T00:00:00Z", None),
 ], ids=["far-future", "past", "plausible", "offset", "naive-utc", "now", "max-window", "over-window", "malformed"])
 def test_worklink_quota_reset_text_hint(tmp_path, monkeypatch, hint, expected):
-    from mimir.worklink import orchestrator
+    from mimir_cultivate.worklink import orchestrator
 
     now = datetime(2030, 1, 1, 12, tzinfo=UTC)
 
@@ -366,7 +368,7 @@ def test_worklink_quota_reset_text_hint(tmp_path, monkeypatch, hint, expected):
 
 
 def test_failure_kind_change_starts_new_occurrence(tmp_path):
-    from mimir.worklink.dispatch_failures import record_failure
+    from mimir_cultivate.worklink.dispatch_failures import record_failure
 
     now = datetime.now(UTC)
     kwargs = dict(issue_id=700, attempt=1, exit_status=1, error="same error", log_path=None)
@@ -382,7 +384,7 @@ def test_failure_kind_change_starts_new_occurrence(tmp_path):
 
 
 def test_quota_hold_marker_only_forgives_matching_claim():
-    from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, QUOTA_HOLD_PREFIX, SHUTDOWN_ABORT_PREFIX, ShutdownAbortRecord
+    from mimir_cultivate.worklink.claims import ChainlinkClaims, ClaimRecord, QUOTA_HOLD_PREFIX, SHUTDOWN_ABORT_PREFIX, ShutdownAbortRecord
 
     claimed = datetime.now(UTC)
     claim = ClaimRecord(700, 1, "agent", claimed)
@@ -405,7 +407,7 @@ def _factory(home: Path, run_id: str = "chainlink-700") -> FactoryRunRecord:
 
 
 def test_operator_stop_marker_requires_matching_issue_and_attempt(tmp_path):
-    from mimir.worklink.control import _mark_operator_stop, _operator_stop_path, operator_stop_requested
+    from mimir_cultivate.worklink.control import _mark_operator_stop, _operator_stop_path, operator_stop_requested
 
     _mark_operator_stop(tmp_path, 700, 2)
     assert operator_stop_requested(tmp_path, 700, 2)
@@ -450,8 +452,8 @@ def claim_runner():
 def test_stop_rejected_factory_identity(
     tmp_path, monkeypatch, claim_runner, ticks, observed, zombie, kill_error, dead,
 ):
-    import mimir.worklink.control as control
-    import mimir.worklink.factory_state as factory_state
+    import mimir_cultivate.worklink.control as control
+    import mimir_cultivate.worklink.factory_state as factory_state
 
     record = _factory(tmp_path)
     record = replace(record, handle=replace(record.handle, process_start_ticks=ticks))
@@ -498,8 +500,8 @@ def test_stop_rejected_factory_identity(
 @pytest.mark.parametrize("dead", [False, True], ids=["still-alive", "exited"])
 @pytest.mark.parametrize("error", [KeyError("missing job"), RuntimeError("offline"), OSError("failed")])
 def test_stop_factory_cancel_failure(tmp_path, monkeypatch, claim_runner, dead, error):
-    import mimir.worklink.control as control
-    import mimir.worklink.factory_state as factory_state
+    import mimir_cultivate.worklink.control as control
+    import mimir_cultivate.worklink.factory_state as factory_state
 
     record = _factory(tmp_path)
     kill = Mock(side_effect=[None, ProcessLookupError(errno.ESRCH, "gone") if dead else None])
@@ -534,8 +536,8 @@ def test_stop_factory_cancel_failure(tmp_path, monkeypatch, claim_runner, dead, 
 @pytest.mark.parametrize("live_id", ["chainlink-700", "700"])
 @pytest.mark.parametrize("other", ["dead", "uncertain", "live"])
 def test_stop_checks_both_factory_records(tmp_path, monkeypatch, claim_runner, live_id, other):
-    import mimir.worklink.control as control
-    import mimir.worklink.factory_state as factory_state
+    import mimir_cultivate.worklink.control as control
+    import mimir_cultivate.worklink.factory_state as factory_state
 
     live = _factory(tmp_path, live_id)
     other_id = "700" if live_id == "chainlink-700" else "chainlink-700"
@@ -582,7 +584,7 @@ def test_stop_checks_both_factory_records(tmp_path, monkeypatch, claim_runner, l
 def test_cross_uid_factory_stop_uses_recorded_handle_and_verified_executor_exit(
     tmp_path, monkeypatch, claim_runner,
 ):
-    import mimir.worklink.factory_state as factory_state
+    import mimir_cultivate.worklink.factory_state as factory_state
 
     record = replace(_factory(tmp_path), handle=LaunchHandle(
         "local_subprocess", str(uuid.uuid4()), 99, 4321,
@@ -633,7 +635,7 @@ def test_cross_uid_factory_stop_uses_recorded_handle_and_verified_executor_exit(
 def test_cross_uid_factory_identity_mismatch_refuses_signal(
     tmp_path, monkeypatch, claim_runner, observed, expected_dead,
 ):
-    import mimir.worklink.factory_state as factory_state
+    import mimir_cultivate.worklink.factory_state as factory_state
 
     record = _factory(tmp_path)
     monkeypatch.setattr(factory_state.os, "kill", Mock(side_effect=PermissionError(errno.EPERM, "denied")))
@@ -743,7 +745,7 @@ def test_executor_factory_cancel_contract_fails_closed(monkeypatch, change):
 
 
 def test_cross_uid_run_state_requires_matching_start_ticks(monkeypatch):
-    import mimir.worklink.run_state as run_state
+    import mimir_cultivate.worklink.run_state as run_state
 
     state = WorklinkRunState(
         issue_id=700, attempt=1, backend="feature_factory", compute_name="local_subprocess",

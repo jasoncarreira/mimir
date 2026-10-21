@@ -511,6 +511,7 @@ def register_action_protocol(
         RepoPRAction, validate_scope, checkout_action=RepoPRAction.CHECKOUT,
         live_lease=_live_scoped_pr_lease, checkout_tool=checkout_tool,
         trusted_scope=TrustedScopeConstructors(
+            scope_type=RepoPRActionScope,
             issue=issue_repo_scope, review=RepoReviewState,
             registry=RepoPRScopeRegistry, discovered=ServerDiscoveredPRStates,
             store=ServerDiscoveredPRScopeStore, retained=RetainedFactoryScope,
@@ -948,6 +949,7 @@ def register_tools(registrar: PolicyRegistrar) -> None:
         agent_push=repository.was_agent_push,
         tracked_file=repository.is_tracked_file_in_pr_checkout,
         derive_retained_scope=derive_retained_factory_scope,
+        action_for=lambda name: RepoPRAction[name.upper()],
         retained_checkout_root=retained_checkout_root,
         active_checkout=repository.active_pr_checkout_lease_for_path,
         git_command=repository.hardened_git_command,

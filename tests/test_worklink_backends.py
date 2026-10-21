@@ -12,28 +12,24 @@ from typing import Any
 
 import pytest
 
+pytest.importorskip("mimir_cultivate", reason="Worklink backends belong to Cultivate")
+
 from tests.nested_pytest import pytest_command
 
-from mimir.opencode_config import OpenCodeInvocation
-from mimir.worklink.backends import (
-    WORKLINK_MERGED_LABEL,
-    BackendRegistry,
-    FeatureFactoryBackend,
-    OpenCodeBackend,
-    ComputeResult,
-    LocalSubprocessComputeBackend,
-    RawResult,
-    TieredReviewConfig,
-    ToolPin,
-    WorkOrder,
-    WorklinkConfig,
-    WorklinkDefaults,
+from mimir_cultivate.opencode import OpenCodeInvocation
+from mimir_cultivate.worklink.backends.base import RawResult, WorkOrder, blocked_reason_from_output
+from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
+from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+from mimir_cultivate.worklink.backends.registry import (
+    WORKLINK_MERGED_LABEL, BackendRegistry, TieredReviewConfig,
+    WorklinkConfig, WorklinkDefaults, SHIPPING_BACKENDS, SHIPPING_COMPUTE_BACKENDS,
 )
-from mimir.worklink.backends.base import blocked_reason_from_output
-from mimir.worklink.backends.registry import SHIPPING_BACKENDS, SHIPPING_COMPUTE_BACKENDS
-from mimir.worklink.compute import ComputeCaps, ComputeLaunchError, LaunchHandle, WorkSpec
-import mimir.worklink.compute as compute_module
-import mimir.worklink.backends.opencode as opencode_module
+from mimir_cultivate.worklink.tool_pins import ToolPin
+from mimir_cultivate.worklink.compute import (
+    ComputeCaps, ComputeLaunchError, ComputeResult, LaunchHandle, WorkSpec, LocalSubprocessComputeBackend,
+)
+import mimir_cultivate.worklink.compute as compute_module
+import mimir_cultivate.worklink.backends.opencode as opencode_module
 
 
 class FakeProcess:
@@ -606,7 +602,7 @@ async def test_local_subprocess_compute_backend_preserves_subprocess_shape(
         return FakeProcess(returncode=0, stdout=b"ok", stderr=b"")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
     backend = LocalSubprocessComputeBackend()
 
     spec = WorkSpec(
@@ -674,7 +670,7 @@ async def test_local_subprocess_compute_omits_parent_death_hook_off_linux(
         return FakeProcess(returncode=0)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
     monkeypatch.setattr(compute_module, "sys", SimpleNamespace(platform="darwin"))
     backend = LocalSubprocessComputeBackend()
     spec = WorkSpec(
@@ -714,7 +710,7 @@ async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
     monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "4")
     backend = LocalSubprocessComputeBackend()
     spec = WorkSpec(
@@ -814,7 +810,7 @@ async def test_anonymous_launch_failure_does_not_unlink_none_paths(
         raise OSError("spawn failed")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_exec)
-    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
     backend = LocalSubprocessComputeBackend()
     spec = WorkSpec(
         issue_id=1,
@@ -1094,7 +1090,7 @@ async def test_feature_factory_launch_remains_shell_free_argv(
 ) -> None:
     calls: list[dict[str, Any]] = []
 
-    from mimir.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
     from types import SimpleNamespace
 
     async def fake_exec(args, capability, env, projections, **kwargs):
@@ -1102,8 +1098,8 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         capability._contained_started(SimpleNamespace(pid=None))
         return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
 
-    monkeypatch.setattr("mimir.worklink.compute.execute_contained", fake_exec)
-    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute.execute_contained", fake_exec)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
     monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
@@ -1177,7 +1173,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
         return FakeProcess(returncode=0, stdout=b"done\n", stderr=b"")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -1362,7 +1358,7 @@ def test_opencode_backend_logs_native_model_divergence_from_home_default(
         env={"MIMIR_HOME": str(tmp_path)},
     )
 
-    with caplog.at_level("WARNING", logger="mimir.worklink.backends.opencode"):
+    with caplog.at_level("WARNING", logger="mimir_cultivate.worklink.backends.opencode"):
         spec = OpenCodeBackend().work_spec(
             order,
             attempt=1,
@@ -1418,7 +1414,7 @@ async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> N
     "Error: Rate limit reached",
 ])
 def test_opencode_provider_quota_error_records(line: str) -> None:
-    from mimir.worklink.backends.opencode import _status_from_output
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
 
     assert _status_from_output(1, line, "") == "quota_exhausted"
 
@@ -1429,7 +1425,7 @@ def test_opencode_provider_quota_error_records(line: str) -> None:
     "Rate limit reached", "The usage limit has been reached",
 ])
 def test_opencode_stderr_unprefixed_quota_error(line: str) -> None:
-    from mimir.worklink.backends.opencode import _status_from_output
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
 
     assert _status_from_output(1, "→ Read mimir/budget.py", line) == "quota_exhausted"
     assert _status_from_output(1, f"Error: {line}", "") == "quota_exhausted"
@@ -1445,7 +1441,7 @@ def test_opencode_stderr_unprefixed_quota_error(line: str) -> None:
     ("HTTP 429 Too Many Requests", ""),
 ])
 def test_opencode_non_provider_quota_false_positives(stdout: str, stderr: str) -> None:
-    from mimir.worklink.backends.opencode import _status_from_output
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
 
     assert _status_from_output(1, stdout, stderr) == "failed"
 
@@ -1469,7 +1465,7 @@ def test_opencode_non_provider_quota_false_positives(stdout: str, stderr: str) -
     "lowercase-prefix", "not-429", "assertion", "npm", "stack-frame",
 ])
 def test_opencode_tool_quota_messages_remain_failures(line: str, stream: str) -> None:
-    from mimir.worklink.backends.opencode import _status_from_output
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
 
     stdout, stderr = (line, "") if stream == "stdout" else ("", line)
     assert _status_from_output(1, stdout, stderr) == "failed"
@@ -1482,13 +1478,13 @@ def test_opencode_tool_quota_messages_remain_failures(line: str, stream: str) ->
     "| Error: HTTP 429",
 ])
 def test_opencode_quoted_quota_is_not_provider_error(line: str) -> None:
-    from mimir.worklink.backends.opencode import _status_from_output
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
 
     assert _status_from_output(1, line, line) == "failed"
 
 
 def test_opencode_auth_error_wins_over_echoed_quota_and_real_quota() -> None:
-    from mimir.worklink.backends.opencode import _status_from_output
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
 
     assert _status_from_output(
         1, "→ Read mimir/rate_limits.py\nError: Rate limit reached",
@@ -1507,7 +1503,7 @@ def test_opencode_auth_error_wins_over_echoed_quota_and_real_quota() -> None:
     "\x1b[90m| \x1b[0mHTTP 401 Unauthorized\n",
 ])
 def test_opencode_builder_output_is_not_provider_auth(stderr: str) -> None:
-    from mimir.worklink.backends.opencode import _status_from_output
+    from mimir_cultivate.worklink.backends.opencode import _status_from_output
 
     assert _status_from_output(1, "", stderr) == "failed"
 
@@ -1527,7 +1523,7 @@ def test_opencode_builder_output_is_not_provider_auth(stderr: str) -> None:
     ("\x1b[91mToken refresh failed: 401\x1b[0m", "Token refresh failed: 401"),
 ])
 def test_opencode_provider_auth_quotes_evidence_line(line: str, evidence: str) -> None:
-    from mimir.worklink.backends.opencode import _error_from_status, _status_from_output
+    from mimir_cultivate.worklink.backends.opencode import _error_from_status, _status_from_output
 
     stderr = f"{line}\n→ Read mimir/access_control.py [offset=7433, limit=13]\n"
     status = _status_from_output(1, "", stderr)
@@ -1552,7 +1548,7 @@ async def test_opencode_backend_transcript_filename_contract(
         return FakeProcess(returncode=0, stdout=b'done\n', stderr=b"")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     auth.parent.mkdir(parents=True)
@@ -1689,7 +1685,7 @@ def test_registry_rejects_invalid_opencode_bash_allowlist(allowlist: object) -> 
 def test_registry_keeps_and_logs_python_default_bash_allowlist(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with caplog.at_level("INFO", logger="mimir.worklink.backends.registry"):
+    with caplog.at_level("INFO", logger="mimir_cultivate.worklink.backends.registry"):
         backend = BackendRegistry().get("opencode")
 
     assert backend.bash_allowlist == ("git *", "uv *")
@@ -1708,7 +1704,7 @@ def test_registry_derives_only_configured_non_python_runner(
     monkeypatch: pytest.MonkeyPatch, test_command: str, runner_pattern: str
 ) -> None:
     monkeypatch.setattr(
-        "mimir.worklink.backends.opencode.resolve_opencode_invocation",
+        "mimir_cultivate.worklink.backends.opencode.resolve_opencode_invocation",
         lambda **_: OpenCodeInvocation(
             model="openai/test-model",
             provider="openai",
@@ -1847,8 +1843,8 @@ async def test_local_subprocess_env_allowlist_passes_creds_not_bridge_secrets(
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "bridge-secret")
     monkeypatch.setenv("MIMIR_API_KEY", "operator-secret")
 
-    from mimir.worklink.compute import LocalSubprocessComputeBackend
-    from mimir.worklink.compute import WorkSpec
+    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+    from mimir_cultivate.worklink.compute import WorkSpec
 
     wt = tmp_path / "wt"
     wt.mkdir()
@@ -2135,7 +2131,7 @@ def test_worklink_resolution_admits_any_configured_provider(
     because each reaches the worker through the projected auth document rather
     than the worker environment allowlist, so a regression could hide in either.
     """
-    from mimir.worklink.backends.opencode import resolve_worklink_opencode_invocation
+    from mimir_cultivate.worklink.backends.opencode import resolve_worklink_opencode_invocation
 
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     env = _provider_env(tmp_path, "openrouter:anthropic/claude-opus-4.8")
@@ -2164,7 +2160,7 @@ def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
     other ask categories are untouched by this change. Proving that would need an
     integration check against the pinned OpenCode permission evaluator.
     """
-    from mimir.worklink.backends.feature_factory import _FACTORY_PERMISSION
+    from mimir_cultivate.worklink.backends.feature_factory import _FACTORY_PERMISSION
 
     home = tmp_path / "home"
     home.mkdir()

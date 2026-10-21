@@ -23,11 +23,6 @@ from mimir.models import (
     InformationFlowLabels,
     InformationFlowState,
     NormalizedPullRequestSnapshot,
-    RepoPRAction,
-    RepoPRActionScope,
-    RepoPRScopeRegistry,
-    RepoReviewState,
-    ServerDiscoveredPRStates,
     SourceLabel,
 )
 try:
@@ -35,6 +30,10 @@ try:
 except PackageNotFoundError:
     pytest.skip("repository tool wiring requires installed Cultivate", allow_module_level=True)
 
+from mimir_cultivate.policy import (
+    RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry,
+    RepoReviewState, ServerDiscoveredPRStates,
+)
 from mimir_cultivate.forge import (
     CheckProjection, ReviewProjection, remediation_checkout_preflight, set_forge_client,
 )
@@ -129,6 +128,7 @@ def _auth(scope: RepoPRActionScope, *additional: RepoPRActionScope) -> AuthConte
         enforcement_enabled=True,
         ifc_labels=labels,
         repo_pr_scope_registry=RepoPRScopeRegistry(states),
+        server_discovered_pr_states=ServerDiscoveredPRStates(),
         repo_review_state=state if len(states) == 1 else None,
         repo_pr_action_scope=scope if len(states) == 1 else None,
     )
@@ -562,6 +562,15 @@ def _remediation_runtime(monkeypatch: pytest.MonkeyPatch, client: _RemediationFo
         provenance="poller_payload",
     )
     context = _auth(old_scope)
+    service = replace(
+        context.service_authority, canonical="poller:github-activity", trigger="poller",
+        authority_profile="github", capabilities=("pr_metadata", "repo_checkout"),
+    )
+    context = replace(
+        context, principal="service:poller:github-activity",
+        canonical_principal=service.canonical, trigger="poller",
+        channel_id=service.canonical, service_authority=service,
+    )
     set_forge_client(client)
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
 
@@ -1004,7 +1013,7 @@ async def test_core_only_pr_scope_policy_refuses_in_both_modes(
 
 
 @pytest.mark.asyncio
-async def test_selected_repo_grant_shadows_then_enforces_with_the_same_reason(
+async def test_selected_repo_grant_refuses_even_in_shadow_with_the_same_reason(
     monkeypatch: pytest.MonkeyPatch, selected_repo_policy,
 ) -> None:
     scope = _scope(RepoPRAction.INSPECT)
@@ -1034,10 +1043,10 @@ async def test_selected_repo_grant_shadows_then_enforces_with_the_same_reason(
         "repo_stage", enforced_context, enforce=True, arguments=arguments,
     )
 
-    assert shadow.allowed is True
+    assert shadow.allowed is False
     assert shadow.would_block is True
     assert enforced.allowed is False
-    assert shadow.reason == enforced.reason == "repo_pr_grant_denied"
+    assert shadow.reason == enforced.reason == "repo_pr_scope_denied"
     events = [fields for kind, fields in captured if kind == "shadow_tool_decision"]
     assert len(events) == 1
     assert events[0]["tool"] == "repo_stage"

@@ -17,9 +17,11 @@ import uuid
 import pytest
 from tests.timing import HANG_GUARD_SECONDS
 
-import mimir.worklink.compute as compute
-import mimir.worklink.worker_exec as worker_exec
-from mimir.worklink.compute import ComputeLaunchError, LaunchHandle, LocalSubprocessComputeBackend, WorkSpec
+pytest.importorskip("mimir_cultivate", reason="Worklink worker parity belongs to Cultivate")
+
+import mimir_cultivate.worklink.compute as compute
+import mimir_cultivate.worklink.worker_exec as worker_exec
+from mimir_cultivate.worklink.compute import ComputeLaunchError, LaunchHandle, LocalSubprocessComputeBackend, WorkSpec
 
 
 SCENARIOS = (
@@ -155,8 +157,8 @@ async def test_operator_issued_opencode_uses_fd_anchored_dir_but_direct_keeps_ab
     authorization = Authorization()
     authorization.path = checkout
     client = WorkerClient()
-    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
-    monkeypatch.setattr("mimir.worklink.run_state.process_start_ticks", lambda pid: pid)
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setattr("mimir_cultivate.worklink.run_state.process_start_ticks", lambda pid: pid)
     work = spec()
     object.__setattr__(work, "output_root", tmp_path / "output")
     object.__setattr__(work, "local_checkout", checkout)
@@ -178,7 +180,7 @@ async def test_operator_issued_opencode_uses_fd_anchored_dir_but_direct_keeps_ab
         "opencode", "run", "--dir", str(checkout), "--", "prompt"
     )
 
-    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     calls: list[tuple[str, ...]] = []
 
     async def fake_exec(*args: str, **kwargs: Any) -> WorkerProcess:
@@ -218,8 +220,8 @@ def test_fd_anchored_opencode_argv_rejects_a_different_checkout() -> None:
 async def launch_worker(
     monkeypatch: pytest.MonkeyPatch, client: object
 ) -> tuple[LocalSubprocessComputeBackend, LaunchHandle]:
-    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
-    monkeypatch.setattr("mimir.worklink.run_state.process_start_ticks", lambda pid: pid)
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setattr("mimir_cultivate.worklink.run_state.process_start_ticks", lambda pid: pid)
     backend = LocalSubprocessComputeBackend.for_authorized_checkout(
         getattr(client, "checkout", None) or Authorization(),
         worker_client=client,
@@ -243,8 +245,8 @@ async def test_enabled_launch_cancellation_waits_for_handshake_then_cancels(
             return await super().launch(**kwargs)
 
     client = SuspendedClient()
-    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
-    monkeypatch.setattr("mimir.worklink.run_state.process_start_ticks", lambda pid: pid)
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setattr("mimir_cultivate.worklink.run_state.process_start_ticks", lambda pid: pid)
     backend = LocalSubprocessComputeBackend.for_authorized_checkout(
         Authorization(), worker_client=client
     )
@@ -279,7 +281,7 @@ async def test_enabled_launch_failure_after_suspension_is_a_launch_error(
             await asyncio.sleep(0)
             raise OSError("executor unavailable")
 
-    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     backend = LocalSubprocessComputeBackend.for_authorized_checkout(
         Authorization(), worker_client=SuspendedFailingClient()
     )
@@ -304,7 +306,7 @@ async def test_job_alive_tracks_contained_task_and_direct_process(
     await backend.cleanup(handle)
     assert backend.job_alive(handle) is False
 
-    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     direct = LocalSubprocessComputeBackend()
     direct_handle = await direct.launch(
         direct_spec("import threading; threading.Event().wait()")
@@ -368,7 +370,7 @@ async def test_contained_timeout_bounds_cancel_and_collection_independently(
 async def test_worker_cancel_socket_receive_has_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.worker_client as worker_client
+    import mimir_cultivate.worklink.worker_client as worker_client
 
     observed_timeouts: list[float] = []
 
@@ -428,7 +430,7 @@ def direct_spec(source: str) -> WorkSpec:
 async def run_direct(
     monkeypatch: pytest.MonkeyPatch, source: str, timeout: float | None = None
 ) -> Any:
-    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     backend = LocalSubprocessComputeBackend()
     handle = await backend.launch(direct_spec(source))
     result = await backend.wait(handle, timeout)
@@ -455,7 +457,7 @@ async def wait_for_child_ready(read_fd: int) -> None:
 async def test_direct_terminated_output_is_durable_while_running(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, termination: str
 ) -> None:
-    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     backend = LocalSubprocessComputeBackend()
     ready = tmp_path / "ready"
     work = direct_spec(
@@ -520,7 +522,7 @@ async def test_direct_termination_kills_pipe_holding_grandchild(
     monkeypatch.setattr(worker_exec, "_terminate_process_group_pid", expedited_terminate)
     monkeypatch.setattr(worker_exec.os, "killpg", observed_killpg)
     monkeypatch.setattr(compute.asyncio, "create_subprocess_exec", create_with_readiness)
-    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     if trigger == "overflow":
         monkeypatch.setenv("MIMIR_WORKLINK_MAX_STDOUT_BYTES", "1")
     output = "overflow" if trigger == "overflow" else "ready"
@@ -572,7 +574,7 @@ async def test_closed_worker_direct_parity_inventory(
         "coding_disabled",
     )
     if scenario == "normal_completion":
-        import mimir.worklink.worker_client as worker_client
+        import mimir_cultivate.worklink.worker_client as worker_client
 
         checkout = tmp_path / "executor-checkout"
         checkout.mkdir()
@@ -597,8 +599,8 @@ async def test_closed_worker_direct_parity_inventory(
         authorization = PipeAuthorization()
         client = worker_client.WorkerClient(authorization)
         monkeypatch.setattr(client, "_connect", lambda: client_socket)
-        monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: True)
-        monkeypatch.setattr("mimir.worklink.run_state.process_start_ticks", lambda pid: pid)
+        monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+        monkeypatch.setattr("mimir_cultivate.worklink.run_state.process_start_ticks", lambda pid: pid)
         monkeypatch.setattr(worker_exec, "HOME_ROOT", tmp_path / "worker-homes")
         worker_exec.HOME_ROOT.mkdir()
         monkeypatch.setattr(worker_exec, "_validate_checkout", lambda *_args: None)
@@ -648,7 +650,7 @@ async def test_closed_worker_direct_parity_inventory(
         with pytest.raises(KeyError):
             await backend.wait(handle, 1)
 
-        monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+        monkeypatch.setenv("MIMIR_PLUGINS", "")
         direct_backend = LocalSubprocessComputeBackend()
         direct_handle = await direct_backend.launch(direct_spec(source))
         direct = await direct_backend.wait(direct_handle, None)
@@ -680,7 +682,7 @@ async def test_closed_worker_direct_parity_inventory(
         assert worker.exit_code == direct.exit_code == -15
 
     elif scenario == "running_cancellation":
-        import mimir.worklink.worker_client as worker_client
+        import mimir_cultivate.worklink.worker_client as worker_client
 
         authorization = Authorization()
         socket_events: list[str] = []
@@ -827,7 +829,7 @@ async def test_closed_worker_direct_parity_inventory(
 
         monkeypatch.setattr(compute.asyncio, "create_subprocess_exec", observed_create)
         monkeypatch.setattr(compute.os, "killpg", observed_killpg)
-        monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+        monkeypatch.setenv("MIMIR_PLUGINS", "")
         direct_backend = LocalSubprocessComputeBackend()
         # Negative control: hold the handler before its write until SIGKILL,
         # independent of scheduler load or the duration of the TERM grace.
@@ -910,7 +912,7 @@ async def test_closed_worker_direct_parity_inventory(
             0,
         )
 
-        monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
+        monkeypatch.setenv("MIMIR_PLUGINS", "")
         direct_backend = LocalSubprocessComputeBackend()
         direct_ready = tmp_path / "direct-one-ready"
         direct_first = await direct_backend.launch(
@@ -955,7 +957,7 @@ async def test_closed_worker_direct_parity_inventory(
         )
 
     else:
-        import mimir.worklink.worker_client as worker_client
+        import mimir_cultivate.worklink.worker_client as worker_client
 
         touched = {
             "authorization": 0,

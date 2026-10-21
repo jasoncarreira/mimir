@@ -159,6 +159,7 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
 async def exercise_real_worklink_failure_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, selected_provider: bool = False,
 ) -> None:
+    from mimir.plugins.manager import load_plugins
     from mimir_cultivate.worklink import dispatch_failures as failures
     from mimir_cultivate.worklink.compute import LaunchHandle
     from mimir_cultivate.worklink.factory_state import FactoryRunRecord, save_factory_record
@@ -192,7 +193,10 @@ async def exercise_real_worklink_failure_turn(
 
     skills = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
     ready = next(
-        config for config in discover_pollers(skills, state_root=state_root)
+        config for config in discover_pollers(
+            skills, state_root=state_root,
+            policy=load_plugins(enable="cultivate").policy, plugin_candidates=(),
+        )
         if config.name == "worklink-ready-queue"
     )
     failures.record_failure(
@@ -216,6 +220,10 @@ async def exercise_real_worklink_failure_turn(
         ready,
         command=f"{sys.executable} scripts/poller.py",
     )
+    if selected_provider:
+        from mimir_cultivate.scheduler import worklink_poller_hooks
+
+        ready = replace(ready, hooks=worklink_poller_hooks())
     enqueued = _CapturingEnqueue()
 
     emitted = await run_poller(ready, enqueue=enqueued, home=home)
@@ -384,14 +392,14 @@ async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_cultivate_policy,
 ) -> None:
     __tracebackhide__ = True
+    from mimir.plugins.manager import load_plugins
     from mimir_cultivate.repository import ProjectTestResult
     from mimir_cultivate import repository as repo_module
     from mimir.tools.budget_gate import BudgetGateMiddleware
     from mimir.plugins.core import selected_policy_registry
-    from mimir.worklink import dispatch_failures as failures, worker_client
-    from mimir_cultivate.worklink import worker_client as provider_worker_client
-    from mimir.worklink.compute import LaunchHandle
-    from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
+    from mimir_cultivate.worklink import dispatch_failures as failures, worker_client
+    from mimir_cultivate.worklink.compute import LaunchHandle
+    from mimir_cultivate.worklink.factory_state import FactoryRunRecord, save_factory_record
 
     home = tmp_path / "home"
     state_root = home / "state" / "pollers"
@@ -415,10 +423,6 @@ async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
-    monkeypatch.setattr(provider_worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
-    monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
-    )
     monkeypatch.setattr(
         "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
         lambda _record: False,
@@ -426,7 +430,10 @@ async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow
 
     skills = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
     ready = next(
-        config for config in discover_pollers(skills, state_root=state_root)
+        config for config in discover_pollers(
+            skills, state_root=state_root,
+            policy=load_plugins(enable="cultivate").policy, plugin_candidates=(),
+        )
         if config.name == "worklink-ready-queue"
     )
     failures.record_failure(
@@ -472,7 +479,7 @@ async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow
         return subprocess.run(argv, env=env, capture_output=True, check=False)
 
     monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
-    monkeypatch.setattr(provider_worker_client, "run_factory_control", owner_control)
+    monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
 
     async def passing_test(self, selectors, *, suite):
         return ProjectTestResult(True, "tests_passed", 0)

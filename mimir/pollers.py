@@ -123,7 +123,6 @@ from .poller_hooks import (
     reserved_hook_profile_for_name,
     reserved_skill_for_name,
     resolve_poller_hooks,
-    worklink_recovery_relevance_check as _worklink_recovery_relevance_check,
 )
 from .poller_budget import (
     PollerBudgetConfig,

@@ -41,7 +41,7 @@ except PackageNotFoundError:
     pytest.skip("repository tooling requires installed Cultivate", allow_module_level=True)
 
 
-from mimir.contained_execution import (
+from mimir_cultivate.contained_execution import (
     CollectedExecutionResult,
     SensitiveMaterialScrubber,
 )
@@ -439,7 +439,8 @@ def _selected_checkout_and_follow_on_with_live_grants(
         ScopedPRGrants, _SCOPED_PR_ISSUER, consume_scoped_pr_checkout,
         observe_scoped_pr_checkout,
     )
-    from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, RepoPRScopeRegistry
+    from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState
+    from mimir_cultivate.policy import RepoPRScopeRegistry
     from mimir.plugins.core import policy_scope
     from mimir.plugins.manager import load_plugins
     from mimir.tools.budget_gate import BudgetGateMiddleware
@@ -460,7 +461,7 @@ def _selected_checkout_and_follow_on_with_live_grants(
         scoped_pr_grants=ScopedPRGrants(
             scope.principal, (scope,), protocols=selected.scoped_actions,
             _issuer=_SCOPED_PR_ISSUER,
-        ), enforcement_enabled=True,
+        ), enforcement_enabled=True, _plugin_slot_policy=selected,
     )
     monkeypatch.setattr(selected_forge, "remediation_checkout_preflight", lambda *_: (state, None))
     monkeypatch.setattr(selected_forge, "_client", lambda _: object())
@@ -561,7 +562,8 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     from mimir_cultivate import repository as repo_tools
     from mimir.access_control import CapabilityTier, ToolAuthorization, build_trigger_service_principal
     from mimir_cultivate.forge import CommentProjection, PullRequestProjection, ReviewProjection
-    from mimir.models import InformationFlowLabels, InformationFlowState, RepoPRScopeRegistry
+    from mimir.models import InformationFlowLabels, InformationFlowState
+    from mimir_cultivate.policy import RepoPRScopeRegistry
     from mimir.plugins.core import selected_policy_registry
     from mimir_cultivate import forge, repository as repo
 
@@ -1679,8 +1681,9 @@ def test_wrapper_records_only_successful_verified_head_transition(
     from mimir.plugins.core import selected_policy_registry
     from mimir_cultivate import repository as git_module
     from mimir.models import (
-        AuthContext, InformationFlowLabels, RepoPRScopeRegistry, SourceLabel, TurnInteractivity,
+        AuthContext, InformationFlowLabels, SourceLabel, TurnInteractivity,
     )
+    from mimir_cultivate.policy import RepoPRScopeRegistry
     from mimir_cultivate import repository as wrapper
 
     origin, _source, scope, state = _repo_scope_and_state(tmp_path, event_type=event_type)
@@ -4127,10 +4130,10 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
         pytest.skip("requires Linux root to exercise the fixed worker identity")
 
     import mimir_cultivate.contained_checkout as contained_checkout
-    import mimir.contained_execution as contained_execution
-    import mimir.worklink.checkout as worklink_checkout
-    import mimir.worklink.worker_exec as worker_exec
-    from mimir.worklink.worker_client import WorkerClient
+    import mimir_cultivate.contained_execution as contained_execution
+    import mimir_cultivate.worklink.checkout as worklink_checkout
+    import mimir_cultivate.worklink.worker_exec as worker_exec
+    from mimir_cultivate.worklink.worker_client import WorkerClient
 
     try:
         controller = pwd.getpwnam("mimir")

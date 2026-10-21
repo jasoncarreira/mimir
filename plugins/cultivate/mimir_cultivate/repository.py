@@ -309,7 +309,7 @@ from pathlib import Path
 import re
 from typing import Literal
 
-from mimir.models import RepoPRAction
+from .policy import RepoPRAction
 
 
 ParityDecision = Literal["allow", "refuse", "escalate", "unavailable"]
@@ -627,12 +627,8 @@ from typing import Callable, Iterator, Sequence
 import uuid
 
 from mimir._rmtree import rmtree_missing_ok
-from mimir.models import (
-    NormalizedPullRequestSnapshot,
-    RepoPRAction,
-    RepoPRActionScope,
-    RepoReviewState,
-)
+from mimir.models import NormalizedPullRequestSnapshot
+from .policy import RepoPRAction, RepoPRActionScope, RepoReviewState
 from .worklink.checkout import (
     _assert_self_contained_checkout,
     _clone_attempt_checkout,
@@ -3743,13 +3739,7 @@ from .policy import RepoPRAction, RepoReviewState, RetainedFactoryScope
 from mimir.redaction import redact_text
 
 
-from importlib.util import find_spec
-
-if find_spec("mimir_cultivate.worklink.backends.registry") is None:
-    # The Worklink registry is installed by a later importer-safe slice.
-    from mimir.worklink.backends.registry import WorklinkConfig
-else:
-    from .worklink.backends.registry import WorklinkConfig
+from .worklink.backends.registry import WorklinkConfig
 from .worklink.identities import get_identities
 from .worklink.worker_client import StaleWorkerExecutorError
 

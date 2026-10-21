@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import fcntl
+import importlib.util
 import os
 from pathlib import Path
 import stat
@@ -12,23 +13,21 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from mimir import access_control as ac
-from mimir.contained_execution import CollectedExecutionResult
-from mimir.models import RetainedFactoryScope
 from mimir.readonly_backend import RetainedCheckoutFilesystemBackend
 from mimir.plugins.core import core_policy_registry, policy_scope
 from mimir.plugins.manager import load_plugins
-from mimir.worklink.compute import LaunchHandle
-from mimir.worklink.backends.feature_factory import FactoryStatus
-from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
-from mimir.worklink.factory_state import (
-    FactoryRunRecord,
-    factory_issue_resource_lock,
-    save_factory_record,
-)
-from mimir.worklink.retained_scope import (
-    derive_retained_factory_scope,
-    retained_factory_effect_lease,
-)
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.policy import RetainedFactoryScope
+    from mimir_cultivate.worklink.compute import LaunchHandle
+    from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+    from mimir_cultivate.worklink.factory_state import (
+        FactoryRunRecord, factory_issue_resource_lock, save_factory_record,
+    )
+    from mimir_cultivate.worklink.retained_scope import (
+        derive_retained_factory_scope, retained_factory_effect_lease,
+    )
 
 
 @pytest.fixture
@@ -39,7 +38,7 @@ def retained_incident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         version("mimir-cultivate")
     except PackageNotFoundError:
         pytest.skip("requires installed Cultivate")
-    from mimir.worklink import worker_client
+    from mimir_cultivate.worklink import worker_client
     provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
 
     home = tmp_path / "home"
@@ -397,7 +396,7 @@ def test_effect_lease_revalidates_and_refuses_busy_resource(
     scope = derive_retained_factory_scope(case.event, case.service).scope
     assert scope is not None
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
     )
     with retained_factory_effect_lease(case.home, scope) as lease:
         assert lease.scope == scope
@@ -455,10 +454,10 @@ def test_session_lock_reconciliation_fails_closed(
     }
     status.update(changes)
     monkeypatch.setattr(
-        "mimir.worklink.backends.feature_factory.FeatureFactoryBackend.status",
+        "mimir_cultivate.worklink.backends.feature_factory.FeatureFactoryBackend.status",
         lambda *args, **kwargs: SimpleNamespace(**status),
     )
-    from mimir.worklink.retained_scope import _factory_session_lock_is_fresh
+    from mimir_cultivate.worklink.retained_scope import _factory_session_lock_is_fresh
 
     with pytest.raises(RuntimeError, match="status identity changed"):
         _factory_session_lock_is_fresh(case.record)
@@ -476,7 +475,7 @@ def test_retained_backend_dispatches_file_effects_under_lease(
         backend, "_binding", lambda _path: (SimpleNamespace(), scope, target),
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
     )
     monkeypatch.setattr(
         "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
@@ -518,7 +517,7 @@ async def test_retained_replace_shrink_guard_and_override(
     async_path: bool, existing: int, new: int, refused: bool,
 ) -> None:
     from mimir.readonly_backend import _replace_shrink_error
-    from mimir.worklink.worker_exec import _run_factory_file_child
+    from mimir_cultivate.worklink.worker_exec import _run_factory_file_child
 
     case = retained_incident
     scope = derive_retained_factory_scope(case.event, case.service).scope
@@ -536,7 +535,7 @@ async def test_retained_replace_shrink_guard_and_override(
         "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
     )
     monkeypatch.chdir(case.sandbox.parents[1])
     calls = []
@@ -589,15 +588,15 @@ def test_effect_lease_refuses_operation_time_races(
     scope = derive_retained_factory_scope(case.event, case.service).scope
     assert scope is not None
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh",
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
         lambda _record: race == "fresh",
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope.factory_process_is_alive",
+        "mimir_cultivate.worklink.retained_scope.factory_process_is_alive",
         lambda _record: race == "alive",
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope.factory_process_is_verified_dead",
+        "mimir_cultivate.worklink.retained_scope.factory_process_is_verified_dead",
         lambda _record: race != "unverifiable",
     )
     if race == "stale":
@@ -612,7 +611,7 @@ def test_effect_lease_refuses_operation_time_races(
         save_factory_record(case.home, replace(case.record, run_id="1810"))
 
     if race == "interlock":
-        from mimir.worklink.factory_state import factory_checkout_interlock
+        from mimir_cultivate.worklink.factory_state import factory_checkout_interlock
 
         outer = factory_checkout_interlock(case.home, pruning=True)
     else:
@@ -644,7 +643,7 @@ async def test_each_retained_effect_refuses_operation_time_race_without_mutation
 ) -> None:
     """Every mutating seam reacquires the exact lease before its downstream effect."""
     from mimir_cultivate import repository as repo_module
-    from mimir.worklink import worker_client
+    from mimir_cultivate.worklink import worker_client
 
     case = retained_incident
     _initialize_retained_repository(case)
@@ -654,20 +653,20 @@ async def test_each_retained_effect_refuses_operation_time_race_without_mutation
         "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
     )
     monkeypatch.setattr(
         "mimir_cultivate.worklink.retained_scope.factory_process_is_alive",
         lambda _record: race == "live",
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope.factory_process_is_alive", lambda _record: race == "live",
+        "mimir_cultivate.worklink.retained_scope.factory_process_is_alive", lambda _record: race == "live",
     )
     monkeypatch.setattr(
         "mimir_cultivate.worklink.retained_scope.factory_process_is_verified_dead", lambda _record: True,
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope.factory_process_is_verified_dead", lambda _record: True,
+        "mimir_cultivate.worklink.retained_scope.factory_process_is_verified_dead", lambda _record: True,
     )
     if race == "replaced":
         save_factory_record(case.home, replace(case.record, branch="replacement"))
@@ -693,7 +692,7 @@ async def test_each_retained_effect_refuses_operation_time_race_without_mutation
     monkeypatch.setattr(repo_module.RepoProjectTests, "execute", project_test)
 
     if race == "interlock":
-        from mimir.worklink.factory_state import factory_checkout_interlock
+        from mimir_cultivate.worklink.factory_state import factory_checkout_interlock
 
         outer = factory_checkout_interlock(case.home, pruning=True)
     else:
@@ -792,8 +791,7 @@ def test_resource_lock_hardening_fails_closed(
                 return SimpleNamespace(**values)
             return value
 
-        from mimir.worklink import factory_state
-
+        from mimir_cultivate.worklink import factory_state
         monkeypatch.setattr(factory_state.os, "fstat", foreign_owner)
     with factory_issue_resource_lock(tmp_path, 1810) as acquired:
         assert acquired is False
@@ -833,7 +831,7 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
 ) -> None:
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
     from mimir_cultivate import repository as repo_module
-    from mimir.worklink import worker_client
+    from mimir_cultivate.worklink import worker_client
 
     case = retained_incident
     _initialize_retained_repository(case)
@@ -843,7 +841,7 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
     scope = derive_retained_factory_scope(case.event, case.service).scope
     assert scope is not None
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
     )
     monkeypatch.setattr(
         "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
@@ -1086,7 +1084,7 @@ async def test_each_retained_repo_operation_refuses_stale_occurrence_before_exec
     retained_incident, monkeypatch: pytest.MonkeyPatch, operation: str,
 ) -> None:
     from mimir_cultivate import repository as repo_module
-    from mimir.worklink import worker_client
+    from mimir_cultivate.worklink import worker_client
 
     case = retained_incident
     scope = derive_retained_factory_scope(case.event, case.service).scope

@@ -1,4 +1,5 @@
 #!/bin/sh
+# factory-version: 0.10.18
 set -eu
 apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg git jq procps ripgrep xz-utils \

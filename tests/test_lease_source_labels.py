@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -26,11 +27,11 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
-    RepoPRActionScope,
-    RepoReviewState,
     SourceLabel,
     TurnInteractivity,
 )
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.policy import RepoPRActionScope, RepoReviewState
 from tests.lease_attestation_helper import assert_lease_attested
 
 
@@ -154,6 +155,8 @@ def _auth(
     scope: RepoPRActionScope | None = None,
     recorded_verdict: bool = True,
 ) -> AuthContext:
+    from mimir.plugins.core import selected_policy_registry
+
     current = labels or InformationFlowLabels()
     scope = scope or _scope(
         repository, pr_number=pr_number, observed_head_sha=observed_head_sha,
@@ -173,6 +176,7 @@ def _auth(
         ifc_labels=current,
         ifc_state=state,
         repo_pr_action_scope=scope,
+        _plugin_slot_policy=selected_policy_registry(),
     )
 
 
@@ -206,10 +210,9 @@ def _real_attested_lease(tmp_path: Path, *, author: str = "collaborator"):
         "pr_number": scope.pr_number, "head_sha": head,
         "base_sha": lease.base_sha, "lineage": {},
     }))
-    auth = _auth(scope=scope)
     state = RepoReviewState(scope)
     state.attach_checkout_lease(lease)
-    object.__setattr__(auth, "repo_review_state", state)
+    auth = replace(_auth(scope=scope), repo_review_state=state)
     return auth, scope, lease, target, (DEFAULT_USER_NAME, DEFAULT_USER_EMAIL)
 
 
@@ -501,7 +504,7 @@ async def test_repo_test_red_run_remediation_sequence(
         assert result["stdout"] == output.decode()
         assert result["stderr"] == "untrusted stderr"
     if state_carrier != "alias":
-        from mimir.models import ServerDiscoveredPRStates, RepoPRScopeRegistry
+        from mimir_cultivate.policy import ServerDiscoveredPRStates, RepoPRScopeRegistry
         cache = ServerDiscoveredPRStates()
         cache.remember(state)
         object.__setattr__(auth, "server_discovered_pr_states", cache)
@@ -1186,10 +1189,12 @@ def test_ci_run_provenance_requires_protected_or_attested_head(
     auth, scope, _, _, _ = _real_attested_lease(tmp_path)
     if sha == "unattested":
         auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
-    from mimir.models import RepoPRScopeRegistry
-    object.__setattr__(auth, "repo_pr_scope_registry", RepoPRScopeRegistry((auth.repo_review_state,)))
-    object.__setattr__(auth, "ci_run_targets", frozenset({("owner/repo", 42)}))
-    object.__setattr__(auth, "ci_branch_targets", frozenset({("owner/repo", branch, None)}))
+    from mimir_cultivate.policy import RepoPRScopeRegistry
+    auth = replace(
+        auth, repo_pr_scope_registry=RepoPRScopeRegistry((auth.repo_review_state,)),
+        ci_run_targets=frozenset({("owner/repo", 42)}),
+        ci_branch_targets=frozenset({("owner/repo", branch, None)}),
+    )
     run = {"id": 42, "head_sha": scope.observed_head_sha if sha in {"attested", "unattested"} else sha,
            "head_branch": "main" if branch == "fork" else branch,
            "head_repository": "other/repo" if branch == "fork" else "owner/repo"}
@@ -1241,8 +1246,10 @@ def test_ci_classifier_refuses_nonretained_plugin_provenance(monkeypatch, tool_n
         suffix = "/jobs" if tool_name == "ci_run_jobs" else ""
         resource_id = f"owner/repo#actions/run/42{suffix}"
         other_resource = f"owner/repo#actions/run/43{suffix}"
-    object.__setattr__(auth, "ci_run_targets", frozenset({("owner/repo", 42)}))
-    object.__setattr__(auth, "ci_branch_targets", frozenset({("owner/repo", "main", 7)}))
+    auth = replace(
+        auth, ci_run_targets=frozenset({("owner/repo", 42)}),
+        ci_branch_targets=frozenset({("owner/repo", "main", 7)}),
+    )
     fields = dict(
         principal="operator", domain="repository", resource_id=resource_id,
         bridge_instance="forge", sensitivity="internal",
@@ -1322,7 +1329,7 @@ def test_ci_jobs_api_error_after_run_attestation_keeps_turn_clean(tmp_path, monk
     from mimir_cultivate import forge
 
     auth, scope, _, _, _ = _real_attested_lease(tmp_path)
-    object.__setattr__(auth, "ci_run_targets", frozenset({("owner/repo", 42)}))
+    auth = replace(auth, ci_run_targets=frozenset({("owner/repo", 42)}))
     monkeypatch.setattr(access_control_module, "is_configured_github_repo", lambda *_: True)
     monkeypatch.setattr(forge, "_client_for_repository", lambda *_: SimpleNamespace(
         get_run=lambda *_: {"id": 42, "head_branch": "main", "head_sha": "c" * 40,
@@ -1648,7 +1655,6 @@ def test_protected_base_lineage_keeps_file_reads_trusted_but_plugin_results_inco
     scope = replace(original, destination_ref="refs/heads/main", observed_base_sha=base)
     object.__setattr__(lease, "scope_id", scope.scope_id)
     object.__setattr__(lease, "base_sha", base)
-    object.__setattr__(auth, "repo_pr_action_scope", scope)
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
     state = RepoReviewState(scope)
     state.attach_checkout_lease(lease)
@@ -1660,7 +1666,7 @@ def test_protected_base_lineage_keeps_file_reads_trusted_but_plugin_results_inco
         check=True, capture_output=True, text=True,
     ).stdout.splitlines()
     _record_clean_head(lease, *descendants)
-    object.__setattr__(auth, "repo_review_state", state)
+    auth = replace(auth, repo_pr_action_scope=scope, repo_review_state=state)
     assert_lease_attested(auth, scope, lease)
     selected = selected_policy_registry()
     monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(

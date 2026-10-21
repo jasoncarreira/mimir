@@ -18,8 +18,9 @@ from mimir.access_control import (
     build_trigger_service_principal,
     service_filesystem_read_roots,
 )
-from mimir.models import AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState
 pytest.importorskip("mimir_cultivate")
+from mimir.models import AuthContext
+from mimir_cultivate.policy import RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState
 from mimir_cultivate.repository import PRCheckoutLease
 from mimir.read_policy import configured_non_admin_read_roots, resolve_non_admin_read_target
 from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file_tool_routes

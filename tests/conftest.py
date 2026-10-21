@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import asyncio
 import os
 import shlex
 import shutil
@@ -174,6 +175,7 @@ def synthetic_worklink_identities(monkeypatch, request):
         "mimir.worklink.worker_exec",
         "mimir_cultivate.contained_checkout",
         "mimir_cultivate.worklink.checkout",
+        "mimir_cultivate.worklink.worker_exec",
     )
     for module_name in existing_modules:
         module = sys.modules.get(module_name)
@@ -266,7 +268,10 @@ def repo_review_git_root(tmp_path):
 @pytest.fixture
 def repo_review_state(repo_review_git_root):
     """A real inspection root with all former remediation grants enabled."""
-    from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
+    pytest.importorskip("mimir_cultivate", reason="PR review state belongs to Cultivate")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate.policy import RepoPRAction, RepoPRActionScope, RepoReviewState
 
     state = RepoReviewState(RepoPRActionScope(
         provenance="poller_payload", canonical_repo="o/r",
@@ -284,7 +289,70 @@ def repo_review_state(repo_review_git_root):
         scope_id=state.action_scope.scope_id, owner=state.action_scope.principal,
         is_active=True,
     ))
-    return state
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield state
+
+
+@pytest.fixture
+def authorized_fake_backend_gate(monkeypatch):
+    """Exercise mock backends' gates against a real, FD-bound test checkout."""
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.checkout import _mint_checkout_authorization
+    from mimir_cultivate.worklink.compute import (
+        ComputeResult, LaunchHandle, LocalSubprocessComputeBackend,
+    )
+    from mimir_cultivate.worklink.evidence import _command_with_pytest_report
+
+    observe = orchestrator.observe_evidence
+
+    async def observed(**kwargs):
+        if kwargs.get("backend") != "fake" or kwargs.get("test_command") is None:
+            return await observe(**kwargs)
+        checkout = kwargs["checkout"]
+        fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        with _mint_checkout_authorization(
+            checkout, kwargs["issue"], kwargs["attempt"], fd,
+        ) as authorization:
+            worker = LocalSubprocessComputeBackend.for_authorized_checkout(authorization)
+            results = {}
+
+            async def launch(spec, argv):
+                authorization.verify(spec.local_checkout)
+                command = argv[2]
+                if command.startswith(("pytest ", "uv run pytest ")):
+                    options = shlex.split(spec.env["PYTEST_ADDOPTS"])
+                    report = Path([
+                        option.partition("=")[2] for option in options
+                        if option.startswith("--junitxml=")
+                    ][-1]).parent
+                    if not report.is_absolute():
+                        report = checkout / report
+                    command = _command_with_pytest_report(command, report)
+                try:
+                    result = await asyncio.to_thread(
+                        kwargs["runner"], command, cwd=checkout, timeout=spec.timeout_s,
+                    )
+                    observed_result = ComputeResult(
+                        result.returncode, result.stdout or "", result.stderr or "",
+                    )
+                except subprocess.TimeoutExpired:
+                    observed_result = ComputeResult(124, "", "", timed_out=True)
+                handle = LaunchHandle("local_subprocess", f"gate-{len(results) + 1}")
+                results[handle.identifier] = observed_result
+                return handle
+
+            async def wait(handle, _timeout):
+                return results[handle.identifier]
+
+            async def cleanup(handle):
+                results.pop(handle.identifier, None)
+
+            worker._launch_contained = launch
+            worker.wait = wait
+            worker.cleanup = cleanup
+            return await observe(**{**kwargs, "compute": worker})
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observed)
 
 
 # Host-only Mimir settings: set by an operator or a deployment, never by a test.

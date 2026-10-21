@@ -4,6 +4,7 @@ import asyncio
 import errno
 import os
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -11,6 +12,28 @@ import pytest
 pytest.importorskip("mimir_cultivate", reason="Worklink compute belongs to Cultivate")
 
 from mimir_cultivate.worklink import compute, run_state
+
+
+def test_authorized_checkout_binds_configured_worker_uid(monkeypatch, tmp_path) -> None:
+    from mimir_cultivate.worklink import identities
+    from mimir_cultivate.worklink.checkout import _mint_checkout_authorization
+
+    monkeypatch.setattr(
+        identities, "get_identities", lambda: SimpleNamespace(worklink_uid=4242),
+    )
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    with _mint_checkout_authorization(tmp_path, 17, 1, fd) as authorization:
+        worker = compute.LocalSubprocessComputeBackend.for_authorized_checkout(
+            authorization, worker_uid=4242,
+        )
+        assert worker._authorized_checkout is authorization
+        assert worker._worker_uid == 4242
+        authorization.verify(tmp_path)
+        for wrong_uid in (4243, -1, True, "4242"):
+            with pytest.raises(ValueError, match="configured worker identity"):
+                compute.LocalSubprocessComputeBackend.for_authorized_checkout(
+                    authorization, worker_uid=wrong_uid,
+                )
 
 
 @pytest.mark.asyncio

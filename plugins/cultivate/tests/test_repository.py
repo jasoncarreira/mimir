@@ -295,7 +295,7 @@ def test_provider_checkout_handoff_and_live_result_observation(
 async def test_provider_project_tests_run_fixed_command_in_contained_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
 
     _origin, _source, _scope, state = _repo_scope_and_state(tmp_path)
     home = tmp_path / "home"

@@ -17,8 +17,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mimir.worklink.backends.feature_factory import FACTORY_VERSION
-from mimir.worklink.tool_pins import OPENCODE_VERSION
+FACTORY_VERSION = "0.10.18"
+OPENCODE_VERSION = "1.18.21"
 from mimir.plugin_dockerfile import main as assemble_main, verify_pins
 
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"

@@ -58,6 +58,7 @@ class ScopedActionProtocol:
 class TrustedScopeConstructors:
     """Owner-bound constructors called only after trusted ingress validates input."""
 
+    scope_type: type
     issue: Callable[..., Any]
     review: Callable[..., Any]
     registry: Callable[..., Any]
@@ -77,6 +78,7 @@ class PolicyConsumerHooks:
     agent_push: Callable[..., bool]
     tracked_file: Callable[..., bool]
     derive_retained_scope: Callable[..., Any]
+    action_for: Callable[[str], Any]
     retained_checkout_root: Callable[[], Any]
     active_checkout: Callable[..., Any]
     git_command: Callable[..., Any]
@@ -497,7 +499,7 @@ class PolicyRegistry:
                 or any(not callable(getattr(hooks, name)) for name in (
                     "resolve_review", "revalidate_head", "resolve_issue", "superseded_push",
                     "verified_push", "agent_push", "tracked_file",
-                    "derive_retained_scope", "retained_checkout_root", "active_checkout", "git_command", "lineage",
+                    "derive_retained_scope", "action_for", "retained_checkout_root", "active_checkout", "git_command", "lineage",
                     "verified_base", "git_env", "review_submission", "claim_review",
                     "repository_inventory", "repository_selection", "shell_environment",
                 )) or not isinstance(hooks.protected_refs, frozenset)
@@ -527,6 +529,7 @@ class PolicyRegistry:
                 or (trusted_scope is not None and (
                     not self._selected_first_party(owner)
                     or type(trusted_scope) is not TrustedScopeConstructors
+                    or not isinstance(trusted_scope.scope_type, type)
                     or any(not callable(getattr(trusted_scope, name)) for name in (
                         "issue", "review", "registry", "discovered", "store", "retained",
                     ))

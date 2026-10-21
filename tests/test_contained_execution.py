@@ -10,9 +10,11 @@ from typing import Any
 import pytest
 from tests.timing import HANG_GUARD_SECONDS
 
-import mimir.contained_execution as contained
+pytest.importorskip("mimir_cultivate", reason="Contained execution belongs to Cultivate")
+
+import mimir_cultivate.contained_execution as contained
 import mimir.output_capture as output_capture
-from mimir.contained_execution import (
+from mimir_cultivate.contained_execution import (
     SensitiveMaterialScrubber,
     base_worker_environment,
     execute_contained,

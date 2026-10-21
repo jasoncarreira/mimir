@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import hmac
 import http.client
 import json
@@ -32,11 +33,11 @@ from mimir.access_control import (
 from mimir.models import (
     AuthContext,
     InformationFlowLabels,
-    RepoPRAction,
-    RepoPRActionScope,
-    RepoReviewState,
-    ServerDiscoveredPRStates,
 )
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.policy import (
+        RepoPRAction, RepoPRActionScope, RepoReviewState, ServerDiscoveredPRStates,
+    )
 from mimir import outbound_privacy
 from mimir.outbound_privacy import scan_outbound
 from mimir.read_policy import _has_protected_read_name, is_protected_read_path
@@ -715,7 +716,7 @@ def test_github_text_credentials_are_refused_on_both_paths(
     executed: list[bool] = []
 
     from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
-    from mimir.models import RepoPRScopeRegistry
+    from mimir_cultivate.policy import RepoPRScopeRegistry
     from mimir.plugins.manager import load_plugins
     from tests.test_repo_tools import _repo_scope_and_state
 

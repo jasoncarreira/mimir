@@ -25,6 +25,7 @@ import asyncio
 import builtins
 import contextvars
 import fcntl
+import importlib.util
 import json
 import os
 import subprocess
@@ -58,14 +59,14 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
-    RepoPRAction,
-    RepoPRActionScope,
-    RepoPRScopeRegistry,
-    RepoReviewState,
-    ServerDiscoveredPRStates,
     SourceLabel,
     TurnContext,
 )
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.policy import (
+        RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry,
+        RepoReviewState, ServerDiscoveredPRStates,
+    )
 from mimir.identities import IdentityResolver
 from mimir.plugins.core import register_core_tools
 from mimir.plugins.registry import PolicyRegistry
@@ -7485,6 +7486,7 @@ def test_checkout_proof_has_no_legacy_shell_adapter() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("execution_path", ["sync", "async"])
 @pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.usefixtures("selected_repository_policy")
 async def test_repo_review_shell_cutover_cannot_create_checkout_proof(
     execution_path: str,
     enforce: bool,
@@ -7493,6 +7495,7 @@ async def test_repo_review_shell_cutover_cannot_create_checkout_proof(
     maintenance_pinned_executables: dict[str, Path],
 ) -> None:
     from mimir.access_control import CapabilityTier, build_trigger_service_principal
+    from mimir.plugins.core import selected_policy_registry
 
     root = tmp_path / "repo"
     root.mkdir()
@@ -7533,6 +7536,7 @@ async def test_repo_review_shell_cutover_cannot_create_checkout_proof(
         is_service=True, service_authority=service, enforcement_enabled=enforce,
         ifc_labels=InformationFlowLabels(),
         repo_review_state=state, repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        _plugin_slot_policy=selected_policy_registry(),
     )
     seen: list[list[str]] = []
 

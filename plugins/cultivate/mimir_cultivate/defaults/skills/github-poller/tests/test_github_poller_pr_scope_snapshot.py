@@ -18,7 +18,9 @@ import pytest
 from github_poller_test_support import poller
 from mimir import access_control
 from mimir.access_control import _repo_pr_scope
-from mimir.models import RepoPRAction
+from mimir.plugins.core import policy_scope
+from mimir.plugins.manager import load_plugins
+from mimir_cultivate.policy import RepoPRAction, RepoPRScopeProvenance
 
 REPO = "owner/repo"
 SELF = "mimir-carreira"
@@ -35,6 +37,8 @@ def _scope_preconditions(monkeypatch: pytest.MonkeyPatch):
             ("/server/configured/repo",), 1,
         ),
     )
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
 
 
 def _full_pr(number: int, *, author: str = "alice", head_repo: str = REPO) -> dict:
@@ -60,7 +64,7 @@ def _full_pr(number: int, *, author: str = "alice", head_repo: str = REPO) -> di
 def _scope_from(event: dict):
     """Issue a scope from an emitted event exactly as the framework does."""
     return _repo_pr_scope(
-        provenance=access_control.RepoPRScopeProvenance.POLLER_PAYLOAD,
+        provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
         repo=event.get("repo"),
         principal=event.get("pr_author") if event.get("event_type") == "pr_synchronize"
         else event.get("author"),

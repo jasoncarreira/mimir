@@ -165,12 +165,12 @@ def test_core_only_config_boots_with_repository_file_without_loading_provider(tm
 import sys
 from mimir.config import Config
 from mimir import access_control
-from mimir.worklink import orchestrator, merge_closure
 config = Config.from_env()
 assert config.plugin_manager.policy.policy_consumer_hooks is None
 assert access_control._repository_inventory(str(config.home)) is None
 assert access_control._configured_repo_write_roots() == []
 assert 'mimir.repository_config' not in sys.modules
+assert not any(name == 'mimir.worklink' or name.startswith('mimir.worklink.') for name in sys.modules)
 assert 'mimir_cultivate' not in sys.modules
 """
     env = {**os.environ, "MIMIR_PLUGINS": "", "MIMIR_HOME": str(tmp_path)}

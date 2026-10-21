@@ -112,7 +112,7 @@ assert not names & {'repo_status', 'pr_job_log', 'spawn_open_code'}
 
 def test_selected_provider_tool_inventory_has_no_duplicate_names():
     selected = load_plugins(enable="cultivate").policy
-    tools = all_mimir_tools("openai:test", policy=selected, coding_enabled=False)
+    tools = all_mimir_tools("openai:test", policy=selected, require_provider_available=False)
     names = [tool.name for tool in tools]
     assert len(names) == len(set(names))
     assert {"worklink_run", "worklink_resume", "repo_status"} <= set(names)

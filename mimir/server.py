@@ -1144,12 +1144,11 @@ def build_app(config: Config) -> web.Application:
     # Preserve the early dependency preflight: selected provider prerequisites
     # fail before broader server construction when the runtime is absent.
     from .tools import all_mimir_tools
-    requested_coding = getattr(config, "coding_enabled", False)
     manager = getattr(config, "plugin_manager", None)
     if manager is None:
-        all_mimir_tools(coding_enabled=requested_coding)
+        all_mimir_tools()
     else:
-        all_mimir_tools(coding_enabled=requested_coding, policy=manager.policy,
+        all_mimir_tools(policy=manager.policy,
                         materialize_plugins=False)
 
     process_session_id = make_process_session_id()
@@ -1800,7 +1799,6 @@ def build_app(config: Config) -> web.Application:
         derived_lease_read_root = derived_pr_checkout_read_root()
         await log_event(
             "filesystem_read_scope",
-            coding_enabled=config.coding_enabled,
             derived_pr_checkout_read_roots=(
                 [str(derived_lease_read_root)] if derived_lease_read_root is not None else []
             ),

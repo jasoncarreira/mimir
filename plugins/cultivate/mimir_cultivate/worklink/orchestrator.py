@@ -1181,8 +1181,11 @@ class WorklinkRunner:
             if worker_uid_drop:
                 if not isinstance(compute, LocalSubprocessComputeBackend):
                     raise WorklinkError("worker uid drop requires local subprocess compute")
-                compute = LocalSubprocessComputeBackend.for_path_checkout(
-                    get_identities().worklink_uid
+                if not lease.worker_authorized or lease.authorization is None:
+                    raise WorklinkError("selected worker requires an issued checkout authorization")
+                lease.authorization.verify(lease.path)
+                compute = LocalSubprocessComputeBackend.for_authorized_checkout(
+                    lease.authorization, worker_uid=get_identities().worklink_uid,
                 )
                 checkout_fd = os.open(
                     lease.path,

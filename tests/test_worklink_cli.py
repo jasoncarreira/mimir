@@ -17,27 +17,24 @@ from unittest.mock import AsyncMock, Mock, call
 import pytest
 
 from mimir.cli import main
-from mimir.worklink.orchestrator import WorklinkRunResult
-from mimir.worklink.control import (
-    archive_worklink_factory_records, reconcile_run_states, stop_worklink, worklink_status,
-)
-from mimir.worklink import autonomy
-from mimir.worklink.autonomy import check_concurrency
-from mimir.worklink.backends.feature_factory import parse_factory_status
-from mimir.worklink.claims import ChainlinkClaims
-from mimir.worklink.compute import LaunchHandle
-from mimir.worklink.factory_state import (
-    FactoryRunRecord, factory_checkout_interlock, factory_issue_resource_lock,
-    load_factory_record, save_factory_record,
-)
-from mimir.worklink.run_state import (
-    OrphanBlockRecord,
-    WorklinkRunState,
-    load_orphan_block_record,
-    load_run_state,
-    process_start_ticks,
-    save_run_state,
-)
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.worklink.orchestrator import WorklinkRunResult
+    from mimir_cultivate.worklink.control import (
+        archive_worklink_factory_records, reconcile_run_states, stop_worklink, worklink_status,
+    )
+    from mimir_cultivate.worklink import autonomy
+    from mimir_cultivate.worklink.autonomy import check_concurrency
+    from mimir_cultivate.worklink.backends.feature_factory import parse_factory_status
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+    from mimir_cultivate.worklink.compute import LaunchHandle
+    from mimir_cultivate.worklink.factory_state import (
+        FactoryRunRecord, factory_checkout_interlock, factory_issue_resource_lock,
+        load_factory_record, save_factory_record,
+    )
+    from mimir_cultivate.worklink.run_state import (
+        OrphanBlockRecord, WorklinkRunState, load_orphan_block_record,
+        load_run_state, process_start_ticks, save_run_state,
+    )
 
 
 _PROVIDER_CLI_CASES = frozenset({
@@ -68,6 +65,9 @@ _PROVIDER_CLI_CASES = frozenset({
 
 @pytest.fixture(autouse=True)
 def _select_cultivate_for_cli(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    if request.node.name.split("[", 1)[0] == "test_core_cli_does_not_register_worklink":
+        return
+    pytest.importorskip("mimir_cultivate", reason="Worklink CLI belongs to Cultivate")
     if request.node.name.split("[", 1)[0] not in _PROVIDER_CLI_CASES:
         return
     if importlib.util.find_spec("mimir_cultivate") is None:
@@ -500,7 +500,7 @@ def test_worklink_cli_rejects_unknown_subcommand(
 def test_worklink_run_failed_without_attempt_prints_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from mimir.worklink.orchestrator import WorklinkRunResult
+    from mimir_cultivate.worklink.orchestrator import WorklinkRunResult
 
     import mimir_cultivate.commands as worklink_cmd
 
@@ -955,7 +955,7 @@ def test_status_reports_labels_unavailable_instead_of_absent(tmp_path: Path) -> 
 
 
 def test_status_bounds_chainlink_subprocesses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import mimir.worklink.control as control
+    import mimir_cultivate.worklink.control as control
 
     calls: list[tuple[list[str], int | None]] = []
 
@@ -1076,11 +1076,11 @@ def test_reconcile_releases_orphan_slot_routes_label_and_leaves_live_lock(
     def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
         if args[1:3] == ["locks", "release"]:
-            from mimir.worklink.dispatch_failures import (
+            from mimir_cultivate.worklink.dispatch_failures import (
                 dispatch_failure_state_dir,
                 load_failure_state,
             )
-            from mimir.worklink.orchestrator import run_worklink
+            from mimir_cultivate.worklink.orchestrator import run_worklink
 
             incident = load_failure_state(dispatch_failure_state_dir(tmp_path))[
                 "issues"
@@ -1171,7 +1171,7 @@ def test_reconcile_releases_orphan_slot_routes_label_and_leaves_live_lock(
 def test_orphan_incident_write_failure_preserves_claim_labels_and_run_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.dispatch_failures as dispatch_failures
+    import mimir_cultivate.worklink.dispatch_failures as dispatch_failures
 
     now = datetime.now(UTC)
     state = _state(
@@ -1498,7 +1498,7 @@ def test_pruner_preserves_unpublished_checkout_and_different_block_reason(
 
     record = load_orphan_block_record(tmp_path, 17)
     assert record is not None
-    from mimir.worklink.run_state import save_orphan_block_record
+    from mimir_cultivate.worklink.run_state import save_orphan_block_record
 
     save_orphan_block_record(tmp_path, replace(record, publication_outcome="undetermined"))
     comments.append(
@@ -1509,7 +1509,7 @@ def test_pruner_preserves_unpublished_checkout_and_different_block_reason(
 
 
 def test_old_prune_cannot_clear_new_attempt_block(tmp_path: Path) -> None:
-    from mimir.worklink.run_state import save_orphan_block_record
+    from mimir_cultivate.worklink.run_state import save_orphan_block_record
 
     old = OrphanBlockRecord(
         issue_id=18,
@@ -1703,7 +1703,7 @@ def test_factory_stop_refuses_unverified_or_reused_process_identity(
 ) -> None:
     from types import SimpleNamespace
 
-    import mimir.worklink.control as control
+    import mimir_cultivate.worklink.control as control
 
     monkeypatch.setattr(control, "load_run_state", lambda home, issue_id: None)
     record = SimpleNamespace(run_id="chainlink-700", handle=LaunchHandle("local_subprocess", "4321", 99))
@@ -1793,7 +1793,7 @@ def test_stop_cli_reports_rejected_factory_identity(
 def test_stop_cli_refuses_unverified_live_leaf(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    import mimir.worklink.control as control
+    import mimir_cultivate.worklink.control as control
 
     state = _state(tmp_path, 700, os.getpid(), ticks=None, started_at=datetime.now(UTC))
 

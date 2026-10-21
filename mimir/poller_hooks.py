@@ -44,10 +44,6 @@ def _github_recovery(poller: "PollerConfig") -> "RelevanceFn":
     return github_recovery_relevance_check(token)
 
 
-def _worklink_recovery(poller: "PollerConfig") -> "RelevanceFn":
-    return worklink_recovery_relevance_check(poller.resolved_persist_dir())
-
-
 def github_recovery_relevance_check(token: str) -> "RelevanceFn":
     """Compatibility entry point for the GitHub skill's recovery hook."""
     from . import pollers
@@ -110,42 +106,19 @@ def github_recovery_relevance_check(token: str) -> "RelevanceFn":
     return check
 
 
-def worklink_recovery_relevance_check(persist_dir: Path) -> "RelevanceFn":
-    """Compatibility entry point for Worklink's recovery hook."""
-    from .worklink.poller_hooks import recovery_relevance_check
-
-    return recovery_relevance_check(persist_dir)
-
-
-def _worklink_receipt_liveness(
-    persist_dir: Path,
-    home: Path | None,
-    prune_stale: PruneStaleReceipts,
-) -> None:
-    from .worklink.poller_hooks import report_live_delivery_receipts
-
-    report_live_delivery_receipts(persist_dir, home, prune_stale)
-
-
 _CORE_HOOK_PROFILES = {
     "github": PollerHookProfile(
         skill="github-poller",
         reserved_name="github-activity",
         hooks=PollerHooks(recovery_relevance=_github_recovery),
     ),
-    "worklink": PollerHookProfile(
-        skill="chainlink-orchestrator",
-        reserved_name="worklink-ready-queue",
-        hooks=PollerHooks(
-            recovery_relevance=_worklink_recovery,
-            receipt_liveness=_worklink_receipt_liveness,
-        ),
-    ),
 }
 
 
 def reserved_hook_profile_for_name(name: str) -> str | None:
     """Return the hook profile expected by a reserved poller name."""
+    if name == "worklink-ready-queue":
+        return "worklink"
     for profile_name, profile in _CORE_HOOK_PROFILES.items():
         if profile.reserved_name == name:
             return profile_name
@@ -156,6 +129,8 @@ def reserved_skill_for_name(name: str) -> str | None:
     """Return the only skill allowed to claim a reserved poller name."""
     if name == "github-ci-watch":
         return "github-ci-watch"
+    if name == "worklink-ready-queue":
+        return "chainlink-orchestrator"
     profile_name = reserved_hook_profile_for_name(name)
     if profile_name is None:
         return None
@@ -171,10 +146,11 @@ def resolve_poller_hooks(
         return None
     if not isinstance(raw, str):
         raise ValueError(f"unknown poller hooks profile: {raw!r}")
-    if raw == "worklink" and plugin_owner is not None:
+    if raw == "worklink":
         registered = policy.poller_hooks.get(raw) if policy is not None else None
-        if (plugin_owner != "cultivate" or manifest_path.parent.name != "chainlink-orchestrator"
-                or registered is None or registered[0] != plugin_owner):
+        if (plugin_owner not in (None, "cultivate")
+                or manifest_path.parent.name != "chainlink-orchestrator"
+                or registered is None or registered[0] != "cultivate"):
             raise ValueError(f"reserved or foreign poller hooks profile: {raw!r}")
         hooks = registered[1]()
         if not isinstance(hooks, PollerHooks):

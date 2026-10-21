@@ -51,9 +51,6 @@ from .identities import AccessMetadata
 from .memory_proposals import is_protected_model_path
 from .models import (
     NormalizedPullRequestSnapshot,
-    RetainedFactoryScope,
-    RepoPRAction,
-    RepoPRScopeProvenance,
     SourceKind,
 )
 from .read_policy import (
@@ -670,14 +667,12 @@ def current_turn_scratch_root() -> Path | None:
     return path
 
 
-def worklink_retained_checkout_root() -> Path:
-    """Return Worklink's code-defined retained-checkout root."""
+def worklink_retained_checkout_root() -> Path | None:
+    """Return the selected owner's retained-checkout root, if registered."""
     hooks = selected_policy_registry().policy_consumer_hooks
     if hooks is not None:
         return Path(hooks.retained_checkout_root())
-    from .worklink.worker_client import WORKLINK_CHECKOUT_ROOT
-
-    return WORKLINK_CHECKOUT_ROOT
+    return None
 
 
 def _is_registered_retained_scope(scope: object) -> bool:
@@ -685,7 +680,16 @@ def _is_registered_retained_scope(scope: object) -> bool:
         constructors = getattr(action, "trusted_scope", None)
         if constructors is not None and type(scope) is constructors.retained:
             return True
-    return isinstance(scope, RetainedFactoryScope)
+    return False
+
+
+def _registered_scope_constructors(auth_context: Any = None) -> Any:
+    policy = getattr(auth_context, "_plugin_slot_policy", None) or selected_policy_registry()
+    return next(
+        (constructors for protocol in policy.scoped_actions.values()
+         if (constructors := getattr(protocol, "trusted_scope", None)) is not None),
+        None,
+    )
 
 
 def _is_worklink_retained_checkout_service(
@@ -745,7 +749,9 @@ def service_filesystem_read_roots(
             if lease is not None and _target_within_active_pr_checkout_lease(str(lease.path), state):
                 roots.append(Path(lease.path))
     if _is_worklink_retained_checkout_service(service, auth_context=auth_context):
-        roots.append(worklink_retained_checkout_root())
+        retained_root = worklink_retained_checkout_root()
+        if retained_root is not None:
+            roots.append(retained_root)
     if (
         getattr(service, "trigger", None) == "poller"
         and str(getattr(service, "canonical", "")).startswith("poller:")
@@ -771,7 +777,10 @@ def service_shell_filesystem_read_roots(
     roots = service_filesystem_read_roots(service, auth_context=auth_context)
     if not _is_worklink_retained_checkout_service(service, auth_context=auth_context):
         return roots
-    retained = worklink_retained_checkout_root().resolve(strict=False)
+    retained_root = worklink_retained_checkout_root()
+    if retained_root is None:
+        return roots
+    retained = retained_root.resolve(strict=False)
     static_roots = {
         Path(root).resolve(strict=False)
         for root in getattr(service, "filesystem_read_roots", ())
@@ -913,29 +922,6 @@ def _valid_git_branch(value: object) -> bool:
     )
 
 
-_REPO_PR_REMEDIATION_ACTIONS = frozenset({
-    RepoPRAction.INSPECT.value,
-    RepoPRAction.CHECKOUT.value,
-    RepoPRAction.TEST.value,
-    RepoPRAction.WRITE.value,
-    RepoPRAction.COMMIT.value,
-    RepoPRAction.PUSH.value,
-    RepoPRAction.PR_COMMENT.value,
-    RepoPRAction.PR_EDIT.value,
-    RepoPRAction.PR_REREQUEST.value,
-})
-_REPO_PR_CI_REMEDIATION_ACTIONS = _REPO_PR_REMEDIATION_ACTIONS - frozenset({
-    RepoPRAction.PR_EDIT.value,
-    RepoPRAction.PR_REREQUEST.value,
-})
-_REPO_PR_CONFLICT_RESOLUTION_ACTIONS = _REPO_PR_REMEDIATION_ACTIONS
-_REPO_PR_REVIEW_ACTIONS = frozenset({
-    RepoPRAction.INSPECT.value,
-    RepoPRAction.CHECKOUT.value,
-    RepoPRAction.TEST.value,
-    RepoPRAction.PR_REVIEW.value,
-    RepoPRAction.PR_COMMENT.value,
-})
 def _typed_action_view(*memberships: str) -> Mapping[str, str | None]:
     return PolicyMappingView(lambda policy: {
         name: tool.typed_action.value if tool.typed_action is not None else None
@@ -1166,14 +1152,14 @@ def _repo_pr_scope_resolution(
         return RepoPRScopeResolution(
             refusal_reason="pull-request operation rejected: live pull request is closed or invalid"
         )
-    from .models import RepoPRActionScope
-
     policy = policy if policy is not None else selected_policy_registry()
     constructors = next(
         (protocol.trusted_scope for protocol in policy.scoped_actions.values()
          if protocol.trusted_scope is not None), None,
     )
-    scope_type = constructors.issue if constructors is not None else RepoPRActionScope
+    if constructors is None:
+        return RepoPRScopeResolution(refusal_reason="no selected scoped-action owner")
+    scope_type = constructors.issue
     scope_fields = dict(
         provenance=provenance,
         canonical_repo=repo,
@@ -1191,17 +1177,8 @@ def _repo_pr_scope_resolution(
         checkout_ref=None if is_remediation else f"refs/pull/{number}/head",
         pull_request_author=principal,
     )
-    if constructors is not None:
-        return RepoPRScopeResolution(scope=scope_type(
-            is_remediation=is_remediation, **scope_fields,
-        ))
-    operations = (
-        _REPO_PR_CI_REMEDIATION_ACTIONS if event_type == "pr_ci_failure"
-        else _REPO_PR_REMEDIATION_ACTIONS if is_remediation
-        else _REPO_PR_REVIEW_ACTIONS
-    )
     return RepoPRScopeResolution(scope=scope_type(
-        allowed_operations=operations, **scope_fields,
+        is_remediation=is_remediation, **scope_fields,
     ))
 
 
@@ -1256,7 +1233,7 @@ def create_server_discovered_heartbeat_scope(
     ):
         return None
     return _repo_pr_scope(
-        provenance=RepoPRScopeProvenance.SERVER_DISCOVERED,
+        provenance="server_discovered",
         repo=repo,
         principal=pull_request.author,
         event_type=event_type,
@@ -1301,7 +1278,7 @@ def resolve_server_discovered_review_scope(
             refusal_reason="pull-request operation rejected: live pull request is closed or invalid"
         )
     return _repo_pr_scope_resolution(
-        provenance=RepoPRScopeProvenance.SERVER_DISCOVERED,
+        provenance="server_discovered",
         repo=repo,
         principal=pull_request.author,
         event_type="pr_review",
@@ -1331,16 +1308,16 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
     items = event.extra.get("items")
     if not isinstance(items, list):
         return None
-    from .models import RepoPRScopeRegistry, RepoReviewState
-
     constructors = next(
         (protocol.trusted_scope for protocol in (policy or selected_policy_registry()).scoped_actions.values()
          if protocol.trusted_scope is not None), None,
     )
-    review_type = constructors.review if constructors is not None else RepoReviewState
-    registry_type = constructors.registry if constructors is not None else RepoPRScopeRegistry
+    if constructors is None:
+        return None
+    review_type = constructors.review
+    registry_type = constructors.registry
 
-    by_target: dict[tuple[str, int], RepoReviewState | None] = {}
+    by_target: dict[tuple[str, int], Any] = {}
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -1364,7 +1341,7 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
                 continue
         scope = _repo_pr_scope(
             policy=policy,
-            provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
+            provenance="poller_payload",
             repo=item.get("repo"),
             principal=(item.get("pr_author") if item.get("event_type") == "pr_synchronize"
                        else item.get("author")),
@@ -2620,7 +2597,7 @@ def _repo_review_git_execution_argv(argv: list[str], state: Any) -> list[str] | 
     """Bind local-only inspection to an explicit server-owned review root."""
     if (
         not argv or argv[0] != "git"
-        or not _repo_review_action_allowed(state, RepoPRAction.INSPECT)
+        or not _repo_review_action_allowed(state, _registered_review_action("inspect"))
     ):
         return None
     root_text = getattr(state, "root", None)
@@ -2897,10 +2874,17 @@ def _repo_review_git_read_arguments(subcommand: str, arguments: list[str]) -> bo
     return False
 
 
-def _repo_review_action_allowed(review_state: Any, action: RepoPRAction) -> bool:
+def _registered_review_action(name: str, auth_context: Any = None) -> Any:
+    selected = getattr(auth_context, "_plugin_slot_policy", None) or selected_policy_registry()
+    hooks = selected.policy_consumer_hooks
+    return hooks.action_for(name) if hooks is not None else None
+
+
+def _repo_review_action_allowed(review_state: Any, action: Any) -> bool:
     scope = getattr(review_state, "action_scope", None)
     return (
         scope is not None
+        and action is not None
         and action.value in getattr(scope, "allowed_operations", frozenset())
     )
 
@@ -5026,8 +5010,6 @@ def resolve_repository_review_state(
     path: object = None,
 ) -> tuple[Any, str | None]:
     """Resolve one request's PR state without relying on a batched singleton."""
-    from .models import RepoPRScopeRegistry
-
     argv: list[str] = []
     if isinstance(command, str):
         try:
@@ -5053,8 +5035,12 @@ def resolve_repository_review_state(
                 return state, None
 
     registry = getattr(auth_context, "repo_pr_scope_registry", None)
-    if not isinstance(registry, RepoPRScopeRegistry):
-        return getattr(auth_context, "repo_review_state", None), None
+    constructors = _registered_scope_constructors(auth_context)
+    if constructors is None:
+        return None, None
+    if type(registry) is not constructors.registry:
+        state = getattr(auth_context, "repo_review_state", None)
+        return (state if type(state) is constructors.review else None), None
 
     if path is not None:
         state = registry.resolve_checkout_path(path)
@@ -5664,8 +5650,7 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
     service = get_trusted_service_from_auth_context(auth_context)
     policy = service.sink_policy_for("fetch_url") if service is not None else None
     if service is not None and service.github_activity:
-        from .models import RepoPRActionScope
-
+        constructors = _registered_scope_constructors(auth_context)
         # Expanded evidence reads need BOTH manifest authority and the turn's
         # remediation scope; ambient URL approvals must not bypass either.
         try:
@@ -5691,7 +5676,8 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
         if _target_matches_github_pr_api(target, "GITHUB_REPOS"):
             if refusal is not None:
                 return False
-            if isinstance(scope, RepoPRActionScope) and scope.checkout_ref is None:
+            if (constructors is not None and type(scope) is constructors.scope_type
+                    and scope.checkout_ref is None):
                 match = (
                     _GITHUB_PR_API_PATH.fullmatch(parsed.path)
                     if parsed.netloc == "api.github.com"
@@ -5723,12 +5709,12 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
             and not parsed.fragment
             and match is not None
             and refusal is None
-            and isinstance(scope, RepoPRActionScope)
+            and constructors is not None and type(scope) is constructors.scope_type
             and scope.checkout_ref is None
             and scope.pull_request_author == scope.principal
             and scope.head_repo.lower() == scope.canonical_repo.lower()
             and scope.head_remote == "origin"
-            and RepoPRAction.COMMIT.value in scope.allowed_operations
+            and _repo_review_action_allowed(state, _registered_review_action("commit", auth_context))
             and f"{match[1]}/{match[2]}".lower() == scope.canonical_repo.lower()
             and match[3].lower() == scope.observed_head_sha.lower()
         )
@@ -7465,7 +7451,7 @@ class SinkGate:
                     service.authority_profile == "github"
                     # Own-PR heartbeat maintenance repairs conflicts through the
                     # file tools, so it needs the same active-lease write gate as
-                    # poller remediation. The in-lease RepoPRAction.WRITE grant
+                    # poller remediation. The in-lease write grant
                     # check and the out-of-lease denial below are unchanged, so
                     # this widens WHO reaches the gate, never what it permits.
                     or heartbeat_git_authority_enabled(service)
@@ -7484,7 +7470,7 @@ class SinkGate:
                 if target_in_lease:
                     service_target_allowed = True
                     if not _repo_review_action_allowed(
-                        review_state, RepoPRAction.WRITE,
+                        review_state, _registered_review_action("write", auth_context),
                     ):
                         github_repo_scope_refusal = "repo_pr_write_not_granted"
                 elif scope is not None:
@@ -9155,10 +9141,12 @@ def _valid_scoped_pr_grant(
 ) -> bool:
     grants = getattr(auth_context, "scoped_pr_grants", None)
     if (not isinstance(grants, ScopedPRGrants)
-             or protocol is None or protocol.owner != owner
-             or grants._protocols.get(owner) is not protocol
-            or type(action) is not protocol.action_type
-             or scope is None or getattr(scope, "owner", None) != owner
+              or protocol is None or protocol.owner != owner
+              or grants._protocols.get(owner) is not protocol
+             or type(action) is not protocol.action_type
+              or (getattr(protocol, "trusted_scope", None) is not None
+                  and type(scope) is not protocol.trusted_scope.scope_type)
+              or scope is None or getattr(scope, "owner", None) != owner
              or grants.principal != getattr(auth_context, "canonical_principal", None)):
         return False
     slot_policy = getattr(auth_context, "_plugin_slot_policy", None)
@@ -9220,8 +9208,6 @@ def resolve_registered_review_state(
     auth_context: "AuthContext | None", repository: Any, pull_request: Any,
 ) -> Any:
     """Resolve a third-party review only from server-bound turn state."""
-    from .models import RepoPRScopeRegistry
-
     if (not isinstance(repository, str) or not repository.strip()
             or type(pull_request) is not int or pull_request < 1):
         raise ToolException(
@@ -9229,7 +9215,17 @@ def resolve_registered_review_state(
             "must be a positive integer"
         )
     registry = getattr(auth_context, "repo_pr_scope_registry", None)
-    state = registry.resolve(repository, pull_request) if isinstance(registry, RepoPRScopeRegistry) else None
+    constructors = _registered_scope_constructors(auth_context)
+    state = None
+    if constructors is not None and type(registry) is constructors.registry:
+        state = registry.resolve(repository, pull_request)
+    elif constructors is None and callable(getattr(registry, "resolve", None)):
+        grants = getattr(auth_context, "scoped_pr_grants", None)
+        if isinstance(grants, ScopedPRGrants):
+            candidate = registry.resolve(repository, pull_request)
+            owner = getattr(getattr(candidate, "action_scope", None), "owner", None)
+            if owner in grants._protocols:
+                state = candidate
     if state is None:
         raise ToolException("pull-request operation rejected: no bound review state for this target")
     return state
@@ -10008,13 +10004,12 @@ class ToolRegistry:
                         else None
                     )
                 if plugin_tool is not None and state is not None:
-                    from .models import RepoReviewState
-
                     protocol = (policy if policy is not None else selected_policy_registry()).scoped_actions.get(plugin_tool.owner)
                     constructors = getattr(protocol, "trusted_scope", None)
                     typed_state = (
-                        type(state) is constructors.review if constructors is not None
-                        else isinstance(state, RepoReviewState)
+                        type(state) is constructors.review if constructors is not None else
+                        isinstance(getattr(auth_context, "scoped_pr_grants", None), ScopedPRGrants)
+                        and getattr(state, "action_scope", None) is not None
                     )
                     if not typed_state or (
                         state.repo.lower() != tool_arguments["repository"].lower()
@@ -10808,7 +10803,7 @@ def _pr_checkout_lease_attestation(
             "canonical_origin", "owner", "verified_base_sha",
         )
     ):
-        # Synthetic callers without the runtime's RepoReviewState do not get the
+        # Synthetic callers without a registered review state do not get the
         # cache, but still fail closed against the immutable attested head.
         if getattr(lease, "head_sha", "").lower() != expected_head:
             return verdict(False, LeaseAttestationReason.REVIEW_STATE_MISMATCH)
@@ -11244,9 +11239,10 @@ def protected_result_source(
             service, auth_context=auth_context,
         ):
             try:
-                retained_root = worklink_retained_checkout_root().resolve(strict=True)
-                retained_resource = Path(resource_id).resolve(strict=True)
-                retained_checkout = retained_resource.is_relative_to(retained_root)
+                retained_root = worklink_retained_checkout_root()
+                if retained_root is not None:
+                    retained_resource = Path(resource_id).resolve(strict=True)
+                    retained_checkout = retained_resource.is_relative_to(retained_root.resolve(strict=True))
             except (OSError, RuntimeError, ValueError):
                 retained_checkout = False
         anchor = _filesystem_read_trust_anchor(
@@ -11503,7 +11499,7 @@ def retained_invocation_lease_active(scope: object, context: object) -> bool:
 class _RetainedResultReceipt:
     """One invocation's host-observed output under the live retained lease."""
 
-    def __init__(self, tool: str, context: Any, scope: RetainedFactoryScope,
+    def __init__(self, tool: str, context: Any, scope: Any,
                  result: Any, failed: bool, policy: Any,
                  *, execution_id: str, head: str,
                  lease_identity: tuple[str, str, int, int] | tuple[str, str, int, int, str]) -> None:
@@ -11540,7 +11536,7 @@ class _RetainedResultReceipt:
             and hashlib.sha256(content.encode() if isinstance(content, str) else content).digest() == self.digest
         )
 
-    def _live_binding(self, context: Any, scope: RetainedFactoryScope, policy: Any) -> bool:
+    def _live_binding(self, context: Any, scope: Any, policy: Any) -> bool:
         if len(self.lease_identity) == 5 and not retained_invocation_lease_active(scope, context):
             return False
         binding = _retained_checkout_binding(scope)
@@ -11548,7 +11544,7 @@ class _RetainedResultReceipt:
 
 
 def _retained_checkout_binding(
-    scope: RetainedFactoryScope,
+    scope: Any,
 ) -> tuple[str, tuple[str, str, int, int] | tuple[str, str, int, int, str]] | None:
     """Observe the incident's checkout, never a numerically colliding PR lease."""
     held = _held_retained_lease.get()
@@ -12471,7 +12467,6 @@ def _deepagents_builtin_tool_names() -> tuple[str, ...]:
 def assert_model_tool_inventory_cataloged(
     *,
     model_spec: str | None = None,
-    coding_enabled: bool = False,
     policy: "PolicyRegistry | None" = None,
 ) -> None:
     """Raise if the assembled model surface lacks authz or IFC metadata."""
@@ -12484,8 +12479,7 @@ def assert_model_tool_inventory_cataloged(
     catalog = get_operation_catalog()
     mimir_tools = all_mimir_tools(
         model_spec=model_spec,
-        coding_enabled=coding_enabled,
-        require_coding_available=False,
+        require_provider_available=False,
         policy=policy,
         materialize_plugins=False,
     )
@@ -12586,7 +12580,6 @@ def resolve_access_control_enforcement(
     requested: bool,
     *,
     model_spec: str | None = None,
-    coding_enabled: bool = False,
     policy: "PolicyRegistry | None" = None,
 ) -> bool:
     """Fail closed at the enforcement enablement boundary."""
@@ -12594,7 +12587,6 @@ def resolve_access_control_enforcement(
         assert_capability_matrix_complete()
         assert_model_tool_inventory_cataloged(
             model_spec=model_spec,
-            coding_enabled=coding_enabled,
             policy=policy,
         )
     return requested
@@ -13000,9 +12992,13 @@ def create_auth_context(
     - ContextVar fallback heuristics
     - Single-active-turn heuristics
     """
-    from .models import (
-        AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
-        TurnInteractivity,
+    from .models import AuthContext, TurnInteractivity
+
+    selected = policy if policy is not None else selected_policy_registry()
+    constructors = next(
+        (trusted for protocol in selected.scoped_actions.values()
+         if (trusted := getattr(protocol, "trusted_scope", None)) is not None),
+        None,
     )
 
     author = event.author
@@ -13064,7 +13060,8 @@ def create_auth_context(
     )
     carried_scope = event.repo_pr_action_scope
     if not (
-        isinstance(carried_scope, RepoPRActionScope)
+        constructors is not None
+        and type(carried_scope) is constructors.scope_type
         and carried_scope.provenance == "server_discovered"
         and registered_service is not None
         and registered_service.authority_profile in _PR_REVIEW_SCOPE_AUTHORITY_PROFILES
@@ -13075,7 +13072,7 @@ def create_auth_context(
     ):
         carried_scope = None
     if repo_pr_scope_registry is None and carried_scope is not None:
-        repo_pr_scope_registry = RepoPRScopeRegistry((RepoReviewState(carried_scope),))
+        repo_pr_scope_registry = constructors.registry((constructors.review(carried_scope),))
     single_state = (
         repo_pr_scope_registry.review_states[0]
         if repo_pr_scope_registry is not None

@@ -1248,16 +1248,16 @@ def test_status_control_rejects_malformed_trailing_and_nonfinite_output(tmp_path
 def test_migrated_factory_consumers_have_finite_legacy_free_inventory() -> None:
     root = Path(__file__).parent.parent
     consumers = (
-        "mimir/worklink/orchestrator.py",
-        "mimir/worklink/autonomy.py",
-        "mimir/worklink/continuation.py",
-        "mimir/worklink/control.py",
-        "mimir/worklink/run_state.py",
-        "mimir/worklink/factory_state.py",
-        "mimir/worklink/checkout.py",
-        "mimir/worklink/backends/feature_factory.py",
-        "mimir/commands/worklink.py",
-        "mimir/server.py",
+        "plugins/cultivate/mimir_cultivate/worklink/orchestrator.py",
+        "plugins/cultivate/mimir_cultivate/worklink/autonomy.py",
+        "plugins/cultivate/mimir_cultivate/worklink/continuation.py",
+        "plugins/cultivate/mimir_cultivate/worklink/control.py",
+        "plugins/cultivate/mimir_cultivate/worklink/run_state.py",
+        "plugins/cultivate/mimir_cultivate/worklink/factory_state.py",
+        "plugins/cultivate/mimir_cultivate/worklink/checkout.py",
+        "plugins/cultivate/mimir_cultivate/worklink/backends/feature_factory.py",
+        "plugins/cultivate/mimir_cultivate/commands.py",
+        "plugins/cultivate/mimir_cultivate/server.py",
         "mimir/web_ui.py",
         "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator/scripts/poller.py",
     )

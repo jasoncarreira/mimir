@@ -2462,9 +2462,10 @@ def _result_labels_for_call(
         original_scope = authorization.repo_pr_action_scope
         repository = arguments.get("repository")
         pull_request = arguments.get("pull_request")
-        discovered = auth_context.server_discovered_pr_states.resolve(
-            repository, pull_request,
-        ) if isinstance(repository, str) and isinstance(pull_request, int) else None
+        cache = auth_context.server_discovered_pr_states
+        discovered = cache.resolve(repository, pull_request) if (
+            cache is not None and isinstance(repository, str) and type(pull_request) is int
+        ) else None
         state = discovered
         if state is None and auth_context.repo_pr_scope_registry is not None:
             state = auth_context.repo_pr_scope_registry.resolve(repository, pull_request)

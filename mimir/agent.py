@@ -1942,10 +1942,11 @@ class Agent:
                 candidate = Path(lease_root)
                 if candidate.is_absolute() and candidate.is_dir() and not candidate.is_symlink():
                     roots = (*roots, (str(candidate.resolve()), "rw"))
-            retained_root = worklink_retained_checkout_root().resolve(strict=False)
-            # The exact retained route must override even an operator-declared
-            # writable parent; retained effects always require a live lease.
-            roots = (*roots, (str(retained_root), "retained"))
+            retained_root = worklink_retained_checkout_root()
+            if retained_root is not None:
+                # The exact retained route overrides even an operator-declared
+                # writable parent; retained effects require a live lease.
+                roots = (*roots, (str(retained_root.resolve(strict=False)), "retained"))
             routes = build_file_tool_routes(roots) if roots else {}
             if routes:
                 self._backend = FileToolRouter(default=home_backend, routes=routes)

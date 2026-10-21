@@ -1,4 +1,4 @@
-"""Parity of the extracted OpenCode implementation while core callers remain live."""
+"""Cultivate's OpenCode configuration and contained proposal contract."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import subprocess
 
 import pytest
 
-from mimir import opencode_config as core_config
 from mimir_cultivate import opencode, repository
 
 
@@ -27,7 +26,7 @@ def _auth(home: Path, provider: str, entry: dict[str, str]) -> None:
     path.write_text(json.dumps({provider: entry}), encoding="utf-8")
 
 
-def test_selected_provider_projection_and_oauth_match_core(tmp_path: Path) -> None:
+def test_selected_provider_projects_only_selected_config_and_oauth(tmp_path: Path) -> None:
     path = tmp_path / "opencode.jsonc"
     path.write_text(
         '{"model":"openai/gpt-test","provider":{"openai":'
@@ -41,18 +40,15 @@ def test_selected_provider_projection_and_oauth_match_core(tmp_path: Path) -> No
         "OPENAI_TOKEN": "private-token", "OPENAI_API_KEY": "ambient-token",
     }
     selected = opencode.resolve_opencode_invocation(env=env)
-    original = core_config.resolve_opencode_invocation(env=env)
     assert (selected.model, selected.provider, selected.model_source) == (
-        original.model, original.provider, original.model_source,
+        "openai/gpt-test", "openai", "opencode_config",
     )
-    assert selected.remove_env == original.remove_env == ("OPENAI_API_KEY",)
-    assert selected.pass_env == original.pass_env == ("OPENAI_TOKEN",)
+    assert selected.remove_env == ("OPENAI_API_KEY",)
+    assert selected.pass_env == ("OPENAI_TOKEN",)
     documents = opencode.opencode_worker_documents(selected, env)
-    baseline = core_config.opencode_worker_documents(original, env)
-    assert documents.config_document == baseline.config_document
-    assert documents.auth_document == baseline.auth_document
     assert json.loads(documents.config_document)["permission"] == {"external_directory": "deny"}
     assert b"other-secret" not in documents.config_document
+    assert b"other-secret" not in documents.auth_document
     assert isinstance(documents.scrubber, opencode.SensitiveMaterialScrubber)
     assert "private-refresh" not in repr(selected)
     assert "private-token" not in documents.scrubber.scrub_text("private-token")
@@ -64,7 +60,7 @@ def test_selected_provider_projection_and_oauth_match_core(tmp_path: Path) -> No
     {"options": {"github-copilot": {}}},
     {"apiKey": "prefix-{env:SECRET}"},
 ])
-def test_unsafe_provider_config_fails_closed_like_core(
+def test_unsafe_provider_config_fails_closed(
     tmp_path: Path, provider_config: dict[str, object],
 ) -> None:
     path = tmp_path / "opencode.json"
@@ -73,12 +69,9 @@ def test_unsafe_provider_config_fails_closed_like_core(
     }), encoding="utf-8")
     env = {"HOME": str(tmp_path), "OPENCODE_CONFIG": str(path), "PROXY_API_KEY": "ambient"}
     selected = opencode.resolve_opencode_invocation(env=env)
-    original = core_config.resolve_opencode_invocation(env=env)
     with pytest.raises(opencode.OpenCodeConfigError) as raised:
         opencode.opencode_worker_documents(selected, env)
-    with pytest.raises(core_config.OpenCodeConfigError) as baseline:
-        core_config.opencode_worker_documents(original, env)
-    assert raised.value.reason_code == baseline.value.reason_code == "config_unsafe_inline_secret"
+    assert raised.value.reason_code == "config_unsafe_inline_secret"
 
 
 def test_github_provider_has_no_worker_projection(tmp_path: Path) -> None:

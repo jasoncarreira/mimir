@@ -257,7 +257,8 @@ async def test_build_agent_restores_and_executes_real_repo_tool_after_recovery(
     from mimir_cultivate import repository as repo_tools
     from langchain.tools import ToolRuntime
     from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
-    from mimir.models import AuthContext, RepoPRScopeRegistry, RepoReviewState
+    from mimir.models import AuthContext
+    from mimir_cultivate.policy import RepoPRScopeRegistry, RepoReviewState
     from mimir.plugins.core import policy_scope
     from tests.test_pr_checkout_lease import _repo_and_scope
     from mimir.tools import registry
@@ -266,7 +267,7 @@ async def test_build_agent_restores_and_executes_real_repo_tool_after_recovery(
     monkeypatch.setattr(
         "mimir.tools.all_mimir_tools",
         lambda **kwargs: registry.all_mimir_tools(
-            **kwargs, require_coding_available=False,
+            **kwargs, require_provider_available=False,
         ),
     )
 
@@ -321,6 +322,9 @@ async def test_agent_assembles_registered_worklink_runner_and_dispatches(
 ) -> None:
     pytest.importorskip("mimir_cultivate")
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    lease_root = tmp_path / "pr-leases"
+    lease_root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
     agent = _make_agent(tmp_path, monkeypatch)
     capture = _stub_deepagent_build(monkeypatch)
     from mimir.tools import registry
