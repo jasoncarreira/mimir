@@ -8002,7 +8002,7 @@ print('{"poller": "x", "prompt": "ok"}')
     assert "SSL=/some/ca/cert.pem" in combined_stderr
 
 
-# ─── Worklink reasoning effort across the real poller env boundary ────
+# ─── Selected Worklink across the real poller env boundary ────
 
 
 def test_worklink_ready_queue_manifest_forwards_model_and_reasoning_effort() -> None:
@@ -8053,11 +8053,12 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
         "MIMIR_MODEL_SPEC": "codex-plus:gpt-agent",
         "MIMIR_MODEL_REASONING_EFFORT": agent_effort,
         "WORKLINK_REPO": str(repo),
-        "MIMIR_CODING_ENABLED": "1",
+        "MIMIR_PLUGINS": "cultivate",
     }
     if override is not None:
         parent_env["MIMIR_WORKLINK_REASONING_EFFORT"] = override
     monkeypatch.setattr(os, "environ", parent_env)
+    assert "MIMIR_CODING_ENABLED" not in os.environ
     assert not (home / ".env").exists()
     [cfg] = discover_pollers(skill, state_root=home / "state" / "pollers")
 
@@ -8069,14 +8070,21 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
         "import json, os, sys\n"
         "from pathlib import Path\n"
         f"sys.path.insert(0, {str(root)!r})\n"
-        "from mimir.worklink.backends import OpenCodeBackend, WorkOrder\n"
+        "from mimir.coding import coding_enabled\n"
+        "from mimir_cultivate.worklink.backends.base import WorkOrder\n"
+        "from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend\n"
+        "assert coding_enabled() and os.environ['MIMIR_PLUGINS'] == 'cultivate'\n"
+        "assert 'MIMIR_CODING_ENABLED' not in os.environ\n"
         f"order = WorkOrder(1844, Path({str(repo)!r}), 'prompt', None, 30, "
         "{'MIMIR_HOME': os.environ['MIMIR_HOME']})\n"
         "spec = OpenCodeBackend().work_spec(order, attempt=1, repo_url='u', "
         "base_ref='main', branch='issue/1844-a1', test_command='true')\n"
         f"Path({str(result_path)!r}).write_text(json.dumps({{"
         "'argv': spec.local_argv, 'variant': spec.backend_config['variant'], "
-        "'source': spec.backend_config['variant_source']}), encoding='utf-8')\n",
+        "'source': spec.backend_config['variant_source'], "
+        "'provider': type(spec).__module__, "
+        "'projections': [p.path for p in spec.backend_config['worker_projections']], "
+        "'selected': os.environ['MIMIR_PLUGINS']}), encoding='utf-8')\n",
         encoding="utf-8",
     )
     driver = tmp_path / "dispatch.py"
@@ -8123,12 +8131,65 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
         dispatch_log.read_text(encoding="utf-8") if dispatch_log.exists() else "no dispatch log",
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["selected"] == "cultivate"
+    assert result["provider"].startswith("mimir_cultivate.worklink.")
+    assert result["projections"] == [
+        ".config/opencode/opencode.json", ".local/share/opencode/auth.json",
+    ]
     assert result["variant"] == "high"
     assert result["source"] == source
     index = result["argv"].index("--variant")
     assert result["argv"][index + 1] == "high"
     assert result["argv"].count("--variant") == 1
     assert not (home / ".env").exists()
+
+
+@pytest.mark.asyncio
+async def test_worklink_poller_disabled_selection_reaches_child_without_provider(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shipped env contract cannot turn an old flag into child authority."""
+    manifest = (
+        Path(__file__).resolve().parents[1]
+        / "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator/pollers.json"
+    )
+    queue = next(
+        entry for entry in json.loads(manifest.read_text(encoding="utf-8"))["pollers"]
+        if entry["name"] == "worklink-ready-queue"
+    )
+    monkeypatch.setattr(os, "environ", {
+        "PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path),
+        "MIMIR_PLUGINS": "", "MIMIR_CODING_ENABLED": "true",
+    })
+    observed = tmp_path / "child.json"
+    leaf = tmp_path / "leaf.py"
+    leaf.write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "from mimir.coding import coding_enabled\n"
+        f"Path({str(observed)!r}).write_text(json.dumps({{"
+        "'plugins': os.environ.get('MIMIR_PLUGINS'), "
+        "'legacy': os.environ.get('MIMIR_CODING_ENABLED'), "
+        "'coding': coding_enabled(), "
+        "'provider_imported': any(name == 'mimir_cultivate' or "
+        "name.startswith('mimir_cultivate.') for name in sys.modules)}))\n",
+        encoding="utf-8",
+    )
+    driver = tmp_path / "dispatch.py"
+    driver.write_text(
+        "import subprocess, sys\n"
+        f"subprocess.run([sys.executable, {str(leaf)!r}], check=True)\n",
+        encoding="utf-8",
+    )
+    cfg = PollerConfig(
+        name=queue["name"], command=f"{sys.executable} {driver.name}",
+        cron=queue["cron"], env={}, skill_dir=tmp_path,
+        persist_dir=tmp_path / "poller-state", pass_env=tuple(queue["pass_env"]),
+    )
+    assert await run_poller(cfg, enqueue=_CapturingEnqueue(), home=home, timeout=30) == 0
+    assert json.loads(observed.read_text(encoding="utf-8")) == {
+        "plugins": "", "legacy": None, "coding": False, "provider_imported": False,
+    }
 
 
 # ─── chainlink #82 sub #83/#85: pass_env passthrough mechanism ─────────
