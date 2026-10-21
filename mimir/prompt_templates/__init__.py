@@ -44,7 +44,6 @@ def _template_names() -> list[str]:
         entry.name
         for entry in _TEMPLATES_ROOT.iterdir()
         if entry.is_file() and entry.suffix == ".md"
-        and entry.name not in {"worklink-order.md", "decompose.md"}
     )
 
 
