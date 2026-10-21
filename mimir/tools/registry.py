@@ -2826,34 +2826,6 @@ async def _spawn_open_code_impl(
     }, indent=2)
 
 
-@tool
-async def spawn_open_code(
-    prompt: str,
-    cwd: Optional[str] = None,
-    timeout_s: int = 1800,
-    name: Optional[str] = None,
-    model: Optional[str] = None,
-    agent: Optional[str] = None,
-    artifact_root: Optional[str] = None,
-) -> str:
-    """Run OpenCode in a fresh contained checkout and return a bounded proposal."""
-    from ..contained_checkout import create_opencode_checkout
-    from ..contained_execution import execute_contained
-
-    return await _spawn_open_code_impl(
-        prompt,
-        cwd,
-        timeout_s,
-        name,
-        model,
-        agent,
-        artifact_root,
-        contained_runner=execute_contained,
-        checkout_factory=create_opencode_checkout,
-        execution_identifier=str(uuid.uuid4()),
-    )
-
-
 # ────────────────────────────────────────────────────────────────────
 # Pending mimir-package update (mimir/update_on_start.py)
 # ────────────────────────────────────────────────────────────────────
