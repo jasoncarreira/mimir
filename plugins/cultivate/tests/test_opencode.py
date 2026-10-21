@@ -15,6 +15,14 @@ from mimir.contained_execution import SensitiveMaterialScrubber
 from mimir_cultivate import opencode, repository
 
 
+def test_selected_spawn_factory_is_provider_owned() -> None:
+    from mimir_cultivate.policy import _factory
+
+    selected = _factory("mimir_cultivate.opencode", "spawn_open_code")()
+    assert selected is opencode.spawn_open_code
+    assert selected.name == "spawn_open_code"
+
+
 def _auth(home: Path, provider: str, entry: dict[str, str]) -> None:
     path = home / ".local" / "share" / "opencode" / "auth.json"
     path.parent.mkdir(parents=True)

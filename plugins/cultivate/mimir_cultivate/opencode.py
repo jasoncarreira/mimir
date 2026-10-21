@@ -11,7 +11,10 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import uuid
 from typing import Any
+
+from langchain_core.tools import tool
 
 from mimir.access_control import _MAINTENANCE_GIT_BASE_OVERRIDES, _maintenance_git_filter_overrides
 from mimir.model_registry import DEFAULT_MODEL_SPEC
@@ -839,3 +842,27 @@ def classify_spawn_terminal_state(
 
 def cleanup_failure_event(run_id: str) -> dict[str, str]:
     return {"type": "spawn_open_code_cleanup_failed", "run_id": run_id, "reason_code": "cleanup_failed"}
+
+
+@tool
+async def spawn_open_code(
+    prompt: str,
+    cwd: str | None = None,
+    timeout_s: int = 1800,
+    name: str | None = None,
+    model: str | None = None,
+    agent: str | None = None,
+    artifact_root: str | None = None,
+) -> str:
+    """Run OpenCode in a fresh contained checkout and return a bounded proposal."""
+    from mimir.tools.registry import _spawn_open_code_impl
+
+    from .contained_checkout import create_opencode_checkout
+    from .contained_execution import execute_contained
+
+    return await _spawn_open_code_impl(
+        prompt, cwd, timeout_s, name, model, agent, artifact_root,
+        contained_runner=execute_contained,
+        checkout_factory=create_opencode_checkout,
+        execution_identifier=str(uuid.uuid4()),
+    )

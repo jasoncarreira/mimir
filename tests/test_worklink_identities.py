@@ -32,9 +32,9 @@ import pwd
 pwd.getpwnam = lambda name: (_ for _ in ()).throw(AssertionError(name))
 grp.getgrnam = lambda name: (_ for _ in ()).throw(AssertionError(name))
 
-import mimir.contained_checkout
-import mimir.worklink.checkout
-import mimir.worklink.worker_exec
+import mimir_cultivate.contained_checkout
+import mimir_cultivate.worklink.checkout
+import mimir_cultivate.worklink.worker_exec
 print("safe")
 """
     )
@@ -85,10 +85,10 @@ def group(name):
 pwd.getpwnam = user
 grp.getgrnam = group
 
-import mimir.contained_checkout as handoff
-import mimir.worklink.checkout as checkout
-import mimir.worklink.identities as identities
-import mimir.worklink.worker_exec as executor
+import mimir_cultivate.contained_checkout as handoff
+import mimir_cultivate.worklink.checkout as checkout
+import mimir_cultivate.worklink.identities as identities
+import mimir_cultivate.worklink.worker_exec as executor
 
 values = [
     identities.get_identities(),

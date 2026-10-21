@@ -496,7 +496,7 @@ def register_tools(registrar: PolicyRegistrar) -> None:
             or name == "unsupported_operation" else
             "mimir_cultivate.repository" if name.startswith("repo_") else
             "mimir_cultivate.registration" if name in _BUILDS else
-            "mimir.tools.registry"
+            "mimir_cultivate.opencode"
         )
         action = declaration.typed_action
         adapter = (

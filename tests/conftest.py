@@ -169,10 +169,11 @@ def synthetic_worklink_identities(monkeypatch, request):
     all_enabled, names = _selection(os.environ.get("MIMIR_PLUGINS", ""))
     selected = all_enabled or "cultivate" in names
     existing_modules = (
-        "mimir.contained_checkout",
         "mimir.project_tests",
         "mimir.worklink.checkout",
         "mimir.worklink.worker_exec",
+        "mimir_cultivate.contained_checkout",
+        "mimir_cultivate.worklink.checkout",
     )
     for module_name in existing_modules:
         module = sys.modules.get(module_name)

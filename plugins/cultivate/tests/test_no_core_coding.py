@@ -59,18 +59,18 @@ def test_retired_coding_import_aliases_are_detected(
     assert any(_retired_import(name) for name in names)
 
 
-def test_proposal_git_environment_is_core_only() -> None:
+def test_opencode_proposal_git_environment_is_provider_owned() -> None:
     script = """
 import sys
-from mimir.opencode_proposal import _sanitized_git_env
-assert 'mimir_cultivate' not in sys.modules
+from mimir_cultivate.opencode import _sanitized_git_env
+assert 'mimir.opencode_proposal' not in sys.modules
 env = _sanitized_git_env()
 assert env['GIT_CONFIG_GLOBAL'] == '/dev/null'
 assert env['GIT_TERMINAL_PROMPT'] == '0'
 assert env['GIT_ASKPASS'] == '/bin/false'
-assert 'mimir_cultivate' not in sys.modules
+assert 'mimir.opencode_proposal' not in sys.modules
 """
-    env = {**os.environ, "MIMIR_PLUGINS": ""}
+    env = {**os.environ, "MIMIR_PLUGINS": "cultivate"}
     result = subprocess.run(
         [sys.executable, "-c", script], env=env, capture_output=True,
         text=True, timeout=20,

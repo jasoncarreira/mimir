@@ -7123,7 +7123,7 @@ def test_converted_tool_prose_is_not_classified_as_error(
 @pytest.mark.parametrize("added_fields", [False, True])
 @pytest.mark.usefixtures("selected_repository_policy")
 def test_returned_typed_errors_allow_added_producer_fields(tool_name, added_fields):
-    from mimir.opencode_proposal import SpawnTerminalResult
+    from mimir_cultivate.opencode import SpawnTerminalResult
     from mimir.tools.budget_gate import _returned_value_is_error
 
     if tool_name == "repo_test":
