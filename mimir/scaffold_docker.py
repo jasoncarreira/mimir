@@ -39,8 +39,6 @@ from typing import Literal
 
 from .plugin_dockerfile import (assemble_services, cultivate_scripts, has_trusted_cultivate,
                                 pinned_packages, render_stage, select_plugins, services)
-from .worklink.backends.feature_factory import FACTORY_VERSION
-from .worklink.tool_pins import OPENCODE_VERSION
 
 
 DEFAULT_BASE_IMAGE = "public.ecr.aws/docker/library/python:3.11-slim"
@@ -481,34 +479,6 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]
 """
 
 
-def _opencode_install_block() -> str:
-    """Dockerfile block installing OpenCode runtime when enabled.
-
-    Installs the pinned OpenCode runtime (opencode-ai + plugins) when
-    MIMIR_ENABLE_OPENCODE is set. The plugins provide feature-factory and
-    project-memory functionality for Worklink backends.
-    """
-    return (
-        "# OpenCode runtime - optional build dependency, not plugin activation.\n"
-        f"# Pins: opencode-ai@{OPENCODE_VERSION}, feature-factory@{FACTORY_VERSION},\n"
-        f"# opencode-feature-factory@{FACTORY_VERSION},\n"
-        "# opencode-project-memory@0.1.0, opencode-openai-codex-auth@4.4.0,\n"
-        "# opencode-anthropic-auth@0.0.13.\n"
-        "ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js\n"
-        "ENV PATH=\"/opt/mimir-opencode/bin:${PATH}\"\n"
-        "ARG MIMIR_ENABLE_OPENCODE=0\n"
-        "RUN if python3 -c 'import os, sys; sys.exit(os.environ.get(\"MIMIR_ENABLE_OPENCODE\", \"\").strip().lower() not in {\"1\", \"true\", \"yes\", \"on\", \"y\"})'; then \\\n"
-        "        npm install --global --prefix /opt/mimir-opencode \\\n"
-        f"            opencode-ai@{OPENCODE_VERSION} \\\n"
-        f"            feature-factory@{FACTORY_VERSION} \\\n"
-        f"            opencode-feature-factory@{FACTORY_VERSION} \\\n"
-        "            opencode-project-memory@0.1.0 \\\n"
-        "            opencode-openai-codex-auth@4.4.0 \\\n"
-        "            opencode-anthropic-auth@0.0.13 ; \\\n"
-        "    fi"
-    )
-
-
 def render_dockerfile(
     fragments: list[Fragment],
     *,
@@ -529,8 +499,7 @@ def render_dockerfile(
     ``UV_EXTRAS`` there).
 
     ``install_opencode`` retains the existing config-baking option. The
-    install step is always emitted and gated by ``MIMIR_ENABLE_OPENCODE``
-    at build time, so no scaffold-time opt-in is required.
+    runtime installation belongs to the selected Cultivate Docker fragment.
     """
     if mode == "pypi":
         base = _DOCKERFILE_BASE_PYPI
@@ -553,9 +522,11 @@ def render_dockerfile(
     # and pypi templates can't drift on the defensive cleanup logic.
     base = base.replace("__USERDEL_BLOCK__", _USERDEL_BLOCK)
     trusted_cultivate = has_trusted_cultivate(plugins)
-    base = base.replace("__OPENCODE_INSTALL__", "" if trusted_cultivate else _opencode_install_block())
+    base = base.replace("__OPENCODE_INSTALL__", "")
     base = base.replace("__OPENCODE_CONFIG__", _opencode_build_config_block(install_opencode))
     if trusted_cultivate:
+        from mimir_cultivate.worklink.backends.feature_factory import FACTORY_VERSION
+
         base = base.replace("# Pinned mermaid CLI", "ENV NODE_VERSION=22\n"
                             "ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js\n"
                             "ENV PATH=\"/opt/mimir-opencode/bin:${PATH}\"\n"
