@@ -2332,11 +2332,22 @@ def test_filesystem_error_requires_exact_nonempty_backend_attestation(tmp_path: 
         ),), content_free_error="not found")
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_retired_repository_refusal_cannot_claim_content_free_trust() -> None:
-    auth = _core_auth()
+    from mimir.plugins.core import selected_policy_registry
+    from mimir.tool_descriptors import ResultOriginKind, get_tool_descriptor
+
+    policy = selected_policy_registry()
+    registered = policy.tools["repo_status"]
+    assert registered.owner == "cultivate"
+    assert get_tool_descriptor("repo_status", policy=policy) is registered.descriptor
+    assert registered.descriptor.git_operation_result
+    assert registered.descriptor.result_origin & ResultOriginKind.REPOSITORY
+    auth = _auth()
+    assert type(auth.repo_pr_action_scope) is RepoPRActionScope
     authorization = ToolAuthorization(
         tool_name="repo_status", decision=OperationDecision.RESOURCE_SCOPED,
-        allowed=True, repo_pr_action_scope=auth.repo_pr_action_scope,
+        allowed=True, repo_pr_action_scope=auth.repo_pr_action_scope, policy=policy,
     )
     fixed = "repository operation rejected (repository_git_failed) [inactive_checkout]: " \
             "an active matching checkout lease is required"
@@ -2357,6 +2368,7 @@ def test_retired_repository_refusal_cannot_claim_content_free_trust() -> None:
             provenance=provenance, failed=True,
         )
         assert labels is not None and labels.has_untrusted_active_ingest
+        assert labels.sources[0].domain == registered.result_domain == "repository"
     exact = classify_protected_result(
         "repo_status", {"repository": "owner/repo", "pull_request": 7},
         auth, authorization,
@@ -2364,7 +2376,28 @@ def test_retired_repository_refusal_cannot_claim_content_free_trust() -> None:
         provenance=ProtectedResultProvenance((), fixed), failed=True,
     )
     assert exact is not None and exact.has_untrusted_active_ingest
+    assert exact.sources[0].domain == registered.result_domain
     assert exact.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_status>"
+
+
+def test_core_unknown_repo_status_error_cannot_claim_content_free_trust() -> None:
+    from mimir.plugins.core import core_policy_registry
+
+    policy = core_policy_registry()
+    assert "repo_status" not in policy.tools
+    fixed = "repository operation rejected (repository_git_failed) [inactive_checkout]"
+    labels = classify_protected_result(
+        "repo_status", {"repository": "owner/repo", "pull_request": 7},
+        _core_auth(),
+        ToolAuthorization(
+            tool_name="repo_status", decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True, policy=policy,
+        ),
+        result=ToolMessage(content=fixed, tool_call_id="refusal", status="error"),
+        provenance=ProtectedResultProvenance((), fixed), failed=True,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+    assert labels.sources[0].domain == "unknown"
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
