@@ -2010,7 +2010,7 @@ def acquire_pr_checkout_lease(
         foreign_candidates: list[tuple[Path, str]] = []
         rebound_candidates: dict[Path, PRCheckoutLease] = {}
         if foreign_leases:
-            from mimir._context import active_pr_checkout_lease_paths
+            from .scheduler import active_pr_checkout_lease_paths
 
             active_paths = {
                 path.resolve(strict=False) for path in active_pr_checkout_lease_paths()

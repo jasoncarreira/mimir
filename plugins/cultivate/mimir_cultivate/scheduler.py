@@ -8,12 +8,36 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from mimir._context import active_pr_checkout_lease_paths
+from mimir._context import active_turn_auth_contexts
 from mimir.background_io import run_in_pool
 from mimir.event_logger import log_event
 from mimir.poller_hooks import PollerHooks
 
 _REAP_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="worklink-reap")
+
+
+def active_pr_checkout_lease_paths() -> set[Path]:
+    """Protect leases held by live turns, including discovered PR scopes."""
+    paths: set[Path] = set()
+    for auth in active_turn_auth_contexts():
+        states: list[Any] = []
+        registry = getattr(auth, "repo_pr_scope_registry", None)
+        states.extend(getattr(registry, "review_states", ()))
+        state = getattr(auth, "repo_review_state", None)
+        if state is not None:
+            states.append(state)
+        cache = getattr(auth, "server_discovered_pr_states", None)
+        lock = getattr(cache, "_lock", None)
+        cached_states = getattr(cache, "_states", None)
+        if lock is not None and isinstance(cached_states, dict):
+            with lock:
+                states.extend(cached_states.values())
+        for review_state in states:
+            lease = getattr(review_state, "checkout_lease", None)
+            path = getattr(lease, "path", None)
+            if path is not None:
+                paths.add(Path(path))
+    return paths
 
 
 def worklink_poller_hooks() -> PollerHooks:

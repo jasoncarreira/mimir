@@ -1440,7 +1440,7 @@ def test_acquire_refuses_second_live_scope_for_same_target(
     metadata_path = first.path / ".git" / "mimir-pr-checkout-lease.json"
     original_metadata = metadata_path.read_bytes()
     monkeypatch.setattr(
-        "mimir._context.active_pr_checkout_lease_paths",
+        "mimir_cultivate.scheduler.active_pr_checkout_lease_paths",
         lambda: {first.path},
     )
     monkeypatch.setattr(
@@ -1470,7 +1470,7 @@ def test_acquire_reuses_ended_scope_for_same_target(
         first_scope, owner=first_scope.principal, lease_root=lease_root,
     )
     monkeypatch.setattr(
-        "mimir._context.active_pr_checkout_lease_paths",
+        "mimir_cultivate.scheduler.active_pr_checkout_lease_paths",
         lambda: set(),
     )
     monkeypatch.setattr(

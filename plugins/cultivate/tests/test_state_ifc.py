@@ -13,8 +13,9 @@ from langchain_core.messages import AIMessage
 from mimir import models
 from mimir.commitments import CommitmentRecord, CommitmentsStore, make_commitment_id
 from mimir._context import (
-    active_pr_checkout_lease_paths, reset_current_turn, set_current_turn,
+    reset_current_turn, set_current_turn,
 )
+from mimir_cultivate.scheduler import active_pr_checkout_lease_paths
 from mimir_cultivate import policy
 from mimir.plugins.manager import load_plugins
 from mimir.access_control import (

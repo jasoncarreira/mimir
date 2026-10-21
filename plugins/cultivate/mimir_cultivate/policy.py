@@ -28,6 +28,7 @@ from mimir.models import (
 from mimir.tool_descriptors import (
     ResultOriginKind, SinkCategory, ToolDescriptor, _argument_payload, _generic_target,
 )
+from mimir.plugins.registry import TrustedScopeConstructors
 
 if TYPE_CHECKING:
     from mimir.plugins.registry import PolicyRegistrar
@@ -78,6 +79,11 @@ def register_action_protocol(
     registrar.register_scoped_action(
         RepoPRAction, validate_scope, checkout_action=RepoPRAction.CHECKOUT,
         live_lease=_live_scoped_pr_lease, checkout_tool=checkout_tool,
+        trusted_scope=TrustedScopeConstructors(
+            issue=RepoPRActionScope, review=RepoReviewState,
+            registry=RepoPRScopeRegistry, discovered=ServerDiscoveredPRStates,
+            store=ServerDiscoveredPRScopeStore, retained=RetainedFactoryScope,
+        ),
     )
 
 

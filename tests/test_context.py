@@ -14,9 +14,11 @@ chainlink #23 subissue #24:
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 
 from mimir._context import (
     _active_turns,
+    active_turn_auth_contexts,
     active_turn_snapshots,
     get_only_active_turn,
     get_turn_by_saga_session_id,
@@ -50,6 +52,16 @@ def _clean_registry():
     finally:
         _active_turns.clear()
         _active_turns.update(snapshot)
+
+
+def test_active_turn_auth_contexts_snapshots_only_live_carriers():
+    first, second = object(), object()
+    _active_turns["first"] = SimpleNamespace(auth_context=first)
+    _active_turns["empty"] = SimpleNamespace(auth_context=None)
+    snapshot = active_turn_auth_contexts()
+    _active_turns["second"] = SimpleNamespace(auth_context=second)
+    assert snapshot == (first,)
+    assert active_turn_auth_contexts() == (first, second)
 
 
 def test_get_turn_by_saga_session_id_hits_registered_turn():
