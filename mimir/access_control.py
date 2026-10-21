@@ -13198,7 +13198,7 @@ def create_auth_context(
         origin_ref=event.source_id,
         audience_provider=audience_provider,
         cross_platform_pull=cross_platform_pull,
-        _plugin_slot_policy=policy,
+        _plugin_slot_policy=policy if policy is not None else selected_policy_registry(),
     )
 
 

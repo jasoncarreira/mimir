@@ -1708,15 +1708,15 @@ class AuthContext(_AuthContextAuthoritySlot):
     )
     # Server-created immutable registry for all valid PR items in one trusted
     # poller payload. Each state carries its own monotonic checkout proof.
-    repo_pr_scope_registry: RepoPRScopeRegistry | None = field(
+    repo_pr_scope_registry: Any = field(
         default=None, repr=False, compare=False,
     )
     # Single-scope aliases retained for callers whose trusted event can only
     # carry one PR (notably server-discovered heartbeat turns).
-    repo_review_state: RepoReviewState | None = field(
+    repo_review_state: Any = field(
         default=None, repr=False, compare=False,
     )
-    repo_pr_action_scope: RepoPRActionScope | None = field(
+    repo_pr_action_scope: Any = field(
         default=None, repr=False, compare=False,
     )
     scoped_pr_grants: Any = field(default=None, repr=False, compare=False)
@@ -1728,10 +1728,10 @@ class AuthContext(_AuthContextAuthoritySlot):
     server_discovered_pr_states: Any = field(default=None, repr=False, compare=False)
     # Agent-owned server provenance retained across turns. It contains only
     # immutable scopes, never mutable checkout state, and is not model input.
-    server_discovered_pr_scope_store: ServerDiscoveredPRScopeStore | None = field(
+    server_discovered_pr_scope_store: Any = field(
         default=None, repr=False, compare=False,
     )
-    retained_factory_scope: RetainedFactoryScope | None = field(
+    retained_factory_scope: Any = field(
         default=None, repr=False, compare=False,
     )
     retained_factory_scope_refusal: str | None = field(

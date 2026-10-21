@@ -57,7 +57,7 @@ from ..pollers import (
     PollerOverridesValidationError,
     validate_poller_overrides_text,
 )
-from ..models import AuthContext, Integrity, IntegrityEffect, RetainedFactoryScope, TurnInteractivity
+from ..models import AuthContext, Integrity, IntegrityEffect, TurnInteractivity
 from ..scheduler import SchedulerJob
 from ..plugins.core import scoped_policy_call, selected_policy_registry
 

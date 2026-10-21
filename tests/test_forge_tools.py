@@ -40,12 +40,11 @@ from mimir_cultivate.forge import (
 )
 from mimir.models import (
     AgentEvent, AuthContext, InformationFlowLabels, NormalizedPullRequestSnapshot,
-    RepoPRAction, RepoPRActionScope,
-    RepoPRScopeRegistry,
-    RepoReviewState,
-    ServerDiscoveredPRScopeStore,
-    ServerDiscoveredPRStates,
     SourceLabel,
+)
+from mimir_cultivate.policy import (
+    RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
+    ServerDiscoveredPRScopeStore, ServerDiscoveredPRStates,
 )
 from mimir.identities import IdentityResolver
 from mimir_cultivate.forge import (
