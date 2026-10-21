@@ -110,8 +110,6 @@ def test_coding_tool_is_absent_when_gate_is_unset_even_if_cli_exists(
     from mimir.tools import all_mimir_tools
 
     monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
-
     assert "spawn_open_code" not in {tool.name for tool in all_mimir_tools()}
 
 
@@ -164,17 +162,41 @@ for name in ('mimir.tools.forge', 'mimir.tools.repo', 'mimir.forge',
     assert result.returncode == 0, result.stderr
 
 
+def _selected_cultivate_policy():
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.manager import load_plugins
+
+    return load_plugins(enable="cultivate").policy
+
+
+def test_explicitly_selected_missing_provider_is_refused(monkeypatch) -> None:
+    from mimir.plugins import discovery
+    from mimir.plugins.manager import load_plugins
+
+    monkeypatch.setattr(discovery.metadata, "entry_points", lambda **_kwargs: ())
+    with pytest.raises(discovery.PluginDiscoveryError, match=r"missing plugin\(s\): cultivate"):
+        load_plugins(enable="cultivate")
+
+
 def test_coding_tool_is_registered_only_when_enabled_and_available(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
     from mimir.tools import all_mimir_tools
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate import forge
 
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
 
-    names = {tool.name for tool in all_mimir_tools(coding_enabled=True)}
+    names = {tool.name for tool in all_mimir_tools(coding_enabled=True, policy=selected)}
     assert "spawn_open_code" in names
+    from mimir_cultivate.opencode import spawn_open_code
+    assert next(tool for tool in all_mimir_tools(
+        coding_enabled=True, policy=selected,
+    ) if tool.name == "spawn_open_code") is spawn_open_code
 
 
 def test_identity_degradation_removes_coding_tools_and_does_not_auto_recover(
@@ -186,6 +208,7 @@ def test_identity_degradation_removes_coding_tools_and_does_not_auto_recover(
     from mimir.plugins.manager import load_plugins
     from mimir_cultivate import forge as forge_tools
 
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
     selected = load_plugins(enable="cultivate").policy
     monkeypatch.setattr(forge_tools, "_github_identity_degraded", True)
     with policy_scope(selected):
@@ -208,10 +231,11 @@ def test_enabled_coding_without_opencode_fails_loudly(
 ) -> None:
     from mimir.tools import all_mimir_tools
 
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: False)
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: False)
 
     with pytest.raises(RuntimeError, match="opencode CLI.*not installed"):
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(coding_enabled=True, policy=selected)
 
 
 def test_enabled_coding_without_checkout_config_fails_loudly(
@@ -219,11 +243,12 @@ def test_enabled_coding_without_checkout_config_fails_loudly(
 ) -> None:
     from mimir.tools import all_mimir_tools
 
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
 
     with pytest.raises(RuntimeError, match="MIMIR_PR_CHECKOUT_LEASE_ROOT"):
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(coding_enabled=True, policy=selected)
 
 
 @pytest.mark.parametrize("degraded", [False, True])
@@ -239,7 +264,7 @@ def test_coding_startup_aggregates_missing_prerequisites(
 
     selected = load_plugins(enable="cultivate").policy
     monkeypatch.setattr(forge, "_github_identity_degraded", degraded)
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: False)
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: False)
     real_access = registry.os.access
     monkeypatch.setattr(
         registry.os, "access",
@@ -286,7 +311,7 @@ def test_coding_startup_writable_root_and_identity_gate(monkeypatch, tmp_path, d
 
     selected = load_plugins(enable="cultivate").policy
     monkeypatch.setattr(forge, "_github_identity_degraded", degraded)
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setattr(registry.os, "access", lambda path, mode: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
     with policy_scope(selected):
@@ -299,12 +324,13 @@ def test_coding_startup_writable_root_and_identity_gate(monkeypatch, tmp_path, d
 def test_coding_startup_rejects_existing_relative_lease_root(monkeypatch, tmp_path):
     from mimir.tools import all_mimir_tools
 
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.chdir(tmp_path)
     (tmp_path / "leases").mkdir()
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", "leases")
     with pytest.raises(RuntimeError, match="not configured as an absolute path"):
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(coding_enabled=True, policy=selected)
 
 
 def test_coding_startup_rejects_executable_directory_as_git(monkeypatch, tmp_path):
@@ -317,27 +343,34 @@ def test_coding_startup_rejects_executable_directory_as_git(monkeypatch, tmp_pat
         registry, "Path",
         lambda value: git_directory if value == "/usr/bin/git" else Path(value),
     )
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
     with pytest.raises(RuntimeError, match="pinned Git binary /usr/bin/git"):
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(coding_enabled=True, policy=selected)
 
 
 def test_declarative_coding_inventory_does_not_probe_cli_availability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.tools import all_mimir_tools
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate import forge
+
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    selected = _selected_cultivate_policy()
 
     def unexpected_probe() -> bool:
         raise AssertionError("declarative inventory must not probe PATH")
 
-    monkeypatch.setattr("mimir.providers.opencode_available", unexpected_probe)
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", unexpected_probe)
 
     names = {
         tool.name
         for tool in all_mimir_tools(
             coding_enabled=True,
             require_coding_available=False,
+            policy=selected,
         )
     }
     assert "spawn_open_code" in names
@@ -352,7 +385,9 @@ def test_core_only_policy_exposes_no_typed_repo_pr_tools() -> None:
                 if tool.resource_scope == "repo_pr"}
 
 
-def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled() -> None:
+def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     pytest.importorskip("mimir_cultivate")
     from mimir.access_control import (
         SinkCategory,
@@ -362,10 +397,12 @@ def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled() -> Non
     from mimir.tools import all_mimir_tools
     from mimir.plugins.core import policy_scope
     from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge
 
     default_names = {
         tool.name for tool in all_mimir_tools(require_coding_available=False)
     }
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
     selected = load_plugins(enable="cultivate").policy
     with policy_scope(selected):
         enabled_names = {

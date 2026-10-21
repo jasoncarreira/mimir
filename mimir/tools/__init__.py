@@ -83,19 +83,6 @@ from .saga_ops import (
 )
 from .proposals import proposal_diff
 
-_CODING_EXPORTS = {
-    "spawn_open_code": "registry",
-}
-
-
-def __getattr__(name: str):
-    module = _CODING_EXPORTS.get(name)
-    if module is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    from importlib import import_module
-
-    return getattr(import_module(f".{module}", __name__), name)
-
 __all__ = [
     # Core tools (callable by the agent)
     "memory_query",
@@ -127,7 +114,6 @@ __all__ = [
     "commitment_snooze",
     "commitment_dismiss",
     "commitment_list",
-    "spawn_open_code",
     # Web tools (gated on provider; see web_tools_enabled)
     "web_search",
     "fetch_url",

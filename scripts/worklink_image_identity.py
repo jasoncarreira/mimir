@@ -198,7 +198,8 @@ from pathlib import Path
 import subprocess
 import uuid
 
-from mimir.tools.registry import set_spawn_config, spawn_open_code
+from mimir.tools.registry import set_spawn_config
+from mimir_cultivate.opencode import spawn_open_code
 
 SEED = Path(os.environ["WORKLINK_REPO"])
 ARTIFACTS = Path("/home/mimir/worklink-spawn-artifacts")

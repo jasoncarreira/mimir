@@ -4125,7 +4125,7 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     if sys.platform != "linux" or os.geteuid() != 0:
         pytest.skip("requires Linux root to exercise the fixed worker identity")
 
-    import mimir.contained_checkout as contained_checkout
+    import mimir_cultivate.contained_checkout as contained_checkout
     import mimir.contained_execution as contained_execution
     import mimir.worklink.checkout as worklink_checkout
     import mimir.worklink.worker_exec as worker_exec

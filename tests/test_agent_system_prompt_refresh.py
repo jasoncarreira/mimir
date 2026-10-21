@@ -118,7 +118,6 @@ async def test_build_agent_routes_lease_root_created_after_first_build(
 
     agent._config.plugin_manager = load_plugins(enable="")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
     agent._config.coding_enabled = failed_first_build
     monkeypatch.setattr("mimir.tools.all_mimir_tools", registry.all_mimir_tools)
 

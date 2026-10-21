@@ -502,10 +502,10 @@ class TestConfigFromEnv:
         monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
         monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
 
-        def unexpected_probe() -> bool:
+        def unexpected_probe(_binary: str) -> None:
             raise AssertionError("config inventory validation must not probe PATH")
 
-        monkeypatch.setattr("mimir.providers.opencode_available", unexpected_probe)
+        monkeypatch.setattr("mimir.providers.shutil.which", unexpected_probe)
 
         from mimir.config import Config
 

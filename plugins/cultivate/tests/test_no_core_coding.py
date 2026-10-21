@@ -13,9 +13,11 @@ import pytest
 
 
 _RETIRED_CORE_MODULES = {
+    "mimir.contained_checkout": "mimir/contained_checkout.py",
     "mimir.forge": "mimir/forge/__init__.py",
     "mimir.forge.client": "mimir/forge/client.py",
     "mimir.forge.github": "mimir/forge/github.py",
+    "mimir.opencode_proposal": "mimir/opencode_proposal.py",
     "mimir.pr_checkout_lease": "mimir/pr_checkout_lease.py",
     "mimir.project_tests": "mimir/project_tests.py",
     "mimir.repo_pr_parity": "mimir/repo_pr_parity.py",
@@ -59,21 +61,39 @@ def test_retired_coding_import_aliases_are_detected(
     assert any(_retired_import(name) for name in names)
 
 
-def test_proposal_git_environment_is_core_only() -> None:
+def test_opencode_proposal_git_environment_is_provider_owned() -> None:
     script = """
 import sys
-from mimir.opencode_proposal import _sanitized_git_env
-assert 'mimir_cultivate' not in sys.modules
+from mimir_cultivate.opencode import _sanitized_git_env
+assert 'mimir.opencode_proposal' not in sys.modules
 env = _sanitized_git_env()
 assert env['GIT_CONFIG_GLOBAL'] == '/dev/null'
 assert env['GIT_TERMINAL_PROMPT'] == '0'
 assert env['GIT_ASKPASS'] == '/bin/false'
-assert 'mimir_cultivate' not in sys.modules
+assert 'mimir.opencode_proposal' not in sys.modules
 """
-    env = {**os.environ, "MIMIR_PLUGINS": ""}
+    env = {**os.environ, "MIMIR_PLUGINS": "cultivate"}
     result = subprocess.run(
         [sys.executable, "-c", script], env=env, capture_output=True,
         text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_core_spawn_inventory_does_not_import_disabled_provider() -> None:
+    script = """
+import sys
+from mimir.tools.registry import all_mimir_tools
+all_mimir_tools(model_spec='openai:test')
+assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.')
+               for name in sys.modules)
+assert 'mimir.opencode_proposal' not in sys.modules
+assert 'mimir.contained_checkout' not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "MIMIR_PLUGINS": ""},
+        capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 0, result.stderr
 
