@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import json
+from importlib.metadata import PackageNotFoundError, version
 import os
 import re
 import stat
@@ -38,13 +39,30 @@ from mimir.scaffold_docker import (
     render_start_sh,
     scaffold,
 )
-from mimir.plugin_dockerfile import render_stage, select_plugins
+from mimir.plugin_dockerfile import cultivate_scripts, render_stage, select_plugins
+from mimir.plugins.discovery import PluginDiscoveryError
 
 
 def _scaffold_install_text(home: Path) -> str:
     dockerfile = (home / "Dockerfile").read_text()
     fragment = home / ".mimir-scaffold/cultivate-docker/base.sh"
     return dockerfile + (fragment.read_text() if fragment.is_file() else "")
+
+
+def _cultivate_installed() -> bool:
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        return False
+    return True
+
+
+def _cultivate_or_refusal():
+    if _cultivate_installed():
+        return select_plugins(enable="cultivate")
+    with pytest.raises(PluginDiscoveryError, match=r"missing plugin\(s\): cultivate"):
+        select_plugins(enable="cultivate")
+    return ()
 
 
 def _provider(tmp_path: Path):
@@ -626,10 +644,14 @@ def test_render_dockerfile_is_structurally_parseable(mode, install_opencode):
 def test_render_dockerfile_installs_opencode_when_selected():
     """The selected provider supplies the OpenCode install in both modes."""
     assert FACTORY_VERSION == "0.10.18"
-    plugins = select_plugins(enable="cultivate")
+    plugins = _cultivate_or_refusal()
     for mode in ("workspace", "pypi"):
         out = render_dockerfile([], mode=mode, install_opencode=True, plugins=plugins)
-        base = (Path(__file__).resolve().parents[1] / "plugins/cultivate/mimir_cultivate/docker/base.sh").read_text()
+        if not plugins:
+            assert "cultivate-docker" not in out
+            assert "opencode-ai@" not in out
+            continue
+        base = cultivate_scripts(plugins[0])["base.sh"]
         assert "COPY .mimir-scaffold/cultivate-docker/" in out, mode
         assert f"opencode-ai@{OPENCODE_VERSION}" in base, mode
         assert "feature-factory@${FACTORY_VERSION}" in base, mode
@@ -657,6 +679,17 @@ def test_render_dockerfile_does_not_install_opencode_without_provider():
         assert "__OPENCODE_CONFIG__" not in out, mode
 
 
+def test_scaffold_selected_missing_provider_refuses(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    if _cultivate_installed():
+        scaffold(tmp_path, mode="pypi")
+        assert (tmp_path / ".mimir-scaffold/cultivate-docker/base.sh").is_file()
+    else:
+        with pytest.raises(PluginDiscoveryError, match=r"missing plugin\(s\): cultivate"):
+            scaffold(tmp_path, mode="pypi")
+        assert not (tmp_path / "Dockerfile").exists()
+
+
 @pytest.mark.parametrize("mode", ["workspace", "pypi"])
 @pytest.mark.parametrize("selected", [False, True])
 def test_build_install_and_selected_plugin_bootstrap(mode, selected, monkeypatch):
@@ -665,9 +698,10 @@ def test_build_install_and_selected_plugin_bootstrap(mode, selected, monkeypatch
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if selected else "")
     monkeypatch.setenv("MIMIR_ENABLE_OPENCODE", "0")
-    dockerfile = render_dockerfile([], mode=mode, plugins=select_plugins(enable="cultivate") if selected else ())
-    assert ("COPY .mimir-scaffold/cultivate-docker/" in dockerfile) is selected
-    assert ("ARG MIMIR_ENABLE_OPENCODE=0" in dockerfile) is selected
+    plugins = _cultivate_or_refusal() if selected else ()
+    dockerfile = render_dockerfile([], mode=mode, plugins=plugins)
+    assert ("COPY .mimir-scaffold/cultivate-docker/" in dockerfile) is bool(plugins)
+    assert ("ARG MIMIR_ENABLE_OPENCODE=0" in dockerfile) is bool(plugins)
     start = render_start_sh(mode=mode)
     assert "MIMIR_CODING_ENABLED" not in start
     guard = next(line for line in start.splitlines() if line.startswith("if python3"))
@@ -678,13 +712,65 @@ def test_build_install_and_selected_plugin_bootstrap(mode, selected, monkeypatch
     assert result.stdout == ("bootstrapped" if selected else "")
 
 
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+def test_selected_cultivate_scaffold_executes_gated_pinned_install(tmp_path, monkeypatch, mode):
+    plugins = _cultivate_or_refusal()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
+    scaffold(home, mode=mode)
+    dockerfile = (home / "Dockerfile").read_text()
+    fragment = home / ".mimir-scaffold/cultivate-docker/base.sh"
+    if not plugins:
+        assert not fragment.exists()
+        assert "opencode-ai@" not in dockerfile
+        return
+
+    assert "COPY .mimir-scaffold/cultivate-docker/ /opt/cultivate-docker/" in dockerfile
+    assert 'sh /opt/cultivate-docker/base.sh' in dockerfile
+    assert f"ARG FACTORY_VERSION={FACTORY_VERSION}" in dockerfile
+    assert fragment.read_text() == cultivate_scripts(plugins[0])["base.sh"]
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for command in ("apt-get", "curl", "bash", "rm"):
+        script = bin_dir / command
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+    npm = bin_dir / "npm"
+    npm.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$NPM_LOG"\n')
+    npm.chmod(0o755)
+    log = tmp_path / "npm.log"
+    for enabled in ("0", "1"):
+        result = subprocess.run(
+            ["sh", str(fragment)],
+            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                 "NODE_VERSION": "22", "FACTORY_VERSION": FACTORY_VERSION,
+                 "MIMIR_ENABLE_OPENCODE": enabled, "NPM_LOG": str(log)},
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        assert result.returncode == 0
+        if enabled == "0":
+            assert not log.exists()
+        else:
+            assert log.read_text().splitlines() == [
+                "install", "--global", "--prefix", "/opt/mimir-opencode",
+                f"opencode-ai@{OPENCODE_VERSION}",
+                f"feature-factory@{FACTORY_VERSION}",
+                f"opencode-feature-factory@{FACTORY_VERSION}",
+                "opencode-project-memory@0.1.0", "opencode-openai-codex-auth@4.4.0",
+                "opencode-anthropic-auth@0.0.13",
+            ]
+
+
 def test_scaffold_installs_opencode_when_selected(tmp_path: Path, monkeypatch):
     """A selected provider supplies the runtime; the config flag alone does not."""
     home = tmp_path / "opencode-home"
     home.mkdir()
-    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    plugins = _cultivate_or_refusal()
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
     scaffold(home, mode="pypi", install_opencode=True)
-    assert f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)
+    assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)) is bool(plugins)
 
     plain = tmp_path / "plain-home"
     plain.mkdir()
@@ -698,9 +784,10 @@ def test_scaffold_installs_opencode_for_workspace_mode(tmp_path: Path, monkeypat
     """Workspace mode respects install_opencode flag."""
     home = tmp_path / "ws-opencode-home"
     home.mkdir()
-    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    plugins = _cultivate_or_refusal()
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
     scaffold(home, mode="workspace", install_opencode=True)
-    assert f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)
+    assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)) is bool(plugins)
 
 
 def test_scaffold_creates_opencode_config_at_xdg_global_path(tmp_path: Path):
@@ -1057,12 +1144,13 @@ def test_cli_exposes_opencode_opt_in(tmp_path: Path, capsys, monkeypatch):
     assert parser.parse_args(["--opencode"]).opencode is True
     assert parser.parse_args(["--no-opencode"]).opencode is False
     assert "--opencode" in parser.format_help()
-    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    plugins = _cultivate_or_refusal()
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
     args = parser.parse_args(
         ["--home", str(tmp_path), "--mode", "pypi", "--opencode"]
     )
     assert cmd(args) == 0
-    assert f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(tmp_path)
+    assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(tmp_path)) is bool(plugins)
 
 
 @pytest.mark.parametrize("installed_version", ["0.0.1", OPENCODE_VERSION])
@@ -1073,7 +1161,8 @@ def test_cmd_flagless_rerun_preserves_deployment_shape(
 
     home = tmp_path / "renamed-home"
     home.mkdir()
-    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    plugins = _cultivate_or_refusal()
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if plugins else "")
     scaffold(
         home,
         mode="pypi",
@@ -1092,7 +1181,7 @@ def test_cmd_flagless_rerun_preserves_deployment_shape(
     dockerfile = (home / "Dockerfile").read_text()
     compose = (home / "compose.yml").read_text()
     assert "Generated by `mimir scaffold-docker --mode pypi`" in dockerfile
-    assert f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)
+    assert (f"opencode-ai@{OPENCODE_VERSION}" in _scaffold_install_text(home)) is bool(plugins)
     assert "container_name: stable-service" in compose
     assert '"127.0.0.1:9000:8080"' in compose
 

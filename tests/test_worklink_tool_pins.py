@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from importlib.metadata import PackageNotFoundError, version
 import re
+
+import pytest
 
 from mimir.worklink.backends.feature_factory import FACTORY_VERSION
 from mimir.worklink.tool_pins import (
@@ -10,6 +13,7 @@ from mimir.worklink.tool_pins import (
 )
 from mimir.plugin_dockerfile import cultivate_scripts, select_plugins
 from mimir.scaffold_docker import render_dockerfile
+from mimir.plugins.discovery import PluginDiscoveryError
 
 
 def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -> None:
@@ -97,18 +101,26 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     cultivate = install_sources["plugins/cultivate/mimir_cultivate/docker/base.sh"]
     assert "feature-factory@${FACTORY_VERSION}" in cultivate
     assert "opencode-feature-factory@${FACTORY_VERSION}" in cultivate
-    selected = select_plugins(enable="cultivate")
-    assert len(selected) == 1
-    assert selected[0].name == "cultivate"
-    fragment = cultivate_scripts(selected[0])["base.sh"]
-    assert f"opencode-ai@{pins['opencode'].pin}" in fragment
-    for package in ("feature-factory", "opencode-feature-factory"):
-        assert f"{package}@${{FACTORY_VERSION}}" in fragment
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        with pytest.raises(PluginDiscoveryError, match=r"missing plugin\(s\): cultivate"):
+            select_plugins(enable="cultivate")
+        selected = ()
+    else:
+        selected = select_plugins(enable="cultivate")
+        assert len(selected) == 1
+        assert selected[0].name == "cultivate"
+        fragment = cultivate_scripts(selected[0])["base.sh"]
+        assert f"opencode-ai@{pins['opencode'].pin}" in fragment
+        for package in ("feature-factory", "opencode-feature-factory"):
+            assert f"{package}@${{FACTORY_VERSION}}" in fragment
     for mode in ("workspace", "pypi"):
-        scaffold = render_dockerfile([], mode=mode, plugins=selected)
-        assert f"ARG FACTORY_VERSION={pins['feature-factory'].pin}" in scaffold
-        assert "COPY .mimir-scaffold/cultivate-docker/ /opt/cultivate-docker/" in scaffold
-        assert 'FACTORY_VERSION="$FACTORY_VERSION" sh /opt/cultivate-docker/base.sh' in scaffold
+        if selected:
+            scaffold = render_dockerfile([], mode=mode, plugins=selected)
+            assert f"ARG FACTORY_VERSION={pins['feature-factory'].pin}" in scaffold
+            assert "COPY .mimir-scaffold/cultivate-docker/ /opt/cultivate-docker/" in scaffold
+            assert 'FACTORY_VERSION="$FACTORY_VERSION" sh /opt/cultivate-docker/base.sh' in scaffold
         unselected = render_dockerfile([], mode=mode)
         assert "cultivate-docker" not in unselected
         assert "opencode-ai@" not in unselected
