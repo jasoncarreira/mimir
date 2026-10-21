@@ -8,6 +8,8 @@ from mimir.worklink.tool_pins import (
     OPENCODE_VERSION,
     default_tool_pins,
 )
+from mimir.plugin_dockerfile import cultivate_scripts, select_plugins
+from mimir.scaffold_docker import render_dockerfile
 
 
 def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -> None:
@@ -95,9 +97,22 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     cultivate = install_sources["plugins/cultivate/mimir_cultivate/docker/base.sh"]
     assert "feature-factory@${FACTORY_VERSION}" in cultivate
     assert "opencode-feature-factory@${FACTORY_VERSION}" in cultivate
-    scaffold = install_sources["mimir/scaffold_docker.py"]
-    assert "feature-factory@{FACTORY_VERSION}" in scaffold
-    assert "opencode-feature-factory@{FACTORY_VERSION}" in scaffold
+    selected = select_plugins(enable="cultivate")
+    assert len(selected) == 1
+    assert selected[0].name == "cultivate"
+    fragment = cultivate_scripts(selected[0])["base.sh"]
+    assert f"opencode-ai@{pins['opencode'].pin}" in fragment
+    for package in ("feature-factory", "opencode-feature-factory"):
+        assert f"{package}@${{FACTORY_VERSION}}" in fragment
+    for mode in ("workspace", "pypi"):
+        scaffold = render_dockerfile([], mode=mode, plugins=selected)
+        assert f"ARG FACTORY_VERSION={pins['feature-factory'].pin}" in scaffold
+        assert "COPY .mimir-scaffold/cultivate-docker/ /opt/cultivate-docker/" in scaffold
+        assert 'FACTORY_VERSION="$FACTORY_VERSION" sh /opt/cultivate-docker/base.sh' in scaffold
+        unselected = render_dockerfile([], mode=mode)
+        assert "cultivate-docker" not in unselected
+        assert "opencode-ai@" not in unselected
+        assert "feature-factory@" not in unselected
     assert f"opencode-project-memory@{pins['opencode-project-memory'].pin}" in install_text
     assert f"opencode-openai-codex-auth@{pins['opencode-openai-codex-auth'].pin}" in install_text
     assert f"opencode-anthropic-auth@{pins['opencode-anthropic-auth'].pin}" in install_text

@@ -1141,8 +1141,8 @@ def build_app(config: Config) -> web.Application:
     # logs-dir creation, and logger construction run here before init_logger.
     # Failures in those phases genuinely cannot emit startup_failed. Every
     # _start_application phase runs after init_logger and is covered below.
-    # Preserve the early dependency preflight: explicit coding opt-in still
-    # fails loudly before broader server construction when the runtime is absent.
+    # Preserve the early dependency preflight: selected provider prerequisites
+    # fail before broader server construction when the runtime is absent.
     from .tools import all_mimir_tools
     requested_coding = getattr(config, "coding_enabled", False)
     manager = getattr(config, "plugin_manager", None)

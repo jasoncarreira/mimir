@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
-from mimir.agent import _selected_turn_hooks, _turn_tool_surface_ready, _unready_tool_owners
+from mimir.agent import _selected_turn_hooks, _unready_tool_owners
 from mimir.models import AgentEvent
 from mimir.plugins.manager import load_plugins
 from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry
@@ -32,14 +30,10 @@ def test_selected_provider_registers_owner_bound_turn_callbacks(monkeypatch) -> 
     with monkeypatch.context() as probe:
         probe.setattr(opencode, "opencode_available", lambda: True)
         assert prerequisite() == ()
-    selected_policy = registry
-    config = SimpleNamespace(plugin_manager=SimpleNamespace(policy=selected_policy), coding_enabled=False)
     monkeypatch.setattr(forge, "_github_identity_degraded", False)
-    assert _turn_tool_surface_ready(config) is False
-    assert _unready_tool_owners(selected_policy) == frozenset()
+    assert _unready_tool_owners(registry) == frozenset()
     monkeypatch.setattr(forge, "_github_identity_degraded", True)
-    assert _turn_tool_surface_ready(config) is False
-    assert _unready_tool_owners(selected_policy) == frozenset({"cultivate"})
+    assert _unready_tool_owners(registry) == frozenset({"cultivate"})
 
     event = AgentEvent(trigger="user_message", channel_id="web:one", content="hello")
     assert _selected_turn_hooks(registry, "failure_intervention")[0](event) is False

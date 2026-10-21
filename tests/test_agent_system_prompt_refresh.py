@@ -226,12 +226,11 @@ async def test_build_agent_rebuilds_without_coding_tools_after_identity_latch(
     from mimir.plugins.manager import load_plugins
 
     agent._config.plugin_manager = load_plugins(enable="cultivate")
-    agent._config.coding_enabled = True
     capture = _stub_deepagent_build(monkeypatch)
-    requested: list[bool] = []
+    requested: list[dict] = []
     monkeypatch.setattr(
         "mimir.tools.all_mimir_tools",
-        lambda **kwargs: requested.append(kwargs.get("coding_enabled", False)) or [],
+        lambda **kwargs: requested.append(kwargs) or [],
     )
     from mimir_cultivate import forge as forge_tools
     monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
@@ -241,8 +240,8 @@ async def test_build_agent_rebuilds_without_coding_tools_after_identity_latch(
     second = await agent._build_agent_if_needed()
 
     assert first is not second
-    assert requested == [False, False]
-    assert agent._cached_coding_enabled is False
+    assert len(requested) == 2
+    assert all("coding_enabled" not in kwargs for kwargs in requested)
     assert "cultivate" in agent._cached_unready_tool_owners
 
 
