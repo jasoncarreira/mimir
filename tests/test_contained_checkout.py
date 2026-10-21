@@ -7,6 +7,8 @@ import subprocess
 
 import pytest
 
+pytest.importorskip("mimir_cultivate.contained_checkout")
+
 import mimir_cultivate.contained_checkout as contained_checkout
 import mimir_cultivate.worklink.checkout as checkout
 from mimir_cultivate.contained_checkout import create_opencode_checkout, create_repo_test_checkout

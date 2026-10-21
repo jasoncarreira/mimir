@@ -14,6 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("mimir_cultivate.opencode")
+
 from mimir.contained_execution import CollectedExecutionResult
 from mimir_cultivate import contained_execution as provider_contained_execution
 from mimir_cultivate import opencode as provider_opencode

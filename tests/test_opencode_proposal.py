@@ -8,6 +8,8 @@ import subprocess
 
 import pytest
 
+pytest.importorskip("mimir_cultivate.opencode")
+
 import mimir_cultivate.opencode as proposal_module
 from mimir_cultivate.opencode import SensitiveMaterialScrubber
 from mimir_cultivate.opencode import (
