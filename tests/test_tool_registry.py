@@ -183,7 +183,10 @@ def test_coding_tool_is_registered_only_when_enabled_and_available(
     tmp_path,
 ) -> None:
     from mimir.tools import all_mimir_tools
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate import forge
 
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
     selected = _selected_cultivate_policy()
     monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
@@ -205,6 +208,7 @@ def test_identity_degradation_removes_coding_tools_and_does_not_auto_recover(
     from mimir.plugins.manager import load_plugins
     from mimir_cultivate import forge as forge_tools
 
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
     selected = load_plugins(enable="cultivate").policy
     monkeypatch.setattr(forge_tools, "_github_identity_degraded", True)
     with policy_scope(selected):
@@ -350,6 +354,10 @@ def test_declarative_coding_inventory_does_not_probe_cli_availability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.tools import all_mimir_tools
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate import forge
+
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
     selected = _selected_cultivate_policy()
 
     def unexpected_probe() -> bool:
@@ -377,7 +385,9 @@ def test_core_only_policy_exposes_no_typed_repo_pr_tools() -> None:
                 if tool.resource_scope == "repo_pr"}
 
 
-def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled() -> None:
+def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     pytest.importorskip("mimir_cultivate")
     from mimir.access_control import (
         SinkCategory,
@@ -387,10 +397,12 @@ def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled() -> Non
     from mimir.tools import all_mimir_tools
     from mimir.plugins.core import policy_scope
     from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge
 
     default_names = {
         tool.name for tool in all_mimir_tools(require_coding_available=False)
     }
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
     selected = load_plugins(enable="cultivate").policy
     with policy_scope(selected):
         enabled_names = {
