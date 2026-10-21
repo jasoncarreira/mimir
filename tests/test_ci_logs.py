@@ -8,7 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from mimir import ci_logs
+if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+    pytest.skip("Cultivate is not selected", allow_module_level=True)
+
+from mimir_cultivate import ci as ci_logs
 
 
 def test_cultivate_helper_is_only_a_provider_import():

@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from mimir.github_withhold import (
+from tests.withhold_probe import OUTSIDER_MARKER, assert_marker_absent
+
+if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+    pytest.skip("Cultivate is not selected", allow_module_level=True)
+
+from mimir_cultivate.github_trust import (
     WithheldItem, partition, placeholder, sanitize_login, sanitize_timestamp,
     sanitize_url, summarise,
 )
-from tests.withhold_probe import OUTSIDER_MARKER, assert_marker_absent
 
 
 def _candidate(kind: str, author: str) -> dict[str, object]:
@@ -75,7 +80,7 @@ def test_partition_withholds_truthy_non_bool_attestations(verdict: object) -> No
 def test_truthy_attestation_mutant_fails_regression(
     monkeypatch: pytest.MonkeyPatch, verdict: object,
 ) -> None:
-    import mimir.github_withhold as withhold
+    import mimir_cultivate.github_trust as withhold
 
     source = Path(withhold.__file__).read_text(encoding="utf-8")
     assert source.count("if verdict is True:") == 1

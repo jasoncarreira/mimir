@@ -136,6 +136,24 @@ log = logging.getLogger(__name__)
 
 _ATTESTATION_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="poller-attest")
 
+
+def _safe_signal_login(value: object) -> str:
+    if isinstance(value, str) and re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?", value, re.ASCII,
+    ):
+        return value
+    return "<invalid-login>"
+
+
+def _safe_signal_url(value: object, repo: object) -> str | None:
+    if not isinstance(value, str) or not isinstance(repo, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo, re.ASCII,
+    ):
+        return None
+    pattern = rf"https://github\.com/{re.escape(repo)}/(?:issues|pull)/[0-9]+(?:\#[A-Za-z0-9_-]{{1,64}})?"
+    return value if re.fullmatch(pattern, value, re.ASCII) else None
+
+
 # Wall-clock ceiling for one poller subprocess. Overrunning it is not a partial
 # result: the timeout path discards the stdout already collected (see the
 # ``asyncio.TimeoutError`` handler in ``run_poller``). No buffered AgentEvents
@@ -3081,17 +3099,15 @@ async def run_poller(
                 "github_outsider_issue_withheld",
                 "pr_auto_review_skipped_untrusted_author",
             }:
-                from .github_withhold import sanitize_login, sanitize_url
-
                 repo = payload.get("repo")
                 number = payload.get("number")
                 payload = {
-                    "repo": repo if isinstance(repo, str) and sanitize_url(
+                    "repo": repo if isinstance(repo, str) and _safe_signal_url(
                         f"https://github.com/{repo}/issues/1", repo,
                     ) else None,
                     "number": number if type(number) is int and number > 0 else None,
-                    "author": sanitize_login(payload.get("author")),
-                    "url": sanitize_url(payload.get("url"), repo),
+                    "author": _safe_signal_login(payload.get("author")),
+                    "url": _safe_signal_url(payload.get("url"), repo),
                 }
             try:
                 # Same ordering rule as the mid-run barrier: the receipt durably
@@ -3112,13 +3128,12 @@ async def run_poller(
                     "pr_auto_review_skipped_untrusted_author",
                 }:
                     from .bridges._mentions import neutralize_display_name
-                    from .github_withhold import sanitize_login, sanitize_url
 
                     repo = payload.get("repo")
-                    url = sanitize_url(payload.get("url"), repo)
+                    url = _safe_signal_url(payload.get("url"), repo)
                     if url:
                         login = neutralize_display_name(
-                            sanitize_login(payload.get("author")),
+                            _safe_signal_login(payload.get("author")),
                         )
                         kind = "issue" if signal_name == "github_outsider_issue_withheld" else "PR"
                         outsider_notices.append(f"Outsider {kind} withheld: {login} {url}")
