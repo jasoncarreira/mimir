@@ -121,10 +121,13 @@ exists — turn it on here first:
 | `MIMIR_ACTIVITY_PANEL_CHANNELS` | A passive, live-updating "working…" panel posted to the channel that accumulates the turn's steps and edits itself in place (Slack `chat.update` / Discord message edit). |
 | `MIMIR_MIDTURN_INJECTION_CHANNELS` | Fold an inbound user message into the currently-running turn instead of queuing it for the next one. |
 | `MIMIR_CHAT_SKILLS_ENABLED` | Chat slash-skill discovery + invocation from a channel. |
-| `MIMIR_CODING_ENABLED` | Single coding runtime/build flag. Requires OpenCode, pinned Git, and an existing runtime-writable PR checkout lease root; see [coding prerequisites](#coding-prerequisites). |
 | `MIMIR_FACTORY_EPICS_ENABLED` | Feature-factory epic dispatch in the chainlink-orchestrator poller (for `worklink:epic` issues). |
 
-Installed Python plugins use a separate operator-owned process-environment enable
+Coding is an optional installed provider, not a feature flag: install the
+same-version `mimir-cultivate` package and select `cultivate` in `MIMIR_PLUGINS`.
+The retired coding flag has no effect. See [coding prerequisites](#coding-prerequisites).
+
+Installed Python plugins use an operator-owned process-environment enable
 list. They are trusted in-process code, not a sandbox or a remote marketplace.
 Unset or empty `MIMIR_PLUGINS` disables optional plugins only; existing core tools
 remain available. Disabled providers are inspected through package metadata, not
@@ -186,7 +189,6 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_MIDTURN_INJECTION_CHANNELS` | csv-list | `""` (off) | Fold inbound `user_message` events into the running turn. Pollers / scheduled ticks excluded. |
 | `MIMIR_CHAT_SKILLS_ENABLED` | bool | `false` | Chat slash-skill discovery/invocation (chainlink #783). |
 | `MIMIR_CHAT_SKILL_ALLOWLIST` | csv-list | `""` | Skill slugs allowed as chat slash-skills (companion to the flag above). |
-| `MIMIR_CODING_ENABLED` | bool | `false` | Enable the coding tool surface and scaffold image's OpenCode install/bootstrap. See [coding prerequisites](#coding-prerequisites); missing prerequisites fail startup together. |
 
 ## Concurrency, queue & timeouts
 
@@ -870,7 +872,7 @@ Optional keys that enable specific tools/skills; unset = the tool/skill is off.
 ## Build- & scaffold-time variables
 
 These are consumed by the Docker scaffold / build (`start.sh`, Dockerfiles,
-`compose.env`). `MIMIR_CODING_ENABLED` is also the Python runtime coding flag.
+`compose.env`). Build arguments do not enable a provider at runtime.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
@@ -878,28 +880,28 @@ These are consumed by the Docker scaffold / build (`start.sh`, Dockerfiles,
 | `MIMIR_DEFAULT_BRANCH` | str | `main` | Branch `start.sh` clones. |
 | `MIMIR_ENABLE_CLAUDE_CODE` | bool (`0`/`1`) | `0` | Build arg: `1` installs the Claude Code model adapter; the CLI is operator-provided. |
 | `MIMIR_ENABLE_OPENCODE` | bool (`0`/`1`) | `0` | Root Dockerfile build arg: `1` installs pinned OpenCode and bootstraps its config. Selected Cultivate scaffold images use the same build argument and pass it to runtime bootstrap; this is not the runtime plugin selection (`MIMIR_PLUGINS`). |
-| `MIMIR_CODING_ENABLED` | bool | `false` | Single runtime/build flag: true installs the pinned OpenCode runtime and bundled plugins in scaffold images and bootstraps their config at runtime. |
 | `MIMIR_EXTRAS` | csv-list | `anthropic,discord,slack,mcp` | pip extras build arg (`mimir-agent[...]`) in the PyPI-mode Dockerfile. |
 | `MIMIR_QUOTA_POLL_ENABLED` | bool (`0`/`1`) | unset | Setup-generated compatibility marker for subscription routes. Provider-side polling is not implemented for all routes, so do not treat this marker alone as evidence that quota polling is active. |
 
 ### Coding prerequisites
 
-Coding stays disabled by default. In the current core-only deployment,
-`MIMIR_CODING_ENABLED` remains the runtime coding flag and the legacy scaffold
-build/bootstrap flag until coding-flag retirement. The old independent scaffold
-`MIMIR_ENABLE_OPENCODE` knob was removed; the root Dockerfile uses that name as
-a build argument, and newly selected Cultivate scaffolds use it for both build
-and bootstrap. Select the installed provider separately with `MIMIR_PLUGINS`.
-Scaffold Compose passes its image switch from the project `.env` or shell to
-`build.args` and `environment`. Compose interpolation does not read `compose.env`;
-putting the switch only there does not configure the build. `--opencode` only
-optionally bakes the home's config into the image.
+Coding stays disabled by default. Install matching-version `mimir-cultivate`
+and set `MIMIR_PLUGINS=cultivate` in the supervisor process environment; an
+unselected or absent provider supplies no coding tools. For image builds,
+select and install Cultivate at build time as described in
+[plugins](plugins.md#docker-image-assembly-and-services).
+`MIMIR_ENABLE_OPENCODE` is a build argument for the pinned CLI/bootstrap, not
+a runtime coding switch. Compose reads its project `.env` for build argument
+interpolation, not `compose.env`; place runtime `MIMIR_PLUGINS` in the process
+environment. Regenerate scaffolds and rebuild images after changing installed
+plugins. `--opencode` only optionally bakes the home's config into the image.
 
 Before an operator chooses to enable coding, provision all prerequisites:
 
-- Install the pinned OpenCode CLI from `mimir/worklink/tool_pins.py` on the runtime
-  `PATH`. Regenerate older scaffolds and **rebuild the image** after changing the
-  coding flag (`docker compose build`, then `docker compose up -d`). A restart
+- Install the pinned OpenCode CLI from
+  `mimir_cultivate.worklink.tool_pins` on the runtime `PATH`. Regenerate older
+  scaffolds and **rebuild the image** after selecting Cultivate for the image
+  (`docker compose build`, then `docker compose up -d`). A restart
   alone cannot install the CLI. Hand-maintained images must supply the same
   prerequisites themselves; a runtime/build mismatch with a missing CLI is
   caught at startup rather than exposing broken tools.

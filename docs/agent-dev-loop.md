@@ -43,7 +43,7 @@ You need two GitHub identities, one always-on host for the mimir agent, and your
 | Agent host | Linux or macOS box that stays on, with Docker | Runs the mimir agent and its builds. Allow 8 CPUs, 16 GB RAM and 60 GB+ free disk |
 | Your machine | Claude Code, `gh`, `git`, `uv` | Runs reviews: full test suites in worktrees |
 | Model access | A subscription or API key for the agent | e.g. a Codex/ChatGPT plan (`codex-plus`), Claude Max (`claude-code`) or an API key |
-| mimir | `pip install "mimir-agent[<extras>]"` | Extras: `codex-plus`, `claude-code`, `anthropic`, `openai`, `discord`, `slack`, `mcp`. Worklink and GitHub tools are in the base package |
+| mimir + Cultivate | `pip install "mimir-agent[<extras>]" "mimir-cultivate==<matching-mimir-version>"` | Extras: `codex-plus`, `claude-code`, `anthropic`, `openai`, `discord`, `slack`, `mcp`. Worklink and GitHub coding tools require the separately installed, selected Cultivate provider. Core remains MIT; Cultivate is BSL. |
 | chainlink | The issue tracker the queue reads | Built into the Docker image by `mimir scaffold-docker`; set `CHAINLINK_BIN` to use your own build |
 | Chat bridge (optional) | Discord or Slack | How you talk to the agent and get its alerts |
 
@@ -143,14 +143,16 @@ Every `docker compose` command in this section runs **from the agent home** (`cd
 **1. Install mimir and create a home.**
 
 ```bash
-pip install "mimir-agent[codex-plus,discord]"      # pick your model and chat extras
+pip install "mimir-agent[codex-plus,discord]" "mimir-cultivate==<matching-mimir-version>"
 mimir setup --home ~/agents/my-agent                # add --model / --subscription to choose a model
 # The container sees this home at /mimir-home, but setup wrote saga's database paths as
 # absolute host paths; point them at the container path or the agent can't open its memory.
 sed -i.bak -E 's#^(db_path|metrics_db_path) = ".*/\.mimir/#\1 = "/mimir-home/.mimir/#' ~/agents/my-agent/saga.toml
 ```
 
-**2. Install the two skills that run the loop.** Do this before scaffolding: `scaffold-docker` reads installed skills for their Dockerfile fragments and the environment keys they need.
+**2. Install the two Cultivate skills that run the loop.** Select Cultivate in
+the operator process first. Do this before scaffolding: `scaffold-docker` reads
+installed skills for their Dockerfile fragments and the environment keys they need.
 
 ```bash
 mimir skills install chainlink-orchestrator --home ~/agents/my-agent   # poller: worklink-ready-queue, every 10 min
@@ -175,10 +177,14 @@ FRAG
 
 The directory has no `SKILL.md`, so the agent never loads it as a skill; only the scaffold reads it. If your tests use another runner, install that instead, and use it in `test_command` below.
 
-**4. Generate the Docker files.** Re-run this whenever you install or remove a skill or fragment; it rewrites `Dockerfile` and `compose.yml` and merges new keys into `compose.env` without touching your values.
+**4. Generate the Docker files.** Run with `MIMIR_PLUGINS=cultivate` in the
+operator process environment and the matching provider installed. Re-run this
+whenever you install or remove a skill, plugin or fragment; it rewrites
+`Dockerfile` and `compose.yml` and merges new keys into `compose.env` without
+touching your values.
 
 ```bash
-mimir scaffold-docker --home ~/agents/my-agent --service-name my-agent --mode pypi \
+MIMIR_PLUGINS=cultivate mimir scaffold-docker --home ~/agents/my-agent --service-name my-agent --mode pypi \
   --extras "codex-plus,discord,mcp"
 ```
 
@@ -413,7 +419,8 @@ A valid leaf needs:
 - `- Scope:`, `- Out of scope:` and `- Suggested test command:` under Worklink notes;
 - at least one `- [ ]` checklist line starting in column 0.
 
-Validate it locally with `missing_leaf_template_parts` from `mimir/worklink/planning.py`; it must return `[]`.
+Validate it locally with `missing_leaf_template_parts` from
+`mimir_cultivate.worklink.planning`; it must return `[]`.
 
 **2. File and arm it.** Run these where the agent's chainlink tracker lives: in `<home>`, or through `docker exec -u <user> -w <home> <container>`.
 
@@ -505,7 +512,7 @@ Each rule below exists because breaking it once cost a bad merge, a false diagno
 
 **Specs**
 
-11. **Write criteria a build can meet from its checkout alone.** The builder can't open or read the PR, see reviews, or update the tracker; the controller does those around it. Anything that needs a live service, a PR or the tracker goes in the review criteria as a reviewer-only live check, in those words. This is a spec rule, not a containment boundary: the shipping `local_subprocess` compute backend is **not** network-isolated and shares the host filesystem (`network_isolated=False`, `shared_filesystem=True` in `mimir/worklink/compute.py`). Enabling autonomous runs accepts that risk.
+11. **Write criteria a build can meet from its checkout alone.** The builder can't open or read the PR, see reviews, or update the tracker; the controller does those around it. Anything that needs a live service, a PR or the tracker goes in the review criteria as a reviewer-only live check, in those words. This is a spec rule, not a containment boundary: the shipping `local_subprocess` compute backend is **not** network-isolated and shares the host filesystem (`network_isolated=False`, `shared_filesystem=True` in `mimir_cultivate/worklink/compute.py`). Enabling autonomous runs accepts that risk.
 12. **Criteria must hold against main, not a sibling branch.** Declare ordering with `chainlink issue block <leaf> <blocker>`.
 13. **Ground every spec in the current code.** Cite `file:line` on today's main. Before writing that a mechanism is missing, verify that it really is.
 14. **Test sentinels must not look like secrets.** The publication scanner refuses `sk-…`, JWT or long base64 shapes even in tests. Use plain strings like `fake-oauth-sentinel-not-a-token`.
