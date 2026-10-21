@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from mimir.worklink.planning import (
+pytest.importorskip("mimir_cultivate", reason="Worklink planning belongs to Cultivate")
+
+from mimir_cultivate.worklink.planning import (
     _REQUIRED_SECTIONS,
     missing_leaf_template_parts,
     target_branch_from_description,

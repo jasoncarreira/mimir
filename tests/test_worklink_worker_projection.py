@@ -5,9 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from mimir.worklink import checkout as checkout_module
-from mimir.worklink.backends.base import WorkOrder
-from mimir.worklink.backends.opencode import OpenCodeBackend
+pytest.importorskip("mimir_cultivate", reason="Worklink worker projections belong to Cultivate")
+
+from mimir_cultivate.worklink import checkout as checkout_module
+from mimir_cultivate.worklink.backends.base import WorkOrder
+from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
 
 
 def _write_native_files(home: Path) -> None:

@@ -6,9 +6,11 @@ import subprocess
 
 import pytest
 
+pytest.importorskip("mimir_cultivate", reason="Worklink Git publication belongs to Cultivate")
+
 import mimir._rmtree as rmtree_module
-import mimir.worklink.safe_git as safe_git_module
-from mimir.worklink.safe_git import ControllerGitPublication, SafeGitError
+import mimir_cultivate.worklink.safe_git as safe_git_module
+from mimir_cultivate.worklink.safe_git import ControllerGitPublication, SafeGitError
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
