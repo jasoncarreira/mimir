@@ -241,9 +241,6 @@ def _assert_session_fixture_clears(
             next(fixture)
 
 
-_CODING_ENABLED = "MIMIR_CODING_ENABLED"
-
-
 def test_declared_publishing_identity_tests_ignore_the_host_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -266,17 +263,37 @@ def test_declared_publishing_identity_tests_ignore_the_host_override(
     )
 
 
-def test_coding_state_tests_ignore_the_host_override(
+def test_selected_cultivate_survives_host_environment_isolation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The Worklink gate must pass with deployment coding enabled.
+    """Do not turn selected-provider coverage into a core-only test run."""
+    pytest.importorskip("mimir_cultivate")
+    from mimir.coding import coding_enabled
+    from tests.conftest import _clear_host_mimir_environment
 
-    The chainlink-orchestrator deliberately passes ``MIMIR_CODING_ENABLED`` to
-    every Worklink build. Without the session fixture clearing that host value,
-    disabled-default tool-registry tests and backend/evidence tests silently run
-    against the enabled worker path.
-    """
-    _assert_session_fixture_clears(_CODING_ENABLED, "true", monkeypatch)
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    fixture = _clear_host_mimir_environment.__wrapped__()
+    next(fixture)
+    try:
+        assert os.environ["MIMIR_PLUGINS"] == "cultivate"
+        assert coding_enabled()
+    finally:
+        with pytest.raises(StopIteration):
+            next(fixture)
+
+
+def test_retired_flag_alone_does_not_import_or_activate_cultivate() -> None:
+    """A fresh core process ignores the old flag even if the package is installed."""
+    env = {**os.environ, "MIMIR_PLUGINS": "", "MIMIR_CODING_ENABLED": "true"}
+    child = subprocess.run(
+        [sys.executable, "-c", "from mimir.coding import coding_enabled\n"
+         "import sys\n"
+         "assert not coding_enabled()\n"
+         "assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.') "
+         "for name in sys.modules)\n"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
 
 
 # ── 4. poller-injected env must not reach the suite ───────────────────

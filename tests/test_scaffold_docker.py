@@ -648,45 +648,46 @@ def test_render_dockerfile_installs_opencode_when_enabled():
         ), mode
 
 
-def test_render_dockerfile_always_offers_coding_build_arg():
-    """No scaffold-time opt-in is needed for the single build/runtime flag."""
+def test_render_dockerfile_always_offers_opencode_build_arg():
     for mode in ("workspace", "pypi"):
         out = render_dockerfile([], mode=mode)
         assert f"opencode-ai@{OPENCODE_VERSION}" in out, mode
-        assert "ARG MIMIR_CODING_ENABLED=false" in out, mode
-        assert "MIMIR_ENABLE_OPENCODE" not in out, mode
+        assert "ARG MIMIR_ENABLE_OPENCODE=0" in out, mode
+        assert "MIMIR_CODING_ENABLED" not in out, mode
         assert "/home/mimir/.config/opencode/opencode.json" not in out, mode
         assert "__OPENCODE_INSTALL__" not in out, mode
         assert "__OPENCODE_CONFIG__" not in out, mode
 
 
 @pytest.mark.parametrize("mode", ["workspace", "pypi"])
-@pytest.mark.parametrize("value", [None, "", "false", "0", "off", "invalid", "true", "1", "yes", "on", "y", " TRUE "])
-def test_single_coding_flag_controls_install_and_bootstrap(mode, value, monkeypatch):
+@pytest.mark.parametrize("selected", [False, True])
+def test_build_install_and_selected_plugin_bootstrap(mode, selected, monkeypatch):
     import subprocess
 
-    from mimir.coding import coding_enabled
-
-    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
-    if value is not None:
-        monkeypatch.setenv("MIMIR_CODING_ENABLED", value)
-    # The retired variable must not activate either generated guard.
-    monkeypatch.setenv("MIMIR_ENABLE_OPENCODE", "1")
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if selected else "")
+    monkeypatch.setenv("MIMIR_ENABLE_OPENCODE", "0")
     dockerfile = render_dockerfile([], mode=mode)
     install = re.search(r"RUN (if python3 .*?\n    fi)", dockerfile, re.S).group(1)
     result = subprocess.run(
         ["sh", "-c", "npm() { printf installed; }; " + install],
         capture_output=True, text=True, check=True,
     )
-    assert result.stdout == ("installed" if coding_enabled() else "")
+    assert result.stdout == ""
+    monkeypatch.setenv("MIMIR_ENABLE_OPENCODE", "1")
+    result = subprocess.run(
+        ["sh", "-c", "npm() { printf installed; }; " + install],
+        capture_output=True, text=True, check=True,
+    )
+    assert result.stdout == "installed"
     start = render_start_sh(mode=mode)
-    assert "MIMIR_ENABLE_OPENCODE" not in start
+    assert "MIMIR_CODING_ENABLED" not in start
     guard = next(line for line in start.splitlines() if line.startswith("if python3"))
     result = subprocess.run(
         ["sh", "-c", guard + " printf bootstrapped; fi"],
         capture_output=True, text=True, check=True,
     )
-    assert result.stdout == ("bootstrapped" if coding_enabled() else "")
+    assert result.stdout == ("bootstrapped" if selected else "")
 
 
 def test_scaffold_installs_opencode_when_flag_set(tmp_path: Path):
@@ -800,9 +801,9 @@ def test_scaffold_opencode_config_is_idempotent(tmp_path: Path):
 def test_start_scripts_bootstrap_the_global_config_when_opencode_is_enabled():
     workspace = render_start_sh(mode="workspace")
     pypi = render_start_sh(mode="pypi")
-    assert 'os.environ.get("MIMIR_CODING_ENABLED", "")' in workspace
+    assert 'os.environ.get("MIMIR_PLUGINS", "")' in workspace
     assert 'uv run mimir opencode-bootstrap --home "$HOME"' in workspace
-    assert 'os.environ.get("MIMIR_CODING_ENABLED", "")' in pypi
+    assert 'os.environ.get("MIMIR_PLUGINS", "")' in pypi
     assert 'mimir opencode-bootstrap --home "$HOME"' in pypi
 
 
@@ -1473,9 +1474,10 @@ def test_render_compose_yml_exposes_claude_code_build_switch():
             out.count("MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}")
             == 2
         )
-        assert out.count('MIMIR_CODING_ENABLED: "${MIMIR_CODING_ENABLED:-false}"') == 2
-        assert "MIMIR_ENABLE_OPENCODE" not in out
-        assert "Set them in .env or the shell" in out
+        assert 'MIMIR_ENABLE_OPENCODE: "${MIMIR_ENABLE_OPENCODE:-0}"' in out
+        assert 'MIMIR_PLUGINS: "${MIMIR_PLUGINS:-}"' in out
+        assert "MIMIR_CODING_ENABLED" not in out
+        assert "Build switches live in .env or the shell" in out
         assert "Compose interpolation does not read env_file" in out
 
 

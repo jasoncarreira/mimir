@@ -705,6 +705,7 @@ async def test_local_subprocess_compute_omits_parent_death_hook_off_linux(
 async def test_local_subprocess_compute_caps_output_and_kills_on_overflow(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     process = FakeProcess(returncode=None, stdout=b"abcdefgh", stderr=b"err")
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
@@ -808,6 +809,7 @@ def test_output_paths_reject_backend_path_components(tmp_path: Path) -> None:
 async def test_anonymous_launch_failure_does_not_unlink_none_paths(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     async def fail_exec(*_args: str, **_kwargs: Any) -> FakeProcess:
         raise OSError("spawn failed")
 
@@ -1167,6 +1169,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
 ) -> None:
     """chainlink #830: the opencode backend runs `opencode run --dir <worktree>
     -- <prompt>` and interprets its output."""
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     calls: list[dict[str, Any]] = []
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
@@ -1541,6 +1544,7 @@ async def test_opencode_backend_transcript_filename_contract(
     """chainlink #831: regression test that opencode transcript filenames use
     the 'opencode-' prefix (not 'codex-') and embed the issue id, so mixed
     deployments can tell runs apart."""
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     calls: list[dict[str, Any]] = []
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
@@ -1829,6 +1833,7 @@ async def test_local_subprocess_env_allowlist_passes_creds_not_bridge_secrets(
     """chainlink #830: autonomous local_subprocess must hand the coding CLI its
     provider creds + HOME (so opencode finds config/plugins/auth) while never
     leaking bridge/operator secrets. Inert until the docker->worktree pivot."""
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     captured: dict[str, Any] = {}
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:

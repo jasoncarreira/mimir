@@ -4346,10 +4346,11 @@ def test_chainlink_orchestrator_passes_controller_environment_overrides() -> Non
     pass_env = manifest["pollers"][0]["pass_env"]
     assert "MIMIR_FACTORY_PUBLISHING_IDENTITY" in pass_env
     assert "FACTORY_PUBLISHING_IDENTITY" in pass_env
-    # The flag selects the worker uid without selecting the declined contained
+    # Plugin selection reaches the worker without selecting the declined contained
     # checkout barrier (#1434). This protects the source repo, not credentials
     # (virtiofs ownership remains tracked in #1435) or sibling runs.
-    assert "MIMIR_CODING_ENABLED" in pass_env
+    assert "MIMIR_PLUGINS" in pass_env
+    assert "MIMIR_CODING_ENABLED" not in pass_env
 
 
 def test_worklink_ignores_planner_suggested_test_command_by_default(
@@ -5959,7 +5960,9 @@ def test_factory_permission_failure_prevents_launch(
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", coding)
+    if coding == "1":
+        pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if coding == "1" else "")
 
     def denied(*args):
         raise PermissionError("group change denied")
@@ -12173,7 +12176,8 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         return cp(args)
 
     worker_uid = 4242
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setattr(
         orchestrator,
         "get_identities",

@@ -1244,10 +1244,7 @@ def test_disabled_coding_keeps_legacy_checkout_path(
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
-    if value is None:
-        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
-    else:
-        monkeypatch.setenv("MIMIR_CODING_ENABLED", value)
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
 
     assert checkout_module._isolated_checkout_path(repo, ".worklink", 1410, 2) == (
         tmp_path / ".worklink" / "repo" / "1410-2"
@@ -1260,7 +1257,8 @@ def test_enabled_coding_uses_bounded_hashed_checkout_path(
     repo = tmp_path / "repo"
     repo.mkdir()
     root = tmp_path / "enabled"
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", root)
 
     path = checkout_module._isolated_checkout_path(repo, ".worklink", 1410, 2)
@@ -1366,7 +1364,8 @@ def test_enabled_eligible_checkout_uses_normal_path_and_shared_modes_without_aut
 ) -> None:
     repo = _repo_with_main(tmp_path)
     calls: list[list[str]] = []
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     forbidden_root = tmp_path / "enabled"
     monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", forbidden_root)
     monkeypatch.setattr(
@@ -1413,7 +1412,8 @@ def test_enabled_controller_only_checkout_preserves_legacy_behavior(
 ) -> None:
     repo = _repo_with_main(tmp_path)
     calls: list[list[str]] = []
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", tmp_path / "enabled")
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:

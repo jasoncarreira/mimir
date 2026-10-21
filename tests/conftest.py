@@ -315,7 +315,6 @@ _HOST_ONLY_ENV = frozenset(
         "MIMIR_OUTBOUND_PII_JEV",
         "MIMIR_OUTBOUND_PRIVACY_ENFORCE",
         "JEV_KEY",
-        "MIMIR_CODING_ENABLED",
         "MIMIR_CODEX_PLUS_BUFFER_NONINTERACTIVE",
         "MIMIR_FACTORY_PUBLISHING_IDENTITY",
         "MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S",
@@ -397,12 +396,9 @@ def _clear_host_mimir_environment():
     and publication for every build. Tests that exercise the override set it
     explicitly in the test body.
 
-    ``MIMIR_CODING_ENABLED`` is likewise a deployment capability switch. Tests
-    that exercise enabled coding already opt in explicitly through the function
-    argument or ``monkeypatch.setenv``; allowing the host value to leak instead
-    changes disabled-default assertions and routes Worklink tests through the
-    enabled worker path. A Worklink test gate must therefore be invariant to the
-    controller's configured coding state.
+    ``MIMIR_PLUGINS`` is the process-owned plugin selection and must survive this
+    fixture. Tests requiring core-only behavior select it explicitly; clearing
+    selection here would silently turn off the selected-provider test matrix.
 
     ``MIMIR_MALLOC_TRIM_CRON`` must not let a deployment override change the
     suite's default-registration assertions.

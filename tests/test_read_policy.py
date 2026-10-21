@@ -152,8 +152,8 @@ def test_non_admin_attachment_root_refuses_symlink_escape(
     ) is None
 
 
-@pytest.mark.parametrize("flag", [None, "0", "false", "invalid", "1", "true"])
-def test_derived_lease_read_root_is_coding_only(flag, tmp_path, monkeypatch):
+@pytest.mark.parametrize("selected", [False, True])
+def test_derived_lease_read_root_is_coding_only(selected, tmp_path, monkeypatch):
     from mimir.access_control import _configured_file_write_roots
 
     home = tmp_path / "home"
@@ -163,15 +163,14 @@ def test_derived_lease_read_root_is_coding_only(flag, tmp_path, monkeypatch):
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
     monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
-    if flag is None:
-        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
-    else:
-        monkeypatch.setenv("MIMIR_CODING_ENABLED", flag)
+    if selected:
+        pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if selected else "")
     baseline = configured_non_admin_read_roots()
     write_roots = _configured_file_write_roots()
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
 
-    enabled = flag in {"1", "true"}
+    enabled = selected
     assert derived_pr_checkout_read_root() == (lease_root if enabled else None)
     roots = configured_non_admin_read_roots()
     assert (lease_root in roots) is enabled
@@ -202,7 +201,8 @@ def test_invalid_lease_root_does_not_extend_read_policy(invalid, tmp_path, monke
     }
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
     baseline = configured_non_admin_read_roots()
     if invalid != "unset":
@@ -228,7 +228,8 @@ def test_derived_lease_known_root_preserves_absolute_paths(tmp_path, monkeypatch
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lexical))
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     roots = configured_non_admin_read_roots()
     assert root in roots and lexical in roots
     # Isolate derived-root routing from the unrelated broad /tmp default.
@@ -248,7 +249,7 @@ def test_derived_lease_known_root_preserves_absolute_paths(tmp_path, monkeypatch
     protected = root / ".env"
     protected.write_text("private\n")
     assert resolve_non_admin_read_target(str(protected), scan_file=True) is None
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "0")
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     assert policy.resolved_read_target_from_arguments(
         "read_file", {"file_path": str(target)},
     ) == str(home / str(target).lstrip("/"))
@@ -269,7 +270,8 @@ def test_derived_lease_read_containment(escape, tmp_path, monkeypatch):
     (root / "escape").symlink_to(outside)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lexical))
     requested = lexical / ("escape" if escape == "symlink" else "../outside.txt")
     # Keep /tmp enabled: a missing narrow lexical root must not fall back to it.
@@ -287,7 +289,8 @@ def test_derived_lease_does_not_expand_write_configuration(tmp_path, monkeypatch
     root.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
     before = _configured_file_write_roots()
     assert root in configured_non_admin_read_roots()

@@ -2032,8 +2032,9 @@ def test_pr_review_others_preserves_service_trust_guards(stage: str, mutation: d
 @pytest.mark.parametrize("stage", ["stored", "fetch", "accept"])
 @pytest.mark.parametrize("grant", [False, True])
 def test_pr_review_others_does_not_widen_scheduled_ticks(
-    tmp_path: Path, stage: str, grant: bool,
+    tmp_path: Path, stage: str, grant: bool, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     heartbeat = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
     scheduler = get_service_principal("scheduled_tick")
     assert scheduler is not None
@@ -2049,9 +2050,11 @@ def test_pr_review_others_does_not_widen_scheduled_ticks(
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_heartbeat_git_flag_preserves_principal_and_shell_policy(tmp_path, monkeypatch, enabled):
-    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     baseline = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", str(enabled).lower())
+    if enabled:
+        pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if enabled else "")
     principal = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
     assert principal == baseline
     auth = _trusted_service_auth(principal, channel_id="scheduler:heartbeat")
@@ -4995,7 +4998,8 @@ def test_repo_review_observed_code_execution_refusals_name_usable_guidance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Observed review-turn npm and inline Python attempts stay refused usefully."""
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
 
     argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
         command, "repo_review",
@@ -5016,10 +5020,7 @@ def test_repo_review_guidance_does_not_name_unavailable_repo_test(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The default coding-disabled deployment is not sent to a missing tool."""
-    if coding_env is None:
-        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
-    else:
-        monkeypatch.setenv("MIMIR_CODING_ENABLED", coding_env)
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
 
     argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
         "npm run", "repo_review",
@@ -11554,7 +11555,8 @@ def test_heartbeat_maintenance_file_sink_is_confined_to_exact_active_lease(
         path.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{source}:rw")
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
 
     state = _review_state("o/r", 42, "worklink/42", str(source))
     state.action_scope.__dict__["event_type"] = "heartbeat_pr_maintenance"
@@ -11592,8 +11594,8 @@ def test_heartbeat_maintenance_file_sink_is_confined_to_exact_active_lease(
         assert denied.allowed is False
         assert denied.reason == "repo_pr_target_outside_active_lease"
 
-    # Without the operator coding opt-in the heartbeat never reaches the gate.
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "0")
+    # Without the selected provider the heartbeat never reaches the gate.
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     unflagged = registry.authorize_tool(
         tool_name, auth, enforce=True,
         target_channel=str(checkout / "mimir" / "access_control.py"),
@@ -11615,7 +11617,8 @@ def test_heartbeat_maintenance_file_sink_requires_the_scope_write_grant(
         path.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{source}:rw")
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
 
     state = _review_state("o/r", 42, "worklink/42", str(source))
     state.action_scope.__dict__["event_type"] = "heartbeat_pr_maintenance"

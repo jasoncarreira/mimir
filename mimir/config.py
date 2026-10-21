@@ -26,7 +26,6 @@ from dotenv import dotenv_values, load_dotenv
 
 from .access_control import resolve_access_control_enforcement
 from .billing import BillingMode, detect_billing_mode
-from .coding import coding_enabled
 from .env import _ENV_BOOL_FALSY, _ENV_BOOL_TRUTHY, env_bool
 
 if TYPE_CHECKING:
@@ -1329,8 +1328,7 @@ class Config:
     # default; the allowlist is normalized, lowercased skill slugs only.
     chat_skills_enabled: bool = False
     chat_skill_allowlist: tuple[str, ...] = ()
-    # The OpenCode binary being installed is not operator consent to expose a
-    # code-writing tool to the model. This capability is explicitly opt-in.
+    # Derived from the installed, selected Cultivate plugin; not a separate flag.
     coding_enabled: bool = False
     # Native OpenCode JSON/JSONC selected through OPENCODE_CONFIG, or its
     # standard XDG/HOME location. Provider/plugin settings remain OpenCode-owned.
@@ -1384,7 +1382,9 @@ class Config:
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
         model_spec = _env("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
-        coding_enabled_value = coding_enabled()
+        coding_enabled_value = any(
+            plugin.candidate.name == "cultivate" for plugin in plugin_manager.plugins
+        )
         from .opencode_config import opencode_config_path
 
         resolved_opencode_config = opencode_config_path()

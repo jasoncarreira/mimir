@@ -1016,18 +1016,18 @@ async def test_closed_worker_direct_parity_inventory(
                 result.command,
             )
 
-        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+        monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
         baseline_backend = LocalSubprocessComputeBackend()
         baseline_handle = await baseline_backend.launch(disabled_spec())
         baseline = await baseline_backend.wait(baseline_handle, None)
         await baseline_backend.cleanup(baseline_handle)
         assert (baseline.exit_code, baseline.stdout, baseline.stderr) == (0, "unchanged\n", "")
 
-        for flag in ("false", None):
-            if flag is None:
-                monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+        for selection in ("", None):
+            if selection is None:
+                monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
             else:
-                monkeypatch.setenv("MIMIR_CODING_ENABLED", flag)
+                monkeypatch.setenv("MIMIR_PLUGINS", selection)
             backend = LocalSubprocessComputeBackend.for_authorized_checkout(
                 ForbiddenAuthorization()
             )

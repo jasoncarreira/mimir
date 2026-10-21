@@ -682,7 +682,7 @@ def result_is_protected(path: Path, *, text: str | None = None) -> bool:
 
 
 def derived_pr_checkout_read_root() -> Path | None:
-    """Return the coding-only lease routing root, not a lease authorization grant.
+    """Return the selected plugin's lease routing root, not an authorization grant.
 
     Unlike lease provisioning, policy discovery must not create directories.
     Keep home/protected-system roots out using the file-tool root validator.

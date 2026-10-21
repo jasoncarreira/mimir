@@ -468,11 +468,11 @@ class TestConfigFromEnv:
         assert cfg.chat_skills_enabled is True
         assert cfg.chat_skill_allowlist == ("memory", "github", "review")
 
-    def test_coding_capability_is_off_by_default_and_opt_in(
+    def test_coding_capability_requires_selected_installed_plugin(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
     ) -> None:
         self._base(monkeypatch)
-        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+        monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
         from mimir.config import Config
 
         with caplog.at_level(logging.INFO, logger="mimir.config"):
@@ -481,6 +481,9 @@ class TestConfigFromEnv:
 
         caplog.clear()
         monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+        assert Config.from_env().coding_enabled is False
+        pytest.importorskip("mimir_cultivate")
+        monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
         with caplog.at_level(logging.INFO, logger="mimir.config"):
             assert Config.from_env().coding_enabled is True
         assert "coding assistant capability: enabled" in caplog.text
@@ -500,10 +503,16 @@ class TestConfigFromEnv:
     ) -> None:
         self._base(monkeypatch)
         monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
-        monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+        pytest.importorskip("mimir_cultivate")
+        monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
 
-        def unexpected_probe(_binary: str) -> None:
-            raise AssertionError("config inventory validation must not probe PATH")
+        import shutil
+        original_which = shutil.which
+
+        def unexpected_probe(binary: str) -> str | None:
+            if binary == "opencode":
+                raise AssertionError("config inventory validation must not probe OpenCode on PATH")
+            return original_which(binary)
 
         monkeypatch.setattr("mimir.providers.shutil.which", unexpected_probe)
 

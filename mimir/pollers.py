@@ -381,7 +381,7 @@ _NON_SECRET_FORWARDED_ENV_KEYS = frozenset({
     "MIMIR_SOURCE_DIR",
     "GITHUB_REPOS",
     "MIMIR_GITHUB_REPOS",
-    "MIMIR_CODING_ENABLED",
+    "MIMIR_PLUGINS",
     "MIMIR_GITHUB_PRELOAD_REVIEW_SKILL",
     "MIMIR_GITHUB_REVIEW_SKILL_PATH",
 })
@@ -389,8 +389,8 @@ _NON_SECRET_FORWARDED_ENV_KEYS = frozenset({
 
 The GitHub login is identity used by authorization and review reconciliation;
 the two home/source values are filesystem locations; the repository values are
-public repository selectors; and the remaining values are feature flags or a
-review-skill path. None is a credential. This is deliberately closed: every
+public repository selectors; plugin selection; and the remaining values are
+feature flags or a review-skill path. None is a credential. This is deliberately closed: every
 other value forwarded through ``pass_env`` or manifest ``env`` remains redacted.
 """
 

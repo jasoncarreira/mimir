@@ -3003,6 +3003,7 @@ def test_server_discovered_scope_is_reused_on_later_autonomous_turn(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     client = FakeForge()
     _configure_live_review(monkeypatch, client)
     store = ServerDiscoveredPRScopeStore()
@@ -3052,6 +3053,7 @@ def test_autonomous_turn_cannot_resolve_model_named_unhanded_pr(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     client = FakeForge()
     _configure_live_review(monkeypatch, client)
 
@@ -3082,7 +3084,7 @@ def test_heartbeat_git_fresh_own_pr_all_typed_actions(tmp_path, monkeypatch, ena
     client = FakeForge()
     client.snapshot_author = "reviewer"
     _configure_live_review(monkeypatch, client)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", str(enabled).lower())
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if enabled else "")
     context = _production_auth_context(tmp_path, "scheduled_tick")
     service = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
     context = replace(context, service_authority=service)
@@ -3131,7 +3133,7 @@ def test_heartbeat_git_refuses_incompatible_cached_scope_without_mutation(
     client = FakeForge()
     client.snapshot_author = "reviewer"
     _configure_live_review(monkeypatch, client)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", str(enabled).lower())
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if enabled else "")
     snapshot = client.get_pull_request_snapshot("owner/repo", 17)
     scope = access_control.create_server_discovered_heartbeat_scope(
         "owner/repo", snapshot, event_type="heartbeat_pr_maintenance",
@@ -3170,7 +3172,7 @@ def test_heartbeat_git_refuses_incompatible_cached_scope_without_mutation(
 
 @pytest.mark.parametrize("field", ["type", "trigger", "authority_profile", "canonical"])
 def test_heartbeat_authority_predicate_boundaries(tmp_path, monkeypatch, field):
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     service = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
     candidate = SimpleNamespace(**vars(service)) if field == "type" else replace(service, **{field: "other"})
     assert not access_control.heartbeat_git_authority_enabled(candidate)
@@ -3182,7 +3184,7 @@ def test_heartbeat_direct_authorization_boundaries(tmp_path, monkeypatch, field)
     client = FakeForge()
     client.snapshot_author = "reviewer"
     _configure_live_review(monkeypatch, client)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     service = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
     scope = access_control.create_server_discovered_heartbeat_scope(
         "owner/repo", client.get_pull_request_snapshot("owner/repo", 17),
@@ -3208,7 +3210,7 @@ def test_heartbeat_direct_authorization_boundaries(tmp_path, monkeypatch, field)
 
 @pytest.mark.parametrize("field", ["capability", "profile", "empty_accept", "other_accept"])
 def test_heartbeat_scope_stage_boundaries(tmp_path, monkeypatch, field):
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     context = _production_auth_context(tmp_path, "scheduled_tick")
     service = context.service_authority
     stage, author, login = "fetch", "reviewer", "reviewer"
@@ -3236,7 +3238,7 @@ def test_heartbeat_resolution_input_boundaries(tmp_path, monkeypatch, repository
     client = FakeForge()
     client.snapshot_author = "reviewer"
     _configure_live_review(monkeypatch, client)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     context = _production_auth_context(tmp_path, "scheduled_tick")
     with pytest.raises(ToolException, match=reason):
         resolve_review_state_for_context(context, repository, number)
@@ -3252,7 +3254,7 @@ def test_heartbeat_cached_scope_pin_boundaries(tmp_path, monkeypatch, field):
     client = FakeForge()
     client.snapshot_author = "reviewer"
     _configure_live_review(monkeypatch, client)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     context = _production_auth_context(tmp_path, "scheduled_tick")
     scope = access_control.create_server_discovered_heartbeat_scope(
         "owner/repo", client.get_pull_request_snapshot("owner/repo", 17),
@@ -3273,7 +3275,7 @@ def test_heartbeat_provider_boundary_refusals(tmp_path, monkeypatch, field):
     client = FakeForge()
     client.snapshot_author = "reviewer"
     _configure_live_review(monkeypatch, client)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     snapshot = client.get_pull_request_snapshot("owner/repo", 1)
     candidate = {
         "type": SimpleNamespace(**vars(snapshot)),
@@ -3301,7 +3303,7 @@ def test_heartbeat_checkout_rejects_poller_preflight_shortcut(tmp_path, monkeypa
     client = FakeForge()
     client.snapshot_author = "reviewer"
     _configure_live_review(monkeypatch, client)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     scope = access_control.create_server_discovered_heartbeat_scope(
         "owner/repo", client.get_pull_request_snapshot("owner/repo", 17),
         event_type="pr_changes_requested_stale",
@@ -3334,7 +3336,7 @@ def test_heartbeat_git_rejects_other_author_scope_reuse(tmp_path, monkeypatch, s
         server_discovered_pr_scope_store=store,
     )
     previous = resolve_review_state_for_context(operator, "owner/repo", 17)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     context = replace(
         _production_auth_context(tmp_path, "scheduled_tick"),
         server_discovered_pr_scope_store=store,
@@ -3384,7 +3386,7 @@ def test_heartbeat_git_validates_provider_identity(tmp_path, monkeypatch, mutati
     client = FakeForge()
     client.snapshot_author = "reviewer"
     _configure_live_review(monkeypatch, client)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     snapshot = client.get_pull_request_snapshot("owner/repo", 17)
     monkeypatch.setattr(client, "get_pull_request_snapshot", lambda *args: replace(snapshot, **mutation))
     context = _production_auth_context(tmp_path, "scheduled_tick")
@@ -3407,7 +3409,7 @@ def test_heartbeat_git_rejects_untrusted_context_even_with_cached_scope(tmp_path
     monkeypatch.setattr(client, "get_job_log", lambda *args: "untrusted job log", raising=False)
     client.snapshot_author = "reviewer"
     _configure_live_review(monkeypatch, client)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     context = _production_auth_context(tmp_path, "scheduled_tick")
     resolve_review_state_for_context(context, "owner/repo", 17)
     context = replace(context, **mutation)
@@ -3435,7 +3437,7 @@ def test_heartbeat_git_revalidates_cached_identity(tmp_path, monkeypatch, login)
     client = FakeForge()
     client.snapshot_author = "reviewer"
     _configure_live_review(monkeypatch, client)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     context = _production_auth_context(tmp_path, "scheduled_tick")
     resolve_review_state_for_context(context, "owner/repo", 17)
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", login)
@@ -3448,6 +3450,7 @@ def test_advanced_head_invalidates_reuse_and_is_not_rechecked_this_turn(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     client = FakeForge()
     client.snapshot_heads = ["c" * 40, "d" * 40]
     _configure_live_review(monkeypatch, client)
@@ -3540,6 +3543,8 @@ def test_advanced_stored_head_rechecks_discovery_acceptance(
 async def test_invalid_stored_scope_refuses_reads_and_gates_typed_escalation(
     tmp_path, monkeypatch: pytest.MonkeyPatch, invalid: str, reason: str,
 ) -> None:
+    if invalid in {"fetch-denied", "accept-denied"}:
+        monkeypatch.setenv("MIMIR_PLUGINS", "")
     client = FakeForge()
     _configure_live_review(monkeypatch, client)
     store = ServerDiscoveredPRScopeStore()
@@ -3613,6 +3618,7 @@ async def test_scope_handed_to_second_turn_still_requires_checkout_grant(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     client = FakeForge()
     _configure_live_review(monkeypatch, client)
     store = ServerDiscoveredPRScopeStore()
@@ -3723,7 +3729,10 @@ def _poller_operator_context(tmp_path) -> AuthContext:
 )
 def test_real_turn_kind_forge_review_scope_policy(
     tmp_path, turn_kind: str, expected: tuple[bool, bool, bool, bool],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if turn_kind == "scheduled_tick":
+        monkeypatch.setenv("MIMIR_PLUGINS", "")
     context = _production_auth_context(tmp_path, turn_kind)
 
     actual = (

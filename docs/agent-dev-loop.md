@@ -258,10 +258,11 @@ Leave `backends.opencode.bash_allowlist` unset: mimir derives it from your `test
   MIMIR_PR_CHECKOUT_LEASE_ROOT=/workspace/.pr-leases   # same filesystem as the repo root
   ```
 
-- **`.env` (in the agent home) holds the coding toggle.** Compose interpolates it into both the image build (it installs the pinned OpenCode runtime) and the container environment, so the two can't disagree. Compose never reads `compose.env` for interpolation, so the toggle only works here.
+- **`.env` (in the agent home) holds Compose build and plugin selections.** Install the Cultivate package in the image, then select it with `MIMIR_PLUGINS`; selection without the installed package fails startup. `MIMIR_ENABLE_OPENCODE` is only a build argument for the pinned OpenCode runtime, not a runtime coding switch. Compose reads `.env` for interpolation, not `compose.env`. Leave `MIMIR_PLUGINS` unset to run core without importing Cultivate.
 
   ```bash
-  MIMIR_CODING_ENABLED=true
+  MIMIR_ENABLE_OPENCODE=1
+  MIMIR_PLUGINS=cultivate
   ```
 
 `GITHUB_TOKEN` must be a real, valid token before first boot: `start.sh` runs `gh auth login --with-token` under `set -e`, so an invalid token stops the container. Don't set `GH_TOKEN` to a different value; two tokens that disagree stop dispatch. Check the token with `mimir verify-cred GITHUB_TOKEN`.
@@ -275,7 +276,7 @@ docker compose run --rm --no-deps --entrypoint sh my-agent -c '
   id                                       # the runtime user: mimir, uid/gid 1000 unless you overrode them
   test -d /workspace/.pr-leases -a ! -L /workspace/.pr-leases -a -w /workspace/.pr-leases && echo lease-root-ok
   uv --version && cd /workspace/<repo> && uv run pytest -q
-  env | cut -d= -f1 | grep -E "^(GITHUB_TOKEN|MIMIR_GITHUB_SELF_LOGIN|GH_USER_NAME|GH_USER_EMAIL|MIMIR_PR_CHECKOUT_LEASE_ROOT|MIMIR_CODING_ENABLED)$"'
+  env | cut -d= -f1 | grep -E "^(GITHUB_TOKEN|MIMIR_GITHUB_SELF_LOGIN|GH_USER_NAME|GH_USER_EMAIL|MIMIR_PR_CHECKOUT_LEASE_ROOT|MIMIR_PLUGINS)$"'
 ```
 
 If `lease-root-ok` doesn't print, fix ownership on the host and re-run the check:
