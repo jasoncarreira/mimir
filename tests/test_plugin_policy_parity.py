@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import fields, replace
 from pathlib import Path
 
@@ -450,7 +451,6 @@ def test_pre_extraction_coding_policy_is_frozen(
     assert CODING_TOOLS <= frozen["authorization"].keys()
     assert CODING_TOOLS <= frozen["extractor_results"].keys()
     assert retired.isdisjoint(registry.tools)
-    assert CODING_TOOLS.isdisjoint(registry.tools)
     required_memberships = (
         "retained_repo_tools", "worklink_build_tools", "repo_publish_tools",
         "tainted_writes",
@@ -477,9 +477,91 @@ def test_pre_extraction_coding_policy_is_frozen(
         for membership in required_memberships:
             assert (membership in tool.memberships) == (name in tables[membership])
         assert len(frozen["authorization"][name]) == 18
-    for name in CODING_TOOLS:
+    for name in sorted(CODING_TOOLS):
         assert observed[name].keys() == frozen["authorization"][name].keys()
         for case, original in frozen["authorization"][name].items():
             current = observed[name][case]
-            if case.endswith(":enforced") and not original[1]:
-                assert not current[1], (name, case)
+            tool = selected.tools[name]
+            if current == original:
+                continue
+            enforced = case.endswith(":enforced")
+            tainted = "_tainted_" in case
+            # These oracle contexts have neither a server-issued PR grant nor
+            # a review state. Previously they stopped at the legacy scope gate;
+            # selected tools must now fail at the more specific owner grant or
+            # fail to extract a target from that missing state.
+            if (tool.resource_scope == "repo_pr" and original[3] == "repo_pr_scope_denied"
+                    and current[3] == "repo_pr_grant_denied"):
+                assert tool.typed_action is not None and tool.flow == "source"
+                expected = [*original[:3], "repo_pr_grant_denied", *original[4:]]
+            elif (tool.resource_scope == "repo_pr" and original[3] == "repo_pr_scope_denied"
+                  and current[3] == "sink_target_required"):
+                assert tool.typed_action is not None and tool.flow in {"both", "sink"}
+                expected = [*original[:3], "sink_target_required", "admin", *original[5:]]
+            elif name == "unsupported_operation" and current[3] == "channel_target_required":
+                assert tool.resource_scope == "channel" and original[3] == "repo_pr_scope_denied"
+                expected = [*original[:3], "channel_target_required", "admin", *original[5:]]
+            elif (tool.writes_code_or_state and "worklink_build_tools" not in tool.memberships
+                  and tainted and current[3] == "write_blocked_by_untrusted_ingest"):
+                assert original[3] in {
+                    "repo_pr_scope_denied", "ifc_label_blocked:forge", "ifc_label_blocked:spawn",
+                    "issue_repository_source_required", "admin_required", None,
+                }
+                expected = ["admin_required", False, True,
+                            "write_blocked_by_untrusted_ingest", "admin", "unknown", False]
+            elif name in {"worklink_run", "worklink_resume"}:
+                assert tool.resource_scope == "worklink"
+                assert not os.environ.get("WORKLINK_REPO") and not os.environ.get("MIMIR_WORKLINK_REPO")
+                expected = ["resource_scoped", not enforced, True,
+                            "sink_target_required", "admin", "both", not enforced]
+            elif name == "spawn_open_code":
+                assert not tainted and tool.descriptor.sink_destination == "spawn_process"
+                expected = ["admin_required", not enforced, True,
+                            "sink_target_required", "admin", "both", not enforced]
+            else:
+                pytest.fail(f"unreviewed coding authorization change: {name} {case}: {original} -> {current}")
+            assert current == expected, (name, case, original, current)
+
+
+def test_selected_coding_tools_reach_a_permitted_production_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from tests.test_repo_tools import _selected_checkout_and_follow_on_with_live_grants
+
+    selected, scope, _auth, _follow_on, checkout, fetched = (
+        _selected_checkout_and_follow_on_with_live_grants(tmp_path, monkeypatch)
+    )
+    assert selected.tools["repo_checkout"].owner == "cultivate"
+    assert selected.tools["repo_fetch"].owner == "cultivate"
+    assert scope.observed_head_sha
+    assert checkout.status != "error"
+    assert fetched.status != "error"
+
+
+def test_selected_spawn_and_build_admit_clean_bound_destinations(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        for tool, target, arguments in (
+            ("spawn_open_code", str(home), {"cwd": str(home)}),
+            ("worklink_run", str(repo), {}),
+        ):
+            for enforce in (False, True):
+                decision = policy.ToolRegistry().authorize_tool(
+                    tool, _context("admin", False), enforce=enforce,
+                    target_channel=target, arguments=arguments,
+                )
+                assert decision.allowed and not decision.would_block, (tool, enforce, decision.reason)
+                assert decision.flow_direction.value == "both"
