@@ -8,7 +8,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from mimir.worklink import compute, run_state
+pytest.importorskip("mimir_cultivate", reason="Worklink compute belongs to Cultivate")
+
+from mimir_cultivate.worklink import compute, run_state
 
 
 @pytest.mark.asyncio
@@ -35,7 +37,7 @@ async def test_external_process_wait_kill_guard(monkeypatch, error) -> None:
 
 @pytest.mark.asyncio
 async def test_external_process_cancel_propagates_probe_permission_error(monkeypatch) -> None:
-    from mimir.worklink import worker_exec
+    from mimir_cultivate.worklink import worker_exec
 
     failure = PermissionError(errno.EPERM, "not our process")
     kill = Mock(side_effect=failure)

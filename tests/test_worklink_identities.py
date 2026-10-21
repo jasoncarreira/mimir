@@ -23,7 +23,7 @@ def _run_identity_import(script: str, *, environment: dict[str, str] | None = No
     )
 
 
-def test_worklink_imports_do_not_resolve_system_accounts() -> None:
+def test_core_imports_do_not_resolve_system_accounts_or_load_provider() -> None:
     result = _run_identity_import(
         """
 import grp
@@ -32,9 +32,9 @@ import pwd
 pwd.getpwnam = lambda name: (_ for _ in ()).throw(AssertionError(name))
 grp.getgrnam = lambda name: (_ for _ in ()).throw(AssertionError(name))
 
-import mimir.contained_execution
-import mimir.worklink.checkout
-import mimir.worklink.worker_exec
+import mimir.contained_snapshot
+import mimir.access_control
+import mimir.plugins.core
 import sys
 assert 'mimir_cultivate' not in sys.modules
 print("safe")
@@ -88,18 +88,15 @@ print("safe")
     assert result.stdout.strip() == "safe"
 
 
-@pytest.mark.parametrize("provider", [False, True])
-def test_system_account_resolution_is_cached_and_shared_by_consumers(provider: bool) -> None:
-    if provider:
-        pytest.importorskip("mimir_cultivate")
-    package = "mimir_cultivate.worklink" if provider else "mimir.worklink"
+def test_system_account_resolution_is_cached_and_shared_by_consumers() -> None:
+    pytest.importorskip("mimir_cultivate")
+    package = "mimir_cultivate.worklink"
     imports = (
         f"import {package}.checkout as checkout\n"
         f"import {package}.identities as identities\n"
         f"import {package}.worker_exec as executor\n"
     )
-    if provider:
-        imports += "import mimir_cultivate.contained_checkout as handoff\n"
+    imports += "import mimir_cultivate.contained_checkout as handoff\n"
     result = _run_identity_import(
         """
 import grp
@@ -132,7 +129,7 @@ print(json.dumps({
     "calls": calls,
 }))
 """.replace("IMPORTS", imports).replace(
-            "HANDOFF", "handoff.get_identities()," if provider else ""
+            "HANDOFF", "handoff.get_identities(),"
         ),
         environment={
             "MIMIR_UID": "7",
@@ -143,7 +140,7 @@ print(json.dumps({
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {
-        "values": [[42001, 42002, 42003]] * (4 if provider else 3),
+        "values": [[42001, 42002, 42003]] * 4,
         "same": True,
         "calls": [["user", "mimir"], ["user", "worklink"], ["group", "worklink"]],
     }
@@ -160,6 +157,7 @@ print(json.dumps({
 def test_missing_required_identity_fails_on_first_containment_use(
     missing_kind: str, missing_name: str, message: str
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
     result = _run_identity_import(
         f"""
 import grp
@@ -178,8 +176,8 @@ def group(name):
 
 pwd.getpwnam = user
 grp.getgrnam = group
-import mimir.worklink.worker_exec
-from mimir.worklink.identities import get_identities
+import mimir_cultivate.worklink.worker_exec
+from mimir_cultivate.worklink.identities import get_identities
 get_identities()
 """
     )

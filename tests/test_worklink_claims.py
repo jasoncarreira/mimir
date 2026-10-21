@@ -10,7 +10,9 @@ from typing import Sequence
 
 import pytest
 
-from mimir.worklink.claims import (
+pytest.importorskip("mimir_cultivate", reason="Worklink claims belong to Cultivate")
+
+from mimir_cultivate.worklink.claims import (
     MAX_SHUTDOWN_ABORT_FORGIVENESS,
     SHUTDOWN_ABORT_PREFIX,
     ChainlinkClaims,
@@ -19,8 +21,8 @@ from mimir.worklink.claims import (
     _ChainlinkContentionExhausted,
     claim_records_from_comments,
 )
-from mimir.worklink.evidence import TestResult, WorklinkEvidence
-from mimir.worklink.orchestrator import _write_evidence
+from mimir_cultivate.worklink.evidence import TestResult, WorklinkEvidence
+from mimir_cultivate.worklink.orchestrator import _write_evidence
 
 
 def completed(args: Sequence[str], returncode: int = 0) -> subprocess.CompletedProcess[str]:
@@ -490,7 +492,7 @@ def test_independent_descriptor_excludes_invocations_and_bounds_wait(tmp_path, m
             with pytest.raises(_ChainlinkContentionExhausted, match="contention exhausted"):
                 claims._run("issue", "show", "1602")
         else:
-            import mimir.worklink.orchestrator as orchestrator
+            import mimir_cultivate.worklink.orchestrator as orchestrator
 
             events = []
 
@@ -627,7 +629,7 @@ def test_list_issue_ids_falls_back_when_id_is_null() -> None:
 @pytest.mark.parametrize("epic", [False, True])
 @pytest.mark.parametrize("ledger_failure", [False, True])
 def test_claim_issue_blocks_when_attempts_exhausted(tmp_path, monkeypatch, epic, ledger_failure) -> None:
-    from mimir.worklink import dispatch_failures
+    from mimir_cultivate.worklink import dispatch_failures
     if ledger_failure:
         def fail(*args, **kwargs):
             raise OSError("ledger unavailable")
@@ -668,7 +670,7 @@ def test_claim_issue_blocks_when_attempts_exhausted(tmp_path, monkeypatch, epic,
 
 @pytest.mark.parametrize("ledger_failure", [False, True])
 def test_reaper_enforces_own_ttl_before_steal(tmp_path: Path, monkeypatch, ledger_failure) -> None:
-    from mimir.worklink import dispatch_failures
+    from mimir_cultivate.worklink import dispatch_failures
     if ledger_failure:
         def fail(*args, **kwargs):
             raise OSError("ledger unavailable")
@@ -828,8 +830,8 @@ def test_reaper_persists_incident_before_force_steal_and_write_failure_preserves
 def test_reaper_incident_is_durable_before_steal_and_blocks_concurrent_core(
     tmp_path: Path,
 ) -> None:
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
-    from mimir.worklink.orchestrator import run_worklink
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+    from mimir_cultivate.worklink.orchestrator import run_worklink
 
     calls: list[list[str]] = []
     now = datetime(2026, 9, 19, tzinfo=UTC)
@@ -1351,7 +1353,7 @@ def test_claim_issue_refuses_when_review_ready_evidence_exists(tmp_path: Path, c
 
     claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, home_path=tmp_path)
 
-    with caplog.at_level("INFO", logger="mimir.worklink.claims"):
+    with caplog.at_level("INFO", logger="mimir_cultivate.worklink.claims"):
         result = claims.claim_issue(200, labels=["worklink:ready"])
 
     assert result.claimed is False
@@ -1432,7 +1434,7 @@ def test_graceful_shutdown_releases_only_this_process_claim_and_forgives_budget(
 
 
 def test_shutdown_operator_stop_disarms_only_matching_attempt(tmp_path: Path) -> None:
-    from mimir.worklink.control import _mark_operator_stop
+    from mimir_cultivate.worklink.control import _mark_operator_stop
 
     now = datetime(2026, 10, 8, tzinfo=UTC)
     stopped = ClaimRecord(1033, 2, "agent", now)
@@ -1477,7 +1479,7 @@ def test_shutdown_operator_stop_disarms_only_matching_attempt(tmp_path: Path) ->
 
 
 def test_transition_issue_operator_stop_does_not_rearm(tmp_path: Path) -> None:
-    from mimir.worklink.control import _mark_operator_stop
+    from mimir_cultivate.worklink.control import _mark_operator_stop
 
     calls: list[list[str]] = []
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:

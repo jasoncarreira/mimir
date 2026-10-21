@@ -6,8 +6,10 @@ import re
 
 import pytest
 
-from mimir.worklink.backends.feature_factory import FACTORY_VERSION
-from mimir.worklink.tool_pins import (
+pytest.importorskip("mimir_cultivate", reason="Worklink tool pins belong to Cultivate")
+
+from mimir_cultivate.worklink.backends.feature_factory import FACTORY_VERSION
+from mimir_cultivate.worklink.tool_pins import (
     OPENCODE_VERSION,
     default_tool_pins,
 )
