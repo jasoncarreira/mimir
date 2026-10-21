@@ -134,20 +134,22 @@ def test_retained_file_effects_are_in_all_central_policy_inventories() -> None:
 
 
 def test_worklink_resume_is_exact_spawn_capability() -> None:
+    pytest.importorskip("mimir_cultivate")
     from mimir.tools import budget_gate
 
-    assert ac.get_sink_category("worklink_resume") is ac.SinkCategory.SPAWN
-    assert ac.get_tool_flow_direction("worklink_resume") is ac.ToolFlowDirection.BOTH
-    assert ac.TRIGGER_CAPABILITY_TIERS["worklink_resume"] is ac.CapabilityTier.CODE_EXECUTION
-    assert "worklink_resume" in budget_gate._REMEDIATION_EFFECT_TOOLS
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        assert ac.get_sink_category("worklink_resume") is ac.SinkCategory.SPAWN
+        assert ac.get_tool_flow_direction("worklink_resume") is ac.ToolFlowDirection.BOTH
+        assert ac.TRIGGER_CAPABILITY_TIERS["worklink_resume"] is ac.CapabilityTier.CODE_EXECUTION
+        assert "worklink_resume" in budget_gate._REMEDIATION_EFFECT_TOOLS
 
 
 @pytest.mark.asyncio
 async def test_worklink_resume_dispatches_exact_scope_detached(
     retained_incident, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.tools import registry
-    from mimir.worklink import autonomy, detached_dispatch, factory_state
+    from mimir_cultivate.registration import worklink_resume
+    from mimir_cultivate.worklink import autonomy, detached_dispatch, factory_state
 
     case = retained_incident
     scope = derive_retained_factory_scope(case.event, case.service).scope
@@ -173,7 +175,7 @@ async def test_worklink_resume_dispatches_exact_scope_detached(
         ),
     )
 
-    output = await registry.worklink_resume.coroutine(runtime=_retained_runtime(scope))
+    output = await worklink_resume.coroutine(runtime=_retained_runtime(scope))
 
     assert "recovery dispatched" in output
     assert "run_id=chainlink-1810" in output
@@ -188,8 +190,9 @@ async def test_worklink_resume_dispatches_exact_scope_detached(
 
 @pytest.mark.asyncio
 async def test_worklink_resume_refuses_leaf_without_launch(monkeypatch: pytest.MonkeyPatch) -> None:
-    from mimir.tools import registry
-    from mimir.worklink import detached_dispatch
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.registration import worklink_resume
+    from mimir_cultivate.worklink import detached_dispatch
 
     monkeypatch.setattr(
         detached_dispatch, "launch_detached_worklink",
@@ -199,7 +202,7 @@ async def test_worklink_resume_refuses_leaf_without_launch(monkeypatch: pytest.M
         retained_factory_scope=None,
         retained_factory_scope_refusal="incident is not a retained factory run",
     ))
-    output = await registry.worklink_resume.coroutine(runtime=runtime)
+    output = await worklink_resume.coroutine(runtime=runtime)
     assert "refused" in output
     assert "leaf incidents must be diagnosed and reported" in output
 
@@ -225,8 +228,8 @@ async def test_worklink_resume_refuses_leaf_without_launch(monkeypatch: pytest.M
 async def test_worklink_resume_preflight_refuses_changed_state_without_launch(
     retained_incident, monkeypatch: pytest.MonkeyPatch, mutation: str, reason: str,
 ) -> None:
-    from mimir.tools import registry
-    from mimir.worklink import autonomy, detached_dispatch, dispatch_failures, factory_state
+    from mimir_cultivate.registration import worklink_resume
+    from mimir_cultivate.worklink import autonomy, detached_dispatch, dispatch_failures, factory_state
 
     case = retained_incident
     scope = derive_retained_factory_scope(case.event, case.service).scope
@@ -283,7 +286,7 @@ async def test_worklink_resume_preflight_refuses_changed_state_without_launch(
     launch = Mock(side_effect=AssertionError("refused recovery launched"))
     monkeypatch.setattr(detached_dispatch, "launch_detached_worklink", launch)
 
-    output = await registry.worklink_resume.coroutine(runtime=_retained_runtime(scope))
+    output = await worklink_resume.coroutine(runtime=_retained_runtime(scope))
 
     assert reason in output
     launch.assert_not_called()

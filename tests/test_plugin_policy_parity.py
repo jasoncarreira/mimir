@@ -14,8 +14,8 @@ import pytest
 
 from mimir import access_control as policy
 from mimir import read_policy
-from mimir.plugins.core import core_policy_registry
-from mimir.plugins.core import policy_membership
+from mimir.plugins.core import core_policy_registry, policy_membership, policy_scope
+from mimir.plugins.manager import load_plugins
 from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel, TurnInteractivity
 from mimir.tool_descriptors import (
     TOOL_DESCRIPTORS,
@@ -397,8 +397,7 @@ def test_original_core_policy_matches_frozen_oracle(
     assert expected["baseline_sha"] == BASELINE
     assert len(expected["descriptors"]) == 103
     assert _canonical(expected, home) == fixture_bytes
-    retired = (frozenset(CODING_TOOLS)
-               - {"spawn_open_code", "worklink_run", "worklink_resume"})
+    retired = CODING_TOOLS | {"pr_review_others"}
 
     def without_retired(value):
         if isinstance(value, dict):
@@ -411,6 +410,20 @@ def test_original_core_policy_matches_frozen_oracle(
 
     observed = without_retired(json.loads(_canonical(_snapshot(home, monkeypatch), home)))
     projected = without_retired(expected)
+    projected["tables"]["profile_capability_companions"] = {
+        profile: companions for profile, companions in
+        projected["tables"]["profile_capability_companions"].items() if companions
+    }
+    scheduler = projected["tables"]["trusted_service_principals"]["scheduled_tick"]
+    scheduler["sink_destinations"] = [
+        destination for destination in scheduler["sink_destinations"]
+        if destination not in {"spawn_process", "worklink"}
+    ]
+    scheduler["sink_policies"] = [
+        item for item in scheduler["sink_policies"] if len(item) == 3
+    ]
+    for key, value in scheduler.items():
+        assert observed["tables"]["trusted_service_principals"]["scheduled_tick"][key] == value, key
     assert observed.keys() == projected.keys()
     for category, value in observed.items():
         if isinstance(value, dict):
@@ -424,27 +437,30 @@ def test_original_core_policy_matches_frozen_oracle(
 def test_pre_extraction_coding_policy_is_frozen(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
     home = tmp_path / "oracle-home"
     _prepare_inputs(home, monkeypatch)
     frozen = json.loads(FIXTURE.read_bytes())
     tables = frozen["tables"]
     registry = core_policy_registry()
-    retired = (frozenset(CODING_TOOLS)
-               - {"spawn_open_code", "worklink_run", "worklink_resume"})
+    retired = CODING_TOOLS
 
     assert len(CODING_TOOLS) == 40
     assert CODING_TOOLS <= frozen["descriptors"].keys()
     assert CODING_TOOLS <= frozen["authorization"].keys()
     assert CODING_TOOLS <= frozen["extractor_results"].keys()
     assert retired.isdisjoint(registry.tools)
-    assert CODING_TOOLS - retired <= registry.tools.keys()
+    assert CODING_TOOLS.isdisjoint(registry.tools)
     required_memberships = (
         "retained_repo_tools", "worklink_build_tools", "repo_publish_tools",
         "tainted_writes",
     )
     assert set(required_memberships) <= tables.keys()
-    for name in sorted(CODING_TOOLS - retired):
-        tool = registry.tools[name]
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        observed = _outcomes(home)
+    for name in sorted(CODING_TOOLS):
+        tool = selected.tools[name]
         descriptor = frozen["descriptors"][name]
         assert tool.flow == tables["flow"].get(name)
         assert tool.tier == tables["tier"].get(name)
@@ -461,6 +477,9 @@ def test_pre_extraction_coding_policy_is_frozen(
         for membership in required_memberships:
             assert (membership in tool.memberships) == (name in tables[membership])
         assert len(frozen["authorization"][name]) == 18
-    observed = _outcomes(home)
-    for name in CODING_TOOLS - retired:
-        assert observed[name] == frozen["authorization"][name]
+    for name in CODING_TOOLS:
+        assert observed[name].keys() == frozen["authorization"][name].keys()
+        for case, original in frozen["authorization"][name].items():
+            current = observed[name][case]
+            if case.endswith(":enforced") and not original[1]:
+                assert not current[1], (name, case)

@@ -3882,7 +3882,7 @@ async def test_admin_sensitive_tool_denied_for_non_admin(
 
     token = set_current_turn(ctx)
     try:
-        out = await mw.awrap_tool_call(_make_request("worklink_run", "id-admin"), handler)
+        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-admin"), handler)
     finally:
         reset_current_turn(token)
 
@@ -3894,7 +3894,7 @@ async def test_admin_sensitive_tool_denied_for_non_admin(
     assert "admin_tool_call_denied" in kinds
     assert "tool_call_denied" in kinds
     admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
-    assert admin_event["tool"] == "worklink_run"
+    assert admin_event["tool"] == "shell_exec"
     assert admin_event["canonical_author"] == "alice"
     assert admin_event["denial_reason"] == "admin_required"
 
@@ -7018,14 +7018,20 @@ async def test_converted_tool_failure_is_accounted_from_typed_status(
     arguments: dict[str, Any],
     expected_text: str,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    from mimir.tools import extra, registry, shell_async, web
+    from mimir.tools import extra, shell_async, web
+    from mimir_cultivate.registration import worklink_run
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
 
     monkeypatch.delenv("MIMIR_HOME", raising=False)
+    if tool_name == "worklink_run":
+        monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
     monkeypatch.setattr(shell_async, "_REGISTRY", None)
     monkeypatch.setitem(extra._TURN_STATE, "turns_log_path", None)
     tools = {
-        "worklink_run": registry.worklink_run,
+        "worklink_run": worklink_run,
         "web_search": web.web_search,
         "fetch_url": web.fetch_url,
         "bash_job_output": shell_async.bash_job_output,
@@ -7033,7 +7039,9 @@ async def test_converted_tool_failure_is_accounted_from_typed_status(
         "mimir_get_turn": extra.mimir_get_turn,
     }
     request = _make_request(tool_name, f"typed-{tool_name}", args=arguments)
-    produced = await tools[tool_name].ainvoke(request.tool_call)
+    selected = load_plugins(enable="cultivate").policy if tool_name == "worklink_run" else None
+    with policy_scope(selected):
+        produced = await tools[tool_name].ainvoke(request.tool_call)
     assert isinstance(produced, ToolMessage)
     assert produced.status == "error"
     assert produced.content == expected_text
@@ -7057,9 +7065,10 @@ async def test_converted_tool_failure_is_accounted_from_typed_status(
         monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", json.dumps([arguments["url"]]))
     token = set_current_turn(ctx)
     try:
-        result = await BudgetGateMiddleware().awrap_tool_call(
-            _make_request(tool_name, f"typed-{tool_name}", args=arguments), handler,
-        )
+        with policy_scope(selected):
+            result = await BudgetGateMiddleware().awrap_tool_call(
+                _make_request(tool_name, f"typed-{tool_name}", args=arguments), handler,
+            )
     finally:
         reset_current_turn(token)
 
@@ -7775,7 +7784,7 @@ async def test_core_only_repo_test_refusal_does_not_taint_turn() -> None:
         reset_current_turn(token)
 
     assert refusal.status == "error"
-    assert "repository_tool_unavailable" in str(refusal.content)
+    assert "unknown_sink_category" in str(refusal.content)
     assert adapted.content == "adapted"
     assert calls == ["adapted"]
     assert ctx.ifc_labels.has_untrusted_active_ingest is False

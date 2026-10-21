@@ -2907,6 +2907,7 @@ def test_poller_payload_cannot_bypass_active_sink_ifc(
     tool_name: str,
     target: str,
     sink_category: str,
+    selected_cultivate_policy,
 ):
     poller = AuthContext(
         principal="service:poller",
@@ -3151,6 +3152,7 @@ def test_fetch_redirect_pin_includes_only_approved_ingested_urls() -> None:
 def test_worklink_integrity_gate_uses_only_untrusted_active_ingest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    selected_cultivate_policy,
     integrity: str,
     integrity_effect: str,
     expected: bool,
@@ -3182,6 +3184,7 @@ def test_worklink_integrity_gate_uses_only_untrusted_active_ingest(
 def test_worklink_repo_service_adapter_allows_only_configured_repo(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    selected_cultivate_policy,
 ) -> None:
     repo = tmp_path / "repo"
     wrong_repo = tmp_path / "wrong-repo"
@@ -3230,6 +3233,7 @@ def test_upgrade_service_add_schedule_allows_same_scope() -> None:
 def test_generic_spawn_is_blocked_even_for_trusted_trigger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    selected_cultivate_policy,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     service = ServicePrincipal(
@@ -4992,6 +4996,7 @@ def test_review_skill_read_admits_scoped_forge_sinks_under_enforcement(
 def test_worklink_run_is_blocked_after_shell_result_with_external_provenance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    selected_cultivate_policy,
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

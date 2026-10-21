@@ -48,7 +48,6 @@ ALLOWLIST = {
     "CODEX_HOME",         # Codex CLI's own config dir; read to locate auth.
     "CLAUDE_CONFIG_DIR",  # Claude Code CLI's own config dir.
     "CHAINLINK_BIN",      # Path override for the external chainlink CLI binary.
-    "WORKLINK_RUN_BIN",   # Path override for the external worklink runner.
     "WORKLINK_RUN_LOG",   # Poller-supplied run-log path for failure escalation.
     "MIMIR_SPAWN_DEPTH",  # Harness-set on child processes to track spawn depth;
                           # read to enforce the recursion cap, not operator-set.

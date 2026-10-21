@@ -412,8 +412,6 @@ def build_trigger_service_principal(
                 profile, "scheduler_read_only",
             )
             policies.append(ServiceSinkPolicy(operation, "shell_profile", shell_profile))
-        elif operation in {"worklink_run", "worklink_resume"}:
-            policies.append(ServiceSinkPolicy(operation, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"))
         elif operation == "fetch_url":
             fetch_policy = _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE.get(profile)
             if profile in {"research", "github"} and approved_urls:
@@ -441,6 +439,8 @@ def build_trigger_service_principal(
                 bound = selected.shell_profile_mappings.get(profile, "scheduler_read_only")
             elif adapter == "spawn_workspace":
                 bound = "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"
+            elif adapter == "worklink_repo":
+                bound = "WORKLINK_REPO/MIMIR_WORKLINK_REPO"
             else:
                 raise ValueError(f"unsupported service sink adapter for {operation}: {adapter}")
             policies.append(ServiceSinkPolicy(operation, adapter, bound))
@@ -9728,32 +9728,14 @@ class ToolRegistry:
             )
             return finish(auth)
 
-        from .plugins.core import _FORGE_ACTIONS, _REPO_ACTIONS, core_policy_registry
-
         policy = policy if policy is not None else selected_policy_registry()
         if not policy.frozen:
             raise ValueError("authorization requires a frozen policy")
         tool_policy = policy.tools.get(tool_name)
-        retired_forge = _FORGE_ACTIONS.keys() | {
-            "pr_list", "ci_run_jobs", "ci_run", "ci_recent_runs", "issue_comment",
-        }
-        if tool_policy is None and tool_name in retired_forge:
-            return finish(ToolAuthorization(
-                tool_name=tool_name,
-                decision=OperationDecision.ADMIN_REQUIRED,
-                allowed=False,
-                reason="forge_tool_unavailable",
-                enforcement_enabled=True,
-                would_block=True,
-            ))
-        if tool_policy is None and tool_name in _REPO_ACTIONS:
-            return finish(ToolAuthorization(
-                tool_name=tool_name,
-                decision=OperationDecision.ADMIN_REQUIRED,
-                allowed=False,
-                reason="repository_tool_unavailable",
-                enforcement_enabled=True,
-                would_block=True,
+        if (not enforce and tool_name in _WORKLINK_BUILD_TOOLS
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            return finish(_worklink_build_denial(
+                tool_name, service, auth_context, ifc_labels,
             ))
         plugin_tool = (
             tool_policy if tool_policy is not None and tool_policy.owner != "core"
@@ -11709,21 +11691,11 @@ def classify_protected_result(
     # claimed NON_INGESTING results; they never inherit core refusal exemptions.
     selected = authorization.policy if authorization.policy is not None else selected_policy_registry()
     registered = selected.tools.get(tool_name)
-    if registered is None:
-        from .plugins.core import _FORGE_ACTIONS, _REPO_ACTIONS
-
-        if tool_name in (_FORGE_ACTIONS.keys() | {
-            "pr_list", "ci_run_jobs", "ci_run", "ci_recent_runs", "issue_comment",
-        }):
-            return _incomplete_protected_result(
-                "repository", arguments or {}, tool_name=tool_name,
-                auth_context=auth_context,
-            )
-        if tool_name in _REPO_ACTIONS:
-            return _incomplete_protected_result(
-                "repository", arguments or {}, tool_name=tool_name,
-                auth_context=auth_context,
-            )
+    if registered is None and not tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX):
+        return _incomplete_protected_result(
+            "unknown", arguments or {}, tool_name=tool_name,
+            auth_context=auth_context,
+        )
     retained_verified = False
     if registered is not None and registered.owner != "core":
         scope = getattr(auth_context, "retained_factory_scope", None)

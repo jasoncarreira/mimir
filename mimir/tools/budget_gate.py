@@ -3786,6 +3786,18 @@ def _prepare_tool_call_execution(
     if privacy_refusal is not None:
         return _tool_call_refusal(call, privacy_refusal, arguments=None)
 
+    selected = policy if policy is not None else selected_policy_registry()
+    validated_mcp = (
+        tool_name.startswith("mcp_") and getattr(request, "tool", None) is not None
+        and authorization is not None and authorization.decision is not OperationDecision.UNKNOWN
+        and not authorization.would_block
+    )
+    if tool_name not in selected.tools and not validated_mcp:
+        return _tool_call_refusal(
+            call, f"{tool_name} was refused before execution (unknown_operation).",
+            arguments=None, record_outcome=True,
+        )
+
     # This is an accident deterrent, not a security boundary; see #259.
     prohibition = _check_prohibited(tool_name, request)
     if prohibition is not None:
