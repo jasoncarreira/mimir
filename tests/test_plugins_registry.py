@@ -94,6 +94,49 @@ def test_matching_tool_and_capability_tiers_project_one_value():
     assert registry.freeze().tiers["sample"] == "scope-contained"
 
 
+def test_plugin_non_tool_capability_has_owner_bound_tier_and_core_profile_membership():
+    registry = PolicyRegistry()
+    registry.register_authority_profile("review")
+    plugin = registry.registrar("example")
+    plugin.register_capability("review_other_authors", tier="scoped-with-provenance")
+    plugin.add_to_profile("review", "review_other_authors")
+
+    policy = registry.freeze()
+    assert policy.tiers["review_other_authors"] == "scoped-with-provenance"
+    assert "review_other_authors" in policy.authority_profiles["review"]
+    assert "review_other_authors" not in policy.tools
+
+
+def test_plugin_non_tool_capability_cannot_grant_foreign_policy():
+    registry = PolicyRegistry()
+    registry.register_authority_profile("review")
+    registry.register_capability("core_grant", tier="unbounded")
+    registry.register_authority_profile("core_review", capabilities={"core_grant"})
+    one = registry.registrar("one")
+    two = registry.registrar("two")
+    one.register_capability("one_grant", tier="scoped-with-provenance")
+    two.register_capability("two_grant", tier="scope-contained")
+    with pytest.raises(PolicyRegistrationError, match="foreign tool"):
+        two.add_to_profile("review", "one_grant")
+    with pytest.raises(PolicyRegistrationError, match="foreign tool"):
+        one.add_to_profile("review", "core_grant")
+    with pytest.raises(PolicyRegistrationError, match="owner cannot be overridden"):
+        one.register_tool(**tool_fields(owner="core"))
+    with pytest.raises(PolicyRegistrationError, match="invalid capability tier"):
+        one.register_capability("bad_grant", tier="unrecognized")
+    assert "bad_grant" not in registry.capabilities
+    assert registry.authority_profiles["review"] == frozenset()
+
+
+def test_plugin_cannot_override_registered_tool_tier_with_non_tool_api():
+    registry = PolicyRegistry()
+    plugin = registry.registrar("example")
+    plugin.register_tool(**tool_fields())
+    with pytest.raises(PolicyRegistrationError, match="invalid capability tier"):
+        plugin.register_capability("sample", tier="unbounded")
+    assert "sample" not in registry.capabilities
+
+
 def test_plugin_cannot_exclude_its_descriptor_or_flow():
     registry = PolicyRegistry()
     with pytest.raises(PolicyRegistrationError, match="descriptor exclusion is core-only"):

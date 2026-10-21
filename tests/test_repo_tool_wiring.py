@@ -587,7 +587,7 @@ def test_core_only_head_advance_cannot_dispatch_without_owner(monkeypatch):
         policy=core_policy_registry(),
     )
     assert not decision.allowed
-    assert decision.reason == "repository_tool_unavailable"
+    assert decision.reason == "unknown_sink_category"
     assert old_scope.observed_head_sha == "a" * 40
     assert client.review_calls == 0
     assert context.ifc_state.own_push_lineage() == {}
@@ -965,12 +965,39 @@ async def test_core_only_pr_scope_policy_refuses_in_both_modes(
         arguments=arguments,
     )
 
-    assert not shadow.allowed
+    assert shadow.allowed
     assert shadow.would_block is True
     assert enforced.allowed is False
-    assert shadow.reason == enforced.reason == "forge_tool_unavailable"
+    assert shadow.reason == "unknown_operation"
+    assert enforced.reason == "unknown_sink_category"
     events = [fields for kind, fields in captured if kind == "shadow_tool_decision"]
-    assert not events
+    assert len(events) == 1
+    assert events[0]["would_block"] is True
+
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langgraph.runtime import Runtime
+    from mimir.plugins.core import core_policy_registry
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    for enforce in (False, True):
+        called = []
+        request = ToolCallRequest(
+            tool_call={"name": "pr_metadata", "args": arguments, "id": "core-only",
+                       "type": "tool_call"},
+            tool=None, state={}, runtime=Runtime(context=replace(
+                _auth(scope), enforcement_enabled=enforce,
+            )),
+        )
+
+        async def handler(_request):
+            called.append(True)
+            return ToolMessage(content="executed", tool_call_id="core-only")
+
+        result = await BudgetGateMiddleware(core_policy_registry()).awrap_tool_call(request, handler)
+        assert result.status == "error"
+        assert ("unknown_sink_category" if enforce else "unknown_operation") in str(result.content)
+        assert not called
 
 
 @pytest.mark.asyncio

@@ -200,7 +200,8 @@ def test_descriptors_are_equivalent_to_all_pre_migration_policy_tables() -> None
     retired_coding = {
         name for name in known_names
         if name.startswith(("repo_", "pr_", "ci_"))
-        or name in {"issue_comment", "unsupported_operation"}
+        or name in {"issue_comment", "unsupported_operation",
+                    "spawn_open_code", "worklink_run", "worklink_resume"}
     }
 
     # The frozen inventory predates the server-side proposal diff read.

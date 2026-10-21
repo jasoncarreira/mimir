@@ -4977,7 +4977,7 @@ def test_model_supplied_runtime_cannot_restore_core_forge_authorization(
         )
 
     assert result.status == "error"
-    assert "forge_tool_unavailable" in str(result.content)
+    assert "unknown_sink_category" in str(result.content)
     assert client.calls == []
     assert reached == []
 

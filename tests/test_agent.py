@@ -1826,10 +1826,10 @@ def test_core_only_turn_has_no_registered_cultivate_worklink_tool():
 
     policy = load_plugins(enable="").policy
     assert not any(tool.owner == "cultivate" for tool in policy.tools.values())
-    assert policy.tools["worklink_run"].owner == "core"  # until coding-policy retirement
-    assert "repo_status" not in {
+    assert "worklink_run" not in policy.tools
+    assert {"repo_status", "worklink_run", "spawn_open_code"}.isdisjoint({
         tool.name for tool in all_mimir_tools("openai:test", policy=policy)
-    }
+    })
 
 
 async def test_poller_turn_reads_owned_channel_memory_without_boundary_denial(

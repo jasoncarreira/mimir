@@ -5498,7 +5498,7 @@ async def test_service_shell_refuses_unauthorized_cwd_without_echoing_it(
     [
         (
             lambda _home, _readonly, _outside: {"cwd": ".", "artifact_root": "artifacts"},
-            "ifc_label_blocked:spawn",
+            "sink_target_required",
         ),
         (
             lambda _home, readonly, _outside: {"cwd": str(readonly)},
@@ -5509,7 +5509,7 @@ async def test_service_shell_refuses_unauthorized_cwd_without_echoing_it(
                 "cwd": str(home),
                 "artifact_root": str(outside),
             },
-            "ifc_label_blocked:spawn",
+            "sink_target_required",
         ),
     ],
     ids=["write-root", "read-only-cwd", "outside-artifact-root"],
@@ -5519,6 +5519,7 @@ async def test_service_spawn_destinations_are_confined_to_write_roots(
     monkeypatch: pytest.MonkeyPatch,
     args_factory,
     expected_reason: str,
+    selected_repository_policy,
 ) -> None:
     from langchain_core.messages import ToolMessage
 
@@ -5535,16 +5536,16 @@ async def test_service_spawn_destinations_are_confined_to_write_roots(
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{readonly}:ro")
     monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", lambda *_args, **_kw: None)
 
-    event = AgentEvent(
-        trigger="scheduled_tick",
-        channel_id="scheduler:test",
-        service_principal="scheduler",
-    )
     labels = InformationFlowLabels(
         labels=frozenset({"private"}),
         source_channels=frozenset({"scheduler:test"}),
     )
-    auth_context = create_auth_context(event, enforce=True, ifc_labels=labels)
+    service = build_trigger_service_principal(
+        canonical="poller:spawn-scope", trigger="poller", profile="custom",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("spawn_open_code",),
+        roots=(home,), creation_path="test_service_spawn_destinations_are_confined_to_write_roots",
+    )
+    auth_context = _service_auth(service, labels)
     seen_args: dict[str, object] = {}
 
     async def handler(request):
@@ -6610,7 +6611,10 @@ def test_non_admin_human_write_is_confined_to_unprotected_state(
         assert decision.reason == "write_scope"
 
 
-def test_non_admin_human_cannot_run_code_tools(tmp_path: Path) -> None:
+def test_non_admin_human_cannot_run_code_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_repository_policy,
+) -> None:
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
     registry = ToolRegistry()
     for operation in (
         "worklink_run", "spawn_open_code",
@@ -6620,6 +6624,7 @@ def test_non_admin_human_cannot_run_code_tools(tmp_path: Path) -> None:
             _write_auth(),
             enforce=True,
             target_channel=str(tmp_path),
+            arguments={"cwd": str(tmp_path)} if operation == "spawn_open_code" else None,
         )
         assert decision.allowed is False, operation
         if operation == "worklink_run":
@@ -6949,9 +6954,10 @@ async def test_shadow_early_return_parity(
 
 
 @pytest.mark.parametrize("tool", ["issue_comment", "pr_metadata"])
-def test_core_only_forge_tools_refuse_even_without_enforcement(tool: str) -> None:
+def test_core_only_forge_tools_are_unregistered_and_shadow_would_block(tool: str) -> None:
     from mimir.plugins.core import core_policy_registry
 
+    assert tool not in core_policy_registry().tools
     registry = ToolRegistry()
     auth = _write_auth()
     for enforce in (False, True):
@@ -6959,8 +6965,7 @@ def test_core_only_forge_tools_refuse_even_without_enforcement(tool: str) -> Non
             tool, auth, enforce=enforce, policy=core_policy_registry(),
             arguments={"repository": "owner/repo", "pull_request": 7},
         )
-        assert not decision.allowed
-        assert decision.reason == "forge_tool_unavailable"
+        assert decision.allowed is not enforce
         assert decision.would_block
 
 
@@ -7014,17 +7019,17 @@ async def test_nonadmin_ifc_shadow_census_preserves_causing_source(monkeypatch) 
 
     monkeypatch.setattr("mimir.event_logger.log_event", capture)
     shadow = registry.authorize_tool(
-        "spawn_open_code", auth, enforce=False, target_channel="/tmp/worktree",
+        "request_mimir_update", auth, enforce=False, target_channel="/tmp/worktree",
     )
     enforced = registry.authorize_tool(
-        "spawn_open_code", auth, enforce=True, target_channel="/tmp/worktree",
+        "request_mimir_update", auth, enforce=True, target_channel="/tmp/worktree",
     )
     await asyncio.sleep(0)
     assert shadow.allowed is True
     assert enforced.allowed is False
     assert shadow.reason == enforced.reason == "admin_required"
     assert [fields["reason"] for _, fields in captured] == [
-        "ifc_label_blocked:spawn", "admin_required",
+        "ifc_label_blocked:file", "admin_required",
     ]
     assert all(kind == "shadow_tool_decision" for kind, _ in captured)
     assert all(fields["would_block"] is True for _, fields in captured)
@@ -8431,6 +8436,7 @@ async def test_ifc_shadow_denial_records_one_bounded_redacted_causing_source(
     tool_name: str,
     target: str,
     reason: str,
+    selected_repository_policy,
 ) -> None:
     compatible = SourceLabel(
         principal="alice", domain="channel", resource_id="slack-C1",
@@ -8469,8 +8475,24 @@ async def test_ifc_shadow_denial_records_one_bounded_redacted_causing_source(
                             lambda kind, **fields: hard_events.append((kind, fields)))
         shadow = registry.authorize_tool(
             tool_name, auth, enforce=False, target_channel=target, ifc_labels=labels,
+            arguments={"cwd": target} if tool_name == "spawn_open_code" else None,
         )
         await asyncio.sleep(0)
+
+    if tool_name == "spawn_open_code":
+        assert not shadow.allowed and not shadow.is_shadow_decision
+        assert shadow.reason == "write_blocked_by_untrusted_ingest"
+        assert len(hard_events) == 1
+        assert hard_events[0][0] == "write_blocked_by_untrusted_ingest"
+        assert hard_events[0][1]["tool"] == tool_name
+        assert "secret-value" not in repr(hard_events)
+        assert captured == []
+        for enforce in (False, True):
+            denied = SinkGate.check_sink_flow(tool_name, target, labels, auth, enforce=enforce)
+            assert denied.allowed is not enforce
+            assert denied.would_block
+            assert denied.reason == reason
+        return
 
     if tool_name == "write_file":
         # The always-on write veto emits bounded, redacted source identifiers,
@@ -10449,7 +10471,7 @@ def test_fresh_changes_requested_review_mints_remediation_authority(
             tool_name, auth, enforce=True, arguments=arguments,
         )
         assert decision.allowed is False
-        assert decision.reason == "repository_tool_unavailable"
+        assert decision.reason == "unknown_sink_category"
 
     before = _github_poller_auth(
         authority, {**item, "state": "COMMENTED"},
@@ -10462,7 +10484,7 @@ def test_fresh_changes_requested_review_mints_remediation_authority(
             tool_name, before, enforce=True, arguments=arguments,
         )
         assert decision.allowed is False
-        assert decision.reason == "repository_tool_unavailable"
+        assert decision.reason == "unknown_sink_category"
 
 
 @pytest.mark.parametrize(
@@ -10501,7 +10523,7 @@ def test_trusted_collaborator_comment_on_own_open_pr_mints_remediation_authority
             tool_name, auth, enforce=True, arguments=arguments,
         )
         assert not decision.allowed
-        assert decision.reason == "repository_tool_unavailable"
+        assert decision.reason == "unknown_sink_category"
 
     assert auth.repo_review_state is not None
     checkout = _attach_test_checkout_lease(
@@ -12133,7 +12155,7 @@ def test_poller_scope_drops_conflicting_snapshots_for_same_pr(
             arguments={"repository": "o/r", "pull_request": 42},
         )
         assert decision.allowed is False
-        assert decision.reason == "repository_tool_unavailable"
+        assert decision.reason == "unknown_sink_category"
 
 
 def test_repo_write_authority_is_resolved_per_pr_without_scope_union(
@@ -12178,9 +12200,9 @@ def test_repo_write_authority_is_resolved_per_pr_without_scope_union(
             arguments={"repository": "o/r", "pull_request": 43},
         )
         assert first.allowed is False
-        assert first.reason == "repository_tool_unavailable"
+        assert first.reason == "unknown_sink_category"
         assert second.allowed is False
-        assert second.reason == "repository_tool_unavailable"
+        assert second.reason == "unknown_sink_category"
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
@@ -16300,6 +16322,7 @@ def test_non_repo_poller_keeps_scheduler_read_only_shell_profile() -> None:
 def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    selected_repository_policy,
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -16347,7 +16370,7 @@ def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
     )
     spawn = registry.authorize_tool(
         "spawn_open_code", _service_auth(service, trusted), enforce=True,
-        target_channel=str(repo),
+        target_channel=str(repo), arguments={"cwd": str(repo)},
     )
 
     assert admitted.allowed is True
@@ -16363,6 +16386,7 @@ def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
 def test_worklink_build_tools_refuse_untrusted_ingest_on_both_routes(
     tool_name: str, enforce: bool, route: str,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    selected_repository_policy,
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -16495,6 +16519,7 @@ def test_selected_worklink_build_projection_preserves_live_taint_veto(
 
 def test_worklink_build_veto_does_not_catch_informational_untrusted_sources(
     tmp_path: Path,
+    selected_repository_policy,
 ) -> None:
     auth = _trusted_operator_write_auth(admin=True)
     source = replace(
@@ -16515,6 +16540,7 @@ def test_worklink_build_veto_does_not_catch_informational_untrusted_sources(
 @pytest.mark.parametrize("principal", ["nonadmin", "undeclared_service"])
 def test_worklink_build_veto_cannot_be_skipped_by_shadow_admin_or_capability_denial(
     tool_name: str, principal: str, tmp_path: Path,
+    selected_repository_policy,
 ) -> None:
     tainted_labels = InformationFlowLabels().with_source(SourceLabel(
         principal="external", domain="filesystem", resource_id="poller-state",
@@ -16524,14 +16550,16 @@ def test_worklink_build_veto_cannot_be_skipped_by_shadow_admin_or_capability_den
         integrity_effect="active_ingest",
     ))
     if principal == "nonadmin":
-        auth = replace(_write_auth(), ifc_labels=tainted_labels)
+        auth = replace(_write_auth(), ifc_labels=tainted_labels,
+                       ifc_state=InformationFlowState(labels=tainted_labels))
     else:
         service = build_trigger_service_principal(
             canonical="poller:without-build-capability", trigger="poller",
             profile="custom", tier=CapabilityTier.SCOPE_CONTAINED,
             capabilities=("read_file",), creation_path="test",
         )
-        auth = _service_auth(service, tainted_labels)
+        auth = replace(_service_auth(service, tainted_labels),
+                       ifc_state=InformationFlowState(labels=tainted_labels))
     decision = ToolRegistry().authorize_tool(
         tool_name, auth, enforce=False, target_channel=str(tmp_path),
     )
@@ -16540,15 +16568,19 @@ def test_worklink_build_veto_cannot_be_skipped_by_shadow_admin_or_capability_den
     assert decision.reason == "worklink_build_blocked_by_untrusted_ingest"
 
 
-def test_admin_write_and_code_tool_authority_is_unchanged(tmp_path: Path) -> None:
+def test_admin_writes_stay_allowed_but_selected_coding_targets_must_match(
+    tmp_path: Path, selected_repository_policy,
+) -> None:
     registry = ToolRegistry()
-    for operation in ("write_file", "edit_file", "worklink_run", "spawn_open_code"):
+    target = str(tmp_path / ".git" / "hooks" / "pre-commit")
+    for operation in ("write_file", "edit_file"):
         assert registry.authorize_tool(
-            operation,
-            _write_auth(admin=True),
-            enforce=True,
-            target_channel=str(tmp_path / ".git" / "hooks" / "pre-commit"),
+            operation, _write_auth(admin=True), enforce=True, target_channel=target,
         ).allowed is True
+    for operation in ("worklink_run", "spawn_open_code"):
+        assert not registry.authorize_tool(
+            operation, _write_auth(admin=True), enforce=True, target_channel=target,
+        ).allowed
 
 
 def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter(
@@ -18723,7 +18755,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
         SinkCategory.HTTP_WEBHOOK: {"webhook", "http_request"},
         SinkCategory.NETWORK: {"fetch_url", "web_search"},
         SinkCategory.SHELL_PROCESS: {"shell_exec", "bash_async", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell"},
-        SinkCategory.SPAWN: {"spawn_open_code", "worklink_run", "worklink_resume"},
+        SinkCategory.SPAWN: set(),
         SinkCategory.NOTIFICATION: {"operator_alert", "ntfy_send"},
         SinkCategory.FILE: {"write_file", "edit_file", "replace_file", "Write", "Edit", "download_files", "adownload_files", "rebuild_index", "request_mimir_update"},
         SinkCategory.SAGA: {"memory_store", "memory_propose", "saga_record_skill_learning", "saga_feedback", "saga_mark_contributions", "saga_forget", "saga_end_session", "commitment_complete", "commitment_snooze", "commitment_dismiss", "defer_injected_message"},
@@ -18979,6 +19011,7 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
         "pr_inline_review_comment", "pr_comment", "pr_edit_body", "issue_comment",
         "pr_rerequest_review", "unsupported_operation",
     }
+    retired_forge |= {"spawn_open_code", "worklink_run", "worklink_resume"}
     for table in (flows, decisions):
         for names in table.values():
             names.difference_update(retired_forge)

@@ -758,8 +758,8 @@ class PolicyRegistry:
             if owner != "core" or legacy_service_sink_tier not in _TIERS:
                 raise PolicyRegistrationError(f"{owner}: invalid legacy sink tier for {name}")
         if tier is not None:
-            if tier not in _TIERS or owner != "core":
-                raise PolicyRegistrationError(f"{owner}: capability {name}: invalid core-only tier")
+            if tier not in _TIERS or (owner != "core" and tool is not None):
+                raise PolicyRegistrationError(f"{owner}: capability {name}: invalid capability tier")
             tool = self._tools.get(name)
             if tool is not None and tool.tier is not None and tool.tier != tier:
                 raise PolicyRegistrationError(
@@ -1059,8 +1059,8 @@ class PolicyRegistrar:
             raise PolicyRegistrationError(f"{self.plugin}: owner cannot be overridden")
         self._registry.register_tool(owner=self.plugin, **kwargs)
 
-    def register_capability(self, name: str) -> None:
-        self._registry.register_capability(name, owner=self.plugin)
+    def register_capability(self, name: str, *, tier: str | None = None) -> None:
+        self._registry.register_capability(name, owner=self.plugin, tier=tier)
 
     def register_authority_profile(self, name: str, **kwargs: Any) -> None:
         if "owner" in kwargs:
@@ -1070,14 +1070,20 @@ class PolicyRegistrar:
     def add_to_profile(self, profile: str, tool: str) -> None:
         registry = self._registry
         registry._writable()
-        if tool not in registry._tools or registry._tools[tool].owner != self.plugin:
+        registered = registry._tools.get(tool)
+        capability_owner = registry._capabilities.get(tool)
+        if (registered is None and (capability_owner != self.plugin or tool not in registry._capability_tiers)) or (
+            registered is not None and registered.owner != self.plugin
+        ):
             raise PolicyRegistrationError(f"{self.plugin}: cannot add foreign tool {tool} to {profile}")
         if profile not in registry._profiles:
             raise PolicyRegistrationError(f"unknown profile: {profile}")
         current = registry._profiles[profile]
+        if registered is None and current.owner not in {"core", self.plugin}:
+            raise PolicyRegistrationError(f"{self.plugin}: cannot add capability to foreign profile {profile}")
         registry._profiles[profile] = replace(current, capabilities=current.capabilities | {tool})
-        registered = registry._tools[tool]
-        registry._tools[tool] = replace(registered, profiles=registered.profiles | {profile})
+        if registered is not None:
+            registry._tools[tool] = replace(registered, profiles=registered.profiles | {profile})
 
     def register_shell_profile_mapping(self, profile: str, shell_profile: str) -> None:
         if profile not in self._registry._profiles or self._registry._profiles[profile].owner != self.plugin:

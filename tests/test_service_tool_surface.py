@@ -113,9 +113,25 @@ INVENTORY = (
 OPEN = list(INVENTORY[:5])
 CODE_EXECUTION = OPEN + [
     "read_file", "memory_store", "shell_exec", "bash_async", "bash_jobs_list",
-    "bash_job_output", "write_file", "edit_file", "send_message", "spawn_open_code",
-    "worklink_run",
+    "bash_job_output", "write_file", "edit_file", "send_message",
 ]
+
+
+def test_selected_cultivate_restores_only_registered_code_execution_tools():
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import core_policy_registry, policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    assert {"spawn_open_code", "worklink_run"}.isdisjoint(core_policy_registry().tools)
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        context = service_context("code_execution")
+        request = ModelRequest(
+            model=RecordingModel(), messages=[], tools=tools(*INVENTORY),
+            runtime=Runtime(context=context),
+        )
+        names = [tool.name for tool in ServiceToolSurfaceMiddleware()._filter_request(request).tools]
+    assert names == CODE_EXECUTION + ["spawn_open_code", "worklink_run"]
 
 
 class RecordingModel(BaseChatModel):
@@ -554,16 +570,21 @@ async def test_real_deepagents_builtin_write_visibility(kind, asynchronous):
     )
 
 
-def test_current_request_inventory_is_not_widened():
+def test_current_request_inventory_is_filtered_not_widened():
     middleware = ServiceToolSurfaceMiddleware()
     context = service_context("code_execution")
-    for inventory in (tools("web_search", "spawn_open_code"), tools("memory_get"), []):
+    for inventory, expected in (
+        (tools("web_search", "spawn_open_code"), ["web_search"]),
+        (tools("memory_get"), ["memory_get"]),
+        ([], []),
+    ):
         request = ModelRequest(model=RecordingModel(), messages=[], tools=inventory,
                                runtime=Runtime(context=context))
         filtered = middleware._filter_request(request)
-        assert filtered.tools == inventory
-        expected = ", ".join(tool.name for tool in inventory) or "(none)"
-        assert f"Available tools: {expected}." in filtered.system_message.text
+        assert [tool.name for tool in filtered.tools] == expected
+        assert set(expected) <= {tool.name for tool in inventory}
+        listed = ", ".join(expected) or "(none)"
+        assert f"Available tools: {listed}." in filtered.system_message.text
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])

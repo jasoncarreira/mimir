@@ -43,7 +43,6 @@ from .registry import (
     reload_pollers,
     remove_schedule,
     send_message,
-    set_arbiter,
     set_poller_overrides,
     set_schedule_priority,
     set_schedule_cron,
@@ -54,8 +53,7 @@ from .registry import (
     set_identity_resolver,
     set_scheduler,
     set_spawn_config,
-    worklink_run,
-    worklink_resume,
+    set_arbiter,
 )
 from .web import (
     fetch_url,
@@ -149,9 +147,6 @@ __all__ = [
     "set_spawn_config",
     "set_current_channel_id",
     "set_arbiter",
-    # Worklink in-turn dispatch (#444)
-    "worklink_run",
-    "worklink_resume",
     # Aggregate
     "all_mimir_tools",
 ]

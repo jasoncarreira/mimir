@@ -33,7 +33,8 @@ def _extractor(value: object, undeclared: object) -> str:
 def _retired_forge_and_repository(oracle: dict) -> frozenset[str]:
     return (frozenset(oracle["tables"]["repo_actions"])
             | frozenset(oracle["tables"]["forge_actions"])
-            | {"pr_list", "ci_run_jobs", "ci_run", "ci_recent_runs", "issue_comment"})
+            | {"pr_list", "ci_run_jobs", "ci_run", "ci_recent_runs", "issue_comment",
+               "spawn_open_code", "worklink_run", "worklink_resume"})
 
 
 def test_all_frozen_core_descriptors_come_from_registrations() -> None:
@@ -74,7 +75,7 @@ def test_core_runtime_factories_cover_each_surface_without_loading_coding() -> N
     assert len(names) == len(set(names))
     assert all(registry.tools[name].factory is not None for name in names)
     assert all(registry.tools[name].policy_only for name in registry.tools if name not in names)
-    assert core_runtime_names("coding") == ("spawn_open_code",)
+    assert core_runtime_names("coding") == ()
     assert "repo_test" not in registry.tools
     assert "pr_metadata" not in registry.tools
 
@@ -382,4 +383,4 @@ def test_budget_policy_views_are_frozen_core_memberships() -> None:
     assert "pr_job_log" not in budget_gate._STANDING_REVIEW_TOOLS
     assert "repo_commit" not in budget_gate._REMEDIATION_EFFECT_TOOLS
     assert "pr_comment" not in budget_gate._REMEDIATION_EFFECT_TOOLS
-    assert "worklink_run" in budget_gate._TYPED_ERROR_SIGNAL_TOOLS
+    assert "worklink_run" not in budget_gate._TYPED_ERROR_SIGNAL_TOOLS

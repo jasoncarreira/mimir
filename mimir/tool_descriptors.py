@@ -84,47 +84,6 @@ def _generic_target(
     return (_value(arguments.get("target") or arguments.get("destination")),)
 
 
-def _repo_pr_target(
-    tool_name: str, arguments: Mapping[str, Any], auth_context: Any | None,
-) -> tuple[str | None, ...]:
-    from .plugins.core import selected_policy_registry
-    from .models import RetainedFactoryScope
-
-    registered = selected_policy_registry().tools.get(tool_name)
-    retained = getattr(auth_context, "retained_factory_scope", None)
-    if (registered is not None and registered.owner != "core"
-            and "retained_repo_tools" in registered.memberships
-            and isinstance(retained, RetainedFactoryScope)
-            and getattr(auth_context, "is_service", False)
-            and arguments.get("repository") == retained.repository
-            and arguments.get("pull_request") == retained.issue_id):
-        return (f"{retained.repository}#issue/{retained.issue_id}@retained/{retained.scope_id}",)
-    discovered = getattr(auth_context, "server_discovered_pr_states", None)
-    repository = arguments.get("repository")
-    pull_request = arguments.get("pull_request")
-    state = (
-        discovered.resolve_for_tool(tool_name, repository, pull_request)
-        if discovered is not None
-        and isinstance(repository, str)
-        and isinstance(pull_request, int)
-        else None
-    )
-    if state is None:
-        registry = getattr(auth_context, "repo_pr_scope_registry", None)
-        state = (
-            registry.resolve(repository, pull_request)
-            if registry is not None and hasattr(registry, "resolve")
-            else None
-        )
-    if state is None:
-        return (None,)
-    scope = state.action_scope
-    return (
-        f"{scope.canonical_repo}#pull/{scope.pr_number}"
-        f"@{scope.observed_head_sha}:{scope.scope_id}",
-    )
-
-
 def _operator_alert_target(
     _tool_name: str, _arguments: Mapping[str, Any], _auth_context: Any | None,
 ) -> tuple[str | None, ...]:
@@ -155,20 +114,6 @@ def _command_target(
     _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
 ) -> tuple[str | None, ...]:
     return (_value(arguments.get("command")),)
-
-
-def _spawn_target(
-    _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
-) -> tuple[str | None, ...]:
-    target = _value(arguments.get("cwd") or os.environ.get("MIMIR_HOME"))
-    artifact_root = _value(arguments.get("artifact_root"))
-    return (target, artifact_root) if artifact_root else (target,)
-
-
-def _worklink_target(
-    _tool_name: str, _arguments: Mapping[str, Any], _auth_context: Any | None,
-) -> tuple[str | None, ...]:
-    return (_value(os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")),)
 
 
 def _url_target(
@@ -355,7 +300,6 @@ _CORE_DESCRIPTOR_DECLARATIONS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "set_schedule_cron": _D(SinkCategory.SCHEDULER, _schedule_target, "scheduler", result_origin=_N),
     "shell": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
     "shell_exec": _D(SinkCategory.SHELL_PROCESS, _command_target, "shell_process", sink_payload_extractor=_argument_payload("command")),
-    "spawn_open_code": _D(SinkCategory.SPAWN, _spawn_target, "spawn_process", ifc_delegation=True),
     "submit_proposal": _D(SinkCategory.PROPOSAL, _generic_target, "proposal", result_origin=_N),
     "task": _D(result_origin=_N, ifc_delegation=True),
     "web_search": _D(
@@ -368,8 +312,6 @@ _CORE_DESCRIPTOR_DECLARATIONS: Mapping[str, ToolDescriptor] = MappingProxyType({
     ),
     "web_turn_events": _D(SinkCategory.SAME_CHANNEL, _generic_target),
     "webhook": _D(SinkCategory.HTTP_WEBHOOK, _url_target, "network", sink_payload_extractor=_argument_payload("url", "body")),
-    "worklink_resume": _D(SinkCategory.SPAWN, _worklink_target, "worklink"),
-    "worklink_run": _D(SinkCategory.SPAWN, _worklink_target, "worklink"),
     "write_file": _D(SinkCategory.FILE, _file_target, "filesystem", result_origin=_N),
     "write_todos": _D(result_origin=_N),
 })

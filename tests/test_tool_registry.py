@@ -515,10 +515,12 @@ def test_shell_tool_description_states_both_execution_contracts(shell_tool) -> N
 
 def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
     catalog = OperationCatalog()
-    resource_scoped = {"write_file", "edit_file", "worklink_run"}
+    resource_scoped = {"write_file", "edit_file"}
+    moved = {"worklink_run", "spawn_open_code"}
 
-    assert _OLD_ADMIN_TOOLS - resource_scoped <= catalog._ADMIN_REQUIRED_OPERATIONS
+    assert _OLD_ADMIN_TOOLS - resource_scoped - moved <= catalog._ADMIN_REQUIRED_OPERATIONS
     assert resource_scoped <= catalog._RESOURCE_SCOPED_OPERATIONS
+    assert moved.isdisjoint(catalog._ADMIN_REQUIRED_OPERATIONS | catalog._RESOURCE_SCOPED_OPERATIONS)
     assert catalog.get_decision("mcp__mimir__shell_exec") == OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("mcp_mimir_shell_exec") == OperationDecision.ADMIN_REQUIRED
 
@@ -587,15 +589,26 @@ def test_web_search_ifc_target_is_the_configured_search_endpoint(
 
 @pytest.mark.parametrize("operation", ["spawn_open_code", "task"])
 def test_factory_operations_are_cataloged_as_admin_required(operation: str) -> None:
-    catalog = OperationCatalog()
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
 
-    assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
+    catalog = OperationCatalog()
+    if operation == "task":
+        assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
+        return
+    pytest.importorskip("mimir_cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
 
 
 def test_spawn_open_code_declares_spawn_sink_destination() -> None:
+    pytest.importorskip("mimir_cultivate")
     from mimir.tool_descriptors import TOOL_DESCRIPTORS
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
 
-    assert TOOL_DESCRIPTORS["spawn_open_code"].sink_destination == "spawn_process"
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        assert TOOL_DESCRIPTORS["spawn_open_code"].sink_destination == "spawn_process"
 
 
 @pytest.mark.parametrize(
@@ -630,8 +643,11 @@ def test_scheduler_service_principal_can_invoke_factory_operations(
 
     assert decision.allowed is expected
     assert decision.decision == OperationDecision.ADMIN_REQUIRED
-    assert decision.reason == (None if expected else "ifc_label_blocked:spawn")
-    assert decision.service_principal is get_service_principal("scheduled_tick")
+    assert decision.reason == (None if expected else "unknown_sink_category")
+    if expected:
+        assert decision.service_principal is get_service_principal("scheduled_tick")
+    else:
+        assert decision.service_principal is None
 
 
 def test_unknown_operation_fails_closed_only_when_enforced() -> None:
@@ -935,6 +951,9 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
     assert denied.allowed is False
     if trigger == "saga_session_end":
         assert denied.reason == "session_boundary_capability_denied"
+    elif denied_operation == "spawn_open_code":
+        assert denied.reason == "unknown_sink_category"
+        assert denied.service_principal is None
     else:
         assert denied.reason == "admin_required"
         assert denied.service_principal is get_service_principal(trigger)
@@ -1479,17 +1498,17 @@ def test_scheduler_principal_has_required_capabilities_for_heartbeat() -> None:
     read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn"}
     write_ops = {"write_file", "edit_file"}
     shell_ops = {"shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"}
-    spawn_ops = {"spawn_open_code", "task"}
+    spawn_ops = {"task"}
     schedule_ops = {"list_schedules"}
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
     saga_ops = {"saga_forget"}
-    worklink_ops = {"worklink_run"}
 
-    all_expected = read_ops | write_ops | shell_ops | spawn_ops | schedule_ops | proposal_ops | saga_ops | worklink_ops
+    all_expected = read_ops | write_ops | shell_ops | spawn_ops | schedule_ops | proposal_ops | saga_ops
     for cap in all_expected:
         assert scheduler.has_capability(cap), f"scheduler missing {cap}"
 
-    forbidden = {"request_mimir_update", "remove_schedule", "reload_pollers"}
+    forbidden = {"request_mimir_update", "remove_schedule", "reload_pollers",
+                 "spawn_open_code", "worklink_run"}
     for cap in forbidden:
         assert not scheduler.has_capability(cap), f"scheduler should NOT have {cap}"
 
@@ -1637,6 +1656,7 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal(
                 "service_capability_denied",
                 "session_boundary_capability_denied",
                 "ifc_label_blocked:spawn",
+                "unknown_sink_category",
             ), f"{trigger} {operation} denied for wrong reason: {result.reason}"
 
 
@@ -1977,7 +1997,8 @@ def test_runtime_worklink_cli_hints_require_operator():
     from pathlib import Path
 
     import mimir
-    from mimir.tools.registry import worklink_run
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.registration import worklink_run
 
     root = Path(mimir.__file__).parent
     hints = []
@@ -1991,5 +2012,7 @@ def test_runtime_worklink_cli_hints_require_operator():
                     assert not re.search(r"(?:use|run|try).*mimir worklink (?:run|resume).*force", text, re.I), module
                     assert not re.search(r"force.*mimir worklink (?:run|resume)", text, re.I), module
     assert hints  # Scan must continue to cover actual runtime literals.
-    assert "ask the operator to run `mimir worklink run`" in root.joinpath("tools/registry.py").read_text()
+    from mimir_cultivate import registration
+
+    assert "ask the operator to run `mimir worklink run`" in Path(registration.__file__).read_text()
     assert "Use ``mimir worklink run`` to force" not in worklink_run.description

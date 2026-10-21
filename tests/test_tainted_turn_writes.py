@@ -79,8 +79,39 @@ def test_retired_core_repository_tool_is_unavailable(tool, enforce):
     auth, _ = tainted()
     with policy_scope(core_policy_registry()):
         decision = ac.ToolRegistry().authorize_tool(tool, auth, enforce=enforce)
-    assert not decision.allowed
-    assert decision.reason == "repository_tool_unavailable"
+    assert tool not in core_policy_registry().tools
+    assert decision.allowed is not enforce
+    assert decision.would_block
+    assert decision.reason == ("unknown_sink_category" if enforce else "unknown_operation")
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("tool", ["repo_test", "repo_push", "repo_commit"])
+def test_retired_core_repository_tool_cannot_dispatch(tool, enforce):
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langgraph.runtime import Runtime
+
+    from mimir.plugins.core import core_policy_registry
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, _ = tainted()
+    auth = replace(auth, enforcement_enabled=enforce)
+    request = ToolCallRequest(
+        tool_call={"name": tool, "args": {"repository": "owner/repo", "pull_request": 7},
+                   "id": "core-only", "type": "tool_call"},
+        tool=None, state={}, runtime=Runtime(context=auth),
+    )
+    called = []
+
+    def handler(_request):
+        called.append(True)
+        return ToolMessage(content="executed", tool_call_id="core-only")
+
+    result = BudgetGateMiddleware(core_policy_registry()).wrap_tool_call(request, handler)
+    assert result.status == "error"
+    assert ("unknown_sink_category" if enforce else "unknown_operation") in str(result.content)
+    assert not called
 
 
 @pytest.mark.parametrize("path", ["state/wiki/a.md", "memory/a.md", "skills/x/SKILL.md",

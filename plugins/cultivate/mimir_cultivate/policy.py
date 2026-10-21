@@ -469,6 +469,9 @@ def register_tools(registrar: PolicyRegistrar) -> None:
     from .worklink.retained_scope import derive_retained_factory_scope
 
     registrar.register_turn_hook("startup_prerequisites", opencode.startup_prerequisites)
+    registrar.register_capability("pr_review_others", tier="scoped-with-provenance")
+    registrar.add_to_profile("github", "pr_review_others")
+    registrar.add_to_profile("custom", "pr_review_others")
 
     registrar.register_policy_consumer_hooks(PolicyConsumerHooks(
         owner="cultivate", resolve_review=forge.resolve_review_state_for_context,

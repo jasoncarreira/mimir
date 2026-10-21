@@ -687,8 +687,8 @@ async def test_worklink_resume_shared_launcher_runs_epic_and_retires_only_target
 ) -> None:
     """Exercise worklink_resume -> shared launcher -> CLI -> run_epic success."""
     pytest.importorskip("mimir_cultivate.commands")
-    from mimir.tools import registry
-    from mimir.worklink import autonomy, detached_dispatch
+    from mimir_cultivate.registration import worklink_resume
+    from mimir_cultivate.worklink import autonomy, detached_dispatch
     from mimir.worklink.orchestrator import WorklinkRunResult, WorklinkRunner
     from mimir_cultivate.worklink.orchestrator import WorklinkRunner as CultivateWorklinkRunner
     from mimir_cultivate.worklink.detached_dispatch import FactoryRecoveryIdentity
@@ -752,7 +752,7 @@ async def test_worklink_resume_shared_launcher_runs_epic_and_retires_only_target
     monkeypatch.setattr(WorklinkRunner, "run_epic", successful_recovery)
     monkeypatch.setattr(CultivateWorklinkRunner, "run_epic", successful_recovery)
 
-    output = await registry.worklink_resume.coroutine(runtime=SimpleNamespace(context=auth))
+    output = await worklink_resume.coroutine(runtime=SimpleNamespace(context=auth))
 
     assert "recovery dispatched" in output
     assert captured_argv[:4] == [sys.executable, "-m", "mimir", "worklink"]
@@ -1020,8 +1020,8 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
 async def test_worklink_resume_tool_time_race_refuses_without_launch_or_fresh_attempt(
     remediation_case, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.tools import registry
-    from mimir.worklink import detached_dispatch
+    from mimir_cultivate.registration import worklink_resume
+    from mimir_cultivate.worklink import detached_dispatch
 
     case = remediation_case
     _event, _labels, auth = await _trusted_turn(case)
@@ -1037,7 +1037,7 @@ async def test_worklink_resume_tool_time_race_refuses_without_launch_or_fresh_at
     payload = json.loads(state.read_text(encoding="utf-8"))
     payload["issues"]["1811"]["occurrence_id"] = "replacement-occurrence"
     state.write_text(json.dumps(payload), encoding="utf-8")
-    output = await registry.worklink_resume.coroutine(
+    output = await worklink_resume.coroutine(
         runtime=SimpleNamespace(context=auth),
     )
 
@@ -1050,8 +1050,8 @@ async def test_worklink_resume_tool_time_race_refuses_without_launch_or_fresh_at
 async def test_worklink_resume_replaced_tool_time_race_refuses_without_launch_or_fresh_attempt(
     remediation_case, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.tools import registry
-    from mimir.worklink import detached_dispatch
+    from mimir_cultivate.registration import worklink_resume
+    from mimir_cultivate.worklink import detached_dispatch
 
     case = remediation_case
     _event, _labels, auth = await _trusted_turn(case)
@@ -1069,7 +1069,7 @@ async def test_worklink_resume_replaced_tool_time_race_refuses_without_launch_or
     monkeypatch.setattr(detached_dispatch, "launch_detached_worklink", launch)
     before = sorted((case.home / "state/worklink").rglob("*"))
 
-    output = await registry.worklink_resume.coroutine(
+    output = await worklink_resume.coroutine(
         runtime=SimpleNamespace(context=auth),
     )
 
