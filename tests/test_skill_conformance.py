@@ -226,8 +226,7 @@ def registered_tool_names(monkeypatch: pytest.MonkeyPatch) -> set[str]:
     selected = load_plugins(enable="cultivate").policy
     tools = registry.all_mimir_tools(
         model_spec="anthropic:claude-sonnet-4-6",
-        coding_enabled=True,
-        require_coding_available=False,
+        require_provider_available=False,
         policy=selected,
     )
     # Include the framework-native tools which do not go through this factory.

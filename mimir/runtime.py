@@ -340,9 +340,6 @@ async def create_agent_runtime(
             else:
                 runtime_loop.call_soon_threadsafe(schedule_alert)
 
-        coding_enabled = any(
-            plugin.candidate.name == "cultivate" for plugin in manager.plugins
-        ) if manager is not None else False
         identity_hooks = {
             name: hook for (owner, name), hook in manager.policy.server_hooks.items()
             if owner != "core" and name.startswith("github_identity_")
@@ -353,9 +350,9 @@ async def create_agent_runtime(
             identity_hooks["github_identity_callback"](github_identity_degraded)
             initialize_identity()
         if manager is None:
-            all_mimir_tools(coding_enabled=coding_enabled)
+            all_mimir_tools()
         else:
-            all_mimir_tools(coding_enabled=coding_enabled, policy=manager.policy,
+            all_mimir_tools(policy=manager.policy,
                             materialize_plugins=False)
 
         from .agent import Agent
@@ -718,7 +715,6 @@ def _install_runtime_globals(bundle: AgentRuntimeBundle) -> None:
     tools.set_spawn_config(
         {
             "default_cwd": bundle.config.home,
-            "opencode_config_path": bundle.config.opencode_config_path,
         }
     )
     tools.set_shell_job_registry(

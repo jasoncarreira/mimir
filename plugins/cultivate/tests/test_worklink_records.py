@@ -30,8 +30,6 @@ from mimir_cultivate.worklink.factory_state import (
     save_factory_record,
 )
 from mimir_cultivate.worklink import identities
-from mimir.worklink.compute import LocalSubprocessComputeBackend
-from mimir.worklink import evidence as core_evidence
 from mimir_cultivate.worklink.planning import target_branch_from_description
 from mimir_cultivate.worklink.run_state import WorklinkRunState
 from mimir_cultivate.worklink.safe_git import (
@@ -325,7 +323,7 @@ async def test_selected_provider_observes_gate_through_authorized_compute(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("gate_exit", [0, 1])
-async def test_factory_completion_matches_core_evidence(
+async def test_factory_completion_records_observed_gate_evidence(
     tmp_path: Path, gate_exit: int,
 ) -> None:
     checkout = tmp_path / "factory-sandbox"
@@ -352,12 +350,9 @@ async def test_factory_completion_matches_core_evidence(
         backend_status="completed", test_command="check-gate", safe_git=GitObservation(),
         work_spec=spec, runner=runner,
     )
-    core = await core_evidence.observe_evidence(**arguments)
     provider = await observe_evidence(**arguments)
-    assert calls == [("check-gate", checkout)] * 2
-    assert (provider.status, provider.review_ready, provider.reasons) == (
-        core.status, core.review_ready, core.reasons,
-    )
-    assert provider.evidence.files_changed == core.evidence.files_changed
-    assert provider.evidence.tests.exit_code == core.evidence.tests.exit_code == gate_exit
-    assert provider.evidence.tests.observed == core.evidence.tests.observed
+    assert calls == [("check-gate", checkout)]
+    assert provider.evidence.files_changed == ["changed.py"]
+    assert provider.evidence.tests.exit_code == gate_exit
+    assert provider.evidence.tests.observed
+    assert provider.review_ready is (gate_exit == 0)

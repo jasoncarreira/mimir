@@ -14,7 +14,7 @@ from mimir import access_control
 from mimir.config import Config
 from mimir.plugins.core import policy_scope
 from mimir_cultivate.repository import RepositoryConfig, RepositoryInventory, RepositoryTestSuite
-from mimir.worklink.backends.registry import WorklinkConfig
+from mimir_cultivate.worklink.backends.registry import WorklinkConfig
 
 
 @pytest.fixture(autouse=True)

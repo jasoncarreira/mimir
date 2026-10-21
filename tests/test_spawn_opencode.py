@@ -16,7 +16,7 @@ import pytest
 
 pytest.importorskip("mimir_cultivate.opencode")
 
-from mimir.contained_execution import CollectedExecutionResult
+from mimir_cultivate.contained_execution import CollectedExecutionResult
 from mimir_cultivate import contained_execution as provider_contained_execution
 from mimir_cultivate import opencode as provider_opencode
 from mimir_cultivate.opencode import _spawn_open_code_impl
@@ -302,7 +302,7 @@ async def test_worker_environment_sensitive_path_is_configuration_refused(
 async def test_benign_complete_argv_and_environment_values_launch(
     spawn_tree, tmp_path, monkeypatch, ingress
 ):
-    from mimir import contained_execution
+    from mimir_cultivate import contained_execution
 
     _home, seed = spawn_tree
     record = {}
@@ -496,7 +496,7 @@ async def test_artifact_run_directory_failure_precedes_execution(
 async def test_generated_payload_containment_and_unsafe_negative_control(
     spawn_tree, tmp_path
 ):
-    from mimir.contained_execution import execute_contained
+    from mimir_cultivate.contained_execution import execute_contained
 
     _home, seed = spawn_tree
     controller_home = tmp_path / "controller-home"

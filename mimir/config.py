@@ -689,16 +689,15 @@ def _parse_file_tool_roots(
     return tuple(out.items())
 
 
-def _configure_declared_repositories(home: Path, inventory_loader: Any = None) -> None:
+def _configure_declared_repositories(
+    home: Path, inventory_loader: Any = None, repository_selection: Any = None,
+) -> None:
     """Validate the repository inventory and reconcile its legacy projections."""
     if inventory_loader is None:
         return
-    from .worklink.backends.registry import WorklinkConfig
-
     inventory = inventory_loader(home / "repositories.yaml")
     if not inventory.declared:
         return
-    worklink = WorklinkConfig.load(home / "worklink.yaml")
 
     declared_roots = tuple(
         (str(item.root), item.mode)
@@ -737,25 +736,8 @@ def _configure_declared_repositories(home: Path, inventory_loader: Any = None) -
     else:
         os.environ["GITHUB_REPOS"] = ",".join(declared_slugs)
 
-    target = inventory.repository(worklink.repository) if worklink.repository else None
-    if worklink.repository is not None and target is None:
-        raise RuntimeError(
-            "worklink.yaml repository does not name a declared repository: "
-            f"{worklink.repository}"
-        )
-    declared_target = str(target.root) if target is not None else None
-    for name in ("WORKLINK_REPO", "MIMIR_WORKLINK_REPO"):
-        legacy_target = os.environ.get(name)
-        if legacy_target and (
-            declared_target is None
-            or Path(legacy_target).resolve() != Path(declared_target)
-        ):
-            raise RuntimeError(
-                f"{name} disagrees with worklink.yaml: "
-                f"legacy={legacy_target!r}, declared={declared_target!r}"
-            )
-    if declared_target is not None and not os.environ.get("WORKLINK_REPO"):
-        os.environ["WORKLINK_REPO"] = declared_target
+    if repository_selection is not None:
+        repository_selection(home, inventory)
 
     git = shutil.which("git")
     if git is None and inventory.repositories:
@@ -1328,11 +1310,6 @@ class Config:
     # default; the allowlist is normalized, lowercased skill slugs only.
     chat_skills_enabled: bool = False
     chat_skill_allowlist: tuple[str, ...] = ()
-    # Derived from the installed, selected Cultivate plugin; not a separate flag.
-    coding_enabled: bool = False
-    # Native OpenCode JSON/JSONC selected through OPENCODE_CONFIG, or its
-    # standard XDG/HOME location. Provider/plugin settings remain OpenCode-owned.
-    opencode_config_path: Path | None = None
     # Operator-declared absolute roots OUTSIDE the home the file tools may
     # read/edit, as ``(abs_path, "ro"|"rw")`` pairs (chainlink #650). Empty =
     # home-only (today's behavior). ``MIMIR_FILE_TOOL_ROOTS``.
@@ -1371,6 +1348,7 @@ class Config:
         hooks = plugin_manager.policy.policy_consumer_hooks
         _configure_declared_repositories(
             home, hooks.repository_inventory if hooks is not None else None,
+            hooks.repository_selection if hooks is not None else None,
         )
         if "MIMIR_FILE_OP_ROOTS" in os.environ:
             log.warning(
@@ -1382,16 +1360,6 @@ class Config:
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
         model_spec = _env("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
-        coding_enabled_value = any(
-            plugin.candidate.name == "cultivate" for plugin in plugin_manager.plugins
-        )
-        from .opencode_config import opencode_config_path
-
-        resolved_opencode_config = opencode_config_path()
-        log.info(
-            "coding assistant capability: %s",
-            "enabled" if coding_enabled_value else "disabled",
-        )
         # Resolve once — used by both ``billing_mode`` (to detect QUOTA
         # vs API_KEY billing) and ``oauth_credentials_path`` (the field
         # itself). Computing it twice was redundant and could in theory
@@ -1499,7 +1467,6 @@ class Config:
             access_control_enforced=resolve_access_control_enforcement(
                 _env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False),
                 model_spec=model_spec,
-                coding_enabled=coding_enabled_value,
                 policy=plugin_manager.policy,
             ),
             open_bridge=_env_bool("MIMIR_OPEN_BRIDGE", False),
@@ -1539,8 +1506,6 @@ class Config:
             chat_skill_allowlist=_parse_chat_skill_allowlist(
                 _env("MIMIR_CHAT_SKILL_ALLOWLIST", "")
             ),
-            coding_enabled=coding_enabled_value,
-            opencode_config_path=resolved_opencode_config,
             api_key=_env("MIMIR_API_KEY"),
             web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),
             chat_stream_max_subscribers=_env_int(

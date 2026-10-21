@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -26,11 +27,11 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
-    RepoPRActionScope,
-    RepoReviewState,
     SourceLabel,
     TurnInteractivity,
 )
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.policy import RepoPRActionScope, RepoReviewState
 from tests.lease_attestation_helper import assert_lease_attested
 
 
@@ -126,6 +127,7 @@ def _scope(
     observed_head_sha: str = "a" * 40,
     author: str = "mimir-bot",
 ) -> RepoPRActionScope:
+    pytest.importorskip("mimir_cultivate", reason="PR scopes belong to Cultivate")
     return RepoPRActionScope(
         provenance="server_discovered",
         canonical_repo=repository,
@@ -154,6 +156,8 @@ def _auth(
     scope: RepoPRActionScope | None = None,
     recorded_verdict: bool = True,
 ) -> AuthContext:
+    from mimir.plugins.core import selected_policy_registry
+
     current = labels or InformationFlowLabels()
     scope = scope or _scope(
         repository, pr_number=pr_number, observed_head_sha=observed_head_sha,
@@ -173,6 +177,17 @@ def _auth(
         ifc_labels=current,
         ifc_state=state,
         repo_pr_action_scope=scope,
+        _plugin_slot_policy=selected_policy_registry(),
+    )
+
+
+def _core_auth() -> AuthContext:
+    labels = InformationFlowLabels()
+    return AuthContext(
+        principal="operator", canonical_principal="operator", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="channel-1",
+        interactivity=TurnInteractivity.INTERACTIVE, enforcement_enabled=True,
+        ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
     )
 
 
@@ -206,10 +221,9 @@ def _real_attested_lease(tmp_path: Path, *, author: str = "collaborator"):
         "pr_number": scope.pr_number, "head_sha": head,
         "base_sha": lease.base_sha, "lineage": {},
     }))
-    auth = _auth(scope=scope)
     state = RepoReviewState(scope)
     state.attach_checkout_lease(lease)
-    object.__setattr__(auth, "repo_review_state", state)
+    auth = replace(_auth(scope=scope), repo_review_state=state)
     return auth, scope, lease, target, (DEFAULT_USER_NAME, DEFAULT_USER_EMAIL)
 
 
@@ -501,7 +515,7 @@ async def test_repo_test_red_run_remediation_sequence(
         assert result["stdout"] == output.decode()
         assert result["stderr"] == "untrusted stderr"
     if state_carrier != "alias":
-        from mimir.models import ServerDiscoveredPRStates, RepoPRScopeRegistry
+        from mimir_cultivate.policy import ServerDiscoveredPRStates, RepoPRScopeRegistry
         cache = ServerDiscoveredPRStates()
         cache.remember(state)
         object.__setattr__(auth, "server_discovered_pr_states", cache)
@@ -1186,10 +1200,12 @@ def test_ci_run_provenance_requires_protected_or_attested_head(
     auth, scope, _, _, _ = _real_attested_lease(tmp_path)
     if sha == "unattested":
         auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
-    from mimir.models import RepoPRScopeRegistry
-    object.__setattr__(auth, "repo_pr_scope_registry", RepoPRScopeRegistry((auth.repo_review_state,)))
-    object.__setattr__(auth, "ci_run_targets", frozenset({("owner/repo", 42)}))
-    object.__setattr__(auth, "ci_branch_targets", frozenset({("owner/repo", branch, None)}))
+    from mimir_cultivate.policy import RepoPRScopeRegistry
+    auth = replace(
+        auth, repo_pr_scope_registry=RepoPRScopeRegistry((auth.repo_review_state,)),
+        ci_run_targets=frozenset({("owner/repo", 42)}),
+        ci_branch_targets=frozenset({("owner/repo", branch, None)}),
+    )
     run = {"id": 42, "head_sha": scope.observed_head_sha if sha in {"attested", "unattested"} else sha,
            "head_branch": "main" if branch == "fork" else branch,
            "head_repository": "other/repo" if branch == "fork" else "owner/repo"}
@@ -1241,8 +1257,10 @@ def test_ci_classifier_refuses_nonretained_plugin_provenance(monkeypatch, tool_n
         suffix = "/jobs" if tool_name == "ci_run_jobs" else ""
         resource_id = f"owner/repo#actions/run/42{suffix}"
         other_resource = f"owner/repo#actions/run/43{suffix}"
-    object.__setattr__(auth, "ci_run_targets", frozenset({("owner/repo", 42)}))
-    object.__setattr__(auth, "ci_branch_targets", frozenset({("owner/repo", "main", 7)}))
+    auth = replace(
+        auth, ci_run_targets=frozenset({("owner/repo", 42)}),
+        ci_branch_targets=frozenset({("owner/repo", "main", 7)}),
+    )
     fields = dict(
         principal="operator", domain="repository", resource_id=resource_id,
         bridge_instance="forge", sensitivity="internal",
@@ -1322,7 +1340,7 @@ def test_ci_jobs_api_error_after_run_attestation_keeps_turn_clean(tmp_path, monk
     from mimir_cultivate import forge
 
     auth, scope, _, _, _ = _real_attested_lease(tmp_path)
-    object.__setattr__(auth, "ci_run_targets", frozenset({("owner/repo", 42)}))
+    auth = replace(auth, ci_run_targets=frozenset({("owner/repo", 42)}))
     monkeypatch.setattr(access_control_module, "is_configured_github_repo", lambda *_: True)
     monkeypatch.setattr(forge, "_client_for_repository", lambda *_: SimpleNamespace(
         get_run=lambda *_: {"id": 42, "head_branch": "main", "head_sha": "c" * 40,
@@ -1648,7 +1666,6 @@ def test_protected_base_lineage_keeps_file_reads_trusted_but_plugin_results_inco
     scope = replace(original, destination_ref="refs/heads/main", observed_base_sha=base)
     object.__setattr__(lease, "scope_id", scope.scope_id)
     object.__setattr__(lease, "base_sha", base)
-    object.__setattr__(auth, "repo_pr_action_scope", scope)
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
     state = RepoReviewState(scope)
     state.attach_checkout_lease(lease)
@@ -1660,7 +1677,7 @@ def test_protected_base_lineage_keeps_file_reads_trusted_but_plugin_results_inco
         check=True, capture_output=True, text=True,
     ).stdout.splitlines()
     _record_clean_head(lease, *descendants)
-    object.__setattr__(auth, "repo_review_state", state)
+    auth = replace(auth, repo_pr_action_scope=scope, repo_review_state=state)
     assert_lease_attested(auth, scope, lease)
     selected = selected_policy_registry()
     monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
@@ -2173,7 +2190,7 @@ async def test_glob_discovered_error_name_remains_untrusted(
         hidden.chmod(0o700)
     assert result.error and hidden.name in result.error
     assert provenance is None or provenance.content_free_error is None
-    auth = _auth()
+    auth = _core_auth()
     labels = classify_protected_result(
         "glob", {"pattern": "**/*.txt", "path": "/top"}, auth,
         ToolAuthorization(tool_name="glob", decision=OperationDecision.RESOURCE_SCOPED,
@@ -2244,7 +2261,7 @@ async def test_symlink_target_exception_remains_untrusted(
     tool_name = "read_file" if method in {"read", "aread"} else method.removeprefix("a")
     arguments = {"file_path" if tool_name == "read_file" else "path": "/reference.txt"}
     labels = classify_protected_result(
-        tool_name, arguments, _auth(),
+        tool_name, arguments, _core_auth(),
         ToolAuthorization(tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
                           allowed=True),
         result=ToolMessage(content=f"Error: {result.error}", tool_call_id="symlink",
@@ -2260,7 +2277,7 @@ def test_filesystem_error_cannot_erase_content_captured_before_failure(
     outside = tmp_path / "outside.txt"
     outside.write_text("outside content", encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
-    auth = _auth()
+    auth = _core_auth()
     source = protected_result_source(
         auth, principal="filesystem", domain="filesystem",
         resource_id=str(outside), bridge_instance="filesystem",
@@ -2282,7 +2299,7 @@ def test_filesystem_error_cannot_erase_content_captured_before_failure(
 
 
 def test_filesystem_error_requires_exact_nonempty_backend_attestation(tmp_path: Path) -> None:
-    auth = _auth()
+    auth = _core_auth()
     path = tmp_path / "missing.txt"
     authorization = ToolAuthorization(
         tool_name="read_file", decision=OperationDecision.RESOURCE_SCOPED, allowed=True,
@@ -2315,11 +2332,22 @@ def test_filesystem_error_requires_exact_nonempty_backend_attestation(tmp_path: 
         ),), content_free_error="not found")
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_retired_repository_refusal_cannot_claim_content_free_trust() -> None:
+    from mimir.plugins.core import selected_policy_registry
+    from mimir.tool_descriptors import ResultOriginKind, get_tool_descriptor
+
+    policy = selected_policy_registry()
+    registered = policy.tools["repo_status"]
+    assert registered.owner == "cultivate"
+    assert get_tool_descriptor("repo_status", policy=policy) is registered.descriptor
+    assert registered.descriptor.git_operation_result
+    assert registered.descriptor.result_origin & ResultOriginKind.REPOSITORY
     auth = _auth()
+    assert type(auth.repo_pr_action_scope) is RepoPRActionScope
     authorization = ToolAuthorization(
         tool_name="repo_status", decision=OperationDecision.RESOURCE_SCOPED,
-        allowed=True, repo_pr_action_scope=auth.repo_pr_action_scope,
+        allowed=True, repo_pr_action_scope=auth.repo_pr_action_scope, policy=policy,
     )
     fixed = "repository operation rejected (repository_git_failed) [inactive_checkout]: " \
             "an active matching checkout lease is required"
@@ -2340,6 +2368,7 @@ def test_retired_repository_refusal_cannot_claim_content_free_trust() -> None:
             provenance=provenance, failed=True,
         )
         assert labels is not None and labels.has_untrusted_active_ingest
+        assert labels.sources[0].domain == registered.result_domain == "repository"
     exact = classify_protected_result(
         "repo_status", {"repository": "owner/repo", "pull_request": 7},
         auth, authorization,
@@ -2347,7 +2376,28 @@ def test_retired_repository_refusal_cannot_claim_content_free_trust() -> None:
         provenance=ProtectedResultProvenance((), fixed), failed=True,
     )
     assert exact is not None and exact.has_untrusted_active_ingest
+    assert exact.sources[0].domain == registered.result_domain
     assert exact.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_status>"
+
+
+def test_core_unknown_repo_status_error_cannot_claim_content_free_trust() -> None:
+    from mimir.plugins.core import core_policy_registry
+
+    policy = core_policy_registry()
+    assert "repo_status" not in policy.tools
+    fixed = "repository operation rejected (repository_git_failed) [inactive_checkout]"
+    labels = classify_protected_result(
+        "repo_status", {"repository": "owner/repo", "pull_request": 7},
+        _core_auth(),
+        ToolAuthorization(
+            tool_name="repo_status", decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True, policy=policy,
+        ),
+        result=ToolMessage(content=fixed, tool_call_id="refusal", status="error"),
+        provenance=ProtectedResultProvenance((), fixed), failed=True,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+    assert labels.sources[0].domain == "unknown"
 
 
 @pytest.mark.usefixtures("selected_repository_policy")

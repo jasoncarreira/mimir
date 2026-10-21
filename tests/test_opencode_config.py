@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from mimir.opencode_config import (
+pytest.importorskip("mimir_cultivate", reason="OpenCode configuration belongs to Cultivate")
+
+from mimir_cultivate.opencode import (
     OpenCodeAuthError,
     OpenCodeConfigError,
     opencode_config_path,

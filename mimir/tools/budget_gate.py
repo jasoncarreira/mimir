@@ -2462,9 +2462,10 @@ def _result_labels_for_call(
         original_scope = authorization.repo_pr_action_scope
         repository = arguments.get("repository")
         pull_request = arguments.get("pull_request")
-        discovered = auth_context.server_discovered_pr_states.resolve(
-            repository, pull_request,
-        ) if isinstance(repository, str) and isinstance(pull_request, int) else None
+        cache = auth_context.server_discovered_pr_states
+        discovered = cache.resolve(repository, pull_request) if (
+            cache is not None and isinstance(repository, str) and type(pull_request) is int
+        ) else None
         state = discovered
         if state is None and auth_context.repo_pr_scope_registry is not None:
             state = auth_context.repo_pr_scope_registry.resolve(repository, pull_request)
@@ -4243,9 +4244,9 @@ def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
     registered = _plugin_tool(call.tool_name, call.policy)
     if registered is None or registered.resource_scope != "repo_pr":
         return None
-    from ..models import RetainedFactoryScope
+    from ..access_control import _is_registered_retained_scope
 
-    if isinstance(call.authorization.repo_pr_action_scope, RetainedFactoryScope):
+    if _is_registered_retained_scope(call.authorization.repo_pr_action_scope):
         if _retained_dispatch_scope(call) is not None:
             return None
         return _tool_call_refusal(
@@ -4282,14 +4283,13 @@ def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
 
 
 def _retained_dispatch_scope(call: _PreparedToolCall) -> Any:
-    from ..access_control import _is_worklink_retained_checkout_service
-    from ..models import RetainedFactoryScope
+    from ..access_control import _is_registered_retained_scope, _is_worklink_retained_checkout_service
 
     scope = getattr(call.authorization, "repo_pr_action_scope", None)
     registered = _plugin_tool(call.tool_name, call.policy)
     service = get_trusted_service_from_auth_context(call.auth_context)
     if (
-        not isinstance(scope, RetainedFactoryScope)
+        not _is_registered_retained_scope(scope)
         or scope is not getattr(call.auth_context, "retained_factory_scope", None)
         or registered is None or "retained_repo_tools" not in registered.memberships
         or registered.resource_scope != "repo_pr"

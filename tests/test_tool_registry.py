@@ -191,11 +191,11 @@ def test_coding_tool_is_registered_only_when_enabled_and_available(
     monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
 
-    names = {tool.name for tool in all_mimir_tools(coding_enabled=True, policy=selected)}
+    names = {tool.name for tool in all_mimir_tools(policy=selected)}
     assert "spawn_open_code" in names
     from mimir_cultivate.opencode import spawn_open_code
     assert next(tool for tool in all_mimir_tools(
-        coding_enabled=True, policy=selected,
+        policy=selected,
     ) if tool.name == "spawn_open_code") is spawn_open_code
 
 
@@ -215,7 +215,7 @@ def test_identity_degradation_removes_coding_tools_and_does_not_auto_recover(
         names = {
             tool.name
             for tool in all_mimir_tools(
-                coding_enabled=True, require_coding_available=False, policy=selected,
+                require_provider_available=False, policy=selected,
             )
         }
 
@@ -235,7 +235,7 @@ def test_enabled_coding_without_opencode_fails_loudly(
     monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: False)
 
     with pytest.raises(RuntimeError, match="opencode CLI.*not installed"):
-        all_mimir_tools(coding_enabled=True, policy=selected)
+        all_mimir_tools(policy=selected)
 
 
 def test_enabled_coding_without_checkout_config_fails_loudly(
@@ -248,7 +248,7 @@ def test_enabled_coding_without_checkout_config_fails_loudly(
     monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
 
     with pytest.raises(RuntimeError, match="MIMIR_PR_CHECKOUT_LEASE_ROOT"):
-        all_mimir_tools(coding_enabled=True, policy=selected)
+        all_mimir_tools(policy=selected)
 
 
 @pytest.mark.parametrize("degraded", [False, True])
@@ -290,7 +290,7 @@ def test_coding_startup_aggregates_missing_prerequisites(
         )
 
     with pytest.raises(RuntimeError) as error:
-        all_mimir_tools(coding_enabled=True, policy=selected)
+        all_mimir_tools(policy=selected)
     message = str(error.value)
     assert "opencode CLI" in message
     assert "pinned Git binary /usr/bin/git" in message
@@ -315,7 +315,7 @@ def test_coding_startup_writable_root_and_identity_gate(monkeypatch, tmp_path, d
     monkeypatch.setattr(registry.os, "access", lambda path, mode: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
     with policy_scope(selected):
-        names = {tool.name for tool in all_mimir_tools(coding_enabled=True, policy=selected)}
+        names = {tool.name for tool in all_mimir_tools(policy=selected)}
     assert ("spawn_open_code" in names) is not degraded
     assert ("repo_test" in names) is not degraded
     assert list(tmp_path.iterdir()) == []
@@ -330,7 +330,7 @@ def test_coding_startup_rejects_existing_relative_lease_root(monkeypatch, tmp_pa
     (tmp_path / "leases").mkdir()
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", "leases")
     with pytest.raises(RuntimeError, match="not configured as an absolute path"):
-        all_mimir_tools(coding_enabled=True, policy=selected)
+        all_mimir_tools(policy=selected)
 
 
 def test_coding_startup_rejects_executable_directory_as_git(monkeypatch, tmp_path):
@@ -347,7 +347,7 @@ def test_coding_startup_rejects_executable_directory_as_git(monkeypatch, tmp_pat
     monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
     with pytest.raises(RuntimeError, match="pinned Git binary /usr/bin/git"):
-        all_mimir_tools(coding_enabled=True, policy=selected)
+        all_mimir_tools(policy=selected)
 
 
 def test_declarative_coding_inventory_does_not_probe_cli_availability(
@@ -368,8 +368,7 @@ def test_declarative_coding_inventory_does_not_probe_cli_availability(
     names = {
         tool.name
         for tool in all_mimir_tools(
-            coding_enabled=True,
-            require_coding_available=False,
+            require_provider_available=False,
             policy=selected,
         )
     }
@@ -400,14 +399,14 @@ def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled(
     from mimir_cultivate import forge
 
     default_names = {
-        tool.name for tool in all_mimir_tools(require_coding_available=False)
+        tool.name for tool in all_mimir_tools(require_provider_available=False)
     }
     monkeypatch.setattr(forge, "_github_identity_degraded", False)
     selected = load_plugins(enable="cultivate").policy
     with policy_scope(selected):
         enabled_names = {
             tool.name for tool in all_mimir_tools(
-                coding_enabled=True, require_coding_available=False, policy=selected,
+                require_provider_available=False, policy=selected,
             )
         }
     typed_names = {name for name, tool in selected.tools.items()
@@ -442,18 +441,27 @@ def test_typed_repo_pr_sinks_all_have_destination_extraction() -> None:
     assert all(TOOL_DESCRIPTORS[name].sink_destination is not None for name in sinks)
 
 
-def test_typed_repo_pr_schemas_only_name_exact_registry_selectors() -> None:
-    from mimir.access_control import _TYPED_REPO_PR_TOOL_ACTIONS
+def test_typed_repo_pr_schemas_only_name_exact_registry_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from mimir.tools import all_mimir_tools
+    selected = _selected_cultivate_policy()
+    from mimir_cultivate import forge
 
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
     tools = {
         tool.name: tool
         for tool in all_mimir_tools(
-            coding_enabled=True, require_coding_available=False,
+            require_provider_available=False, policy=selected,
         )
     }
+    typed_names = {
+        name for name, declared in selected.tools.items()
+        if declared.resource_scope == "repo_pr" and declared.factory is not None
+    }
+    assert typed_names
     forbidden = {"repo", "pr", "pr_number", "url", "host"}
-    for name in _TYPED_REPO_PR_TOOL_ACTIONS:
+    for name in typed_names:
         properties = tools[name].tool_call_schema.model_json_schema()["properties"]
         assert forbidden.isdisjoint(properties), (name, properties)
         assert {"repository", "pull_request"} <= set(properties), (name, properties)
@@ -481,7 +489,7 @@ def test_repo_test_schema_exposes_no_execution_authority() -> None:
 def test_build_app_checks_enabled_coding_surface_at_startup() -> None:
     from mimir.server import build_app
 
-    config = SimpleNamespace(coding_enabled=True)
+    config = SimpleNamespace()
     with (
         patch(
             "mimir.tools.all_mimir_tools",
@@ -491,7 +499,7 @@ def test_build_app_checks_enabled_coding_surface_at_startup() -> None:
     ):
         build_app(config)
 
-    assemble.assert_called_once_with(coding_enabled=True)
+    assemble.assert_called_once_with()
 
 
 @pytest.mark.parametrize("shell_tool", [shell_exec, bash_async])

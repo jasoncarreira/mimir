@@ -10,7 +10,6 @@ import re
 
 import pytest
 
-from mimir.contained_execution import SensitiveMaterialScrubber
 from mimir.redaction import (
     _COLON_CREDENTIAL_PATTERNS,
     _TOKEN_PATTERNS,
@@ -166,12 +165,18 @@ def test_bare_secret_patterns_preserve_ordinary_text(text: str) -> None:
     assert scrub_text(text) == expected_live
 
 
-def test_shared_corpus_pins_contained_scrubber_registration_asymmetry() -> None:
-    scrubber = SensitiveMaterialScrubber(home="", checkout=None)
-
+def test_shared_corpus_is_redacted_by_core_logs() -> None:
     for text in BARE_SECRET_TEXT_CORPUS:
         assert redact_text(text) != text
         assert scrub_text(text) != text
+
+
+def test_shared_corpus_pins_contained_scrubber_registration_asymmetry() -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.contained_execution import SensitiveMaterialScrubber
+
+    scrubber = SensitiveMaterialScrubber(home="", checkout=None)
+    for text in BARE_SECRET_TEXT_CORPUS:
         assert scrubber.scrub_text(text) == text
 
         scrubber.add_scalar(text)

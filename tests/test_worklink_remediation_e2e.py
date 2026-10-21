@@ -25,6 +25,8 @@ import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+pytest.importorskip("mimir_cultivate", reason="Worklink remediation belongs to Cultivate")
+
 from mimir import access_control as ac
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
@@ -35,14 +37,14 @@ from mimir.pollers import discover_pollers, run_poller
 from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file_tool_routes
 from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
-from mimir.worklink.backends.feature_factory import FactoryStatus
-from mimir.worklink.compute import LaunchHandle
-from mimir.worklink.dispatch_failures import (
+from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
+from mimir_cultivate.worklink.compute import LaunchHandle
+from mimir_cultivate.worklink.dispatch_failures import (
     dispatch_failure_state_dir,
     load_failure_state,
     record_failure,
 )
-from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
+from mimir_cultivate.worklink.factory_state import FactoryRunRecord, save_factory_record
 
 
 class _CapturingEnqueue:
@@ -163,7 +165,7 @@ class _ExecutorServer:
         assert not self.errors, self.errors
 
     def _handle(self, connection: socket.socket) -> None:
-        from mimir.worklink import worker_exec
+        from mimir_cultivate.worklink import worker_exec
 
         try:
             peer = connection.getsockopt(
@@ -207,7 +209,7 @@ def remediation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     except PackageNotFoundError:
         pytest.skip("requires installed Cultivate")
     provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
-    from mimir.worklink import worker_client
+    from mimir_cultivate.worklink import worker_client
 
     home = tmp_path / "home"
     state_root = home / "state" / "pollers"
@@ -238,10 +240,6 @@ def remediation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
     monkeypatch.setattr(provider_worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
-    monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh",
-        lambda _record: False,
-    )
     monkeypatch.setattr(
         "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
         lambda _record: False,
@@ -295,15 +293,20 @@ def remediation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 async def _trusted_turn(case):
+    from mimir_cultivate.scheduler import worklink_poller_hooks
+
     skills = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
     ready = next(
         config
-        for config in discover_pollers(skills, state_root=case.state_root)
+        for config in discover_pollers(
+            skills, state_root=case.state_root,
+            policy=load_plugins(enable="cultivate").policy, plugin_candidates=(),
+        )
         if config.name == "worklink-ready-queue"
     )
     capture = _CapturingEnqueue()
     emitted = await run_poller(
-        replace(ready, command=f"{sys.executable} scripts/poller.py"),
+        replace(ready, command=f"{sys.executable} scripts/poller.py", hooks=worklink_poller_hooks()),
         enqueue=capture,
         home=case.home,
     )
@@ -689,7 +692,7 @@ async def test_worklink_resume_shared_launcher_runs_epic_and_retires_only_target
     pytest.importorskip("mimir_cultivate.commands")
     from mimir_cultivate.registration import worklink_resume
     from mimir_cultivate.worklink import autonomy, detached_dispatch
-    from mimir.worklink.orchestrator import WorklinkRunResult, WorklinkRunner
+    from mimir_cultivate.worklink.orchestrator import WorklinkRunResult, WorklinkRunner
     from mimir_cultivate.worklink.orchestrator import WorklinkRunner as CultivateWorklinkRunner
     from mimir_cultivate.worklink.detached_dispatch import FactoryRecoveryIdentity
 
@@ -779,7 +782,7 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
 ) -> None:
     """Run the production remediation effect paths across real Linux identities."""
     provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
-    from mimir import contained_execution
+    from mimir_cultivate import contained_execution
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
     from mimir_cultivate.repository import (
         GitCommit,
@@ -790,7 +793,7 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
         RepoProjectTests,
         retained_factory_git_runner,
     )
-    from mimir.worklink import worker_client, worker_exec
+    from mimir_cultivate.worklink import worker_client, worker_exec
 
     identities = _system_identities()
     boundary = Path("/tmp") / f"mimir-remediation-{uuid.uuid4()}"
@@ -913,10 +916,10 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
 
         monkeypatch.setattr(provider_checkout, "REPO_TEST_CHECKOUT_ROOT", snapshots)
         monkeypatch.setattr(
-            "mimir.worklink.checkout._REPO_TEST_CHECKOUT_ROOT", snapshots,
+            "mimir_cultivate.worklink.checkout._REPO_TEST_CHECKOUT_ROOT", snapshots,
         )
         monkeypatch.setattr(
-            "mimir.worklink.retained_scope._factory_session_lock_is_fresh",
+            "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
             lambda _record: False,
         )
         monkeypatch.setattr(

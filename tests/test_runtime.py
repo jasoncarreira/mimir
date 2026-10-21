@@ -105,7 +105,7 @@ async def test_factory_unknown_sender_real_delivery(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     cfg = replace(Config.from_env(), operator_alert_channel="slack-COPS",
-                  access_control_enforced=True, coding_enabled=False,
+                  access_control_enforced=True,
                   pairing_operator_digest_delay_seconds=3600,
                   pairing_dm_auto_reply_interval_seconds=0)
     refusal = "No @everyone @here <@123> <!channel> <!here> <@U1>"
@@ -299,8 +299,6 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         commitments_log=tmp_path / ".mimir" / "commitments.jsonl",
         operator_alert_channel="",
         pairing_pending_max=100,
-        opencode_config_path=None,
-        coding_enabled=False,
     )
 
 
@@ -973,7 +971,6 @@ async def test_runtime_preflight_recovers_after_bounded_transient_retries(
     )
     config = _config(tmp_path)
     config.plugin_manager = load_plugins(enable="cultivate")
-    config.coding_enabled = True
     config.operator_alert_channel = "ops"
     bundle = await runtime.create_agent_runtime(config, _core(tmp_path), adapters)
 
@@ -1083,8 +1080,7 @@ async def test_runtime_preflight_never_retries_permanent_identity_latch(
     assert forge_tools.github_identity_is_degraded() is True
     assert forge_tools.github_identity_recovery_pending() is False
     assert any(
-        kind == "tools" and options.get("coding_enabled") is True
-        and options.get("policy") is config.plugin_manager.policy
+        kind == "tools" and options.get("policy") is config.plugin_manager.policy
         for kind, options in events if isinstance(options, dict)
     )
     await bundle.aclose()
@@ -1580,7 +1576,6 @@ async def test_runtime_global_matrix_is_installed_and_reset_in_order(
         "mcp",
     ]
     config = _config(tmp_path)
-    config.coding_enabled = True
     adapters = _adapters(events)
     core = _core(tmp_path)
     bundle = await runtime.create_agent_runtime(config, core, adapters)
@@ -1619,7 +1614,6 @@ async def test_runtime_global_matrix_is_installed_and_reset_in_order(
         "commitments_store": bundle.commitments_store,
         "spawn_config": {
             "default_cwd": config.home,
-            "opencode_config_path": config.opencode_config_path,
         },
         "arbiter": bundle.agent._arbiter,
     }
@@ -2034,7 +2028,6 @@ async def test_factory_rollback_task_timeout_continues_reverse_closers_and_rerai
     monkeypatch.setattr(runtime, "RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS", 0.01)
     config = _config(tmp_path)
     config.plugin_manager = load_plugins(enable="cultivate")
-    config.coding_enabled = True
     config.operator_alert_channel = "ops"
     adapters = _adapters(events)
 
@@ -2241,7 +2234,7 @@ from mimir.scheduler import Scheduler
 assert \"mimir.server\" not in sys.modules
 _config_io.reload_config()
 config = Config.from_env()
-assert not config.coding_enabled
+assert not config.plugin_manager.plugins
 assert not any(name == \"mimir_cultivate\" or name.startswith(\"mimir_cultivate.\") for name in sys.modules)
 core = runtime.create_core_services(config)
 dispatcher = Dispatcher(config, resolver=core.identity_resolver)

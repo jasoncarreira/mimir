@@ -19,6 +19,8 @@ import pytest
 import asyncio
 from importlib.metadata import PackageNotFoundError, version
 
+pytestmark = pytest.mark.usefixtures("authorized_fake_backend_gate")
+
 try:
     version("mimir-cultivate")
 except PackageNotFoundError:
@@ -26,26 +28,20 @@ except PackageNotFoundError:
 
 from mimir.event_logger import _reset_logger_for_tests, init_logger
 from mimir_cultivate.forge import GitHubIdentityVerificationError
-from mimir.worklink.backends import (
-    Caps,
-    ComputeCaps,
-    ComputeResult,
-    RawResult,
-    WorkOrder,
-)
-from mimir.worklink.evidence import EvidenceValidation, TestResult, WorklinkEvidence
-from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
-from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, ClaimResult, claim_records_from_comments
-from mimir.worklink.compute import LaunchHandle, WorkSpec
-from mimir.worklink.checkout import CheckoutLease
-from mimir.worklink.detached_dispatch import FactoryRecoveryIdentity
-from mimir.worklink.backends.feature_factory import (
+from mimir_cultivate.worklink.backends.base import Caps, RawResult, WorkOrder
+from mimir_cultivate.worklink.compute import ComputeCaps, ComputeResult, LaunchHandle, WorkSpec
+from mimir_cultivate.worklink.evidence import EvidenceValidation, TestResult, WorklinkEvidence
+from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
+from mimir_cultivate.worklink.claims import ChainlinkClaims, ClaimRecord, ClaimResult, claim_records_from_comments
+from mimir_cultivate.worklink.checkout import CheckoutLease
+from mimir_cultivate.worklink.detached_dispatch import FactoryRecoveryIdentity
+from mimir_cultivate.worklink.backends.feature_factory import (
     _FACTORY_PERMISSION,
     FactoryContractError,
     FeatureFactoryBackend,
     parse_factory_status,
 )
-from mimir.worklink.factory_state import (
+from mimir_cultivate.worklink.factory_state import (
     FactoryRecordError,
     FactoryRunRecord,
     archive_factory_record,
@@ -55,8 +51,8 @@ from mimir.worklink.factory_state import (
     load_factory_records_for_issue,
     save_factory_record,
 )
-from mimir.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
-from mimir.worklink.orchestrator import (
+from mimir_cultivate.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
+from mimir_cultivate.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
     WorklinkError,
@@ -87,7 +83,7 @@ def test_factory_checkout_interlock_cross_process(tmp_path: Path, pruning: bool)
     script = """
 import json, sys
 from pathlib import Path
-from mimir.worklink.factory_state import factory_checkout_interlock
+from mimir_cultivate.worklink.factory_state import factory_checkout_interlock
 results = []
 for pruning in (False, True):
     with factory_checkout_interlock(Path(sys.argv[1]), pruning=pruning) as acquired:
@@ -214,7 +210,7 @@ def test_factory_stale_diagnostic_defaults_and_falls_back_to_fifteen_minutes(
 def test_run_worklink_epic_records_unhandled_failure_at_sync_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     recorded: list[dict[str, object]] = []
 
@@ -249,7 +245,7 @@ def test_run_worklink_epic_records_unhandled_failure_at_sync_boundary(
 def test_run_worklink_epic_records_interrupt_before_releasing_resource_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     recorded: list[dict[str, object]] = []
 
@@ -273,8 +269,8 @@ def test_run_worklink_epic_records_interrupt_before_releasing_resource_lock(
 def test_finalize_primary_incident_survives_secondary_transition_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -403,9 +399,6 @@ class FakeBackend:
         )
 
 
-
-
-
 def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -514,8 +507,8 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
 def test_stuck_cancellation_stops_heartbeat_and_releases_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    import mimir.worklink.worker_exec as worker_exec
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.worker_exec as worker_exec
 
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -706,7 +699,7 @@ def test_read_work_item_missing_issue_fails_without_payload() -> None:
 def test_malformed_epic_work_item_fails_before_claim_or_sandbox(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     repo = tmp_path / "repo"
     calls: list[Sequence[str] | str] = []
@@ -740,7 +733,7 @@ def test_malformed_epic_work_item_fails_before_claim_or_sandbox(
 
 
 def test_factory_launch_binding_rejects_argv_controller_disagreement(tmp_path: Path) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     spec = WorkSpec(
         issue_id=700,
@@ -773,8 +766,8 @@ def test_factory_launch_binding_requires_the_resolved_publishing_identity(
     the FILE's identity -- which reads as a misconfiguration rather than a stripped
     variable, and sent one investigation the wrong way already.
     """
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.backends.feature_factory import FACTORY_PUBLISHING_IDENTITY_ENV
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.backends.feature_factory import FACTORY_PUBLISHING_IDENTITY_ENV
 
     def _spec(env: dict[str, str]) -> WorkSpec:
         return WorkSpec(
@@ -816,7 +809,7 @@ def test_factory_launch_binding_requires_the_resolved_publishing_identity(
 def test_preclaim_registry_crash_emits_scrubbed_failure_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
@@ -854,8 +847,8 @@ def test_preclaim_registry_crash_emits_scrubbed_failure_event(
 def test_preclaim_multiline_git_contention_does_not_persist_backoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import load_failure_state
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import load_failure_state
 
     state_dir = tmp_path / "state" / "pollers" / "worklink-ready-queue"
     ambient_state_dir = tmp_path / "ambient-state"
@@ -879,8 +872,8 @@ def test_preclaim_multiline_git_contention_does_not_persist_backoff(
 def test_postclaim_failure_emits_same_failure_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import load_failure_state
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import load_failure_state
 
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
@@ -915,7 +908,7 @@ def test_postclaim_failure_emits_same_failure_event(
     assert entry["terminal_error"] == "backend exploded api_key=[REDACTED]"
     assert entry["preserved_ref"] == "origin/feature/chainlink-441"
     assert entry["work_path"] == str(tmp_path / "retained-checkout")
-    from mimir.worklink.dispatch_failures import pending_failure_alerts
+    from mimir_cultivate.worklink.dispatch_failures import pending_failure_alerts
 
     _, alerts = pending_failure_alerts(state_dir)
     assert alerts[0]["preserved_ref"] == "origin/feature/chainlink-441"
@@ -928,7 +921,7 @@ def test_preclaim_failure_does_not_trigger_ready_scan(
 ) -> None:
     """Termination guard: a no-slot preclaim failure must not redispatch itself."""
     import mimir.poller_triggers as poller_triggers
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     async def preclaim_failure(self: WorklinkRunner, issue_id: int, **_: object):
         return orchestrator.WorklinkRunResult(issue_id, None, "failed", reason="bad config")
@@ -950,7 +943,7 @@ def test_preclaim_failure_does_not_trigger_ready_scan(
 def test_non_autonomous_failure_does_not_persist_dispatch_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     async def failed_after_claim(self: WorklinkRunner, issue_id: int, **_: object):
         return orchestrator.WorklinkRunResult(issue_id, 2, "failed", reason="backend exploded")
@@ -968,8 +961,8 @@ def test_non_autonomous_failure_does_not_persist_dispatch_failure(
 def test_manual_success_clears_autonomous_failure_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import load_failure_state, record_failure
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import load_failure_state, record_failure
 
     state_dir = tmp_path / "state" / "pollers" / "worklink-ready-queue"
     record_failure(
@@ -1017,8 +1010,8 @@ def test_claim_refusal_dispatch_failure_accounting(
     reason: str | None,
     status: str,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import (
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
         pending_failure_alerts,
@@ -1104,8 +1097,8 @@ def test_claim_refusal_dispatch_failure_accounting(
 def test_leaf_dispatch_failure_clears_ledger_only_after_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import (
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
         pending_failure_alerts,
@@ -1157,8 +1150,8 @@ def test_leaf_dispatch_failure_clears_ledger_only_after_success(
 def test_epic_dispatch_failure_clears_ledger_only_after_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import (
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
         pending_failure_alerts,
@@ -1200,7 +1193,7 @@ def test_epic_dispatch_failure_clears_ledger_only_after_success(
 def test_unparseable_retained_factory_record_incident_names_path_and_archive_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
     sandbox = tmp_path / "chainlink-700"
     retained = FactoryRunRecord(
@@ -1427,8 +1420,8 @@ def _orchestrator_runner(
 def test_selected_test_env_survives_state_evidence_and_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, recover: bool
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.run_state import WorklinkRunState, save_run_state
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.run_state import WorklinkRunState, save_run_state
 
     selected = {"PYTEST_ADDOPTS": "-n 2"}
     repo = tmp_path / "repo"
@@ -1473,6 +1466,7 @@ def test_selected_test_env_survives_state_evidence_and_recovery(
     async def observe(**kwargs: Any) -> EvidenceValidation:
         # Exercise the gate-handle replacement as well as initial worker state.
         kwargs["on_gate_launch"](LaunchHandle("fake_compute", "gate-job"))
+        kwargs["on_gate_launch"] = None
         return await original_observe(**kwargs)
 
     monkeypatch.setattr(orchestrator, "observe_evidence", observe)
@@ -1532,8 +1526,8 @@ def test_selected_test_env_survives_state_evidence_and_recovery(
 def test_gate_heartbeat_prevents_reaping_and_stops_with_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: str, recover: bool, gate_round: int
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.run_state import WorklinkRunState, save_run_state
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.run_state import WorklinkRunState, save_run_state
 
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -1671,8 +1665,8 @@ def test_gate_heartbeat_prevents_reaping_and_stops_with_run(
 
 @pytest.mark.parametrize("failed_observation", [1, 2])
 def test_diagnostic_rerun_pass_does_not_push_or_open_pr(tmp_path, monkeypatch, failed_observation):
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.evidence import validate_evidence
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.evidence import validate_evidence
 
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -1714,8 +1708,8 @@ def test_diagnostic_rerun_pass_does_not_push_or_open_pr(tmp_path, monkeypatch, f
 def test_gate_flakes_survive_second_observation_without_masking_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, later_exit_code: int
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.evidence import validate_evidence
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.evidence import validate_evidence
 
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -1786,7 +1780,7 @@ def test_gate_flakes_survive_second_observation_without_masking_failure(
 def test_evidence_comment_and_flake_event_scrub_node_ids(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, has_tests: bool
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     secret = "ghp_" + "a" * 36
     node = f"tests/test_gate.py::test_token[{secret}]"
@@ -1889,7 +1883,7 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
         )
     )
 
-    assert result.status == "completed"
+    assert result.status == "completed", result.reason
     assert result.review_ready is True
     assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
     assert (tmp_path / "state" / "worklink" / "evidence" / "441-1.json").is_file()
@@ -2004,7 +1998,7 @@ def test_publication_replacement_interleaving(tmp_path: Path, monkeypatch, fence
     neither heartbeat nor claim ownership is used as the publication guarantee.
     Disabling only the new fence reproduces two PRs through the real pipeline.
     """
-    import mimir.worklink.orchestrator as module
+    import mimir_cultivate.worklink.orchestrator as module
 
     if not fenced:
         monkeypatch.setattr(
@@ -2106,7 +2100,7 @@ def test_publication_replacement_interleaving(tmp_path: Path, monkeypatch, fence
     "evidence-list", "corrupt-evidence", "invalid-json", "completed-evidence",
 ])
 def test_publication_fence_failures_and_retry(tmp_path: Path, monkeypatch, failure) -> None:
-    import mimir.worklink.orchestrator as module
+    import mimir_cultivate.worklink.orchestrator as module
 
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -2247,7 +2241,7 @@ def test_publication_fence_failures_and_retry(tmp_path: Path, monkeypatch, failu
 
 
 def test_publication_fence_accepts_missing_evidence_directory(tmp_path: Path) -> None:
-    from mimir.worklink.orchestrator import _leaf_publication
+    from mimir_cultivate.worklink.orchestrator import _leaf_publication
 
     evidence_dir = tmp_path / "state/worklink/evidence"
     assert not evidence_dir.exists()
@@ -2385,7 +2379,7 @@ def test_report_cleanup_failure_cannot_skip_lock_release_or_state_clear(
     report_dir = tmp_path / "executor-report"
     report_dir.mkdir()
     monkeypatch.setattr(
-        "mimir.worklink.orchestrator._make_executor_report_dir",
+        "mimir_cultivate.worklink.orchestrator._make_executor_report_dir",
         lambda issue_id, attempt, *, worker_uid_drop=False: report_dir,
     )
 
@@ -2394,7 +2388,7 @@ def test_report_cleanup_failure_cannot_skip_lock_release_or_state_clear(
             raise PermissionError("executor-owned report is not removable")
 
     monkeypatch.setattr(
-        "mimir.worklink.orchestrator.rmtree_missing_ok",
+        "mimir_cultivate.worklink.orchestrator.rmtree_missing_ok",
         deny_report_removal,
     )
     registry = BackendRegistry(WorklinkConfig())
@@ -2431,10 +2425,10 @@ def test_interrupted_claim_is_reapable(
         WorklinkRunner = orchestrator.WorklinkRunner
         monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     else:
-        import mimir.worklink.orchestrator as orchestrator
-        from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
-        from mimir.worklink.claims import ChainlinkClaims
-        from mimir.worklink.run_state import load_run_state
+        import mimir_cultivate.worklink.orchestrator as orchestrator
+        from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
+        from mimir_cultivate.worklink.claims import ChainlinkClaims
+        from mimir_cultivate.worklink.run_state import load_run_state
         WorklinkRunner = orchestrator.WorklinkRunner
     from mimir.cli import main
 
@@ -2525,9 +2519,9 @@ def test_interrupted_claim_is_reapable(
 def test_published_transition_failure_is_reaped_to_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_step: str, release_first: bool,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.claims import _ChainlinkContentionExhausted
-    from mimir.worklink.control import reconcile_run_states
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.claims import _ChainlinkContentionExhausted
+    from mimir_cultivate.worklink.control import reconcile_run_states
 
     repo = tmp_path / "repo"
     checkout = repo.parent / ".worklink" / repo.name / "441-1"
@@ -2832,8 +2826,8 @@ def test_sync_leaf_failed_result_keeps_primary_incident_when_release_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import mimir.poller_triggers as poller_triggers
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -2894,7 +2888,7 @@ def test_claimed_blocked_leaf_releases_slot_and_triggers_ready_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import mimir.poller_triggers as poller_triggers
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     repo = tmp_path / "repo"
     checkout = tmp_path / "unsafe-worktree"
@@ -2941,7 +2935,7 @@ def test_release_notification_is_suppressed_when_state_clear_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import mimir.poller_triggers as poller_triggers
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     events: list[str] = []
     monkeypatch.setattr(
@@ -2994,7 +2988,7 @@ def test_worklink_pr_body_includes_build_section_and_intact_evidence(tmp_path: P
         call for call in calls if isinstance(call, list) and call[:3] == ["gh", "pr", "create"]
     )
     body = pr_call[pr_call.index("--body") + 1]
-    from mimir.worklink.merge_closure import parse_completion_reference
+    from mimir_cultivate.worklink.merge_closure import parse_completion_reference
 
     assert parse_completion_reference(body, expected_issue_id=441).qualifies
     assert f"Build summary:\n\n{section}\n\n" in body
@@ -3197,7 +3191,7 @@ def test_zero_exit_executor_and_failed_gate_record_structured_reason_and_diverge
         return executor_report_dir
 
     monkeypatch.setattr(
-        "mimir.worklink.orchestrator._make_executor_report_dir",
+        "mimir_cultivate.worklink.orchestrator._make_executor_report_dir",
         make_executor_report_dir,
     )
 
@@ -3626,7 +3620,7 @@ def test_worklink_disabled_base_fetch_fails_before_backend_dispatch(tmp_path: Pa
 
 
 def test_backend_blocked_result_routes_leaf_to_blocked_with_reason(tmp_path: Path, monkeypatch) -> None:
-    from mimir.worklink import dispatch_failures
+    from mimir_cultivate.worklink import dispatch_failures
 
     attempted = []
     original = dispatch_failures.record_leaf_transition
@@ -3691,7 +3685,7 @@ def test_backend_blocked_result_routes_leaf_to_blocked_with_reason(tmp_path: Pat
 
 
 def test_leaf_blocked_ledger_failure_keeps_transition_and_result(tmp_path, monkeypatch):
-    from mimir.worklink import dispatch_failures
+    from mimir_cultivate.worklink import dispatch_failures
 
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -3748,7 +3742,7 @@ def test_worklink_runner_backend_nonzero_transitions_failed_without_pr(tmp_path:
 def test_leaf_incident_write_failure_preserves_claim_and_retained_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_kind: str,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -3811,7 +3805,7 @@ def test_leaf_incident_write_failure_preserves_claim_and_retained_run(
 def test_leaf_failure_is_durable_before_release_and_blocks_concurrent_core_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_kind: str,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -4101,7 +4095,7 @@ def test_gate_timeout_blocks_instead_of_retrying(tmp_path: Path, timed_out: bool
         and reason in call[-1] for call in calls
     )
     if not timed_out:
-        from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+        from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
         incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["441"]
         assert incident["failure_kind"] == "tests_failed"
@@ -4159,7 +4153,7 @@ INVALID_STRICT_ISSUE_JSON = (
 def test_worklink_runner_demotes_template_invalid_ready_leaf_before_claim(
     tmp_path: Path, monkeypatch, ledger_failure: bool,
 ) -> None:
-    from mimir.worklink import dispatch_failures
+    from mimir_cultivate.worklink import dispatch_failures
     if ledger_failure:
         def fail(*args, **kwargs):
             raise OSError("ledger unavailable")
@@ -4203,7 +4197,7 @@ def test_worklink_runner_demotes_template_invalid_ready_leaf_before_claim(
         isinstance(call, list) and call[:3] == ["chainlink", "locks", "claim"]
         for call in calls
     )
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
     notices = list(load_failure_state(dispatch_failure_state_dir(tmp_path)).get("factory_transitions", {}).values())
     if ledger_failure:
         assert notices == []
@@ -4287,10 +4281,10 @@ def test_validate_leaf_warns_for_legacy_leaves_without_orphaning_them() -> None:
 
 def test_planner_prompt_renders_single_leaf_template_constant() -> None:
     from mimir.prompt_templates import bundled_defaults
-    from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
+    from mimir_cultivate.worklink.planning import LEAF_TEMPLATE_MARKDOWN
 
     root = Path(__file__).parent.parent
-    prompt_path = root / "mimir/prompt_templates/decompose.md"
+    prompt_path = root / "plugins/cultivate/mimir_cultivate/prompt_templates/decompose.md"
     prompt = prompt_path.read_text(encoding="utf-8")
     rendered = render_decomposition_prompt(
         template_path=prompt_path,
@@ -4308,21 +4302,20 @@ def test_planner_prompt_renders_single_leaf_template_constant() -> None:
     assert "worklink-order.md" not in bundled_defaults()
 
 
-def test_cultivate_planner_template_matches_legacy_fallback() -> None:
+def test_cultivate_planner_template_is_provider_owned() -> None:
     planning = pytest.importorskip("mimir_cultivate.worklink.planning")
-    from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
+    from mimir_cultivate.worklink.planning import LEAF_TEMPLATE_MARKDOWN
 
     root = Path(__file__).parent.parent
     plugin = root / "plugins/cultivate/mimir_cultivate/prompt_templates/decompose.md"
-    legacy = root / "mimir/prompt_templates/decompose.md"
-    assert plugin.read_bytes() == legacy.read_bytes()
+    assert not (root / "mimir/prompt_templates/decompose.md").exists()
     assert planning.LEAF_TEMPLATE_MARKDOWN == LEAF_TEMPLATE_MARKDOWN
     rendered = planning.render_decompose_prompt(plugin.read_text(encoding="utf-8"))
     assert LEAF_TEMPLATE_MARKDOWN in rendered and "{leaf_template}" not in rendered
 
 
 def test_skill_embeds_single_leaf_template_constant() -> None:
-    from mimir.worklink.planning import LEAF_TEMPLATE_MARKDOWN
+    from mimir_cultivate.worklink.planning import LEAF_TEMPLATE_MARKDOWN
 
     root = Path(__file__).parent.parent
     skill = (root / "plugins/cultivate/mimir_cultivate/defaults/skills" / "chainlink-orchestrator" / "SKILL.md").read_text(
@@ -4441,7 +4434,7 @@ def test_worklink_prompt_keeps_planner_suggestion_advisory(
 def test_registered_backends_use_isolated_checkout_by_default(
     backend_name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, worker_eligible: bool,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     registry = BackendRegistry(WorklinkConfig())
     if backend_name == "dummy":
@@ -4500,7 +4493,7 @@ def test_registered_backends_use_isolated_checkout_by_default(
 def test_factory_checkout_has_three_way_target_branch_agreement_without_detached_head(
     tmp_path: Path,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
@@ -4584,7 +4577,7 @@ def test_concurrent_opencode_checkouts_do_not_share_parent_git_project(tmp_path:
     a standalone repository, so neither the sibling nor parent repo is under its
     git toplevel/common directory while the full base history remains readable.
     """
-    from mimir.worklink.orchestrator import _create_backend_checkout
+    from mimir_cultivate.worklink.orchestrator import _create_backend_checkout
 
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
@@ -4646,7 +4639,7 @@ def test_concurrent_opencode_checkouts_do_not_share_parent_git_project(tmp_path:
 
 
 def test_outside_checkout_detection_marks_root_leak_failed(tmp_path: Path) -> None:
-    from mimir.worklink.orchestrator import _with_outside_checkout_detection
+    from mimir_cultivate.worklink.orchestrator import _with_outside_checkout_detection
 
     validation = EvidenceValidation(
         status="failed",
@@ -4692,7 +4685,7 @@ def test_outside_checkout_detection_marks_root_leak_failed(tmp_path: Path) -> No
 def test_outside_checkout_detection_is_independent_of_attempt_diff(
     tmp_path: Path, files_changed: list[str], root_state: str,
 ) -> None:
-    from mimir.worklink.orchestrator import _with_outside_checkout_detection
+    from mimir_cultivate.worklink.orchestrator import _with_outside_checkout_detection
 
     checkout = tmp_path / "attempt"
     status = "completed" if files_changed else "failed"
@@ -4747,7 +4740,7 @@ def test_outside_checkout_detection_is_independent_of_attempt_diff(
 
 
 def test_outside_checkout_leak_is_quarantined_recoverably(tmp_path: Path) -> None:
-    from mimir.worklink.orchestrator import _dirty_paths, _with_outside_checkout_detection
+    from mimir_cultivate.worklink.orchestrator import _dirty_paths, _with_outside_checkout_detection
 
     def git(*args: str) -> str:
         out = subprocess.run(
@@ -4814,7 +4807,7 @@ class _CodexNamedBackend(FakeBackend):
 
 
 
-from mimir.worklink.compute import LaunchHandle as _LaunchHandle
+from mimir_cultivate.worklink.compute import LaunchHandle as _LaunchHandle
 
 
 @pytest.mark.parametrize(
@@ -4860,7 +4853,7 @@ def test_run_epic_refuses_invalid_target_branch_before_dispatch(
 def test_run_epic_refuses_nonexistent_target_branch_before_claim_or_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -4919,7 +4912,7 @@ def test_run_epic_refuses_nonexistent_target_branch_before_claim_or_checkout(
 def test_run_epic_non_epic_issue_emits_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     issue_json = json.dumps(
         {
@@ -4952,7 +4945,7 @@ def test_run_epic_non_epic_issue_emits_refusal(
 def test_run_epic_autonomy_refusal_emits_leaf_event_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -5011,7 +5004,7 @@ def test_run_epic_claim_refusals_emit_leaf_event_names(
     event_name: str,
     reason: str,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -5112,7 +5105,7 @@ def test_run_epic_refuses_review_state_before_claim_or_factory_launch(
         return cp(args)
 
     monkeypatch.setattr(
-        "mimir.worklink.backends.feature_factory.FeatureFactoryBackend.admit",
+        "mimir_cultivate.worklink.backends.feature_factory.FeatureFactoryBackend.admit",
         lambda self: Path(self.entrypoint),
     )
     registry = BackendRegistry(WorklinkConfig())
@@ -5344,7 +5337,7 @@ def test_inherited_credential_clears_a_prebound_identity_memo(
 
 def _stub_factory_launch_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     """Resolve the launch identity offline: the recovery tests own the launch, not GitHub."""
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     class Forge:
         def __init__(self, *, token: str) -> None:
@@ -5371,7 +5364,7 @@ def _stub_factory_launch_identity(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _assert_fresh_driver_launch(spec: WorkSpec, operator_checkout: Path, run_id: str) -> None:
     """A fresh-session relaunch must look like the initial launch to /feature intake."""
-    from mimir.worklink.backends.feature_factory import FACTORY_PUBLISHING_IDENTITY_ENV
+    from mimir_cultivate.worklink.backends.feature_factory import FACTORY_PUBLISHING_IDENTITY_ENV
 
     argv = spec.local_argv
     assert argv is not None and "--session" not in argv
@@ -5419,7 +5412,7 @@ def _run_factory_preflight_case(
     launch_calls: list[WorkSpec] | None = None,
     sync_entrypoint: bool = False,
 ) -> tuple[object, list[WorkSpec], list[str], list[list[str]]]:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     # The checkout and launch are mocked. Keep real chmod/chown local to the
     # test user's group instead of requiring deployment accounts or privileges.
@@ -5621,7 +5614,7 @@ def _run_factory_preflight_case(
 @pytest.mark.parametrize("autonomous", [False, True])
 @pytest.mark.parametrize("launched", [False, True])
 def test_factory_start_prompt_at_durable_launch(tmp_path, monkeypatch, autonomous, launched):
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
     def entries():
         return list(load_failure_state(dispatch_failure_state_dir(tmp_path)).get(
@@ -5651,8 +5644,8 @@ def test_factory_start_prompt_at_durable_launch(tmp_path, monkeypatch, autonomou
 @pytest.mark.parametrize("autonomous", [False, True])
 @pytest.mark.parametrize("ending", ["completed", "blocked", "partial", "needs-human", "failure", "release-failure"])
 def test_factory_success_prompt_only_after_success(tmp_path, monkeypatch, autonomous, ending):
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
     pr_url = "https://github.com/owner/repo/pull/42"
 
@@ -5703,8 +5696,8 @@ def test_factory_success_prompt_only_after_success(tmp_path, monkeypatch, autono
 
 @pytest.mark.parametrize("failed_kind", ["factory_start", "factory_success"])
 def test_factory_milestone_write_failure_preserves_result(tmp_path, monkeypatch, failed_kind):
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink import dispatch_failures
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink import dispatch_failures
 
     cleaned = []
     logged = []
@@ -5749,7 +5742,7 @@ def test_factory_launch_requires_confirmed_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     release_confirmed: bool, completion: str,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     signals: list[str] = []
     clears: list[tuple[Path, int]] = []
@@ -5817,7 +5810,7 @@ def test_factory_launch_requires_confirmed_cleanup(
 def test_factory_incident_write_failure_preserves_retained_run_without_rearm(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupted: bool,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     writes: list[int] = []
     signals: list[str] = []
@@ -5858,7 +5851,7 @@ def test_factory_incident_write_failure_preserves_retained_run_without_rearm(
 def test_factory_failure_is_durable_before_release_and_blocks_concurrent_core_admission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupted: bool,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     order_seen: list[str] = []
     claim_calls: list[int] = []
@@ -5929,7 +5922,7 @@ def test_factory_initial_local_launch_provisions_worker_sandbox_permissions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import stat
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     checkout_calls: list[dict[str, Any]] = []
     ownership: list[tuple[Path, int, int]] = []
@@ -5958,7 +5951,7 @@ def test_factory_initial_local_launch_provisions_worker_sandbox_permissions(
 def test_factory_permission_failure_prevents_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coding: str,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     if coding == "1":
         pytest.importorskip("mimir_cultivate")
@@ -5981,7 +5974,7 @@ def test_factory_permission_failure_prevents_launch(
 def test_factory_missing_worker_identity_is_actionable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     def missing():
         raise KeyError("mimir account missing")
@@ -5994,7 +5987,7 @@ def test_factory_missing_worker_identity_is_actionable(
 def test_factory_non_worker_permissions_are_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     def unexpected(*args):
         raise AssertionError("non-worker path must not resolve identities or change ownership")
@@ -6012,7 +6005,7 @@ def test_factory_non_worker_permissions_are_untouched(
 def test_post_merge_factory_failure_pushes_branch_before_record_becomes_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     pushed: list[str] = []
 
@@ -6073,7 +6066,7 @@ def test_post_merge_factory_failure_pushes_branch_before_record_becomes_failed(
 def test_post_merge_factory_preservation_failure_keeps_original_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     def refuse_capture(*args: object, **kwargs: object) -> object:
         raise OSError("credential helper unavailable")
@@ -6104,7 +6097,7 @@ def test_factory_failure_preservation_skips_runs_without_unpublished_merged_work
     monkeypatch: pytest.MonkeyPatch,
     already_published: bool,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -6176,7 +6169,7 @@ def test_factory_dispatch_verifies_process_token_and_normalizes_child_aliases(
         assert repo == tmp_path / "repo"
         return settings
 
-    monkeypatch.setattr("mimir.worklink.orchestrator._git_credential_settings", capture)
+    monkeypatch.setattr("mimir_cultivate.worklink.orchestrator._git_credential_settings", capture)
     result, launched, verified_tokens, commands = _run_factory_preflight_case(
         tmp_path, monkeypatch, credentials=credentials
     )
@@ -6422,7 +6415,7 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
     description: str,
     expected_base: str,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     # Placement uses a synthetic checkout owned by the test process.
     monkeypatch.setattr(
@@ -6604,7 +6597,7 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
 def test_factory_identity_preflight_is_not_repeated_for_retained_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release_confirmed: bool
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -6716,8 +6709,8 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
 def test_retained_running_factory_precondition_does_not_consume_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import (
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
         pending_failure_alerts,
@@ -6812,8 +6805,8 @@ def test_retained_running_factory_precondition_does_not_consume_attempt(
 
 
 def test_post_work_factory_failure_consumes_attempt(tmp_path: Path) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -6867,7 +6860,7 @@ def test_post_work_factory_failure_consumes_attempt(tmp_path: Path) -> None:
 def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: str
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     _configure_opencode_oauth(tmp_path, monkeypatch)
     repo = tmp_path / "repo"
@@ -7040,7 +7033,7 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
             orchestrator, "factory_record_run_ids", lambda issue_id: ("other", "ids")
         )
     if refusal == "ownership_boundary":
-        import mimir.worklink.worker_client as worker_client
+        import mimir_cultivate.worklink.worker_client as worker_client
 
         monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
         monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: None)
@@ -7161,7 +7154,7 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
     assert old_sandbox.is_dir() is (
         refusal not in {"sandbox", "sandbox_secondary_read"}
     )
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
     incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
     assert incident["active"] is False
@@ -7175,7 +7168,7 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
 
 
 def test_factory_launch_preflight_refuses_existing_run_sandbox(tmp_path: Path) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -7217,7 +7210,7 @@ def test_factory_launch_preflight_refuses_existing_run_sandbox(tmp_path: Path) -
 
 @pytest.mark.parametrize("phase", ["running", "parked", "failed", "terminal"])
 def test_factory_recovery_phases_are_explicit(phase: str) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     assert phase in orchestrator._RECOVERABLE_FACTORY_PHASES
     assert "stopped" not in orchestrator._RECOVERABLE_FACTORY_PHASES
@@ -7226,7 +7219,7 @@ def test_factory_recovery_phases_are_explicit(phase: str) -> None:
 def test_autonomous_leaf_incident_fence_precedes_issue_reads_and_mutations(
     tmp_path: Path,
 ) -> None:
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
 
     record_failure(
         dispatch_failure_state_dir(tmp_path),
@@ -7256,7 +7249,7 @@ def test_autonomous_leaf_incident_fence_precedes_issue_reads_and_mutations(
 def test_autonomous_leaf_refuses_unreadable_retained_record_before_issue_reads(
     tmp_path: Path,
 ) -> None:
-    from mimir.worklink.run_state import run_state_path
+    from mimir_cultivate.worklink.run_state import run_state_path
 
     retained = run_state_path(tmp_path, 441)
     retained.parent.mkdir(parents=True)
@@ -7282,7 +7275,7 @@ def test_autonomous_leaf_refuses_unreadable_retained_record_before_issue_reads(
 def test_autonomous_leaf_before_claim_preserves_raced_dead_retained_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     repo = tmp_path / "repo"
     worktree = tmp_path / "worktree"
@@ -7338,7 +7331,7 @@ def test_autonomous_leaf_before_claim_preserves_raced_dead_retained_state(
 def test_state_clear_failure_never_notifies_ready_queue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     scans: list[Path] = []
     claims = SimpleNamespace(release_issue=lambda issue_id: True)
@@ -7366,7 +7359,7 @@ def test_state_clear_failure_never_notifies_ready_queue(
 def test_silently_failed_state_clear_never_notifies_ready_queue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     state = WorklinkRunState(
         issue_id=441,
@@ -7405,8 +7398,8 @@ def test_silently_failed_state_clear_never_notifies_ready_queue(
 def test_autonomous_completion_does_not_clear_concurrent_newer_incident(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import (
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
         record_failure,
@@ -7438,7 +7431,7 @@ def test_autonomous_completion_does_not_clear_concurrent_newer_incident(
 def test_manual_completion_keeps_existing_unconditional_success_semantics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.worklink.dispatch_failures import (
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
         record_failure,
@@ -7469,7 +7462,7 @@ def test_every_epic_claim_uses_factory_concurrency_cap(
     monkeypatch: pytest.MonkeyPatch,
     autonomous: bool,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -7535,8 +7528,8 @@ def test_expected_factory_recovery_rechecks_identity_inside_claim_without_launch
     mutation: str,
     expected_reason: str,
 ) -> None:
-    import mimir.worklink.dispatch_failures as failures
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.dispatch_failures as failures
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -7725,7 +7718,7 @@ def test_factory_terminal_outcomes_emit_transition_payload(
     review_ready: bool,
     pr_url: str | None,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -7800,7 +7793,7 @@ def test_factory_terminal_result_preserves_next(
     next_action: str | None,
 ) -> None:
     from dataclasses import replace
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     record = _factory_lifecycle_record(
@@ -7846,8 +7839,8 @@ def test_factory_terminal_result_preserves_next(
 def test_factory_partial_survives_leaf_ledger_boundary_without_clearing_attention(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import (
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
         pending_failure_alerts,
@@ -7909,7 +7902,7 @@ def test_factory_status_binding_allows_null_base_before_completion(
     tmp_path: Path,
     lifecycle: str,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -7926,7 +7919,7 @@ def test_factory_status_binding_allows_null_base_before_completion(
 
 
 def test_factory_status_binding_rejects_populated_base_mismatch(tmp_path: Path) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -7944,7 +7937,7 @@ def test_factory_status_binding_rejects_populated_base_mismatch(tmp_path: Path) 
 
 
 def test_epic_factory_status_binds_by_run_id_with_null_issue_key(tmp_path: Path) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "chainlink-1337"
     sandbox.mkdir()
@@ -7972,7 +7965,7 @@ def test_epic_factory_status_binds_by_run_id_with_null_issue_key(tmp_path: Path)
 def test_issue_sourced_factory_status_binds_by_run_id_with_null_issue_key(
     tmp_path: Path,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -7999,7 +7992,7 @@ def test_factory_status_issue_key_is_display_only(
     tmp_path: Path,
     issue_key: str | None,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -8032,7 +8025,7 @@ def test_factory_status_binding_names_missing_consumed_lifecycle_field(
     field: str,
     reason: str,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -8050,7 +8043,7 @@ def test_factory_status_binding_names_missing_consumed_lifecycle_field(
 
 
 def test_factory_status_binding_refuses_pre_manifest_diagnostic(tmp_path: Path) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -8181,8 +8174,8 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     idle: bool,
     contended: bool,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.backends.feature_factory import FactoryRunLockContended
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.backends.feature_factory import FactoryRunLockContended
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -8346,7 +8339,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     assert retained.status is not None and retained.status.is_parked
     assert transitions[0]["status"] == "blocked"
     assert transitions[0]["attempt"] == 1
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
     notices = list(load_failure_state(dispatch_failure_state_dir(tmp_path))["factory_transitions"].values())
     assert len(notices) == 1 and notices[0]["kind"] == "factory_needs_human"
     assert reason in notices[0]["reason"]
@@ -8425,8 +8418,8 @@ def test_factory_supervision_tolerates_run_lock_contention_before_first_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A contended first read is not an observation; supervision waits and proceeds."""
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.backends.feature_factory import FactoryRunLockContended
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.backends.feature_factory import FactoryRunLockContended
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -8500,8 +8493,8 @@ def test_factory_supervision_survives_contended_heartbeat_and_skips_it_on_reused
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """refreshSessionLock takes the same run-state lock; contention there is no fault either."""
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.backends.feature_factory import FactoryRunLockContended
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.backends.feature_factory import FactoryRunLockContended
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -8644,7 +8637,7 @@ def test_factory_executor_exit_retains_scrubbed_tail_and_record_pointer(
 
 @pytest.fixture
 def factory_clock(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     clock = SimpleNamespace(now=0.0)
     # Replace only the supervisor's clock lookup, not the event loop's timers.
@@ -8664,8 +8657,8 @@ def _run_factory_progress_case(
     stop_at: float,
     rewrite: tuple[str, str] | None = None,
 ) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]], WorklinkRunResult | None]:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import (
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
     )
@@ -8802,7 +8795,7 @@ def test_factory_1783_progress_does_not_create_incident_or_alert(
     transcript_writes: tuple[tuple[float, str], ...],
     stop_at: float,
 ) -> None:
-    from mimir.worklink.dispatch_failures import (
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         pending_failure_alerts,
     )
@@ -8829,7 +8822,7 @@ def test_factory_alive_without_activity_parks_at_separate_idle_threshold(
     factory_clock: SimpleNamespace,
     stale_after: float,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: stale_after)
     idle_after = max(7200.0, 8 * stale_after)
@@ -8852,7 +8845,7 @@ def test_factory_long_silent_generation_is_not_parked_or_reported_as_failure(
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
 ) -> None:
-    from mimir.worklink.dispatch_failures import (
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         pending_failure_alerts,
     )
@@ -8893,7 +8886,7 @@ def test_factory_unreadable_work_snapshot_does_not_prevent_idle_park(
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     monkeypatch.setattr(orchestrator, "_factory_work_snapshot", lambda _sandbox: None)
     state, _, result = _run_factory_progress_case(
@@ -8933,7 +8926,7 @@ def test_factory_work_advance_keeps_driver_active(
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
 ) -> None:
-    from mimir.worklink.dispatch_failures import (
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         pending_failure_alerts,
     )
@@ -8957,7 +8950,7 @@ def test_factory_work_snapshot_does_not_depend_on_private_run_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     private = sandbox / ".factory" / "700" / "run.json"
@@ -8988,8 +8981,8 @@ def test_run_worklink_epic_supersedes_stall_with_terminal_failure(
     factory_clock: SimpleNamespace,
     terminal: str,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
     original_supervise = WorklinkRunner._supervise_factory_070
     real_sleep = asyncio.sleep
@@ -9100,7 +9093,7 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     original_supervise = WorklinkRunner._supervise_factory_070
     stopped = asyncio.Event()
@@ -9198,7 +9191,7 @@ def test_factory_live_transcript_prevents_idle_park(
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -9287,7 +9280,7 @@ def test_factory_live_transcript_prevents_idle_park(
     assert delays == [1.0] * 4000
     assert len(claim_heartbeats) == 4000
     assert lifecycle == ["cancel", "cleanup"]
-    from mimir.worklink.dispatch_failures import (
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
         pending_failure_alerts,
@@ -9304,7 +9297,7 @@ def test_factory_supervision_keeps_polling_after_controller_failure(
     failure: str,
     factory_clock: SimpleNamespace,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -9416,7 +9409,7 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
     factory_clock: SimpleNamespace,
     expiry: str,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     handle = LaunchHandle("local_subprocess", "123", 456)
@@ -9489,7 +9482,7 @@ def test_factory_recovery_absent_lock_is_bounded_by_startup_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory_clock: SimpleNamespace,
     lock_owner: str | None,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -9558,7 +9551,7 @@ def test_factory_supervision_skips_other_invalid_statuses(
     tmp_path: Path,
     after_valid: bool,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -9876,7 +9869,7 @@ def test_factory_completion_rejection_matrix_persists_failed_evidence(
     monkeypatch: pytest.MonkeyPatch,
     case: str,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -9963,13 +9956,44 @@ def test_factory_completion_rejection_matrix_persists_failed_evidence(
     assert evidence["failure_reason"]
 
 
-def test_factory_completion_with_real_evidence_and_wrapped_runner(tmp_path: Path) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+@pytest.fixture
+def factory_completion_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.worker_client as worker_client
 
-    sandbox = tmp_path / "sandbox"
-    sandbox.mkdir()
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    identities = orchestrator.get_identities()
+    monkeypatch.setattr(
+        orchestrator, "get_identities",
+        lambda: replace(identities, mimir_uid=os.getuid()),
+    )
+    sandbox = tmp_path / "repo" / "700-1" / "checkout" / ".factory-sandboxes" / "700"
+    sandbox.mkdir(parents=True)
+    sandbox.parents[1].chmod(0o2770)
+    return sandbox
+
+
+def test_factory_completion_with_real_evidence_and_wrapped_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory_completion_sandbox: Path,
+) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.worker_client as worker_client
+
+    sandbox = factory_completion_sandbox
     completion_runner = _completion_runner(sandbox, case="success")
     gate_calls = []
+
+    def worker_gate(checkout, argv, *, env, timeout=30, output_limit=1024 * 1024):
+        if argv[:1] == ["git"]:
+            assert checkout == sandbox.parents[1]
+            result = controller(argv)
+            return cp(argv, result.returncode, result.stdout.encode(), result.stderr.encode())
+        assert checkout == sandbox
+        assert argv == ("/bin/sh", "-c", f"cd {sandbox} && make test")
+        gate_calls.append(("make test", checkout, True))
+        return cp(argv, stdout=b"all tests passed\n", stderr=b"")
+
+    monkeypatch.setattr(worker_client, "run_factory_control", worker_gate)
 
     def controller(args, cwd=None, *, text=True, timeout=1800):
         if isinstance(args, str):
@@ -10007,7 +10031,7 @@ def test_factory_completion_with_real_evidence_and_wrapped_runner(tmp_path: Path
 @pytest.mark.parametrize("text", [True, False])
 @pytest.mark.parametrize("options", [{}, {"timeout": 7}])
 def test_factory_git_runner_forwards_controller_options(tmp_path: Path, args, text: bool, options) -> None:
-    from mimir.worklink.orchestrator import _factory_git_runner
+    from mimir_cultivate.worklink.orchestrator import _factory_git_runner
 
     calls = []
     result = subprocess.CompletedProcess(args, 0, "ok" if text else b"ok", "" if text else b"")
@@ -10021,12 +10045,11 @@ def test_factory_git_runner_forwards_controller_options(tmp_path: Path, args, te
 
 
 def test_factory_completion_requires_entire_success_conjunction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory_completion_sandbox: Path,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
-    sandbox = tmp_path / "sandbox"
-    sandbox.mkdir()
+    sandbox = factory_completion_sandbox
     validation = _completion_validation(sandbox)
 
     async def observed(**kwargs: object) -> EvidenceValidation:
@@ -10058,7 +10081,7 @@ def test_factory_completion_rejects_unbound_base_before_external_verification(
     monkeypatch: pytest.MonkeyPatch,
     pr_base: str | None,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -10098,7 +10121,7 @@ def test_factory_completion_rejects_unbound_base_before_external_verification(
 def test_factory_completion_failure_never_transitions_to_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -10192,8 +10215,8 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     idle_park: bool,
 ) -> None:
     _stub_factory_launch_identity(monkeypatch)
-    from mimir.worklink.compute import LocalSubprocessComputeBackend
-    from mimir.worklink.run_state import process_start_ticks
+    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+    from mimir_cultivate.worklink.run_state import process_start_ticks
 
     if local_compute and sys.platform != "linux":
         pytest.skip("real process identity/reclamation integration requires Linux /proc")
@@ -10216,7 +10239,7 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
         script = """
 import json, sys
 from pathlib import Path
-from mimir.worklink.autonomy import prune_stale_attempt_checkouts_for_home
+from mimir_cultivate.worklink.autonomy import prune_stale_attempt_checkouts_for_home
 home, repo = map(Path, sys.argv[1:])
 pruned = prune_stale_attempt_checkouts_for_home(home, repo=repo)
 print(json.dumps([str(path) for path in pruned]))
@@ -10263,7 +10286,7 @@ print(json.dumps([str(path) for path in pruned]))
         assert trusted_repo == repo
         return credential_settings
 
-    monkeypatch.setattr("mimir.worklink.orchestrator._git_credential_settings", capture_credentials)
+    monkeypatch.setattr("mimir_cultivate.worklink.orchestrator._git_credential_settings", capture_credentials)
     if action is not None:
         statuses.append(status("needs-human", "fresh"))
     statuses.extend([
@@ -10503,7 +10526,7 @@ def test_factory_recovery_rejection_command_matrix(
     expected: list[str],
 ) -> None:
     _stub_factory_launch_identity(monkeypatch)
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     if case == "identity_refused":
         class RefusingForge:
@@ -10685,8 +10708,8 @@ def test_factory_recovery_launch_start(
     write_failure: str | None,
 ) -> None:
     _stub_factory_launch_identity(monkeypatch)
-    import mimir.worklink.dispatch_failures as failures
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.dispatch_failures as failures
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     _configure_opencode_oauth(tmp_path, monkeypatch)
     sandbox = tmp_path / "sandbox"
@@ -10822,7 +10845,7 @@ def test_factory_recovery_parks_running_before_resume(
     initial_status: str, initial_lock: str, case: str, expected: list[str],
 ) -> None:
     _stub_factory_launch_identity(monkeypatch)
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     _configure_opencode_oauth(tmp_path, monkeypatch)
     sandbox = tmp_path / "sandbox"
@@ -10957,7 +10980,7 @@ def test_factory_recovery_binds_work_item_to_retained_run_id(
 ) -> None:
     """The real canonical render must not refuse a legacy retained run after its lock moved."""
     _stub_factory_launch_identity(monkeypatch)
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     _configure_opencode_oauth(tmp_path, monkeypatch)
     operator_checkout = tmp_path / "checkout"
@@ -11032,7 +11055,7 @@ def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _stub_factory_launch_identity(monkeypatch)
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -11125,7 +11148,7 @@ def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or
 def test_factory_recovery_binding_rejects_every_precontrol_mismatch(
     tmp_path: Path, case: str
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -11203,7 +11226,7 @@ def test_factory_checkout_repository_resolves_local_lease_or_push_url(
     sandbox_push: str | None,
     expected: str | None,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
     lease = tmp_path / "lease"
@@ -11339,7 +11362,7 @@ def test_factory_lock_refusal_exit_parks_without_terminal_failure(tmp_path: Path
 
 
 def test_factory_lock_refusal_ignores_marker_in_stderr_log() -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     result = ComputeResult(
         0,
@@ -11421,7 +11444,7 @@ def _stage_file(repo: Path, name: str, content: bytes) -> None:
 
 
 def test_staged_secret_guard_allows_match_already_in_base(tmp_path: Path) -> None:
-    from mimir.worklink.orchestrator import _assert_staged_diff_has_no_secret
+    from mimir_cultivate.worklink.orchestrator import _assert_staged_diff_has_no_secret
 
     repo = tmp_path / "repo"
     _init_commit_repo(repo)
@@ -11433,7 +11456,7 @@ def test_staged_secret_guard_allows_match_already_in_base(tmp_path: Path) -> Non
 
 
 def test_staged_secret_guard_allows_reusing_base_match(tmp_path: Path) -> None:
-    from mimir.worklink.orchestrator import _assert_staged_diff_has_no_secret
+    from mimir_cultivate.worklink.orchestrator import _assert_staged_diff_has_no_secret
 
     repo = tmp_path / "repo"
     _init_commit_repo(repo)
@@ -11445,7 +11468,7 @@ def test_staged_secret_guard_allows_reusing_base_match(tmp_path: Path) -> None:
 
 
 def test_staged_secret_guard_refuses_new_match_without_echoing_it(tmp_path: Path) -> None:
-    from mimir.worklink.orchestrator import WorklinkError, _assert_staged_diff_has_no_secret
+    from mimir_cultivate.worklink.orchestrator import WorklinkError, _assert_staged_diff_has_no_secret
 
     repo = tmp_path / "repo"
     _init_commit_repo(repo)
@@ -11462,7 +11485,7 @@ def test_staged_secret_guard_refuses_new_match_without_echoing_it(tmp_path: Path
 
 
 def test_staged_secret_guard_refuses_secret_in_added_file(tmp_path: Path) -> None:
-    from mimir.worklink.orchestrator import WorklinkError, _assert_staged_diff_has_no_secret
+    from mimir_cultivate.worklink.orchestrator import WorklinkError, _assert_staged_diff_has_no_secret
 
     repo = tmp_path / "repo"
     _init_commit_repo(repo)
@@ -11475,7 +11498,7 @@ def test_staged_secret_guard_refuses_secret_in_added_file(tmp_path: Path) -> Non
 
 
 def test_staged_secret_guard_scans_binary_blob_marked_no_diff(tmp_path: Path) -> None:
-    from mimir.worklink.orchestrator import _assert_staged_diff_has_no_secret
+    from mimir_cultivate.worklink.orchestrator import _assert_staged_diff_has_no_secret
 
     repo = tmp_path / "repo"
     _init_commit_repo(repo)
@@ -11494,7 +11517,7 @@ def test_staged_secret_guard_scans_binary_blob_marked_no_diff(tmp_path: Path) ->
 
 @pytest.mark.parametrize("failure", ["unreadable", "non-byte"])
 def test_staged_secret_guard_fails_closed_for_base_blob(failure: str) -> None:
-    from mimir.worklink.orchestrator import WorklinkError, _assert_staged_diff_has_no_secret
+    from mimir_cultivate.worklink.orchestrator import WorklinkError, _assert_staged_diff_has_no_secret
 
     secret = b"ghp_" + b"A" * 36
 
@@ -11524,7 +11547,7 @@ def test_staged_secret_guard_fails_closed_for_base_blob(failure: str) -> None:
 def test_commit_checkout_changes_refuses_secret_in_staged_blob(
     tmp_path: Path, case: str
 ) -> None:
-    from mimir.worklink.orchestrator import WorklinkError, _commit_checkout_changes
+    from mimir_cultivate.worklink.orchestrator import WorklinkError, _commit_checkout_changes
 
     repo = tmp_path / "repo"
     _init_commit_repo(repo)
@@ -11551,7 +11574,7 @@ def test_commit_checkout_changes_fails_closed_when_scan_command_fails() -> None:
     # A security gate must not silently pass when it cannot verify: a non-zero
     # `git diff --cached -U0` (bad index/config/permissions) must refuse the
     # commit, not accept empty stdout as "clean".
-    from mimir.worklink.orchestrator import WorklinkError, _commit_checkout_changes
+    from mimir_cultivate.worklink.orchestrator import WorklinkError, _commit_checkout_changes
 
     issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
     committed = {"ran": False}
@@ -11566,7 +11589,7 @@ def test_commit_checkout_changes_allows_benign_low_signal_token() -> None:
     # The scan uses high-signal, length-floored patterns (mirroring the
     # pre-commit hook), NOT the broad log redactor — so a benign placeholder
     # `token=` in generated content must not block the commit.
-    from mimir.worklink.orchestrator import _commit_checkout_changes
+    from mimir_cultivate.worklink.orchestrator import _commit_checkout_changes
 
     issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
     committed = {"ran": False}
@@ -11579,7 +11602,7 @@ def test_commit_checkout_changes_allows_benign_low_signal_token() -> None:
 
 
 def test_commit_checkout_changes_commits_clean_diff() -> None:
-    from mimir.worklink.orchestrator import _commit_checkout_changes
+    from mimir_cultivate.worklink.orchestrator import _commit_checkout_changes
 
     issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
     committed = {"ran": False}
@@ -11590,7 +11613,7 @@ def test_commit_checkout_changes_commits_clean_diff() -> None:
 
 
 def test_commit_checkout_changes_names_unreadable_staged_path() -> None:
-    from mimir.worklink.orchestrator import WorklinkError, _commit_checkout_changes
+    from mimir_cultivate.worklink.orchestrator import WorklinkError, _commit_checkout_changes
 
     committed = {"ran": False}
     runner = _commit_runner(
@@ -11607,7 +11630,7 @@ def test_commit_checkout_changes_names_unreadable_staged_path() -> None:
 
 
 def test_commit_checkout_changes_names_staged_path_with_invalid_blob_output() -> None:
-    from mimir.worklink.orchestrator import WorklinkError, _commit_checkout_changes
+    from mimir_cultivate.worklink.orchestrator import WorklinkError, _commit_checkout_changes
 
     committed = {"ran": False}
     runner = _commit_runner(
@@ -11624,7 +11647,7 @@ def test_commit_checkout_changes_names_staged_path_with_invalid_blob_output() ->
 
 
 def test_commit_checkout_changes_commits_clean_binary_blob(tmp_path: Path) -> None:
-    from mimir.worklink.orchestrator import _commit_checkout_changes
+    from mimir_cultivate.worklink.orchestrator import _commit_checkout_changes
 
     repo = tmp_path / "repo"
     _init_commit_repo(repo)
@@ -11646,7 +11669,7 @@ def test_commit_checkout_changes_commits_clean_binary_blob(tmp_path: Path) -> No
 
 
 def test_authorized_startup_snapshot_uses_publication_only(tmp_path: Path) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     calls = []
 
@@ -11674,7 +11697,7 @@ def test_authorized_startup_snapshot_uses_publication_only(tmp_path: Path) -> No
 
 
 def test_authorized_publication_helpers_never_use_checkout_runner(tmp_path: Path) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     calls = []
 
@@ -11753,8 +11776,8 @@ def test_authorized_publication_helpers_never_use_checkout_runner(tmp_path: Path
 
 
 def test_authorized_publication_ignores_hostile_checkout_git_metadata(tmp_path: Path) -> None:
-    from mimir.worklink.safe_git import ControllerGitPublication
-    import mimir.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.safe_git import ControllerGitPublication
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     trusted = tmp_path / "trusted"
     checkout = tmp_path / "checkout"
@@ -11873,7 +11896,7 @@ def test_worker_capabilities_close_in_order_and_retain_non_success(
     scenario: str,
     delete_checkout: bool,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     boundary = tmp_path / scenario
     checkout = boundary / "checkout"
@@ -11911,7 +11934,7 @@ def test_worker_capabilities_close_in_order_and_retain_non_success(
 def test_worker_capability_cleanup_tolerates_entry_removed_concurrently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     boundary = tmp_path / "attempt"
     checkout = boundary / "checkout"
@@ -11955,8 +11978,8 @@ def test_worker_capability_cleanup_tolerates_entry_removed_concurrently(
 def test_authorized_runner_closes_real_attempt_capabilities(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.compute import (
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.compute import (
         ComputeLaunchError,
         LocalSubprocessComputeBackend,
         _enabled_child_env,
@@ -11980,7 +12003,17 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     class Authorization:
         def __init__(self):
             self.closed = 0
+            self.path = checkout
+            self.issue_id = 1410
+            self.attempt = 1
             self.fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
+            self.device = os.fstat(self.fd).st_dev
+            self.inode = os.fstat(self.fd).st_ino
+
+        def verify(self, path):
+            assert self.closed == 0 and path == self.path
+            observed = os.stat(path, follow_symlinks=False)
+            assert (observed.st_dev, observed.st_ino) == (self.device, self.inode)
 
         def duplicate_fd(self):
             assert self.closed == 0
@@ -12047,8 +12080,13 @@ def test_authorized_runner_closes_real_attempt_capabilities(
 
     publication = Publication()
 
-    class BoundCompute:
+    class BoundCompute(LocalSubprocessComputeBackend):
         name = "local_subprocess"
+
+        async def _launch_contained(self, spec, command):
+            self._authorized_checkout.verify(spec.local_checkout)
+            assert command == tuple(spec.local_argv)
+            return await self.launch(spec)
 
         def capabilities(self):
             return ComputeCaps(True, False, True, False)
@@ -12073,7 +12111,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
 
         async def wait(self, handle, timeout_s):
             if len(bound_specs) > 1:
-                from mimir.worklink.run_state import load_run_state
+                from mimir_cultivate.worklink.run_state import load_run_state
 
                 state = load_run_state(tmp_path, 1410)
                 assert state is not None
@@ -12088,7 +12126,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         async def cancel(self, handle):
             return None
 
-    bound = BoundCompute()
+    bound = BoundCompute(_authorized_checkout=authorization, _worker_uid=4242)
 
     class WorkerBackend(FakeBackend):
         name = "opencode"
@@ -12147,8 +12185,8 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             "main",
             local_base="base-sha",
             isolated_checkout=True,
-            worker_authorized=False,
-            authorization=None,
+            worker_authorized=True,
+            authorization=authorization,
         )
 
     def capture(*args, **kwargs):
@@ -12157,7 +12195,8 @@ def test_authorized_runner_closes_real_attempt_capabilities(
 
     requested_uids = []
 
-    def bind(cls, worker_uid, **kwargs):
+    def bind(cls, issued, *, worker_uid, **kwargs):
+        assert issued is authorization
         requested_uids.append(worker_uid)
         return bound
 
@@ -12183,10 +12222,14 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         "get_identities",
         lambda: SimpleNamespace(worklink_uid=worker_uid, worklink_gid=os.getgid()),
     )
+    monkeypatch.setattr(
+        "mimir_cultivate.worklink.identities.get_identities",
+        lambda: SimpleNamespace(worklink_uid=worker_uid, worklink_gid=os.getgid()),
+    )
     monkeypatch.setattr(orchestrator, "OpenCodeBackend", WorkerBackend)
     monkeypatch.setattr(orchestrator, "create_isolated_checkout", create_checkout)
     monkeypatch.setattr(orchestrator.ControllerGitPublication, "capture", capture)
-    monkeypatch.setattr(LocalSubprocessComputeBackend, "for_path_checkout", classmethod(bind))
+    monkeypatch.setattr(LocalSubprocessComputeBackend, "for_authorized_checkout", classmethod(bind))
     if scenario == "evidence_exception":
         async def fail_evidence(**kwargs):
             raise RuntimeError("evidence failed")
@@ -12201,10 +12244,9 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     assert checkout_kwargs["worker_eligible"] is True
     assert requested_uids == [worker_uid]
     assert lifecycle.count("publication-acquired") == 1
-    assert lifecycle[-1:] == ["publication"]
+    assert lifecycle[-2:] == ["publication", "authorization"]
     assert publication.closed == 1
-    assert authorization.closed == 0
-    authorization.close()
+    assert authorization.closed == 1
     expected_published = scenario in {"success", "branch_cleanup_exception"}
     expected_blocked = scenario in {
         "blocked",
@@ -12214,7 +12256,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     }
     assert result.status == (
         "completed" if expected_published else ("blocked" if expected_blocked else "failed")
-    )
+    ), result.reason
     assert checkout.exists() is (not expected_published)
     assert sibling_marker.read_text() == "keep me\n"
     expected_launches = {
@@ -12258,7 +12300,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
 
 
 def _identity_stub(gid: int):
-    from mimir.worklink.identities import WorklinkIdentities
+    from mimir_cultivate.worklink.identities import WorklinkIdentities
 
     return lambda: WorklinkIdentities(
         mimir_uid=os.getuid(), worklink_uid=os.getuid() + 1, worklink_gid=gid
@@ -12278,7 +12320,7 @@ def test_executor_report_dir_is_shared_with_the_worker_group(monkeypatch, tmp_pa
     comparing ``st_gid`` to this process's own group passes even when the grant is
     deleted entirely.
     """
-    from mimir.worklink import orchestrator as orch
+    from mimir_cultivate.worklink import orchestrator as orch
 
     worker_gid = os.getgid() + 4242  # deliberately NOT the gid mkdtemp would produce
     monkeypatch.setattr(orch, "get_identities", _identity_stub(worker_gid))
@@ -12304,7 +12346,7 @@ def test_controller_mode_report_dir_stays_private(monkeypatch, tmp_path) -> None
     There is no worker uid to accommodate: granting the worklink group here would
     widen access for no reason.
     """
-    from mimir.worklink import orchestrator as orch
+    from mimir_cultivate.worklink import orchestrator as orch
 
     def _unexpected(*_args, **_kwargs):
         raise AssertionError("controller mode must not share the report directory")
@@ -12330,7 +12372,7 @@ def test_worker_report_dir_failure_aborts_before_the_backend_launches(
     exists to remove -- after the suite has run, with worse diagnostics. The
     half-made directory must not be left behind.
     """
-    from mimir.worklink import orchestrator as orch
+    from mimir_cultivate.worklink import orchestrator as orch
 
     monkeypatch.setattr(orch, "get_identities", _identity_stub(os.getgid() + 4242))
     report = tmp_path / "report"
@@ -12380,7 +12422,7 @@ def test_factory_startup_deadline_resolves_or_announces(
     monkeypatch.delenv("MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S", raising=False)
     if raw is not None:
         monkeypatch.setenv("MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S", raw)
-    from mimir.worklink import orchestrator as _orch
+    from mimir_cultivate.worklink import orchestrator as _orch
 
     events: list[tuple[str, dict]] = []
     monkeypatch.setattr(

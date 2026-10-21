@@ -51,6 +51,20 @@ class ScopedActionProtocol:
     checkout_action: StrEnum | None = None
     live_lease: Callable[..., Any] | None = None
     checkout_tool: str | None = None
+    trusted_scope: TrustedScopeConstructors | None = None
+
+
+@dataclass(frozen=True)
+class TrustedScopeConstructors:
+    """Owner-bound constructors called only after trusted ingress validates input."""
+
+    scope_type: type
+    issue: Callable[..., Any]
+    review: Callable[..., Any]
+    registry: Callable[..., Any]
+    discovered: Callable[..., Any]
+    store: Callable[..., Any]
+    retained: Callable[..., Any]
 
 
 @dataclass(frozen=True)
@@ -64,6 +78,8 @@ class PolicyConsumerHooks:
     agent_push: Callable[..., bool]
     tracked_file: Callable[..., bool]
     derive_retained_scope: Callable[..., Any]
+    action_for: Callable[[str], Any]
+    retained_checkout_root: Callable[[], Any]
     active_checkout: Callable[..., Any]
     git_command: Callable[..., Any]
     protected_refs: frozenset[str]
@@ -76,6 +92,7 @@ class PolicyConsumerHooks:
     review_submission: Callable[..., Any]
     claim_review: Callable[..., Any]
     repository_inventory: Callable[..., Any]
+    repository_selection: Callable[..., None]
     shell_environment: Callable[..., dict[str, str]]
 
 
@@ -163,6 +180,20 @@ _CORE_ONLY_MEMBERSHIPS = frozenset({
 _FIRST_PARTY_PROJECTED_MEMBERSHIPS = frozenset({
     "retained_repo_tools", "worklink_build_tools", "repo_publish_tools",
 })
+
+
+def selected_first_party_available() -> bool:
+    """Check the installed first-party entry point without importing its provider."""
+    from .discovery import enabled_plugins
+
+    return any(
+        candidate.enabled and candidate.diagnostic is None
+        and candidate.name == "cultivate"
+        and candidate.distribution == "mimir-cultivate"
+        and candidate.entry_point.group == "mimir.plugins"
+        and candidate.entry_point.value == "mimir_cultivate:provider"
+        for candidate in enabled_plugins()
+    )
 
 
 def _name(value: str, kind: str) -> str:
@@ -468,9 +499,9 @@ class PolicyRegistry:
                 or any(not callable(getattr(hooks, name)) for name in (
                     "resolve_review", "revalidate_head", "resolve_issue", "superseded_push",
                     "verified_push", "agent_push", "tracked_file",
-                    "derive_retained_scope", "active_checkout", "git_command", "lineage",
+                    "derive_retained_scope", "action_for", "retained_checkout_root", "active_checkout", "git_command", "lineage",
                     "verified_base", "git_env", "review_submission", "claim_review",
-                    "repository_inventory", "shell_environment",
+                    "repository_inventory", "repository_selection", "shell_environment",
                 )) or not isinstance(hooks.protected_refs, frozenset)
                 or not isinstance(hooks.git_config, tuple) or not isinstance(hooks.lease_metadata, str)):
             raise PolicyRegistrationError(f"{owner}: invalid policy consumer hooks")
@@ -480,7 +511,9 @@ class PolicyRegistry:
         self, action_type: type[StrEnum], validate_scope: Callable[..., bool],
         *, checkout_action: StrEnum | None = None,
         live_lease: Callable[..., Any] | None = None,
-        checkout_tool: str | None = None, owner: str = "core",
+        checkout_tool: str | None = None,
+        trusted_scope: TrustedScopeConstructors | None = None,
+        owner: str = "core",
     ) -> None:
         self._writable()
         if (owner == "core" or owner in self._scoped_actions
@@ -493,10 +526,19 @@ class PolicyRegistry:
                     or not checkout_tool or checkout_tool != checkout_tool.strip()
                 ))
                 or (live_lease is not None and not callable(live_lease))
+                or (trusted_scope is not None and (
+                    not self._selected_first_party(owner)
+                    or type(trusted_scope) is not TrustedScopeConstructors
+                    or not isinstance(trusted_scope.scope_type, type)
+                    or any(not callable(getattr(trusted_scope, name)) for name in (
+                        "issue", "review", "registry", "discovered", "store", "retained",
+                    ))
+                ))
                 or any(protocol.action_type is action_type for protocol in self._scoped_actions.values())):
             raise PolicyRegistrationError(f"{owner}: invalid or duplicate scoped action protocol")
         self._scoped_actions[owner] = ScopedActionProtocol(
-            owner, action_type, validate_scope, checkout_action, live_lease, checkout_tool,
+            owner, action_type, validate_scope, checkout_action, live_lease,
+            checkout_tool, trusted_scope,
         )
 
     def register_poller_hook(self, name: str, hook: Callable[..., Any], *, owner: str = "core") -> None:
@@ -1147,8 +1189,10 @@ class PolicyRegistrar:
         *, checkout_action: StrEnum | None = None,
         live_lease: Callable[..., Any] | None = None,
         checkout_tool: str | None = None,
+        trusted_scope: TrustedScopeConstructors | None = None,
     ) -> None:
         self._registry.register_scoped_action(
             action_type, validate_scope, checkout_action=checkout_action,
-            live_lease=live_lease, checkout_tool=checkout_tool, owner=self.plugin,
+            live_lease=live_lease, checkout_tool=checkout_tool,
+            trusted_scope=trusted_scope, owner=self.plugin,
         )

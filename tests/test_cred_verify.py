@@ -302,13 +302,11 @@ def test_subprocess_probe_cleans_home_on_launch_exception(monkeypatch, failure):
 
 
 def test_binary_lookup_uses_restricted_path(monkeypatch):
-    from mimir.contained_execution import base_worker_environment
-
     calls = []
     monkeypatch.setenv("PATH", "/agent-writable/bin")
     monkeypatch.setattr(cred_verify.shutil, "which", lambda name, **kw: calls.append((name, kw)))
     assert not cred_verify._has_binary("tool")
-    assert calls == [("tool", {"path": base_worker_environment("cred-verify")["PATH"]})]
+    assert calls == [("tool", {"path": "/usr/local/bin:/usr/bin:/bin"})]
 
 
 def test_all_env_set_probe_needs_every_var(

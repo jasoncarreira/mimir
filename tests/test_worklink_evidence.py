@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Sequence
 from unittest.mock import MagicMock
 
-from mimir.worklink import evidence as ev
-from mimir.worklink.evidence import (
+pytest.importorskip("mimir_cultivate", reason="Worklink evidence belongs to Cultivate")
+
+from mimir_cultivate.worklink import evidence as ev
+from mimir_cultivate.worklink.evidence import (
     TestResult,
     WorklinkEvidence,
     observe_evidence,
@@ -251,7 +253,7 @@ async def test_observe_evidence_carries_backend_blocked_reason(tmp_path: Path) -
 def test_gate_test_summary_keeps_output_tail_not_head() -> None:
     """chainlink #815: pytest prints the failure list LAST — the evidence test
     summary must keep the tail so retries can act on it."""
-    from mimir.worklink.evidence import _summarize_test_output
+    from mimir_cultivate.worklink.evidence import _summarize_test_output
 
     lines = [f"noise-{index}" for index in range(1, 101)] + [
         "FAILED tests/test_z.py::test_gate - AssertionError",
@@ -308,7 +310,7 @@ def test_pytest_report_read_failures_are_distinguishable(
     if contents is not None:
         (tmp_path / "junit.xml").write_text(contents, encoding="utf-8")
     if max_bytes is not None:
-        monkeypatch.setattr("mimir.worklink.evidence._PYTEST_REPORT_MAX_BYTES", max_bytes)
+        monkeypatch.setattr("mimir_cultivate.worklink.evidence._PYTEST_REPORT_MAX_BYTES", max_bytes)
 
     result = read_pytest_result("pytest -q", tmp_path)
 
@@ -330,15 +332,72 @@ def _init_gate_repo(tmp_path: Path, test_source: str) -> Path:
     return repo
 
 
+class _AuthorizedGateCompute:
+    name = "local_subprocess"
+
+    def __init__(self, checkout: Path, issue: int, attempt: int, request: pytest.FixtureRequest):
+        from mimir_cultivate.worklink.checkout import _mint_checkout_authorization
+
+        self._authorized_checkout = _mint_checkout_authorization(
+            checkout, issue, attempt, os.open(checkout, os.O_RDONLY | os.O_DIRECTORY),
+        )
+        request.addfinalizer(self._authorized_checkout.close)
+        self._checkout = checkout
+        self._processes: dict[str, asyncio.subprocess.Process] = {}
+
+    async def _launch_contained(self, spec, command):
+        from mimir_cultivate.worklink.compute import LaunchHandle, _enabled_child_env
+
+        self._authorized_checkout.verify(spec.local_checkout)
+        assert tuple(spec.local_argv) == command
+        env = _enabled_child_env(spec, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        home = self._checkout.parent / "gate-worker-home"
+        home.mkdir(mode=0o700, exist_ok=True)
+        env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"),
+                   XDG_DATA_HOME=str(home / ".local/share"), XDG_CACHE_HOME=str(home / ".cache"))
+        process = await asyncio.create_subprocess_exec(
+            *command, cwd=self._checkout, env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        handle = LaunchHandle(self.name, str(process.pid))
+        self._processes[handle.identifier] = process
+        return handle
+
+    async def wait(self, handle, timeout_s):
+        from mimir_cultivate.worklink.compute import ComputeResult
+
+        process = self._processes[handle.identifier]
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout_s)
+            return ComputeResult(process.returncode, stdout.decode(), stderr.decode(), handle=handle)
+        except TimeoutError:
+            process.kill()
+            stdout, stderr = await process.communicate()
+            return ComputeResult(124, stdout.decode(), stderr.decode(), timed_out=True, handle=handle)
+
+    async def cleanup(self, handle):
+        process = self._processes.pop(handle.identifier)
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+    async def cancel(self, handle):
+        process = self._processes[handle.identifier]
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["opencode", "feature_factory"])
 @pytest.mark.parametrize("injected", [False, True])
-async def test_default_gate_bounds_checkout_environment(tmp_path, monkeypatch, backend, injected):
-    from mimir.worklink.checkout import coding_enabled
-    from mimir.worklink.orchestrator import _runner_for_home
+async def test_default_gate_bounds_checkout_environment(tmp_path, monkeypatch, backend, injected, request):
+    from mimir.plugins.registry import selected_first_party_available
+    from mimir_cultivate.worklink.compute import WorkSpec
+    from mimir_cultivate.worklink.orchestrator import _runner_for_home
 
     monkeypatch.setenv("MIMIR_PLUGINS", "")
-    assert not coding_enabled()
+    assert not selected_first_party_available()
     credentials = (
         "ANTHROPIC_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "SLACK_BOT_TOKEN",
         "DISCORD_TOKEN", "MIMIR_API_KEY", "MIMIR_MODEL_SPEC", "UNLISTED_GATE_SENTINEL",
@@ -354,26 +413,32 @@ async def test_default_gate_bounds_checkout_environment(tmp_path, monkeypatch, b
     (repo / "conftest.py").write_text(
         "import os\n"
         f"assert not set({credentials!r}) & os.environ.keys()\n"
-        "assert '-W error' in os.environ['PYTEST_ADDOPTS']\n"
+        f"assert ('-W error' in os.environ['PYTEST_ADDOPTS']) is {backend == 'feature_factory'}\n"
         "assert '--junitxml=' in os.environ['PYTEST_ADDOPTS']\n",
         encoding="utf-8",
     )
+    command = f"{shlex.quote(sys.executable)} -m pytest -q test_gate_sample.py"
+    compute = _AuthorizedGateCompute(repo, 1684, 1, request) if backend == "opencode" else None
+    spec = WorkSpec(
+        1684, 1, "repo", "main", "issue/1684-a1", "", None, command, backend, 60,
+        backend_config={"pass_env": ()}, local_checkout=repo,
+    ) if compute is not None else None
     result = await observe_evidence(
         issue=1684, attempt=1, backend=backend, branch="issue/1684-a1",
         checkout=repo, started_at=datetime.now(UTC), base_ref="main",
         backend_status="completed",
-        test_command=f"{shlex.quote(sys.executable)} -m pytest -q test_gate_sample.py",
+        test_command=command, compute=compute, work_spec=spec,
         runner=_runner_for_home(tmp_path, "chainlink") if injected else None,
     )
-    assert result.review_ready, result.evidence.tests
+    assert result.review_ready, "\n".join(result.evidence.tests.summary.splitlines()[:12])
     assert result.evidence.tests.counts.passed == 1
     assert result.evidence.tests.report_error is None
 
 
 @pytest.mark.parametrize("injected", [False, True])
 def test_shell_gate_real_uv_has_provisioned_home(tmp_path, monkeypatch, injected):
-    from mimir.worklink.evidence import _run
-    from mimir.worklink.orchestrator import _runner_for_home
+    from mimir_cultivate.worklink.evidence import _run
+    from mimir_cultivate.worklink.orchestrator import _runner_for_home
 
     uv = shutil.which("uv")
     if uv is None:
@@ -428,7 +493,7 @@ async def test_gate_records_counts_from_pytest_generated_junit(tmp_path: Path) -
     result = await observe_evidence(
         issue=1482,
         attempt=1,
-        backend="codex",
+        backend="feature_factory",
         branch="issue/1482-a1",
         checkout=repo,
         started_at=datetime.now(UTC),
@@ -456,7 +521,7 @@ async def test_gate_records_failed_node_ids_from_pytest_cache(tmp_path: Path) ->
     result = await observe_evidence(
         issue=1482,
         attempt=1,
-        backend="codex",
+        backend="feature_factory",
         branch="issue/1482-a1",
         checkout=repo,
         started_at=datetime.now(UTC),
@@ -477,7 +542,7 @@ async def test_gate_records_failed_node_ids_from_pytest_cache(tmp_path: Path) ->
 @pytest.mark.parametrize("failure", ["parallel", "transient_infrastructure"])
 @pytest.mark.asyncio
 async def test_serial_rerun_cannot_publish_parallel_gate_as_pass(tmp_path, monkeypatch, failure):
-    from mimir.worklink.orchestrator import IssueContext, _open_pr
+    from mimir_cultivate.worklink.orchestrator import IssueContext, _open_pr
 
     repo = _init_gate_repo(tmp_path, f'''
 from pathlib import Path
@@ -497,7 +562,7 @@ def test_passes():
     monkeypatch.setenv("MIMIR_PLUGINS", "")
     command = f"{shlex.quote(sys.executable)} -m pytest -q -n 2"
     result = await observe_evidence(
-        issue=1692, attempt=1, backend="codex", branch="issue/1692-a1",
+        issue=1692, attempt=1, backend="feature_factory", branch="issue/1692-a1",
         checkout=repo, started_at=datetime.now(UTC), base_ref="main",
         backend_status="completed", test_command=command,
     )
@@ -571,7 +636,7 @@ def test_other():
 ''')
     monkeypatch.setenv("WORKLINK_GATE_TEST_ENV", "same")
     result = await observe_evidence(
-        issue=1557, attempt=1, backend="codex", branch="issue/1557-a1",
+        issue=1557, attempt=1, backend="feature_factory", branch="issue/1557-a1",
         checkout=repo, started_at=datetime.now(UTC), base_ref="main",
         backend_status="completed",
         test_command=f"{shlex.quote(sys.executable)} -m pytest -q test_gate_sample.py",
@@ -598,7 +663,7 @@ def test_other():
 ])
 @pytest.mark.asyncio
 async def test_gate_rerun_incomplete_reports_fail_closed(tmp_path, monkeypatch, fault):
-    import mimir.worklink.evidence as module
+    import mimir_cultivate.worklink.evidence as module
 
     calls = []
     node = "test_sample.py::test_one"
@@ -635,9 +700,8 @@ async def test_gate_rerun_incomplete_reports_fail_closed(tmp_path, monkeypatch, 
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         return subprocess.CompletedProcess(command, exit_code, "output", "")
 
-    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: False)
     result = await module.observe_evidence(
-        issue=1557, attempt=1, backend="opencode", branch="issue/1557-a1",
+        issue=1557, attempt=1, backend="feature_factory", branch="issue/1557-a1",
         checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
         backend_status="completed", test_command="uv run --extra dev --extra bench pytest -q -n 6",
         runner=runner,
@@ -660,20 +724,25 @@ async def test_gate_rerun_incomplete_reports_fail_closed(tmp_path, monkeypatch, 
     "uv sync pytest",
 ])
 def test_gate_rerun_refuses_unknown_command_shapes(command):
-    from mimir.worklink.evidence import _pytest_rerun_command
+    from mimir_cultivate.worklink.evidence import _pytest_rerun_command
     assert _pytest_rerun_command(command, ("tests/test_one.py::test_one",)) is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("timeout_run", [1, 2], ids=["initial", "rerun"])
-async def test_worker_timeout_with_complete_reports_fails_closed(tmp_path, monkeypatch, timeout_run):
-    from mimir.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
+async def test_worker_timeout_with_complete_reports_fails_closed(tmp_path, monkeypatch, timeout_run, request):
+    from mimir_cultivate.worklink.checkout import _mint_checkout_authorization
+    from mimir_cultivate.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
 
     node = "test_sample.py::test_one"
     specs = []
 
     class Compute:
-        async def launch(self, spec):
+        name = "local_subprocess"
+
+        async def _launch_contained(self, spec, argv):
+            assert argv == tuple(spec.local_argv)
+            self._authorized_checkout.verify(spec.local_checkout)
             specs.append(spec)
             return LaunchHandle("local_subprocess", str(len(specs)))
 
@@ -699,12 +768,18 @@ async def test_worker_timeout_with_complete_reports_fails_closed(tmp_path, monke
 
     pytest.importorskip("mimir_cultivate")
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    compute = Compute()
+    compute._authorized_checkout = _mint_checkout_authorization(
+        tmp_path, 1696, 1, os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY),
+    )
+    request.addfinalizer(compute._authorized_checkout.close)
     result = await observe_evidence(
         issue=1696, attempt=1, backend="opencode", branch="branch",
         checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
         backend_status="completed", test_command="pytest -q", runner=runner,
-        work_spec=WorkSpec(1696, 1, "url", "main", "branch", "prompt", None, "pytest -q", "opencode", 7),
-        compute=Compute(),
+        work_spec=WorkSpec(1696, 1, "url", "main", "branch", "prompt", None, "pytest -q", "opencode", 7,
+                           local_checkout=tmp_path),
+        compute=compute,
     )
     assert len(specs) == timeout_run
     assert result.reasons == ("gate_timed_out",)
@@ -724,7 +799,7 @@ async def test_worker_timeout_with_complete_reports_fails_closed(tmp_path, monke
 
 
 def test_gate_rerun_preserves_launcher_and_removes_selection():
-    from mimir.worklink.evidence import _pytest_rerun_command
+    from mimir_cultivate.worklink.evidence import _pytest_rerun_command
     command = "uv run --extra dev --extra bench pytest -q -n 6 -k first -m slow tests/ -x --lf"
     node = "tests/test_one.py::test_one[semi; quoted ' argument]"
     assert shlex.split(_pytest_rerun_command(command, (node,))) == [
@@ -736,7 +811,7 @@ def test_gate_rerun_preserves_launcher_and_removes_selection():
 def test_evidence_test_command_uses_bare_command_without_model_spec(
     monkeypatch,
 ) -> None:
-    from mimir.worklink.evidence import _run
+    from mimir_cultivate.worklink.evidence import _run
 
     captured: dict[str, object] = {}
 
@@ -789,7 +864,7 @@ def test_gate_exit_124_alone_is_not_an_observed_timeout():
 
 def test_gate_timeout_is_persisted_and_counts_as_divergence():
     from dataclasses import asdict
-    from mimir.worklink.evidence import _gate_results_diverge
+    from mimir_cultivate.worklink.evidence import _gate_results_diverge
 
     executor = TestResult("pytest -q", 0)
     measured = TestResult("pytest -q", 0, timed_out=True)
@@ -799,7 +874,7 @@ def test_gate_timeout_is_persisted_and_counts_as_divergence():
 
 @pytest.mark.asyncio
 async def test_controller_gate_yields_to_heartbeat_and_records_timeout(tmp_path):
-    from mimir.worklink.compute import WorkSpec
+    from mimir_cultivate.worklink.compute import WorkSpec
 
     entered = threading.Event()
     heartbeat = threading.Event()
@@ -821,10 +896,10 @@ async def test_controller_gate_yields_to_heartbeat_and_records_timeout(tmp_path)
     task = asyncio.create_task(beat())
     try:
         result = await observe_evidence(
-            issue=1696, attempt=1, backend="codex", branch="branch",
+            issue=1696, attempt=1, backend="feature_factory", branch="branch",
             checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
             backend_status="completed", test_command="pytest -q", runner=runner,
-            work_spec=WorkSpec(1696, 1, "url", "main", "branch", "prompt", None, "pytest -q", "codex", 7),
+            work_spec=WorkSpec(1696, 1, "url", "main", "branch", "prompt", None, "pytest -q", "feature_factory", 7),
         )
     finally:
         task.cancel()
@@ -840,8 +915,8 @@ async def test_controller_gate_yields_to_heartbeat_and_records_timeout(tmp_path)
 
 @pytest.mark.parametrize("runner_name", ["evidence", "orchestrator", "home"])
 def test_default_controller_runner_enforces_timeout(tmp_path, runner_name):
-    from mimir.worklink.evidence import _run
-    from mimir.worklink.orchestrator import _run as orchestrator_run, _runner_for_home
+    from mimir_cultivate.worklink.evidence import _run
+    from mimir_cultivate.worklink.orchestrator import _run as orchestrator_run, _runner_for_home
 
     runner = {"evidence": _run, "orchestrator": orchestrator_run, "home": _runner_for_home(tmp_path, "chainlink")}[runner_name]
 
@@ -854,7 +929,7 @@ def test_default_controller_runner_enforces_timeout(tmp_path, runner_name):
 
 @pytest.mark.parametrize("for_home", [False, True])
 def test_controller_gate_runner_preserves_binary_output(tmp_path, for_home):
-    from mimir.worklink.orchestrator import _run, _runner_for_home
+    from mimir_cultivate.worklink.orchestrator import _run, _runner_for_home
 
     runner = _runner_for_home(tmp_path, "chainlink") if for_home else _run
     result = runner("printf gate", cwd=tmp_path, text=False, timeout=5)
@@ -902,7 +977,7 @@ async def test_observe_evidence_uses_executor_diff_and_test_results(tmp_path: Pa
     result = await observe_evidence(
         issue=439,
         attempt=1,
-        backend="codex",
+        backend="feature_factory",
         branch="issue/439-a1",
         checkout=repo,
         started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
@@ -973,7 +1048,7 @@ async def test_observe_evidence_sees_untracked_files(tmp_path: Path) -> None:
     result = await observe_evidence(
         issue=439,
         attempt=1,
-        backend="codex",
+        backend="feature_factory",
         branch="issue/439-a1",
         checkout=repo,
         started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
@@ -1005,7 +1080,7 @@ async def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> N
     result = await observe_evidence(
         issue=439,
         attempt=1,
-        backend="codex",
+        backend="feature_factory",
         branch="issue/439-a1",
         checkout=repo,
         started_at=datetime(2026, 6, 11, 5, tzinfo=UTC),
@@ -1021,8 +1096,9 @@ async def test_observe_evidence_sees_committed_backend_work(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("timed_out", [False, True])
-async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_path: Path, timed_out) -> None:
-    from mimir.worklink.compute import (
+async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_path: Path, timed_out, request) -> None:
+    from mimir_cultivate.worklink.checkout import _mint_checkout_authorization
+    from mimir_cultivate.worklink.compute import (
         ComputeResult,
         LaunchHandle,
         WorkSpec,
@@ -1030,11 +1106,15 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
     )
 
     class Compute:
+        name = "local_subprocess"
+
         def __init__(self) -> None:
             self.specs = []
             self.cleaned = []
 
-        async def launch(self, spec):
+        async def _launch_contained(self, spec, argv):
+            assert argv == tuple(spec.local_argv)
+            self._authorized_checkout.verify(spec.local_checkout)
             _enabled_child_env(spec, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
             self.specs.append(spec)
             return LaunchHandle("local_subprocess", "job")
@@ -1062,7 +1142,7 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
         "branch",
         "prompt",
         None,
-        "",
+        "pytest -q",
         "opencode",
         30,
         env={"OPENCODE_PERMISSION": '{"edit":"allow"}'},
@@ -1071,6 +1151,10 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
         local_argv=("opencode",),
     )
     compute = Compute()
+    compute._authorized_checkout = _mint_checkout_authorization(
+        repo, 1, 1, os.open(repo, os.O_RDONLY | os.O_DIRECTORY),
+    )
+    request.addfinalizer(compute._authorized_checkout.close)
     pytest.importorskip("mimir_cultivate")
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
 
@@ -1127,10 +1211,11 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
 @pytest.mark.asyncio
 @pytest.mark.parametrize("blocked_phase", ["gate", "export", "cleanup"])
 @pytest.mark.parametrize("stop", [False, True, "race"], ids=["deadline", "operator-stop", "stop-at-deadline"])
-async def test_gate_diagnostic_deadline_isolation(monkeypatch, tmp_path, blocked_phase, stop):
+async def test_gate_diagnostic_deadline_isolation(monkeypatch, tmp_path, blocked_phase, stop, request):
     from types import SimpleNamespace
-    from mimir.contained_execution import CollectedExecutionResult
-    from mimir.worklink import compute as cp
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.worklink.checkout import _mint_checkout_authorization
+    from mimir_cultivate.worklink import compute as cp
 
     pytest.importorskip("mimir_cultivate")
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
@@ -1149,6 +1234,11 @@ async def test_gate_diagnostic_deadline_isolation(monkeypatch, tmp_path, blocked
     class Compute(cp.LocalSubprocessComputeBackend):
         # Replace only worker launch/IPC. Exercise the real compute.wait timer,
         # shielding, timeout cancellation, terminal collection and cleanup.
+        async def _launch_contained(self, spec, argv):
+            assert argv == tuple(spec.local_argv)
+            self._authorized_checkout.verify(spec.local_checkout)
+            return await self.launch(spec)
+
         async def launch(self, spec):
             phase = "gate" if not specs else "export" if len(specs) == 1 else "cleanup"
             specs[phase] = spec
@@ -1191,6 +1281,10 @@ async def test_gate_diagnostic_deadline_isolation(monkeypatch, tmp_path, blocked
             cleaned.append(handle.identifier)
 
     compute = Compute()
+    compute._authorized_checkout = _mint_checkout_authorization(
+        tmp_path, 1755, 1, os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY),
+    )
+    request.addfinalizer(compute._authorized_checkout.close)
     loop = asyncio.get_running_loop()
     call_at = loop.call_at
     deadlines = []
@@ -1219,7 +1313,8 @@ async def test_gate_diagnostic_deadline_isolation(monkeypatch, tmp_path, blocked
         checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
         backend_status="completed", test_command="pytest -q", runner=runner,
         work_spec=cp.WorkSpec(1755, 1, "url", "main", "branch", "", None,
-                              "pytest -q", "opencode", 5400, output_root=tmp_path / "artifacts"),
+                              "pytest -q", "opencode", 5400, local_checkout=tmp_path,
+                              output_root=tmp_path / "artifacts"),
         compute=compute,
     ))
     try:
@@ -1270,8 +1365,8 @@ async def test_gate_diagnostic_deadline_isolation(monkeypatch, tmp_path, blocked
 @pytest.mark.parametrize("diagnostic", [False, True])
 async def test_compute_gate_budget_selection(tmp_path, budget, diagnostic):
     from unittest.mock import AsyncMock
-    from mimir.worklink.compute import ComputeResult, WorkSpec
-    from mimir.worklink.evidence import _run_compute_gate
+    from mimir_cultivate.worklink.compute import ComputeResult, WorkSpec
+    from mimir_cultivate.worklink.evidence import _run_compute_gate
 
     spec = WorkSpec(1755, 1, "url", "main", "branch", "", None, "pytest", "opencode", budget)
     compute = AsyncMock()
@@ -1279,8 +1374,11 @@ async def test_compute_gate_budget_selection(tmp_path, budget, diagnostic):
     await _run_compute_gate("pytest", checkout=tmp_path, work_spec=spec,
                             compute=compute, diagnostic=diagnostic)
     expected = min(budget, 60) if diagnostic else budget
-    assert compute.launch.call_args.args[0].timeout_s == expected
-    compute.wait.assert_awaited_once_with(compute.launch.return_value, expected)
+    gate_spec, argv = compute._launch_contained.call_args.args
+    assert gate_spec.timeout_s == expected
+    assert argv == ("/bin/sh", "-c", "pytest")
+    compute.launch.assert_not_awaited()
+    compute.wait.assert_awaited_once_with(compute._launch_contained.return_value, expected)
     assert spec.timeout_s == budget
 
 
@@ -1319,11 +1417,11 @@ async def test_enabled_opencode_evidence_uses_controller_git_without_fd_publicat
 async def test_live_gate_durable_handle_targets_exact_cancellation(
     tmp_path: Path, monkeypatch, recovery: str
 ) -> None:
-    from mimir.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
-    from mimir.worklink.control import stop_worklink
-    from mimir.worklink.evidence import _run_compute_gate
-    from mimir.worklink.orchestrator import WorklinkRunner
-    from mimir.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
+    from mimir_cultivate.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
+    from mimir_cultivate.worklink.control import stop_worklink
+    from mimir_cultivate.worklink.evidence import _run_compute_gate
+    from mimir_cultivate.worklink.orchestrator import WorklinkRunner
+    from mimir_cultivate.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
 
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -1343,23 +1441,25 @@ async def test_live_gate_durable_handle_targets_exact_cancellation(
         cancelled.append(observed)
 
     monkeypatch.setattr(
-        "mimir.worklink.control.LocalSubprocessComputeBackend.cancel", cancel
+        "mimir_cultivate.worklink.control.LocalSubprocessComputeBackend.cancel", cancel
     )
     monkeypatch.setattr(
-        "mimir.worklink.orchestrator.LocalSubprocessComputeBackend.cancel", cancel
+        "mimir_cultivate.worklink.orchestrator.LocalSubprocessComputeBackend.cancel", cancel
     )
     monkeypatch.setattr(
-        "mimir.worklink.control.process_is_alive", lambda state: True
+        "mimir_cultivate.worklink.control.process_is_alive", lambda state: True
     )
     monkeypatch.setattr(
-        "mimir.worklink.control.process_identity_verified", lambda state: True
+        "mimir_cultivate.worklink.control.process_identity_verified", lambda state: True
     )
     monkeypatch.setattr(
-        "mimir.worklink.orchestrator.process_is_alive", lambda state: True
+        "mimir_cultivate.worklink.orchestrator.process_is_alive", lambda state: True
     )
 
     class Compute:
-        async def launch(self, spec):
+        async def _launch_contained(self, spec, argv):
+            assert argv == ("/bin/sh", "-c", "pytest -q")
+            assert spec.local_checkout == checkout
             return handle
 
         async def wait(self, observed, timeout_s):
@@ -1447,7 +1547,7 @@ def test_gate_report_directory_is_writable_by_the_gate_identity(tmp_path):
     pytest_sessionfinish while writing --junitxml -- after every test had passed.
     The gate then exited 1 on a green run and reported no structured counts.
     """
-    from mimir.worklink.evidence import _gate_report_directory
+    from mimir_cultivate.worklink.evidence import _gate_report_directory
 
     checkout = tmp_path / "checkout"
     checkout.mkdir()

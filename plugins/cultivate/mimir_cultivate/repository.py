@@ -309,7 +309,7 @@ from pathlib import Path
 import re
 from typing import Literal
 
-from mimir.models import RepoPRAction
+from .policy import RepoPRAction
 
 
 ParityDecision = Literal["allow", "refuse", "escalate", "unavailable"]
@@ -627,12 +627,8 @@ from typing import Callable, Iterator, Sequence
 import uuid
 
 from mimir._rmtree import rmtree_missing_ok
-from mimir.models import (
-    NormalizedPullRequestSnapshot,
-    RepoPRAction,
-    RepoPRActionScope,
-    RepoReviewState,
-)
+from mimir.models import NormalizedPullRequestSnapshot
+from .policy import RepoPRAction, RepoPRActionScope, RepoReviewState
 from .worklink.checkout import (
     _assert_self_contained_checkout,
     _clone_attempt_checkout,
@@ -2010,7 +2006,7 @@ def acquire_pr_checkout_lease(
         foreign_candidates: list[tuple[Path, str]] = []
         rebound_candidates: dict[Path, PRCheckoutLease] = {}
         if foreign_leases:
-            from mimir._context import active_pr_checkout_lease_paths
+            from .scheduler import active_pr_checkout_lease_paths
 
             active_paths = {
                 path.resolve(strict=False) for path in active_pr_checkout_lease_paths()
@@ -2351,7 +2347,7 @@ from urllib.parse import urlsplit
 
 from mimir.access_control import ToolFlowDirection, authorize_repo_pr_tool
 from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-from mimir.models import RetainedFactoryScope, RepoPRAction, RepoPRActionScope, RepoReviewState
+from .policy import RetainedFactoryScope, RepoPRAction, RepoPRActionScope, RepoReviewState
 
 from mimir.redaction import redact_text
 
@@ -3739,17 +3735,11 @@ from mimir.contained_snapshot import (
     SnapshotEmbeddedRepository,
 )
 from mimir.event_logger import safe_log_event
-from mimir.models import RepoPRAction, RepoReviewState, RetainedFactoryScope
+from .policy import RepoPRAction, RepoReviewState, RetainedFactoryScope
 from mimir.redaction import redact_text
 
 
-from importlib.util import find_spec
-
-if find_spec("mimir_cultivate.worklink.backends.registry") is None:
-    # The Worklink registry is installed by a later importer-safe slice.
-    from mimir.worklink.backends.registry import WorklinkConfig
-else:
-    from .worklink.backends.registry import WorklinkConfig
+from .worklink.backends.registry import WorklinkConfig
 from .worklink.identities import get_identities
 from .worklink.worker_client import StaleWorkerExecutorError
 
@@ -4777,7 +4767,8 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
-from mimir.models import AuthContext, RepoReviewState, RetainedFactoryScope, SourceLabel
+from mimir.models import AuthContext, SourceLabel
+from .policy import RepoReviewState, RetainedFactoryScope
 
 
 

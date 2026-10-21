@@ -70,12 +70,13 @@ def test_all_frozen_core_descriptors_come_from_registrations() -> None:
 
 def test_core_runtime_factories_cover_each_surface_without_loading_coding() -> None:
     registry = core_policy_registry()
-    surfaces = ("default", "web_search", "fetch_url", "coding")
+    surfaces = ("default", "web_search", "fetch_url")
     names = [name for surface in surfaces for name in core_runtime_names(surface)]
     assert len(names) == len(set(names))
     assert all(registry.tools[name].factory is not None for name in names)
     assert all(registry.tools[name].policy_only for name in registry.tools if name not in names)
-    assert core_runtime_names("coding") == ()
+    with pytest.raises(KeyError):
+        core_runtime_names("coding")
     assert "repo_test" not in registry.tools
     assert "pr_metadata" not in registry.tools
 

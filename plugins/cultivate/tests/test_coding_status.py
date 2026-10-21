@@ -17,13 +17,13 @@ from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
 from mimir.models import (
     AgentEvent, AuthContext, InformationFlowLabels, Integrity, IntegrityEffect,
-    TurnContext, TurnInteractivity, ServerDiscoveredPRScopeStore,
+    TurnContext, TurnInteractivity,
 )
 from mimir.plugins.core import policy_scope
 from mimir.plugins.registry import PolicyRegistry
 from mimir.plugins.manager import load_plugins
 from mimir.prompts import build_turn_prompt
-from mimir_cultivate.policy import RepoPRActionScope
+from mimir_cultivate.policy import RepoPRActionScope, ServerDiscoveredPRScopeStore
 from mimir_cultivate.prompts import coding_review_applies, coding_status_applies, register_prompt_provider
 from mimir_cultivate.worklink.factory_state import (
     FactoryRunRecord, FactoryStatus, save_factory_record,

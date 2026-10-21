@@ -21,9 +21,9 @@ from mimir_cultivate.forge import (
     PullRequestProjection, PullRequestSummary, ReviewProjection,
     ReviewRequestProjection, ReviewVerdict,
 )
-from mimir.models import (
-    AuthContext, InformationFlowLabels, RepoPRAction, RepoPRActionScope,
-    RepoPRScopeRegistry, RepoReviewState,
+from mimir.models import AuthContext, InformationFlowLabels
+from mimir_cultivate.policy import (
+    RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
 )
 from mimir.tools.refusals import ToolPolicyRefusal
 from mimir_cultivate import forge

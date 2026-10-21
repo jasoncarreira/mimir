@@ -390,13 +390,22 @@ class LocalSubprocessComputeBackend:
         cls,
         authorization: object,
         *,
+        worker_uid: int | None = None,
         worker_client: object | None = None,
     ) -> LocalSubprocessComputeBackend:
         if not all(
             hasattr(authorization, member) for member in ("verify", "duplicate_fd", "path")
         ):
             raise TypeError("authorization is not a checkout capability")
-        return cls(_authorized_checkout=authorization, _worker_client=worker_client)
+        if worker_uid is not None:
+            from .identities import get_identities
+
+            if type(worker_uid) is not int or worker_uid != get_identities().worklink_uid:
+                raise ValueError("worker uid must match the configured worker identity")
+        return cls(
+            _authorized_checkout=authorization, _worker_uid=worker_uid,
+            _worker_client=worker_client,
+        )
 
     @classmethod
     def for_path_checkout(

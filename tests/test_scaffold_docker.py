@@ -24,8 +24,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mimir.worklink.backends.feature_factory import FACTORY_VERSION
-from mimir.worklink.tool_pins import OPENCODE_VERSION
+FACTORY_VERSION = "0.10.18"
+OPENCODE_VERSION = "1.18.21"
 from mimir.scaffold_docker import (
     DEFAULT_BASE_IMAGE,
     Fragment,

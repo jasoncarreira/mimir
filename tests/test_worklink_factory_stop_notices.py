@@ -13,28 +13,30 @@ from pathlib import Path
 
 import pytest
 
-from mimir.worklink import orchestrator
-from mimir.worklink import evidence as evidence_module
-from mimir.worklink import claims as claims_module
-from mimir.worklink import dispatch_failures
-from mimir.worklink.backends.feature_factory import FactoryStatus
-from mimir.worklink.claims import ClaimRecord
-from mimir.worklink.dispatch_failures import (
+pytest.importorskip("mimir_cultivate", reason="Worklink factory notices belong to Cultivate")
+
+from mimir_cultivate.worklink import orchestrator
+from mimir_cultivate.worklink import evidence as evidence_module
+from mimir_cultivate.worklink import claims as claims_module
+from mimir_cultivate.worklink import dispatch_failures
+from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
+from mimir_cultivate.worklink.claims import ClaimRecord
+from mimir_cultivate.worklink.dispatch_failures import (
     FACTORY_STOP_KINDS,
     dispatch_failure_state_dir,
     load_failure_state,
     pending_failure_alerts,
     record_failure,
 )
-from mimir.worklink.orchestrator import IssueContext, WorklinkRunner
+from mimir_cultivate.worklink.orchestrator import IssueContext, WorklinkRunner
 from tests.test_worklink_orchestrator import (
     _factory_lifecycle_record,
     _factory_lifecycle_status,
     _run_factory_preflight_case,
     cp,
 )
-from mimir.worklink.compute import ComputeResult, LaunchHandle
-from mimir.worklink.poller_hooks import report_live_delivery_receipts
+from mimir_cultivate.worklink.compute import ComputeResult, LaunchHandle
+from mimir_cultivate.worklink.poller_hooks import report_live_delivery_receipts
 
 
 ENDING_NOTICES = {
@@ -69,7 +71,7 @@ LEAF_ENDING_NOTICES = {
 
 
 def test_leaf_ending_inventory_is_closed():
-    from mimir.worklink.dispatch_failures import LEAF_TRANSITION_KINDS
+    from mimir_cultivate.worklink.dispatch_failures import LEAF_TRANSITION_KINDS
 
     source = inspect.getsource(WorklinkRunner._finalize)
     tree = ast.parse(textwrap.dedent(source))
@@ -139,7 +141,7 @@ def test_every_factory_ending_has_one_terminal_agent_notice(tmp_path, monkeypatc
         assert not load_failure_state(state_dir).get("factory_transitions")
         return
     if ending == "operator_stop":
-        from mimir.worklink.control import _mark_operator_stop
+        from mimir_cultivate.worklink.control import _mark_operator_stop
 
         _mark_operator_stop(tmp_path, 700, 1)
         orchestrator._record_run_failure(home=tmp_path, issue_id=700, attempt=1,

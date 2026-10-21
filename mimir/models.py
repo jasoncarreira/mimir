@@ -33,26 +33,6 @@ class TurnInteractivity(StrEnum):
     NON_INTERACTIVE = "non_interactive"
 
 
-class RepoPRScopeProvenance(StrEnum):
-    POLLER_PAYLOAD = "poller_payload"
-    SERVER_DISCOVERED = "server_discovered"
-
-
-class RepoPRAction(StrEnum):
-    """Closed action vocabulary for one repo/PR authority scope."""
-
-    INSPECT = "repo.inspect"
-    CHECKOUT = "repo.checkout"
-    TEST = "repo.test"
-    WRITE = "repo.write"
-    COMMIT = "repo.commit"
-    PUSH = "repo.push"
-    PR_COMMENT = "pr.comment"
-    PR_EDIT = "pr.edit"
-    PR_REREQUEST = "pr.rerequest"
-    PR_REVIEW = "pr.review"
-
-
 @dataclass(frozen=True)
 class NormalizedPullRequestSnapshot:
     """Provider-neutral observed pull-request state supplied by an adapter.
@@ -1089,7 +1069,7 @@ class AgentEvent:
     service_authority: Any = None
     # Optional server-discovered heartbeat authority. Poller scopes are always
     # rebuilt from their trusted payload items and never accepted here.
-    repo_pr_action_scope: "RepoPRActionScope | None" = None
+    repo_pr_action_scope: Any = None
     # Server-carried IFC state for continuations/resumed events. This must be
     # propagated from a trusted TurnContext; generic ingress must not accept a
     # client assertion as a declassification or authority signal.
@@ -1160,456 +1140,6 @@ class SessionACL:
             visibility=visibility,
             provenance_complete=True,
         )
-
-
-@dataclass(frozen=True)
-class RepoPRActionScope:
-    """Immutable server-issued authority for actions on one observed PR state."""
-
-    provenance: RepoPRScopeProvenance
-    canonical_repo: str
-    canonical_root: str
-    canonical_origin: str
-    principal: str
-    event_type: str
-    allowed_operations: frozenset[str]
-    pr_number: int
-    head_repo: str
-    head_remote: str
-    destination_ref: str
-    observed_head_sha: str
-    base_ref: str
-    observed_base_sha: str
-    # A provider-owned immutable ref used only to obtain the observed head.
-    # Write scopes leave this unset and continue to fetch/push destination_ref.
-    checkout_ref: str | None = None
-    # Provider-observed content provenance. The executing principal is always the
-    # configured bot, so it cannot stand in for the author of fetched PR bytes.
-    pull_request_author: str | None = None
-    # The trusted scope issuer, not the action vocabulary, selects the plugin owner.
-    owner: str = "cultivate"
-    scope_id: str = field(init=False)
-
-    def __post_init__(self) -> None:
-        provenance = RepoPRScopeProvenance(self.provenance)
-        object.__setattr__(self, "provenance", provenance)
-        if not isinstance(self.allowed_operations, frozenset):
-            raise TypeError("allowed_operations must be a frozenset")
-        unknown_actions = self.allowed_operations - frozenset(
-            action.value for action in RepoPRAction
-        )
-        if unknown_actions:
-            raise ValueError("unsupported repo/PR action")
-        authority = {
-            "provenance": self.provenance,
-            "canonical_repo": self.canonical_repo,
-            "canonical_root": self.canonical_root,
-            "canonical_origin": self.canonical_origin,
-            "principal": self.principal,
-            "event_type": self.event_type,
-            "allowed_operations": sorted(self.allowed_operations),
-            "pr_number": self.pr_number,
-            "head_repo": self.head_repo,
-            "head_remote": self.head_remote,
-            "destination_ref": self.destination_ref,
-            "observed_head_sha": self.observed_head_sha,
-            "base_ref": self.base_ref,
-            "observed_base_sha": self.observed_base_sha,
-        }
-        if self.checkout_ref is not None:
-            authority["checkout_ref"] = self.checkout_ref
-        if self.pull_request_author is not None:
-            authority["pull_request_author"] = self.pull_request_author
-        encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")).encode()
-        object.__setattr__(self, "scope_id", hashlib.sha256(encoded).hexdigest())
-
-    @property
-    def head_ref(self) -> str:
-        return self.destination_ref.removeprefix("refs/heads/")
-
-
-@dataclass(frozen=True)
-class RepoReviewState:
-    """Immutable PR authority plus typed checkout-lease and execution evidence."""
-
-    action_scope: RepoPRActionScope
-    checked_out: bool = field(default=False, init=False, compare=False)
-    checkout_lease: Any = field(default=None, init=False, repr=False, compare=False)
-    git_expected_head: str | None = field(default=None, init=False, repr=False, compare=False)
-    full_tested_head: str | None = field(default=None, init=False, repr=False, compare=False)
-    conflict_evidence_head: str | None = field(default=None, init=False, repr=False, compare=False)
-    _author_attestation_verdicts: dict[tuple[str, str], tuple[bool, str]] = field(
-        default_factory=dict, init=False, repr=False, compare=False,
-    )
-    _author_attestation_lock: Any = field(
-        default_factory=threading.Lock, init=False, repr=False, compare=False,
-    )
-
-    @property
-    def repo(self) -> str:
-        return self.action_scope.canonical_repo
-
-    @property
-    def pr_number(self) -> int:
-        return self.action_scope.pr_number
-
-    @property
-    def head_ref(self) -> str:
-        return self.action_scope.head_ref
-
-    @property
-    def root(self) -> str:
-        lease = self.checkout_lease
-        if lease is not None and getattr(lease, "is_active", False):
-            return str(lease.path)
-        return self.action_scope.canonical_root
-
-    def attach_checkout_lease(self, lease: Any) -> None:
-        """Activate only a lease issued for this immutable action scope."""
-        if (
-            getattr(lease, "scope_id", None) != self.action_scope.scope_id
-            or getattr(lease, "owner", None) != self.action_scope.principal
-            or not getattr(lease, "is_active", False)
-        ):
-            raise ValueError("checkout lease does not match review scope")
-        object.__setattr__(self, "checkout_lease", lease)
-        object.__setattr__(self, "checked_out", True)
-        object.__setattr__(self, "git_expected_head", self.action_scope.observed_head_sha.lower())
-
-    def record_git_head(self, scope_id: str, head: str) -> None:
-        """Record a typed Git mutation's new HEAD without widening its scope."""
-        lease = self.checkout_lease
-        normalized = head.lower()
-        if (
-            lease is None
-            or scope_id != self.action_scope.scope_id
-            or getattr(lease, "scope_id", None) != scope_id
-            or not getattr(lease, "is_active", False)
-            or len(normalized) != 40
-            or any(character not in "0123456789abcdef" for character in normalized)
-        ):
-            raise ValueError("Git HEAD update does not match active review scope")
-        object.__setattr__(self, "git_expected_head", normalized)
-        object.__setattr__(self, "full_tested_head", None)
-        object.__setattr__(self, "conflict_evidence_head", None)
-        with self._author_attestation_lock:
-            self._author_attestation_verdicts.clear()
-
-    def author_attestation_verdict(self, head: str, verify: Any) -> tuple[bool, str]:
-        """Reuse the verdict and its content-free reason for an unchanged HEAD."""
-        key = (self.action_scope.scope_id, head.lower())
-        with self._author_attestation_lock:
-            cached = self._author_attestation_verdicts.get(key)
-            if cached is not None:
-                return cached
-            verdict = verify()
-            self._author_attestation_verdicts[key] = verdict
-            return verdict
-
-    def record_full_test(self, scope_id: str, head: str) -> None:
-        """Record a successful unselected suite run against the exact checkout HEAD."""
-        self._record_checkout_proof(scope_id, head, "full_tested_head")
-
-    def record_conflict_evidence(self, scope_id: str, head: str) -> None:
-        """Record structured two-sided preservation evidence in the exact HEAD."""
-        self._record_checkout_proof(scope_id, head, "conflict_evidence_head")
-
-    def _record_checkout_proof(self, scope_id: str, head: str, field_name: str) -> None:
-        lease = self.checkout_lease
-        normalized = head.lower()
-        if (
-            lease is None
-            or scope_id != self.action_scope.scope_id
-            or getattr(lease, "scope_id", None) != scope_id
-            or not getattr(lease, "is_active", False)
-            or normalized != self.git_expected_head
-        ):
-            raise ValueError("checkout proof does not match the current scoped HEAD")
-        object.__setattr__(self, field_name, normalized)
-
-    def revoke_checkout_lease(self, lease: Any) -> None:
-        """Revoke the exact attached lease without affecting a replacement."""
-        if self.checkout_lease is lease:
-            object.__setattr__(self, "checkout_lease", None)
-            object.__setattr__(self, "checked_out", False)
-            object.__setattr__(self, "git_expected_head", None)
-            object.__setattr__(self, "full_tested_head", None)
-            object.__setattr__(self, "conflict_evidence_head", None)
-
-
-@dataclass(frozen=True)
-class RepoPRScopeRegistry:
-    """Immutable per-turn registry of independently checked-out PR scopes."""
-
-    review_states: tuple[RepoReviewState, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.review_states, tuple):
-            raise TypeError("review_states must be a tuple")
-        targets: set[tuple[str, int]] = set()
-        for state in self.review_states:
-            if not isinstance(state, RepoReviewState):
-                raise TypeError("review_states must contain RepoReviewState values")
-            target = (state.repo.lower(), state.pr_number)
-            if target in targets:
-                raise ValueError("duplicate pull-request scope target")
-            targets.add(target)
-
-    @property
-    def action_scopes(self) -> tuple[RepoPRActionScope, ...]:
-        return tuple(state.action_scope for state in self.review_states)
-
-    def resolve(self, repository: object, pull_request: object) -> RepoReviewState | None:
-        if (
-            not isinstance(repository, str)
-            or not repository
-            or not isinstance(pull_request, int)
-            or isinstance(pull_request, bool)
-        ):
-            return None
-        target = (repository.lower(), pull_request)
-        return next(
-            (
-                state for state in self.review_states
-                if (state.repo.lower(), state.pr_number) == target
-            ),
-            None,
-        )
-
-    def resolve_checkout_path(self, path: object) -> RepoReviewState | None:
-        """Resolve the active lease that exactly contains an absolute path."""
-        if not isinstance(path, (str, Path)):
-            return None
-        candidate = Path(path)
-        if not candidate.is_absolute() or ".." in candidate.parts:
-            return None
-        try:
-            resolved = candidate.resolve(strict=False)
-        except (OSError, RuntimeError):
-            return None
-
-        for state in self.review_states:
-            lease = state.checkout_lease
-            if (
-                lease is None
-                or not getattr(lease, "is_active", False)
-                or getattr(lease, "scope_id", None) != state.action_scope.scope_id
-                or getattr(lease, "owner", None) != state.action_scope.principal
-            ):
-                continue
-            try:
-                lease_root = Path(lease.lease_root).resolve(strict=True)
-                checkout = Path(lease.path).resolve(strict=True)
-                if checkout.parent != lease_root or checkout == lease_root:
-                    continue
-                resolved.relative_to(checkout)
-            except (OSError, RuntimeError, ValueError):
-                continue
-            return state
-        return None
-
-
-@dataclass(frozen=True)
-class RetainedFactoryScope:
-    """Server-derived authority for one retained factory incident."""
-
-    issue_id: int
-    signature: str
-    occurrence_id: str
-    run_id: str
-    attempt: int
-    session: str
-    repository: str
-    branch: str
-    sandbox: str
-    scope_id: str = field(init=False)
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.issue_id, int)
-            or isinstance(self.issue_id, bool)
-            or self.issue_id < 1
-            or not isinstance(self.attempt, int)
-            or isinstance(self.attempt, bool)
-            or self.attempt < 1
-            or any(
-                not isinstance(value, str) or not value or "\x00" in value
-                for value in (
-                    self.signature, self.occurrence_id, self.run_id, self.session,
-                    self.repository, self.branch, self.sandbox,
-                )
-            )
-            or not Path(self.sandbox).is_absolute()
-        ):
-            raise ValueError("retained factory scope identity is invalid")
-        authority = {
-            "issue_id": self.issue_id,
-            "signature": self.signature,
-            "occurrence_id": self.occurrence_id,
-            "run_id": self.run_id,
-            "attempt": self.attempt,
-            "session": self.session,
-            "repository": self.repository,
-            "branch": self.branch,
-            "sandbox": self.sandbox,
-        }
-        encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")).encode()
-        object.__setattr__(self, "scope_id", hashlib.sha256(encoded).hexdigest())
-
-    def resolve_path(self, path: object, *, strict: bool = False) -> Path | None:
-        """Resolve one absolute path inside this exact retained sandbox."""
-        if not isinstance(path, (str, Path)):
-            return None
-        candidate = Path(path)
-        if not candidate.is_absolute() or ".." in candidate.parts:
-            return None
-        try:
-            root = Path(self.sandbox).resolve(strict=True)
-            resolved = candidate.resolve(strict=strict)
-            relative = resolved.relative_to(root)
-        except (OSError, RuntimeError, ValueError):
-            return None
-        return resolved if relative.parts else None
-
-
-@dataclass
-class ServerDiscoveredPRStates:
-    """Per-turn cache of review states derived from live provider snapshots."""
-
-    _states: dict[tuple[str, int], RepoReviewState] = field(
-        default_factory=dict, init=False, repr=False,
-    )
-    _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
-    _remint_attempts: set[tuple[str, int]] = field(
-        default_factory=set, init=False, repr=False,
-    )
-    _refusals: dict[tuple[str, int], str] = field(
-        default_factory=dict, init=False, repr=False,
-    )
-    _escalation_states: dict[tuple[str, int], RepoReviewState] = field(
-        default_factory=dict, init=False, repr=False,
-    )
-
-    def remember_escalation_scope(self, scope: RepoPRActionScope) -> None:
-        """Retain invalidated authority only as context for a local diagnostic."""
-        with self._lock:
-            self._escalation_states[(scope.canonical_repo, scope.pr_number)] = RepoReviewState(scope)
-
-    def resolve_for_tool(
-        self, tool_name: str, repository: str, pull_request: int,
-    ) -> RepoReviewState | None:
-        state = self.resolve(repository, pull_request)
-        if state is None and tool_name == "unsupported_operation":
-            with self._lock:
-                return self._escalation_states.get((repository.lower(), pull_request))
-        return state
-
-    @property
-    def review_states(self) -> tuple[RepoReviewState, ...]:
-        """Every state discovered this turn.
-
-        Named to match RepoPRScopeRegistry.review_states so a caller holding
-        either scope carrier can enumerate it the same way.
-        """
-        with self._lock:
-            return tuple(self._states.values())
-
-    def resolve(self, repository: str, pull_request: int) -> RepoReviewState | None:
-        with self._lock:
-            return self._states.get((repository.lower(), pull_request))
-
-    def resolve_checkout_path(self, path: object) -> RepoReviewState | None:
-        """Apply the same exact-lease guards to a snapshot of discovered states."""
-        return RepoPRScopeRegistry(self.review_states).resolve_checkout_path(path)
-
-    def remember(self, state: RepoReviewState) -> RepoReviewState:
-        target = (state.repo.lower(), state.pr_number)
-        with self._lock:
-            return self._states.setdefault(target, state)
-
-    def refusal(self, repository: str, pull_request: int) -> str | None:
-        with self._lock:
-            return self._refusals.get((repository.lower(), pull_request))
-
-    def remember_refusal(
-        self, repository: str, pull_request: int, refusal: str,
-    ) -> str:
-        """Cache only failures that remain true after the resolving call completes."""
-        target = (repository.lower(), pull_request)
-        with self._lock:
-            return self._refusals.setdefault(target, refusal)
-
-    def begin_remint(self, repository: str, pull_request: int) -> bool:
-        """Reserve the sole live-snapshot remediation re-mint for a turn."""
-        target = (repository.lower(), pull_request)
-        with self._lock:
-            if target in self._remint_attempts:
-                return False
-            self._remint_attempts.add(target)
-            return True
-
-    def remember_remint(self, original: RepoReviewState, state: RepoReviewState) -> RepoReviewState:
-        """Install newly derived authority without altering the poller scope."""
-        target = (original.repo.lower(), original.pr_number)
-        replacement_target = (state.repo.lower(), state.pr_number)
-        if (
-            target != replacement_target
-            or original.action_scope.event_type not in {"pr_changes_requested_stale", "pr_ci_failure"}
-            or state.action_scope.event_type != original.action_scope.event_type
-            or state.action_scope.provenance != RepoPRScopeProvenance.SERVER_DISCOVERED
-        ):
-            raise ValueError("reminted review scope does not match original remediation target")
-        with self._lock:
-            if target not in self._remint_attempts:
-                raise ValueError("reminted review scope was not reserved")
-            return self._states.setdefault(target, state)
-
-
-@dataclass
-class ServerDiscoveredPRScopeStore:
-    """Agent-owned immutable scope snapshots available to later turns."""
-
-    _scopes: dict[tuple[str, int], RepoPRActionScope] = field(
-        default_factory=dict, init=False, repr=False,
-    )
-    _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
-
-    def resolve(
-        self, repository: object, pull_request: object,
-    ) -> RepoPRActionScope | None:
-        if (
-            not isinstance(repository, str)
-            or not repository
-            or not isinstance(pull_request, int)
-            or isinstance(pull_request, bool)
-        ):
-            return None
-        with self._lock:
-            return self._scopes.get((repository.lower(), pull_request))
-
-    def remember_server_discovery(self, scope: RepoPRActionScope) -> None:
-        """Record authority minted by a trusted server discovery path only."""
-        if (
-            not isinstance(scope, RepoPRActionScope)
-            or scope.provenance != RepoPRScopeProvenance.SERVER_DISCOVERED
-        ):
-            raise ValueError("only server-discovered pull-request scopes can be stored")
-        target = (scope.canonical_repo, scope.pr_number)
-        with self._lock:
-            self._scopes[target] = scope
-
-    def discard(
-        self,
-        repository: str,
-        pull_request: int,
-        *,
-        expected_scope: RepoPRActionScope,
-    ) -> None:
-        """Discard only the stale snapshot the caller actually checked."""
-        target = (repository.lower(), pull_request)
-        with self._lock:
-            if self._scopes.get(target) is expected_scope:
-                self._scopes.pop(target, None)
 
 
 @dataclass
@@ -1708,15 +1238,15 @@ class AuthContext(_AuthContextAuthoritySlot):
     )
     # Server-created immutable registry for all valid PR items in one trusted
     # poller payload. Each state carries its own monotonic checkout proof.
-    repo_pr_scope_registry: RepoPRScopeRegistry | None = field(
+    repo_pr_scope_registry: Any = field(
         default=None, repr=False, compare=False,
     )
     # Single-scope aliases retained for callers whose trusted event can only
     # carry one PR (notably server-discovered heartbeat turns).
-    repo_review_state: RepoReviewState | None = field(
+    repo_review_state: Any = field(
         default=None, repr=False, compare=False,
     )
-    repo_pr_action_scope: RepoPRActionScope | None = field(
+    repo_pr_action_scope: Any = field(
         default=None, repr=False, compare=False,
     )
     scoped_pr_grants: Any = field(default=None, repr=False, compare=False)
@@ -1725,15 +1255,13 @@ class AuthContext(_AuthContextAuthoritySlot):
     ci_branch_targets: frozenset[tuple[str, str, int | None]] = frozenset()
     # Standing review authority is resolved lazily from a live server fetch.
     # This cache is per turn and stores only immutable server-issued scopes.
-    server_discovered_pr_states: ServerDiscoveredPRStates = field(
-        default_factory=ServerDiscoveredPRStates, repr=False, compare=False,
-    )
+    server_discovered_pr_states: Any = field(default=None, repr=False, compare=False)
     # Agent-owned server provenance retained across turns. It contains only
     # immutable scopes, never mutable checkout state, and is not model input.
-    server_discovered_pr_scope_store: ServerDiscoveredPRScopeStore | None = field(
+    server_discovered_pr_scope_store: Any = field(
         default=None, repr=False, compare=False,
     )
-    retained_factory_scope: RetainedFactoryScope | None = field(
+    retained_factory_scope: Any = field(
         default=None, repr=False, compare=False,
     )
     retained_factory_scope_refusal: str | None = field(
@@ -1793,6 +1321,11 @@ class AuthContext(_AuthContextAuthoritySlot):
         object.__setattr__(self, "_audience_provider", audience_provider)
         policy = self._plugin_slot_policy
         if policy is not None and policy.frozen:
+            if object.__getattribute__(self, "server_discovered_pr_states") is None:
+                for protocol in policy.scoped_actions.values():
+                    constructors = getattr(protocol, "trusted_scope", None)
+                    if constructors is not None:
+                        object.__setattr__(self, "server_discovered_pr_states", constructors.discovered())
             slots = dict(self.plugin_slots)
             for owner, slot_type in policy.state_slots.items():
                 if owner not in policy.scoped_actions:

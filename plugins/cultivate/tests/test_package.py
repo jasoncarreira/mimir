@@ -110,7 +110,8 @@ def test_selected_provider_registers_its_coding_resources() -> None:
     assert len(repository) == 16
     assert len(forge) == 21
     assert repository.isdisjoint(forge)
-    assert core_runtime_names("coding") == ()
+    with pytest.raises(KeyError):
+        core_runtime_names("coding")
     coding = {"spawn_open_code", "worklink_run", "worklink_resume"} | repository | forge
     assert len(coding) == 40
     assert {name for name, tool in manager.policy.tools.items() if tool.owner == "cultivate"} == coding

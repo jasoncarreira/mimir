@@ -57,7 +57,7 @@ from ..pollers import (
     PollerOverridesValidationError,
     validate_poller_overrides_text,
 )
-from ..models import AuthContext, Integrity, IntegrityEffect, RetainedFactoryScope, TurnInteractivity
+from ..models import AuthContext, Integrity, IntegrityEffect, TurnInteractivity
 from ..scheduler import SchedulerJob
 from ..plugins.core import scoped_policy_call, selected_policy_registry
 
@@ -2458,8 +2458,7 @@ async def request_mimir_update(
 def all_mimir_tools(
     model_spec: str | None = None,
     *,
-    coding_enabled: bool = False,
-    require_coding_available: bool = True,
+    require_provider_available: bool = True,
     policy: "PolicyRegistry | None" = None,
     materialize_plugins: bool = True,
     unready_plugin_owners: frozenset[str] = frozenset(),
@@ -2474,11 +2473,9 @@ def all_mimir_tools(
     surface before the agent is constructed. Runtime callers may omit it and
     use ``MIMIR_MODEL_SPEC`` as before.
 
-    ``coding_enabled`` reflects the installed, selected coding provider's
-    surface. Runtime assembly validates all local coding prerequisites before
-    identity degradation can hide registration. Declarative inventory
-    checks may pass ``require_coding_available=False`` to enumerate the enabled
-    surface without probing ambient CLI availability.
+    Selected-owner assembly validates local prerequisites before identity
+    degradation can hide registration. Declarative inventory checks may pass
+    ``require_provider_available=False`` without probing ambient CLI availability.
 
     Web tools (Tavily ``web_search`` + ``fetch_url``) are appended
     only when the active LLM provider is not ``claude_code`` — Claude
@@ -2506,11 +2503,12 @@ def all_mimir_tools(
             tools.extend(materialize("web_search"))
         if fetch_url_on:
             tools.extend(materialize("fetch_url"))
-    if coding_enabled:
-        if require_coding_available:
+    selected_owner = getattr(registry.policy_consumer_hooks, "owner", None)
+    if selected_owner is not None:
+        if require_provider_available:
             missing = []
             for (owner, stage), hook in registry.turn_hooks.items():
-                if owner != "core" and stage == "startup_prerequisites" and owner not in unavailable_owners:
+                if owner == selected_owner and stage == "startup_prerequisites" and owner not in unavailable_owners:
                     missing.extend(hook())
             git = Path("/usr/bin/git")
             if not git.is_file() or not os.access(git, os.X_OK):
@@ -2542,14 +2540,9 @@ def all_mimir_tools(
                     "selected coding plugin prerequisites are missing:\n- "
                     + "\n- ".join(missing)
                 )
-        ready = True
-        for (owner, stage), hook in registry.turn_hooks.items():
-            if owner != "core" and stage == "tool_readiness" and hook() is False:
-                unavailable_owners.add(owner)
-                ready = False
-        coding_enabled = ready
-    if coding_enabled:
-        tools.extend(materialize("coding"))
+    for (owner, stage), hook in registry.turn_hooks.items():
+        if owner != "core" and stage == "tool_readiness" and hook() is False:
+            unavailable_owners.add(owner)
     existing = {tool.name for tool in tools}
     for declared in registry.tools.values() if materialize_plugins else ():
         if (declared.owner == "core" or declared.factory is None

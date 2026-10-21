@@ -6,8 +6,10 @@ import re
 
 import pytest
 
-from mimir.worklink.backends.feature_factory import FACTORY_VERSION
-from mimir.worklink.tool_pins import (
+pytest.importorskip("mimir_cultivate", reason="Worklink tool pins belong to Cultivate")
+
+from mimir_cultivate.worklink.backends.feature_factory import FACTORY_VERSION
+from mimir_cultivate.worklink.tool_pins import (
     OPENCODE_VERSION,
     default_tool_pins,
 )
@@ -99,6 +101,7 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     assert factory_arg is not None
     assert FACTORY_VERSION == pins["feature-factory"].pin == factory_arg.group(1)
     cultivate = install_sources["plugins/cultivate/mimir_cultivate/docker/base.sh"]
+    assert cultivate.splitlines()[1] == f"# factory-version: {FACTORY_VERSION}"
     assert "feature-factory@${FACTORY_VERSION}" in cultivate
     assert "opencode-feature-factory@${FACTORY_VERSION}" in cultivate
     try:
@@ -112,6 +115,7 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
         assert len(selected) == 1
         assert selected[0].name == "cultivate"
         fragment = cultivate_scripts(selected[0])["base.sh"]
+        assert fragment.splitlines()[1] == f"# factory-version: {pins['feature-factory'].pin}"
         assert f"opencode-ai@{pins['opencode'].pin}" in fragment
         for package in ("feature-factory", "opencode-feature-factory"):
             assert f"{package}@${{FACTORY_VERSION}}" in fragment

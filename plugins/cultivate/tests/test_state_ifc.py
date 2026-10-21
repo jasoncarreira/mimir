@@ -13,8 +13,9 @@ from langchain_core.messages import AIMessage
 from mimir import models
 from mimir.commitments import CommitmentRecord, CommitmentsStore, make_commitment_id
 from mimir._context import (
-    active_pr_checkout_lease_paths, reset_current_turn, set_current_turn,
+    reset_current_turn, set_current_turn,
 )
+from mimir_cultivate.scheduler import active_pr_checkout_lease_paths
 from mimir_cultivate import policy
 from mimir.plugins.manager import load_plugins
 from mimir.access_control import (
@@ -37,9 +38,31 @@ from tests.test_retained_checkout_readers import exercise_real_worklink_failure_
     "RepoPRScopeRegistry", "RepoReviewState", "RetainedFactoryScope",
     "ServerDiscoveredPRStates", "ServerDiscoveredPRScopeStore",
 ))
-def test_provider_coding_state_reexport_is_core_identity(name: str) -> None:
-    assert getattr(models, name) is getattr(policy, name)
-    assert getattr(policy, name).__module__ == models.__name__
+def test_provider_coding_state_is_defined_in_provider(name: str) -> None:
+    value = getattr(policy, name)
+    assert value.__module__ == "mimir_cultivate.policy"
+
+
+def test_provider_scope_refuses_unsupported_actions() -> None:
+    scope_fields = dict(
+        provenance="poller_payload", canonical_repo="owner/repo",
+        canonical_root="/tmp/repo", canonical_origin="https://github.com/owner/repo.git",
+        principal="owner", event_type="pr_review", pr_number=3,
+        head_repo="owner/repo", head_remote="origin", destination_ref="refs/heads/main",
+        observed_head_sha="a" * 40, base_ref="main", observed_base_sha="b" * 40,
+    )
+    with pytest.raises(ValueError, match="unsupported repo/PR action"):
+        policy.RepoPRActionScope(allowed_operations=frozenset({"unknown.action"}), **scope_fields)
+    scope = policy.RepoPRActionScope(
+        allowed_operations=frozenset({policy.RepoPRAction.INSPECT.value}), **scope_fields,
+    )
+    assert scope.scope_id == policy.RepoPRActionScope(
+        allowed_operations=frozenset({policy.RepoPRAction.INSPECT.value}), **scope_fields,
+    ).scope_id
+    state = policy.RepoReviewState(scope)
+    assert policy.RepoPRScopeRegistry((state,)).resolve("owner/repo", 3) is state
+    with pytest.raises(ValueError, match="duplicate pull-request scope target"):
+        policy.RepoPRScopeRegistry((state, state))
 
 
 def test_disabled_core_import_does_not_load_cultivate() -> None:

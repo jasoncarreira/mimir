@@ -1817,7 +1817,6 @@ async def test_startup_logs_effective_lease_read_scope(tmp_path, monkeypatch, en
             if kind == "filesystem_read_scope"
         ]
         assert payloads == [{
-            "coding_enabled": enabled,
             "derived_pr_checkout_read_roots": [str(root)] if enabled else [],
             "effective_non_admin_read_roots": [
                 str(path) for path in configured_non_admin_read_roots()

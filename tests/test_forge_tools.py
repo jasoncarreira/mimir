@@ -40,12 +40,11 @@ from mimir_cultivate.forge import (
 )
 from mimir.models import (
     AgentEvent, AuthContext, InformationFlowLabels, NormalizedPullRequestSnapshot,
-    RepoPRAction, RepoPRActionScope,
-    RepoPRScopeRegistry,
-    RepoReviewState,
-    ServerDiscoveredPRScopeStore,
-    ServerDiscoveredPRStates,
     SourceLabel,
+)
+from mimir_cultivate.policy import (
+    RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
+    ServerDiscoveredPRScopeStore, ServerDiscoveredPRStates,
 )
 from mimir.identities import IdentityResolver
 from mimir_cultivate.forge import (
@@ -1584,7 +1583,7 @@ def _runtime_for_scopes(*scopes: RepoPRActionScope) -> ToolRuntime[AuthContext]:
 
 @pytest.mark.parametrize("binary_override", [None, "/opt/custom/bin/chainlink"])
 def test_pr_spec_uses_only_evidence_and_projects_armed_description(tmp_path, monkeypatch, binary_override):
-    from mimir.worklink.continuation import issue_bound_to_pr
+    from mimir_cultivate.worklink.continuation import issue_bound_to_pr
 
     if binary_override is None:
         monkeypatch.delenv("CHAINLINK_BIN", raising=False)
@@ -3012,10 +3011,13 @@ def test_server_discovered_scope_is_reused_on_later_autonomous_turn(
         server_discovered_pr_scope_store=store,
     )
 
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
     handed = resolve_review_state_for_context(operator, "owner/repo", 1291)
-    reused = resolve_review_state_for_context(
-        _autonomous_context(tmp_path, store), "OWNER/REPO", 1291,
-    )
+    with policy_scope(core_policy_registry()):
+        reused = resolve_review_state_for_context(
+            _autonomous_context(tmp_path, store), "OWNER/REPO", 1291,
+        )
 
     assert handed.action_scope.provenance == "server_discovered"
     assert reused.action_scope is handed.action_scope
@@ -3057,11 +3059,14 @@ def test_autonomous_turn_cannot_resolve_model_named_unhanded_pr(
     client = FakeForge()
     _configure_live_review(monkeypatch, client)
 
-    with pytest.raises(ToolException) as refused:
-        resolve_review_state_for_context(
-            _autonomous_context(tmp_path, ServerDiscoveredPRScopeStore()),
-            "owner/repo", 1291,
-        )
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
+    with policy_scope(core_policy_registry()):
+        with pytest.raises(ToolException) as refused:
+            resolve_review_state_for_context(
+                _autonomous_context(tmp_path, ServerDiscoveredPRScopeStore()),
+                "owner/repo", 1291,
+            )
 
     assert str(refused.value) == (
         'pull-request operation rejected: requested repository="owner/repo", '
@@ -3089,8 +3094,11 @@ def test_heartbeat_git_fresh_own_pr_all_typed_actions(tmp_path, monkeypatch, ena
     service = access_control.builtin_trigger_service_principal("heartbeat", tmp_path)
     context = replace(context, service_authority=service)
     if not enabled:
-        with pytest.raises(ToolException, match="live scope discovery requires"):
-            resolve_review_state_for_context(context, "owner/repo", 17)
+        from mimir.plugins.core import core_policy_registry, policy_scope
+
+        with policy_scope(core_policy_registry()):
+            with pytest.raises(ToolException, match="live scope discovery requires"):
+                resolve_review_state_for_context(context, "owner/repo", 17)
         assert client.calls == []
         return
     request.getfixturevalue("selected_forge_policy")
@@ -3099,7 +3107,9 @@ def test_heartbeat_git_fresh_own_pr_all_typed_actions(tmp_path, monkeypatch, ena
 
     state = resolve_review_state_for_context(context, "OWNER/REPO", 17)
     scope = state.action_scope
-    assert scope.allowed_operations == access_control._REPO_PR_REMEDIATION_ACTIONS
+    from mimir_cultivate.policy import _REMEDIATION_ACTIONS
+
+    assert scope.allowed_operations == _REMEDIATION_ACTIONS
     assert scope.event_type == "heartbeat_pr_maintenance"
     assert scope.destination_ref == "refs/heads/server-head"
     assert scope.observed_head_sha == "c" * 40
@@ -3162,7 +3172,10 @@ def test_heartbeat_git_refuses_incompatible_cached_scope_without_mutation(
         with pytest.raises(ToolPolicyRefusal, match="^heartbeat_scope_incompatible:"):
             resolve_review_state_for_context(context, "owner/repo", 17)
     else:
-        assert resolve_review_state_for_context(context, "owner/repo", 17) is previous
+        from mimir.plugins.core import core_policy_registry, policy_scope
+
+        with policy_scope(core_policy_registry()):
+            assert resolve_review_state_for_context(context, "owner/repo", 17) is previous
     assert carrier.resolve("owner/repo", 17) is previous
     assert previous.action_scope is scope
     assert previous.checkout_lease is lease
@@ -3461,13 +3474,15 @@ def test_advanced_head_invalidates_reuse_and_is_not_rechecked_this_turn(
     )
     resolve_review_state_for_context(operator, "owner/repo", 1291)
     autonomous = _autonomous_context(tmp_path, store)
+    from mimir.plugins.core import core_policy_registry, policy_scope
 
-    for _ in range(2):
-        with pytest.raises(ToolException) as refused:
-            resolve_review_state_for_context(autonomous, "owner/repo", 1291)
-        assert 'repository="owner/repo", pull_request=1291' in str(refused.value)
-        assert "head advanced" in str(refused.value)
-        assert "discovery not permitted" in str(refused.value)
+    with policy_scope(core_policy_registry()):
+        for _ in range(2):
+            with pytest.raises(ToolException) as refused:
+                resolve_review_state_for_context(autonomous, "owner/repo", 1291)
+            assert 'repository="owner/repo", pull_request=1291' in str(refused.value)
+            assert "head advanced" in str(refused.value)
+            assert "discovery not permitted" in str(refused.value)
 
     assert client.calls == [
         ("snapshot", "owner/repo", 1291),
@@ -3570,9 +3585,17 @@ async def test_invalid_stored_scope_refuses_reads_and_gates_typed_escalation(
         server_discovered_pr_scope_store=store,
     )
     runtime = Runtime(context=context)
+    from contextlib import nullcontext
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
+    def selection():
+        return (policy_scope(core_policy_registry())
+                if invalid in {"fetch-denied", "accept-denied"} else nullcontext())
+
     for _ in range(2):
-        with pytest.raises(ToolException, match=reason):
-            pr_metadata.func(repository="owner/repo", pull_request=1291, runtime=runtime)
+        with selection():
+            with pytest.raises(ToolException, match=reason):
+                pr_metadata.func(repository="owner/repo", pull_request=1291, runtime=runtime)
     assert store.resolve("owner/repo", 1291) is None
     cache = context.server_discovered_pr_states
     assert cache.resolve("owner/repo", 1291) is None
@@ -3585,22 +3608,25 @@ async def test_invalid_stored_scope_refuses_reads_and_gates_typed_escalation(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     events = []
     monkeypatch.setattr("mimir.event_logger.log_durable_event_sync", lambda *a, **kw: events.append(kw))
+    escalation_runtime = Runtime(context=(
+        _poller_context(tmp_path, store) if invalid == "fetch-denied" else context
+    ))
     request = ToolCallRequest(
         tool_call={"name": "unsupported_operation", "args": {
             "repository": "owner/repo", "pull_request": 1291,
             "description": "PR reads refused", "attempted_operations": ["pr_metadata"],
         }, "id": "escalate", "type": "tool_call"},
-        tool=None, state=None, runtime=runtime,
+        tool=None, state=None, runtime=escalation_runtime,
     )
 
     async def handler(request):
-        result = unsupported_operation.func(**request.tool_call["args"], runtime=runtime)
+        result = unsupported_operation.func(**request.tool_call["args"], runtime=escalation_runtime)
         return ToolMessage(content=json.dumps(result), tool_call_id="escalate")
 
     result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
     if invalid in {"fetch-denied", "accept-denied"}:
         assert result.status == "error"
-        assert "cross_channel_scope" in str(result.content)
+        assert ("channel_target_required" if invalid == "fetch-denied" else "cross_channel_scope") in str(result.content)
         assert events == []
     else:
         assert result.status != "error", result.content
@@ -3608,8 +3634,9 @@ async def test_invalid_stored_scope_refuses_reads_and_gates_typed_escalation(
         assert events[0]["scope_id"] == old.scope_id
         assert events[0]["repository"] == "owner/repo"
         assert events[0]["pull_request"] == 1291
-    with pytest.raises(ToolException, match=reason):
-        pr_metadata.func(repository="owner/repo", pull_request=1291, runtime=runtime)
+    with selection():
+        with pytest.raises(ToolException, match=reason):
+            pr_metadata.func(repository="owner/repo", pull_request=1291, runtime=runtime)
     assert client.calls == [("snapshot", "owner/repo", 1291)] * 2
 
 
@@ -3628,7 +3655,7 @@ async def test_scope_handed_to_second_turn_still_requires_checkout_grant(
     )
     resolve_review_state_for_context(operator, "owner/repo", 1291)
     autonomous = replace(
-        _autonomous_context(tmp_path, store),
+        _poller_context(tmp_path, store),
         enforcement_enabled=True,
         ifc_labels=InformationFlowLabels(),
     )
@@ -3734,17 +3761,21 @@ def test_real_turn_kind_forge_review_scope_policy(
     if turn_kind == "scheduled_tick":
         monkeypatch.setenv("MIMIR_PLUGINS", "")
     context = _production_auth_context(tmp_path, turn_kind)
+    from contextlib import nullcontext
+    from mimir.plugins.core import core_policy_registry, policy_scope
 
-    actual = (
-        access_control.can_resolve_forge_review_scope(context, stage="stored"),
-        access_control.can_resolve_forge_review_scope(context, stage="fetch"),
-        access_control.can_resolve_forge_review_scope(
-            context, stage="accept", pr_author="reviewer", self_login="reviewer",
-        ),
-        access_control.can_resolve_forge_review_scope(
-            context, stage="accept", pr_author="third-party", self_login="reviewer",
-        ),
-    )
+    scope = policy_scope(core_policy_registry()) if turn_kind == "scheduled_tick" else nullcontext()
+    with scope:
+        actual = (
+            access_control.can_resolve_forge_review_scope(context, stage="stored"),
+            access_control.can_resolve_forge_review_scope(context, stage="fetch"),
+            access_control.can_resolve_forge_review_scope(
+                context, stage="accept", pr_author="reviewer", self_login="reviewer",
+            ),
+            access_control.can_resolve_forge_review_scope(
+                context, stage="accept", pr_author="third-party", self_login="reviewer",
+            ),
+        )
 
     assert actual == expected
 

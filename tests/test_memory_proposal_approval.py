@@ -21,7 +21,7 @@ from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent
 from mimir.saga.client import SagaStore
 from mimir.turn_event_bus import TurnEventEmitter
-from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY, HTTP_EVENT_INGRESS_EXTRA_VALUE
+from mimir.http_ingress import HTTP_EVENT_INGRESS_EXTRA_KEY, HTTP_EVENT_INGRESS_EXTRA_VALUE
 
 
 @pytest.fixture

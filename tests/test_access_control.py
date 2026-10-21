@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import builtins
+import importlib.util
 import json
 import sys
 import os
@@ -52,14 +53,16 @@ from mimir.models import (
     Integrity,
     IntegrityEffect,
     NormalizedPullRequestSnapshot,
-    RepoPRActionScope,
-    RepoPRScopeRegistry,
-    RepoReviewState,
     SessionACL,
     SourceLabel,
     TurnContext,
     TurnInteractivity,
 )
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.policy import (
+        RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry,
+        RepoReviewState, ServerDiscoveredPRStates, _REMEDIATION_ACTIONS, _REVIEW_ACTIONS,
+    )
 from mimir.tool_descriptors import TOOL_DESCRIPTORS
 
 
@@ -482,6 +485,7 @@ def test_validated_arguments_diagnostic_failure_does_not_change_refusal(
 
 
 def _review_state(repo: str, number: int, branch: str, root: str) -> RepoReviewState:
+    pytest.importorskip("mimir_cultivate", reason="PR review scope belongs to Cultivate")
     return RepoReviewState(RepoPRActionScope(
         provenance="poller_payload",
         canonical_repo=repo,
@@ -489,7 +493,7 @@ def _review_state(repo: str, number: int, branch: str, root: str) -> RepoReviewS
         canonical_origin=f"https://github.com/{repo}.git",
         principal="mimir-bot",
         event_type="pr_changes_requested_stale",
-        allowed_operations=frozenset(action.value for action in access_control.RepoPRAction),
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
         pr_number=number,
         head_repo=repo,
         head_remote="origin",
@@ -2774,8 +2778,7 @@ def test_maximal_model_tool_inventory_has_total_protected_result_partition(
     names = {
         *(tool.name for tool in all_mimir_tools(
             model_spec="openai:test",
-            coding_enabled=True,
-            require_coding_available=False,
+            require_provider_available=False,
         )),
         *access_control._deepagents_builtin_tool_names(),
     }
@@ -7807,7 +7810,9 @@ async def test_github_fetch_url_metadata_has_no_trusted_provenance_and_cache_rea
 
 
 @pytest.fixture
-def github_activity_fetch_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AuthContext:
+def github_activity_fetch_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_repository_policy,
+) -> AuthContext:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setenv("GITHUB_REPOS", "o/r,o/other")
     monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
@@ -7880,8 +7885,6 @@ def test_github_activity_remediation_fetch_refuses_original_url_parse_mismatch(
 
 
 def test_github_activity_review_fetch_refuses_ambiguous_scope(github_activity_fetch_auth: AuthContext) -> None:
-    from mimir.models import RepoPRScopeRegistry
-
     state = github_activity_fetch_auth.repo_review_state
     auth = replace(github_activity_fetch_auth, repo_pr_scope_registry=RepoPRScopeRegistry((
         state, _review_state("o/r", 43, "worklink/43", state.action_scope.canonical_root),
@@ -7911,7 +7914,7 @@ def test_github_activity_ordinary_review_scope_preserves_review_fetch(
     scope = replace(
         github_activity_fetch_auth.repo_review_state.action_scope,
         event_type="pr_opened", checkout_ref="refs/pull/42/head",
-        pull_request_author="contributor", allowed_operations=access_control._REPO_PR_REVIEW_ACTIONS,
+        pull_request_author="contributor", allowed_operations=_REVIEW_ACTIONS,
     )
     auth = replace(github_activity_fetch_auth, repo_review_state=RepoReviewState(scope))
     _assert_activity_fetch(auth, "https://raw.githubusercontent.com/o/r/main/README.md", True)
@@ -7934,8 +7937,6 @@ def test_github_activity_review_fetch_requires_capability(github_activity_fetch_
 def test_github_activity_actions_fetch_requires_trusted_remediation_scope(
     github_activity_fetch_auth: AuthContext, scope_kind: str,
 ) -> None:
-    from mimir.models import RepoPRScopeRegistry
-
     auth = github_activity_fetch_auth
     state = auth.repo_review_state
     if scope_kind == "missing":
@@ -7947,7 +7948,7 @@ def test_github_activity_actions_fetch_requires_trusted_remediation_scope(
     else:
         changes = {
             "review": {"checkout_ref": "refs/pull/42/head"},
-            "read-only": {"allowed_operations": access_control._REPO_PR_REVIEW_ACTIONS},
+            "read-only": {"allowed_operations": _REVIEW_ACTIONS},
             "foreign-author": {"pull_request_author": "someone-else"},
             "fork": {"head_repo": "other/r"},
             "remote": {"head_remote": "source"},
@@ -9241,6 +9242,7 @@ def test_dynamic_trigger_write_denies_symlinked_protected_paths(
         "git diff --stat HEAD~1",
     ],
 )
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_review_shell_profile_admits_local_inspection_commands(
     command: str,
     repo_review_git_root: Path,
@@ -9280,6 +9282,7 @@ def test_repo_review_shell_profile_admits_local_inspection_commands(
         ("git rev-list --count HEAD", "rev-list", []),
     ],
 )
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_review_git_admits_named_inspection_shapes_with_hardened_argv(
     command: str,
     subcommand: str,
@@ -9310,6 +9313,7 @@ def test_repo_review_git_admits_named_inspection_shapes_with_hardened_argv(
     assert argv[subcommand_index + 1:subcommand_index + 1 + len(safety_options)] == safety_options
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_review_commands_agree_for_host_and_contained_git_identity(
     repo_review_git_root: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -9355,6 +9359,7 @@ def test_repo_review_commands_agree_for_host_and_contained_git_identity(
 
 @pytest.mark.parametrize("global_option", ["--no-ext-diff", "--no-pager"])
 @pytest.mark.parametrize("subcommand", ["diff", "log", "show"])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_review_git_admits_restrictive_global_options_before_c(
     global_option: str,
     subcommand: str,
@@ -9418,6 +9423,7 @@ def test_read_only_git_profiles_refuse_global_config_injection(
         "git rev-list --count HEAD --output=/tmp/count",
     ],
 )
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_review_git_retains_execution_and_write_capable_refusals(
     command: str,
     repo_review_git_root: Path,
@@ -9467,6 +9473,7 @@ def test_repo_review_git_retains_execution_and_write_capable_refusals(
     "chainlink issue show 7 --json", "chainlink issue close 7",
     "/usr/local/bin/chainlink issue show 7 --json",
 ])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_review_cutover_refuses_legacy_forms_at_admission_and_binding(
     tool_name: str, command_template: str, repo_review_state: RepoReviewState,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -9526,7 +9533,7 @@ def test_repo_review_local_inspection_requires_explicit_inspect_authority(
     else:
         state = RepoReviewState(replace(
             state.action_scope,
-            allowed_operations=state.action_scope.allowed_operations - {access_control.RepoPRAction.INSPECT.value},
+            allowed_operations=state.action_scope.allowed_operations - {RepoPRAction.INSPECT.value},
         ))
     argv, reason, rule = access_control.parse_service_shell_argv_with_diagnostics(
         "git status", "repo_review", review_state=state,
@@ -9742,6 +9749,7 @@ def test_repo_review_diff_neutralizes_effective_filters_in_real_execution(
     assert marker.exists()
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_review_git_inspection_suppresses_hostile_repository_helpers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10294,7 +10302,7 @@ def test_github_poller_binds_review_scope_from_server_event_and_origin(
     assert auth.repo_review_state.root == str(root.resolve())
     assert auth.repo_pr_action_scope is auth.repo_review_state.action_scope
     assert auth.repo_pr_action_scope.provenance == "poller_payload"
-    assert access_control.RepoPRAction.WRITE.value in (
+    assert RepoPRAction.WRITE.value in (
         auth.repo_pr_action_scope.allowed_operations
     )
 
@@ -10335,9 +10343,9 @@ def test_replayed_github_poller_payload_cannot_mint_repo_pr_scope(
 
     assert live_scope is not None
     assert {
-        access_control.RepoPRAction.WRITE.value,
-        access_control.RepoPRAction.COMMIT.value,
-        access_control.RepoPRAction.PUSH.value,
+        RepoPRAction.WRITE.value,
+        RepoPRAction.COMMIT.value,
+        RepoPRAction.PUSH.value,
     } <= live_scope.allowed_operations
     assert replayed_scope is None
 
@@ -10392,6 +10400,7 @@ def _github_poller_auth(
 
 @pytest.mark.parametrize("path", ["review", "heartbeat", "poller"])
 @pytest.mark.parametrize("verdict", [False, None, 1, "yes", "missing"])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_outsider_pr_scope_requires_exact_attestation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, verdict: object,
 ) -> None:
@@ -10438,6 +10447,7 @@ def test_outsider_pr_scope_requires_exact_attestation(
     assert withheld[1]["count"] == 1
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_poller_collaborator_scope_needs_forwarded_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10448,6 +10458,7 @@ def test_poller_collaborator_scope_needs_forwarded_verdict(
     assert scope.pull_request_author == "collaborator"
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_fresh_changes_requested_review_mints_remediation_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10464,28 +10475,28 @@ def test_fresh_changes_requested_review_mints_remediation_authority(
     registry = ToolRegistry()
     arguments = {"repository": "o/r", "pull_request": 42}
     for tool_name, action in (
-        ("repo_commit", access_control.RepoPRAction.COMMIT),
-        ("repo_push", access_control.RepoPRAction.PUSH),
+        ("repo_commit", RepoPRAction.COMMIT),
+        ("repo_push", RepoPRAction.PUSH),
     ):
         assert action.value in scope.allowed_operations
         decision = registry.authorize_tool(
             tool_name, auth, enforce=True, arguments=arguments,
         )
         assert decision.allowed is False
-        assert decision.reason == "unknown_sink_category"
+        assert decision.reason == "repo_pr_grant_denied"
 
     before = _github_poller_auth(
         authority, {**item, "state": "COMMENTED"},
     )
     assert before.repo_pr_action_scope is not None
-    assert access_control.RepoPRAction.COMMIT.value not in before.repo_pr_action_scope.allowed_operations
-    assert access_control.RepoPRAction.PUSH.value not in before.repo_pr_action_scope.allowed_operations
+    assert RepoPRAction.COMMIT.value not in before.repo_pr_action_scope.allowed_operations
+    assert RepoPRAction.PUSH.value not in before.repo_pr_action_scope.allowed_operations
     for tool_name in ("repo_commit", "repo_push"):
         decision = registry.authorize_tool(
             tool_name, before, enforce=True, arguments=arguments,
         )
         assert decision.allowed is False
-        assert decision.reason == "unknown_sink_category"
+        assert decision.reason == "repo_pr_grant_denied"
 
 
 @pytest.mark.parametrize(
@@ -10497,6 +10508,7 @@ def test_fresh_changes_requested_review_mints_remediation_authority(
     ],
     ids=["conversation-comment", "commented-review", "review-comment"],
 )
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_trusted_collaborator_comment_on_own_open_pr_mints_remediation_authority(
     event_type: str,
     state: str | None,
@@ -10516,7 +10528,7 @@ def test_trusted_collaborator_comment_on_own_open_pr_mints_remediation_authority
     scope = auth.repo_pr_action_scope
 
     assert scope is not None
-    assert scope.allowed_operations == access_control._REPO_PR_REMEDIATION_ACTIONS
+    assert scope.allowed_operations == _REMEDIATION_ACTIONS
     registry = ToolRegistry()
     arguments = {"repository": "o/r", "pull_request": 42}
     for tool_name in ("repo_commit", "repo_push"):
@@ -10524,7 +10536,7 @@ def test_trusted_collaborator_comment_on_own_open_pr_mints_remediation_authority
             tool_name, auth, enforce=True, arguments=arguments,
         )
         assert not decision.allowed
-        assert decision.reason == "unknown_sink_category"
+        assert decision.reason == "repo_pr_grant_denied"
 
     assert auth.repo_review_state is not None
     checkout = _attach_test_checkout_lease(
@@ -10555,6 +10567,7 @@ def test_trusted_collaborator_comment_on_own_open_pr_mints_remediation_authority
         "non-commented-review",
     ],
 )
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_comment_remediation_guards_remain_review_only(
     change: str,
     value: object,
@@ -10576,7 +10589,7 @@ def test_comment_remediation_guards_remain_review_only(
         assert scope is None
     else:
         assert scope is not None
-        assert scope.allowed_operations == access_control._REPO_PR_REVIEW_ACTIONS
+        assert scope.allowed_operations == _REVIEW_ACTIONS
 
 
 @pytest.mark.parametrize(
@@ -10613,6 +10626,7 @@ def test_fresh_changes_requested_remediation_applies_every_write_guard(
 
 
 @pytest.mark.parametrize("event_type", ["pr_opened", "pr_review_comment"])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_non_review_events_remain_review_only_for_self_authored_pr(
     event_type: str,
     tmp_path: Path,
@@ -10624,8 +10638,8 @@ def test_non_review_events_remain_review_only_for_self_authored_pr(
     scope = _github_poller_auth(authority, item).repo_pr_action_scope
 
     assert scope is not None
-    assert access_control.RepoPRAction.COMMIT.value not in scope.allowed_operations
-    assert access_control.RepoPRAction.PUSH.value not in scope.allowed_operations
+    assert RepoPRAction.COMMIT.value not in scope.allowed_operations
+    assert RepoPRAction.PUSH.value not in scope.allowed_operations
 
 
 @pytest.mark.parametrize(
@@ -11399,6 +11413,7 @@ def _attach_test_checkout_lease(
         ("file_search", lambda path: {"path_prefix": str(path), "scope": "all"}),
     ],
 )
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_github_service_read_scope_includes_only_its_active_checkout_lease(
     tool_name: str,
     arguments,
@@ -11491,6 +11506,7 @@ def test_github_service_read_scope_includes_only_its_active_checkout_lease(
     assert released.reason == "read_scope"
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_checkout_lease_read_scope_does_not_bypass_protected_content_veto(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11537,6 +11553,7 @@ def test_checkout_lease_read_scope_does_not_bypass_protected_content_veto(
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_heartbeat_maintenance_file_sink_is_confined_to_exact_active_lease(
     tool_name: str,
     tmp_path: Path,
@@ -11595,11 +11612,14 @@ def test_heartbeat_maintenance_file_sink_is_confined_to_exact_active_lease(
         assert denied.reason == "repo_pr_target_outside_active_lease"
 
     # Without the selected provider the heartbeat never reaches the gate.
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
     monkeypatch.setenv("MIMIR_PLUGINS", "")
-    unflagged = registry.authorize_tool(
-        tool_name, auth, enforce=True,
-        target_channel=str(checkout / "mimir" / "access_control.py"),
-    )
+    with policy_scope(core_policy_registry()):
+        unflagged = registry.authorize_tool(
+            tool_name, auth, enforce=True,
+            target_channel=str(checkout / "mimir" / "access_control.py"),
+        )
     assert unflagged.allowed is False
 
 
@@ -11623,8 +11643,8 @@ def test_heartbeat_maintenance_file_sink_requires_the_scope_write_grant(
     state = _review_state("o/r", 42, "worklink/42", str(source))
     state.action_scope.__dict__["event_type"] = "heartbeat_pr_maintenance"
     state.action_scope.__dict__["allowed_operations"] = frozenset(
-        action.value for action in access_control.RepoPRAction
-        if action is not access_control.RepoPRAction.WRITE
+        action.value for action in RepoPRAction
+        if action is not RepoPRAction.WRITE
     )
     checkout = _attach_test_checkout_lease(
         state, lease_root, f"{state.action_scope.scope_id[:16]}-lease-a",
@@ -11647,6 +11667,7 @@ def test_heartbeat_maintenance_file_sink_requires_the_scope_write_grant(
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file", "replace_file"])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_github_remediation_file_sink_is_confined_to_exact_active_lease(
     tool_name: str,
     tmp_path: Path,
@@ -11712,10 +11733,11 @@ def test_github_remediation_file_sink_is_confined_to_exact_active_lease(
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file", "replace_file"])
 @pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_file_writes_resolve_payload_and_server_discovered_leases(
     tool_name: str, enforce: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.models import ServerDiscoveredPRStates
+    from mimir_cultivate.policy import ServerDiscoveredPRStates
 
     home = tmp_path / "home"
     home.mkdir()
@@ -11796,10 +11818,11 @@ def test_file_writes_resolve_payload_and_server_discovered_leases(
 
 
 @pytest.mark.parametrize("provenance", ["poller_payload", "server_discovered"])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_checkout_path_resolution_requires_exact_active_lease(
     provenance: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.models import ServerDiscoveredPRStates
+    from mimir_cultivate.policy import ServerDiscoveredPRStates
 
     state = RepoReviewState(replace(
         _review_state("o/r", 42, "worklink/42", str(tmp_path)).action_scope,
@@ -11853,14 +11876,14 @@ def test_github_review_scope_cannot_write_inside_its_active_lease(
         remediation.action_scope,
         event_type="pr_review_requested",
         allowed_operations=frozenset({
-            access_control.RepoPRAction.INSPECT.value,
-            access_control.RepoPRAction.CHECKOUT.value,
-            access_control.RepoPRAction.TEST.value,
-            access_control.RepoPRAction.PR_REVIEW.value,
-            access_control.RepoPRAction.PR_COMMENT.value,
+            RepoPRAction.INSPECT.value,
+            RepoPRAction.CHECKOUT.value,
+            RepoPRAction.TEST.value,
+            RepoPRAction.PR_REVIEW.value,
+            RepoPRAction.PR_COMMENT.value,
         }),
     )
-    assert access_control.RepoPRAction.WRITE.value not in review_scope.allowed_operations
+    assert RepoPRAction.WRITE.value not in review_scope.allowed_operations
     state = RepoReviewState(review_scope)
     checkout = _attach_test_checkout_lease(
         state, lease_root, f"{review_scope.scope_id[:16]}-review",
@@ -11954,6 +11977,7 @@ def test_batched_pr_reads_resolve_each_exact_checkout_lease(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("selector", ["git-c", "restrictive-options", "cwd"])
+@pytest.mark.usefixtures("selected_repository_policy")
 async def test_batched_pr_shell_commands_bind_each_exact_checkout_lease(
     selector: str,
     tmp_path: Path,
@@ -12025,6 +12049,7 @@ async def test_batched_pr_shell_commands_bind_each_exact_checkout_lease(
     "chainlink issue delete 42", "contract-cli --help",
     "chainlink --help=private-value --private-option private-operand",
 ])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_service_shell_non_repository_refusal_ignores_review_state_count(
     command: str, tmp_path: Path,
 ) -> None:
@@ -12106,6 +12131,7 @@ def test_service_shell_non_repository_refusal_ignores_review_state_count(
         assert reason is not None and "several checkout leases" in reason
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_review_gh_pr_number_cannot_select_a_batched_shell_state(
     tmp_path: Path,
 ) -> None:
@@ -12161,6 +12187,7 @@ def test_poller_scope_drops_conflicting_snapshots_for_same_pr(
         assert decision.reason == "unknown_sink_category"
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_write_authority_is_resolved_per_pr_without_scope_union(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -12189,10 +12216,10 @@ def test_repo_write_authority_is_resolved_per_pr_without_scope_union(
     review_scope = auth.repo_pr_scope_registry.resolve("o/r", 42).action_scope
     remediation_scope = auth.repo_pr_scope_registry.resolve("o/r", 43).action_scope
     assert review_scope is not remediation_scope
-    assert access_control.RepoPRAction.COMMIT.value not in review_scope.allowed_operations
-    assert access_control.RepoPRAction.COMMIT.value in remediation_scope.allowed_operations
-    assert access_control.RepoPRAction.PUSH.value not in review_scope.allowed_operations
-    assert access_control.RepoPRAction.PUSH.value in remediation_scope.allowed_operations
+    assert RepoPRAction.COMMIT.value not in review_scope.allowed_operations
+    assert RepoPRAction.COMMIT.value in remediation_scope.allowed_operations
+    assert RepoPRAction.PUSH.value not in review_scope.allowed_operations
+    assert RepoPRAction.PUSH.value in remediation_scope.allowed_operations
     for tool_name in ("repo_commit", "repo_push"):
         first = registry.authorize_tool(
             tool_name, auth, enforce=True,
@@ -12203,9 +12230,9 @@ def test_repo_write_authority_is_resolved_per_pr_without_scope_union(
             arguments={"repository": "o/r", "pull_request": 43},
         )
         assert first.allowed is False
-        assert first.reason == "unknown_sink_category"
+        assert first.reason == "repo_pr_grant_denied"
         assert second.allowed is False
-        assert second.reason == "unknown_sink_category"
+        assert second.reason == "repo_pr_grant_denied"
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
@@ -12225,17 +12252,17 @@ def test_repo_pr_scope_is_frozen_deterministic_and_auditable(
     assert first.scope_id == second.scope_id
     assert first.canonical_origin == "git@github.com:o/r.git"
     assert first.allowed_operations == frozenset({
-        access_control.RepoPRAction.INSPECT.value,
-            access_control.RepoPRAction.CHECKOUT.value,
-            access_control.RepoPRAction.TEST.value,
-        access_control.RepoPRAction.WRITE.value,
-        access_control.RepoPRAction.COMMIT.value,
-        access_control.RepoPRAction.PUSH.value,
-        access_control.RepoPRAction.PR_COMMENT.value,
-        access_control.RepoPRAction.PR_EDIT.value,
-        access_control.RepoPRAction.PR_REREQUEST.value,
+        RepoPRAction.INSPECT.value,
+            RepoPRAction.CHECKOUT.value,
+            RepoPRAction.TEST.value,
+        RepoPRAction.WRITE.value,
+        RepoPRAction.COMMIT.value,
+        RepoPRAction.PUSH.value,
+        RepoPRAction.PR_COMMENT.value,
+        RepoPRAction.PR_EDIT.value,
+        RepoPRAction.PR_REREQUEST.value,
     })
-    assert access_control.RepoPRAction.PR_REVIEW.value not in first.allowed_operations
+    assert RepoPRAction.PR_REVIEW.value not in first.allowed_operations
     with pytest.raises(FrozenInstanceError):
         first.destination_ref = "refs/heads/main"
     registry = create_auth_context(event, enforce=True).repo_pr_scope_registry
@@ -12285,6 +12312,7 @@ def test_repo_binding_startup_alert_names_only_configured_probed_roots(
     },)
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfork_pr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -12313,8 +12341,8 @@ def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfor
         "o/r", pr, event_type="pr_mergeability_conflicting",
     )
     assert conflict_scope is not None
-    assert access_control.RepoPRAction.COMMIT.value in conflict_scope.allowed_operations
-    assert access_control.RepoPRAction.PUSH.value in conflict_scope.allowed_operations
+    assert RepoPRAction.COMMIT.value in conflict_scope.allowed_operations
+    assert RepoPRAction.PUSH.value in conflict_scope.allowed_operations
     for change in (
         {"state": "closed"},
         {"author": "someone-else"},
@@ -12329,14 +12357,15 @@ def test_heartbeat_scope_is_only_issued_for_live_configured_self_authored_nonfor
     )
     assert review is not None
     assert review.allowed_operations == frozenset({
-        access_control.RepoPRAction.INSPECT.value,
-        access_control.RepoPRAction.CHECKOUT.value,
-        access_control.RepoPRAction.TEST.value,
-        access_control.RepoPRAction.PR_REVIEW.value,
-        access_control.RepoPRAction.PR_COMMENT.value,
+        RepoPRAction.INSPECT.value,
+        RepoPRAction.CHECKOUT.value,
+        RepoPRAction.TEST.value,
+        RepoPRAction.PR_REVIEW.value,
+        RepoPRAction.PR_COMMENT.value,
     })
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_server_discovered_changes_requested_review_mints_remediation_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -12358,14 +12387,14 @@ def test_server_discovered_changes_requested_review_mints_remediation_authority(
     assert scope is not None
     assert resolution.scope == scope
     assert scope.provenance == "server_discovered"
-    assert access_control.RepoPRAction.COMMIT.value in scope.allowed_operations
-    assert access_control.RepoPRAction.PUSH.value in scope.allowed_operations
+    assert RepoPRAction.COMMIT.value in scope.allowed_operations
+    assert RepoPRAction.PUSH.value in scope.allowed_operations
     ordinary = access_control.resolve_server_discovered_review_scope(
         "o/r", pr, review_state="APPROVED",
     ).scope
     assert ordinary is not None
-    assert access_control.RepoPRAction.COMMIT.value not in ordinary.allowed_operations
-    assert access_control.RepoPRAction.PUSH.value not in ordinary.allowed_operations
+    assert RepoPRAction.COMMIT.value not in ordinary.allowed_operations
+    assert RepoPRAction.PUSH.value not in ordinary.allowed_operations
     for change in (
         {"author": "someone-else"},
         {"head_repo": "fork/r"},
@@ -12375,8 +12404,8 @@ def test_server_discovered_changes_requested_review_mints_remediation_authority(
             "o/r", replace(pr, **change), review_state="CHANGES_REQUESTED",
         ).scope
         if guarded is not None:
-            assert access_control.RepoPRAction.COMMIT.value not in guarded.allowed_operations
-            assert access_control.RepoPRAction.PUSH.value not in guarded.allowed_operations
+            assert RepoPRAction.COMMIT.value not in guarded.allowed_operations
+            assert RepoPRAction.PUSH.value not in guarded.allowed_operations
 
 
 def test_heartbeat_scope_rejects_raw_provider_payload(
@@ -12397,6 +12426,7 @@ def test_heartbeat_scope_rejects_raw_provider_payload(
     ) is None
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_every_service_shell_profile_returns_absolute_executables(
     maintenance_git_home: Path,
     repo_review_git_root: Path,
@@ -18880,8 +18910,8 @@ def test_pr_edit_body_selected_catalog_mirrors_comment() -> None:
     catalog = access_control.get_operation_catalog()
     policy = selected_policy_registry()
     for operation, action in (
-        ("pr_comment", access_control.RepoPRAction.PR_COMMENT),
-        ("pr_edit_body", access_control.RepoPRAction.PR_EDIT),
+        ("pr_comment", RepoPRAction.PR_COMMENT),
+        ("pr_edit_body", RepoPRAction.PR_EDIT),
     ):
         assert catalog.get_decision(operation) is OperationDecision.RESOURCE_SCOPED
         assert access_control.get_sink_category(operation) is SinkCategory.FORGE

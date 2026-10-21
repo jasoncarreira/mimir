@@ -205,7 +205,7 @@ async def test_care_cannot_be_proposed(env):
     {"extra": {"_mimir_event_ingress": "http_api"}},
 ])
 async def test_forged_or_wrong_channel_approval_applies_nothing(env, override):
-    from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY, HTTP_EVENT_INGRESS_EXTRA_VALUE
+    from mimir.http_ingress import HTTP_EVENT_INGRESS_EXTRA_KEY, HTTP_EVENT_INGRESS_EXTRA_VALUE
     if "extra" in override:
         override = {"extra": {HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE}}
     rec = await env.add()

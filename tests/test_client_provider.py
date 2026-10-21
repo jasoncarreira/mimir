@@ -982,7 +982,7 @@ async def test_hands_read_rejects_malformed_provider_result() -> None:
 
 
 def test_hands_surface_is_static_without_client_mcp_registration() -> None:
-    names = [tool.name for tool in all_mimir_tools(require_coding_available=False)]
+    names = [tool.name for tool in all_mimir_tools(require_provider_available=False)]
     assert names.count("hands_read") == 1
     assert names.count("hands_edit") == 1
     assert names.count("hands_shell") == 1

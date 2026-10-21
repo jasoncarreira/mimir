@@ -629,7 +629,6 @@ def is_tracked_file_in_current_pr_lease(path: Path) -> bool:
         _target_within_active_pr_checkout_lease,
         resolve_repository_review_state,
     )
-    from .models import RepoPRScopeRegistry, ServerDiscoveredPRStates
     from .plugins.core import selected_policy_registry
 
     auth_context = getattr(get_current_turn(), "auth_context", None)
@@ -638,22 +637,27 @@ def is_tracked_file_in_current_pr_lease(path: Path) -> bool:
     state, refusal = resolve_repository_review_state(auth_context, path=str(path))
     if refusal is not None or state is None:
         return False
+    registry = getattr(auth_context, "repo_pr_scope_registry", None)
     discovered = getattr(auth_context, "server_discovered_pr_states", None)
-    if (
-        not isinstance(
-            getattr(auth_context, "repo_pr_scope_registry", None), RepoPRScopeRegistry,
+    policy = selected_policy_registry()
+    bound = any(
+        constructors is not None and (
+            type(registry) is constructors.registry
+            or (type(discovered) is constructors.discovered
+                and discovered.resolve(state.repo, state.pr_number) is state)
         )
+        for protocol in policy.scoped_actions.values()
+        if (constructors := getattr(protocol, "trusted_scope", None)) is not None
+    )
+    if (
+        not bound
         and getattr(auth_context, "repo_pr_action_scope", None)
         is not getattr(state, "action_scope", None)
-        and not (
-            isinstance(discovered, ServerDiscoveredPRStates)
-            and discovered.resolve(state.repo, state.pr_number) is state
-        )
     ):
         return False
     if not _target_within_active_pr_checkout_lease(str(path), state):
         return False
-    hooks = selected_policy_registry().policy_consumer_hooks
+    hooks = policy.policy_consumer_hooks
     return hooks.tracked_file(state, path) if hooks is not None else False
 
 
@@ -687,9 +691,11 @@ def derived_pr_checkout_read_root() -> Path | None:
     Unlike lease provisioning, policy discovery must not create directories.
     Keep home/protected-system roots out using the file-tool root validator.
     """
-    from .coding import coding_enabled
+    from .plugins.core import selected_policy_registry
+    from .plugins.registry import selected_first_party_available
 
-    if not coding_enabled():
+    if (selected_policy_registry().policy_consumer_hooks is None
+            and not selected_first_party_available()):
         return None
     home = _resolved_mimir_home()
     raw = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()

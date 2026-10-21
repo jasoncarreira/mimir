@@ -203,7 +203,7 @@ def _conditional_surface(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]
             for coding in (False, True):
                 names = {
                     tool.name for tool in registry.all_mimir_tools(
-                        model_spec, coding_enabled=coding, require_coding_available=False,
+                        model_spec, policy=core_policy_registry(), require_provider_available=False,
                     )
                 }
                 result[f"{model_spec}:coding={coding}"] = sorted(names)
@@ -211,7 +211,7 @@ def _conditional_surface(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]
         controlled.delenv("TAVILY_API_KEY", raising=False)
         result["openai:oracle:web_disabled"] = sorted(
             tool.name for tool in registry.all_mimir_tools(
-                "openai:oracle", coding_enabled=False,
+                "openai:oracle", policy=core_policy_registry(),
             )
         )
     return result

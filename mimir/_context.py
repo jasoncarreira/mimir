@@ -268,29 +268,12 @@ def active_turn_snapshots(*, now: float | None = None) -> list[dict[str, Any]]:
     return snapshots
 
 
-def active_pr_checkout_lease_paths() -> set[Path]:
-    """Return checkout paths currently attached to live turns."""
-    paths: set[Path] = set()
-    for ctx in tuple(_active_turns.values()):
-        auth = getattr(ctx, "auth_context", None)
-        states: list[Any] = []
-        registry = getattr(auth, "repo_pr_scope_registry", None)
-        states.extend(getattr(registry, "review_states", ()))
-        state = getattr(auth, "repo_review_state", None)
-        if state is not None:
-            states.append(state)
-        cache = getattr(auth, "server_discovered_pr_states", None)
-        lock = getattr(cache, "_lock", None)
-        cached_states = getattr(cache, "_states", None)
-        if lock is not None and isinstance(cached_states, dict):
-            with lock:
-                states.extend(cached_states.values())
-        for review_state in states:
-            lease = getattr(review_state, "checkout_lease", None)
-            path = getattr(lease, "path", None)
-            if path is not None:
-                paths.add(Path(path))
-    return paths
+def active_turn_auth_contexts() -> tuple[Any, ...]:
+    """Snapshot live turns' server-owned authorization carriers."""
+    return tuple(
+        ctx.auth_context for ctx in tuple(_active_turns.values())
+        if ctx.auth_context is not None
+    )
 
 
 def resolve_active_ctx(

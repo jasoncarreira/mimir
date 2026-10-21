@@ -163,7 +163,8 @@ def test_selected_checkout_attestation_uses_provider_git_and_rejects_changed_hea
     import importlib.util
 
     from mimir import access_control as ac
-    from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, RepoReviewState
+    from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState
+    from mimir_cultivate.policy import RepoReviewState
     from mimir_cultivate import repository
     from tests.test_pr_checkout_lease import _repo_and_scope
 
@@ -378,8 +379,9 @@ async def test_selected_pr_review_revalidates_head_before_middleware_handler(
     )
     from mimir.models import (
         AuthContext, InformationFlowLabels, InformationFlowState,
-        RepoPRScopeRegistry, RepoReviewState, TurnInteractivity,
+        TurnInteractivity,
     )
+    from mimir_cultivate.policy import RepoPRScopeRegistry, RepoReviewState
     from mimir_cultivate import repository
     from tests.test_pr_checkout_lease import _repo_and_scope
 

@@ -12,9 +12,9 @@ import pytest
 
 pytest.importorskip("mimir_cultivate", reason="repository-bound merge closure requires Cultivate")
 
-from mimir.worklink import merge_closure as closure
-from mimir.worklink import dispatch_failures
-from mimir.worklink.dispatch_failures import (
+from mimir_cultivate.worklink import merge_closure as closure
+from mimir_cultivate.worklink import dispatch_failures
+from mimir_cultivate.worklink.dispatch_failures import (
     autonomous_dispatch_block_reason,
     dispatch_failure_state_dir,
     load_failure_state,
@@ -1335,7 +1335,7 @@ def test_overlapping_process_sweeps_are_serialized(
     script = r'''
 import os, subprocess, sys, time
 from pathlib import Path
-from mimir.worklink.merge_closure import reconcile_merged_leaves
+from mimir_cultivate.worklink.merge_closure import reconcile_merged_leaves
 from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
 home, repo, journal = map(Path, sys.argv[1:])

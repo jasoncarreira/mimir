@@ -525,13 +525,21 @@ def render_dockerfile(
     base = base.replace("__OPENCODE_INSTALL__", "")
     base = base.replace("__OPENCODE_CONFIG__", _opencode_build_config_block(install_opencode))
     if trusted_cultivate:
-        from mimir_cultivate.worklink.backends.feature_factory import FACTORY_VERSION
+        candidate = next(candidate for candidate in plugins if has_trusted_cultivate((candidate,)))
+        script = cultivate_scripts(candidate)["base.sh"]
+        declarations = [line for line in script.splitlines() if line.startswith("# factory-version:")]
+        if len(declarations) != 1:
+            raise ValueError("Cultivate Docker fragment requires one factory version declaration")
+        match = re.fullmatch(r"# factory-version: ([0-9]+(?:\.[0-9]+){2})", declarations[0])
+        if match is None:
+            raise ValueError("Cultivate Docker fragment has an invalid factory version")
+        factory_version = match.group(1)
 
         base = base.replace("# Pinned mermaid CLI", "ENV NODE_VERSION=22\n"
                             "ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js\n"
                             "ENV PATH=\"/opt/mimir-opencode/bin:${PATH}\"\n"
                             "ARG MIMIR_ENABLE_OPENCODE=0\n"
-                            f"ARG FACTORY_VERSION={FACTORY_VERSION}\n"
+                            f"ARG FACTORY_VERSION={factory_version}\n"
                             "COPY .mimir-scaffold/cultivate-docker/ /opt/cultivate-docker/\n"
                             "RUN NODE_VERSION=\"$NODE_VERSION\" MIMIR_ENABLE_OPENCODE=\"$MIMIR_ENABLE_OPENCODE\" "
                             "FACTORY_VERSION=\"$FACTORY_VERSION\" sh /opt/cultivate-docker/base.sh\n\n"

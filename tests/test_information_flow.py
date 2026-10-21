@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -70,12 +71,12 @@ from mimir.models import (
     IngestedURLState,
     Integrity,
     IntegrityEffect,
-    RepoPRActionScope,
-    RepoReviewState,
     SourceLabel,
     TurnContext,
     TurnInteractivity,
 )
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.policy import RepoPRActionScope, RepoReviewState, issue_repo_scope
 from mimir.prompt_sources import prompt_source_label
 from mimir.skill_install import install
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
@@ -3407,7 +3408,7 @@ def selected_cultivate_policy():
 @pytest.fixture
 def shipped_github_fetch_context(request, tmp_path, monkeypatch, selected_cultivate_policy):
     from mimir.pollers import _parse_poller_authority
-    from mimir.models import RepoPRActionScope, RepoReviewState
+    from mimir_cultivate.policy import RepoReviewState, issue_repo_scope
     import mimir.access_control as access_control
 
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
@@ -3424,11 +3425,11 @@ def shipped_github_fetch_context(request, tmp_path, monkeypatch, selected_cultiv
         state_root=None, manifest_path=manifest,
     )
     auth, labels = _trigger_service_context(service, integrity="untrusted")
-    scope = RepoPRActionScope(
+    scope = issue_repo_scope(
+        is_remediation=True,
         provenance="poller_payload", canonical_repo="acme/widget",
         canonical_root=str(tmp_path), canonical_origin="https://github.com/acme/widget.git",
         principal="mimir-bot", event_type="pr_ci_failure",
-        allowed_operations=access_control._REPO_PR_CI_REMEDIATION_ACTIONS,
         pr_number=42, head_repo="acme/widget", head_remote="origin",
         destination_ref="refs/heads/fix", observed_head_sha="a" * 40,
         base_ref="main", observed_base_sha="b" * 40, pull_request_author="mimir-bot",
@@ -6830,6 +6831,7 @@ def test_nonretained_plugin_result_never_issues_repository_fallback_receipt(
 
 
 @pytest.mark.parametrize("field", ["resource_id", "principal"])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_repository_result_attestation_requires_each_exact_boundary_field(
     monkeypatch: pytest.MonkeyPatch, field: str,
 ) -> None:
