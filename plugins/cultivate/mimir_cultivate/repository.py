@@ -2351,7 +2351,7 @@ from urllib.parse import urlsplit
 
 from mimir.access_control import ToolFlowDirection, authorize_repo_pr_tool
 from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-from mimir.models import RetainedFactoryScope, RepoPRAction, RepoPRActionScope, RepoReviewState
+from .policy import RetainedFactoryScope, RepoPRAction, RepoPRActionScope, RepoReviewState
 
 from mimir.redaction import redact_text
 
@@ -3739,7 +3739,7 @@ from mimir.contained_snapshot import (
     SnapshotEmbeddedRepository,
 )
 from mimir.event_logger import safe_log_event
-from mimir.models import RepoPRAction, RepoReviewState, RetainedFactoryScope
+from .policy import RepoPRAction, RepoReviewState, RetainedFactoryScope
 from mimir.redaction import redact_text
 
 
@@ -4777,7 +4777,8 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
-from mimir.models import AuthContext, RepoReviewState, RetainedFactoryScope, SourceLabel
+from mimir.models import AuthContext, SourceLabel
+from .policy import RepoReviewState, RetainedFactoryScope
 
 
 

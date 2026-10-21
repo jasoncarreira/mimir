@@ -77,6 +77,7 @@ class PolicyConsumerHooks:
     agent_push: Callable[..., bool]
     tracked_file: Callable[..., bool]
     derive_retained_scope: Callable[..., Any]
+    retained_checkout_root: Callable[[], Any]
     active_checkout: Callable[..., Any]
     git_command: Callable[..., Any]
     protected_refs: frozenset[str]
@@ -481,7 +482,7 @@ class PolicyRegistry:
                 or any(not callable(getattr(hooks, name)) for name in (
                     "resolve_review", "revalidate_head", "resolve_issue", "superseded_push",
                     "verified_push", "agent_push", "tracked_file",
-                    "derive_retained_scope", "active_checkout", "git_command", "lineage",
+                    "derive_retained_scope", "retained_checkout_root", "active_checkout", "git_command", "lineage",
                     "verified_base", "git_env", "review_submission", "claim_review",
                     "repository_inventory", "shell_environment",
                 )) or not isinstance(hooks.protected_refs, frozenset)

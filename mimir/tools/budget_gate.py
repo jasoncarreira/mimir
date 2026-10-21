@@ -4243,9 +4243,9 @@ def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
     registered = _plugin_tool(call.tool_name, call.policy)
     if registered is None or registered.resource_scope != "repo_pr":
         return None
-    from ..models import RetainedFactoryScope
+    from ..access_control import _is_registered_retained_scope
 
-    if isinstance(call.authorization.repo_pr_action_scope, RetainedFactoryScope):
+    if _is_registered_retained_scope(call.authorization.repo_pr_action_scope):
         if _retained_dispatch_scope(call) is not None:
             return None
         return _tool_call_refusal(
@@ -4282,14 +4282,13 @@ def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
 
 
 def _retained_dispatch_scope(call: _PreparedToolCall) -> Any:
-    from ..access_control import _is_worklink_retained_checkout_service
-    from ..models import RetainedFactoryScope
+    from ..access_control import _is_registered_retained_scope, _is_worklink_retained_checkout_service
 
     scope = getattr(call.authorization, "repo_pr_action_scope", None)
     registered = _plugin_tool(call.tool_name, call.policy)
     service = get_trusted_service_from_auth_context(call.auth_context)
     if (
-        not isinstance(scope, RetainedFactoryScope)
+        not _is_registered_retained_scope(scope)
         or scope is not getattr(call.auth_context, "retained_factory_scope", None)
         or registered is None or "retained_repo_tools" not in registered.memberships
         or registered.resource_scope != "repo_pr"

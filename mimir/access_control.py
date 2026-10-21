@@ -673,9 +673,20 @@ def current_turn_scratch_root() -> Path | None:
 
 def worklink_retained_checkout_root() -> Path:
     """Return Worklink's code-defined retained-checkout root."""
+    hooks = selected_policy_registry().policy_consumer_hooks
+    if hooks is not None:
+        return Path(hooks.retained_checkout_root())
     from .worklink.worker_client import WORKLINK_CHECKOUT_ROOT
 
     return WORKLINK_CHECKOUT_ROOT
+
+
+def _is_registered_retained_scope(scope: object) -> bool:
+    for action in selected_policy_registry().scoped_actions.values():
+        constructors = action.trusted_scope
+        if constructors is not None and type(scope) is constructors.retained:
+            return True
+    return isinstance(scope, RetainedFactoryScope)
 
 
 def _is_worklink_retained_checkout_service(
@@ -1157,22 +1168,19 @@ def _repo_pr_scope_resolution(
         )
     from .models import RepoPRActionScope
 
-    return RepoPRScopeResolution(scope=RepoPRActionScope(
+    policy = selected_policy_registry()
+    constructors = next(
+        (protocol.trusted_scope for protocol in policy.scoped_actions.values()
+         if protocol.trusted_scope is not None), None,
+    )
+    scope_type = constructors.issue if constructors is not None else RepoPRActionScope
+    scope_fields = dict(
         provenance=provenance,
         canonical_repo=repo,
         canonical_root=root,
         canonical_origin=origin,
         principal=self_login,
         event_type=event_type,
-        allowed_operations=(
-            _REPO_PR_CONFLICT_RESOLUTION_ACTIONS
-            if event_type == "pr_mergeability_conflicting"
-            else _REPO_PR_CI_REMEDIATION_ACTIONS
-            if event_type == "pr_ci_failure"
-            else _REPO_PR_REMEDIATION_ACTIONS
-            if is_remediation
-            else _REPO_PR_REVIEW_ACTIONS
-        ),
         pr_number=number,
         head_repo=head_repo,
         head_remote=head_remote if is_remediation else "origin",
@@ -1182,6 +1190,18 @@ def _repo_pr_scope_resolution(
         observed_base_sha=base_sha.lower(),
         checkout_ref=None if is_remediation else f"refs/pull/{number}/head",
         pull_request_author=principal,
+    )
+    if constructors is not None:
+        return RepoPRScopeResolution(scope=scope_type(
+            is_remediation=is_remediation, **scope_fields,
+        ))
+    operations = (
+        _REPO_PR_CI_REMEDIATION_ACTIONS if event_type == "pr_ci_failure"
+        else _REPO_PR_REMEDIATION_ACTIONS if is_remediation
+        else _REPO_PR_REVIEW_ACTIONS
+    )
+    return RepoPRScopeResolution(scope=scope_type(
+        allowed_operations=operations, **scope_fields,
     ))
 
 
@@ -1313,6 +1333,13 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
         return None
     from .models import RepoPRScopeRegistry, RepoReviewState
 
+    constructors = next(
+        (protocol.trusted_scope for protocol in (policy or selected_policy_registry()).scoped_actions.values()
+         if protocol.trusted_scope is not None), None,
+    )
+    review_type = constructors.review if constructors is not None else RepoReviewState
+    registry_type = constructors.registry if constructors is not None else RepoPRScopeRegistry
+
     by_target: dict[tuple[str, int], RepoReviewState | None] = {}
     for item in items:
         if not isinstance(item, dict):
@@ -1364,11 +1391,11 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             # Never choose between conflicting trusted snapshots of one target.
             by_target[target] = None
         elif previous is None:
-            by_target[target] = RepoReviewState(scope)
+            by_target[target] = review_type(scope)
     states = tuple(
         state for _target, state in sorted(by_target.items()) if state is not None
     )
-    return RepoPRScopeRegistry(states) if states else None
+    return registry_type(states) if states else None
 
 
 def _static_service_write_roots() -> list[Path]:
@@ -7539,7 +7566,7 @@ class SinkGate:
             forge_scope_mismatch: dict[str, Any] = {}
             mismatch = (
                 None
-                if isinstance(repo_pr_action_scope, RetainedFactoryScope)
+                if _is_registered_retained_scope(repo_pr_action_scope)
                 else _forge_repository_scope_mismatch(
                     ifc_labels, repo_pr_action_scope,
                     audit_fields=forge_scope_mismatch,
@@ -7807,7 +7834,7 @@ class SinkGate:
                     and source.domain_qualifier is None
                 )
                 or (
-                    isinstance(repo_pr_action_scope, RetainedFactoryScope)
+                    _is_registered_retained_scope(repo_pr_action_scope)
                     and source.domain == "worklink_retained_repository"
                     and source.resource_id == (
                         f"{repo_pr_action_scope.repository}"
@@ -7831,7 +7858,7 @@ class SinkGate:
                 for source in sources
             )
             and (
-                isinstance(repo_pr_action_scope, RetainedFactoryScope)
+                _is_registered_retained_scope(repo_pr_action_scope)
                 or _forge_repository_scope_mismatch(
                     ifc_labels,
                     repo_pr_action_scope,
@@ -9222,7 +9249,7 @@ def authorize_repo_pr_tool(
     """Make the sole policy decision for one typed PR/repository action."""
     if tool_name not in _TYPED_REPO_PR_TOOL_ACTIONS and not registered_plugin:
         raise ValueError(f"not a typed pull-request tool: {tool_name}")
-    if isinstance(scope, RetainedFactoryScope):
+    if _is_registered_retained_scope(scope):
         in_scope = (
             tool_name in _RETAINED_REPO_TOOLS
             and (not registered_plugin or getattr(auth_context, "retained_factory_scope", None) is scope)
@@ -9938,7 +9965,7 @@ class ToolRegistry:
                 )
                 retained_scope = getattr(auth_context, "retained_factory_scope", None)
                 retained_matches = (
-                    isinstance(retained_scope, RetainedFactoryScope)
+                    _is_registered_retained_scope(retained_scope)
                     and tool_name in _RETAINED_REPO_TOOLS
                     and (plugin_tool is None or "retained_repo_tools" in plugin_tool.memberships)
                     and (plugin_tool is None or plugin_tool.resource_scope == "repo_pr")
@@ -10243,7 +10270,7 @@ class ToolRegistry:
                         is_shadow_decision=not enforce and not in_scope,
                         would_block=not in_scope, flow_direction=flow_direction,
                     ))
-                elif scope_kind == "repo_pr" and isinstance(repo_pr_action_scope, RetainedFactoryScope):
+                elif scope_kind == "repo_pr" and _is_registered_retained_scope(repo_pr_action_scope):
                     return finish(authorize_repo_pr_tool(
                         tool_name, repo_pr_action_scope,
                         service_principal=service_principal, enforce=enforce,
@@ -11701,7 +11728,7 @@ def classify_protected_result(
         scope = getattr(auth_context, "retained_factory_scope", None)
         retained_verified = (
             "retained_repo_tools" in registered.memberships
-            and isinstance(scope, RetainedFactoryScope)
+            and _is_registered_retained_scope(scope)
             and authorization.repo_pr_action_scope is scope
             and (arguments or {}).get("repository") == scope.repository
             and (arguments or {}).get("pull_request") == scope.issue_id

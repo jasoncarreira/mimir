@@ -8,7 +8,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Protocol
 
-from mimir.models import NormalizedPullRequestSnapshot, RepoPRActionScope
+from mimir.models import NormalizedPullRequestSnapshot
+from .policy import RepoPRActionScope
 
 
 class ForgeError(RuntimeError):
@@ -205,7 +206,8 @@ from urllib.parse import quote, urlencode
 
 import requests
 
-from mimir.models import NormalizedPullRequestSnapshot, RepoPRActionScope
+from mimir.models import NormalizedPullRequestSnapshot
+from .policy import RepoPRActionScope
 
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
@@ -1280,8 +1282,9 @@ from langchain_core.tools.base import create_schema_from_function
 from pydantic import StrictInt
 
 from mimir.redaction import redact_text
-from mimir.models import (
-    AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
+from mimir.models import AuthContext
+from .policy import (
+    RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
     ServerDiscoveredPRScopeStore, ServerDiscoveredPRStates,
 )
 from mimir.tools.refusals import ToolPolicyRefusal

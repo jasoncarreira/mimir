@@ -21,7 +21,7 @@ from mimir._context import reset_current_turn, set_current_turn
 from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
 from mimir.event_logger import init_logger
 from mimir.models import (
-    InformationFlowLabels, InformationFlowState, RetainedFactoryScope, SourceLabel,
+    InformationFlowLabels, InformationFlowState, SourceLabel,
     TurnContext,
 )
 from mimir.pollers import discover_pollers, run_poller
@@ -45,7 +45,8 @@ def selected_cultivate_policy():
 
 @pytest.fixture
 def retained_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_cultivate_policy):
-    from mimir.worklink import worker_client
+    from mimir_cultivate.policy import RetainedFactoryScope
+    from mimir_cultivate.worklink import worker_client
 
     home = tmp_path / "home"
     (home / "state").mkdir(parents=True)
@@ -158,10 +159,10 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
 async def exercise_real_worklink_failure_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, selected_provider: bool = False,
 ) -> None:
-    from mimir.worklink import dispatch_failures as failures
-    from mimir.worklink.compute import LaunchHandle
-    from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
-    from mimir.worklink import worker_client
+    from mimir_cultivate.worklink import dispatch_failures as failures
+    from mimir_cultivate.worklink.compute import LaunchHandle
+    from mimir_cultivate.worklink.factory_state import FactoryRunRecord, save_factory_record
+    from mimir_cultivate.worklink import worker_client
 
     home = tmp_path / "home"
     state_root = home / "state" / "pollers"
@@ -246,7 +247,7 @@ async def exercise_real_worklink_failure_turn(
         assert service.canonical == "poller:worklink-ready-queue"
         assert retained in ac.service_filesystem_read_roots(
             service, auth_context=auth,
-        )
+        ), auth.retained_factory_scope_refusal
         decision = ac.ToolRegistry().authorize_tool(
             "read_file", auth, enforce=True,
             arguments={"file_path": str(retained_target)},
