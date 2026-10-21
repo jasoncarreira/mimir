@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
 import uuid
 from typing import Any
@@ -21,6 +22,17 @@ from mimir.model_registry import DEFAULT_MODEL_SPEC
 
 
 _REDACTION = b"<redacted>"
+
+
+def opencode_available() -> bool:
+    """Check CLI presence without reading authentication material."""
+    return shutil.which("opencode") is not None
+
+
+def startup_prerequisites() -> tuple[str, ...]:
+    return () if opencode_available() else (
+        "the opencode CLI is not installed or is not on PATH",
+    )
 
 
 class SensitiveMaterialScrubber:

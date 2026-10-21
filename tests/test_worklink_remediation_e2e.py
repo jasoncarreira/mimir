@@ -779,7 +779,7 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
 ) -> None:
     """Run the production remediation effect paths across real Linux identities."""
     provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
-    from mimir import contained_checkout, contained_execution
+    from mimir import contained_execution
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
     from mimir_cultivate.repository import (
         GitCommit,
@@ -908,7 +908,6 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
         monkeypatch.setattr(worker_exec, "HOME_ROOT", executor_homes)
         monkeypatch.setattr(worker_exec, "REPO_TEST_CHECKOUT_ROOT", snapshots)
         monkeypatch.setattr(worker_exec, "REPO_TEST_UV_CACHE", uv_cache)
-        monkeypatch.setattr(contained_checkout, "REPO_TEST_CHECKOUT_ROOT", snapshots)
         from mimir_cultivate import contained_checkout as provider_checkout
         from mimir_cultivate import contained_execution as provider_execution
 

@@ -465,8 +465,10 @@ def _factory(module: str, name: str) -> Callable[[], object]:
 def register_tools(registrar: PolicyRegistrar) -> None:
     """Install the moved tool implementations on the selected policy before freeze."""
     from mimir.plugins.registry import PolicyConsumerHooks
-    from . import forge, repository, review_guard
+    from . import forge, opencode, repository, review_guard
     from .worklink.retained_scope import derive_retained_factory_scope
+
+    registrar.register_turn_hook("startup_prerequisites", opencode.startup_prerequisites)
 
     registrar.register_policy_consumer_hooks(PolicyConsumerHooks(
         owner="cultivate", resolve_review=forge.resolve_review_state_for_context,

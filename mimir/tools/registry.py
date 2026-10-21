@@ -3259,13 +3259,10 @@ def all_mimir_tools(
             tools.extend(materialize("fetch_url"))
     if coding_enabled:
         if require_coding_available:
-            from ..providers import opencode_available
             missing = []
-            if not opencode_available():
-                missing.append(
-                    "the opencode CLI is not "
-                    "installed or is not on PATH"
-                )
+            for (owner, stage), hook in registry.turn_hooks.items():
+                if owner != "core" and stage == "startup_prerequisites" and owner not in unavailable_owners:
+                    missing.extend(hook())
             git = Path("/usr/bin/git")
             if not git.is_file() or not os.access(git, os.X_OK):
                 missing.append(

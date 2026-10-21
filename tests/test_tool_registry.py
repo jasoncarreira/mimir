@@ -110,8 +110,6 @@ def test_coding_tool_is_absent_when_gate_is_unset_even_if_cli_exists(
     from mimir.tools import all_mimir_tools
 
     monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
-
     assert "spawn_open_code" not in {tool.name for tool in all_mimir_tools()}
 
 
@@ -170,10 +168,12 @@ def test_coding_tool_is_registered_only_when_enabled_and_available(
 ) -> None:
     from mimir.tools import all_mimir_tools
 
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    from mimir.plugins.manager import load_plugins
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
 
-    names = {tool.name for tool in all_mimir_tools(coding_enabled=True)}
+    names = {tool.name for tool in all_mimir_tools(coding_enabled=True, policy=selected)}
     assert "spawn_open_code" in names
 
 
@@ -208,10 +208,12 @@ def test_enabled_coding_without_opencode_fails_loudly(
 ) -> None:
     from mimir.tools import all_mimir_tools
 
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: False)
+    from mimir.plugins.manager import load_plugins
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: False)
 
     with pytest.raises(RuntimeError, match="opencode CLI.*not installed"):
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(coding_enabled=True, policy=selected)
 
 
 def test_enabled_coding_without_checkout_config_fails_loudly(
@@ -219,11 +221,13 @@ def test_enabled_coding_without_checkout_config_fails_loudly(
 ) -> None:
     from mimir.tools import all_mimir_tools
 
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    from mimir.plugins.manager import load_plugins
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
 
     with pytest.raises(RuntimeError, match="MIMIR_PR_CHECKOUT_LEASE_ROOT"):
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(coding_enabled=True, policy=selected)
 
 
 @pytest.mark.parametrize("degraded", [False, True])
@@ -239,7 +243,7 @@ def test_coding_startup_aggregates_missing_prerequisites(
 
     selected = load_plugins(enable="cultivate").policy
     monkeypatch.setattr(forge, "_github_identity_degraded", degraded)
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: False)
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: False)
     real_access = registry.os.access
     monkeypatch.setattr(
         registry.os, "access",
@@ -286,7 +290,7 @@ def test_coding_startup_writable_root_and_identity_gate(monkeypatch, tmp_path, d
 
     selected = load_plugins(enable="cultivate").policy
     monkeypatch.setattr(forge, "_github_identity_degraded", degraded)
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setattr(registry.os, "access", lambda path, mode: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
     with policy_scope(selected):
@@ -298,18 +302,21 @@ def test_coding_startup_writable_root_and_identity_gate(monkeypatch, tmp_path, d
 
 def test_coding_startup_rejects_existing_relative_lease_root(monkeypatch, tmp_path):
     from mimir.tools import all_mimir_tools
+    from mimir.plugins.manager import load_plugins
 
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.chdir(tmp_path)
     (tmp_path / "leases").mkdir()
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", "leases")
     with pytest.raises(RuntimeError, match="not configured as an absolute path"):
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(coding_enabled=True, policy=selected)
 
 
 def test_coding_startup_rejects_executable_directory_as_git(monkeypatch, tmp_path):
     from pathlib import Path
     from mimir.tools import all_mimir_tools, registry
+    from mimir.plugins.manager import load_plugins
 
     git_directory = tmp_path / "git"
     git_directory.mkdir()
@@ -317,27 +324,31 @@ def test_coding_startup_rejects_executable_directory_as_git(monkeypatch, tmp_pat
         registry, "Path",
         lambda value: git_directory if value == "/usr/bin/git" else Path(value),
     )
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
     with pytest.raises(RuntimeError, match="pinned Git binary /usr/bin/git"):
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(coding_enabled=True, policy=selected)
 
 
 def test_declarative_coding_inventory_does_not_probe_cli_availability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.tools import all_mimir_tools
+    from mimir.plugins.manager import load_plugins
+    selected = load_plugins(enable="cultivate").policy
 
     def unexpected_probe() -> bool:
         raise AssertionError("declarative inventory must not probe PATH")
 
-    monkeypatch.setattr("mimir.providers.opencode_available", unexpected_probe)
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", unexpected_probe)
 
     names = {
         tool.name
         for tool in all_mimir_tools(
             coding_enabled=True,
             require_coding_available=False,
+            policy=selected,
         )
     }
     assert "spawn_open_code" in names

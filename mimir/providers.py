@@ -419,16 +419,3 @@ def claude_code_auth_status(
         "Claude Code CLI and non-secret credential markers are present",
         "",
     )
-
-
-_OPENCODE_CLI = "opencode"
-
-
-def opencode_available() -> bool:
-    """True when the ``opencode`` CLI — which the ``spawn_open_code`` tool
-    shells out to (``opencode run``) — is on ``PATH``.
-
-    This is a presence, not auth-state, check for the provider-agnostic
-    coding substrate.
-    """
-    return shutil.which(_OPENCODE_CLI) is not None
