@@ -51,6 +51,19 @@ class ScopedActionProtocol:
     checkout_action: StrEnum | None = None
     live_lease: Callable[..., Any] | None = None
     checkout_tool: str | None = None
+    trusted_scope: TrustedScopeConstructors | None = None
+
+
+@dataclass(frozen=True)
+class TrustedScopeConstructors:
+    """Owner-bound constructors called only after trusted ingress validates input."""
+
+    issue: Callable[..., Any]
+    review: Callable[..., Any]
+    registry: Callable[..., Any]
+    discovered: Callable[..., Any]
+    store: Callable[..., Any]
+    retained: Callable[..., Any]
 
 
 @dataclass(frozen=True)
@@ -480,7 +493,9 @@ class PolicyRegistry:
         self, action_type: type[StrEnum], validate_scope: Callable[..., bool],
         *, checkout_action: StrEnum | None = None,
         live_lease: Callable[..., Any] | None = None,
-        checkout_tool: str | None = None, owner: str = "core",
+        checkout_tool: str | None = None,
+        trusted_scope: TrustedScopeConstructors | None = None,
+        owner: str = "core",
     ) -> None:
         self._writable()
         if (owner == "core" or owner in self._scoped_actions
@@ -493,10 +508,18 @@ class PolicyRegistry:
                     or not checkout_tool or checkout_tool != checkout_tool.strip()
                 ))
                 or (live_lease is not None and not callable(live_lease))
+                or (trusted_scope is not None and (
+                    not self._selected_first_party(owner)
+                    or type(trusted_scope) is not TrustedScopeConstructors
+                    or any(not callable(getattr(trusted_scope, name)) for name in (
+                        "issue", "review", "registry", "discovered", "store", "retained",
+                    ))
+                ))
                 or any(protocol.action_type is action_type for protocol in self._scoped_actions.values())):
             raise PolicyRegistrationError(f"{owner}: invalid or duplicate scoped action protocol")
         self._scoped_actions[owner] = ScopedActionProtocol(
-            owner, action_type, validate_scope, checkout_action, live_lease, checkout_tool,
+            owner, action_type, validate_scope, checkout_action, live_lease,
+            checkout_tool, trusted_scope,
         )
 
     def register_poller_hook(self, name: str, hook: Callable[..., Any], *, owner: str = "core") -> None:
@@ -1147,8 +1170,10 @@ class PolicyRegistrar:
         *, checkout_action: StrEnum | None = None,
         live_lease: Callable[..., Any] | None = None,
         checkout_tool: str | None = None,
+        trusted_scope: TrustedScopeConstructors | None = None,
     ) -> None:
         self._registry.register_scoped_action(
             action_type, validate_scope, checkout_action=checkout_action,
-            live_lease=live_lease, checkout_tool=checkout_tool, owner=self.plugin,
+            live_lease=live_lease, checkout_tool=checkout_tool,
+            trusted_scope=trusted_scope, owner=self.plugin,
         )

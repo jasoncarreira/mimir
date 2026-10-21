@@ -12,7 +12,7 @@ from mimir.access_control import ServicePrincipal
 from mimir.models import RepoPRAction
 from mimir.plugins import manager
 from mimir.plugins.discovery import PluginDiscoveryError
-from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry
+from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry, TrustedScopeConstructors
 from mimir.tool_descriptors import (
     ResultOriginKind, SinkCategory, _PAYLOAD_EXTRACTOR_UNDECLARED,
     _TARGET_EXTRACTOR_UNDECLARED,
@@ -525,6 +525,55 @@ def test_scoped_action_protocol_is_owner_bound_and_frozen():
         registry.freeze()
     assert not registry.frozen
     assert registry.scoped_actions["alpha"].validate_scope is validator
+
+
+def test_trusted_scope_constructors_require_selected_owner_and_freeze():
+    class Action(StrEnum):
+        INSPECT = "resource.inspect"
+
+    def construct(*args, **kwargs):
+        return args, kwargs
+
+    constructors = TrustedScopeConstructors(
+        issue=construct, review=construct, registry=construct,
+        discovered=construct, store=construct, retained=construct,
+    )
+    with pytest.raises(PolicyRegistrationError, match="scoped action protocol"):
+        PolicyRegistry().registrar("cultivate").register_scoped_action(
+            Action, lambda *_: True, trusted_scope=constructors,
+        )
+    registry, _ = selected_registry()
+    with pytest.raises(PolicyRegistrationError, match="scoped action protocol"):
+        registry.registrar("foreign").register_scoped_action(
+            Action, lambda *_: True, trusted_scope=constructors,
+        )
+    registry.registrar("cultivate").register_scoped_action(
+        Action, lambda *_: True, trusted_scope=constructors,
+    )
+    protocol = registry.freeze().scoped_actions["cultivate"]
+    assert protocol.trusted_scope is constructors
+    with pytest.raises(FrozenInstanceError):
+        protocol.trusted_scope = None
+    with pytest.raises(FrozenInstanceError):
+        constructors.issue = None
+    with pytest.raises(PolicyRegistrationError, match="frozen"):
+        registry.registrar("cultivate")
+
+
+def test_trusted_scope_constructors_reject_incomplete_bundle():
+    class Action(StrEnum):
+        INSPECT = "resource.inspect"
+
+    registry, _ = selected_registry()
+    with pytest.raises(PolicyRegistrationError, match="scoped action protocol"):
+        registry.registrar("cultivate").register_scoped_action(
+            Action, lambda *_: True,
+            trusted_scope=TrustedScopeConstructors(
+                issue=lambda: None, review=lambda: None, registry=lambda: None,
+                discovered=lambda: None, store=lambda: None, retained=None,
+            ),
+        )
+    assert not registry.scoped_actions
 
 
 def test_registered_owner_action_freezes():
