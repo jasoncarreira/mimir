@@ -445,10 +445,10 @@ def test_typed_repo_pr_schemas_only_name_exact_registry_selectors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.tools import all_mimir_tools
+    selected = _selected_cultivate_policy()
     from mimir_cultivate import forge
 
     monkeypatch.setattr(forge, "_github_identity_degraded", False)
-    selected = _selected_cultivate_policy()
     tools = {
         tool.name: tool
         for tool in all_mimir_tools(

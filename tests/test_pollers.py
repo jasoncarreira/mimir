@@ -474,6 +474,8 @@ def test_declared_hooks_are_selected_independently_of_poller_name(
 ) -> None:
     from mimir.plugins.manager import load_plugins
 
+    if profile == "worklink":
+        pytest.importorskip("mimir_cultivate", reason="Worklink poller hooks belong to Cultivate")
     selected = load_plugins(enable="cultivate").policy if profile == "worklink" else None
     skills = tmp_path / "skills"
     _write_pollers_json(skills / skill, [{

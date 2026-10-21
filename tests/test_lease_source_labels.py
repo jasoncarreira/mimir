@@ -127,6 +127,7 @@ def _scope(
     observed_head_sha: str = "a" * 40,
     author: str = "mimir-bot",
 ) -> RepoPRActionScope:
+    pytest.importorskip("mimir_cultivate", reason="PR scopes belong to Cultivate")
     return RepoPRActionScope(
         provenance="server_discovered",
         canonical_repo=repository,
@@ -177,6 +178,16 @@ def _auth(
         ifc_state=state,
         repo_pr_action_scope=scope,
         _plugin_slot_policy=selected_policy_registry(),
+    )
+
+
+def _core_auth() -> AuthContext:
+    labels = InformationFlowLabels()
+    return AuthContext(
+        principal="operator", canonical_principal="operator", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="channel-1",
+        interactivity=TurnInteractivity.INTERACTIVE, enforcement_enabled=True,
+        ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
     )
 
 
@@ -2179,7 +2190,7 @@ async def test_glob_discovered_error_name_remains_untrusted(
         hidden.chmod(0o700)
     assert result.error and hidden.name in result.error
     assert provenance is None or provenance.content_free_error is None
-    auth = _auth()
+    auth = _core_auth()
     labels = classify_protected_result(
         "glob", {"pattern": "**/*.txt", "path": "/top"}, auth,
         ToolAuthorization(tool_name="glob", decision=OperationDecision.RESOURCE_SCOPED,
@@ -2250,7 +2261,7 @@ async def test_symlink_target_exception_remains_untrusted(
     tool_name = "read_file" if method in {"read", "aread"} else method.removeprefix("a")
     arguments = {"file_path" if tool_name == "read_file" else "path": "/reference.txt"}
     labels = classify_protected_result(
-        tool_name, arguments, _auth(),
+        tool_name, arguments, _core_auth(),
         ToolAuthorization(tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
                           allowed=True),
         result=ToolMessage(content=f"Error: {result.error}", tool_call_id="symlink",
@@ -2266,7 +2277,7 @@ def test_filesystem_error_cannot_erase_content_captured_before_failure(
     outside = tmp_path / "outside.txt"
     outside.write_text("outside content", encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
-    auth = _auth()
+    auth = _core_auth()
     source = protected_result_source(
         auth, principal="filesystem", domain="filesystem",
         resource_id=str(outside), bridge_instance="filesystem",
@@ -2288,7 +2299,7 @@ def test_filesystem_error_cannot_erase_content_captured_before_failure(
 
 
 def test_filesystem_error_requires_exact_nonempty_backend_attestation(tmp_path: Path) -> None:
-    auth = _auth()
+    auth = _core_auth()
     path = tmp_path / "missing.txt"
     authorization = ToolAuthorization(
         tool_name="read_file", decision=OperationDecision.RESOURCE_SCOPED, allowed=True,
@@ -2322,7 +2333,7 @@ def test_filesystem_error_requires_exact_nonempty_backend_attestation(tmp_path: 
 
 
 def test_retired_repository_refusal_cannot_claim_content_free_trust() -> None:
-    auth = _auth()
+    auth = _core_auth()
     authorization = ToolAuthorization(
         tool_name="repo_status", decision=OperationDecision.RESOURCE_SCOPED,
         allowed=True, repo_pr_action_scope=auth.repo_pr_action_scope,

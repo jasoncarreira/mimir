@@ -485,6 +485,7 @@ def test_validated_arguments_diagnostic_failure_does_not_change_refusal(
 
 
 def _review_state(repo: str, number: int, branch: str, root: str) -> RepoReviewState:
+    pytest.importorskip("mimir_cultivate", reason="PR review scope belongs to Cultivate")
     return RepoReviewState(RepoPRActionScope(
         provenance="poller_payload",
         canonical_repo=repo,
@@ -11817,6 +11818,7 @@ def test_file_writes_resolve_payload_and_server_discovered_leases(
 
 
 @pytest.mark.parametrize("provenance", ["poller_payload", "server_discovered"])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_checkout_path_resolution_requires_exact_active_lease(
     provenance: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

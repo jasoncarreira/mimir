@@ -750,6 +750,7 @@ async def test_each_retained_effect_refuses_operation_time_race_without_mutation
 def test_resource_lock_hardening_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe: str,
 ) -> None:
+    pytest.importorskip("mimir_cultivate", reason="factory issue locking belongs to Cultivate")
     if unsafe == "ancestor":
         target = tmp_path / "target"
         target.mkdir()

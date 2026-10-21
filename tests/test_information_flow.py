@@ -6831,6 +6831,7 @@ def test_nonretained_plugin_result_never_issues_repository_fallback_receipt(
 
 
 @pytest.mark.parametrize("field", ["resource_id", "principal"])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_repository_result_attestation_requires_each_exact_boundary_field(
     monkeypatch: pytest.MonkeyPatch, field: str,
 ) -> None:
