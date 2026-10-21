@@ -8070,10 +8070,10 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
         "import json, os, sys\n"
         "from pathlib import Path\n"
         f"sys.path.insert(0, {str(root)!r})\n"
-        "from mimir.coding import coding_enabled\n"
+        "from mimir.plugins.discovery import enabled_plugins\n"
         "from mimir_cultivate.worklink.backends.base import WorkOrder\n"
         "from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend\n"
-        "assert coding_enabled() and os.environ['MIMIR_PLUGINS'] == 'cultivate'\n"
+        "assert any(candidate.name == 'cultivate' for candidate in enabled_plugins()) and os.environ['MIMIR_PLUGINS'] == 'cultivate'\n"
         "assert 'MIMIR_CODING_ENABLED' not in os.environ\n"
         f"order = WorkOrder(1844, Path({str(repo)!r}), 'prompt', None, 30, "
         "{'MIMIR_HOME': os.environ['MIMIR_HOME']})\n"
@@ -8166,11 +8166,11 @@ async def test_worklink_poller_disabled_selection_reaches_child_without_provider
     leaf.write_text(
         "import json, os, sys\n"
         "from pathlib import Path\n"
-        "from mimir.coding import coding_enabled\n"
+        "from mimir.plugins.discovery import enabled_plugins\n"
         f"Path({str(observed)!r}).write_text(json.dumps({{"
         "'plugins': os.environ.get('MIMIR_PLUGINS'), "
         "'legacy': os.environ.get('MIMIR_CODING_ENABLED'), "
-        "'coding': coding_enabled(), "
+        "'coding': any(candidate.name == 'cultivate' for candidate in enabled_plugins()), "
         "'provider_imported': any(name == 'mimir_cultivate' or "
         "name.startswith('mimir_cultivate.') for name in sys.modules)}))\n",
         encoding="utf-8",

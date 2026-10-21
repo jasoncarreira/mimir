@@ -180,6 +180,20 @@ _FIRST_PARTY_PROJECTED_MEMBERSHIPS = frozenset({
 })
 
 
+def selected_first_party_available() -> bool:
+    """Check the installed first-party entry point without importing its provider."""
+    from .discovery import enabled_plugins
+
+    return any(
+        candidate.enabled and candidate.diagnostic is None
+        and candidate.name == "cultivate"
+        and candidate.distribution == "mimir-cultivate"
+        and candidate.entry_point.group == "mimir.plugins"
+        and candidate.entry_point.value == "mimir_cultivate:provider"
+        for candidate in enabled_plugins()
+    )
+
+
 def _name(value: str, kind: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise PolicyRegistrationError(f"invalid {kind}: {value!r}")

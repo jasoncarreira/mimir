@@ -691,9 +691,11 @@ def derived_pr_checkout_read_root() -> Path | None:
     Unlike lease provisioning, policy discovery must not create directories.
     Keep home/protected-system roots out using the file-tool root validator.
     """
-    from .coding import coding_enabled
+    from .plugins.core import selected_policy_registry
+    from .plugins.registry import selected_first_party_available
 
-    if not coding_enabled():
+    if (selected_policy_registry().policy_consumer_hooks is None
+            and not selected_first_party_available()):
         return None
     home = _resolved_mimir_home()
     raw = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()

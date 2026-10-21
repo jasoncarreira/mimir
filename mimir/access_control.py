@@ -42,7 +42,6 @@ from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from .coding import coding_enabled
 from urllib.parse import urlsplit, urlunsplit
 
 from langchain_core.tools import ToolException
@@ -4228,8 +4227,11 @@ def _service_shell_command_shape(argv: list[str]) -> str:
 
 
 def _service_shell_coding_enabled() -> bool:
-    """Whether this deployment exposes coding tools, using config's bool syntax."""
-    return coding_enabled()
+    """Whether the selected owner registered its scoped policy."""
+    from .plugins.registry import selected_first_party_available
+
+    return (selected_policy_registry().policy_consumer_hooks is not None
+            or selected_first_party_available())
 
 
 def _service_shell_typed_tool_guidance(
@@ -12663,7 +12665,7 @@ def is_admin(auth_context: Any) -> bool:
 def heartbeat_git_authority_enabled(service: ServicePrincipal | None) -> bool:
     """Opt in only a server-resolved heartbeat, never model event metadata."""
     return (
-        coding_enabled()
+        _service_shell_coding_enabled()
         and isinstance(service, ServicePrincipal)
         and service.trigger == "scheduled_tick"
         and service.authority_profile == "heartbeat"
@@ -13099,10 +13101,8 @@ def create_auth_context(
     hooks = getattr(policy or selected_policy_registry(), "policy_consumer_hooks", None)
     if hooks is not None:
         derive_retained_factory_scope = hooks.derive_retained_scope
-    elif getattr(policy or selected_policy_registry(), "_projected_owner", None) is not None:
-        derive_retained_factory_scope = lambda *_args: SimpleNamespace(scope=None, refusal_reason="provider unavailable")
     else:
-        from .worklink.retained_scope import derive_retained_factory_scope
+        derive_retained_factory_scope = lambda *_args: SimpleNamespace(scope=None, refusal_reason="provider unavailable")
 
     retained_resolution = derive_retained_factory_scope(
         event, registered_service if is_service else None,

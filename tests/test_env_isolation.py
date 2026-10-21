@@ -268,7 +268,7 @@ def test_selected_cultivate_survives_host_environment_isolation(
 ) -> None:
     """Do not turn selected-provider coverage into a core-only test run."""
     pytest.importorskip("mimir_cultivate")
-    from mimir.coding import coding_enabled
+    from mimir.plugins.discovery import enabled_plugins
     from tests.conftest import _clear_host_mimir_environment
 
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
@@ -276,7 +276,7 @@ def test_selected_cultivate_survives_host_environment_isolation(
     next(fixture)
     try:
         assert os.environ["MIMIR_PLUGINS"] == "cultivate"
-        assert coding_enabled()
+        assert any(candidate.name == "cultivate" for candidate in enabled_plugins())
     finally:
         with pytest.raises(StopIteration):
             next(fixture)
@@ -286,9 +286,9 @@ def test_retired_flag_alone_does_not_import_or_activate_cultivate() -> None:
     """A fresh core process ignores the old flag even if the package is installed."""
     env = {**os.environ, "MIMIR_PLUGINS": "", "MIMIR_CODING_ENABLED": "true"}
     child = subprocess.run(
-        [sys.executable, "-c", "from mimir.coding import coding_enabled\n"
+        [sys.executable, "-c", "from mimir.plugins.discovery import enabled_plugins\n"
          "import sys\n"
-         "assert not coding_enabled()\n"
+         "assert not enabled_plugins()\n"
          "assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.') "
          "for name in sys.modules)\n"],
         env=env, capture_output=True, text=True, check=False,
