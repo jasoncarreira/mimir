@@ -910,6 +910,30 @@ def register_tools(registrar: PolicyRegistrar) -> None:
 
         return WORKLINK_CHECKOUT_ROOT
 
+    def validate_repository_selection(home: Path, inventory: object) -> None:
+        from .worklink.backends.registry import WorklinkConfig
+
+        worklink = WorklinkConfig.load(home / "worklink.yaml")
+        target = inventory.repository(worklink.repository) if worklink.repository else None
+        if worklink.repository is not None and target is None:
+            raise RuntimeError(
+                "worklink.yaml repository does not name a declared repository: "
+                f"{worklink.repository}"
+            )
+        declared_target = str(target.root) if target is not None else None
+        for name in ("WORKLINK_REPO", "MIMIR_WORKLINK_REPO"):
+            legacy_target = os.environ.get(name)
+            if legacy_target and (
+                declared_target is None
+                or Path(legacy_target).resolve() != Path(declared_target)
+            ):
+                raise RuntimeError(
+                    f"{name} disagrees with worklink.yaml: "
+                    f"legacy={legacy_target!r}, declared={declared_target!r}"
+                )
+        if declared_target is not None and not os.environ.get("WORKLINK_REPO"):
+            os.environ["WORKLINK_REPO"] = declared_target
+
     registrar.register_turn_hook("startup_prerequisites", opencode.startup_prerequisites)
     registrar.register_capability("pr_review_others", tier="scoped-with-provenance")
     registrar.add_to_profile("github", "pr_review_others")
@@ -935,6 +959,7 @@ def register_tools(registrar: PolicyRegistrar) -> None:
         review_submission=review_guard.review_submission_from_request,
         claim_review=review_guard.claim_review_submission,
         repository_inventory=repository.RepositoryInventory.load,
+        repository_selection=validate_repository_selection,
         shell_environment=review_guard.github_shell_environment,
     ))
     for name, declaration in sorted(_TOOL_DECLARATIONS.items()):

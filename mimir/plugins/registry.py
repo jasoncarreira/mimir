@@ -90,6 +90,7 @@ class PolicyConsumerHooks:
     review_submission: Callable[..., Any]
     claim_review: Callable[..., Any]
     repository_inventory: Callable[..., Any]
+    repository_selection: Callable[..., None]
     shell_environment: Callable[..., dict[str, str]]
 
 
@@ -484,7 +485,7 @@ class PolicyRegistry:
                     "verified_push", "agent_push", "tracked_file",
                     "derive_retained_scope", "retained_checkout_root", "active_checkout", "git_command", "lineage",
                     "verified_base", "git_env", "review_submission", "claim_review",
-                    "repository_inventory", "shell_environment",
+                    "repository_inventory", "repository_selection", "shell_environment",
                 )) or not isinstance(hooks.protected_refs, frozenset)
                 or not isinstance(hooks.git_config, tuple) or not isinstance(hooks.lease_metadata, str)):
             raise PolicyRegistrationError(f"{owner}: invalid policy consumer hooks")
