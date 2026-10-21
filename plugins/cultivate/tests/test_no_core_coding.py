@@ -13,9 +13,11 @@ import pytest
 
 
 _RETIRED_CORE_MODULES = {
+    "mimir.contained_checkout": "mimir/contained_checkout.py",
     "mimir.forge": "mimir/forge/__init__.py",
     "mimir.forge.client": "mimir/forge/client.py",
     "mimir.forge.github": "mimir/forge/github.py",
+    "mimir.opencode_proposal": "mimir/opencode_proposal.py",
     "mimir.pr_checkout_lease": "mimir/pr_checkout_lease.py",
     "mimir.project_tests": "mimir/project_tests.py",
     "mimir.repo_pr_parity": "mimir/repo_pr_parity.py",

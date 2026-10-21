@@ -15,6 +15,9 @@ from types import SimpleNamespace
 import pytest
 
 from mimir.contained_execution import CollectedExecutionResult
+from mimir_cultivate import contained_execution as provider_contained_execution
+from mimir_cultivate import opencode as provider_opencode
+from mimir_cultivate.worklink.worker_client import WorkerProjection
 from mimir.tools.registry import (
     _SPAWN_DEPTH_ENV,
     _spawn_open_code_impl,
@@ -105,6 +108,9 @@ async def invoke(seed: Path, tmp_path: Path, record: dict, **kwargs):
         kwargs.pop("artifact_root", None),
         contained_runner=kwargs.pop("runner", runner_for(record)),
         checkout_factory=kwargs.pop("factory", factory_for(tmp_path, record)),
+        opencode_backend=provider_opencode,
+        contained_backend=provider_contained_execution,
+        worker_projection=WorkerProjection,
     ))
 
 
@@ -270,11 +276,9 @@ async def test_agent_sensitive_path_is_prompt_refused(
 async def test_worker_environment_sensitive_path_is_configuration_refused(
     spawn_tree, tmp_path, monkeypatch, sensitive_kind
 ):
-    from mimir import contained_execution
-
     home, seed = spawn_tree
     record = {}
-    original = contained_execution.opencode_worker_environment
+    original = provider_contained_execution.opencode_worker_environment
     sensitive = (
         home / "secret"
         if sensitive_kind == "home"
@@ -287,7 +291,7 @@ async def test_worker_environment_sensitive_path_is_configuration_refused(
         return environment
 
     monkeypatch.setattr(
-        contained_execution, "opencode_worker_environment", unsafe_environment
+        provider_contained_execution, "opencode_worker_environment", unsafe_environment
     )
     payload = await invoke(seed, tmp_path, record)
     assert payload["status"] == "configuration_refused"
@@ -463,8 +467,8 @@ async def test_sensitive_material_absent_from_real_event_logger_and_caplog(
 async def test_artifact_run_directory_failure_precedes_execution(
     spawn_tree, tmp_path, monkeypatch
 ):
-    from mimir import event_logger, opencode_config
-    from mimir.opencode_config import OpenCodeConfigError
+    from mimir import event_logger
+    from mimir_cultivate.opencode import OpenCodeConfigError
     _home, seed = spawn_tree
     record = {}
     events = []
@@ -472,7 +476,7 @@ async def test_artifact_run_directory_failure_precedes_execution(
         events.append((event, fields))
     monkeypatch.setattr(event_logger, "safe_log_event", capture)
     monkeypatch.setattr(
-        opencode_config, "resolve_opencode_invocation",
+        provider_opencode, "resolve_opencode_invocation",
         lambda *a, **k: (_ for _ in ()).throw(OpenCodeConfigError("config_malformed")),
     )
     artifact_file = tmp_path / "home" / "not-a-directory"
@@ -644,13 +648,14 @@ async def test_terminal_state_contract(
     spawn_tree, tmp_path, monkeypatch, case, status, exit_code, reason, event_type,
     proposal_file,
 ):
-    from mimir import event_logger, opencode_config, opencode_proposal
+    from mimir import event_logger
     from mimir.contained_snapshot import (
         SnapshotCredentialsRefused, SnapshotEmbeddedRepository,
         SnapshotSourceChanged, SnapshotUnsafeEntry,
     )
-    from mimir.opencode_config import OpenCodeAuthError, OpenCodeConfigError
-    from mimir.opencode_proposal import OpenCodeProposal, ProposalBuildResult
+    from mimir_cultivate.opencode import (
+        OpenCodeAuthError, OpenCodeConfigError, OpenCodeProposal, ProposalBuildResult,
+    )
     from mimir.tools import registry
 
     home, seed = spawn_tree
@@ -671,13 +676,13 @@ async def test_terminal_state_contract(
     if case == "config":
         prompt = f"task {home}"
         monkeypatch.setattr(
-            opencode_config, "resolve_opencode_invocation",
+            provider_opencode, "resolve_opencode_invocation",
             lambda *a, **k: (_ for _ in ()).throw(OpenCodeConfigError("config_malformed")),
         )
     elif case == "auth":
         prompt = f"task {home}"
         monkeypatch.setattr(
-            opencode_config, "resolve_opencode_invocation",
+            provider_opencode, "resolve_opencode_invocation",
             lambda *a, **k: (_ for _ in ()).throw(OpenCodeAuthError("auth_invalid")),
         )
     elif case == "prompt_auth":
@@ -736,7 +741,7 @@ async def test_terminal_state_contract(
         if case == "proposal":
             proposal = OpenCodeProposal(1, "git_binary_patch", "a" * 40, "base64", 0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "")
         monkeypatch.setattr(
-            opencode_proposal, "build_opencode_proposal",
+            provider_opencode, "build_opencode_proposal",
             lambda *a, **k: ProposalBuildResult(proposal, proposal_reason),
         )
 
@@ -808,7 +813,6 @@ async def test_seed_refusal_payload_reports_each_distinct_cause(
 async def test_spawn_exception_refunds_only_before_execution(
     spawn_tree, tmp_path, monkeypatch, work_ran,
 ):
-    from mimir import opencode_proposal
     from mimir.tools import registry
 
     _home, seed = spawn_tree
@@ -819,7 +823,7 @@ async def test_spawn_exception_refunds_only_before_execution(
 
     kwargs = {}
     if work_ran:
-        monkeypatch.setattr(opencode_proposal, "build_opencode_proposal", fail)
+        monkeypatch.setattr(provider_opencode, "build_opencode_proposal", fail)
     else:
         kwargs["factory"] = fail
     with pytest.raises(LookupError, match="fixture failure"):
@@ -841,9 +845,8 @@ async def test_spawn_exception_refunds_only_before_execution(
 async def test_terminal_state_first_match_precedence(
     spawn_tree, tmp_path, monkeypatch, case, expected_status, expected_reason
 ):
-    from mimir import opencode_config
     from mimir.contained_snapshot import SnapshotCredentialsRefused
-    from mimir.opencode_config import OpenCodeConfigError
+    from mimir_cultivate.opencode import OpenCodeConfigError
 
     home, seed = spawn_tree
     record = {}
@@ -854,7 +857,7 @@ async def test_terminal_state_first_match_precedence(
     if case == "configuration_before_prompt":
         prompt = f"inspect {home}/secret"
         monkeypatch.setattr(
-            opencode_config,
+            provider_opencode,
             "resolve_opencode_invocation",
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 OpenCodeConfigError("config_malformed")

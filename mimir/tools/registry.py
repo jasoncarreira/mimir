@@ -2380,15 +2380,16 @@ async def _spawn_open_code_impl(
     *,
     contained_runner: Any,
     checkout_factory: Any,
+    opencode_backend: Any,
+    contained_backend: Any,
+    worker_projection: Any,
     execution_identifier: str | None = None,
 ) -> str:
     import shlex
 
-    from ..contained_execution import (
-        SensitiveMaterialScrubber,
-        base_worker_environment,
-        opencode_worker_environment,
-    )
+    SensitiveMaterialScrubber = contained_backend.SensitiveMaterialScrubber
+    base_worker_environment = contained_backend.base_worker_environment
+    opencode_worker_environment = contained_backend.opencode_worker_environment
     from ..contained_snapshot import (
         SnapshotCredentialsRefused,
         SnapshotEmbeddedRepository,
@@ -2396,22 +2397,18 @@ async def _spawn_open_code_impl(
         SnapshotUnsafeEntry,
     )
     from ..event_logger import safe_log_event
-    from ..opencode_config import (
-        OpenCodeAuthError,
-        OpenCodeConfigError,
-        opencode_auth_path,
-        opencode_config_path,
-        opencode_worker_documents,
-        resolve_opencode_invocation,
-    )
-    from ..opencode_proposal import (
-        build_opencode_proposal,
-        classify_spawn_terminal_state,
-        cleanup_failure_event,
-        prompt_contains_sensitive_source_path,
-        resolve_artifact_handle,
-    )
-    from ..worklink.worker_client import WorkerProjection
+    OpenCodeAuthError = opencode_backend.OpenCodeAuthError
+    OpenCodeConfigError = opencode_backend.OpenCodeConfigError
+    opencode_auth_path = opencode_backend.opencode_auth_path
+    opencode_config_path = opencode_backend.opencode_config_path
+    opencode_worker_documents = opencode_backend.opencode_worker_documents
+    resolve_opencode_invocation = opencode_backend.resolve_opencode_invocation
+    build_opencode_proposal = opencode_backend.build_opencode_proposal
+    classify_spawn_terminal_state = opencode_backend.classify_spawn_terminal_state
+    cleanup_failure_event = opencode_backend.cleanup_failure_event
+    prompt_contains_sensitive_source_path = opencode_backend.prompt_contains_sensitive_source_path
+    resolve_artifact_handle = opencode_backend.resolve_artifact_handle
+    WorkerProjection = worker_projection
 
     cfg = _STATE["spawn_config"]
     if cfg is None:
@@ -2824,6 +2821,20 @@ async def _spawn_open_code_impl(
         "name": name,
         "proposal": terminal.proposal.as_dict() if terminal.proposal else None,
     }, indent=2)
+
+
+@tool
+async def spawn_open_code(
+    prompt: str,
+    cwd: Optional[str] = None,
+    timeout_s: int = 1800,
+    name: Optional[str] = None,
+    model: Optional[str] = None,
+    agent: Optional[str] = None,
+    artifact_root: Optional[str] = None,
+) -> str:
+    """Run OpenCode in a fresh contained checkout and return a bounded proposal."""
+    return "spawn_open_code unavailable: no selected coding provider"
 
 
 # ────────────────────────────────────────────────────────────────────

@@ -175,6 +175,10 @@ def test_coding_tool_is_registered_only_when_enabled_and_available(
 
     names = {tool.name for tool in all_mimir_tools(coding_enabled=True, policy=selected)}
     assert "spawn_open_code" in names
+    from mimir_cultivate.opencode import spawn_open_code
+    assert next(tool for tool in all_mimir_tools(
+        coding_enabled=True, policy=selected,
+    ) if tool.name == "spawn_open_code") is spawn_open_code
 
 
 def test_identity_degradation_removes_coding_tools_and_does_not_auto_recover(

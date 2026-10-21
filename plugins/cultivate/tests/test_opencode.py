@@ -10,8 +10,6 @@ import subprocess
 import pytest
 
 from mimir import opencode_config as core_config
-from mimir import opencode_proposal as core_proposal
-from mimir.contained_execution import SensitiveMaterialScrubber
 from mimir_cultivate import opencode, repository
 
 
@@ -107,14 +105,13 @@ def test_proposal_is_lossless_and_stays_in_checkout(tmp_path: Path) -> None:
     _git(repo, "add", "file.txt")
     _git(repo, "commit", "-qm", "seed")
     (repo / "file.txt").write_text("after\n")
-    scrubber = SensitiveMaterialScrubber(home=tmp_path / "home")
-    baseline = core_proposal.build_opencode_proposal(repo, scrubber=scrubber)
+    scrubber = opencode.SensitiveMaterialScrubber(home=tmp_path / "home")
     result = opencode.build_opencode_proposal(repo, scrubber=scrubber)
-    assert result.reason_code == baseline.reason_code == "proposal_created"
-    assert result.proposal is not None and baseline.proposal is not None
-    assert result.proposal.as_dict() == baseline.proposal.as_dict()
+    assert result.reason_code == "proposal_created"
+    assert result.proposal is not None
+    assert result.proposal.kind == "git_binary_patch"
+    assert result.proposal.byte_length == len(base64.b64decode(result.proposal.patch, validate=True))
     assert opencode._sanitized_git_env() == repository._sanitized_git_env()
-    assert opencode._sanitized_git_env() == core_proposal._sanitized_git_env()
     assert b"after" in base64.b64decode(result.proposal.patch, validate=True)
     assert (repo / "file.txt").read_text() == "after\n"
 
@@ -143,18 +140,23 @@ def test_sensitive_patch_refused_and_artifacts_scrubbed(tmp_path: Path) -> None:
         opencode.resolve_artifact_handle(root, "../escape")
 
 
-def test_terminal_classification_and_prompt_path_policy_match_core(tmp_path: Path) -> None:
+def test_terminal_classification_and_prompt_path_policy(tmp_path: Path) -> None:
     home = tmp_path / "home"
     config = tmp_path / "config.json"
-    for prompt in (str(home / "child"), config.as_uri(), "unrelated text"):
+    for prompt, expected in (
+        (str(home / "child"), "agent_home_path"),
+        (config.as_uri(), "config_auth_source_path"),
+        ("unrelated text", None),
+    ):
         assert opencode.prompt_contains_sensitive_source_path(
             prompt, agent_home=home, source_paths=(config,),
-        ) == core_proposal.prompt_contains_sensitive_source_path(
-            prompt, agent_home=home, source_paths=(config,),
-        )
-    for reason in ("seed_changed", "embedded_seed_repository", "provisioning_unavailable"):
+        ) == expected
+    for reason, status in (
+        ("seed_changed", "seed_refused"),
+        ("embedded_seed_repository", "seed_refused"),
+        ("provisioning_unavailable", "provisioning_unavailable"),
+    ):
         selected = opencode.classify_spawn_terminal_state(provisioning_reason=reason)
-        original = core_proposal.classify_spawn_terminal_state(provisioning_reason=reason)
         assert (selected.status, selected.reason_code, selected.event_type) == (
-            original.status, original.reason_code, original.event_type,
+            status, reason, "spawn_open_code_provisioning_refused",
         )

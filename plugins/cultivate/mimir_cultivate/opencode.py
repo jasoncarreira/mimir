@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 from typing import Any
 
@@ -870,11 +871,15 @@ async def spawn_open_code(
     from mimir.tools.registry import _spawn_open_code_impl
 
     from .contained_checkout import create_opencode_checkout
-    from .contained_execution import execute_contained
+    from . import contained_execution
+    from .worklink.worker_client import WorkerProjection
 
     return await _spawn_open_code_impl(
         prompt, cwd, timeout_s, name, model, agent, artifact_root,
-        contained_runner=execute_contained,
+        contained_runner=contained_execution.execute_contained,
         checkout_factory=create_opencode_checkout,
+        opencode_backend=sys.modules[__name__],
+        contained_backend=contained_execution,
+        worker_projection=WorkerProjection,
         execution_identifier=str(uuid.uuid4()),
     )
