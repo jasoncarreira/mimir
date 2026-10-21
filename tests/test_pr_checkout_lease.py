@@ -25,11 +25,10 @@ from mimir.access_control import (
 from mimir.models import (
     AuthContext,
     InformationFlowLabels,
-    RepoPRAction,
-    RepoPRActionScope,
-    RepoReviewState,
-    ServerDiscoveredPRStates,
     TurnInteractivity,
+)
+from mimir_cultivate.policy import (
+    RepoPRAction, RepoPRActionScope, RepoReviewState, ServerDiscoveredPRStates,
 )
 from mimir_cultivate.repository import (
     PRCheckoutLease,

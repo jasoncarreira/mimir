@@ -46,7 +46,7 @@ from mimir.contained_execution import (
     SensitiveMaterialScrubber,
 )
 from mimir.contained_snapshot import SnapshotCredentialsRefused, create_git_snapshot
-from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState
+from mimir_cultivate.policy import RepoPRAction, RepoPRActionScope, RepoReviewState
 from mimir_cultivate.repository import (
     PRCheckoutLease,
     acquire_pr_checkout_lease,

@@ -19,14 +19,16 @@ from mimir.access_control import (
     create_auth_context, consume_scoped_pr_checkout, observe_scoped_pr_checkout,
 )
 from mimir.models import (
-    AgentEvent, AuthContext, RepoPRScopeRegistry, RepoReviewState,
-    ServerDiscoveredPRStates, TurnInteractivity,
+    AgentEvent, AuthContext, TurnInteractivity,
 )
 from mimir.plugins.registry import PolicyRegistry
 from mimir_cultivate.repository import active_pr_checkout_lease_for_path, create_pr_checkout_lease
 from mimir.tool_descriptors import ResultOriginKind
 from mimir.tools.budget_gate import BudgetGateMiddleware
-from mimir_cultivate.policy import RepoPRAction, register_action_protocol, validate_scoped_pr_action
+from mimir_cultivate.policy import (
+    RepoPRAction, RepoPRScopeRegistry, RepoReviewState, ServerDiscoveredPRStates,
+    register_action_protocol, validate_scoped_pr_action,
+)
 from tests.test_pr_checkout_lease import _repo_and_scope
 from tests.test_access_control import _github_scope_test_setup
 
@@ -37,7 +39,10 @@ def _tool(repository: str, pull_request: int) -> str:
 
 @pytest.fixture
 def policy():
+    from tests.test_plugins_registry import selected_candidate
+
     registry = PolicyRegistry()
+    registry.select_plugin_candidates((selected_candidate(),))
     registrar = registry.registrar("cultivate")
     register_action_protocol(
         registrar, validate_scoped_pr_action, checkout_tool="scoped_checkout",

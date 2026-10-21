@@ -18,7 +18,7 @@ import pytest
 from mimir_cultivate.worklink import checkout, claims, continuation, merge_closure, poller_hooks
 from mimir_cultivate.worklink.retained_scope import derive_retained_factory_scope
 from mimir_cultivate.worklink import retained_scope
-from mimir.models import RetainedFactoryScope
+from mimir_cultivate.policy import RetainedFactoryScope
 from mimir.worklink.dispatch_failures import dispatch_failure_state_dir
 
 

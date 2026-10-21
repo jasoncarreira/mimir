@@ -19,7 +19,7 @@ from mimir.access_control import (
     _RetainedResultReceipt, classify_protected_result,
     _retained_checkout_binding,
 )
-from mimir.models import RetainedFactoryScope
+from mimir_cultivate.policy import RetainedFactoryScope
 from mimir.tools import budget_gate
 
 
@@ -38,8 +38,8 @@ async def test_selected_ordinary_repo_tool_holds_real_issued_pr_lease(
     )
     from mimir.models import (
         AuthContext, InformationFlowLabels, InformationFlowState,
-        RepoPRScopeRegistry, RepoReviewState,
     )
+    from mimir_cultivate.policy import RepoPRScopeRegistry, RepoReviewState
     from mimir.plugins.core import policy_scope
     from mimir.plugins.manager import load_plugins
     from mimir_cultivate import repository
@@ -180,7 +180,8 @@ def _case(monkeypatch, tmp_path):
     context.repo_pr_scope_registry = None
     policy = SimpleNamespace(frozen=True, descriptors={}, scoped_actions={
         "cultivate": SimpleNamespace(live_lease=lambda *_args: None,
-                                       checkout_action=object()),
+                                       checkout_action=object(),
+                                       trusted_scope=SimpleNamespace(retained=RetainedFactoryScope)),
     }, tools={"repo_diff": SimpleNamespace(
         owner="cultivate", result_domain="repository",
         memberships=frozenset({"retained_repo_tools"}),
@@ -491,7 +492,7 @@ async def test_selected_retained_middleware_attests_only_live_outputs(
 @pytest.mark.parametrize("enforced", [False, True])
 def test_ordinary_pr_dispatch_uses_owner_grant_not_retained_scope(monkeypatch, tmp_path, enforced, tool, action):
     from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
-    from mimir.models import RepoPRAction, RepoPRActionScope, RepoReviewState, RepoPRScopeRegistry
+    from mimir_cultivate.policy import RepoPRAction, RepoPRActionScope, RepoReviewState, RepoPRScopeRegistry
 
     scope, context, policy, authorization, result, arguments = _case(monkeypatch, tmp_path)
     registered = SimpleNamespace(

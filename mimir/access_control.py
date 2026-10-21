@@ -683,7 +683,7 @@ def worklink_retained_checkout_root() -> Path:
 
 def _is_registered_retained_scope(scope: object) -> bool:
     for action in selected_policy_registry().scoped_actions.values():
-        constructors = action.trusted_scope
+        constructors = getattr(action, "trusted_scope", None)
         if constructors is not None and type(scope) is constructors.retained:
             return True
     return isinstance(scope, RetainedFactoryScope)
@@ -9290,13 +9290,11 @@ def authorize_repo_pr_tool(
     missing_actions = tuple(
         action for action in required_actions if action not in granted_actions
     )
-    from .models import RepoPRActionScope
-
     grant_valid = not registered_plugin or _valid_scoped_pr_grant(
         auth_context, owner, action, protocol, scope, review_state, tool_name=tool_name,
     )
     in_scope = (
-        (isinstance(scope, RepoPRActionScope) if registered_plugin else scope is not None)
+        scope is not None
         and not missing_actions
         and grant_valid
         and (
@@ -10008,7 +10006,13 @@ class ToolRegistry:
                 if plugin_tool is not None and state is not None:
                     from .models import RepoReviewState
 
-                    if not isinstance(state, RepoReviewState) or (
+                    protocol = (policy if policy is not None else selected_policy_registry()).scoped_actions.get(plugin_tool.owner)
+                    constructors = getattr(protocol, "trusted_scope", None)
+                    typed_state = (
+                        type(state) is constructors.review if constructors is not None
+                        else isinstance(state, RepoReviewState)
+                    )
+                    if not typed_state or (
                         state.repo.lower() != tool_arguments["repository"].lower()
                         or state.pr_number != tool_arguments["pull_request"]
                     ):
