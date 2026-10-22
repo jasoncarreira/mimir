@@ -357,14 +357,17 @@ Pollers are also loaded automatically at startup, so a fresh container restart p
 
 ## Ready-built poller skills
 
-Mimir ships ready-built poller skills under ``mimir/optional-skills/`` — opt-in, NOT auto-installed (most installs don't need them). Each is a standalone skill directory with its own ``SKILL.md`` documenting the env vars and what it watches:
+Core ships no coding or GitHub pollers. The GitHub activity, GitHub CI-watch,
+Worklink ready-queue and Worklink tool-pin pollers belong to the Cultivate
+plugin: when the operator selects it (`MIMIR_PLUGINS=cultivate` in the process
+environment), Cultivate seeds them into `<home>/skills/cultivate-*` at startup.
+Do not copy them by hand, and do not recreate them as home pollers; if they are
+missing, Cultivate is not selected — tell the operator rather than working around it.
 
-| Skill | Watches |
-|---|---|
-| `github-poller` | New issues, PRs, comments, PR reviews, and inline diff comments on configured GitHub repos |
-| `worklink-tool-pins` | Worklink `tool_pins:` version drift; files/reuses low-priority Chainlink bump issues, never auto-bumps |
-
-To install one:
+Other opt-in poller skills live under ``mimir/optional-skills/`` (for example
+`gmail-poller` and `dependency-advisory-watch`). Each is a standalone skill
+directory whose ``SKILL.md`` documents its env vars and what it watches. To
+install one:
 
 ```
 cp -r mimir/optional-skills/<name> <home>/skills/

@@ -39,14 +39,19 @@ instruction.
 
 ## Where to operate
 
-On `worklink-ready-queue`, `github-activity`, and heartbeat service turns,
+On service turns (heartbeat, and the poller turns a selected plugin adds),
 call `chainlink_issue_show(issue_id)` to inspect a live issue, including its
 status, labels, parent, description excerpt and recent comments. Do not run
 `chainlink issue show --json` through shell or read `.chainlink/` and Worklink
-state files directly: those profiles refuse those reads. To read the spec of
-record for a bound PR, call `pr_spec`. The CLI examples below apply only to
-turns whose shell profile admits Chainlink commands (typically an interactive
-operator turn); check the current tool list before choosing a workflow.
+state files directly: those profiles refuse those reads. The CLI examples below
+apply only to turns whose shell profile admits Chainlink commands (typically an
+interactive operator turn); check the current tool list before choosing a workflow.
+
+**Only when the Cultivate plugin is selected** (its tools, such as `pr_spec`
+and `pr_list`, are in your tool list): the same rule covers its
+`worklink-ready-queue` and `github-activity` service turns, and to read the spec
+of record for a bound PR, call `pr_spec`. Without Cultivate those tools and
+turns do not exist; do not try to call them.
 
 Chainlink commands need a `.chainlink/` directory in the cwd or an ancestor.
 The operator's home repo or a working directory will have one. If you get
@@ -426,8 +431,10 @@ couple that *look* idempotent but aren't:
   Across turns the breaker doesn't help; rely on unique keys in the
   message itself if the same content might be generated twice.
 - **`gh pr create` is *not* idempotent.** It happily makes a second
-  PR against the same branch. Always call
-  `pr_list(repository="owner/repo", state="all", head="<branch>")` first.
+  PR against the same branch. Always check for an existing PR on that head
+  first: with Cultivate selected, call
+  `pr_list(repository="owner/repo", state="all", head="<branch>")`; without it,
+  `gh pr list --head "<branch>" --state all` where your shell profile admits it.
 
 ## Failure modes
 
