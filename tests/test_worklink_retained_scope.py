@@ -306,7 +306,7 @@ def test_central_policy_grants_only_five_retained_repo_tools(retained_incident) 
         canonical="poller:worklink-ready-queue", trigger="poller",
         profile="github", tier=ac.CapabilityTier.CODE_EXECUTION,
         capabilities=tuple(sorted(allowed)), creation_path="test",
-        policy=selected,
+        policy=selected, poller_owner="cultivate",
     )
     assert service.worklink_retained_checkout is True
     for tool in (name for name in selected.tools if name.startswith("repo_")):
@@ -322,7 +322,7 @@ def test_central_policy_grants_only_five_retained_repo_tools(retained_incident) 
         canonical="poller:other", trigger="poller",
         profile="github", tier=ac.CapabilityTier.CODE_EXECUTION,
         capabilities=tuple(sorted(allowed)), creation_path="test",
-        policy=selected,
+        policy=selected, poller_owner="cultivate",
     )
     assert wrong_service.worklink_retained_checkout is False
     missing_property = replace(service, worklink_retained_checkout=False)

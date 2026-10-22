@@ -295,12 +295,12 @@ def remediation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 async def _trusted_turn(case):
     from mimir_cultivate.scheduler import worklink_poller_hooks
 
-    skills = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
+    skills = case.home / "skills"
     ready = next(
         config
         for config in discover_pollers(
             skills, state_root=case.state_root,
-            policy=load_plugins(enable="cultivate").policy, plugin_candidates=(),
+            policy=load_plugins(enable="cultivate").policy,
         )
         if config.name == "worklink-ready-queue"
     )

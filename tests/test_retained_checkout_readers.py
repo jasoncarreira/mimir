@@ -74,6 +74,7 @@ def retained_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_cu
         tier=ac.CapabilityTier.CODE_EXECUTION,
         capabilities=tuple(manifest["authority"]["capabilities"]),
         creation_path="mimir.pollers.run_poller:chainlink-orchestrator/pollers.json",
+        poller_owner="cultivate",
     )
     initial = InformationFlowLabels().with_source(SourceLabel(
         principal="worklink", domain="poller_payload", resource_id="incident:1806",
@@ -191,11 +192,11 @@ async def exercise_real_worklink_failure_turn(
 
         monkeypatch.setattr(provider_worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
 
-    skills = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
+    skills = home / "skills"
     ready = next(
         config for config in discover_pollers(
             skills, state_root=state_root,
-            policy=load_plugins(enable="cultivate").policy, plugin_candidates=(),
+            policy=load_plugins(enable="cultivate").policy,
         )
         if config.name == "worklink-ready-queue"
     )
@@ -428,11 +429,11 @@ async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow
         lambda _record: False,
     )
 
-    skills = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
+    skills = home / "skills"
     ready = next(
         config for config in discover_pollers(
             skills, state_root=state_root,
-            policy=load_plugins(enable="cultivate").policy, plugin_candidates=(),
+            policy=load_plugins(enable="cultivate").policy,
         )
         if config.name == "worklink-ready-queue"
     )
