@@ -244,6 +244,91 @@ def test_selected_installed_cultivate_seeded_pollers_reload(tmp_path, monkeypatc
         assert not poller_properties("poller:worklink-ready-queue").worklink_retained_checkout
 
 
+_SEEDED_CULTIVATE_POLLERS = {
+    "worklink-ready-queue": "cultivate-chainlink-orchestrator",
+    "github-ci-watch": "cultivate-github-ci-watch",
+    "github-activity": "cultivate-github-poller",
+    "worklink-tool-pins": "cultivate-worklink-tool-pins",
+}
+
+_SEEDED_CULTIVATE_SCRIPT = r'''
+import json, logging, sys
+from pathlib import Path
+from mimir.plugins.manager import load_plugins
+from mimir.pollers import _is_selected_cultivate_default, discover_pollers
+
+mode, home = sys.argv[1], Path(sys.argv[2])
+seeded = json.loads(sys.argv[3])
+records = []
+handler = logging.Handler()
+handler.emit = records.append
+logging.getLogger("mimir.pollers").addHandler(handler)
+if mode == "seed":
+    from mimir.plugins.defaults import seed_plugin_defaults
+    manager = load_plugins(enable="cultivate")
+    seed_plugin_defaults(home, selected=manager.policy.selected_plugin_candidates)
+    for skill in seeded.values():
+        assert (home / "skills" / skill / "pollers.json").is_file(), skill
+    sys.exit(0)
+manager = load_plugins(enable="cultivate" if mode == "selected" else "")
+for _ in range(2):  # a reload must behave exactly like the first discovery
+    invalid = []
+    pollers = {p.name: p for p in discover_pollers(
+        home / "skills", policy=manager.policy, invalid_entries=invalid)}
+    assert "operator-watch" in pollers, sorted(pollers)
+    assert pollers["operator-watch"].manifest_path.parent.name == "operator-watch"
+    if mode == "selected":
+        for name, skill in seeded.items():
+            poller = pollers[name]
+            assert poller.manifest_path == home / "skills" / skill / "pollers.json", name
+            # Cultivate ownership is what grants these provider-only properties.
+            assert _is_selected_cultivate_default(poller.manifest_path, manager.policy), name
+            assert poller.authority.github_activity is (name == "github-activity")
+            assert poller.authority.github_ci_watch is (name == "github-ci-watch")
+            assert poller.authority.worklink_retained_checkout is (
+                name == "worklink-ready-queue")
+        assert invalid == [], invalid
+        assert not [r for r in records if "poller_duplicate_name" in r.getMessage()]
+    else:
+        assert set(seeded).isdisjoint(pollers), sorted(pollers)
+        skipped = {path.parent.name for path, _, reason in invalid
+                   if "seeded by plugin 'cultivate'" in reason}
+        assert set(seeded.values()) <= skipped, invalid
+        assert "mimir_cultivate" not in sys.modules
+'''
+
+
+def test_seeded_cultivate_pollers_do_not_run_when_cultivate_is_deselected(tmp_path):
+    """Seeds keep their provider identity after the operator deselects Cultivate.
+
+    Each phase runs in a fresh interpreter so the import claim covers the whole
+    process, and the seed phase cannot leave provider state behind for the rest.
+    """
+    if importlib.util.find_spec("mimir_cultivate") is None:
+        pytest.skip("mimir-cultivate is not installed")
+    home = tmp_path / "home"
+    operator = home / "skills" / "operator-watch"
+    operator.mkdir(parents=True)
+    (operator / "pollers.json").write_text(json.dumps({"pollers": [{
+        "name": "operator-watch", "command": "python3 poller.py", "cron": "*/5 * * * *",
+    }]}), encoding="utf-8")
+    env = {**os.environ, "GITHUB_REPOS": "o/r", "WORKLINK_REPO": "o/r",
+           "MIMIR_HOME": str(home)}
+
+    def run(mode: str) -> None:
+        result = subprocess.run(
+            [sys.executable, "-c", _SEEDED_CULTIVATE_SCRIPT, mode, str(home),
+             json.dumps(_SEEDED_CULTIVATE_POLLERS)],
+            env={**env, "MIMIR_PLUGINS": "" if mode == "disabled" else "cultivate"},
+            capture_output=True, text=True, timeout=300,
+        )
+        assert result.returncode == 0, f"{mode}: {result.stderr[-4000:]}"
+
+    run("seed")
+    run("disabled")
+    run("selected")
+
+
 def test_plugin_poller_authority_rejects_foreign_profile(tmp_path):
     from mimir.plugins.registry import PolicyRegistry
 

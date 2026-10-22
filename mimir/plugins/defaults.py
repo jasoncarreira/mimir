@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from .discovery import PluginCandidate, enabled_plugins
+from .discovery import PluginCandidate, discover_plugins, enabled_plugins
 
 
 def safe_destination(root: Path, rel: Path) -> Path:
@@ -21,6 +21,50 @@ def safe_destination(root: Path, rel: Path) -> Path:
         if path.is_symlink():
             raise ValueError(f"symlink in plugin defaults destination: {path}")
     return path
+
+
+#: Home-relative directories whose entries name every plugin that seeded the home.
+SEED_MARKER_DIRS = (Path(".mimir") / "seed-plugin-defaults", Path(".mimir") / "upgrade-plugin-defaults")
+#: First-party providers whose ``<name>-*`` home skills are always a seed namespace.
+FIRST_PARTY_SEED_NAMESPACES = frozenset({"cultivate"})
+
+
+def seeded_skill_namespaces(home: Path) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Identify home skill directories that plugin defaults seeded, without imports.
+
+    Returns ``(exact, prefixes)``: ``exact`` maps a seeded skill directory name to
+    the installed plugin whose inventoried defaults declare it, and ``prefixes``
+    lists plugin names whose whole ``<name>-*`` namespace is a seed namespace
+    (first-party providers, plus any plugin whose seed marker is in ``home`` even
+    when it is no longer installed). Only package metadata and marker names are
+    read; no provider module is imported.
+    """
+    exact: dict[str, str] = {}
+    prefixes = set(FIRST_PARTY_SEED_NAMESPACES)
+    for marker_dir in SEED_MARKER_DIRS:
+        root = Path(home) / marker_dir
+        try:
+            prefixes.update(entry.name for entry in root.iterdir()
+                            if entry.name and not entry.name.startswith("."))
+        except OSError:
+            continue
+    try:
+        candidates = discover_plugins(enable="")
+    except Exception:  # metadata problems must not hide the marker namespaces
+        candidates = ()
+    for candidate in candidates:
+        manifest = candidate.manifest
+        for directory in (manifest.defaults.get("skills", ()) if manifest and manifest.defaults else ()):
+            exact.setdefault(f"{candidate.name}-{Path(directory).name}", candidate.name)
+    return exact, tuple(sorted(prefixes, key=len, reverse=True))
+
+
+def seeded_skill_owner(skill_dir_name: str, namespaces: tuple[dict[str, str], tuple[str, ...]]) -> str | None:
+    """Return the plugin that seeds ``skills/<skill_dir_name>``, or ``None`` for core."""
+    exact, prefixes = namespaces
+    if skill_dir_name in exact:
+        return exact[skill_dir_name]
+    return next((name for name in prefixes if skill_dir_name.startswith(f"{name}-")), None)
 
 
 def plugin_default_files(candidate: PluginCandidate) -> dict[Path, str]:

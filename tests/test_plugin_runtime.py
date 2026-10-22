@@ -459,6 +459,48 @@ assert "mimir_example_plugin" not in sys.modules
     assert result.returncode == 0, result.stderr
 
 
+def test_unselected_third_party_seeds_are_skipped_without_import(example_distribution, tmp_path):
+    """Any plugin's seeded home pollers keep its identity once it is deselected.
+
+    Covers the installed-but-unselected case (package metadata names the seed)
+    and the uninstalled case (only the home's seed marker names it). Fresh
+    interpreters own the import claim.
+    """
+    script = '''
+import sys
+from pathlib import Path
+from mimir.plugins.discovery import enabled_plugins
+from mimir.plugins.defaults import seed_plugin_defaults
+from mimir.plugins.manager import load_plugins
+from mimir.pollers import discover_pollers
+mode, home = sys.argv[1], Path(sys.argv[2])
+if mode == "seed":
+    seed_plugin_defaults(home, selected=enabled_plugins(enable="example"))
+    assert (home / "skills/example-example-watch/pollers.json").is_file()
+else:
+    invalid = []
+    pollers = discover_pollers(home / "skills", policy=load_plugins(enable="").policy,
+                               invalid_entries=invalid)
+    assert [p.name for p in pollers] == ["operator-watch"], pollers
+    assert [(path.parent.name, name) for path, name, reason in invalid
+            if "seeded by plugin 'example'" in reason] == [("example-example-watch", "<manifest>")], invalid
+    assert "mimir_example_plugin" not in sys.modules
+'''
+    home = tmp_path / "home"
+    operator = home / "skills" / "operator-watch"
+    operator.mkdir(parents=True)
+    (operator / "pollers.json").write_text(json.dumps({"pollers": [{
+        "name": "operator-watch", "command": "python3 poller.py", "cron": "*/5 * * * *",
+    }]}), encoding="utf-8")
+    installed = {**os.environ, "PYTHONPATH": str(example_distribution),
+                 "MIMIR_PLUGINS": "", "MIMIR_HOME": str(home)}
+    uninstalled = {key: value for key, value in installed.items() if key != "PYTHONPATH"}
+    for mode, env in (("seed", installed), ("installed", installed), ("uninstalled", uninstalled)):
+        result = subprocess.run([sys.executable, "-c", script, mode, str(home)],
+                                env=env, capture_output=True, text=True)
+        assert result.returncode == 0, f"{mode}: {result.stderr[-4000:]}"
+
+
 def _policy(factory, *, result_domain="plugin-data", service_constraints=False, boundary=False):
     registry = PolicyRegistry()
     register_core_tools(registry)

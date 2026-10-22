@@ -1845,6 +1845,8 @@ def discover_pollers(
         path: None for path in skills_dir.rglob("pollers.json")
     } if skills_dir.exists() else {}
     validated_seeds: set[Path] = set()
+    # Packaged manifest -> the byte-identical home seed that supersedes it.
+    packaged_seeds: dict[Path, Path] = {}
     for candidate in plugin_candidates:
         if not candidate.enabled or candidate.manifest is None:
             continue
@@ -1891,6 +1893,26 @@ def discover_pollers(
                     if seeded.read_bytes() == path.read_bytes():
                         manifests[seeded] = candidate.name
                         validated_seeds.add(seeded)
+                        packaged_seeds[path] = seeded
+
+    # A home skill that a plugin's defaults seeded keeps that plugin's identity
+    # even after the operator deselects the plugin; running it as an ordinary
+    # core-home poller would hand provider pollers (and their write authority)
+    # to core. Ownership is decided from package metadata and the home's seed
+    # markers only: a disabled provider is never imported to decide it.
+    from .plugins.defaults import seeded_skill_namespaces, seeded_skill_owner
+
+    seed_namespaces = seeded_skill_namespaces(skills_dir.parent)
+    selected_owners = {
+        candidate.name for candidate in (
+            *(policy.selected_plugin_candidates if policy is not None else ()),
+            *(candidate for candidate in plugin_candidates if candidate.enabled),
+        )
+    }
+    if "cultivate" in selected_owners and (
+        policy is None or not policy._selected_first_party("cultivate")
+    ):
+        selected_owners.discard("cultivate")
 
     # Only inventory-matched selected seeds precede packaged resources. All
     # other manifests retain their absolute-path ordering and first-wins rule.
@@ -1921,6 +1943,22 @@ def discover_pollers(
             log.info(
                 "poller_manifest_hidden_dir_skipped: %s", pollers_file,
             )
+            continue
+        seed_owner = (
+            seeded_skill_owner(_rel_dirs[0], seed_namespaces)
+            if plugin_owner is None and _rel_dirs else None
+        )
+        if seed_owner is not None and seed_owner not in selected_owners:
+            reason = (
+                f"skill seeded by plugin {seed_owner!r}, which is not selected; "
+                f"set MIMIR_PLUGINS to include {seed_owner!r} to run it"
+            )
+            log.warning(
+                "poller_plugin_seed_unselected: %s — %s; manifest skipped",
+                pollers_file, reason,
+            )
+            if invalid_entries is not None:
+                invalid_entries.append((pollers_file, "<manifest>", reason))
             continue
         skill_dir = pollers_file.parent
         try:
@@ -2072,6 +2110,14 @@ def discover_pollers(
             # chainlink #420: duplicate-name guard. ``log.warning``
             # (sync context, same as the other discovery warnings —
             # ``log_event`` is async and there may be no loop here).
+            if name in seen_names and seen_names[name] == packaged_seeds.get(pollers_file):
+                # Expected pair: the inventory-matched home seed already
+                # registered this name, so its packaged original is redundant.
+                log.debug(
+                    "poller_packaged_default_superseded: %s name=%r by seed %s",
+                    pollers_file, name, seen_names[name],
+                )
+                continue
             if name in seen_names:
                 log.warning(
                     "poller_duplicate_name: %s declares name=%r already "
