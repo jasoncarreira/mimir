@@ -134,10 +134,14 @@ remain available. Disabled providers are inspected through package metadata, not
 imported. Set a comma-separated list of manifest names or `all` to enable them.
 Invalid or duplicate disabled providers are diagnosed in the plugin listing;
 selected missing, duplicate, invalid or incompatible providers fail startup.
-Set `MIMIR_PLUGINS` in the supervisor's process environment (for example,
-`compose.env` or a systemd unit), never in `<MIMIR_HOME>/.env`: the agent can
-write its home. The selection is captured at startup and cannot be changed by
-chat, tools or a home dotenv. `mimir plugins list [--json]` inspects installed
+Set `MIMIR_PLUGINS` in the supervisor's operator-owned process environment
+(for example, a systemd unit). With the generated Docker scaffold, export it
+in the operator's host shell for every Compose invocation: Compose interpolates
+the process value into `environment:`. Neither the mounted agent home's `.env`
+nor its `compose.env` is an authority source; both are agent-writable. In
+particular, `compose.env` cannot override the scaffold's interpolated
+`environment:` entry. The selection is captured at startup and cannot be
+changed by chat, tools or a home dotenv. `mimir plugins list [--json]` inspects installed
 metadata and the current process selection without starting the runtime; it
 reports disabled-manifest diagnostics. See [plugins](plugins.md).
 
