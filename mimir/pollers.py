@@ -1836,7 +1836,7 @@ def discover_pollers(
     # circuit-breaker key, so two manifests declaring the same name
     # would silently conflate all of that state (and overcount
     # installs). First successfully-parsed occurrence in the
-    # deterministic sorted-rglob order wins; later duplicates are
+    # deterministic discovery order wins; later duplicates are
     # skipped loudly, naming both manifests so the operator can see
     # which skill lost.
     seen_names: dict[str, Path] = {}
@@ -1844,6 +1844,7 @@ def discover_pollers(
     manifests: dict[Path, str | None] = {
         path: None for path in skills_dir.rglob("pollers.json")
     } if skills_dir.exists() else {}
+    validated_seeds: set[Path] = set()
     for candidate in plugin_candidates:
         if not candidate.enabled or candidate.manifest is None:
             continue
@@ -1889,8 +1890,13 @@ def discover_pollers(
                     # its manifest diverges from the inventoried distribution.
                     if seeded.read_bytes() == path.read_bytes():
                         manifests[seeded] = candidate.name
+                        validated_seeds.add(seeded)
 
-    for pollers_file, plugin_owner in sorted(manifests.items()):
+    # Only inventory-matched selected seeds precede packaged resources. All
+    # other manifests retain their absolute-path ordering and first-wins rule.
+    for pollers_file, plugin_owner in sorted(
+        manifests.items(), key=lambda item: (item[0] not in validated_seeds, item[0]),
+    ):
         from ._paths import live_loader_path_allowed
         if not live_loader_path_allowed(pollers_file):
             continue
