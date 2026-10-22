@@ -54,7 +54,7 @@ ALLOWLIST = {
 
 # Only read to warn once at boot; retired and deliberately absent from the
 # operator configuration reference.
-RETIRED_KEYS = {"MIMIR_UNAUTHORIZED_USER_BEHAVIOR"}
+RETIRED_KEYS = {"MIMIR_UNAUTHORIZED_USER_BEHAVIOR", "MIMIR_CODING_ENABLED"}
 
 _ENV_ACCESSOR_HINT = "env"  # substring identifying env-reading helper callees
 # Double-underscore suffixes are namespace prefixes (for example

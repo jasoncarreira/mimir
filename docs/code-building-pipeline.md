@@ -5,9 +5,12 @@ leaf that is built, tested, and opened as a pull request, then explains how the
 separate GitHub poller surfaces review work. Paths below are relative to the
 agent home selected by `MIMIR_HOME`.
 
-Worklink is supplied by the optional `mimir-cultivate` package. Install the
-package and select `cultivate` in `MIMIR_PLUGINS` before following these
-instructions; core Mimir alone does not supply Worklink or coding tools.
+Worklink is supplied by the optional Cultivate plugin, the in-repo
+`plugins/cultivate` workspace member. Install it from the same checkout as core
+(`uv sync --all-packages`, or an image built with
+`MIMIR_PLUGIN_SELECTION=cultivate`) and select `cultivate` in `MIMIR_PLUGINS`
+before following these instructions; core Mimir alone does not supply Worklink
+or coding tools. See [upgrading a coding deployment](plugins.md#upgrading-a-coding-deployment).
 
 ## 1. Declare the repository
 

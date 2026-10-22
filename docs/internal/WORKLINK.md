@@ -6,8 +6,10 @@ source of truth; mimir plans; pluggable coding/maintenance CLIs build;
 deterministic machinery connects them.
 
 Worklink's executor, backends and factory integration are supplied by the
-optional `mimir-cultivate` package (`mimir_cultivate.worklink`). Install it and
-select `cultivate` in `MIMIR_PLUGINS` to enable coding; core-only Mimir does not
+optional `mimir-cultivate` package (`mimir_cultivate.worklink`), installed from
+the in-repo `plugins/cultivate` workspace member at the same commit as core.
+Install it (`uv sync --all-packages`, or `MIMIR_PLUGIN_SELECTION=cultivate` at
+image build) and select `cultivate` in `MIMIR_PLUGINS` to enable coding; core-only Mimir does not
 load this provider or expose Worklink commands and tools. Historical rollout
 notes below describe the original architecture, not the current package boundary.
 

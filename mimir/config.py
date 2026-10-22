@@ -689,6 +689,59 @@ def _parse_file_tool_roots(
     return tuple(out.items())
 
 
+#: How an operator gets coding back after it moved out of core. Emitted verbatim
+#: by the boot warnings below: agents and operators act on this string, so it
+#: must stay exact (see docs/plugins.md, "Upgrading a coding deployment").
+CULTIVATE_UPGRADE_HINT = (
+    "Coding now ships as the Cultivate plugin (the plugins/cultivate workspace "
+    "member). To keep coding: install it from this source checkout with "
+    "`uv sync --all-packages` (keep your --extra flags; a plain `uv sync` removes "
+    "it), or rebuild the image with `--build-arg MIMIR_PLUGIN_SELECTION=cultivate`; "
+    "then set MIMIR_PLUGINS=cultivate in the process or supervisor environment "
+    "(shell export, systemd Environment=, compose environment:/env_file) and "
+    "restart. Do NOT put MIMIR_PLUGINS in the agent home's .env: that file cannot "
+    "select plugins. See docs/plugins.md, \"Upgrading a coding deployment\"."
+)
+#: Home files that only a selected forge/coding provider consumes.
+_PROVIDER_OWNED_HOME_FILES = ("worklink.yaml", "repositories.yaml")
+#: One warning per message per process: from_env runs more than once per boot.
+_retired_coding_warned: set[str] = set()
+
+
+def _warn_once(message: str, *args: object) -> None:
+    rendered = message % args if args else message
+    if rendered in _retired_coding_warned:
+        return
+    _retired_coding_warned.add(rendered)
+    log.warning(rendered)
+
+
+def _warn_retired_coding_configuration(home: Path, provider_selected: bool) -> None:
+    """Make an upgrade that silently lost coding loud, without failing boot."""
+    raw = os.environ.get("MIMIR_CODING_ENABLED")
+    if raw is not None:
+        if provider_selected or raw.strip().lower() not in _ENV_BOOL_TRUTHY:
+            _warn_once(
+                "MIMIR_CODING_ENABLED is retired and ignored; coding is selected only "
+                "by MIMIR_PLUGINS. Remove MIMIR_CODING_ENABLED from the deployment"
+            )
+        else:
+            _warn_once(
+                "MIMIR_CODING_ENABLED=%s is retired and ignored: CODING IS DISABLED "
+                "because no coding provider is selected (MIMIR_PLUGINS=%r). %s",
+                raw, os.environ.get("MIMIR_PLUGINS", ""), CULTIVATE_UPGRADE_HINT,
+            )
+    if provider_selected:
+        return
+    for name in _PROVIDER_OWNED_HOME_FILES:
+        if (home / name).exists():
+            _warn_once(
+                "%s exists but no selected plugin owns it (MIMIR_PLUGINS=%r): it is "
+                "IGNORED and coding is disabled. %s",
+                home / name, os.environ.get("MIMIR_PLUGINS", ""), CULTIVATE_UPGRADE_HINT,
+            )
+
+
 def _configure_declared_repositories(
     home: Path, inventory_loader: Any = None, repository_selection: Any = None,
 ) -> None:
@@ -1346,6 +1399,7 @@ class Config:
             log.warning("MIMIR_UNAUTHORIZED_USER_BEHAVIOR is retired; use intake.unknown_senders in identities.yaml")
             cls._retired_intake_warned = True
         hooks = plugin_manager.policy.policy_consumer_hooks
+        _warn_retired_coding_configuration(home, provider_selected=hooks is not None)
         _configure_declared_repositories(
             home, hooks.repository_inventory if hooks is not None else None,
             hooks.repository_selection if hooks is not None else None,

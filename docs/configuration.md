@@ -124,8 +124,11 @@ exists — turn it on here first:
 | `MIMIR_FACTORY_EPICS_ENABLED` | Feature-factory epic dispatch in the chainlink-orchestrator poller (for `worklink:epic` issues). |
 
 Coding is an optional installed provider, not a feature flag: install the
-same-version `mimir-cultivate` package and select `cultivate` in `MIMIR_PLUGINS`.
-The retired coding flag has no effect. See [coding prerequisites](#coding-prerequisites).
+in-repo `plugins/cultivate` workspace member (`uv sync --all-packages`, or an
+image built with `MIMIR_PLUGIN_SELECTION=cultivate`) and select `cultivate` in
+`MIMIR_PLUGINS`. The retired `MIMIR_CODING_ENABLED` flag has no effect and logs a
+warning at boot. See [coding prerequisites](#coding-prerequisites) and
+[upgrading a coding deployment](plugins.md#upgrading-a-coding-deployment).
 
 Installed Python plugins use an operator-owned process-environment enable
 list. They are trusted in-process code, not a sandbox or a remote marketplace.
@@ -889,10 +892,12 @@ These are consumed by the Docker scaffold / build (`start.sh`, Dockerfiles,
 
 ### Coding prerequisites
 
-Coding stays disabled by default. Install matching-version `mimir-cultivate`
-and set `MIMIR_PLUGINS=cultivate` in the supervisor process environment; an
-unselected or absent provider supplies no coding tools. For image builds,
-select and install Cultivate at build time as described in
+Coding stays disabled by default. Install Cultivate from the in-repo
+`plugins/cultivate` workspace member at the same commit as core
+(`uv sync --all-packages`; it is not published to an index) and set
+`MIMIR_PLUGINS=cultivate` in the supervisor process environment; an unselected
+or absent provider supplies no coding tools. For image builds, select Cultivate
+at build time with `MIMIR_PLUGIN_SELECTION=cultivate` as described in
 [plugins](plugins.md#docker-image-assembly-and-services).
 `MIMIR_ENABLE_OPENCODE` is a build argument for the pinned CLI/bootstrap, not
 a runtime coding switch. Compose reads its project `.env` for build argument

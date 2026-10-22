@@ -43,7 +43,7 @@ You need two GitHub identities, one always-on host for the mimir agent, and your
 | Agent host | Linux or macOS box that stays on, with Docker | Runs the mimir agent and its builds. Allow 8 CPUs, 16 GB RAM and 60 GB+ free disk |
 | Your machine | Claude Code, `gh`, `git`, `uv` | Runs reviews: full test suites in worktrees |
 | Model access | A subscription or API key for the agent | e.g. a Codex/ChatGPT plan (`codex-plus`), Claude Max (`claude-code`) or an API key |
-| mimir + Cultivate | `pip install "mimir-agent[<extras>]" "mimir-cultivate==<matching-mimir-version>"` | Extras: `codex-plus`, `claude-code`, `anthropic`, `openai`, `discord`, `slack`, `mcp`. Worklink and GitHub coding tools require the separately installed, selected Cultivate provider. Core remains MIT; Cultivate is BSL. |
+| mimir + Cultivate | A mimir source checkout, then `uv sync --all-packages --extra <extras>` | Extras: `codex-plus`, `claude-code`, `anthropic`, `openai`, `discord`, `slack`, `mcp`. Worklink and GitHub coding tools require the selected Cultivate provider, which is not on PyPI: it installs from the in-repo `plugins/cultivate` member at the same commit as core. Core remains MIT; Cultivate is BSL. |
 | chainlink | The issue tracker the queue reads | Built into the Docker image by `mimir scaffold-docker`; set `CHAINLINK_BIN` to use your own build |
 | Chat bridge (optional) | Discord or Slack | How you talk to the agent and get its alerts |
 
@@ -162,15 +162,17 @@ shell too. `compose.env` holds ordinary container settings, not plugin selection
 **1. Install mimir and create a home.**
 
 ```bash
-pip install "mimir-agent[codex-plus,discord]" "mimir-cultivate==<matching-mimir-version>"
-mimir setup --home ~/agents/my-agent                # add --model / --subscription to choose a model
+# Cultivate is not on PyPI: install it from the checkout, at the same commit as core.
+git clone https://github.com/jasoncarreira/mimir.git && cd mimir
+uv sync --all-packages --extra codex-plus --extra discord   # a plain `uv sync` drops Cultivate
+uv run --no-sync mimir setup --home ~/agents/my-agent                # add --model / --subscription to choose a model
 # The container sees this home at /mimir-home, but setup wrote saga's database paths as
 # absolute host paths; point them at the container path or the agent can't open its memory.
 sed -i.bak -E 's#^(db_path|metrics_db_path) = ".*/\.mimir/#\1 = "/mimir-home/.mimir/#' ~/agents/my-agent/saga.toml
 ```
 
-**2. Seed the Cultivate skills that run the loop.** With the matching package
-installed and `MIMIR_PLUGINS=cultivate` exported by the operator, `mimir setup`
+**2. Seed the Cultivate skills that run the loop.** With Cultivate installed
+from the checkout and `MIMIR_PLUGINS=cultivate` exported by the operator, `mimir setup`
 seeds the provider's packaged defaults into
 `<home>/skills/cultivate-chainlink-orchestrator/` and
 `<home>/skills/cultivate-github-poller/`. Selected-provider startup also seeds
