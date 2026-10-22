@@ -1900,19 +1900,14 @@ def discover_pollers(
     # core-home poller would hand provider pollers (and their write authority)
     # to core. Ownership is decided from package metadata and the home's seed
     # markers only: a disabled provider is never imported to decide it.
-    from .plugins.defaults import seeded_skill_namespaces, seeded_skill_owner
+    from .plugins.defaults import seed_namespaces, selected_plugin_owners
 
-    seed_namespaces = seeded_skill_namespaces(skills_dir.parent)
-    selected_owners = {
-        candidate.name for candidate in (
-            *(policy.selected_plugin_candidates if policy is not None else ()),
-            *(candidate for candidate in plugin_candidates if candidate.enabled),
-        )
-    }
-    if "cultivate" in selected_owners and (
-        policy is None or not policy._selected_first_party("cultivate")
-    ):
-        selected_owners.discard("cultivate")
+    namespaces = seed_namespaces(skills_dir.parent)
+    selected_owners = set(selected_plugin_owners(policy))
+    selected_owners.update(
+        candidate.name for candidate in plugin_candidates
+        if candidate.enabled and candidate.name != "cultivate"
+    )
 
     # Only inventory-matched selected seeds precede packaged resources. All
     # other manifests retain their absolute-path ordering and first-wins rule.
@@ -1945,7 +1940,7 @@ def discover_pollers(
             )
             continue
         seed_owner = (
-            seeded_skill_owner(_rel_dirs[0], seed_namespaces)
+            namespaces.skill_owner(_rel_dirs[0])
             if plugin_owner is None and _rel_dirs else None
         )
         if seed_owner is not None and seed_owner not in selected_owners:

@@ -74,6 +74,11 @@ from .feedback import FeedbackLog
 from . import health
 from . import mid_turn_injection
 from . import _deepagents_patches
+from .skill_visibility import (
+    SeedFilteredSkillsMiddleware,
+    hidden_home_skill_dirs,
+    visible_skill_names,
+)
 from .history import Message, MessageBuffer
 from .harness_egress import harness_sink_allowed
 from .index import IndexGenerator
@@ -1591,6 +1596,7 @@ class Agent:
         self._agent_model: Any | None = None
         self._agent_tools: list[Any] | None = None
         self._agent_middleware: tuple[Any, ...] | None = None
+        self._agent_skills_middleware: Any | None = None
         self._cached_skill_catalog_fingerprint: str | None = None
         self._skill_fingerprint_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._skill_fingerprint_cache: tuple[tuple, str] | None = None
@@ -2024,6 +2030,13 @@ class Agent:
                 # one-shot wrap-up land before the other before_model hooks.
                 from .tools.iteration_gate import IterationGateMiddleware
                 from .tools.service_tool_surface import ServiceToolSurfaceMiddleware
+                # Replaces deepagents' default skills slot (main agent and the
+                # general-purpose subagent) so skills seeded by a deselected
+                # plugin never reach the catalog.
+                self._agent_skills_middleware = SeedFilteredSkillsMiddleware(
+                    backend=self._backend, sources=skill_sources,
+                    home=self._config.home, policy=self._config.plugin_manager.policy,
+                )
                 self._agent_middleware = (
                     TodoListMiddleware(),
                     IterationGateMiddleware(),
@@ -2034,7 +2047,7 @@ class Agent:
                     MidTurnInjectionMiddleware(),
                 )
 
-            for middleware in self._agent_middleware:
+            for middleware in (*self._agent_middleware, self._agent_skills_middleware):
                 set_skill_sources = getattr(middleware, "set_skill_sources", None)
                 if callable(set_skill_sources):
                     set_skill_sources(skill_sources)
@@ -2049,8 +2062,10 @@ class Agent:
                 tools=self._agent_tools,
                 system_prompt=system_prompt,
                 backend=self._backend,
-                skills=skill_sources or None,
-                middleware=self._agent_middleware,
+                middleware=(
+                    (*self._agent_middleware, self._agent_skills_middleware)
+                    if skill_sources else self._agent_middleware
+                ),
                 subagents=build_mimir_subagents(
                     home=self._config.home, policy=self._config.plugin_manager.policy,
                 ),
@@ -4654,7 +4669,10 @@ class Agent:
                 render_skill_telemetry,
             )
             from .skill_defs import installed_skill_names
-            seeded = installed_skill_names(self._config.home)
+            seeded = visible_skill_names(
+                self._config.home, installed_skill_names(self._config.home),
+                self._config.plugin_manager.policy,
+            )
             if not seeded:
                 return None
             # Per-skill success_criteria refines load-kind outcomes
@@ -5059,9 +5077,12 @@ class Agent:
                 event_loop=event_loop,
             ),
             asyncio.to_thread(
-                find_skill_for_channel,
-                event.channel_id,
-                skills_dirs,
+                lambda: find_skill_for_channel(
+                    event.channel_id, skills_dirs,
+                    hidden=hidden_home_skill_dirs(
+                        self._config.home, self._config.plugin_manager.policy,
+                    ),
+                ),
             ),
             saga_query_task
             if saga_query_task is not None

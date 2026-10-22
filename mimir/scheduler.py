@@ -1164,7 +1164,8 @@ class Scheduler:
                 self._yaml_path,
                 writable_roots=agent_writable_roots(self._home),
             )
-        return self._apply_reload(yaml_jobs, rejections)
+        yaml_jobs, skipped = self._drop_unselected_plugin_jobs(yaml_jobs)
+        return self._apply_reload(yaml_jobs, rejections, skipped=skipped)
 
     async def _reload_async(self) -> dict[str, int]:
         """``reload`` with the yaml read off the loop (``to_thread``) and
@@ -1185,12 +1186,51 @@ class Scheduler:
                     self._yaml_path, writable_roots=agent_writable_roots(home),
                 ),
             )
-        return self._apply_reload(yaml_jobs, rejections)
+        yaml_jobs, skipped = await asyncio.to_thread(
+            self._drop_unselected_plugin_jobs, yaml_jobs,
+        )
+        return self._apply_reload(yaml_jobs, rejections, skipped=skipped)
+
+    def _drop_unselected_plugin_jobs(
+        self, jobs: list[SchedulerJob],
+    ) -> tuple[list[SchedulerJob], list[dict[str, Any]]]:
+        """Withhold jobs seeded by a plugin that is not selected in this process.
+
+        Seeding merges ``<plugin>-<job>`` entries into the operator's
+        scheduler.yaml, and they stay there after the operator deselects the
+        plugin. Ownership is decided from package metadata and the home's seed
+        markers only, so the deselected provider is never imported. The entries
+        remain in the file (add/remove rewrites keep them); they just never fire.
+        """
+        from .plugins.defaults import seed_namespaces, selected_plugin_owners
+
+        home = self._home if self._home is not None else self._yaml_path.parent
+        namespaces = seed_namespaces(home)
+        selected = selected_plugin_owners(self._policy)
+        kept: list[SchedulerJob] = []
+        skipped: list[dict[str, Any]] = []
+        for job in jobs:
+            owner = namespaces.job_owner(job.name)
+            if owner is None or owner in selected:
+                kept.append(job)
+                continue
+            reason = (
+                f"job seeded by plugin {owner!r}, which is not selected; "
+                f"set MIMIR_PLUGINS to include {owner!r} to run it"
+            )
+            log.warning(
+                "scheduler_plugin_seed_unselected: %s job=%r — %s; job not scheduled",
+                self._yaml_path, job.name, reason,
+            )
+            skipped.append({"path": str(self._yaml_path), "job": job.name, "reason": reason})
+        return kept, skipped
 
     def _apply_reload(
         self,
         yaml_jobs: list[SchedulerJob],
         rejections: list[dict[str, Any]] | None = None,
+        *,
+        skipped: list[dict[str, Any]] | None = None,
     ) -> dict[str, int]:
         """Apply pre-loaded jobs and mutate APScheduler on the loop thread.
 
@@ -1307,6 +1347,7 @@ class Scheduler:
             )
             registered += 1
         self._dispatch_reload_events("scheduler_job_rejected", rejection_events)
+        self._dispatch_reload_events("scheduler_plugin_job_skipped", list(skipped or []))
         return {"registered": registered, "invalid": invalid}
 
     async def _consult_arbiter(self, *, priority: str) -> Any | None:
@@ -2000,6 +2041,7 @@ class Scheduler:
                 yaml_jobs, _rejections = load_jobs(self._yaml_path)
             except Exception:  # noqa: BLE001 — already logged inside load_jobs
                 yaml_jobs = []
+            yaml_jobs, _skipped = self._drop_unselected_plugin_jobs(yaml_jobs)
 
         effective_cron, source = _resolve_callable_cron(
             yaml_jobs, cdef.name, cdef.default_cron,

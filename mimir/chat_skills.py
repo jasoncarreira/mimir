@@ -68,7 +68,12 @@ class ChatSkillRegistry:
 
     @classmethod
     def from_config(cls, config: Config) -> "ChatSkillRegistry":
-        effective = _load_effective_chat_skills(config.home)
+        from .skill_visibility import hidden_home_skill_dirs
+
+        effective = _load_effective_chat_skills(
+            config.home,
+            hidden=hidden_home_skill_dirs(config.home, config.plugin_manager.policy),
+        )
         discoverable = tuple(
             effective[name]
             for name in config.chat_skill_allowlist
@@ -199,7 +204,10 @@ def _invocation_from_dict(invocation_dict: Mapping[str, Any]) -> ChatSkillInvoca
     )
 
 
-def _load_effective_chat_skills(home: Path) -> dict[str, _EffectiveChatSkill]:
+def _load_effective_chat_skills(
+    home: Path, *, hidden: frozenset[Path] = frozenset(),
+) -> dict[str, _EffectiveChatSkill]:
+    """Chat-invocable skills; ``hidden`` dirs (seeded by deselected plugins) are skipped."""
     out: dict[str, _EffectiveChatSkill] = {}
     for skills_root in (home_builtin_skills_dir(home), home_skills_dir(home)):
         if not skills_root.is_dir():
@@ -209,6 +217,8 @@ def _load_effective_chat_skills(home: Path) -> dict[str, _EffectiveChatSkill]:
         except OSError:
             continue
         for skill_dir in entries:
+            if skill_dir in hidden:
+                continue
             skill = _load_effective_chat_skill(skill_dir)
             if skill is None:
                 continue

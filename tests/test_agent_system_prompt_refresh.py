@@ -462,6 +462,28 @@ async def test_build_agent_rebuilds_when_skill_catalog_changes(
 
 
 @pytest.mark.asyncio
+async def test_build_agent_routes_skills_through_seed_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The skills slot is the seed-filtering middleware, not deepagents' default."""
+    from mimir.skill_visibility import SeedFilteredSkillsMiddleware
+
+    agent = _make_agent(tmp_path, monkeypatch)
+    capture = _stub_deepagent_build(monkeypatch)
+    skill = agent._config.home / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: demo\ndescription: d\n---\n", encoding="utf-8")
+
+    await agent._build_agent_if_needed()
+
+    kwargs = capture.kwargs[0]
+    assert kwargs.get("skills") is None
+    [skills] = [m for m in kwargs["middleware"] if isinstance(m, SeedFilteredSkillsMiddleware)]
+    assert skills.name == "SkillsMiddleware"
+    assert skills.sources == [str(agent._config.home / "skills")]
+
+
+@pytest.mark.asyncio
 async def test_core_prompt_degraded_event_emits_only_on_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

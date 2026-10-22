@@ -60,6 +60,7 @@ _POLLER_CHANNEL_PREFIX = "poller:"
 def _skill_dirs_for_poller(
     poller_name: str,
     skills_dirs: Iterable[Path],
+    hidden: frozenset[Path] = frozenset(),
 ) -> Path | None:
     """Return the skill directory whose ``pollers.json`` declares
     ``poller_name``, or ``None`` when no skill matches.
@@ -78,7 +79,7 @@ def _skill_dirs_for_poller(
         except OSError:
             continue
         for skill_dir in entries:
-            if not skill_dir.is_dir():
+            if not skill_dir.is_dir() or skill_dir in hidden:
                 continue
             pollers_json = skill_dir / "pollers.json"
             from ._paths import live_loader_path_allowed
@@ -109,6 +110,8 @@ def _skill_dirs_for_poller(
 def find_skill_for_channel(
     channel_id: str | None,
     skills_dirs: Iterable[Path],
+    *,
+    hidden: frozenset[Path] = frozenset(),
 ) -> tuple[str, str] | None:
     """Return ``(skill_name, body)`` when ``channel_id`` is a
     ``poller:<name>`` channel whose poller is declared by an
@@ -125,7 +128,7 @@ def find_skill_for_channel(
     poller_name = channel_id[len(_POLLER_CHANNEL_PREFIX):].strip()
     if not poller_name:
         return None
-    skill_dir = _skill_dirs_for_poller(poller_name, skills_dirs)
+    skill_dir = _skill_dirs_for_poller(poller_name, skills_dirs, hidden)
     if skill_dir is None:
         return None
     skill_md = skill_dir / "SKILL.md"

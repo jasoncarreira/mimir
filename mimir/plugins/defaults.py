@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 import yaml
 
 from .discovery import PluginCandidate, discover_plugins, enabled_plugins
+
+if TYPE_CHECKING:
+    from .registry import PolicyRegistry
 
 
 def safe_destination(root: Path, rel: Path) -> Path:
@@ -29,17 +36,66 @@ SEED_MARKER_DIRS = (Path(".mimir") / "seed-plugin-defaults", Path(".mimir") / "u
 FIRST_PARTY_SEED_NAMESPACES = frozenset({"cultivate"})
 
 
-def seeded_skill_namespaces(home: Path) -> tuple[dict[str, str], tuple[str, ...]]:
-    """Identify home skill directories that plugin defaults seeded, without imports.
+@dataclass(frozen=True)
+class SeedNamespaces:
+    """Which home skills and scheduler jobs plugin defaults seeded.
 
-    Returns ``(exact, prefixes)``: ``exact`` maps a seeded skill directory name to
-    the installed plugin whose inventoried defaults declare it, and ``prefixes``
-    lists plugin names whose whole ``<name>-*`` namespace is a seed namespace
-    (first-party providers, plus any plugin whose seed marker is in ``home`` even
-    when it is no longer installed). Only package metadata and marker names are
-    read; no provider module is imported.
+    ``skills`` and ``jobs`` map an exact seeded skill-directory or job name to
+    the installed plugin whose inventoried defaults declare it. ``prefixes``
+    lists plugin names whose whole ``<name>-*`` namespace is a seed namespace:
+    first-party providers, plus any plugin whose seed marker is in the home even
+    when it is no longer installed. Longest names come first.
     """
-    exact: dict[str, str] = {}
+
+    skills: Mapping[str, str]
+    jobs: Mapping[str, str]
+    prefixes: tuple[str, ...]
+
+    def _owner(self, exact: Mapping[str, str], name: str) -> str | None:
+        if name in exact:
+            return exact[name]
+        return next((plugin for plugin in self.prefixes if name.startswith(f"{plugin}-")), None)
+
+    def skill_owner(self, skill_dir_name: str) -> str | None:
+        """The plugin that seeds ``skills/<skill_dir_name>``, or ``None`` for core."""
+        return self._owner(self.skills, skill_dir_name)
+
+    def job_owner(self, job_name: str) -> str | None:
+        """The plugin that seeds scheduler job ``job_name``, or ``None`` for core."""
+        return self._owner(self.jobs, job_name)
+
+
+def _seeded_job_names(candidate: PluginCandidate) -> set[str]:
+    """Names seeding gives a plugin's declared jobs; reads package data only."""
+    manifest = candidate.manifest
+    dist = candidate.entry_point.dist
+    if manifest is None or not manifest.defaults or dist is None or dist.files is None:
+        return set()
+    roots = [item for item in dist.files if item.name == "mimir-plugin.toml"]
+    if len(roots) != 1:
+        return set()
+    root = Path(dist.locate_file(roots[0])).parent
+    names: set[str] = set()
+    for resource in manifest.defaults.get("scheduler_jobs", ()):
+        try:
+            raw = yaml.safe_load((root / resource).read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        entries = raw.get("jobs") if isinstance(raw, dict) else raw
+        for entry in entries if isinstance(entries, list) else ():
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                names.add(f"{candidate.name}-{entry['name'].strip()}")
+    return names
+
+
+def seed_namespaces(home: Path) -> SeedNamespaces:
+    """Identify what plugin defaults seeded into ``home``, without imports.
+
+    Only package metadata, package data and marker names are read; no provider
+    module is imported, so a deselected provider stays unloaded.
+    """
+    skills: dict[str, str] = {}
+    jobs: dict[str, str] = {}
     prefixes = set(FIRST_PARTY_SEED_NAMESPACES)
     for marker_dir in SEED_MARKER_DIRS:
         root = Path(home) / marker_dir
@@ -55,16 +111,37 @@ def seeded_skill_namespaces(home: Path) -> tuple[dict[str, str], tuple[str, ...]
     for candidate in candidates:
         manifest = candidate.manifest
         for directory in (manifest.defaults.get("skills", ()) if manifest and manifest.defaults else ()):
-            exact.setdefault(f"{candidate.name}-{Path(directory).name}", candidate.name)
-    return exact, tuple(sorted(prefixes, key=len, reverse=True))
+            skills.setdefault(f"{candidate.name}-{Path(directory).name}", candidate.name)
+        for name in _seeded_job_names(candidate):
+            jobs.setdefault(name, candidate.name)
+    return SeedNamespaces(MappingProxyType(skills), MappingProxyType(jobs),
+                          tuple(sorted(prefixes, key=len, reverse=True)))
 
 
-def seeded_skill_owner(skill_dir_name: str, namespaces: tuple[dict[str, str], tuple[str, ...]]) -> str | None:
-    """Return the plugin that seeds ``skills/<skill_dir_name>``, or ``None`` for core."""
-    exact, prefixes = namespaces
-    if skill_dir_name in exact:
-        return exact[skill_dir_name]
-    return next((name for name in prefixes if skill_dir_name.startswith(f"{name}-")), None)
+def selected_plugin_owners(policy: "PolicyRegistry | None") -> frozenset[str]:
+    """Plugins whose seeds may run: selected, and first-party where that matters."""
+    if policy is None:
+        return frozenset()
+    names = {candidate.name for candidate in policy.selected_plugin_candidates}
+    if "cultivate" in names and not policy._selected_first_party("cultivate"):
+        names.discard("cultivate")
+    return frozenset(names)
+
+
+def unselected_seeded_skills(home: Path, selected: frozenset[str]) -> dict[str, str]:
+    """Map each ``<home>/skills/<dir>`` seeded by an unselected plugin to that plugin."""
+    root = Path(home) / "skills"
+    try:
+        entries = [entry.name for entry in root.iterdir() if entry.is_dir()]
+    except OSError:
+        return {}
+    namespaces = seed_namespaces(home)
+    hidden = {}
+    for name in entries:
+        owner = namespaces.skill_owner(name)
+        if owner is not None and owner not in selected:
+            hidden[name] = owner
+    return hidden
 
 
 def plugin_default_files(candidate: PluginCandidate) -> dict[Path, str]:
