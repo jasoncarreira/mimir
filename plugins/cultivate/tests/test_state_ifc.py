@@ -177,8 +177,10 @@ def test_selected_owner_registers_frozen_state_without_granting_authority() -> N
 def test_selected_trusted_pr_ingress_uses_owner_state_and_refuses_untrusted_ingress(
     tmp_path, monkeypatch, enforce: bool,
 ) -> None:
-    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
     selected = load_plugins(enable="cultivate").policy
+    _root, authority, item = _github_scope_test_setup(
+        tmp_path, monkeypatch, selected_policy=selected,
+    )
     event = models.AgentEvent(
         trigger="poller", channel_id="poller:github-activity",
         service_principal=authority.canonical, service_authority=authority,
@@ -297,6 +299,7 @@ def test_selected_ci_ingress_checks_exact_server_issued_target(
             canonical="poller:github-ci-watch", trigger="poller", profile="github",
             tier=CapabilityTier.CODE_EXECUTION,
             capabilities=("ci_run_jobs", "ci_recent_runs"), creation_path="test",
+            policy=selected, poller_owner="cultivate",
         )
         event = models.AgentEvent(
             trigger="poller", source="poller", channel_id=service.canonical,

@@ -38,6 +38,7 @@ import yaml
 from mimir import access_control, poller_recovery
 from mimir.event_logger import init_logger
 from mimir.models import AgentEvent
+from mimir.plugins.core import selected_policy_registry
 from mimir.poller_hooks import PollerHooks, resolve_poller_hooks
 from mimir.pollers import (
     POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
@@ -446,6 +447,16 @@ def selected_cultivate_policy():
         pytest.skip("shipped Cultivate poller requires installed Cultivate")
     with policy_scope(load_plugins(enable="cultivate").policy):
         yield
+
+
+def _cultivate_poller_manifest(skill: str) -> Path:
+    candidate = next(candidate for candidate in selected_policy_registry().selected_plugin_candidates
+                     if candidate.name == "cultivate")
+    dist = candidate.entry_point.dist
+    return Path(dist.locate_file(next(
+        file for file in dist.files
+        if file.as_posix() == f"mimir_cultivate/defaults/skills/{skill}/pollers.json"
+    )))
 
 
 @pytest.fixture
@@ -1014,11 +1025,12 @@ def test_ci_watch_shipped_manifest_authorizes_only_approved_urls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/pollers.json"
+    manifest = _cultivate_poller_manifest("github-ci-watch")
     raw = json.loads(manifest.read_text())["pollers"][0]
     service = _parse_poller_authority(
         raw["authority"], name=raw["name"], persist_dir=tmp_path,
-        state_root=None, manifest_path=manifest,
+        state_root=None, manifest_path=manifest, policy=selected_policy_registry(),
+        plugin_owner="cultivate",
     )
     auth = create_auth_context(AgentEvent(
         trigger="poller", channel_id="poller:github-ci-watch",
@@ -1049,7 +1061,7 @@ def test_github_activity_shipped_manifest_authorizes_scoped_actions_evidence(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setenv("GITHUB_REPOS", "o/r")
     monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
-    manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json"
+    manifest = _cultivate_poller_manifest("github-poller")
     raw = json.loads(manifest.read_text())["pollers"][0]
     assert raw["authority"]["approved_urls"] == [
         "https://api.github.com/repos/", "https://github.com/",
@@ -1062,7 +1074,8 @@ def test_github_activity_shipped_manifest_authorizes_scoped_actions_evidence(
         raw["authority"]["approved_urls"] = ["https://api.github.com/repos/other/repo/"]
     service = _parse_poller_authority(
         raw["authority"], name=raw["name"], persist_dir=tmp_path,
-        state_root=None, manifest_path=manifest,
+        state_root=None, manifest_path=manifest, policy=selected_policy_registry(),
+        plugin_owner="cultivate",
     )
     auth = create_auth_context(AgentEvent(
         trigger="poller", channel_id=service.canonical,
@@ -1738,15 +1751,13 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
     monkeypatch.setenv("MIMIR_MCP_SERVERS_PATH", str(operator_secret))
 
-    manifest_path = (
-        Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
-        / "github-poller" / "pollers.json"
-    )
+    manifest_path = _cultivate_poller_manifest("github-poller")
     entry = json.loads(manifest_path.read_text(encoding="utf-8"))["pollers"][0]
     declared_capabilities = tuple(entry["authority"]["capabilities"])
     service = _parse_poller_authority(
         entry["authority"], name=entry["name"], persist_dir=persist_dir,
         state_root=home / "state" / "pollers", manifest_path=manifest_path,
+        policy=selected_policy_registry(), plugin_owner="cultivate",
     )
     context = create_auth_context(AgentEvent(
         trigger="poller", channel_id=service.canonical,
@@ -1923,7 +1934,7 @@ def test_github_activity_active_checkout_write_refuses_git_metadata(
         canonical="poller:github-activity", trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION, capabilities=("write_file",),
         roots=(tmp_path / "state" / "pollers" / "github-activity",),
-        creation_path="test",
+        creation_path="test", poller_owner="cultivate",
     )
     context = replace(
         create_auth_context(AgentEvent(

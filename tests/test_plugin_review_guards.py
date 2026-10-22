@@ -788,31 +788,26 @@ def test_poller_builder_uses_registry_properties_not_canonical_literals(canonica
             creation_path="test:poller", policy=policy, poller_owner=owner,
         )
 
-    core_grant = canonical != "poller:worklink-ready-queue"
-    assert getattr(build(core_policy_registry()), flag) is core_grant
+    assert getattr(build(core_policy_registry()), flag) is False
     registry = PolicyRegistry()
     register_core_tools(registry)
-    # Test-only replacement isolates the declaration's effect. A literal-name
-    # fallback would incorrectly keep the property despite the selected policy.
-    registry._poller_properties[canonical] = PollerProperties()
     selected = registry.freeze()
     assert getattr(build(selected), flag) is False
-    assert getattr(build(core_policy_registry()), flag) is core_grant
-    if not core_grant:
-        import importlib.util
-        from mimir.plugins.manager import load_plugins
+    assert getattr(build(core_policy_registry()), flag) is False
+    import importlib.util
+    from mimir.plugins.manager import load_plugins
 
-        if importlib.util.find_spec("mimir_cultivate") is None:
-            from mimir.plugins.discovery import PluginDiscoveryError
+    if importlib.util.find_spec("mimir_cultivate") is None:
+        from mimir.plugins.discovery import PluginDiscoveryError
 
-            with pytest.raises(PluginDiscoveryError, match="missing plugin"):
-                load_plugins(enable="cultivate")
-        else:
-            cultivate = load_plugins(enable="cultivate").policy
-            assert cultivate.frozen
-            assert getattr(build(cultivate), flag) is False
-            assert getattr(build(cultivate, owner="example"), flag) is False
-            assert getattr(build(cultivate, owner="cultivate"), flag) is True
+        with pytest.raises(PluginDiscoveryError, match="missing plugin"):
+            load_plugins(enable="cultivate")
+    else:
+        cultivate = load_plugins(enable="cultivate").policy
+        assert cultivate.frozen
+        assert getattr(build(cultivate), flag) is False
+        assert getattr(build(cultivate, owner="example"), flag) is False
+        assert getattr(build(cultivate, owner="cultivate"), flag) is True
     with pytest.raises(TypeError):
         selected.poller_properties[canonical] = PollerProperties()
     with pytest.raises(PolicyRegistrationError, match="frozen"):

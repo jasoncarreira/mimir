@@ -1940,6 +1940,7 @@ def _ci_watch_context(
         canonical=principal or f"poller:{poller}", trigger="poller", profile="github",
         tier=access_control.CapabilityTier.CODE_EXECUTION,
         capabilities=("ci_run_jobs", "ci_run", "ci_recent_runs"), creation_path="mimir.pollers.run_poller",
+        poller_owner="cultivate",
     )
     # Vary the capability alone: keep the repository-readable domain and every
     # other authority property intact so another guard cannot hide its removal.

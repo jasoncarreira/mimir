@@ -299,6 +299,12 @@ class CultivateProvider:
         from mimir.plugins.core import PollerProperties
 
         registrar.register_poller_properties(
+            "poller:github-activity", PollerProperties(github_activity=True),
+        )
+        registrar.register_poller_properties(
+            "poller:github-ci-watch", PollerProperties(github_ci_watch=True),
+        )
+        registrar.register_poller_properties(
             "poller:worklink-ready-queue", PollerProperties(worklink_retained_checkout=True),
         )
         from . import commands
