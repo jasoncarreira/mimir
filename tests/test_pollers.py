@@ -111,6 +111,54 @@ def test_plugin_package_poller_hooks_survive_discovery_and_reload(tmp_path):
                             }),)) == []
 
 
+def test_selected_installed_cultivate_seeded_pollers_reload(tmp_path, monkeypatch):
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import core_policy_registry, poller_properties, policy_scope
+    from mimir.plugins.defaults import seed_plugin_defaults
+    from mimir.plugins.manager import load_plugins
+    from mimir.scheduler import Scheduler
+
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    monkeypatch.setenv("WORKLINK_REPO", "o/r")
+    home = tmp_path / "home"
+    installed = discover_pollers(tmp_path / "missing-skills", policy=selected)
+    assert {"github-activity", "worklink-ready-queue"} <= {p.name for p in installed}
+    seed_plugin_defaults(home, selected=selected.selected_plugin_candidates)
+    with policy_scope(core_policy_registry()):
+        assert not poller_properties("poller:worklink-ready-queue").worklink_retained_checkout
+    scheduler = Scheduler(home / "scheduler.yaml", lambda event: None,
+                          home=home, policy=selected)
+    scheduler._pollers_dir = home / "skills"
+    for _ in range(2):
+        pollers, _, invalid = scheduler._discover_pollers_io()
+        for name, skill in (
+            ("github-activity", "github-poller"),
+            ("worklink-ready-queue", "chainlink-orchestrator"),
+        ):
+            [poller] = [p for p in pollers if p.name == name]
+            assert poller.manifest_path == home / "skills" / f"cultivate-{skill}" / "pollers.json"
+            assert poller.hooks is not None
+            assert poller.authority is not None and poller.authority.canonical == f"poller:{name}"
+            assert poller.hooks.recovery_relevance is not None
+            assert not any(entry[1] == name and "reserved" in entry[2] for entry in invalid)
+        with policy_scope(selected):
+            assert poller_properties("poller:worklink-ready-queue").worklink_retained_checkout
+    seeded = home / "skills/cultivate-github-poller/pollers.json"
+    seeded.write_text(seeded.read_text().replace('"cron": "*/15', '"cron": "*/5'))
+    invalid = []
+    assert all(p.manifest_path != seeded for p in discover_pollers(
+        home / "skills", policy=selected, invalid_entries=invalid,
+    ))
+    assert any(entry[0] == seeded and "reserved" in entry[2] for entry in invalid)
+    with policy_scope(core_policy_registry()):
+        core_only = discover_pollers(home / "skills", policy=core_policy_registry())
+        assert {"github-activity", "worklink-ready-queue"}.isdisjoint(
+            p.name for p in core_only
+        )
+        assert not poller_properties("poller:worklink-ready-queue").worklink_retained_checkout
+
+
 def test_plugin_poller_authority_rejects_foreign_profile(tmp_path):
     from mimir.plugins.registry import PolicyRegistry
 

@@ -149,7 +149,10 @@ def resolve_poller_hooks(
     if raw == "worklink":
         registered = policy.poller_hooks.get(raw) if policy is not None else None
         if (plugin_owner not in (None, "cultivate")
-                or manifest_path.parent.name != "chainlink-orchestrator"
+                or manifest_path.parent.name not in (
+                    {"chainlink-orchestrator", "cultivate-chainlink-orchestrator"}
+                    if plugin_owner == "cultivate" else {"chainlink-orchestrator"}
+                )
                 or registered is None or registered[0] != "cultivate"):
             raise ValueError(f"reserved or foreign poller hooks profile: {raw!r}")
         hooks = registered[1]()
@@ -165,9 +168,15 @@ def resolve_poller_hooks(
             raise ValueError(f"invalid poller hooks profile: {raw!r}")
         return hooks
     profile = _CORE_HOOK_PROFILES[raw]
-    if plugin_owner is not None:
+    if plugin_owner is not None and not (
+        raw == "github" and plugin_owner == "cultivate"
+        and manifest_path.parent.name in {"github-poller", "cultivate-github-poller"}
+    ):
         raise ValueError(f"core poller hooks profile {raw!r} is reserved")
-    if manifest_path.parent.name != profile.skill:
+    if manifest_path.parent.name not in (
+        {profile.skill, f"cultivate-{profile.skill}"}
+        if plugin_owner == "cultivate" else {profile.skill}
+    ):
         raise ValueError(
             f"poller hooks profile {raw!r} may only be declared by "
             f"the {profile.skill!r} skill"

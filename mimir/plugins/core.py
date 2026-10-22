@@ -193,16 +193,18 @@ class PollerProperties:
 
 
 def poller_properties(canonical: str) -> PollerProperties:
-    return selected_policy_registry().poller_properties.get(canonical, PollerProperties())
+    policy = selected_policy_registry()
+    if (canonical == "poller:worklink-ready-queue"
+            and policy._selected_first_party("cultivate")
+            and policy.poller_hooks.get("worklink", (None,))[0] == "cultivate"):
+        return PollerProperties(worklink_retained_checkout=True)
+    return policy.poller_properties.get(canonical, PollerProperties())
 
 
 def register_core_poller_properties(registry: PolicyRegistry) -> None:
     """Declare historical semantics once; manifests cannot mint these grants."""
     registry.register_poller_properties(
         "poller:github-activity", PollerProperties(github_activity=True),
-    )
-    registry.register_poller_properties(
-        "poller:worklink-ready-queue", PollerProperties(worklink_retained_checkout=True),
     )
     registry.register_poller_properties(
         "poller:github-ci-watch", PollerProperties(github_ci_watch=True),

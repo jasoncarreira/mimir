@@ -1193,16 +1193,56 @@ def _resolve_direct_child(candidate: Path, base: Path, *, label: str) -> Path:
     return resolved
 
 
+def _is_selected_cultivate_default(manifest_path: Path, policy: PolicyRegistry) -> bool:
+    if not policy._selected_first_party("cultivate") or manifest_path.is_symlink():
+        return False
+    candidate = next(candidate for candidate in policy.selected_plugin_candidates
+                     if candidate.name == "cultivate")
+    dist = candidate.entry_point.dist
+    root_files = [file for file in dist.files if file.name == "mimir-plugin.toml"]
+    if len(root_files) != 1:
+        return False
+    root = Path(dist.locate_file(root_files[0])).parent.resolve()
+    declared = {Path(directory) for directory in candidate.manifest.defaults.get("skills", ())}
+    for file in dist.files:
+        if (file.name != "pollers.json"
+                or not file.parent.is_relative_to(root_files[0].parent)
+                or file.parent.relative_to(root_files[0].parent) not in declared):
+            continue
+        source = Path(dist.locate_file(file))
+        if (source.is_symlink() or source.parent.parent != root / "defaults/skills"
+                or not source.is_file()):
+            continue
+        if manifest_path == source:
+            return True
+        if manifest_path.parent.name == f"cultivate-{source.parent.name}":
+            resources = [item for item in dist.files if item.parent == file.parent
+                         or file.parent in item.parents]
+            if resources and all(
+                not (dest := manifest_path.parent / item.relative_to(file.parent)).is_symlink()
+                and dest.is_file()
+                and dest.read_bytes() == Path(dist.locate_file(item)).read_bytes()
+                for item in resources
+            ):
+                return True
+    return False
+
+
 def _validate_poller_identity(
     name: str, manifest_path: Path, *, plugin_owner: str | None = None,
 ) -> None:
     """Bind names with special server-side authority to their shipped skill identity."""
     required_skill = reserved_skill_for_name(name)
+    cultivated = plugin_owner == "cultivate" and name in {
+        "github-activity", "github-ci-watch", "worklink-ready-queue"
+    }
+    allowed_skill = (
+        {required_skill, f"cultivate-{required_skill}"} if cultivated
+        else {required_skill}
+    )
     if required_skill is not None and (
-        manifest_path.parent.name != required_skill
-        or (plugin_owner is not None and not (
-            name == "worklink-ready-queue" and plugin_owner == "cultivate"
-        ))
+        manifest_path.parent.name not in allowed_skill
+        or (plugin_owner is not None and not cultivated)
     ):
         raise ValueError(
             f"reserved poller name {name!r} may only be declared by "
@@ -1239,7 +1279,11 @@ def _parse_poller_authority(
     profile = raw["profile"]
     if not isinstance(profile, str) or profile not in profiles:
         raise ValueError(f"unknown authority profile: {profile!r}")
-    if plugin_owner is not None and (
+    first_party_defaults = (plugin_owner == "cultivate" and policy is not None
+                            and _is_selected_cultivate_default(manifest_path, policy))
+    if plugin_owner == "cultivate" and not first_party_defaults:
+        raise ValueError("cultivate poller authority requires an inventoried default")
+    if plugin_owner is not None and not first_party_defaults and (
         policy is None or policy.profiles[profile].owner != plugin_owner
     ):
         raise ValueError(f"poller authority profile {profile!r} is not owned by {plugin_owner!r}")
@@ -1259,7 +1303,7 @@ def _parse_poller_authority(
     ):
         raise ValueError("authority capabilities must be a list of non-empty names")
     capabilities = tuple(dict.fromkeys(capabilities_raw))
-    if plugin_owner is not None and any(
+    if plugin_owner is not None and not first_party_defaults and any(
         policy.capabilities.get(capability) != plugin_owner
         or capability not in policy.tools
         or policy.tools[capability].owner != plugin_owner
@@ -1340,7 +1384,7 @@ def _parse_poller_authority(
     saga_full_corpus_read = raw.get("saga_full_corpus_read", False)
     if not isinstance(saga_full_corpus_read, bool):
         raise ValueError("authority saga_full_corpus_read must be a boolean")
-    if plugin_owner is not None and saga_full_corpus_read:
+    if plugin_owner is not None and not first_party_defaults and saga_full_corpus_read:
         raise ValueError("plugin pollers cannot request full corpus read")
 
     roots_raw = raw["scoped_roots"]
@@ -1804,6 +1848,8 @@ def discover_pollers(
             continue
         if policy is None or not policy.frozen:
             raise ValueError("plugin pollers require frozen selected policy")
+        if candidate.name == "cultivate" and not policy._selected_first_party("cultivate"):
+            raise ValueError("cultivate pollers require selected first-party owner")
         dist = candidate.entry_point.dist
         if dist is None or dist.files is None:
             raise ValueError(f"plugin {candidate.name!r} has no package file inventory")
@@ -1811,17 +1857,37 @@ def discover_pollers(
         if len(manifest_files) != 1:
             raise ValueError(f"plugin {candidate.name!r} has no unique package root")
         root = Path(dist.locate_file(manifest_files[0])).parent.resolve()
+        defaults = (candidate.manifest.defaults or {}) if candidate.name == "cultivate" else {}
+        declared_skills = {
+            Path(directory) for directory in defaults.get("skills", ())
+        } if candidate.name == "cultivate" else set()
         for file in dist.files:
             if file.name != "pollers.json":
                 continue
             path = Path(dist.locate_file(file))
+            rel = path.relative_to(root) if path.is_relative_to(root) else None
+            skill = rel.parent if rel is not None else None
+            valid_skill = (
+                skill is not None and (
+                    skill.parent == Path("skills")
+                    or (candidate.name == "cultivate" and skill in declared_skills
+                        and skill.parent == Path("defaults/skills"))
+                )
+            )
             if (path.is_symlink() or not path.resolve().is_relative_to(root)
-                    or path.parent.parent != root / "skills"
+                    or not valid_skill
                     or not path.is_file()):
                 raise ValueError(f"plugin {candidate.name!r}: invalid skill poller resource {path}")
             if path in manifests:
                 raise ValueError(f"plugin poller resource collision: {path}")
             manifests[path] = candidate.name
+            if candidate.name == "cultivate":
+                seeded = skills_dir / f"cultivate-{path.parent.name}" / "pollers.json"
+                if seeded in manifests and not seeded.is_symlink() and seeded.is_file():
+                    # A local copy cannot claim reserved provider identity after
+                    # its manifest diverges from the inventoried distribution.
+                    if seeded.read_bytes() == path.read_bytes():
+                        manifests[seeded] = candidate.name
 
     for pollers_file, plugin_owner in sorted(manifests.items()):
         from ._paths import live_loader_path_allowed
