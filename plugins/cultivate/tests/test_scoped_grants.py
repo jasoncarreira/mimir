@@ -123,7 +123,9 @@ def test_trusted_poller_issues_checkout_grant_but_http_ingress_does_not(tmp_path
     from mimir.plugins.manager import load_plugins
 
     policy = load_plugins(enable="cultivate").policy
-    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    _root, authority, item = _github_scope_test_setup(
+        tmp_path, monkeypatch, selected_policy=policy,
+    )
     event = AgentEvent(
         trigger="poller", channel_id="poller:github-activity",
         service_principal=authority.canonical, service_authority=authority,

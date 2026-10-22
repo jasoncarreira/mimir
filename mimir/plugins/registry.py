@@ -227,6 +227,7 @@ class PolicyRegistry:
         self._principals: dict[str, Any] = {}
         self._principal_owners: dict[str, str] = {}
         self._poller_properties: dict[str, Any] = {}
+        self._plugin_poller_properties: dict[str, tuple[str, Any]] = {}
         self._poller_hooks: dict[str, tuple[str, Callable[..., Any]]] = {}
         self._turn_hooks: dict[tuple[str, str], Callable[..., Any]] = {}
         self._server_hooks: dict[tuple[str, str], Callable[..., Any]] = {}
@@ -370,6 +371,10 @@ class PolicyRegistry:
     @property
     def poller_properties(self) -> Mapping[str, Any]:
         return MappingProxyType(self._poller_properties)
+
+    @property
+    def plugin_poller_properties(self) -> Mapping[str, tuple[str, Any]]:
+        return MappingProxyType(self._plugin_poller_properties)
 
     @property
     def poller_hooks(self) -> Mapping[str, tuple[str, Callable[..., Any]]]:
@@ -610,8 +615,7 @@ class PolicyRegistry:
         self._writable()
         from .core import PollerProperties
 
-        if owner != "core":
-            raise PolicyRegistrationError(f"{owner}: poller properties are core-only")
+        owner = _name(owner, "poller owner")
         canonical = _name(canonical, "poller canonical")
         if not canonical.startswith("poller:") or not canonical.removeprefix("poller:"):
             raise PolicyRegistrationError("poller properties require a poller canonical")
@@ -619,9 +623,14 @@ class PolicyRegistry:
             not isinstance(value, bool) for value in properties.principal_fields().values()
         ):
             raise PolicyRegistrationError("invalid poller properties")
-        if canonical in self._poller_properties:
+        if owner != "core" and properties.worklink_retained_checkout and not self._selected_first_party(owner):
+            raise PolicyRegistrationError(f"{owner}: retained checkout requires selected first-party owner")
+        if canonical in self._poller_properties or canonical in self._plugin_poller_properties:
             raise PolicyRegistrationError(f"duplicate poller properties: {canonical}")
-        self._poller_properties[canonical] = properties
+        if owner == "core":
+            self._poller_properties[canonical] = properties
+        else:
+            self._plugin_poller_properties[canonical] = (owner, properties)
 
     @property
     def descriptors(self) -> Mapping[str, ToolDescriptor]:
@@ -1137,6 +1146,9 @@ class PolicyRegistrar:
 
     def register_poller_hook(self, name: str, hook: Callable[..., Any]) -> None:
         self._registry.register_poller_hook(name, hook, owner=self.plugin)
+
+    def register_poller_properties(self, canonical: str, properties: Any) -> None:
+        self._registry.register_poller_properties(canonical, properties, owner=self.plugin)
 
     def register_turn_hook(self, name: str, hook: Callable[..., Any]) -> None:
         self._registry.register_turn_hook(name, hook, owner=self.plugin)

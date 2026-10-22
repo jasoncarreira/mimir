@@ -192,23 +192,14 @@ class PollerProperties:
         }
 
 
-def poller_properties(canonical: str) -> PollerProperties:
-    return selected_policy_registry().poller_properties.get(canonical, PollerProperties())
-
-
-def register_core_poller_properties(registry: PolicyRegistry) -> None:
-    """Declare historical semantics once; manifests cannot mint these grants."""
-    registry.register_poller_properties(
-        "poller:github-activity", PollerProperties(github_activity=True),
-    )
-    registry.register_poller_properties(
-        "poller:worklink-ready-queue", PollerProperties(worklink_retained_checkout=True),
-    )
-    registry.register_poller_properties(
-        "poller:github-ci-watch", PollerProperties(github_ci_watch=True),
-    )
-
-    # All authorization consumers read properties, never canonical-name lists.
+def poller_properties(
+    canonical: str, *, owner: str | None = None, policy: PolicyRegistry | None = None,
+) -> PollerProperties:
+    policy = policy if policy is not None else selected_policy_registry()
+    registered = policy.plugin_poller_properties.get(canonical)
+    if registered is not None and registered[0] == owner:
+        return registered[1]
+    return policy.poller_properties.get(canonical, PollerProperties())
 
 
 def _names(value: str) -> frozenset[str]:
@@ -572,7 +563,6 @@ def register_core_tools(
         registry.register_shell_profile_mapping(profile, shell)
     registry.register_operator_shell_profile("scheduler_read_only")
     register_core_principals(registry)
-    register_core_poller_properties(registry)
 
 
 def register_core_principals(registry: PolicyRegistry) -> None:

@@ -7820,7 +7820,7 @@ def github_activity_fetch_auth(
         canonical="poller:github-activity", trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION, capabilities=("fetch_url",),
         approved_urls=("https://api.github.com/repos/", "https://github.com/"),
-        creation_path="test",
+        creation_path="test", poller_owner="cultivate",
     )
     return _service_auth(
         service, InformationFlowLabels(),
@@ -7844,9 +7844,9 @@ def test_github_activity_actions_fetch_requires_manifest_approved_urls(
     target = f"https://api.github.com/repos/o/r/commits/{'a' * 40}/check-runs"
     _assert_activity_fetch(auth, target, True)
     service = build_trigger_service_principal(
-        canonical="poller:github-activity", trigger="poller", profile="github",
+        canonical=auth.service_authority.canonical, trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION, capabilities=("fetch_url",),
-        approved_urls=approvals, creation_path="test",
+        approved_urls=approvals, creation_path="test", poller_owner="cultivate",
     )
     _assert_activity_fetch(replace(auth, service_authority=service), target, False)
     _assert_activity_fetch(
@@ -7921,10 +7921,7 @@ def test_github_activity_ordinary_review_scope_preserves_review_fetch(
 
 
 def test_github_activity_review_fetch_requires_capability(github_activity_fetch_auth: AuthContext) -> None:
-    service = build_trigger_service_principal(
-        canonical="poller:github-activity", trigger="poller", profile="github",
-        tier=CapabilityTier.CODE_EXECUTION, capabilities=(), creation_path="test",
-    )
+    service = replace(github_activity_fetch_auth.service_authority, capabilities=())
     _assert_activity_fetch(
         replace(github_activity_fetch_auth, service_authority=service),
         "https://api.github.com/repos/o/r/pulls/42/reviews", False,
@@ -10351,7 +10348,7 @@ def test_replayed_github_poller_payload_cannot_mint_repo_pr_scope(
 
 
 def _github_scope_test_setup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, selected_policy=None,
 ) -> tuple[Path, ServicePrincipal, dict[str, object]]:
     root = tmp_path / "repo"
     home = tmp_path / "home"
@@ -10372,7 +10369,8 @@ def _github_scope_test_setup(
         capabilities=(
             "shell_exec", "write_file", "edit_file", "bash_jobs_list", "bash_job_output",
         ),
-        creation_path="test",
+        creation_path="test", policy=selected_policy,
+        poller_owner="cultivate" if selected_policy is not None else None,
     )
     item: dict[str, object] = {
         "event_type": "pr_changes_requested_stale",

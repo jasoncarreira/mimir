@@ -38,6 +38,7 @@ import yaml
 from mimir import access_control, poller_recovery
 from mimir.event_logger import init_logger
 from mimir.models import AgentEvent
+from mimir.plugins.core import selected_policy_registry
 from mimir.poller_hooks import PollerHooks, resolve_poller_hooks
 from mimir.pollers import (
     POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
@@ -109,6 +110,138 @@ def test_plugin_package_poller_hooks_survive_discovery_and_reload(tmp_path):
                             plugin_candidates=(SimpleNamespace(**{
                                 **vars(candidate), "enabled": False,
                             }),)) == []
+
+
+def test_selected_installed_cultivate_seeded_pollers_reload(tmp_path, monkeypatch):
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import core_policy_registry, poller_properties, policy_scope
+    from mimir.plugins.defaults import seed_plugin_defaults
+    from mimir.plugins.manager import load_plugins
+    from mimir.scheduler import Scheduler
+
+    selected = load_plugins(enable="cultivate").policy
+    local_skill = tmp_path / "skills" / "chainlink-orchestrator"
+    local_skill.mkdir(parents=True)
+    local_manifest = local_skill / "pollers.json"
+    local_authority = {"profile": "github", "tier": "scope-contained",
+                       "capabilities": [], "scoped_roots": []}
+    local_principal = _parse_poller_authority(
+        local_authority, name="worklink-ready-queue", persist_dir=local_skill,
+        state_root=None, manifest_path=local_manifest, policy=selected,
+    )
+    assert not local_principal.worklink_retained_checkout
+    with pytest.raises(ValueError, match="reserved poller name"):
+        _parse_poller_authority(
+            local_authority, name="worklink-ready-queue", persist_dir=local_skill,
+            state_root=None, manifest_path=local_manifest, policy=selected,
+            plugin_owner="example",
+        )
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    monkeypatch.setenv("WORKLINK_REPO", "o/r")
+    home = tmp_path / "z-home"
+    installed = discover_pollers(tmp_path / "missing-skills", policy=selected)
+    shipped = {
+        "github-activity": "github-poller",
+        "github-ci-watch": "github-ci-watch",
+        "worklink-ready-queue": "chainlink-orchestrator",
+    }
+    assert set(shipped) <= {p.name for p in installed}
+    for name in shipped:
+        manifest = next(p.manifest_path for p in installed if p.name == name)
+        authority = next(entry["authority"] for entry in json.loads(manifest.read_text())["pollers"]
+                         if entry["name"] == name)
+        with pytest.raises(ValueError, match="reserved poller name"):
+            _parse_poller_authority(
+                authority, name=name, persist_dir=tmp_path, state_root=None,
+                manifest_path=manifest, policy=selected, plugin_owner="foreign",
+            )
+    seed_plugin_defaults(home, selected=selected.selected_plugin_candidates)
+    # Simulate /opt before /var regardless of where pytest places tmp_path.
+    package_root = tmp_path / "a-installed"
+    package_root.mkdir()
+    (package_root / "mimir-plugin.toml").write_text("", encoding="utf-8")
+    package_files = [Path("mimir-plugin.toml")]
+    for skill in shipped.values():
+        relative = Path("defaults/skills") / skill / "pollers.json"
+        source = next(p.manifest_path for p in installed if p.skill_dir.name == skill)
+        target = package_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+        package_files.append(relative)
+    candidate = next(c for c in selected.selected_plugin_candidates if c.name == "cultivate")
+    dist = SimpleNamespace(files=package_files, locate_file=lambda path: package_root / path)
+    ordered_candidate = SimpleNamespace(
+        name="cultivate", enabled=True, manifest=candidate.manifest,
+        entry_point=SimpleNamespace(dist=dist),
+    )
+    from mimir import pollers as pollers_module
+
+    original_default = pollers_module._is_selected_cultivate_default
+    monkeypatch.setattr(
+        pollers_module, "_is_selected_cultivate_default",
+        lambda path, policy: (path in {package_root / file for file in package_files[1:]}
+                              or original_default(path, policy)),
+    )
+    assert str(package_root) < str(home)
+
+    def ordered_pollers():
+        return discover_pollers(
+            home / "skills", policy=selected, plugin_candidates=(ordered_candidate,),
+        )
+
+    for name, skill in shipped.items():
+        [poller] = [p for p in ordered_pollers() if p.name == name]
+        assert poller.manifest_path == home / "skills" / f"cultivate-{skill}" / "pollers.json"
+        assert poller.skill_dir == poller.manifest_path.parent
+        assert poller.authority is not None and poller.authority.canonical == f"poller:{name}"
+        assert (poller.hooks is not None) is (name != "github-ci-watch")
+        assert poller.authority.github_activity is (name == "github-activity")
+        assert poller.authority.github_ci_watch is (name == "github-ci-watch")
+        assert poller.authority.worklink_retained_checkout is (name == "worklink-ready-queue")
+    with policy_scope(core_policy_registry()):
+        assert not poller_properties("poller:worklink-ready-queue").worklink_retained_checkout
+    scheduler = Scheduler(home / "scheduler.yaml", lambda event: None,
+                          home=home, policy=selected)
+    scheduler._pollers_dir = home / "skills"
+    for _ in range(2):
+        pollers, _, invalid = scheduler._discover_pollers_io()
+        for name, skill in (
+            ("github-activity", "github-poller"),
+            ("github-ci-watch", "github-ci-watch"),
+            ("worklink-ready-queue", "chainlink-orchestrator"),
+        ):
+            [poller] = [p for p in pollers if p.name == name]
+            assert poller.manifest_path == home / "skills" / f"cultivate-{skill}" / "pollers.json"
+            assert (poller.hooks is not None) is (name != "github-ci-watch")
+            assert poller.authority is not None and poller.authority.canonical == f"poller:{name}"
+            assert poller.authority.worklink_retained_checkout is (name == "worklink-ready-queue")
+            if poller.hooks is not None:
+                assert poller.hooks.recovery_relevance is not None
+            assert not any(entry[1] == name and "reserved" in entry[2] for entry in invalid)
+        with policy_scope(selected):
+            assert poller_properties("poller:worklink-ready-queue", owner="cultivate").worklink_retained_checkout
+            assert not poller_properties("poller:worklink-ready-queue").worklink_retained_checkout
+    for name, skill in shipped.items():
+        seeded = home / "skills" / f"cultivate-{skill}" / "pollers.json"
+        original = seeded.read_bytes()
+        seeded.write_bytes(original + b" ")
+        invalid = []
+        fallback = discover_pollers(home / "skills", policy=selected, invalid_entries=invalid)
+        assert next(p for p in fallback if p.name == name).manifest_path == (
+            next(p.manifest_path for p in installed if p.name == name)
+        )
+        assert any(entry[0] == seeded and "reserved" in entry[2] for entry in invalid)
+        seeded.write_bytes(original)
+    assert set(shipped).isdisjoint(p.name for p in discover_pollers(
+        home / "skills", policy=selected,
+        plugin_candidates=(SimpleNamespace(**{**vars(ordered_candidate), "enabled": False}),),
+    ))
+    with policy_scope(core_policy_registry()):
+        core_only = discover_pollers(home / "skills", policy=core_policy_registry())
+        assert set(shipped).isdisjoint(
+            p.name for p in core_only
+        )
+        assert not poller_properties("poller:worklink-ready-queue").worklink_retained_checkout
 
 
 def test_plugin_poller_authority_rejects_foreign_profile(tmp_path):
@@ -380,6 +513,16 @@ def selected_cultivate_policy():
         pytest.skip("shipped Cultivate poller requires installed Cultivate")
     with policy_scope(load_plugins(enable="cultivate").policy):
         yield
+
+
+def _cultivate_poller_manifest(skill: str) -> Path:
+    candidate = next(candidate for candidate in selected_policy_registry().selected_plugin_candidates
+                     if candidate.name == "cultivate")
+    dist = candidate.entry_point.dist
+    return Path(dist.locate_file(next(
+        file for file in dist.files
+        if file.as_posix() == f"mimir_cultivate/defaults/skills/{skill}/pollers.json"
+    )))
 
 
 @pytest.fixture
@@ -948,11 +1091,12 @@ def test_ci_watch_shipped_manifest_authorizes_only_approved_urls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/pollers.json"
+    manifest = _cultivate_poller_manifest("github-ci-watch")
     raw = json.loads(manifest.read_text())["pollers"][0]
     service = _parse_poller_authority(
         raw["authority"], name=raw["name"], persist_dir=tmp_path,
-        state_root=None, manifest_path=manifest,
+        state_root=None, manifest_path=manifest, policy=selected_policy_registry(),
+        plugin_owner="cultivate",
     )
     auth = create_auth_context(AgentEvent(
         trigger="poller", channel_id="poller:github-ci-watch",
@@ -983,7 +1127,7 @@ def test_github_activity_shipped_manifest_authorizes_scoped_actions_evidence(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setenv("GITHUB_REPOS", "o/r")
     monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
-    manifest = Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json"
+    manifest = _cultivate_poller_manifest("github-poller")
     raw = json.loads(manifest.read_text())["pollers"][0]
     assert raw["authority"]["approved_urls"] == [
         "https://api.github.com/repos/", "https://github.com/",
@@ -996,7 +1140,8 @@ def test_github_activity_shipped_manifest_authorizes_scoped_actions_evidence(
         raw["authority"]["approved_urls"] = ["https://api.github.com/repos/other/repo/"]
     service = _parse_poller_authority(
         raw["authority"], name=raw["name"], persist_dir=tmp_path,
-        state_root=None, manifest_path=manifest,
+        state_root=None, manifest_path=manifest, policy=selected_policy_registry(),
+        plugin_owner="cultivate",
     )
     auth = create_auth_context(AgentEvent(
         trigger="poller", channel_id=service.canonical,
@@ -1672,15 +1817,13 @@ def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
     monkeypatch.setenv("MIMIR_MCP_SERVERS_PATH", str(operator_secret))
 
-    manifest_path = (
-        Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
-        / "github-poller" / "pollers.json"
-    )
+    manifest_path = _cultivate_poller_manifest("github-poller")
     entry = json.loads(manifest_path.read_text(encoding="utf-8"))["pollers"][0]
     declared_capabilities = tuple(entry["authority"]["capabilities"])
     service = _parse_poller_authority(
         entry["authority"], name=entry["name"], persist_dir=persist_dir,
         state_root=home / "state" / "pollers", manifest_path=manifest_path,
+        policy=selected_policy_registry(), plugin_owner="cultivate",
     )
     context = create_auth_context(AgentEvent(
         trigger="poller", channel_id=service.canonical,
@@ -1857,7 +2000,7 @@ def test_github_activity_active_checkout_write_refuses_git_metadata(
         canonical="poller:github-activity", trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION, capabilities=("write_file",),
         roots=(tmp_path / "state" / "pollers" / "github-activity",),
-        creation_path="test",
+        creation_path="test", poller_owner="cultivate",
     )
     context = replace(
         create_auth_context(AgentEvent(
