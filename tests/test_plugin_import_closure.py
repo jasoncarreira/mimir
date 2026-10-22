@@ -24,6 +24,43 @@ FORBIDDEN = (
 )
 
 
+def test_disabled_plugin_has_no_coding_tools_in_runtime_or_policy_tables() -> None:
+    # Run in a fresh interpreter: collection of unrelated tests can import the
+    # provider, and the retired flag must not be able to reactivate it.
+    from tests.test_plugin_policy_parity import CODING_TOOLS
+
+    script = """
+import sys
+from mimir.plugins.manager import load_plugins
+from mimir.plugins.core import core_policy_registry
+from mimir.tools.registry import all_mimir_tools
+from mimir import access_control
+
+coding = set(sys.argv[1:])
+assert len(coding) == 40
+selected = load_plugins(enable='')
+assert not selected.plugins
+assert coding.isdisjoint(selected.policy.tools)
+assert coding.isdisjoint(core_policy_registry().tools)
+assert coding.isdisjoint(access_control._TOOL_FLOW_MAP)
+assert coding.isdisjoint(access_control.TRIGGER_CAPABILITY_TIERS)
+assert all(access_control.get_operation_catalog().get_decision(name).value == 'unknown'
+           for name in coding)
+assert coding.isdisjoint(tool.name for tool in all_mimir_tools(
+    model_spec='openai:test', policy=selected.policy,
+    require_provider_available=False,
+))
+assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.')
+               for name in sys.modules)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, *sorted(CODING_TOOLS)],
+        env={**os.environ, "MIMIR_PLUGINS": "", "MIMIR_CODING_ENABLED": "true"},
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize("root", (
     "mimir.server", "mimir.agent", "mimir.tools", "mimir.access_control",
 ))
