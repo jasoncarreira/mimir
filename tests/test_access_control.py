@@ -18,6 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.plugin_selection import cultivate_selected
+
 from mimir import access_control
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import (
@@ -5953,7 +5955,7 @@ def test_core_repository_inventory_absent_preserves_roots_and_declared_file_fail
 
 @pytest.mark.parametrize("enforce", [False, True])
 def test_selected_publish_projection_keeps_all_five_tainted_writes_vetoed(enforce: bool) -> None:
-    if os.environ.get("MIMIR_PLUGINS") != "cultivate":
+    if not cultivate_selected():
         pytest.skip("requires selected Cultivate provider")
     from mimir.plugins.core import core_policy_registry, policy_scope
     from mimir.plugins.manager import load_plugins
@@ -16519,7 +16521,7 @@ def test_worklink_build_tools_refuse_untrusted_ingest_on_both_routes(
 def test_selected_worklink_build_projection_preserves_live_taint_veto(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforce: bool, tool_name: str,
 ) -> None:
-    if os.environ.get("MIMIR_PLUGINS") != "cultivate":
+    if not cultivate_selected():
         pytest.skip("requires selected Cultivate provider")
     from mimir.plugins.core import policy_scope
     from mimir.plugins.manager import load_plugins
@@ -16599,19 +16601,57 @@ def test_worklink_build_veto_cannot_be_skipped_by_shadow_admin_or_capability_den
     assert decision.reason == "worklink_build_blocked_by_untrusted_ingest"
 
 
+@pytest.mark.parametrize("selected", [False, True], ids=["core", "cultivate"])
 def test_admin_writes_stay_allowed_but_selected_coding_targets_must_match(
-    tmp_path: Path, selected_repository_policy,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected: bool,
 ) -> None:
+    """Admin write authority is unchanged; coding tools need the provider AND a target.
+
+    Each refusal is pinned to its reason: without the provider the tools are
+    unknown sinks, and with it a mismatched target is refused before anything
+    else. Only the reason distinguishes the two, since both deny.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    if selected:
+        try:
+            version("mimir-cultivate")
+        except PackageNotFoundError:
+            pytest.skip("repository scope requires installed Cultivate")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
     registry = ToolRegistry()
-    target = str(tmp_path / ".git" / "hooks" / "pre-commit")
-    for operation in ("write_file", "edit_file"):
-        assert registry.authorize_tool(
-            operation, _write_auth(admin=True), enforce=True, target_channel=target,
-        ).allowed is True
-    for operation in ("worklink_run", "spawn_open_code"):
-        assert not registry.authorize_tool(
-            operation, _write_auth(admin=True), enforce=True, target_channel=target,
-        ).allowed
+    admin = _write_auth(admin=True)
+    hook = str(repo / ".git" / "hooks" / "pre-commit")
+
+    def authorize(operation: str, target: str):
+        return registry.authorize_tool(
+            operation, admin, enforce=True, target_channel=target,
+            arguments={"cwd": target} if operation == "spawn_open_code" else None,
+        )
+
+    with policy_scope(load_plugins(enable="cultivate" if selected else "").policy):
+        for operation in ("write_file", "edit_file"):
+            assert registry.authorize_tool(
+                operation, admin, enforce=True, target_channel=hook,
+            ).allowed is True
+        for operation in ("worklink_run", "spawn_open_code"):
+            mismatched = registry.authorize_tool(
+                operation, admin, enforce=True, target_channel=hook,
+            )
+            matching = authorize(operation, str(repo))
+            if selected:
+                assert mismatched.allowed is False, operation
+                assert mismatched.reason == "sink_target_required", operation
+                # The positive case the pre-plugin admin test covered.
+                assert matching.allowed is True, (operation, matching.reason)
+            else:
+                for decision in (mismatched, matching):
+                    assert decision.allowed is False, operation
+                    assert decision.reason == "unknown_sink_category", operation
 
 
 def test_no_service_shell_profile_admits_a_caller_supplied_jq_filter(

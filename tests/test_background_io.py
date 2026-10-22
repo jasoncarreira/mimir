@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
-import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,6 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+
+from tests.plugin_selection import cultivate_selected
 from tests.timing import HANG_GUARD_SECONDS
 
 
@@ -21,7 +22,7 @@ def test_jobs_complete_with_saturated_default_pool(tmp_path, monkeypatch, operat
     from mimir import event_logger, pollers, scheduler, scratch_janitor
     from mimir.models import AgentEvent
 
-    if operation == "worklink" and os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+    if operation == "worklink" and not cultivate_selected():
         pytest.skip("Worklink background work requires selected Cultivate")
 
     marker = contextvars.ContextVar("background-test-marker", default=None)

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.plugin_selection import cultivate_selected
+
 from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
 
@@ -19,7 +21,7 @@ def selected_cultivate(monkeypatch):
         yield
 
 
-if os.environ.get("MIMIR_PLUGINS") != "cultivate":
+if not cultivate_selected():
     pytest.skip("Cultivate gate readers require selected provider", allow_module_level=True)
 
 ev = pytest.importorskip("mimir_cultivate.worklink.evidence")

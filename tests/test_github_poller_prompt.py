@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 from pathlib import Path
 import sys
 
 import pytest
 
+from tests.plugin_selection import cultivate_selected
+
 pytestmark = pytest.mark.skipif(
-    os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"},
+    not cultivate_selected(),
     reason="Cultivate poller is not selected",
 )
 

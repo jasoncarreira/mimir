@@ -3,19 +3,20 @@ from __future__ import annotations
 
 from io import BytesIO
 import importlib
-import os
 from types import SimpleNamespace
 
 import pytest
 
-if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+from tests.plugin_selection import cultivate_selected
+
+if not cultivate_selected():
     pytest.skip("Cultivate is not selected", allow_module_level=True)
 
 from mimir_cultivate import ci as ci_logs
 
 
 def test_cultivate_helper_is_only_a_provider_import():
-    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+    if not cultivate_selected():
         pytest.skip("Cultivate is not selected")
     from mimir_cultivate import ci
 

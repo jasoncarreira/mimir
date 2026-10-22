@@ -169,10 +169,9 @@ def synthetic_worklink_identities(monkeypatch, request):
     """
     if request.node.get_closest_marker("real_worklink_identities") is not None:
         return None
-    from mimir.plugins.discovery import _selection
+    from tests.plugin_selection import cultivate_selected
 
-    all_enabled, names = _selection(os.environ.get("MIMIR_PLUGINS", ""))
-    selected = all_enabled or "cultivate" in names
+    selected = cultivate_selected()
     values = {
         "mimir_uid": SYNTHETIC_MIMIR_UID,
         "worklink_uid": SYNTHETIC_WORKLINK_UID,

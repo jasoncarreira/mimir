@@ -12,10 +12,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.plugin_selection import cultivate_selected
+
 from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
 
-if os.environ.get("MIMIR_PLUGINS") != "cultivate":
+if not cultivate_selected():
     pytest.skip("Cultivate gate reruns require selected provider", allow_module_level=True)
 
 compute_module = pytest.importorskip("mimir_cultivate.worklink.compute")

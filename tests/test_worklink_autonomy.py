@@ -26,7 +26,9 @@ from typing import Sequence
 
 import pytest
 
-if os.environ.get("MIMIR_PLUGINS") != "cultivate":
+from tests.plugin_selection import cultivate_selected
+
+if not cultivate_selected():
     pytest.skip("Worklink autonomy requires selected Cultivate", allow_module_level=True)
 
 pytest.importorskip("mimir_cultivate")
@@ -1814,7 +1816,7 @@ class _FakeArbiter:
 
 @pytest.fixture
 def _tool_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    if os.environ.get("MIMIR_PLUGINS", "") != "cultivate":
+    if not cultivate_selected():
         pytest.skip("selected Cultivate tool requires the provider")
     provider_autonomy = pytest.importorskip("mimir_cultivate.worklink.autonomy")
     provider_orchestrator = pytest.importorskip("mimir_cultivate.worklink.orchestrator")
@@ -1930,7 +1932,7 @@ async def test_worklink_run_dispatches_when_clear_using_worklink_repo(_tool_env)
 async def test_worklink_run_tool_reaches_core_incident_admission_in_both_modes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforced: bool,
 ) -> None:
-    if os.environ.get("MIMIR_PLUGINS", "") != "cultivate":
+    if not cultivate_selected():
         pytest.skip("selected Cultivate tool requires the provider")
     provider_autonomy = pytest.importorskip("mimir_cultivate.worklink.autonomy")
     from mimir.tools import registry as core_registry
@@ -2362,7 +2364,7 @@ def _live_pids(pids: list[int]) -> list[int]:
 
 
 def _load_poller_module():
-    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+    if not cultivate_selected():
         pytest.skip("Cultivate poller is not selected")
     spec = importlib.util.spec_from_file_location("chainlink_orchestrator_poller_under_test", POLLER)
     assert spec is not None and spec.loader is not None
@@ -2377,7 +2379,7 @@ def _load_poller_module():
 
 
 def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
-    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+    if not cultivate_selected():
         pytest.skip("Cultivate poller is not selected")
     env = {k: v for k, v in os.environ.items() if k not in {
         "WORKLINK_REPO", "WORKLINK_RUN_BIN", "WORKLINK_MAX_CONCURRENT", "CHAINLINK_BIN",
@@ -2475,7 +2477,7 @@ def test_ready_dispatch_spawn_failure_records_intended_log_without_consuming_att
     }]
 
 
-@pytest.mark.skipif(os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}, reason="Cultivate poller is not selected")
+@pytest.mark.skipif(not cultivate_selected(), reason="Cultivate poller is not selected")
 def test_poller_reads_cap_from_worklink_yaml(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
@@ -2510,7 +2512,7 @@ def test_poller_reads_cap_from_worklink_yaml(tmp_path: Path) -> None:
     ] == [11, 12]
 
 
-@pytest.mark.skipif(os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}, reason="Cultivate poller is not selected")
+@pytest.mark.skipif(not cultivate_selected(), reason="Cultivate poller is not selected")
 def test_poller_excludes_actively_locked_issue_from_candidates(tmp_path: Path) -> None:
     """A locked issue must not consume the slot its own worker already holds.
 
@@ -2538,7 +2540,7 @@ def test_poller_excludes_actively_locked_issue_from_candidates(tmp_path: Path) -
     assert 100 not in dispatched
 
 
-@pytest.mark.skipif(os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}, reason="Cultivate poller is not selected")
+@pytest.mark.skipif(not cultivate_selected(), reason="Cultivate poller is not selected")
 def test_poller_reads_flow_style_cap_through_worklink_config(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
@@ -2561,7 +2563,7 @@ def test_poller_reads_flow_style_cap_through_worklink_config(tmp_path: Path) -> 
     ] == [11, 12]
 
 
-@pytest.mark.skipif(os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}, reason="Cultivate poller is not selected")
+@pytest.mark.skipif(not cultivate_selected(), reason="Cultivate poller is not selected")
 def test_poller_degrades_before_dispatch_for_invalid_backend_reference(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()

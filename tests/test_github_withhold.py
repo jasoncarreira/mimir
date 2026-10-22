@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from tests.plugin_selection import cultivate_selected
+
 from tests.withhold_probe import OUTSIDER_MARKER, assert_marker_absent
 
-if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+if not cultivate_selected():
     pytest.skip("Cultivate is not selected", allow_module_level=True)
 
 from mimir_cultivate.github_trust import (

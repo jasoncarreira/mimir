@@ -22,6 +22,9 @@ FORBIDDEN = (
     "mimir.pr_checkout_lease", "mimir.project_tests", "mimir.repo_tools",
     "mimir.contained_execution", "mimir.opencode_config", "mimir.coding",
 )
+#: The installed-but-unselected provider. Unlike the retired modules above it
+#: exists, so its absence from a core root's closure is a real property.
+UNSELECTED_PROVIDER = ("mimir_cultivate",)
 
 
 def test_disabled_plugin_has_no_coding_tools_in_runtime_or_policy_tables() -> None:
@@ -65,11 +68,18 @@ assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.')
     "mimir.server", "mimir.agent", "mimir.tools", "mimir.access_control",
 ))
 def test_coding_disabled_import_closure(root: str) -> None:
+    pytest.importorskip(
+        "mimir_cultivate", reason="the provider must be installed for its absence to mean anything",
+    )
     script = """
 import importlib
+import importlib.util
 import sys
+assert importlib.util.find_spec('mimir_cultivate') is not None
 importlib.import_module(sys.argv[1])
+assert sys.argv[1] in sys.modules
 forbidden = sys.argv[2:]
+assert 'mimir_cultivate' in forbidden
 loaded = sorted(name for name in sys.modules
                 if any(name == prefix or name.startswith(prefix + '.')
                        for prefix in forbidden))
@@ -79,7 +89,7 @@ assert not loaded, loaded
     env.pop("MIMIR_PLUGINS", None)
     env["MIMIR_CODING_ENABLED"] = "0"
     result = subprocess.run(
-        [sys.executable, "-c", script, root, *FORBIDDEN],
+        [sys.executable, "-c", script, root, *FORBIDDEN, *UNSELECTED_PROVIDER],
         env=env, capture_output=True, text=True, check=False, timeout=60,
     )
     assert result.returncode == 0, result.stderr

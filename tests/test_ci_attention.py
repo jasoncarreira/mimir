@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import os
 
 import pytest
 
-if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+from tests.plugin_selection import cultivate_selected
+
+if not cultivate_selected():
     pytest.skip("Cultivate is not selected", allow_module_level=True)
 
 from mimir_cultivate.ci import classify_cancelled_run

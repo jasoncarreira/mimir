@@ -27,6 +27,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+from tests.plugin_selection import cultivate_selected
 from tests.timing import HANG_GUARD_SECONDS
 from langchain.agents.middleware import ToolCallRequest
 from langchain.tools import ToolRuntime
@@ -1760,7 +1762,7 @@ async def test_selected_worklink_run_turn_executes_registered_tool_under_middlew
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worklink_ready_poller,
     enforced: bool, tainted: bool,
 ) -> None:
-    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+    if not cultivate_selected():
         pytest.skip("the selected Cultivate Worklink tool is not installed")
     from mimir.plugins.core import policy_scope
     from mimir.tools import registry as tool_registry
@@ -6813,7 +6815,7 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     import os
     import shlex
     import sys
-    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+    if not cultivate_selected():
         pytest.skip("Worklink incident consumer requires selected Cultivate")
 
     from mimir.dispatcher import Dispatcher
@@ -6948,7 +6950,7 @@ async def test_stale_poller_selection_uses_selected_provider_intervention_hook(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforced: bool,
     worklink_ready_poller,
 ) -> None:
-    if os.environ.get("MIMIR_PLUGINS") not in {"cultivate", "all"}:
+    if not cultivate_selected():
         pytest.skip("Worklink incident hook requires selected Cultivate")
     from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir, load_failure_state, record_failure,

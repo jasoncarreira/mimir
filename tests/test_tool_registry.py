@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError, replace
@@ -147,17 +148,49 @@ def test_subagent_budget_gates_share_frozen_parent_policy() -> None:
         assert gates[0]._policy is policy
 
 
-def test_default_surface_does_not_import_coding_modules() -> None:
+@pytest.mark.parametrize("selection", [None, "cultivate"])
+def test_default_surface_does_not_import_coding_modules(selection: str | None) -> None:
+    """An unselected, installed provider stays out of the process tool surface.
+
+    The retired core modules no longer exist, so their absence alone proves
+    nothing. The child builds the surface the way the process does, from its own
+    ``MIMIR_PLUGINS`` (never this suite's), and the selected case is the control
+    showing the probe sees provider tools and imports when they are present.
+    """
+    pytest.importorskip(
+        "mimir_cultivate", reason="the provider must be installed for its absence to mean anything",
+    )
+    from tests.test_plugin_policy_parity import CODING_TOOLS
+
     script = """\
+import importlib.util
+import os
 import sys
+from mimir.plugins.manager import load_plugins
 from mimir.tools.registry import all_mimir_tools
-all_mimir_tools(model_spec='openai:test')
-for name in ('mimir.tools.forge', 'mimir.tools.repo', 'mimir.forge',
-             'mimir.repo_tools', 'mimir.pr_checkout_lease'):
-    assert name not in sys.modules, name
+assert importlib.util.find_spec('mimir_cultivate') is not None
+policy = load_plugins(enable=os.environ.get('MIMIR_PLUGINS', '')).policy
+names = {tool.name for tool in all_mimir_tools(
+    model_spec='openai:test', policy=policy, require_provider_available=False,
+)}
+assert 'send_message' in names, sorted(names)
+exposed = sorted(names & set(sys.argv[1:]))
+loaded = sorted(name for name in sys.modules
+                if name == 'mimir_cultivate' or name.startswith('mimir_cultivate.'))
+if os.environ.get('MIMIR_PLUGINS'):
+    assert 'worklink_run' in exposed and 'pr_list' in exposed, exposed
+    assert 'mimir_cultivate' in loaded, loaded
+else:
+    assert not exposed, exposed
+    assert not loaded, loaded
 """
+    env = dict(os.environ)
+    env.pop("MIMIR_PLUGINS", None)
+    if selection is not None:
+        env["MIMIR_PLUGINS"] = selection
     result = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, check=False,
+        [sys.executable, "-c", script, *sorted(CODING_TOOLS)],
+        env=env, capture_output=True, text=True, check=False, timeout=60,
     )
     assert result.returncode == 0, result.stderr
 
