@@ -52,9 +52,9 @@ _stack_fd = os.open(_journal_path + '.stacks',
 def diagnose(value):
     os.write(_diagnostic_fd, (f'{time.monotonic():.6f} thread={threading.get_ident()} '
                              + value + '\n').encode())
-# The C watchdog can dump even when Python dispatch or the journal tee stalls.
-# This is observation only: it neither expires the controlled timer nor exits.
-faulthandler.dump_traceback_later(proxy.SIGNAL_EXIT_TIMEOUT, repeat=True, file=_stack_fd)
+# Dump only after the 5s exit watchdog should have fired, so observation
+# cannot start at the same instant as the forced exit. It never exits itself.
+faulthandler.dump_traceback_later(2 * proxy.SIGNAL_EXIT_TIMEOUT, repeat=True, file=_stack_fd)
 def record(value):
     os.write(_journal_fd, value + b'\n')
 record(b'child-started')
