@@ -788,7 +788,8 @@ def test_poller_builder_uses_registry_properties_not_canonical_literals(canonica
             creation_path="test:poller", policy=policy,
         )
 
-    assert getattr(build(core_policy_registry()), flag) is True
+    core_grant = canonical != "poller:worklink-ready-queue"
+    assert getattr(build(core_policy_registry()), flag) is core_grant
     registry = PolicyRegistry()
     register_core_tools(registry)
     # Test-only replacement isolates the declaration's effect. A literal-name
@@ -796,7 +797,13 @@ def test_poller_builder_uses_registry_properties_not_canonical_literals(canonica
     registry._poller_properties[canonical] = PollerProperties()
     selected = registry.freeze()
     assert getattr(build(selected), flag) is False
-    assert getattr(build(core_policy_registry()), flag) is True
+    assert getattr(build(core_policy_registry()), flag) is core_grant
+    if not core_grant:
+        from mimir.plugins.manager import load_plugins
+
+        cultivate = load_plugins(enable="cultivate").policy
+        assert cultivate.frozen
+        assert getattr(build(cultivate), flag) is True
     with pytest.raises(TypeError):
         selected.poller_properties[canonical] = PollerProperties()
     with pytest.raises(PolicyRegistrationError, match="frozen"):
