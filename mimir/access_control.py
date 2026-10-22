@@ -11862,21 +11862,6 @@ def classify_protected_result(
             ),
             bridge_instance="forge",
         )
-        if provenance is not None and provenance.sources and all(
-            item.domain == source.domain
-            and item.resource_id == source.resource_id
-            and item.principal == source.principal
-            and item.bridge_instance == source.bridge_instance
-            and item.sensitivity == source.sensitivity
-            and item.authorized_principals == source.authorized_principals
-            and item.source_kind == source.source_kind
-            and item.integrity_effect == source.integrity_effect
-            and item.integrity == "trusted"
-            for item in provenance.sources
-        ):
-            source = replace(source, integrity="trusted")
-            if failed:
-                _log_retained_repository_failure(tool_name, result, repo.lower(), None, None)
         labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels

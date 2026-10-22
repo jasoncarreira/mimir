@@ -400,3 +400,155 @@ async def test_selected_factory_archive_requires_verified_death(
         assert (await response.json())["error"]["code"] == "run_not_verified_dead"
     assert source.read_bytes() == original
     assert not (source.parent / "archive").exists()
+
+
+# Path safety for the selected factory-run endpoints. Restores the coverage the
+# pre-plugin ``/api/v1/factory-runs/{run_id}`` tests in tests/test_web_ui.py
+# carried; ``run_id`` now arrives as a query parameter instead of a path segment.
+
+_FACTORY_BASE = "/api/v1/plugins/cultivate"
+
+
+def _factory_app(home: Path) -> web.Application:
+    app = web.Application(middlewares=[_admin])
+    app["cultivate_home"] = home
+    add_plugin_routes(app, load_plugins(enable="cultivate").policy)
+    return app
+
+
+async def _request_run(client: TestClient, operation: str, run_id: str):
+    if operation == "archive":
+        return await client.post(
+            f"{_FACTORY_BASE}/factory-run/archive", params={"run_id": run_id},
+            json={"reason": "cleanup"},
+        )
+    return await client.get(f"{_FACTORY_BASE}/factory-run", params={"run_id": run_id})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["detail", "archive"])
+@pytest.mark.parametrize(
+    ("unsafe", "error_code"),
+    [
+        ("valid..child", "invalid_run_id"),
+        ("valid/child", "invalid_run_id"),
+        ("valid\\child", "invalid_run_id"),
+        (".hidden", "invalid_run_id"),
+        ("/etc/passwd", "invalid_run_id"),
+        ("../834", "invalid_run_id"),
+        ("", "missing_run_id"),
+        ("   ", "missing_run_id"),
+    ],
+    ids=["dot-dot", "slash", "backslash", "leading-dot", "absolute", "parent", "empty", "blank"],
+)
+async def test_selected_factory_run_rejects_unsafe_ids_before_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, unsafe: str, error_code: str,
+) -> None:
+    from mimir_cultivate import web as cultivate_web
+
+    home = tmp_path / "home"
+    home.mkdir()
+    # A sibling record an escaping id could name, so a missed check is visible.
+    outside = tmp_path / "834.json"
+    outside.write_text("{}", encoding="utf-8")
+
+    def unexpected(*_args):
+        pytest.fail("unsafe run id reached load_factory_record")
+
+    monkeypatch.setattr(cultivate_web, "load_factory_record", unexpected)
+    async with TestClient(TestServer(_factory_app(home))) as client:
+        response = await _request_run(client, operation, unsafe)
+        assert response.status == 400
+        data = await response.json()
+        assert data["ok"] is False
+        assert data["error"]["code"] == error_code
+    assert outside.read_text(encoding="utf-8") == "{}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["detail", "archive"])
+async def test_selected_factory_run_refuses_symlinked_record(
+    tmp_path: Path, operation: str,
+) -> None:
+    home = tmp_path / "home"
+    factory_dir = home / "state" / "worklink" / "factory-runs"
+    factory_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    (factory_dir / "834.json").symlink_to(outside)
+    async with TestClient(TestServer(_factory_app(home))) as client:
+        response = await _request_run(client, operation, "834")
+        assert response.status == 400
+        assert (await response.json())["error"]["code"] == "run_invalid"
+    assert outside.read_text(encoding="utf-8") == "{}"
+    assert (factory_dir / "834.json").is_symlink()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["detail", "archive"])
+async def test_selected_factory_run_refuses_symlinked_parent_directory(
+    tmp_path: Path, operation: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    factory_dir = outside / "worklink" / "factory-runs"
+    factory_dir.mkdir(parents=True)
+    (factory_dir / "834.json").write_text("{}", encoding="utf-8")
+    (home / "state").symlink_to(outside, target_is_directory=True)
+    async with TestClient(TestServer(_factory_app(home))) as client:
+        response = await _request_run(client, operation, "834")
+        assert response.status == 400
+        assert (await response.json())["error"]["code"] == "run_invalid"
+    assert (factory_dir / "834.json").read_text(encoding="utf-8") == "{}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["detail", "archive"])
+async def test_selected_factory_run_not_found(tmp_path: Path, operation: str) -> None:
+    home = tmp_path / "home"
+    (home / "state" / "worklink" / "factory-runs").mkdir(parents=True)
+    async with TestClient(TestServer(_factory_app(home))) as client:
+        response = await _request_run(client, operation, "999")
+        assert response.status == 404
+        data = await response.json()
+        assert data["ok"] is False
+        assert data["error"]["code"] == "run_not_found"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["detail", "archive"])
+async def test_selected_factory_run_malformed_record(tmp_path: Path, operation: str) -> None:
+    home = tmp_path / "home"
+    factory_dir = home / "state" / "worklink" / "factory-runs"
+    factory_dir.mkdir(parents=True)
+    record = factory_dir / "834.json"
+    record.write_text("not valid json", encoding="utf-8")
+    async with TestClient(TestServer(_factory_app(home))) as client:
+        response = await _request_run(client, operation, "834")
+        assert response.status == 400
+        assert (await response.json())["error"]["code"] == "run_invalid"
+        # The listing skips the unreadable record instead of failing.
+        listing = await client.get(f"{_FACTORY_BASE}/factory-runs")
+        assert listing.status == 200
+        assert (await listing.json())["data"]["runs"] == []
+    assert record.read_text(encoding="utf-8") == "not valid json"
+
+
+@pytest.mark.asyncio
+async def test_selected_factory_archive_rejects_malformed_request_body(tmp_path: Path) -> None:
+    record = FactoryRunRecord(
+        run_id="1620", issue_id=1620, attempt=1, repository="owner/repo",
+        base_ref="main", branch="worklink/1620", launcher="/opt/factory/bin/factory.js",
+        sandbox=str(tmp_path / "sandbox"), session=None, handle=None, status=None,
+        observed_at=None, controller_phase="terminal",
+    )
+    source = save_factory_record(tmp_path, record)
+    async with TestClient(TestServer(_factory_app(tmp_path))) as client:
+        response = await client.post(
+            f"{_FACTORY_BASE}/factory-run/archive", params={"run_id": "1620"},
+            data=b"{not json", headers={"Content-Type": "application/json"},
+        )
+        assert response.status == 400
+        assert (await response.json())["error"]["code"] == "invalid_reason"
+    assert source.exists()
