@@ -131,12 +131,19 @@ assert 'mimir.contained_checkout' not in sys.modules
 def test_core_shell_does_not_import_provider_or_grant_forge_credentials() -> None:
     script = """
 import os, subprocess, sys
+from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
 assert 'mimir_cultivate' not in sys.modules
 for argv in (['/usr/bin/gh', 'api', 'user'], ['/usr/bin/git', 'status']):
     env = direct_exec_env(argv)
     assert 'GITHUB_TOKEN' not in env
-    assert 'GH_CONFIG_DIR' not in env
+    if argv[0].endswith('/gh'):
+        # Core's floor: an empty isolated config, never ambient on-disk auth.
+        assert env['GH_CONFIG_DIR'] == _shell_env._GH_CONFIG_DIR
+        assert not os.listdir(env['GH_CONFIG_DIR'])
+    else:
+        assert 'GH_CONFIG_DIR' not in env
+        assert env['GIT_CONFIG_NOSYSTEM'] == '1'
     assert 'GIT_ASKPASS' not in env
     overlay = direct_exec_env_overlay(argv)
     assert overlay['GITHUB_TOKEN'] is None
@@ -147,7 +154,8 @@ assert subprocess.run(['/bin/echo', 'generic-ok'], capture_output=True,
 assert 'mimir_cultivate' not in sys.modules
 """
     env = {**os.environ, "MIMIR_PLUGINS": "", "GITHUB_TOKEN": "secret",
-           "GH_TOKEN": "other-secret", "GIT_ASKPASS": "/tmp/untrusted-helper"}
+           "GH_TOKEN": "other-secret", "GIT_ASKPASS": "/tmp/untrusted-helper",
+           "GH_CONFIG_DIR": "/tmp/ambient-gh-config"}
     result = subprocess.run(
         [sys.executable, "-c", script], env=env, capture_output=True,
         text=True, timeout=20,

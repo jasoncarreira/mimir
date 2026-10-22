@@ -2991,11 +2991,11 @@ def _maintenance_git_probe_env() -> dict[str, str]:
     for key in tuple(env):
         if key.startswith(_MAINTENANCE_GIT_ENV_DENY_PREFIXES):
             env.pop(key, None)
-    env.update({
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_PAGER": "cat",
-        "GIT_OPTIONAL_LOCKS": "0",
-    })
+    from .tools._shell_env import GIT_ENV_PINS
+
+    # The executed child receives the same pins (direct_exec_env), so the probe
+    # and execution resolve identical configuration sources.
+    env.update(GIT_ENV_PINS)
     return env
 
 

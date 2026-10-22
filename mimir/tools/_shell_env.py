@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import sys
+import tempfile
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,18 @@ _INTERACTIVE_ENV_NAMES = _MINIMAL_ENV_NAMES | frozenset({
     "TERM", "TMPDIR", "USER", "LOGNAME", "MIMIR_HOME",
 })
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+# Core's floor for gh: an empty, non-writable config dir, so gh can never
+# discover ambient on-disk auth ($HOME/.config/gh/hosts.yml). A selected forge
+# hook may substitute its own isolated dir and grant a verified credential.
+_GH_CONFIG_DIR = tempfile.mkdtemp(prefix="mimir-gh-config-")
+Path(_GH_CONFIG_DIR).chmod(0o500)
+# Core's floor for git, shared with the authorization-time probe so the probe
+# and the executed child resolve the same configuration sources.
+GIT_ENV_PINS = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_PAGER": "cat",
+    "GIT_OPTIONAL_LOCKS": "0",
+}
 
 
 @dataclass(frozen=True)
@@ -299,18 +312,51 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
         from ..event_logger import log_event_sync
 
         log_event_sync("service_shell_env_passthrough", pass_env=passed)
-    if argv and Path(argv[0]).name in {"gh", "git"}:
+    executable = Path(argv[0]).name if argv else ""
+    if executable in {"gh", "git"}:
         # The hook is installed only for an authenticated, selected first-party
         # owner; importing this core module cannot load a disabled provider.
         from ..plugins.core import selected_policy_registry
 
         hooks = selected_policy_registry().policy_consumer_hooks
-        if Path(argv[0]).name == "gh":
-            # A declaration cannot smuggle forge credentials around selection.
-            env = {key: value for key, value in env.items()
-                   if key != "GITHUB_TOKEN" and not key.startswith("GH_")}
+        env = _core_forge_cli_floor(executable, env)
         if hooks is not None:
-            env = hooks.shell_environment(argv, env)
+            # The hook may strengthen the floor (its own isolated config dir,
+            # a verified credential) but the floor is re-applied afterwards.
+            env = _core_forge_cli_floor(
+                executable, hooks.shell_environment(argv, env), hooked=True,
+            )
+    return env
+
+
+def _is_isolated_gh_config_dir(value: str | None) -> bool:
+    if not value or value == os.environ.get("GH_CONFIG_DIR"):
+        return False
+    try:
+        mode = Path(value).stat().st_mode
+    except OSError:
+        return False
+    return Path(value).is_dir() and mode & 0o222 == 0
+
+
+def _core_forge_cli_floor(
+    executable: str, env: dict[str, str], *, hooked: bool = False,
+) -> dict[str, str]:
+    """Apply core's gh/git isolation, with or without a selected forge hook."""
+    env = dict(env)
+    if executable == "git":
+        # Inherited GIT_* never reach the child (minimal env); these pins also
+        # stop /etc/gitconfig drivers the authorization probe never saw.
+        env.update(GIT_ENV_PINS)
+        return env
+    # Without a hook, core grants no forge credential, so there is no
+    # identity to confirm: gh runs unauthenticated against an empty config.
+    # A declaration cannot smuggle forge credentials around selection.
+    allowed = {"GITHUB_TOKEN", "GH_CONFIG_DIR"} if hooked else set()
+    env = {key: value for key, value in env.items()
+           if not ((key == "GITHUB_TOKEN" or key.startswith("GH_")) and key not in allowed)}
+    if not _is_isolated_gh_config_dir(env.get("GH_CONFIG_DIR")):
+        env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
     return env
 
 

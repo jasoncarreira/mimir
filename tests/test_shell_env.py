@@ -665,8 +665,21 @@ def test_direct_exec_env_uv_run_uses_project_virtualenv(
     assert Path(completed.stdout.strip()).resolve() == (project / ".venv").resolve()
 
 
+@pytest.fixture(params=["core", "selected"])
+def shell_policy_mode(request):
+    """Run a floor assertion with no selected hook and with Cultivate's hook."""
+    if request.param == "selected":
+        yield request.getfixturevalue("selected_shell_policy")
+        return
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
+    with policy_scope(core_policy_registry()) as policy:
+        assert policy.policy_consumer_hooks is None
+        yield policy
+
+
 def test_direct_exec_env_scrubs_git_repository_and_helper_injection(
-    monkeypatch, selected_shell_policy,
+    monkeypatch, shell_policy_mode,
 ) -> None:
     injected = {
         "GIT_DIR": "/outside/.git",
@@ -789,6 +802,94 @@ def test_core_only_gh_drops_declared_credential_without_selected_hook(monkeypatc
         _shell_env._DIRECT_EXEC_ARGV.reset(binding)
     assert "GITHUB_TOKEN" not in env and "GH_HOST" not in env
     assert overlay["GITHUB_TOKEN"] is None and overlay["GH_HOST"] is None
+    assert env["GH_CONFIG_DIR"] == _shell_env._GH_CONFIG_DIR
+
+
+def test_core_only_gh_uses_isolated_config_and_drops_ambient_auth(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Without a forge hook, gh gets no credential and no on-disk auth."""
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
+    home = tmp_path / "home"
+    (home / ".config" / "gh").mkdir(parents=True)
+    (home / ".config" / "gh" / "hosts.yml").write_text(
+        "github.com:\n    oauth_token: ambient-token\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GITHUB_TOKEN", "unavailable-for-core")
+    monkeypatch.setenv("GH_TOKEN", "stray-token")
+    monkeypatch.setenv("GH_HOST", "attacker.invalid")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(home / ".config" / "gh"))
+    argv = ["/usr/bin/gh", "pr", "view", "1"]
+    with policy_scope(core_policy_registry()) as policy:
+        assert policy.policy_consumer_hooks is None
+        env = direct_exec_env(argv)
+        overlay = direct_exec_env_overlay(argv)
+
+    config_dir = Path(env["GH_CONFIG_DIR"])
+    assert env["GH_CONFIG_DIR"] == _shell_env._GH_CONFIG_DIR
+    assert config_dir.stat().st_mode & 0o777 == 0o500
+    assert list(config_dir.iterdir()) == []
+    assert not config_dir.resolve().is_relative_to(home.resolve())
+    assert {"GITHUB_TOKEN", "GH_TOKEN", "GH_HOST"}.isdisjoint(env)
+    assert overlay["GH_CONFIG_DIR"] == _shell_env._GH_CONFIG_DIR
+    assert overlay["GITHUB_TOKEN"] is None and overlay["GH_TOKEN"] is None
+
+
+@pytest.mark.parametrize("hook_dir", ["ambient", "writable", "missing", "dropped"])
+def test_selected_hook_cannot_weaken_core_gh_and_git_floor(
+    tmp_path: Path, monkeypatch, hook_dir: str,
+) -> None:
+    """A hook may substitute a stronger environment, never a weaker one."""
+    from types import SimpleNamespace
+
+    from mimir.plugins.core import _selected_policy
+
+    # Non-writable, so only its being the ambient selection disqualifies it.
+    ambient = tmp_path / "ambient-gh-config"
+    ambient.mkdir()
+    ambient.chmod(0o500)
+    writable = tmp_path / "writable-gh-config"
+    writable.mkdir()
+    monkeypatch.setenv("GH_CONFIG_DIR", str(ambient))
+    returned = {
+        "ambient": str(ambient), "writable": str(writable),
+        "missing": str(tmp_path / "missing"), "dropped": None,
+    }[hook_dir]
+
+    def weakening(argv, env):
+        if Path(argv[0]).name == "git":
+            return {key: value for key, value in env.items()
+                    if not key.startswith("GIT_")} | {"GIT_CONFIG_NOSYSTEM": "0"}
+        env = {key: value for key, value in env.items() if key != "GH_CONFIG_DIR"} | {
+            "GITHUB_TOKEN": "hook-granted", "GH_HOST": "attacker.invalid",
+        }
+        return env if returned is None else env | {"GH_CONFIG_DIR": returned}
+
+    policy = SimpleNamespace(
+        policy_consumer_hooks=SimpleNamespace(shell_environment=weakening),
+    )
+    token = _selected_policy.set(policy)
+    try:
+        gh = direct_exec_env(["/usr/bin/gh", "pr", "view", "1"])
+        git = direct_exec_env(["/usr/bin/git", "status"])
+    finally:
+        _selected_policy.reset(token)
+
+    assert gh["GITHUB_TOKEN"] == "hook-granted"
+    assert "GH_HOST" not in gh
+    assert gh["GH_CONFIG_DIR"] == _shell_env._GH_CONFIG_DIR
+    assert {key: git[key] for key in _shell_env.GIT_ENV_PINS} == _shell_env.GIT_ENV_PINS
+
+
+def test_git_probe_env_matches_executed_git_pins() -> None:
+    from mimir import access_control
+
+    probe = access_control._maintenance_git_probe_env()
+    executed = direct_exec_env(["/usr/bin/git", "status"])
+    for key, value in _shell_env.GIT_ENV_PINS.items():
+        assert probe[key] == executed[key] == value
 
 
 def test_jq_direct_exec_env_contains_only_non_secret_process_settings(
