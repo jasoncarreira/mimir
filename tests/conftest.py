@@ -29,6 +29,7 @@ import pytest
 
 from tests.isolation_fixtures import (  # noqa: F401  (autouse fixtures)
     _isolate_installed_saga_config,
+    _isolate_memory_tool_client,
     _event_log_read_barrier,
     SYNTHETIC_MIMIR_UID,
     SYNTHETIC_WORKLINK_UID,

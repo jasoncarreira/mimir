@@ -36,6 +36,24 @@ def _isolate_installed_saga_config():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_memory_tool_client():
+    """Constructing an Agent with a SagaStore must not affect the next test.
+
+    ``Agent._try_inject_memory_client`` installs the store into the
+    process-wide memory-tool slot, and only runtime teardown clears it, so
+    a test that builds an Agent directly would leave its store for the next
+    test on the same worker. Restore the slot to what this test started with.
+    """
+    from mimir.tools.memory import _MEMORY_STATE
+
+    previous = _MEMORY_STATE.get("client")
+    try:
+        yield
+    finally:
+        _MEMORY_STATE["client"] = previous
+
+
+@pytest.fixture(autouse=True)
 def _event_log_read_barrier(monkeypatch, request):
     """Drain accepted sync telemetry before test-side reads of owned logs.
 

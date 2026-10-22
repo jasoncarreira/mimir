@@ -14,6 +14,7 @@ from tests.isolation_fixtures import (  # noqa: F401  (autouse fixtures)
     _disable_git_auto_maintenance,
     _event_log_read_barrier,
     _isolate_installed_saga_config,
+    _isolate_memory_tool_client,
     _isolate_process_env,
     maintenance_pinned_executables,
     synthetic_worklink_identities,

@@ -7793,6 +7793,7 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
 
 async def test_agent_graph_tool_call_survives_populated_auth_context(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """End-to-end #971 regression through the production assembly.
 
@@ -7810,7 +7811,14 @@ async def test_agent_graph_tool_call_survives_populated_auth_context(
     from deepagents import create_deep_agent
 
     from mimir._deepagents_patches import install_deepagents_grep_context_tool
+    from mimir.tools import memory
     from mimir.tools.store import memory_store
+
+    # The carrier under test is the tool-call parse, not memory_store's body.
+    # Pin the process-wide store slot so the body is deterministic (it returns
+    # the unconfigured message) instead of depending on which store a prior
+    # test on this worker left behind.
+    monkeypatch.setitem(memory._MEMORY_STATE, "client", None)
 
     class _ToolCallingFakeModel(GenericFakeChatModel):
         def bind_tools(self, tools, **kwargs):  # noqa: ARG002 - fake binds nothing
