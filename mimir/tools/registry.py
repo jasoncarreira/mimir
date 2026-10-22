@@ -2397,7 +2397,9 @@ async def request_mimir_update(
     """
     from packaging.version import InvalidVersion, Version
     from .. import __version__, approval_requests
-    from ..update_on_start import parse_target_version, write_flag
+    from ..update_on_start import (
+        cultivate_source_install, cultivate_source_refusal, parse_target_version, write_flag,
+    )
 
     home_env = os.environ.get("MIMIR_HOME")
     if not home_env:
@@ -2413,6 +2415,11 @@ async def request_mimir_update(
         return f"request_mimir_update refused: invalid PEP 440 target version {cleaned_target!r}"
     if target is not None and target < Version(__version__):
         return f"request_mimir_update refused: {cleaned_target} is older than running version {__version__}"
+    source = cultivate_source_install()
+    if source is not None:
+        # Startup would refuse this install anyway; don't ask the operator to
+        # approve an update that cannot apply.
+        return f"request_mimir_update refused: {cultivate_source_refusal(source)}. Tell the operator."
     dispatcher = _STATE.get("dispatcher")
     channel = (getattr(getattr(dispatcher, "_config", None), "operator_alert_channel", "") or "").strip()
     if not channel:

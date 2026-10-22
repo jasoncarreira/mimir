@@ -812,6 +812,12 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         if error:
             return "installed optional skill auto-update failed: " + _sanitize_field(error)
         return "installed optional skill auto-update failed"
+    if rule_kind == "mimir_update_failed" and ev.get("reason") == "cultivate_source_install":
+        err = _sanitize_field(ev.get("error") or "", max_len=240)
+        return (
+            f"mimir update REFUSED: {err} — running on prior version, flag "
+            f"cleared; do not re-request this update"
+        )
     if rule_kind == "mimir_update_failed":
         spec = ev.get("spec") or "?"
         rc = ev.get("rc")

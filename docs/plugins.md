@@ -328,8 +328,13 @@ user and no `worklink-execd` service. Third-party plugins are installed at
 verifies installed versions/selection and assembles services; a non-installable
 selected provider fails the build. Runtime `MIMIR_PLUGINS` alone neither installs
 packages nor changes s6 definitions. Rebuild the image when adding services.
-The pending-update flow upgrades only `mimir-agent` from PyPI; in a Cultivate
-image, rebuild at the new commit instead, so core and plugin stay paired.
+The PyPI self-update paths (the approved pending-update flag,
+`request_mimir_update` and `mimir update --apply`) refuse wherever Cultivate is
+installed from source, which is detected from `<venv>/controller-source-commit` or
+a `file://` install of `mimir-cultivate`. A refused startup update consumes the
+flag and boots the current version, the same as a failed install. To update,
+rebuild the image or re-sync the checkout at the new commit, so core and the
+plugin stay paired.
 
 ### Defaults and configuration
 
