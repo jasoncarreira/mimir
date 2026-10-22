@@ -123,7 +123,10 @@ The hook callable returns `PollerHooks` (for example, a
 `recovery_relevance` factory). Plugin skill `pollers.json` is packaged under
 the declared skill defaults; hook code comes from the selected provider module,
 not from importing a script inside a skill directory. Core poller identities
-and poller properties remain reserved. Poller service authority still requires
+remain reserved, and poller properties (`github_activity`, `github_ci_watch`,
+`worklink_retained_checkout`) and the retained checkout operation are accepted
+only from core or the selected first-party Cultivate owner; any other owner is
+refused at registration. Poller service authority still requires
 registered capabilities/profiles and `build_trigger_service_principal` checks.
 Scheduler declarations are attached via `Scheduler.register_callable` after
 core jobs and before reload/start; both name and job-ID conflicts reject boot.

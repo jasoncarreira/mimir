@@ -472,11 +472,9 @@ class PolicyRegistry:
         self, operation: Callable[..., dict[str, object]], *, owner: str = "core",
     ) -> None:
         self._writable()
-        if (owner == "core" or self._retained_checkout_operation is not None
-                or not callable(operation)
-                or not any(candidate.name == owner and candidate.enabled
-                           and candidate.diagnostic is None
-                           for candidate in self._selected_plugin_candidates)):
+        # Same owner contract as the retained effect lease it pairs with.
+        if (not self._selected_first_party(owner) or self._retained_checkout_operation is not None
+                or not callable(operation)):
             raise PolicyRegistrationError(f"{owner}: invalid retained checkout operation")
         self._retained_checkout_operation = (owner, operation)
 
@@ -623,8 +621,13 @@ class PolicyRegistry:
             not isinstance(value, bool) for value in properties.principal_fields().values()
         ):
             raise PolicyRegistrationError("invalid poller properties")
-        if owner != "core" and properties.worklink_retained_checkout and not self._selected_first_party(owner):
-            raise PolicyRegistrationError(f"{owner}: retained checkout requires selected first-party owner")
+        # Every property is reserved server authority (ScopedPRGrants, the PR-API
+        # fetch_url bypass, PR-lease and retained-checkout writes), so only core
+        # and the selected first-party owner may declare poller properties.
+        if owner != "core" and not self._selected_first_party(owner):
+            raise PolicyRegistrationError(
+                f"{owner}: poller properties require core or the selected first-party owner"
+            )
         if canonical in self._poller_properties or canonical in self._plugin_poller_properties:
             raise PolicyRegistrationError(f"duplicate poller properties: {canonical}")
         if owner == "core":
