@@ -203,6 +203,9 @@ import mimir_cultivate.worklink.evidence
     assert result.returncode == 0, result.stderr
 
 
+# The real accessor is the subject (pwd/grp are faked below), so opt out of the
+# suite's synthetic replacement of it.
+@pytest.mark.real_worklink_identities
 def test_identity_lookup_requires_both_accounts_and_group(monkeypatch: pytest.MonkeyPatch) -> None:
     identities.get_identities.cache_clear()
     monkeypatch.setattr(identities.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid={"mimir": 1001, "worklink": 1002}[name]))

@@ -105,6 +105,10 @@ def test_provider_worker_wire_and_executor_contract(tmp_path: Path) -> None:
     assert "mimir_cultivate.worklink.worker_exec" in worker_client.STALE_EXECUTOR_DIAGNOSTIC
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Linux only: executor RPC requires AF_UNIX SOCK_SEQPACKET and SO_PEERCRED",
+)
 @pytest.mark.asyncio
 async def test_provider_worker_client_refuses_non_root_peer_before_sending(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -197,8 +201,11 @@ def test_provider_worker_identity_guard_rejects_wrong_uid_without_root(
         worker_exec, "get_identities",
         lambda: SimpleNamespace(worklink_uid=2001, worklink_gid=2002),
     )
-    monkeypatch.setattr(worker_exec.os, "getresuid", lambda: (2001, 2001, 0))
-    monkeypatch.setattr(worker_exec.os, "getresgid", lambda: (2002, 2002, 2002))
+    # getresuid/getresgid are Linux-only; the guard's decision is portable.
+    monkeypatch.setattr(worker_exec.os, "getresuid", lambda: (2001, 2001, 0), raising=False)
+    monkeypatch.setattr(
+        worker_exec.os, "getresgid", lambda: (2002, 2002, 2002), raising=False,
+    )
     with pytest.raises(RuntimeError, match="worker identity drop failed"):
         worker_exec._verify_worker_identity()
 
@@ -216,8 +223,16 @@ def test_provider_factory_file_child_in_isolated_interpreter(tmp_path: Path) -> 
         input=json.dumps(request), text=True, capture_output=True, cwd=tmp_path, timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["status"] == "ok"
-    assert (sandbox / "hello.txt").read_text() == "hello"
+    if sys.platform == "linux":
+        assert json.loads(result.stdout)["status"] == "ok"
+        assert (sandbox / "hello.txt").read_text() == "hello"
+    else:
+        # Create-only publication needs renameat2(RENAME_NOREPLACE); elsewhere
+        # the isolated child still runs and must refuse rather than overwrite.
+        assert json.loads(result.stdout) == {
+            "status": "error", "error": "atomic create-only publication is unavailable",
+        }
+        assert not (sandbox / "hello.txt").exists()
 
 
 def test_provider_dispatch_pins_and_claim_finder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -298,6 +313,9 @@ def test_provider_tool_pin_is_independent_of_core_backend() -> None:
         pin.pin = "untrusted"
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux only: executor RPC requires AF_UNIX SOCK_SEQPACKET",
+)
 @pytest.mark.asyncio
 async def test_provider_worker_wire_fd_identity_launch_wait_cancel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 import asyncio
 import stat
@@ -170,11 +172,20 @@ def test_selected_worker_checkout_refuses_replaced_checkout_symlink(
         path.symlink_to(external, target_is_directory=True)
 
     monkeypatch.setattr(checkout, "_assert_self_contained_checkout", replace)
-    with pytest.raises(RuntimeError, match="unavailable or unsafe"):
+    # Linux resolves with openat2(RESOLVE_NO_SYMLINKS) and reports a uniform
+    # refusal; the portable O_NOFOLLOW walk refuses with the OS error itself.
+    with pytest.raises((OSError, RuntimeError)) as refused:
         checkout.create_isolated_checkout(
             repo, issue_id=1949, attempt=2, worker_eligible=True,
         )
+    if sys.platform == "linux":
+        assert refused.type is RuntimeError
+        assert "unavailable or unsafe" in str(refused.value)
+    else:
+        assert isinstance(refused.value, OSError)
+        assert refused.value.errno in {errno.ELOOP, errno.ENOTDIR}
     assert external.is_dir()
+    assert not any(external.iterdir())
 
 
 def test_claim_reset_preserves_wire_format_and_bounded_budget() -> None:

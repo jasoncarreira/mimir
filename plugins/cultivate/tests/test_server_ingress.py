@@ -22,7 +22,9 @@ def test_server_callbacks_belong_to_selected_provider() -> None:
 
 
 def test_selected_process_identity_uses_current_generation(monkeypatch) -> None:
-    monkeypatch.delenv("MIMIR_WORKLINK_AGENT_ID", raising=False)
+    # The hook writes os.environ directly. setenv (unlike delenv on an unset
+    # name) records the prior state, so teardown removes the hook's write too.
+    monkeypatch.setenv("MIMIR_WORKLINK_AGENT_ID", "mimir-worklink:previous-generation")
     policy = load_plugins(enable="cultivate").policy
     policy.server_hooks["cultivate", "process_identity"]("session-123")
     import os

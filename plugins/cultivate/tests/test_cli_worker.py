@@ -64,11 +64,14 @@ def test_opencode_bootstrap_preserves_merge_and_home(
     assert capsys.readouterr().out == f"updated {tmp_path / 'config'}\n"
 
 
-def test_operator_scripts_use_provider_records() -> None:
+def test_operator_scripts_use_provider_records(tmp_path: Path) -> None:
     from scripts import factory_park, factory_resume
     from mimir_cultivate.worklink import factory_state
 
     assert factory_park.load_factory_record is factory_state.load_factory_record
     assert factory_resume.load_factory_record is factory_state.load_factory_record
-    assert factory_park.operator_root(Path("/tmp/checkout/.factory-sandboxes/run")) == Path("/tmp/checkout")
-    assert commands._resolve_worklink_repo(Path("/tmp/repo")) == Path("/tmp/repo")
+    # operator_root resolves the sandbox (macOS /tmp and /var are symlinks), so
+    # compare against the resolved checkout rather than a literal spelling.
+    checkout = tmp_path / "checkout"
+    assert factory_park.operator_root(checkout / ".factory-sandboxes" / "run") == checkout.resolve()
+    assert commands._resolve_worklink_repo(tmp_path / "repo") == (tmp_path / "repo").resolve()
