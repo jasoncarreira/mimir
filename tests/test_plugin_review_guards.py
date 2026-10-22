@@ -781,11 +781,11 @@ def test_poller_builder_uses_registry_properties_not_canonical_literals(canonica
     from mimir.access_control import build_trigger_service_principal
     from mimir.plugins.core import PollerProperties, core_policy_registry
 
-    def build(policy):
+    def build(policy, *, owner=None):
         return build_trigger_service_principal(
             canonical=canonical, trigger="poller", profile="github",
             tier=CapabilityTier.SCOPE_CONTAINED, capabilities=(),
-            creation_path="test:poller", policy=policy,
+            creation_path="test:poller", policy=policy, poller_owner=owner,
         )
 
     core_grant = canonical != "poller:worklink-ready-queue"
@@ -799,32 +799,53 @@ def test_poller_builder_uses_registry_properties_not_canonical_literals(canonica
     assert getattr(build(selected), flag) is False
     assert getattr(build(core_policy_registry()), flag) is core_grant
     if not core_grant:
+        import importlib.util
         from mimir.plugins.manager import load_plugins
 
-        cultivate = load_plugins(enable="cultivate").policy
-        assert cultivate.frozen
-        assert getattr(build(cultivate), flag) is True
+        if importlib.util.find_spec("mimir_cultivate") is None:
+            from mimir.plugins.discovery import PluginDiscoveryError
+
+            with pytest.raises(PluginDiscoveryError, match="missing plugin"):
+                load_plugins(enable="cultivate")
+        else:
+            cultivate = load_plugins(enable="cultivate").policy
+            assert cultivate.frozen
+            assert getattr(build(cultivate), flag) is False
+            assert getattr(build(cultivate, owner="example"), flag) is False
+            assert getattr(build(cultivate, owner="cultivate"), flag) is True
     with pytest.raises(TypeError):
         selected.poller_properties[canonical] = PollerProperties()
     with pytest.raises(PolicyRegistrationError, match="frozen"):
         selected.register_poller_properties("poller:another", PollerProperties())
 
 
-def test_poller_properties_are_core_only_and_duplicate_safe():
-    from mimir.plugins.core import PollerProperties
+def test_poller_properties_are_owner_bound_and_duplicate_safe():
+    from mimir.plugins.core import PollerProperties, poller_properties
 
     registry = PolicyRegistry()
-    with pytest.raises(PolicyRegistrationError, match="core-only"):
-        registry.register_poller_properties(
-            "poller:example", PollerProperties(github_activity=True), owner="example",
+    plugin = registry.registrar("example")
+    with pytest.raises(PolicyRegistrationError, match="selected first-party owner"):
+        plugin.register_poller_properties(
+            "poller:foreign-retained", PollerProperties(worklink_retained_checkout=True),
         )
+    plugin.register_poller_properties(
+        "poller:example", PollerProperties(github_activity=True),
+    )
     assert not registry.poller_properties
-    assert not hasattr(registry.registrar("example"), "register_poller_properties")
-    properties = PollerProperties(github_activity=True)
-    registry.register_poller_properties("poller:example", properties)
+    assert registry.plugin_poller_properties["poller:example"][0] == "example"
     with pytest.raises(PolicyRegistrationError, match="duplicate"):
-        registry.register_poller_properties("poller:example", PollerProperties())
-    assert registry.poller_properties["poller:example"] is properties
+        registry.registrar("other").register_poller_properties("poller:example", PollerProperties())
+    properties = PollerProperties(github_activity=True)
+    registry.register_poller_properties("poller:core-example", properties)
+    with pytest.raises(PolicyRegistrationError, match="duplicate"):
+        registry.register_poller_properties("poller:core-example", PollerProperties())
+    assert registry.poller_properties["poller:core-example"] is properties
+    selected = registry.freeze()
+    assert not poller_properties("poller:example", policy=selected).github_activity
+    assert not poller_properties("poller:example", owner="other", policy=selected).github_activity
+    assert poller_properties("poller:example", owner="example", policy=selected).github_activity
+    with pytest.raises(TypeError):
+        selected.plugin_poller_properties["poller:example"] = ("other", properties)
 
 
 def test_authorization_module_contains_no_reserved_poller_name_literals():

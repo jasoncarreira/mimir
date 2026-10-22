@@ -316,6 +316,7 @@ def build_trigger_service_principal(
     proposal_surface: str = "wiki",
     creation_path: str,
     policy: "PolicyRegistry | None" = None,
+    poller_owner: str | None = None,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
     selected = policy if policy is not None else selected_policy_registry()
@@ -352,7 +353,10 @@ def build_trigger_service_principal(
     home_data_roots = (
         (Path(home) / "state", Path(home) / "memory", artifact_root) if home else ()
     )
-    poller_flags = poller_properties(canonical).principal_fields() if trigger == "poller" else {}
+    poller_flags = (
+        poller_properties(canonical, owner=poller_owner, policy=selected).principal_fields()
+        if trigger == "poller" else {}
+    )
     is_github_activity = poller_flags.get("github_activity", False)
     repo_roots = tuple(root.resolve() for root in _configured_repo_roots())
     fetch_cache_roots = (

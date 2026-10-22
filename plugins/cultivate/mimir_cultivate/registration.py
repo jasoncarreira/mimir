@@ -296,6 +296,11 @@ class CultivateProvider:
         from .scheduler import worklink_poller_hooks
 
         registrar.register_poller_hook("worklink", worklink_poller_hooks)
+        from mimir.plugins.core import PollerProperties
+
+        registrar.register_poller_properties(
+            "poller:worklink-ready-queue", PollerProperties(worklink_retained_checkout=True),
+        )
         from . import commands
 
         registrar.register_cli_command("worklink", commands.add_argparse, commands.dispatch_worklink)

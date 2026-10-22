@@ -1460,6 +1460,7 @@ def _parse_poller_authority(
         proposal_surface=proposal_surface,
         creation_path=f"mimir.pollers.run_poller:{manifest_path}",
         policy=policy,
+        poller_owner=plugin_owner,
     )
 
 #: Recognized string spellings for boolean overrides. YAML 1.1 already maps

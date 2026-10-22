@@ -192,12 +192,13 @@ class PollerProperties:
         }
 
 
-def poller_properties(canonical: str) -> PollerProperties:
-    policy = selected_policy_registry()
-    if (canonical == "poller:worklink-ready-queue"
-            and policy._selected_first_party("cultivate")
-            and policy.poller_hooks.get("worklink", (None,))[0] == "cultivate"):
-        return PollerProperties(worklink_retained_checkout=True)
+def poller_properties(
+    canonical: str, *, owner: str | None = None, policy: PolicyRegistry | None = None,
+) -> PollerProperties:
+    policy = policy if policy is not None else selected_policy_registry()
+    registered = policy.plugin_poller_properties.get(canonical)
+    if registered is not None and registered[0] == owner:
+        return registered[1]
     return policy.poller_properties.get(canonical, PollerProperties())
 
 

@@ -119,6 +119,22 @@ def test_selected_installed_cultivate_seeded_pollers_reload(tmp_path, monkeypatc
     from mimir.scheduler import Scheduler
 
     selected = load_plugins(enable="cultivate").policy
+    local_skill = tmp_path / "skills" / "chainlink-orchestrator"
+    local_skill.mkdir(parents=True)
+    local_manifest = local_skill / "pollers.json"
+    local_authority = {"profile": "github", "tier": "scope-contained",
+                       "capabilities": [], "scoped_roots": []}
+    local_principal = _parse_poller_authority(
+        local_authority, name="worklink-ready-queue", persist_dir=local_skill,
+        state_root=None, manifest_path=local_manifest, policy=selected,
+    )
+    assert not local_principal.worklink_retained_checkout
+    with pytest.raises(ValueError, match="reserved poller name"):
+        _parse_poller_authority(
+            local_authority, name="worklink-ready-queue", persist_dir=local_skill,
+            state_root=None, manifest_path=local_manifest, policy=selected,
+            plugin_owner="example",
+        )
     monkeypatch.setenv("GITHUB_REPOS", "o/r")
     monkeypatch.setenv("WORKLINK_REPO", "o/r")
     home = tmp_path / "home"
@@ -140,10 +156,12 @@ def test_selected_installed_cultivate_seeded_pollers_reload(tmp_path, monkeypatc
             assert poller.manifest_path == home / "skills" / f"cultivate-{skill}" / "pollers.json"
             assert poller.hooks is not None
             assert poller.authority is not None and poller.authority.canonical == f"poller:{name}"
+            assert poller.authority.worklink_retained_checkout is (name == "worklink-ready-queue")
             assert poller.hooks.recovery_relevance is not None
             assert not any(entry[1] == name and "reserved" in entry[2] for entry in invalid)
         with policy_scope(selected):
-            assert poller_properties("poller:worklink-ready-queue").worklink_retained_checkout
+            assert poller_properties("poller:worklink-ready-queue", owner="cultivate").worklink_retained_checkout
+            assert not poller_properties("poller:worklink-ready-queue").worklink_retained_checkout
     seeded = home / "skills/cultivate-github-poller/pollers.json"
     seeded.write_text(seeded.read_text().replace('"cron": "*/15', '"cron": "*/5'))
     invalid = []
