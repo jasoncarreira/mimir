@@ -312,10 +312,11 @@ selection; the agent home's Compose files hold other settings:
 cd ~/agents/my-agent
 docker compose build                       # Cultivate fixes mimir UID/GID at 1001:1001
 docker compose run --rm --no-deps --entrypoint sh my-agent -c '
-  id                                       # mimir, uid/gid 1001 with Cultivate selected
-  test -d /workspace/.pr-leases -a ! -L /workspace/.pr-leases -a -w /workspace/.pr-leases && echo lease-root-ok
-  uv --version && cd /workspace/<repo> && uv run pytest -q
-  env | cut -d= -f1 | grep -E "^(GITHUB_TOKEN|MIMIR_GITHUB_SELF_LOGIN|GH_USER_NAME|GH_USER_EMAIL|MIMIR_PR_CHECKOUT_LEASE_ROOT|MIMIR_PLUGINS)$"'
+  su -s /bin/sh mimir -c "
+    id                                     # mimir, uid/gid 1001 with Cultivate selected
+    test -d /workspace/.pr-leases -a ! -L /workspace/.pr-leases -a -w /workspace/.pr-leases && echo lease-root-ok
+    uv --version && cd /workspace/<repo> && uv run pytest -q
+    env | cut -d= -f1 | grep -E \"^(GITHUB_TOKEN|MIMIR_GITHUB_SELF_LOGIN|GH_USER_NAME|GH_USER_EMAIL|MIMIR_PR_CHECKOUT_LEASE_ROOT|MIMIR_PLUGINS)$\""'
 ```
 
 If `lease-root-ok` doesn't print, fix ownership on the host and re-run the check:
