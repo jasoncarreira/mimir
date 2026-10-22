@@ -436,7 +436,13 @@ jobs:
         # its own conftest; the optional-skills trees run in the dedicated
         # per-skill step below (chainlink #299).
         # Keep tracebacks short; upload raw evidence files on failure instead of huge logs.
-        run: uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+        run: env -u MIMIR_PLUGINS uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+
+      - name: Run selected Cultivate suite (shadow, Python 3.12)
+        if: matrix.python-version == '3.12'
+        env:
+          MIMIR_PLUGINS: cultivate
+        run: env -u MIMIR_ACCESS_CONTROL_ENFORCED uv run --locked --all-packages --extra dev --extra bench pytest -q --tb=short tests plugins/cultivate/tests --basetemp "$PYTEST_EVIDENCE_ROOT/cultivate-shadow"
 
       - name: Run optional-skills tests (per-skill, isolated)
         # Each optional skill under mimir/optional-skills/ ships its own
@@ -448,12 +454,14 @@ jobs:
         run: |
           set -e
           ran=0
-          for tdir in mimir/optional-skills/*/tests; do
+          for tdir in mimir/optional-skills/*/tests plugins/cultivate/mimir_cultivate/defaults/skills/*/tests; do
             if [ -d "$tdir" ]; then
+              test_files=("$tdir"/test_*.py)
+              [ -f "${test_files[0]}" ] || continue
               echo "== $tdir =="
               skill="${tdir%/tests}"
               skill="${skill##*/}"
-              uv run pytest -q "$tdir" --basetemp "$PYTEST_EVIDENCE_ROOT/optional-skills/$skill"
+              env -u MIMIR_PLUGINS uv run --locked --all-packages --extra dev --extra bench pytest -q "$tdir" --basetemp "$PYTEST_EVIDENCE_ROOT/optional-skills/$skill"
               ran=$((ran + 1))
             fi
           done
@@ -461,7 +469,7 @@ jobs:
           # (e.g. an optional-skills layout change) rather than passing
           # vacuously and silently dropping this coverage.
           if [ "$ran" -eq 0 ]; then
-            echo "::error::no optional-skills test dirs matched mimir/optional-skills/*/tests"
+            echo "::error::no optional-skills test dirs matched"
             exit 1
           fi
           echo "ran optional-skills tests for $ran skill(s)"
@@ -679,23 +687,25 @@ jobs:
         run: uv run python -c 'import os; from types import SimpleNamespace; from xdist.plugin import pytest_xdist_auto_num_workers as workers; print("logical CPUs:", os.cpu_count(), "; xdist -n auto workers:", workers(SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))))'
 
       - name: Run mimir test suite
-        run: uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+        run: env -u MIMIR_PLUGINS uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
 
       - name: Run optional-skills tests (per-skill, isolated)
         run: |
           set -e
           ran=0
-          for tdir in mimir/optional-skills/*/tests; do
+          for tdir in mimir/optional-skills/*/tests plugins/cultivate/mimir_cultivate/defaults/skills/*/tests; do
             if [ -d "$tdir" ]; then
+              test_files=("$tdir"/test_*.py)
+              [ -f "${test_files[0]}" ] || continue
               echo "== $tdir =="
               skill="${tdir%/tests}"
               skill="${skill##*/}"
-              uv run pytest -q "$tdir" --basetemp "$PYTEST_EVIDENCE_ROOT/optional-skills/$skill"
+              env -u MIMIR_PLUGINS uv run --locked --all-packages --extra dev --extra bench pytest -q "$tdir" --basetemp "$PYTEST_EVIDENCE_ROOT/optional-skills/$skill"
               ran=$((ran + 1))
             fi
           done
           if [ "$ran" -eq 0 ]; then
-            echo "::error::no optional-skills test dirs matched mimir/optional-skills/*/tests"
+            echo "::error::no optional-skills test dirs matched"
             exit 1
           fi
           echo "ran optional-skills tests for $ran skill(s)"
@@ -851,7 +861,13 @@ jobs:
       - name: Run mimir test suite (enforcement on)
         env:
           MIMIR_ACCESS_CONTROL_ENFORCED: "1"
-        run: uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+        run: env -u MIMIR_PLUGINS uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+
+      - name: Run selected Cultivate suite (enforcement on)
+        env:
+          MIMIR_PLUGINS: cultivate
+          MIMIR_ACCESS_CONTROL_ENFORCED: "1"
+        run: uv run --locked --all-packages --extra dev --extra bench pytest -q --tb=short tests plugins/cultivate/tests --basetemp "$PYTEST_EVIDENCE_ROOT/cultivate-enforced"
 
       - *stage-pytest-evidence
 

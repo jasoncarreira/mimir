@@ -43,7 +43,7 @@ You need two GitHub identities, one always-on host for the mimir agent, and your
 | Agent host | Linux or macOS box that stays on, with Docker | Runs the mimir agent and its builds. Allow 8 CPUs, 16 GB RAM and 60 GB+ free disk |
 | Your machine | Claude Code, `gh`, `git`, `uv` | Runs reviews: full test suites in worktrees |
 | Model access | A subscription or API key for the agent | e.g. a Codex/ChatGPT plan (`codex-plus`), Claude Max (`claude-code`) or an API key |
-| mimir | `pip install "mimir-agent[<extras>]"` | Extras: `codex-plus`, `claude-code`, `anthropic`, `openai`, `discord`, `slack`, `mcp`. Worklink and GitHub tools are in the base package |
+| mimir + Cultivate | `pip install "mimir-agent[<extras>]" "mimir-cultivate==<matching-mimir-version>"` | Extras: `codex-plus`, `claude-code`, `anthropic`, `openai`, `discord`, `slack`, `mcp`. Worklink and GitHub coding tools require the separately installed, selected Cultivate provider. Core remains MIT; Cultivate is BSL. |
 | chainlink | The issue tracker the queue reads | Built into the Docker image by `mimir scaffold-docker`; set `CHAINLINK_BIN` to use your own build |
 | Chat bridge (optional) | Discord or Slack | How you talk to the agent and get its alerts |
 
@@ -138,24 +138,46 @@ No API token is stored anywhere. The environment's approval is the release gate.
 
 The agent needs a home directory, a checkout of your repo, two config files, the bot's GitHub token, and two pollers. One poller dispatches armed issues to builds; the other turns review comments into fixes. The mimir repo's `docs/code-building-pipeline.md` and `docs/configuration.md` are the reference for every key below.
 
-Every `docker compose` command in this section runs **from the agent home** (`cd ~/agents/my-agent`), which is the Compose project directory: its `.env` drives Compose interpolation, and `compose.env` is the container's runtime environment.
+Every `docker compose` command in this section runs **from the agent home**
+(`cd ~/agents/my-agent`), the Compose project directory. In the **operator's
+host shell**, export the provider selection before setup, scaffolding and every
+Compose operation (including rebuilds and restarts):
+
+```bash
+export MIMIR_PLUGINS=cultivate
+export MIMIR_ENABLE_OPENCODE=1
+```
+
+Run the commands below in that same shell. For automation, set these exports in
+the operator-controlled supervisor environment, outside the mounted agent home;
+explicitly export `MIMIR_PLUGINS=` for a core-only deployment. Never source the
+agent home's `.env` or `compose.env` for provider selection. The generated
+Compose file interpolates `MIMIR_PLUGINS` from the host process environment into
+the container environment; an exported value takes precedence over Compose's
+project `.env`. An unset value, unlike an explicitly empty export, could instead
+be taken from that agent-writable `.env`. `MIMIR_ENABLE_OPENCODE` controls image
+build/bootstrap, **not** runtime provider authorization. Keep it in the operator
+shell too. `compose.env` holds ordinary container settings, not plugin selection.
 
 **1. Install mimir and create a home.**
 
 ```bash
-pip install "mimir-agent[codex-plus,discord]"      # pick your model and chat extras
+pip install "mimir-agent[codex-plus,discord]" "mimir-cultivate==<matching-mimir-version>"
 mimir setup --home ~/agents/my-agent                # add --model / --subscription to choose a model
 # The container sees this home at /mimir-home, but setup wrote saga's database paths as
 # absolute host paths; point them at the container path or the agent can't open its memory.
 sed -i.bak -E 's#^(db_path|metrics_db_path) = ".*/\.mimir/#\1 = "/mimir-home/.mimir/#' ~/agents/my-agent/saga.toml
 ```
 
-**2. Install the two skills that run the loop.** Do this before scaffolding: `scaffold-docker` reads installed skills for their Dockerfile fragments and the environment keys they need.
-
-```bash
-mimir skills install chainlink-orchestrator --home ~/agents/my-agent   # poller: worklink-ready-queue, every 10 min
-mimir skills install github-poller --home ~/agents/my-agent            # poller: github-activity, every 15 min
-```
+**2. Seed the Cultivate skills that run the loop.** With the matching package
+installed and `MIMIR_PLUGINS=cultivate` exported by the operator, `mimir setup`
+seeds the provider's packaged defaults into
+`<home>/skills/cultivate-chainlink-orchestrator/` and
+`<home>/skills/cultivate-github-poller/`. Selected-provider startup also seeds
+missing defaults. Do not use `mimir skills install` for these names: that command
+searches core optional skills, not Cultivate's packaged defaults. Check the
+seeded skills and their `pollers.json` before starting the agent. Existing home
+files are not overwritten; later versions use defaults-upgrade proposals.
 
 - **`worklink-ready-queue`** reads `chainlink issue ready`, claims issues labelled `worklink:ready`, and starts `mimir worklink run <id> --autonomous` for each. It needs `WORKLINK_REPO` set; see the skill's `pollers.json`.
 - **`github-activity`** turns reviews, CI failures and merge conflicts on the bot's own PRs into agent turns. A `CHANGES_REQUESTED` review produces a fix and a push, then a re-requested review.
@@ -175,14 +197,24 @@ FRAG
 
 The directory has no `SKILL.md`, so the agent never loads it as a skill; only the scaffold reads it. If your tests use another runner, install that instead, and use it in `test_command` below.
 
-**4. Generate the Docker files.** Re-run this whenever you install or remove a skill or fragment; it rewrites `Dockerfile` and `compose.yml` and merges new keys into `compose.env` without touching your values.
+**4. Generate the Docker files.** Use the operator shell exports above and the
+matching provider installed. Re-run this whenever you install or remove a
+skill, plugin or fragment; it rewrites
+`Dockerfile` and `compose.yml` and merges new keys into `compose.env` without
+touching your values.
 
 ```bash
 mimir scaffold-docker --home ~/agents/my-agent --service-name my-agent --mode pypi \
   --extras "codex-plus,discord,mcp"
 ```
 
-The image runs mimir under `tini` as the non-root user `mimir` (UID/GID `1000` unless you pass `USER_UID`/`USER_GID` build args) and includes the chainlink CLI. The compose file binds the web port to 127.0.0.1 and sets `MIMIR_WEB_HOST=0.0.0.0` inside the container. Set `MIMIR_API_KEY` if you expose the port any further.
+With Cultivate selected at scaffold time, the image runs s6 `/init` as root,
+supervising the agent as `mimir` (fixed UID/GID `1001:1001`) and the separate
+Worklink executor (UID `1002`). The trusted Cultivate fragment fixes these
+identities; do not override them with `USER_UID`/`USER_GID` build args. The
+image includes the chainlink CLI. The compose file binds the web port to
+127.0.0.1 and sets `MIMIR_WEB_HOST=0.0.0.0` inside the container. Set
+`MIMIR_API_KEY` if you expose the port any further.
 
 > **Known issue (mimir 0.8.5 to 0.9.6):** the generated `compose.yml` fails to parse (`yaml: line 28, column 29: mapping values are not allowed in this context`). A `\n` in a usage comment is emitted as a real newline. Until the fix ships, rejoin that comment line after each scaffold run:
 >
@@ -246,9 +278,14 @@ Leave `backends.opencode.bash_allowlist` unset: mimir derives it from your `test
 - a trailing ` *` admits the command with any arguments, e.g. `["git *", "uv run pytest *"]`;
 - keep `"git *"` (or the narrower git commands you intend) or the builder loses git.
 
-**8. Put each setting where it's read.** Docker splits configuration across two files in the agent home, and the split matters:
+**8. Put each setting where it's read.** The operator shell owns plugin
+selection; the agent home's Compose files hold other settings:
 
-- **`compose.env` is the container's runtime environment.** `start.sh` reads it before mimir starts: it sets the git identity from `GH_USER_NAME`/`GH_USER_EMAIL` and logs `gh` in with `GITHUB_TOKEN`. Process environment also overrides `<home>/.env`, so runtime settings belong here. Never print or commit it.
+- **`compose.env` is the container's runtime environment.** It supplies
+  ordinary settings, not provider selection. `start.sh` reads it before mimir
+  starts: it sets the git identity from
+  `GH_USER_NAME`/`GH_USER_EMAIL` and logs `gh` in with `GITHUB_TOKEN`.
+  Keep `MIMIR_PLUGINS` out of this agent-writable file. Never print or commit it.
 
   ```bash
   GITHUB_TOKEN=<bot classic PAT, repo scope>    # the one credential worklink and the pollers use
@@ -258,12 +295,14 @@ Leave `backends.opencode.bash_allowlist` unset: mimir derives it from your `test
   MIMIR_PR_CHECKOUT_LEASE_ROOT=/workspace/.pr-leases   # same filesystem as the repo root
   ```
 
-- **`.env` (in the agent home) holds Compose build and plugin selections.** Install the Cultivate package in the image, then select it with `MIMIR_PLUGINS`; selection without the installed package fails startup. `MIMIR_ENABLE_OPENCODE` is only a build argument for the pinned OpenCode runtime, not a runtime coding switch. Compose reads `.env` for interpolation, not `compose.env`. Leave `MIMIR_PLUGINS` unset to run core without importing Cultivate.
-
-  ```bash
-  MIMIR_ENABLE_OPENCODE=1
-  MIMIR_PLUGINS=cultivate
-  ```
+- **Build versus runtime.** The operator-exported `MIMIR_ENABLE_OPENCODE=1`
+  installs the pinned OpenCode runtime at image build time; rebuilding is
+  required after changing it. The operator-exported `MIMIR_PLUGINS=cultivate`
+  selects the separately installed plugin at runtime and at scaffold generation.
+  Do not put either selection in the agent home's `.env`; Compose otherwise
+  reads that writable file for interpolation when a host export is missing.
+  `MIMIR_PLUGINS` in `compose.env` is also not a safe substitute: the generated
+  Compose `environment:` value is interpolated separately and takes precedence.
 
 `GITHUB_TOKEN` must be a real, valid token before first boot: `start.sh` runs `gh auth login --with-token` under `set -e`, so an invalid token stops the container. Don't set `GH_TOKEN` to a different value; two tokens that disagree stop dispatch. Check the token with `mimir verify-cred GITHUB_TOKEN`.
 
@@ -271,17 +310,25 @@ Leave `backends.opencode.bash_allowlist` unset: mimir derives it from your `test
 
 ```bash
 cd ~/agents/my-agent
-docker compose build                       # Linux: add --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g)
+docker compose build                       # Cultivate fixes mimir UID/GID at 1001:1001
 docker compose run --rm --no-deps --entrypoint sh my-agent -c '
-  id                                       # the runtime user: mimir, uid/gid 1000 unless you overrode them
-  test -d /workspace/.pr-leases -a ! -L /workspace/.pr-leases -a -w /workspace/.pr-leases && echo lease-root-ok
-  uv --version && cd /workspace/<repo> && uv run pytest -q
-  env | cut -d= -f1 | grep -E "^(GITHUB_TOKEN|MIMIR_GITHUB_SELF_LOGIN|GH_USER_NAME|GH_USER_EMAIL|MIMIR_PR_CHECKOUT_LEASE_ROOT|MIMIR_PLUGINS)$"'
+  su -s /bin/sh mimir -c "
+    id                                     # mimir, uid/gid 1001 with Cultivate selected
+    test -d /workspace/.pr-leases -a ! -L /workspace/.pr-leases -a -w /workspace/.pr-leases && echo lease-root-ok
+    uv --version && cd /workspace/<repo> && uv run pytest -q
+    env | cut -d= -f1 | grep -E \"^(GITHUB_TOKEN|MIMIR_GITHUB_SELF_LOGIN|GH_USER_NAME|GH_USER_EMAIL|MIMIR_PR_CHECKOUT_LEASE_ROOT|MIMIR_PLUGINS)$\""'
 ```
 
 If `lease-root-ok` doesn't print, fix ownership on the host and re-run the check:
-- **Linux:** bind mounts keep host UIDs. Either build with your own UID/GID (the build args above), so the runtime user is you, or `sudo chown -R 1000:1000 ~/agents/my-agent-work` to match the default image user.
-- **macOS (Docker Desktop or OrbStack):** bind-mounted files appear owned by the container user, so a directory you created is writable as is. Don't pass `USER_GID=$(id -g)` on macOS: your GID (20, `staff`) collides with a system group in the image and the build fails.
+- **Linux:** bind mounts keep host UIDs. Set ownership on the dedicated lease
+  directory to match the fixed Cultivate runtime identity, for example
+  `sudo chown 1001:1001 ~/agents/my-agent-work/.pr-leases`. Ensure the checkout
+  is readable/traversable by UID 1001 as well; do not recursively chown the
+  entire source checkout or override the image's fixed identities.
+- **macOS (Docker Desktop or OrbStack):** bind-mounted files typically appear
+  writable to the container user. Check with the one-off container above; if
+  the lease root is not writable, adjust the host share's permissions. Do not
+  pass `USER_GID=$(id -g)` to a Cultivate image.
 
 **10. Let only you talk to it.** `<home>/state/identities.yaml` maps people to chat accounts and roles, and unknown authors are refused at intake. Add yourself with the `admin` role using `mimir identities add` (run `mimir identities --help` for the flags). Leave `MIMIR_OPEN_BRIDGE` off.
 
@@ -413,7 +460,8 @@ A valid leaf needs:
 - `- Scope:`, `- Out of scope:` and `- Suggested test command:` under Worklink notes;
 - at least one `- [ ]` checklist line starting in column 0.
 
-Validate it locally with `missing_leaf_template_parts` from `mimir/worklink/planning.py`; it must return `[]`.
+Validate it locally with `missing_leaf_template_parts` from
+`mimir_cultivate.worklink.planning`; it must return `[]`.
 
 **2. File and arm it.** Run these where the agent's chainlink tracker lives: in `<home>`, or through `docker exec -u <user> -w <home> <container>`.
 
@@ -505,7 +553,7 @@ Each rule below exists because breaking it once cost a bad merge, a false diagno
 
 **Specs**
 
-11. **Write criteria a build can meet from its checkout alone.** The builder can't open or read the PR, see reviews, or update the tracker; the controller does those around it. Anything that needs a live service, a PR or the tracker goes in the review criteria as a reviewer-only live check, in those words. This is a spec rule, not a containment boundary: the shipping `local_subprocess` compute backend is **not** network-isolated and shares the host filesystem (`network_isolated=False`, `shared_filesystem=True` in `mimir/worklink/compute.py`). Enabling autonomous runs accepts that risk.
+11. **Write criteria a build can meet from its checkout alone.** The builder can't open or read the PR, see reviews, or update the tracker; the controller does those around it. Anything that needs a live service, a PR or the tracker goes in the review criteria as a reviewer-only live check, in those words. This is a spec rule, not a containment boundary: the shipping `local_subprocess` compute backend is **not** network-isolated and shares the host filesystem (`network_isolated=False`, `shared_filesystem=True` in `mimir_cultivate/worklink/compute.py`). Enabling autonomous runs accepts that risk.
 12. **Criteria must hold against main, not a sibling branch.** Declare ordering with `chainlink issue block <leaf> <blocker>`.
 13. **Ground every spec in the current code.** Cite `file:line` on today's main. Before writing that a mechanism is missing, verify that it really is.
 14. **Test sentinels must not look like secrets.** The publication scanner refuses `sk-…`, JWT or long base64 shapes even in tests. Use plain strings like `fake-oauth-sentinel-not-a-token`.
