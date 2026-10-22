@@ -80,7 +80,10 @@ def discover_plugins(*, enable: str | None = None) -> tuple[PluginCandidate, ...
     candidates.sort(key=lambda item: (item.name, item.distribution, item.entry_point.value))
     missing = names - counts.keys()
     if missing:
-        raise PluginDiscoveryError(f"MIMIR_PLUGINS: missing plugin(s): {', '.join(sorted(missing))}")
+        hint = ("; cultivate is the in-repo plugins/cultivate workspace member: install it with "
+                "`uv sync --all-packages` from the source checkout, or rebuild the image with "
+                "`--build-arg MIMIR_PLUGIN_SELECTION=cultivate`" if "cultivate" in missing else "")
+        raise PluginDiscoveryError(f"MIMIR_PLUGINS: missing plugin(s): {', '.join(sorted(missing))}{hint}")
     return tuple(candidates)
 
 

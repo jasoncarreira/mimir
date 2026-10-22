@@ -479,6 +479,15 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/start.sh"]
 """
 
 
+def _index_pins(plugins: tuple) -> tuple[str, ...]:
+    """Pins installed from a package index: every selected plugin but Cultivate.
+
+    Cultivate is not published; it is built from ``plugins/cultivate`` at the
+    same commit as core (see ``controller.sh``/``executor.sh`` and start.sh).
+    """
+    return pinned_packages(tuple(p for p in plugins if not has_trusted_cultivate((p,))))
+
+
 def render_dockerfile(
     fragments: list[Fragment],
     *,
@@ -557,29 +566,40 @@ def render_dockerfile(
                             _S6_SCAFFOLD_BLOCK.replace('__PLUGIN_SERVICES__', '') + '\n'
                             'COPY .mimir-scaffold/s6-rc.d/ /etc/s6-overlay/s6-rc.d/\n'
                             'RUN sh /opt/cultivate-docker/service.sh\nENTRYPOINT ["/init"]')
-        cultivate_pin = next(pin for pin in pinned_packages(plugins)
-                             if pin.startswith("mimir-cultivate=="))
+        # Cultivate is never installed from an index. executor.sh overlays core
+        # and plugins/cultivate from the verified MIMIR_EXECUTOR_COMMIT into the
+        # root worker venv. In pypi mode controller.sh installs core and the
+        # plugin from the same commit into the user-owned venv; in workspace mode
+        # start.sh syncs the boot clone with ``--all-packages`` instead.
         executor = (
             "USER root\nARG MIMIR_GIT_REF\nARG MIMIR_CONTROLLER_COMMIT\n"
             "ARG MIMIR_EXECUTOR_COMMIT\nARG MIMIR_GIT_URL=https://github.com/jasoncarreira/mimir.git\n"
-            "ARG MIMIR_EXTRAS=anthropic,discord,slack,mcp\n"
-            "RUN test \"$MIMIR_EXECUTOR_COMMIT\" = \"$MIMIR_CONTROLLER_COMMIT\" "
+            # pypi mode already declared MIMIR_EXTRAS with the scaffold's extras;
+            # a second default here would silently replace them.
+            + ("" if mode == "pypi" else "ARG MIMIR_EXTRAS=anthropic,discord,slack,mcp\n")
+            + "RUN test \"$MIMIR_EXECUTOR_COMMIT\" = \"$MIMIR_CONTROLLER_COMMIT\" "
             "&& git check-ref-format \"$MIMIR_GIT_REF\"\n"
             "RUN MIMIR_GIT_REF=\"$MIMIR_GIT_REF\" MIMIR_EXECUTOR_COMMIT=\"$MIMIR_EXECUTOR_COMMIT\" "
             "MIMIR_GIT_URL=\"$MIMIR_GIT_URL\" MIMIR_EXTRAS=\"$MIMIR_EXTRAS\" "
             "sh /opt/cultivate-docker/executor.sh\n"
-            f'RUN /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "{cultivate_pin}"\n'
-            "USER mimir\n"
         )
         if mode == "pypi":
+            executor += (
+                "USER mimir\n"
+                "RUN MIMIR_GIT_REF=\"$MIMIR_GIT_REF\" MIMIR_CONTROLLER_COMMIT=\"$MIMIR_CONTROLLER_COMMIT\" "
+                "MIMIR_GIT_URL=\"$MIMIR_GIT_URL\" MIMIR_EXTRAS=\"$MIMIR_EXTRAS\" "
+                "sh /opt/cultivate-docker/controller.sh\n"
+            )
             base = base.replace("# Pre-warm the fastembed", executor + "\n# Pre-warm the fastembed")
         else:
+            # The workspace template is still root here; the following
+            # ``COPY start.sh`` + ``chmod`` must keep running as root.
             base = base.replace("EXPOSE 8080", executor + "\nEXPOSE 8080")
     if plugins:
         base = base.replace("# ===== BEGIN mimir-scaffold-docker: skill fragments =====",
                             render_stage(plugins, "base") + "\n\n# ===== BEGIN mimir-scaffold-docker: skill fragments =====")
         base = base.replace("# Non-root user.", render_stage(plugins, "build") + "\n\n# Non-root user.")
-        pins = pinned_packages(plugins)
+        pins = _index_pins(plugins)
         service_list = services(plugins)
         if mode == "pypi" and pins:
             install = "RUN pip install --no-cache-dir " + " ".join(f'"{pin}"' for pin in pins)
@@ -959,6 +979,7 @@ def render_start_sh(
     mode: ScaffoldMode = _DEFAULT_MODE,
     plugin_pins: tuple[str, ...] = (),
     plugin_services: bool = False,
+    cultivate: bool = False,
 ) -> str:
     """Render start.sh.
 
@@ -981,23 +1002,35 @@ def render_start_sh(
     substring inside ``${NEW_VAR}`` and leaves a stray ``$`` that
     crashes the container at boot. See the regression test
     ``test_render_start_sh_uv_sync_line_is_valid_shell_with_no_extras``.
+
+    ``plugin_pins`` are index-installed distributions only. ``cultivate``
+    selects the in-repo ``plugins/cultivate`` workspace member: workspace mode
+    syncs it from the boot clone with ``uv sync --all-packages`` (a plain
+    ``uv sync`` would remove it), so it is always the clone's own commit.
     """
     if mode == "pypi":
-        return _START_SH_TEMPLATE_PYPI + ("\n# Selected services are supervised separately by s6: " + ", ".join(plugin_pins) + "\n" if plugin_pins else "")
+        selected = (("mimir-cultivate (built from plugins/cultivate at MIMIR_CONTROLLER_COMMIT)",)
+                    if cultivate else ()) + tuple(plugin_pins)
+        return _START_SH_TEMPLATE_PYPI + ("\n# Selected services are supervised separately by s6: " + ", ".join(selected) + "\n" if selected else "")
     if mode != "workspace":
         raise ValueError(f"unknown scaffold mode {mode!r}; expected one of {_MODES}")
     extras = uv_extras or []
-    flags = " ".join(f"--extra {e}" for e in extras)
-    boot = "# Selected plugin distributions: " + ", ".join(plugin_pins) + "\n"
+    flags = " ".join([f"--extra {e}" for e in extras] + (["--all-packages"] if cultivate else []))
+    selected = (("mimir-cultivate (workspace member)",) if cultivate else ()) + tuple(plugin_pins)
+    boot = "# Selected plugin distributions: " + ", ".join(selected) + "\n"
+    if cultivate:
+        boot += ("uv run --no-sync python -c 'import importlib.metadata as m; m.version(\"mimir-cultivate\")' "
+                 "|| { echo \"[start.sh] ERROR: uv sync --all-packages did not install mimir-cultivate; "
+                 "does ${REPO_DIR} contain plugins/cultivate?\" >&2; exit 1; }\n")
     if plugin_pins:
         boot += "uv pip install --python .venv/bin/python " + " ".join(f'"{pin}"' for pin in plugin_pins) + "\n"
         boot += "uv run --no-sync python -c 'import importlib.metadata as m; " + "; ".join(
             f'assert m.version("{pin.split("==")[0]}") == "{pin.split("==")[1]}"' for pin in plugin_pins
         ) + "'\n"
-        if plugin_services:
-            boot += "touch /run/mimir-plugin-services/ready\n"
+    if plugin_services and selected:
+        boot += "touch /run/mimir-plugin-services/ready\n"
     script = _START_SH_TEMPLATE.replace("{UV_EXTRAS}", flags)
-    if plugin_pins:
+    if selected:
         script = script.replace("uv run ", "uv run --no-sync ")
         script = script.replace("# ─── home seed (idempotent", boot + "\n# ─── home seed (idempotent")
     return script
@@ -1494,8 +1527,9 @@ def scaffold(
     # unchanged.
     ss_path = home / "start.sh"
     ss_text = render_start_sh(uv_extras=uv_extras, mode=mode,
-                              plugin_pins=pinned_packages(plugins),
-                              plugin_services=bool(selected_services))
+                              plugin_pins=_index_pins(plugins),
+                              plugin_services=bool(selected_services),
+                              cultivate=trusted_cultivate)
     _write_if_changed(ss_path, ss_text, "start.sh")
     if ss_path.is_file():
         ss_path.chmod(0o755)

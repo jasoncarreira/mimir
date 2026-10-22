@@ -335,6 +335,9 @@ def main() -> None:
             "--build-arg", f"MIMIR_GIT_REF={git_ref}",
             "--build-arg", f"MIMIR_CONTROLLER_COMMIT={source_commit}",
             "--build-arg", f"MIMIR_EXECUTOR_COMMIT={source_commit}",
+            # The worker exists only in a Cultivate image; select the in-repo
+            # plugin so this proof exercises it from the same commit.
+            "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate",
             "--tag", IMAGE, ".",
         ], timeout=1200)
         run([
@@ -352,8 +355,22 @@ def main() -> None:
             test "$(stat -c %U:%G /opt/mimir-worklink/uv-cache)" = root:root
             test "$(stat -c %a /opt/mimir-worklink/uv-cache)" = 755
             test "$(cat /opt/mimir-worklink/executor-source-commit)" = "SOURCE_COMMIT"
+            test "$(cat /home/mimir/venv/controller-source-commit)" = "SOURCE_COMMIT"
             test "$(stat -c %a:%u:%g /var/lib/mimir-worklink/homes)" = 710:0:1002
         """.replace("SOURCE_COMMIT", source_commit))
+        # Both venvs must run Cultivate built from the pinned source tree, never an
+        # index wheel, and the worker's core must be the overlay, not a pin's.
+        docker_exec("/bin/sh", "-ceu", r"""
+            for python in /opt/mimir-worklink/venv/bin/python /home/mimir/venv/bin/python; do
+                "$python" - <<'PY'
+import importlib.metadata as metadata, json, sys
+for name in ("mimir-agent", "mimir-cultivate"):
+    origin = json.loads(metadata.distribution(name).read_text("direct_url.json") or "{}")
+    if not origin.get("url", "").startswith("file://"):
+        raise SystemExit(f"{sys.executable}: {name} is not installed from the pinned source: {origin}")
+PY
+            done
+        """)
         # Read the live uids from /proc INSIDE the container.
         #
         # ``docker top`` is unusable for this. It runs ps on the HOST, so its

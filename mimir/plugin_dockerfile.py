@@ -14,7 +14,7 @@ from .plugins.discovery import PluginCandidate, PluginDiscoveryError, discover_p
 
 
 _CULTIVATE_PACKAGE = "mimir-cultivate"
-_CULTIVATE_SCRIPTS = ("base.sh", "users.sh", "executor.sh", "bootstrap.sh", "service.sh")
+_CULTIVATE_SCRIPTS = ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh", "service.sh")
 
 
 def has_trusted_cultivate(candidates: tuple[PluginCandidate, ...]) -> bool:

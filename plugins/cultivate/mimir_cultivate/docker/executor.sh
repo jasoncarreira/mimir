@@ -16,8 +16,11 @@ python3 -m venv /opt/mimir-worklink/venv
 /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 /opt/mimir-worklink/venv/bin/pip install --no-cache-dir 'pypdf>=6.16'
 /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source
+# Cultivate comes from the same verified tree as the core overlay, never an index:
+# --no-deps keeps its exact mimir-agent pin from replacing the overlaid core.
+/opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source/plugins/cultivate
 /opt/mimir-worklink/venv/bin/pip install --no-cache-dir uv
-ln -s /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv
+ln -sf /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv
 UV_CACHE_DIR=/opt/mimir-worklink/uv-cache uv sync --directory /opt/mimir-worklink/source \
     --locked --extra dev --extra bench --no-install-workspace
 rm -rf /opt/mimir-worklink/source/.venv

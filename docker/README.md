@@ -18,6 +18,14 @@ docker build \
   -t mimir:latest .
 ```
 
+Add `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` (and usually
+`--build-arg MIMIR_ENABLE_OPENCODE=1`) for a coding image. Cultivate is not
+published to an index; the build installs core and the in-repo
+`plugins/cultivate` member from the pinned commit into both venvs. Then run the
+container with `MIMIR_PLUGINS=cultivate` in its environment. Without the build
+argument the image is core-only and has no Worklink executor. See
+[upgrading a coding deployment](../docs/plugins.md#upgrading-a-coding-deployment).
+
 The root-owned Worklink executor is installed into the image under
 `/opt/mimir-worklink`; it is not updated by a bind-mounted controller checkout.
 Its source is cloned from `MIMIR_GIT_URL` (the upstream repository by default)

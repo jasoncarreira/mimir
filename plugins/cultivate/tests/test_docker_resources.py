@@ -17,7 +17,7 @@ from mimir.scaffold_docker import render_dockerfile, scaffold
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS = ROOT / "plugins/cultivate/mimir_cultivate/docker"
-SCRIPT_NAMES = ("base.sh", "users.sh", "executor.sh", "bootstrap.sh", "service.sh")
+SCRIPT_NAMES = ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh", "service.sh")
 
 
 def _candidate(*, name: str = "cultivate", distribution: str = "mimir-cultivate",
@@ -36,8 +36,9 @@ def test_selected_cultivate_uses_only_inventoried_first_party_scripts() -> None:
     candidate = _candidate()
     assert has_trusted_cultivate((candidate,))
     scripts = cultivate_scripts(candidate)
-    assert set(scripts) == {"base.sh", "users.sh", "executor.sh", "bootstrap.sh", "service.sh"}
+    assert set(scripts) == set(SCRIPT_NAMES)
     assert 'origin "$MIMIR_EXECUTOR_COMMIT"' in scripts["executor.sh"]
+    assert 'origin "$MIMIR_CONTROLLER_COMMIT"' in scripts["controller.sh"]
     assert 'mimir_cultivate.worklink.worker_exec' in scripts["service.sh"]
     assert not services((candidate,)), "the reserved worker service is not a generic manifest service"
 
@@ -79,7 +80,17 @@ def test_selected_scaffold_composes_fixed_worker_and_supervisor(mode: str) -> No
     assert 'RUN groupadd --gid "${USER_GID}" mimir' not in text
     assert 'ARG MIMIR_EXECUTOR_COMMIT' in text
     assert 'MIMIR_EXTRAS="$MIMIR_EXTRAS" sh /opt/cultivate-docker/executor.sh' in text
-    assert 'mimir-cultivate==0.9.10' in text
+    # Cultivate is never installed from an index in either venv.
+    assert 'mimir-cultivate==' not in text
+    # pypi mode builds core + plugin for the controller venv from the pinned
+    # commit; workspace mode's controller is the boot clone (start.sh).
+    assert ('sh /opt/cultivate-docker/controller.sh' in text) is (mode == "pypi")
+    if mode == "pypi":
+        assert text.count("ARG MIMIR_EXTRAS") == 1, "a second default would replace the scaffold's extras"
+    else:
+        # The workspace template stays root for the following COPY + chmod.
+        executor = text.index("sh /opt/cultivate-docker/executor.sh")
+        assert "USER mimir" not in text[executor:text.index("RUN chmod +x /usr/local/bin/start.sh")]
     assert "COPY .mimir-scaffold/s6-rc.d/ /etc/s6-overlay/s6-rc.d/" in text
     assert 'ENTRYPOINT ["/init"]' in text
     assert 'ARG MIMIR_CODING_ENABLED' not in text
@@ -102,6 +113,14 @@ def test_selected_scaffold_writes_worker_resources(tmp_path: Path, monkeypatch, 
     start = (tmp_path / "start.sh").read_text()
     assert 'os.environ.get("MIMIR_PLUGINS", "")' in start
     assert "MIMIR_CODING_ENABLED" not in start
+    assert "mimir-cultivate==" not in start
+    if mode == "workspace":
+        # Every sync keeps the workspace member; a plain sync would remove it.
+        assert 'UV_EXTRAS=" --all-packages"' in start or 'UV_EXTRAS="--all-packages"' in start
+        assert "uv sync $UV_EXTRAS\n" in start and "uv sync $UV_EXTRAS $SKILL_EXTRAS" in start
+        assert "uv pip install" not in start
+        assert start.index("uv sync $UV_EXTRAS\n") < start.index('m.version("mimir-cultivate")') < start.index(
+            "exec uv run --no-sync mimir run")
 
 
 @pytest.mark.parametrize("mode", ["root", "pypi"])
@@ -110,9 +129,8 @@ def test_build_bootstrap_selects_provider_only_for_invocation(tmp_path: Path, mo
                   else render_dockerfile([], mode="pypi", plugins=(_candidate(),)))
     assert "ENV MIMIR_PLUGINS=cultivate" not in dockerfile
     assert 'MIMIR_PLUGINS=cultivate MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE"' in dockerfile
-    if mode == "pypi":
-        assert dockerfile.index('pip install --no-cache-dir "mimir-cultivate==0.9.10"') < dockerfile.index(
-            'MIMIR_PLUGINS=cultivate MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE"')
+    assert dockerfile.index("sh /opt/cultivate-docker/controller.sh") < dockerfile.index(
+        'MIMIR_PLUGINS=cultivate MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE"')
     stub = tmp_path / "mimir"
     stub.write_text('#!/bin/sh\nprintf "%s:%s\\n" "$MIMIR_PLUGINS" "$*" >> "$BOOT_LOG"\n')
     stub.chmod(0o755)
@@ -137,6 +155,8 @@ def test_actual_selected_cli_bootstraps_and_missing_provider_fails(tmp_path: Pat
                              cwd=ROOT, env=env, capture_output=True, text=True)
     assert missing.returncode != 0
     assert "MIMIR_PLUGINS: missing plugin(s): cultivate" in missing.stderr
+    assert "`uv sync --all-packages`" in missing.stderr
+    assert "--build-arg MIMIR_PLUGIN_SELECTION=cultivate" in missing.stderr
 
 
 @pytest.mark.parametrize("mode", ["root", "workspace", "pypi"])

@@ -16,7 +16,7 @@ def _image_instructions() -> str:
     scripts = ROOT / "plugins/cultivate/mimir_cultivate/docker"
     return DOCKERFILE.read_text(encoding="utf-8") + "\n" + "\n".join(
         (scripts / name).read_text(encoding="utf-8") for name in
-        ("base.sh", "users.sh", "executor.sh", "bootstrap.sh", "service.sh")
+        ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh", "service.sh")
     )
 
 
@@ -86,6 +86,13 @@ def test_root_executor_is_immutable_and_installed_outside_user_homes() -> None:
     assert "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir" in text
     assert "pypdf" in text
     assert "pip install --no-cache-dir --no-deps /opt/mimir-worklink/source" in text
+    # The worker runs Cultivate from the same verified tree, never an index wheel
+    # whose exact mimir-agent pin could replace the overlaid core.
+    plugin_overlay = "pip install --no-cache-dir --no-deps /opt/mimir-worklink/source/plugins/cultivate"
+    assert plugin_overlay in text
+    assert text.index("pip install --no-cache-dir --no-deps /opt/mimir-worklink/source\n") < text.index(plugin_overlay)
+    assert "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir \"$package\"" not in text
+    assert '"mimir-cultivate==' not in text
     assert "UV_CACHE_DIR=/opt/mimir-worklink/uv-cache uv sync" in text
     assert "--locked --extra dev --extra bench --no-install-workspace" in text
     assert "rm -rf /opt/mimir-worklink/source/.venv" in text

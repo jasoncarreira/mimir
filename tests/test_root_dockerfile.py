@@ -29,7 +29,7 @@ def _text() -> str:
     root = DOCKERFILE.read_text(encoding="utf-8")
     fragments = ROOT / "plugins/cultivate/mimir_cultivate/docker"
     return root + "\n" + "\n".join((fragments / name).read_text(encoding="utf-8") for name in (
-        "base.sh", "users.sh", "executor.sh", "bootstrap.sh", "service.sh"
+        "base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh", "service.sh"
     ))
 
 
@@ -45,6 +45,10 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
     invocations = [root.index(f"sh /opt/cultivate-docker/{name}") for name in names]
     assert invocations == sorted(invocations)
     assert root.index("USER root\nARG MIMIR_GIT_URL") < invocations[2] < root.index("USER mimir", invocations[2])
+    # controller.sh is new since the extraction: it runs as mimir, after the
+    # root worker build and before the bootstrap that needs the plugin installed.
+    controller = root.index("sh /opt/cultivate-docker/controller.sh")
+    assert root.index("USER mimir", invocations[2]) < controller < invocations[3]
     assert root.index("COPY deploy/s6-overlay/s6-rc.d/") < invocations[4] < root.index('ENTRYPOINT ["/init"]')
     assert f"ARG FACTORY_VERSION={FACTORY_VERSION}" in root
     assert "ARG FACTORY_VERSION=0.10.16" in fixture  # The only version drift in the snapshot.
@@ -91,7 +95,7 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
          "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir pypdf>=6.16",
          "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source",
          "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir uv",
-         "ln -s /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv",
+         "ln -s",
          "UV_CACHE_DIR=/opt/mimir-worklink/uv-cache uv sync --directory /opt/mimir-worklink/source",
          "--locked --extra dev --extra bench --no-install-workspace",
          "rm -rf /opt/mimir-worklink/source/.venv", "rm -rf /opt/mimir-worklink/source",
@@ -137,6 +141,15 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
     for name, original in zip(names, baseline, strict=True):
         expected_steps = steps(original)
         actual_steps = steps((source / name).read_text())
+        if name == "executor.sh":
+            # Intentional post-extraction changes, each pinned exactly:
+            # 1. Cultivate is overlaid from the same verified tree as core, with
+            #    --no-deps so its exact mimir-agent pin cannot replace the overlay.
+            overlay = "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source"
+            expected_steps.insert(expected_steps.index(overlay) + 1, overlay + "/plugins/cultivate")
+            # 2. The uv link replaces a uv the scaffold image already installed.
+            link = "ln -s /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv"
+            expected_steps[expected_steps.index(link)] = link.replace("ln -s", "ln -sf")
         if name == "service.sh":
             # The original single chmod is intentionally split so scaffold's
             # absent watchdog is optional. Both present services remain required.
@@ -152,43 +165,121 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
         assert actual_steps == expected_steps, name
 
 
-@pytest.mark.parametrize("selection,packages,all_installed,keeps_service,success", [
-    ("", "", "0", False, True),
-    ("", "mimir-cultivate==0.9.10", "0", False, True),
-    ("cultivate", "mimir-cultivate==0.9.10", "0", True, True),
-    ("", "mimir-cultivate==0.9.10", "1", True, True),
-    ("cultivate", "", "0", True, False),
+def _run_instructions(text: str) -> list[str]:
+    """Each ``RUN`` instruction's shell program, continuation lines kept."""
+    programs, current = [], None
+    for line in text.splitlines():
+        if current is not None:
+            current.append(line)
+            if not line.rstrip().endswith("\\"):
+                programs.append("\n".join(current))
+                current = None
+        elif line.startswith("RUN "):
+            current = [line[4:]]
+            if not line.rstrip().endswith("\\"):
+                programs.append(current[0])
+                current = None
+    return programs
+
+
+@pytest.mark.parametrize("selection,packages,selected,success", [
+    ("", "", "0", True),
+    ("other", "example-provider==1.0", "0", True),
+    ("cultivate", "", "1", True),
+    (" cultivate , other", "", "1", True),
+    ("all", "", "1", True),
+    ("cultivate", "mimir-cultivate==0.9.10", None, False),
+    ("", "Mimir_Cultivate==0.9.10", None, False),
 ])
-def test_root_service_selection_executes_verified_build_branch(
-    tmp_path, selection, packages, all_installed, keeps_service, success,
+def test_root_cultivate_selection_executes_verified_build_branches(
+    tmp_path, selection, packages, selected, success,
 ) -> None:
     root = DOCKERFILE.read_text()
-    selected = root.split('COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/\n', 1)[1]
-    program = selected.split('\n# Use the assembler', 1)[0]
-    assert program.startswith("RUN set -eu;")
+    marker_dir = tmp_path / "cultivate-docker"
+    marker_dir.mkdir()
     s6 = tmp_path / "s6-rc.d"
     (s6 / "worklink-execd").mkdir(parents=True)
-    marker = s6 / "user/contents.d/worklink-execd"
-    marker.parent.mkdir(parents=True)
-    marker.touch()
-    pip = tmp_path / "pip"
-    pip.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$PIP_LOG"\n')
-    pip.chmod(0o755)
-    output = tmp_path / "pip.log"
-    program = program.replace("RUN ", "", 1).replace(
-        "/opt/mimir-worklink/venv/bin/pip", str(pip)).replace(
-        "/etc/s6-overlay/s6-rc.d", str(s6))
-    result = subprocess.run(["sh", "-c", program], capture_output=True, text=True, env={
-        **os.environ, "MIMIR_PLUGIN_SELECTION": selection, "MIMIR_PLUGIN_PACKAGES": packages,
-        "MIMIR_PLUGIN_ALL_INSTALLED": all_installed, "PIP_LOG": str(output),
-    })
+    bundle = s6 / "user/contents.d/worklink-execd"
+    bundle.parent.mkdir(parents=True)
+    bundle.touch()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "commands.log"
+    for command in ("sh", "groupadd", "useradd", "chmod"):
+        (bin_dir / command).write_text(f'#!/bin/sh\nprintf "{command} %s\\n" "$*" >> "$COMMAND_LOG"\n')
+        (bin_dir / command).chmod(0o755)
+    env = {**os.environ, "MIMIR_PLUGIN_SELECTION": selection, "MIMIR_PLUGIN_PACKAGES": packages,
+           "COMMAND_LOG": str(log)}
+
+    def run(program: str, *, stubbed: bool) -> subprocess.CompletedProcess[str]:
+        program = program.replace("/opt/cultivate-docker", str(marker_dir)).replace(
+            "/etc/s6-overlay/s6-rc.d", str(s6))
+        path = f"{bin_dir}:{os.environ['PATH']}" if stubbed else os.environ["PATH"]
+        return subprocess.run(["/bin/sh", "-c", program], capture_output=True, text=True,
+                              env={**env, "PATH": path})
+
+    programs = _run_instructions(root)
+    selector, = (p for p in programs if "/opt/cultivate-docker/selected" in p and "printf" in p)
+    result = run(selector, stubbed=False)
     assert (result.returncode == 0) is success, result.stderr
-    if success:
-        assert (s6 / "worklink-execd").exists() is keeps_service
-        assert marker.exists() is keeps_service
-        assert output.exists() is keeps_service
+    if not success:
+        assert "remove it from MIMIR_PLUGIN_PACKAGES and set MIMIR_PLUGIN_SELECTION=cultivate" in result.stderr
+        return
+    assert (marker_dir / "selected").read_text() == selected + "\n"
+
+    gated = [p for p in programs if "cat /opt/cultivate-docker/selected" in p]
+    # users, executor, controller, bootstrap, worker-service removal, assembler pin.
+    assert len(gated) == 6
+    for program in gated:
+        if "plugin_dockerfile import main" in program:
+            continue
+        assert run(program, stubbed=True).returncode == 0
+    calls = log.read_text().splitlines() if log.exists() else []
+    scripts = [line.split()[1].rsplit("/", 1)[1] for line in calls if line.startswith("sh ")]
+    if selected == "1":
+        assert scripts == ["users.sh", "executor.sh", "controller.sh", "bootstrap.sh"]
+        assert not any(line.startswith(("groupadd", "useradd")) for line in calls)
     else:
-        assert "Cultivate requires a pinned mimir-cultivate package" in result.stderr
+        assert scripts == []
+        assert "groupadd --gid 1001 mimir" in calls
+        assert "useradd --create-home --uid 1001 --gid mimir --shell /bin/bash mimir" in calls
+        assert not any("worklink" in line for line in calls)
+    assert (s6 / "worklink-execd").exists() is (selected == "1")
+    assert bundle.exists() is (selected == "1")
+
+
+def test_root_assembler_pins_selected_cultivate_to_the_built_version(tmp_path) -> None:
+    program, = (p for p in _run_instructions(DOCKERFILE.read_text())
+                if "plugin_dockerfile import main" in p)
+    marker_dir = tmp_path / "cultivate-docker"
+    marker_dir.mkdir()
+    python = tmp_path / "python"
+    python.write_text('#!/bin/sh\nif [ "$1" = -c ] && [ "${3:-}" = "" ] && printf %s "$2" | grep -q metadata; '
+                      'then echo 9.8.7; else shift 2; printf "%s\\n" "$@" > "$ARGS_LOG"; fi\n')
+    python.chmod(0o755)
+    for selected, packages, expected in (("1", "", "mimir-cultivate==9.8.7"),
+                                         ("1", "third==1.0", "third==1.0,mimir-cultivate==9.8.7"),
+                                         ("0", "third==1.0", "third==1.0")):
+        (marker_dir / "selected").write_text(selected + "\n")
+        log = tmp_path / f"args-{selected}-{packages}"
+        local = program.replace("/opt/cultivate-docker", str(marker_dir)).replace(
+            "/home/mimir/venv/bin/python", str(python)).replace("&& rm -rf /opt/mimir-image-assembly", "")
+        subprocess.run(["/bin/sh", "-c", local], check=True, env={
+            **os.environ, "MIMIR_PLUGIN_PACKAGES": packages, "MIMIR_PLUGIN_SELECTION": "",
+            "MIMIR_PLUGIN_ALL_INSTALLED": "0", "ARGS_LOG": str(log)})
+        args = log.read_text().splitlines()
+        assert args[args.index("--packages") + 1] == expected
+
+
+def test_root_image_never_installs_cultivate_from_an_index() -> None:
+    text = _text()
+    assert '"mimir-cultivate==' not in text
+    assert "pip install --no-cache-dir --no-deps /opt/mimir-worklink/source/plugins/cultivate" in text
+    controller = (ROOT / "plugins/cultivate/mimir_cultivate/docker/controller.sh").read_text()
+    assert 'origin "$MIMIR_CONTROLLER_COMMIT"' in controller
+    assert 'test "$(git -C "$source" rev-parse HEAD)" = "$MIMIR_CONTROLLER_COMMIT"' in controller
+    assert 'pip install --no-cache-dir "$core" "$source/plugins/cultivate"' in controller
+    assert "npm run build" in controller
 
 
 def test_apt_install_layer_includes_jq() -> None:
