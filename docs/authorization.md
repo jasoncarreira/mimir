@@ -985,7 +985,9 @@ code and cannot be relaxed by configuration.
 wins, just as for argv admission; grants are not merged. Missing variables are
 omitted, leaving credential errors to the executable. Omitting `pass_env` retains
 the existing environment behavior, including `gh`'s `GITHUB_TOKEN`, isolated
-`GH_CONFIG_DIR`, and identity confirmation.
+`GH_CONFIG_DIR`, and identity confirmation. These are core behavior, with or
+without a selected plugin: the token is bound to `MIMIR_GITHUB_SELF_LOGIN` on
+the first call and every later call is refused if the token changes.
 
 Process-control names are reserved: `PATH`, `MIMIR_MODEL_SPEC`, `BASH_ENV`, `ENV`,
 and names beginning with `LD_`, `DYLD_`, `PYTHON`, `GIT_`, or `GH_` cannot be

@@ -433,8 +433,11 @@ couple that *look* idempotent but aren't:
 - **`gh pr create` is *not* idempotent.** It happily makes a second
   PR against the same branch. Always check for an existing PR on that head
   first with `pr_list(repository="owner/repo", state="all", head="<branch>")`.
-  PR tools exist only when Cultivate is selected; core has no authenticated
-  `gh`, so without Cultivate ask the operator instead.
+  PR tools exist only when Cultivate is selected. Without it, core `gh` is
+  authenticated (the operator's `GITHUB_TOKEN`, identity-checked against
+  `MIMIR_GITHUB_SELF_LOGIN`) for the read-only PR and issue views and lists
+  your shell profile admits; use one of those to look for a PR on that head,
+  or ask the operator if your profile admits none.
 
 ## Failure modes
 
