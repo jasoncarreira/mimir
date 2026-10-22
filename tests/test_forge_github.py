@@ -6,6 +6,8 @@ from importlib.metadata import PackageNotFoundError, version
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+
+from mimir import github_identity as core_identity
 from langchain_core.tools import ToolException
 import requests
 
@@ -220,7 +222,7 @@ def test_list_run_jobs_caps_more_than_100_jobs_without_fetching_third_page():
 def reset_verified_identity(monkeypatch) -> None:
     from mimir_cultivate import forge as forge_tools
 
-    monkeypatch.setattr(github_module, "_verified_identity", None)
+    monkeypatch.setattr(core_identity, "_verified_identity", None)
     monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
     monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
     monkeypatch.setattr(forge_tools, "_github_identity_degraded_callback", None)

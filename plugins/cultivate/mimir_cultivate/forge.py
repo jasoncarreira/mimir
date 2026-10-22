@@ -206,6 +206,9 @@ from urllib.parse import quote, urlencode
 
 import requests
 
+from mimir import github_identity as _core_identity
+from mimir.github_identity import GitHubIdentityFailureKind
+from mimir.github_identity import credential_fingerprint as _credential_fingerprint
 from mimir.models import NormalizedPullRequestSnapshot
 from .policy import RepoPRActionScope
 
@@ -220,10 +223,9 @@ _MAX_ITEMS = 500
 _MAX_PAGES = 10
 _MAX_BODY_BYTES = 65_536
 # Identity bindings intentionally expire only with the process. Effects never
-# refresh this cache, so a changed or missing credential fails closed.
+# refresh this cache, so a changed or missing credential fails closed. The
+# cache is core's (mimir.github_identity), shared with core's credentialed gh.
 GITHUB_IDENTITY_CACHE_TTL_SECONDS: None = None
-_identity_lock = threading.Lock()
-_verified_identity: tuple[str, str] | None = None
 
 
 def _diff_path(section: bytes) -> str:
@@ -318,66 +320,33 @@ def bound_diff(diff: str) -> str:
     return bounded.decode("utf-8")
 
 
-class GitHubIdentityFailureKind(StrEnum):
-    """Typed provenance for deciding whether identity verification may retry."""
-
-    TRANSIENT = "transient"
-    PERMANENT = "permanent"
-
-
 class _GitHubRequestError(ForgeError):
     def __init__(self, message: str, *, retryable: bool) -> None:
         super().__init__(message)
         self.retryable = retryable
 
 
-class GitHubIdentityVerificationError(ForgeError):
-    """A safe, pre-effect failure to bind credentials to a declared login."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        declared_login: str = "",
-        authenticated_login: str = "",
-        failure_kind: GitHubIdentityFailureKind = GitHubIdentityFailureKind.PERMANENT,
-    ) -> None:
-        super().__init__(message)
-        self.declared_login = declared_login
-        self.authenticated_login = authenticated_login
-        self.failure_kind = failure_kind
+class GitHubIdentityVerificationError(ForgeError, _core_identity.GitHubIdentityVerificationError):
+    """Core's identity failure, also a ``ForgeError`` for provider callers."""
 
 
-def _credential_fingerprint(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+def _as_forge_identity_error(
+    exc: _core_identity.GitHubIdentityVerificationError,
+) -> GitHubIdentityVerificationError:
+    if isinstance(exc, GitHubIdentityVerificationError):
+        return exc
+    return GitHubIdentityVerificationError(
+        str(exc), declared_login=exc.declared_login,
+        authenticated_login=exc.authenticated_login, failure_kind=exc.failure_kind,
+    )
 
 
 def confirm_github_identity(principal: str, token: str | None = None) -> str:
-    """Confirm *principal* against the process-cached authenticated identity."""
-    expected = principal.strip()
-    credential = token if token is not None else os.environ.get("GITHUB_TOKEN", "")
-    fingerprint = _credential_fingerprint(credential.strip())
-    with _identity_lock:
-        verified = _verified_identity
-    if verified is None:
-        raise GitHubIdentityVerificationError(
-            "github identity verification cache is empty",
-            declared_login=expected,
-        )
-    login, verified_fingerprint = verified
-    if fingerprint != verified_fingerprint:
-        raise GitHubIdentityVerificationError(
-            "github identity verification cache does not match active credential",
-            declared_login=expected,
-            authenticated_login=login,
-        )
-    if login.casefold() != expected.casefold():
-        raise GitHubIdentityVerificationError(
-            f"github acting identity mismatch: authenticated as {login}, scope principal is {principal}",
-            declared_login=expected,
-            authenticated_login=login,
-        )
-    return login
+    """Confirm *principal* against core's process-cached authenticated identity."""
+    try:
+        return _core_identity.confirm_github_identity(principal, token)
+    except _core_identity.GitHubIdentityVerificationError as exc:
+        raise _as_forge_identity_error(exc) from exc
 
 
 class GitHubForgeClient:
@@ -408,26 +377,8 @@ class GitHubForgeClient:
     def verify_identity(self, declared_login: str) -> str:
         """Resolve and process-cache the token owner, refusing any mismatch."""
         expected = declared_login.strip()
-        if not expected:
-            raise GitHubIdentityVerificationError("github declared identity is empty")
-        fingerprint = _credential_fingerprint(self._token.strip())
-        global _verified_identity
-        with _identity_lock:
-            if _verified_identity is not None:
-                login, cached_fingerprint = _verified_identity
-                if cached_fingerprint != fingerprint:
-                    raise GitHubIdentityVerificationError(
-                        "github identity verification cache does not match active credential",
-                        declared_login=expected,
-                        authenticated_login=login,
-                    )
-                if login.casefold() != expected.casefold():
-                    raise GitHubIdentityVerificationError(
-                        f"github identity mismatch: authenticated as {login}, declared as {expected}",
-                        declared_login=expected,
-                        authenticated_login=login,
-                    )
-                return login
+
+        def fetch_login() -> str:
             try:
                 data = self._request("GET", "/user")
             except _GitHubRequestError as exc:
@@ -440,20 +391,12 @@ class GitHubForgeClient:
                         else GitHubIdentityFailureKind.PERMANENT
                     ),
                 ) from exc
-            login = str(data.get("login", "")).strip() if isinstance(data, Mapping) else ""
-            if _REVIEWER.fullmatch(login) is None:
-                raise GitHubIdentityVerificationError(
-                    "github identity verification returned an invalid login",
-                    declared_login=expected,
-                )
-            if login.casefold() != expected.casefold():
-                raise GitHubIdentityVerificationError(
-                    f"github identity mismatch: authenticated as {login}, declared as {expected}",
-                    declared_login=expected,
-                    authenticated_login=login,
-                )
-            _verified_identity = (login, fingerprint)
-            return login
+            return str(data.get("login", "")) if isinstance(data, Mapping) else ""
+
+        try:
+            return _core_identity.verify_github_identity(expected, self._token, fetch_login)
+        except _core_identity.GitHubIdentityVerificationError as exc:
+            raise _as_forge_identity_error(exc) from exc
 
     def _confirm_effect_identity(self, scope: RepoPRActionScope) -> None:
         confirm_github_identity(scope.principal, self._token)

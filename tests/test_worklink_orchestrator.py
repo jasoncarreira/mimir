@@ -5313,8 +5313,10 @@ def test_inherited_credential_clears_a_prebound_identity_memo(
     )
     assert child == {"GH_TOKEN": "process-token", "GITHUB_TOKEN": "process-token"}
 
+    from mimir import github_identity as core_identity
+
     monkeypatch.setattr(
-        github_module,
+        core_identity,
         "_verified_identity",
         ("factory-owner", github_module._credential_fingerprint("process-token")),
     )

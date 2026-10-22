@@ -129,25 +129,28 @@ assert 'mimir.contained_checkout' not in sys.modules
     assert result.returncode == 0, result.stderr
 
 
-def test_core_shell_does_not_import_provider_or_grant_forge_credentials() -> None:
+def test_core_shell_does_not_import_provider_and_grants_only_the_process_token() -> None:
     script = """
 import os, subprocess, sys
 from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
+from mimir import github_identity
 assert 'mimir_cultivate' not in sys.modules
+github_identity._verified_identity = ('reviewer', github_identity.credential_fingerprint('secret'))
 for argv in (['/usr/bin/gh', 'api', 'user'], ['/usr/bin/git', 'status']):
     env = direct_exec_env(argv)
-    assert 'GITHUB_TOKEN' not in env
+    overlay = direct_exec_env_overlay(argv)
     if argv[0].endswith('/gh'):
-        # Core's floor: an empty isolated config, never ambient on-disk auth.
+        # Core's floor: the process token only, and an empty isolated config,
+        # never ambient on-disk auth.
+        assert env['GITHUB_TOKEN'] == 'secret'
         assert env['GH_CONFIG_DIR'] == _shell_env._GH_CONFIG_DIR
         assert not os.listdir(env['GH_CONFIG_DIR'])
     else:
+        assert 'GITHUB_TOKEN' not in env and overlay['GITHUB_TOKEN'] is None
         assert 'GH_CONFIG_DIR' not in env
         assert env['GIT_CONFIG_NOSYSTEM'] == '1'
     assert 'GIT_ASKPASS' not in env
-    overlay = direct_exec_env_overlay(argv)
-    assert overlay['GITHUB_TOKEN'] is None
     assert overlay['GH_TOKEN'] is None
 assert subprocess.run(['/bin/echo', 'generic-ok'], capture_output=True,
                       env=direct_exec_env(['/bin/echo', 'generic-ok']),
@@ -155,6 +158,7 @@ assert subprocess.run(['/bin/echo', 'generic-ok'], capture_output=True,
 assert 'mimir_cultivate' not in sys.modules
 """
     env = {**os.environ, "MIMIR_PLUGINS": "", "GITHUB_TOKEN": "secret",
+           "MIMIR_GITHUB_SELF_LOGIN": "reviewer",
            "GH_TOKEN": "other-secret", "GIT_ASKPASS": "/tmp/untrusted-helper",
            "GH_CONFIG_DIR": "/tmp/ambient-gh-config"}
     result = subprocess.run(
