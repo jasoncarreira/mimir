@@ -114,11 +114,13 @@ def test_selected_provider_tool_inventory_has_no_duplicate_names(monkeypatch):
     from mimir_cultivate import forge
 
     selected = load_plugins(enable="cultivate").policy
+    expected = {name for name, tool in selected.tools.items() if tool.owner == "cultivate"}
+    assert expected
     monkeypatch.setattr(forge, "_github_identity_degraded", False)
     tools = all_mimir_tools("openai:test", policy=selected, require_provider_available=False)
     names = [tool.name for tool in tools]
     assert len(names) == len(set(names))
-    assert {"worklink_run", "worklink_resume", "repo_status"} <= set(names)
+    assert expected <= set(names)
 
     monkeypatch.setattr(forge, "_github_identity_degraded", True)
     degraded_names = {
@@ -126,7 +128,7 @@ def test_selected_provider_tool_inventory_has_no_duplicate_names(monkeypatch):
             "openai:test", policy=selected, require_provider_available=False,
         )
     }
-    assert not degraded_names & CODING_TOOLS
+    assert not degraded_names & expected
 
 
 def test_selected_ci_run_and_branch_grants_cannot_substitute_for_each_other(monkeypatch):
