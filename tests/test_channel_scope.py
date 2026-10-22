@@ -148,7 +148,8 @@ def test_home_dotenv_interpolation_prefers_process_environment(monkeypatch, tmp_
 
 
 def test_scope_env_keys_are_isolated_from_host():
-    source = Path(__file__).with_name("conftest.py").read_text()
+    here = Path(__file__)
+    source = here.with_name("conftest.py").read_text() + here.with_name("isolation_fixtures.py").read_text()
     for key in {
         "MIMIR_CHANNEL_SCOPE_FILE",
         *(f"MIMIR_{platform}_{key}" for platform in ("DISCORD", "SLACK")

@@ -48,6 +48,8 @@ ALLOWLIST = {
     "CODEX_HOME",         # Codex CLI's own config dir; read to locate auth.
     "CLAUDE_CONFIG_DIR",  # Claude Code CLI's own config dir.
     "CHAINLINK_BIN",      # Path override for the external chainlink CLI binary.
+    "GH_CONFIG_DIR",      # gh CLI's own config dir; read only to refuse an
+                          # ambient one as the forced isolation dir.
     "MIMIR_SPAWN_DEPTH",  # Harness-set on child processes to track spawn depth;
                           # read to enforce the recursion cap, not operator-set.
 }

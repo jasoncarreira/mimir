@@ -1356,6 +1356,9 @@ async def test_update_reply_after_requesting_turn_ends_never_invokes_model(
     reply_style: str, request_count: int, request: pytest.FixtureRequest,
 ):
     """Named/sole bare replies resolve; ambiguous bare replies list IDs pre-turn."""
+    # The selected-mode venv installs Cultivate from source, which refuses
+    # PyPI self-updates; this test exercises the approval flow itself.
+    monkeypatch.setattr("mimir.update_on_start.cultivate_source_install", lambda: None)
     from mimir import __version__, approval_requests, mid_turn_injection
     from mimir.tools import registry as tool_registry
     from mimir.update_on_start import flag_path

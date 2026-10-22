@@ -574,7 +574,7 @@ async def test_parallel_loaders_preserve_serial_prompt_and_provenance_order(
     monkeypatch.setattr(agent, "_assemble_self_state_block", lambda *_args, **_kwargs: blocks["self_state"])
     monkeypatch.setattr(
         "mimir.skill_resolver.find_skill_for_channel",
-        lambda *_args: ("ordered-skill", "SKILL"),
+        lambda *_args, **_kwargs: ("ordered-skill", "SKILL"),
     )
 
     prompt, recent = await agent._build_turn_prompt(
@@ -773,7 +773,7 @@ async def test_auto_loaded_skill_learning_contributes_atom_provenance(
     agent._saga_store = _Store()
     monkeypatch.setattr(
         "mimir.skill_resolver.find_skill_for_channel",
-        lambda channel_id, skills_dirs: ("feed-watch", "CLEAN SKILL BODY"),
+        lambda channel_id, skills_dirs, **_kwargs: ("feed-watch", "CLEAN SKILL BODY"),
     )
     event = AgentEvent(
         trigger="poller",
@@ -902,7 +902,7 @@ async def test_self_authored_framework_prompt_sources_remain_sink_compatible(
     await agent._buffer.append(recent_message)
     monkeypatch.setattr(
         "mimir.skill_resolver.find_skill_for_channel",
-        lambda channel_id, skills_dirs: ("framework-skill", "SKILL SENTINEL"),
+        lambda channel_id, skills_dirs, **_kwargs: ("framework-skill", "SKILL SENTINEL"),
     )
     event = AgentEvent(
         trigger="user_message", channel_id="ch-current", content="now",

@@ -432,9 +432,9 @@ couple that *look* idempotent but aren't:
   message itself if the same content might be generated twice.
 - **`gh pr create` is *not* idempotent.** It happily makes a second
   PR against the same branch. Always check for an existing PR on that head
-  first: with Cultivate selected, call
-  `pr_list(repository="owner/repo", state="all", head="<branch>")`; without it,
-  `gh pr list --head "<branch>" --state all` where your shell profile admits it.
+  first with `pr_list(repository="owner/repo", state="all", head="<branch>")`.
+  PR tools exist only when Cultivate is selected; core has no authenticated
+  `gh`, so without Cultivate ask the operator instead.
 
 ## Failure modes
 
