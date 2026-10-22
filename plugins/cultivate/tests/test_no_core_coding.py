@@ -92,6 +92,7 @@ def test_retired_coding_import_aliases_are_detected(
 
 
 def test_opencode_proposal_git_environment_is_provider_owned() -> None:
+    pytest.importorskip("mimir_cultivate")
     script = """
 import sys
 from mimir_cultivate.opencode import _sanitized_git_env
