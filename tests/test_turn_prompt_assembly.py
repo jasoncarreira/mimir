@@ -2230,6 +2230,8 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "prompt_sources.prompt_source_label"): 1,
         ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "prompt_sources.prompt_source_label"): 1,
         ("producer", "mimir/poller_recovery.py", "_event_from_stash", "SourceLabel.from_record"): 1,
+        # Conversation-history read-back restores content-bound offload inputs.
+        ("producer", "mimir/_deepagents_summarization.py", "read_offload_labels", "SourceLabel.from_record"): 1,
         ("producer", "mimir/poller_recovery.py", "_restore_event", "SourceLabel"): 1,
         ("producer", "mimir/pollers.py", "run_poller", "SourceLabel"): 1,
         ("producer", "mimir/prompt_sources.py", "prompt_source_label", "SourceLabel"): 1,

@@ -11288,6 +11288,8 @@ def protected_result_source(
             retained_checkout=retained_checkout,
         )
         integrity, integrity_effect = anchor.integrity
+        # Offload provenance may add original source ACLs at the backend, but
+        # never raises a conversation_history path above its HOME anchor.
         if anchor is FilesystemReadTrust.AUTHOR_ATTESTATION:
             principal = requester
             domain = "repository"

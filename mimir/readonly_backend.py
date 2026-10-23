@@ -1745,6 +1745,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
             publish_protected_result,
         )
         from .read_policy import framework_large_tool_results_root
+        from ._deepagents_summarization import read_offload_labels
 
         turn = get_current_turn()
         auth_context = getattr(turn, "auth_context", None)
@@ -1764,16 +1765,19 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
             ):
                 continue
             resolved_paths.append(str(resolved))
-        publish_protected_result(tuple(
-            protected_result_source(
+        sources = []
+        for resolved in resolved_paths:
+            sources.append(protected_result_source(
                 auth_context,
                 principal="filesystem",
                 domain="filesystem",
                 resource_id=resolved,
                 bridge_instance="filesystem",
-            )
-            for resolved in resolved_paths
-        ))
+            ))
+            # Exact, content-bound offload inputs accompany the filesystem
+            # label. A missing record leaves the ordinary untrusted path label.
+            sources.extend(read_offload_labels(resolved) or ())
+        publish_protected_result(tuple(sources))
 
     def ls(self, path: str) -> LsResult:
         if self._is_outside_root(path):
