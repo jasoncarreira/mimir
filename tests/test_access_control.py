@@ -68,6 +68,44 @@ if importlib.util.find_spec("mimir_cultivate") is not None:
 from mimir.tool_descriptors import TOOL_DESCRIPTORS
 
 
+def test_core_has_no_ci_tool_classification_branches() -> None:
+    from mimir.plugins.core import core_policy_registry
+
+    ci_tools = {"ci_run_jobs", "ci_run", "ci_recent_runs"}
+    assert ci_tools.isdisjoint(core_policy_registry().tools)
+    tree = ast.parse(Path(access_control.__file__).read_text())
+    for function_name in ("authorize_tool", "classify_protected_result"):
+        functions = [node for node in ast.walk(tree)
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                     and node.name == function_name]
+        assert len(functions) == 1
+        # The poller grant derivation and plugin resource-scope dispatch still
+        # refer to CI; neither is a name-based core CI-tool classifier.
+        assert not any(
+            isinstance(node, ast.Compare)
+            and isinstance(node.left, ast.Name) and node.left.id == "tool_name"
+            and any(isinstance(value, ast.Constant) and value.value in ci_tools
+                    for comparator in node.comparators
+                    for value in ast.walk(comparator))
+            for node in ast.walk(functions[0])
+        )
+
+
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_selected_ci_tools_use_plugin_scopes_not_retained_core_tools() -> None:
+    from mimir.plugins.core import selected_policy_registry
+
+    tools = selected_policy_registry().tools
+    assert {name: (tools[name].owner, tools[name].resource_scope)
+            for name in ("ci_run", "ci_run_jobs", "ci_recent_runs")} == {
+                "ci_run": ("cultivate", "ci_run"),
+                "ci_run_jobs": ("cultivate", "ci_run"),
+                "ci_recent_runs": ("cultivate", "ci_branch"),
+            }
+    assert all("retained_repo_tools" not in tools[name].memberships
+               for name in ("ci_run", "ci_run_jobs", "ci_recent_runs"))
+
+
 @pytest.mark.parametrize("revision", ["HEAD~4..HEAD", "origin/feature/plugins...HEAD"])
 def test_repo_review_git_range_refusal_names_token(revision: str) -> None:
     from mimir.access_control import _service_shell_not_admitted_reason
