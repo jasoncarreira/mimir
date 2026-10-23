@@ -1026,8 +1026,8 @@ def _pr_attestation(
     if metadata.number != scope.pr_number:
         return ("",), scope.observed_head_sha
     if metadata.head_sha != scope.observed_head_sha:
-        # Runtime-less callers (notably checkout) retain observed-head-only
-        # trust; accepting a new head requires per-turn lineage recording.
+        # Runtime-less callers retain observed-head-only trust; accepting a
+        # new head requires a verified own push and per-turn recording.
         if runtime is None:
             return ("<head-mismatch>",), scope.observed_head_sha
         from ..repo_tools import was_verified_push

@@ -399,7 +399,7 @@ def repo_checkout(
     if callable(getattr(client, "author_is_trusted", None)) or (
         isinstance(scope.pull_request_author, str) and _BOT_LOGIN.fullmatch(scope.pull_request_author)
     ):
-        authors, _ = _call(lambda: _pr_content_authors(client, scope))
+        authors, _ = _call(lambda: _pr_content_authors(client, scope, runtime))
         if authors == (scope.pull_request_author,) and scope.pull_request_author:
             verdict = _author_verdict(context, scope, scope.pull_request_author, client)
             context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
