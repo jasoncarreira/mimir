@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
-FACTORY_VERSION = "0.10.18"
+FACTORY_VERSION = "0.12.1"
 OPENCODE_VERSION = "1.18.21"
 from mimir.scaffold_docker import (
     DEFAULT_BASE_IMAGE,
@@ -643,7 +643,7 @@ def test_render_dockerfile_is_structurally_parseable(mode, install_opencode):
 
 def test_render_dockerfile_installs_opencode_when_selected():
     """The selected provider supplies the OpenCode install in both modes."""
-    assert FACTORY_VERSION == "0.10.18"
+    assert FACTORY_VERSION == "0.12.1"
     plugins = _cultivate_or_refusal()
     for mode in ("workspace", "pypi"):
         out = render_dockerfile([], mode=mode, install_opencode=True, plugins=plugins)

@@ -18,7 +18,7 @@ from ..compute import ComputeResult, WorkSpec
 from .base import Caps, CheckoutShape, RawResult, WorkOrder
 
 
-FACTORY_VERSION = "0.10.18"
+FACTORY_VERSION = "0.12.1"
 DEFAULT_FACTORY_ENTRYPOINT = "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
 FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("init", ("init",)),
