@@ -943,7 +943,13 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
                         capability, socket_path=socket_path,
                     )
                     provider_execution.WorkerClient = contained_execution.WorkerClient
-                    event, labels, auth = asyncio.run(_trusted_turn(case))
+                    # The turn's authority is derived under the selected provider
+                    # policy, as the runtime does and as the remediation_case
+                    # fixture does for the other tests. Without it the core policy
+                    # has no retained-scope hook ("provider unavailable").
+                    selected = load_plugins(enable="cultivate").policy
+                    with policy_scope(selected):
+                        event, labels, auth = asyncio.run(_trusted_turn(case))
                     scope = auth.retained_factory_scope
                     assert scope is not None, auth.retained_factory_scope_refusal
                     turn = TurnContext(
@@ -959,7 +965,7 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
                         default=WriteGuardBackend(home, ["state"], guard_outside_root=True),
                         routes=build_file_tool_routes([(str(retained_root), "retained")]),
                     )
-                    with policy_scope(load_plugins(enable="cultivate").policy):
+                    with policy_scope(selected):
                         token = set_current_turn(turn)
                         try:
                             written = backend.write(str(sandbox / "new.txt"), "new\n")
