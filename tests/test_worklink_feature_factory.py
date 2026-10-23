@@ -114,6 +114,86 @@ def structured_status_payload() -> dict[str, Any]:
     )
 
 
+# Validator rows exactly as `factory status --json` prints them on 0.12.1, captured
+# from the published CLI against run.json validator records it accepted as valid.
+# 0.12.1 adds `override` to every non-null validator, null unless an operator ran
+# `factory override-validator` on a NO-GO.
+_HEAD_0121 = "7e23159fbf0b672e575144586918b4930d7d0210"
+_VALIDATOR_0121 = {
+    "go": {
+        "verdict": "GO", "report": "reviews/implementation-validator.json",
+        "reviewed_head": _HEAD_0121, "loops": 0, "override": None,
+    },
+    "nogo": {
+        "verdict": "NO-GO", "report": "reviews/implementation-validator.json",
+        "reviewed_head": _HEAD_0121, "loops": 0, "override": None,
+    },
+    "override": {
+        "verdict": "NO-GO", "report": "reviews/implementation-validator.json",
+        "reviewed_head": _HEAD_0121, "loops": 0,
+        "override": {
+            "reviewed_head": _HEAD_0121,
+            "reason": "AC4 finding judged non-blocking by operator",
+            "session": "operator-20261023",
+            "at": "2026-10-23T14:00:00.000Z",
+        },
+    },
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_VALIDATOR_0121))
+def test_status_accepts_0121_validator_override_shapes(shape: str) -> None:
+    payload = status_payload(validator=_VALIDATOR_0121[shape])
+
+    status = parse_factory_status(json.dumps(payload).encode())
+
+    assert status.validator == _VALIDATOR_0121[shape]
+    assert status.to_json()["validator"] == _VALIDATOR_0121[shape]
+    assert parse_factory_status(status.to_json()) == status
+
+
+def test_status_keeps_pre_0121_validator_rows_without_override() -> None:
+    row = structured_status_payload()["validator"]
+    assert "override" not in row
+
+    status = parse_factory_status(status_payload(validator=row))
+
+    assert status.validator == row
+    assert "override" not in status.to_json()["validator"]
+
+
+def _override_row(**changes: Any) -> dict[str, Any]:
+    row = json.loads(json.dumps(_VALIDATOR_0121["override"]))
+    for key, value in changes.items():
+        if key.startswith("override_"):
+            member = key.removeprefix("override_")
+            if value is _DROP:
+                del row["override"][member]
+            else:
+                row["override"][member] = value
+        else:
+            row[key] = value
+    return row
+
+
+_DROP = object()
+
+
+@pytest.mark.parametrize("row, message", [
+    (_override_row(verdict="GO"), "requires a NO-GO"),
+    (_override_row(verdict="GO-WITH-NITS"), "requires a NO-GO"),
+    (_override_row(override_reviewed_head="0" * 40), "must name the verdict's reviewed_head"),
+    (_override_row(override_reason=_DROP), "must be an object with"),
+    (_override_row(override_extra="x"), "must be an object with"),
+    (_override_row(override_reason="   "), "nonblank"),
+    (_override_row(override_session=7), "nonblank"),
+    (_override_row(override="operator said so"), "must be an object with"),
+])
+def test_status_rejects_malformed_validator_override(row: dict[str, Any], message: str) -> None:
+    with pytest.raises(FactoryContractError, match=message):
+        parse_factory_status(status_payload(validator=row))
+
+
 @pytest.mark.parametrize("wire", ["mapping", "text", "bytes"])
 def test_status_089_live_failure_regression(wire: str) -> None:
     payload = structured_status_payload()
