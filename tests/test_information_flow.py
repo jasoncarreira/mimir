@@ -4508,6 +4508,108 @@ def test_operator_bounded_shell_result_remains_untrusted_informational() -> None
     assert labels.has_untrusted_active_ingest is False
 
 
+@pytest.mark.parametrize("command", [
+    "cat {path}", "head -n 2 -- {path}", "tail -n2 {path}",
+    "less {path}", "grep -e injection -- {path}",
+    "rg --no-config -n -e injection -- {path}",
+    "sed -n '1p' {path}", "awk 'NR == 1' {path}",
+    "find {parent} -name '*.md' -exec cat {{}} \\;",
+    "cat < {path}", "cat {parent}/*.md",
+    "env LANG=C sh -c 'cat {path}'", "bash -lc 'head {path}'",
+    "cat $MIMIR_HOME/conversation_history/attack.md",
+    "rg --no-config -l=injection {parent}",
+])
+def test_shell_home_reads_share_file_tool_integrity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str,
+) -> None:
+    home = tmp_path / "home"
+    target = home / "conversation_history" / "attack.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("injection", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    shell = command.format(path=target, parent=target.parent)
+    auth = _auth(roles=("admin",))
+    authorization = ToolAuthorization(
+        tool_name="shell_exec", decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True, flow_direction=ToolFlowDirection.BOTH,
+    )
+    labels = classify_protected_result(
+        "shell_exec", {"command": shell}, auth, authorization, result="injection",
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+    assert any(
+        source.domain == "filesystem" and
+        (source.integrity, source.integrity_effect) == ("untrusted", "active_ingest")
+        for source in labels.sources
+    )
+
+
+def test_shell_offloaded_untrusted_history_fences_next_clean_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deepagents.backends import FilesystemBackend
+    from deepagents.middleware.summarization import SummarizationMiddleware
+    from langchain_core.messages import HumanMessage
+    from mimir import _deepagents_summarization
+    from mimir.tools.extra import shell_exec
+    from mimir.tools.budget_gate import _authorize_tool_call
+    from types import MethodType
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    _deepagents_summarization.install_offload_traceback_logging_patch()
+    middleware = object.__new__(SummarizationMiddleware)
+    middleware._get_history_path = MethodType(
+        lambda _self, _session_id=None: "/conversation_history/attack.md", middleware,
+    )
+    middleware._history_path_prefix = "/conversation_history"
+    middleware._media_prefix = "/conversation_history/media"
+    # The prior turn ingested an outside author's message; DeepAgents persists
+    # those bytes. Its taint is turn-local and does not carry into the next turn.
+    previous = InformationFlowState(labels=_labels())
+    assert previous.has_untrusted_active_ingest(InformationFlowLabels())
+    middleware._offload_to_backend(
+        FilesystemBackend(root_dir=home, virtual_mode=True),
+        [HumanMessage(content="injection")], "previous-turn",
+    )
+    target = home / "conversation_history" / "attack.md"
+    auth = replace(
+        _auth(roles=("admin",)), ifc_labels=InformationFlowLabels(),
+        ifc_state=InformationFlowState(labels=InformationFlowLabels()),
+    )
+    authorization = ToolAuthorization(
+        tool_name="shell_exec", decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=True, flow_direction=ToolFlowDirection.BOTH,
+    )
+    args = {"command": f"cat {target}"}
+    output = shell_exec.invoke(args)
+    assert "injection" in output
+    labels = classify_protected_result("shell_exec", args, auth, authorization, result=output)
+    assert labels is not None and labels.has_untrusted_active_ingest
+    auth.ifc_state.merge(labels, fallback=auth.ifc_labels)
+    for tool in ("memory_store", "repo_stage", "edit_file"):
+        decision, _refusal = _authorize_tool_call(
+            tool, auth, arguments={"file_path": str(home / "state" / "code.py")},
+        )
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+    trusted = home / "memory" / "notes.md"
+    trusted.parent.mkdir()
+    trusted.write_text("own notes", encoding="utf-8")
+    clean_auth = replace(
+        auth, ifc_state=InformationFlowState(labels=InformationFlowLabels()),
+    )
+    trusted_args = {"command": f"cat {trusted}"}
+    trusted_output = shell_exec.invoke(trusted_args)
+    trusted_labels = classify_protected_result(
+        "shell_exec", trusted_args, clean_auth, authorization, result=trusted_output,
+    )
+    assert trusted_labels is not None and not trusted_labels.has_untrusted_active_ingest
+    assert any(source.domain == "filesystem" and source.integrity == "trusted"
+               for source in trusted_labels.sources)
+
+
 def test_operator_bounded_shell_results_merge_monotonically() -> None:
     auth = _auth(roles=("user", "admin"))
     authorization = ToolAuthorization(
@@ -6689,7 +6791,8 @@ def test_shell_gate_after_real_source_labelling(
     assert decision.allowed is (source == "collaborator_pr"), (decision.reason, decision.refusal_detail)
     if source == "collaborator_pr":
         output = classify_protected_result(
-            tool_name, {}, auth, decision, result="ordinary shell output",
+            tool_name, {"command": "git status --short" if profile == "github" else "printf gate"},
+            auth, decision, result="ordinary shell output",
         )
         if output is not None:
             assert all(item.integrity == "untrusted" for item in output.sources)

@@ -14499,6 +14499,112 @@ def test_service_shell_read_operand_parser_distinguishes_option_values(
     assert access_control._shell_read_path_operands(shlex.split(command)) == expected
 
 
+@pytest.mark.parametrize(("command", "tainted"), [
+    ("cat memory/notes.md", False),
+    ("grep -e needle -- memory/notes.md", False),
+    ("grep -f memory/notes.md -- memory/notes.md", False),
+    ("grep -in -e needle memory/notes.md", False),
+    ("rg --no-config -n -e needle -- memory/notes.md", False),
+    ("rg --no-config --files memory", False),
+    ("ls memory", False),
+    ("cat /dev/null", False),
+    ("git status --short", False),
+    ("printf hello", False),
+    ("cat conversation_history/raw.md", True),
+    ("grep -f memory/notes.md -- conversation_history/raw.md", True),
+    ("rg --no-config --files conversation_history", True),
+    ("ls conversation_history", True),
+    ("ls -R state", True),
+    ("awk -f memory/notes.md conversation_history/raw.md", True),
+    ("grep -ri needle state", True),
+    ("grep -r needle .", True),
+    ("rg --no-config --files .", True),
+    ("cat $(some_unknown_path)", True),
+    ("sed --mystery '1p' memory/notes.md", True),
+    ("env -i sh -c 'cat conversation_history/raw.md'", True),
+    ("cat < conversation_history/raw.md", True),
+    ("grep -r needle state", True),
+    ("python3 -c 'open(\"conversation_history/raw.md\").read()'", True),
+    ("env -S 'sh -c cat conversation_history/raw.md'", True),
+    ("cat 'unterminated", True),
+])
+def test_shell_read_classification_fails_closed_only_for_possible_home_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, tainted: bool,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "memory").mkdir()
+    (home / "memory" / "notes.md").write_text("own", encoding="utf-8")
+    (home / "conversation_history").mkdir()
+    (home / "conversation_history" / "raw.md").write_text("outside", encoding="utf-8")
+    poller = home / "state" / "pollers" / "github"
+    poller.mkdir(parents=True)
+    (poller / "payload.txt").write_text("outside", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    sources = access_control._shell_filesystem_read_sources(command, {}, None)
+    assert any(source.integrity == "untrusted" and source.integrity_effect == "active_ingest"
+               for source in sources) is tainted
+
+
+def test_missing_shell_command_fails_closed_in_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    assert any(source.integrity_effect == "active_ingest" for source in
+               access_control._shell_filesystem_read_sources(None, {}, None))
+
+
+@pytest.mark.parametrize("uncertainty", ["too_many_entries", "broken_symlink"])
+def test_recursive_shell_read_fails_closed_on_uninspectable_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uncertainty: str,
+) -> None:
+    home = tmp_path / "home"
+    trusted = home / "memory"
+    trusted.mkdir(parents=True)
+    if uncertainty == "too_many_entries":
+        for index in range(access_control._SHELL_RECURSIVE_READ_ENTRY_LIMIT + 1):
+            (trusted / f"entry-{index}").write_text("own", encoding="utf-8")
+    else:
+        (trusted / "missing").symlink_to(trusted / "not-there")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    sources = access_control._shell_filesystem_read_sources(
+        "rg --no-config --files memory", {}, None,
+    )
+    assert any(source.integrity_effect == "active_ingest" for source in sources)
+
+
+def test_unparsed_shell_command_with_external_cwd_stays_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    external = outside / "external.md"
+    external.write_text("outside", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    assert not access_control._shell_filesystem_read_sources(
+        "python3 -c 'print(1)'", {"cwd": str(outside)}, None,
+    )
+    assert not access_control._shell_filesystem_read_sources(
+        f"cat {external}", {}, None,
+    )
+    assert not access_control._shell_filesystem_read_sources(
+        f"printf '%s' {home / 'conversation_history' / 'raw.md'}", {}, None,
+    )
+    assert any(source.integrity_effect == "active_ingest" for source in
+               access_control._shell_filesystem_read_sources(
+                   "custom-reader ../home/conversation_history/raw.md",
+                   {"cwd": str(outside)}, None,
+               ))
+    assert any(source.integrity_effect == "active_ingest" for source in
+               access_control._shell_filesystem_read_sources(
+                   "cat $TARGET", {"cwd": str(outside)}, None,
+               ))
+
+
 def test_service_shell_operandless_ls_keeps_explicit_operand_compatibility(
     maintenance_pinned_executables: dict[str, Path],
 ) -> None:

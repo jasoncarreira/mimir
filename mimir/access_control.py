@@ -20,6 +20,7 @@ New in chainlink #866:
 
 from __future__ import annotations
 
+import glob as path_glob
 import hashlib
 import ipaddress
 import json
@@ -2827,6 +2828,278 @@ def _shell_read_path_operands(argv: list[str]) -> tuple[str, ...] | None:
     """Validate one filesystem reader and return only its path operands."""
     slots = _shell_read_operand_slots(argv)
     return slots.explicit_paths if slots is not None else None
+
+
+_SHELL_CONTENT_READERS = frozenset({
+    "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep",
+    "rg", "sed", "awk", "gawk", "find", "wc", "jq", "ls",
+})
+_SHELL_NO_CONTENT_COMMANDS = frozenset({
+    "echo", "printf", "pwd", "true", "false", "cd", "git", "gh", "chainlink",
+    "curl", "mkdir", "touch", "date", "sleep", "test", "[", "export", "exit",
+})
+_SHELL_LITERAL_OUTPUT_COMMANDS = frozenset({
+    "echo", "printf", "pwd", "true", "false", "cd", "mkdir", "touch",
+    "date", "sleep", "test", "[", "export", "exit",
+})
+_SHELL_READ_OPTION_VALUES = {
+    "head": frozenset({"-n", "-c"}),
+    "tail": frozenset({"-n", "-c"}),
+    "less": frozenset({"-p", "-t"}),
+    "grep": frozenset({"-e", "-f", "--regexp", "--file", "--include", "--exclude", "--exclude-dir"}),
+    "rg": frozenset({"-e", "-f", "-g", "-t", "-T", "--regexp", "--file", "--glob", "--type", "--type-not"}),
+    "sed": frozenset({"-e", "-f", "--expression", "--file"}),
+    "awk": frozenset({"-F", "-f", "-v", "--file"}),
+    "gawk": frozenset({"-F", "-f", "-v", "--file"}),
+}
+
+
+def _shell_filesystem_read_sources(
+    command: Any, args: Mapping[str, Any], auth_context: "AuthContext | None",
+) -> tuple["SourceLabel", ...]:
+    """Attribute shell reads to physical files, never to model-visible output text.
+
+    This is a conservative shell *read* parser, not the service-shell admission
+    parser. Unknown syntax in a reader is a possible HOME read. The interactive
+    shell expands variables, globs, redirections and nested interpreters after
+    authorization, so uncertainty must not turn an untrusted file into an
+    informational shell result.
+    """
+    from .models import SourceLabel
+
+    home_text = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_text:
+        return ()
+    home = Path(home_text).resolve(strict=False)
+    from .tools.extra import _effective_shell_cwd
+
+    raw_cwd = args.get("cwd")
+    cwd = Path(raw_cwd).expanduser() if isinstance(raw_cwd, str) and raw_cwd else _effective_shell_cwd()
+    cwd = cwd.resolve(strict=False) if cwd is not None else home
+    if not isinstance(command, str):
+        return (protected_result_source(
+            auth_context, principal="filesystem", domain="filesystem",
+            resource_id=str(home), bridge_instance="filesystem",
+        ),)
+    sources: list[SourceLabel] = []
+
+    def add_path(raw: str, *, recursive: bool = False) -> None:
+        if raw in {"-", "/dev/null"}:
+            return
+        used_home_variable = "$HOME" in raw or "${HOME}" in raw
+        expanded = raw.replace("${MIMIR_HOME}", str(home)).replace("$MIMIR_HOME", str(home))
+        expanded = expanded.replace("${HOME}", os.path.expanduser("~")).replace("$HOME", os.path.expanduser("~"))
+        expanded = os.path.expanduser(expanded)
+        # Unknown expansion, substitution, brace syntax or a glob with no
+        # resolvable matches can select any HOME file. Never trust its spelling.
+        if any(char in expanded for char in "$`{}()"):
+            candidates = [home]
+        else:
+            path = Path(expanded)
+            path = path if path.is_absolute() else cwd / path
+            if path_glob.has_magic(str(path)):
+                candidates = [Path(match) for match in path_glob.glob(str(path), recursive=True)]
+                if not candidates:
+                    candidates = [path.parent]
+            else:
+                candidates = [path]
+        for candidate in candidates:
+            resolved = candidate.resolve(strict=False)
+            if used_home_variable and not resolved.is_relative_to(home):
+                resolved = home  # The shell may have rebound HOME earlier.
+            if not resolved.is_relative_to(home):
+                continue
+            if recursive and resolved.is_dir():
+                # A trusted directory may contain an untrusted subtree or a
+                # symlink into one. Bound inspection; uncertainty taints rather
+                # than treating a trusted parent as an endorsement of children.
+                pending = [resolved]
+                visited: set[Path] = set()
+                entries = 0
+                unsafe = False
+                while pending and not unsafe:
+                    directory = pending.pop()
+                    if directory in visited:
+                        continue
+                    visited.add(directory)
+                    try:
+                        with os.scandir(directory) as listing:
+                            for entry in listing:
+                                entries += 1
+                                if entries > _SHELL_RECURSIVE_READ_ENTRY_LIMIT:
+                                    unsafe = True
+                                    break
+                                child = Path(entry.path).resolve(strict=True)
+                                if not child.is_relative_to(home):
+                                    continue
+                                if _filesystem_result_integrity(auth_context, str(child)) == (
+                                    "untrusted", "active_ingest"
+                                ):
+                                    unsafe = True
+                                    break
+                                if child.is_dir():
+                                    pending.append(child)
+                    except (OSError, RuntimeError, ValueError):
+                        unsafe = True
+                if unsafe:
+                    resolved = home
+            source = protected_result_source(
+                auth_context, principal="filesystem", domain="filesystem",
+                resource_id=str(resolved), bridge_instance="filesystem",
+            )
+            if source not in sources:
+                sources.append(source)
+
+    def scan(text: str, depth: int = 0) -> None:
+        if depth > 3:
+            add_path(str(home))
+            return
+        try:
+            lexer = shlex.shlex(text, posix=True, punctuation_chars="|&;<>()")
+            lexer.whitespace_split = True
+            tokens = list(lexer)
+        except ValueError:
+            if str(home) in text or "HOME" in text or cwd.is_relative_to(home):
+                add_path(str(home))
+            return
+        segment: list[str] = []
+
+        def consume(words: list[str]) -> None:
+            if not words:
+                return
+            if words[0] == "env":
+                remaining = words[1:]
+                while remaining and (remaining[0] in {"-i", "--ignore-environment"} or
+                                     "=" in remaining[0] and not remaining[0].startswith("-")):
+                    remaining = remaining[1:]
+                if remaining[:1] and remaining[0].startswith("-"):
+                    add_path(str(home))
+                    return
+                consume(remaining)
+                return
+            if words[0] in {"sh", "bash"} and len(words) >= 3 and words[1] in {"-c", "-lc", "-ec", "-euc"}:
+                scan(words[2], depth + 1)
+                return
+            name = Path(words[0]).name
+            if name not in _SHELL_CONTENT_READERS:
+                if name in _SHELL_LITERAL_OUTPUT_COMMANDS:
+                    return
+                # Other programs can still consume HOME data, including via a
+                # relative spelling from an external working directory.
+                for word in words[1:]:
+                    if word.startswith(("/", "./", "../", "~/", "$HOME", "${HOME}",
+                                        "$MIMIR_HOME", "${MIMIR_HOME}")):
+                        add_path(word)
+                if name not in _SHELL_NO_CONTENT_COMMANDS and cwd.is_relative_to(home):
+                    add_path(str(home))
+                return
+            values = _SHELL_READ_OPTION_VALUES.get(name, frozenset())
+            positional: list[str] = []
+            pattern_supplied = False
+            recursive = name == "find" or name == "rg" or any(
+                flag in words for flag in ("-r", "-R", "--recursive")
+            )
+            index = 1
+            ended = False
+            uncertain = False
+            while index < len(words):
+                word = words[index]
+                if word == "--" and not ended:
+                    ended = True
+                elif not ended and word in values:
+                    if index + 1 >= len(words):
+                        uncertain = True
+                    else:
+                        if word in {"-f", "--file"}:
+                            add_path(words[index + 1])
+                        if word in {"-e", "--regexp"} or (
+                            word in {"-f", "--file"} and name in {"grep", "rg", "awk", "gawk"}
+                        ):
+                            pattern_supplied = True
+                        index += 1
+                elif not ended and word.startswith("-") and word != "-":
+                    if word.startswith(("-e", "--regexp=")) and name in {"grep", "rg"}:
+                        pattern_supplied = True
+                    elif word.startswith(("-f", "--file=")) and name in {"grep", "rg", "sed", "awk", "gawk"}:
+                        add_path(word.split("=", 1)[-1] if "=" in word else word[2:])
+                        if name in {"grep", "rg", "awk", "gawk"}:
+                            pattern_supplied = True
+                    elif name in {"head", "tail"} and word.startswith(("-n", "-c", "--lines=", "--bytes=")):
+                        pass
+                    elif name in {"grep", "rg"} and word.startswith((
+                        "--include=", "--exclude=", "--exclude-dir=", "--glob=",
+                        "--type=", "--type-not=", "-g",
+                    )):
+                        pass
+                    elif name in {"awk", "gawk"} and word.startswith(("-F", "-v")):
+                        pass
+                    elif name == "find" and word in {"-exec", "-execdir"}:
+                        # The find root was already collected; executed readers
+                        # can read any matching descendant.
+                        recursive = True
+                        break
+                    elif name in {"sed", "awk"} and word in {"-n", "-E", "-r", "-i"}:
+                        pass
+                    elif name in {"sed", "awk", "gawk"}:
+                        uncertain = True
+                    elif name == "ls" and word in {"-l", "-la", "-al", "-a", "-A", "-1", "-R", "-d", "-h"}:
+                        pass
+                    elif name in {"grep", "rg"} and word in {
+                        "--no-config", "--hidden", "--files", "--no-ignore", "--line-number",
+                        "--files-with-matches", "--recursive", "--fixed-strings", "--color=never",
+                        "-n", "-l", "-i", "-v", "-F", "-H", "-h", "-s", "-u", "-r", "-R",
+                        "-q", "-E", "-w", "-x", "-L", "-S", "-N", "-U", "-I", "-o",
+                    }:
+                        if word == "--files" and name == "rg":
+                            pattern_supplied = True
+                        pass
+                    elif name in {"grep", "rg"} and len(word) > 2 and word.startswith("-") and all(
+                        flag in ("EFHhilnqrsuvwxoR" if name == "grep" else "FHhiLlnqrsuvwxoSNU")
+                        for flag in word[1:]
+                    ):
+                        recursive = recursive or "r" in word or "R" in word
+                    elif name in {"grep", "rg"} and word.startswith("-"):
+                        # Unknown option semantics can select HOME implicitly.
+                        uncertain = True
+                    elif name in {"cat", "head", "tail", "less", "more", "wc", "jq"}:
+                        uncertain = True
+                    else:
+                        uncertain = True
+                else:
+                    positional.append(word)
+                index += 1
+            if name in {"grep", "egrep", "fgrep", "rg", "awk", "gawk", "jq"} and not pattern_supplied and positional:
+                positional.pop(0)
+            if name == "sed" and positional and not any(flag in words for flag in ("-e", "-f", "--expression", "--file")):
+                positional.pop(0)
+            if not positional and (name in {"find", "ls"} or recursive):
+                positional = ["."]
+            for path in positional:
+                add_path(path, recursive=recursive)
+            if uncertain and (cwd.is_relative_to(home) or any(str(home) in w or "HOME" in w for w in words)):
+                add_path(str(home))
+
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"<", "<<", "<<<", "<>"}:
+                if index + 1 < len(tokens):
+                    add_path(tokens[index + 1])
+                    index += 2
+                    continue
+                add_path(str(home))
+            elif token in {"|", "||", "&&", ";", "&", "(", ")"}:
+                consume(segment)
+                segment = []
+            elif token in {">", ">>", "2>", "2>>"}:
+                index += 1
+            else:
+                segment.append(token)
+            index += 1
+        consume(segment)
+
+    scan(command)
+    return tuple(sources)
 
 
 def _target_matches_read_only_shell_command(argv: list[str]) -> bool:
@@ -11987,6 +12260,10 @@ def classify_protected_result(
         and provenance is None
         and (not failed or tool_name == "shell_exec")
     ):
+        shell_sources = (
+            _shell_filesystem_read_sources(args.get("command"), args, auth_context)
+            if tool_name == "shell_exec" else ()
+        )
         # Ordinary authorized shell output is untrusted information, not a new
         # external ingest that deadlocks the next shell step. bash_job_output is
         # bash_async's mapped content path; bash_jobs_list belongs here too because
@@ -12018,6 +12295,8 @@ def classify_protected_result(
             integrity="untrusted",
             integrity_effect="informational",
         ))
+        for source in shell_sources:
+            labels = labels.with_source(source)
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels
 
