@@ -9550,11 +9550,12 @@ def test_factory_recovery_absent_lock_is_bounded_by_startup_deadline(
     assert load_factory_record(tmp_path, "700").session == "session-1"
 
 
+@pytest.mark.parametrize("record_session", ["session-1", None], ids=["recovery", "initial-launch"])
 @pytest.mark.parametrize("pre_manifest", [False, True])
 @pytest.mark.parametrize("guard", ["dead", "live_driver", "live_lock", "unverified", "not_running"])
 def test_factory_startup_deadline_reparks_only_a_verified_dead_unlocked_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory_clock: SimpleNamespace,
-    pre_manifest: bool, guard: str,
+    pre_manifest: bool, guard: str, record_session: str | None,
 ) -> None:
     import mimir_cultivate.worklink.orchestrator as orchestrator
 
@@ -9609,7 +9610,8 @@ def test_factory_startup_deadline_reparks_only_a_verified_dead_unlocked_run(
             events.append("terminal")
             state["parked"] = True
 
-    record = _factory_lifecycle_record(sandbox, handle)
+    # An initial launch has no session until its driver takes the lock.
+    record = replace(_factory_lifecycle_record(sandbox, handle), session=record_session)
     # The nonexistent PID is verifiably dead only when its birth marker was
     # recorded. The unverified case exercises the real fail-closed guard.
     monkeypatch.setattr(orchestrator, "_log_event", lambda name, **kw: events.append(name))
@@ -9655,9 +9657,13 @@ def test_factory_startup_deadline_reparks_only_a_verified_dead_unlocked_run(
     retained = load_factory_record(tmp_path, "700")
     assert retained.controller_phase == "parked"
     assert retained.status.park_snapshot == snapshot
+    # Recovery admits only a retained session, so a session-less launch gets a
+    # controller-owned one; an existing session is kept unchanged.
+    if record_session is None:
+        assert retained.session and retained.session.startswith("worklink-repark-")
+    else:
+        assert retained.session == record_session
 
-    if pre_manifest:
-        return
     _stub_factory_launch_identity(monkeypatch)
     _configure_opencode_oauth(tmp_path, monkeypatch)
     recovery_events: list[str] = []
@@ -9668,11 +9674,12 @@ def test_factory_startup_deadline_reparks_only_a_verified_dead_unlocked_run(
             return _factory_lifecycle_status(
                 sandbox, status="running" if "resume" in recovery_events else "needs-human",
                 lock=recovery_lock["value"],
-                session="session-1" if recovery_lock["value"] == "fresh" else None,
+                session=retained.session if recovery_lock["value"] == "fresh" else None,
                 park_snapshot=snapshot,
             )
 
         def lock(self, run_id: str, action: str, **kwargs: object) -> None:
+            assert kwargs["session"] == retained.session
             recovery_events.append(action)
             recovery_lock["value"] = "fresh" if action == "claim" else "absent"
 

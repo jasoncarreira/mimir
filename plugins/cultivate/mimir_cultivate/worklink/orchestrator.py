@@ -3344,6 +3344,14 @@ class WorklinkRunner:
                 _require_factory_status(current, factory_record)
                 if current.status != "running" or (current.lock == "fresh" and not current.dead_lock):
                     raise WorklinkError("factory startup deadline: run has a live lock or is not running")
+                if not (factory_record.session or current.lock_session):
+                    # An initial launch whose driver died before taking the lock has
+                    # no session anywhere, and recovery admits only a retained one.
+                    # Record a controller-owned session; recovery claims the absent
+                    # lock under it through the factory CLI before resuming.
+                    factory_record = replace(
+                        factory_record, session=f"worklink-repark-{os.urandom(8).hex()}",
+                    )
             retain_result(wait_result, "needs-human")
             await asyncio.to_thread(
                 backend.terminal,
