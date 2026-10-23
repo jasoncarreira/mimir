@@ -1,0 +1,1 @@
+- Make the shell-timeout process-group test deterministic: it now mocks `os.getpgid` for its fabricated PID, so a real process that happens to own that PID can no longer change the result.
