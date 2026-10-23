@@ -93,7 +93,8 @@ def _status_row(value: object, name: str) -> dict[str, Any]:
     if not isinstance(value, dict) or len(json.dumps(value).encode()) > 16 * 1024:
         raise FactoryContractError(f"factory status {name} must be a bounded object")
     fields = _STATUS_ROW_FIELDS[name]
-    if set(value) != set(fields):
+    # Factory 0.12.1 adds an optional validator.override; records retained before it omit the key.
+    if set(value) - ({"override"} if name == "validator" else set()) != set(fields):
         raise FactoryContractError(f"factory status {name} fields are invalid")
     result = {}
     for key, kind in fields.items():
@@ -106,6 +107,19 @@ def _status_row(value: object, name: str) -> dict[str, Any]:
         result[key] = item
     if name == "validator" and result["verdict"] not in {"GO", "GO-WITH-NITS", "NO-GO"}:
         raise FactoryContractError("factory status validator.verdict has an unknown verdict")
+    if name == "validator" and "override" in value:
+        override = value["override"]
+        if override is not None:
+            if not isinstance(override, dict) or set(override) != {"reviewed_head", "reason", "session", "at"}:
+                raise FactoryContractError(
+                    "factory status validator.override must be an object with reviewed_head, reason, session and at"
+                )
+            override = {key: _status_text(override[key], f"validator.override.{key}") for key in sorted(override)}
+            if result["verdict"] != "NO-GO":
+                raise FactoryContractError("factory status validator.override requires a NO-GO verdict")
+            if override["reviewed_head"] != result["reviewed_head"]:
+                raise FactoryContractError("factory status validator.override must name the verdict's reviewed_head")
+        result["override"] = override
     if name == "next_action" and result["kind"] not in {
         "terminal", "gate", "step", "observe-slice", "blocked-slice", "dispatch-slice",
         "seed-slices", "pr", "complete",
