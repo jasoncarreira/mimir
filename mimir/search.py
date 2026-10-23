@@ -377,6 +377,7 @@ class Indexer:
         self._chunk_overlap = chunk_overlap
         self._db_lock = threading.Lock()
         self._sweep_task: asyncio.Task | None = None
+        self._active_sweeps: set[asyncio.Future[dict[str, int]]] = set()
         self._closed = False
         # Per-instance LRU for query embeddings — file_search call patterns
         # repeat the same query string several times per turn (mirror of
@@ -450,6 +451,10 @@ class Indexer:
                 await self._sweep_task
             except asyncio.CancelledError:
                 pass
+        # Cancelling the startup/periodic sweep awaiter does not stop its
+        # executor thread. Join it before the home can be retired.
+        if self._active_sweeps:
+            await asyncio.gather(*self._active_sweeps, return_exceptions=True)
 
     async def _sweep_loop(self) -> None:
         try:
@@ -474,7 +479,12 @@ class Indexer:
     async def sweep(self) -> dict[str, int]:
         """Walk memory/ + state/, reindex any drift; remove db rows for
         deleted files. Returns a small stats dict."""
-        return await asyncio.to_thread(self._sweep_sync)
+        worker = asyncio.get_running_loop().run_in_executor(None, self._sweep_sync)
+        self._active_sweeps.add(worker)
+        worker.add_done_callback(self._active_sweeps.discard)
+        # Keep the worker alive and tracked even if its asyncio caller is
+        # cancelled during server cleanup.
+        return await asyncio.shield(worker)
 
     async def search(
         self,
