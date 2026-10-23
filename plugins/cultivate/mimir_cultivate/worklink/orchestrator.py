@@ -3425,25 +3425,21 @@ class WorklinkRunner:
         async def repark_startup_failure(reason: str) -> WorklinkRunResult:
             # The park helper cancels and drains the driver, verifies its birth
             # marker, then reads run state again before invoking the factory CLI.
-            # With no manifest even then, the original failure remains the diagnosis.
+            # With no manifest even then, the original failure remains the diagnosis,
+            # raised to the generic handler, which records the incident as before.
             result = await park_for_reason(
                 last_status or FactoryStatus(
                     factory_record.run_id, False, factory_record.sandbox,
                 ),
                 reason, startup_failure=True,
             )
+            # A completed repark is a park, not an incident: an active
+            # operator_required incident would fence the next autonomous dispatch.
             _log_event(
                 "worklink_factory_supervision_error",
                 issue_id=issue.issue_id, run_id=factory_record.run_id,
                 attempt=factory_record.attempt, error_class="WorklinkError",
                 message=reason,
-            )
-            incident_owner.record(
-                producer="supervision_observation", terminal=False, home=self.home,
-                issue_id=issue.issue_id, attempt=factory_record.attempt,
-                error=reason, exit_status=None, autonomous=autonomous,
-                run_id=factory_record.run_id, work_path=factory_record.sandbox,
-                transcript_path=factory_record.transcript,
             )
             return result
 

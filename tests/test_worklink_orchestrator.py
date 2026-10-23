@@ -9648,7 +9648,9 @@ def test_factory_startup_deadline_reparks_only_a_verified_dead_unlocked_run(
     assert "startup deadline" in result.reason
     assert events.index("cancel") < events.index("terminal") < events.index("cleanup")
     assert "worklink_factory_supervision_error" in events
-    assert incidents and incidents[0]["producer"] == "supervision_observation"
+    # A completed repark records no operator incident: an active one would fence
+    # the next autonomous dispatch, which is what the repark exists to allow.
+    assert incidents == []
     assert transitions[0]["status"] == "blocked"
     retained = load_factory_record(tmp_path, "700")
     assert retained.controller_phase == "parked"
