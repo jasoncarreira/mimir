@@ -10950,13 +10950,6 @@ def _lease_has_clean_lineage(
         return _lease_refuse(LeaseAttestationReason.LINEAGE_READ_ERROR)
 
 
-def _scope_has_protected_base(scope: Any, protected_refs: frozenset[str]) -> bool:
-    return (
-        getattr(scope, "destination_ref", None) in protected_refs
-        or f"refs/heads/{getattr(scope, 'base_ref', '')}" in protected_refs
-    )
-
-
 def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
     """Read the checkout's actual branch and HEAD with one hardened Git command."""
     from .repo_tools import hardened_git_command

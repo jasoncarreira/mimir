@@ -1396,11 +1396,10 @@ def test_checkout_records_native_author_trust_for_file_reads(
     result = repo.repo_checkout.func("owner/repo", 7, runtime=runtime)
     assert result["status"] == "checked_out"
     assert result["path"] == str(checkout)
-    trusted_head = mismatch in {None, "verified_own_push"}
     assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is (
-        verdict if trusted_head else None
+        verdict if mismatch is None else None
     )
-    assert calls == ([("owner/repo", "collaborator")] if trusted_head else [])
+    assert calls == ([] if mismatch else [("owner/repo", "collaborator")])
 
     # The checkout's own tool result carries the same exact-scope provenance
     # as subsequent lease reads, but only after an affirmative native verdict.
@@ -1416,7 +1415,7 @@ def test_checkout_records_native_author_trust_for_file_reads(
         result=result, provenance=checkout_provenance,
     )
     assert checkout_labels.sources[0].integrity == (
-        "trusted" if verdict is True and trusted_head else "untrusted"
+        "trusted" if verdict is True and mismatch is None else "untrusted"
     )
 
     def no_attestation(*args):
@@ -1428,7 +1427,7 @@ def test_checkout_records_native_author_trust_for_file_reads(
         ToolAuthorization(tool_name="read_file", decision="resource_scoped", allowed=True),
         result=target.read_text(),
     )
-    trusted = verdict is True and trusted_head
+    trusted = verdict is True and mismatch is None
     assert labels is not None
     assert len(labels.sources) == 1
     source = labels.sources[0]
@@ -1546,8 +1545,10 @@ def _git_commit(path: Path, target: Path, message: str, author: str, committer: 
 def test_unprotected_verified_base_merge_keeps_lease_reads_and_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login, extra_commit: bool,
 ) -> None:
-    from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+    from mimir.git_bootstrap import DEFAULT_USER_NAME
     from mimir import pr_checkout_lease
+    from mimir.pr_checkout_lease import PRCheckoutLease, _METADATA, _metadata
+    from mimir.tools import repo
 
     monkeypatch.setattr(access_control_module, "_lease_head_is_author_attested", _self_login)
     auth, original, lease, target, _ = _real_attested_lease(tmp_path)
@@ -1558,38 +1559,78 @@ def test_unprotected_verified_base_merge_keeps_lease_reads_and_writes(
     observed_base = _git_commit(lease.path, base_file, "observed", "outsider", "outsider")
     verified_base = _git_commit(lease.path, base_file, "verified", "outsider", "outsider")
     subprocess.run(["git", "-C", str(lease.path), "checkout", "-q", "worklink/7"], check=True)
-    subprocess.run([
-        "git", "-C", str(lease.path), "-c", f"user.name={DEFAULT_USER_NAME}",
-        "-c", f"user.email={DEFAULT_USER_EMAIL}", "merge", "-q", "--no-ff",
-        "base", "-m", "merge verified base",
-    ], check=True)
-    merge_head = subprocess.run(
-        ["git", "-C", str(lease.path), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    scope = replace(original, observed_head_sha=attested, observed_base_sha=observed_base,
-                    base_ref="feature/plugins", destination_ref="refs/heads/worklink/7")
-    lease.scope_id = scope.scope_id
-    lease.head_sha = merge_head
-    lease.base_sha = verified_base
-    lease.scope_base_sha = observed_base
-    lease.verified_base_sha = verified_base
-    raw_path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
-    raw = json.loads(raw_path.read_text())
-    raw.update(scope_id=scope.scope_id, head_sha=merge_head, base_sha=verified_base,
-               verified_base_sha=verified_base, lineage={merge_head: True})
-    raw_path.write_text(json.dumps(raw))
+    scope = replace(
+        original, observed_head_sha=attested, observed_base_sha=observed_base,
+        base_ref="feature/plugins", destination_ref="refs/heads/worklink/7",
+        allowed_operations=frozenset({"repo.inspect", "repo.write", "repo.commit"}),
+    )
+    now = datetime.now(UTC)
+    lease = PRCheckoutLease(
+        canonical_repo=scope.canonical_repo, canonical_origin=scope.canonical_origin,
+        source_root=Path(scope.canonical_root), scope_base_sha=observed_base,
+        base_sha=verified_base, verified_base_sha=verified_base, head_sha=attested,
+        destination_ref=scope.destination_ref, owner=scope.principal,
+        scope_id=scope.scope_id, path=lease.path, lease_root=tmp_path,
+        created_at=now, expires_at=now + timedelta(hours=1),
+        recovery_id="merge-recording-test", pr_number=scope.pr_number, lineage={},
+    )
+    raw_path = lease.path / _METADATA
+    # Seed only acquisition state. GitMerge must produce its own clean lineage.
+    raw_path.write_text(json.dumps(_metadata(lease)))
+    subprocess.run(
+        ["git", "-C", str(lease.path), "remote", "add", "origin", scope.canonical_origin],
+        check=True,
+    )
     object.__setattr__(auth, "repo_pr_action_scope", scope)
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
     state = RepoReviewState(scope)
     state.attach_checkout_lease(lease)
-    state.record_git_head(scope.scope_id, merge_head)
     object.__setattr__(auth, "repo_review_state", state)
+    monkeypatch.setattr(repo, "_state", lambda *_: state)
+    token = begin_protected_result_capture()
+    try:
+        result = repo.repo_merge.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(token)
+    assert result["ok"]
+    merge_head = subprocess.run(
+        ["git", "-C", str(lease.path), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    parents = subprocess.run(
+        ["git", "-C", str(lease.path), "rev-list", "--parents", "-n", "1", merge_head],
+        check=True, capture_output=True, text=True,
+    ).stdout.split()
+    assert parents == [merge_head, attested, verified_base]  # A real non-fast-forward merge.
+    raw = json.loads(raw_path.read_text())
+    assert raw["lineage"] == {merge_head: True}
+    assert lease.lineage == {merge_head: True}
+    assert lease.head_sha == state.git_expected_head == merge_head
+    assert raw["verified_base_sha"] == verified_base
+    merge_labels = classify_protected_result(
+        "repo_merge", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_merge", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope),
+        result=result, provenance=provenance,
+    )
+    assert merge_labels.sources[0].integrity == "trusted"
+    auth.ifc_state.merge(merge_labels)
+
+    # Discriminating pair for the second verified-base disjunct: both the
+    # recorded fetched base and its ancestry still match, only scope_base differs.
+    assert _self_login(lease.path, scope.head_ref, attested, merge_head,
+                       scope=scope, lease=lease, ifc_state=auth.ifc_state)
+    wrong_scope_base = replace(lease, scope_base_sha=common)
+    assert scope.observed_base_sha != wrong_scope_base.scope_base_sha
+    assert not _self_login(
+        lease.path, scope.head_ref, attested, merge_head,
+        scope=scope, lease=wrong_scope_base, ifc_state=auth.ifc_state,
+    ), "scope-base mismatch must refuse"
 
     if extra_commit:
         # A local commit outside the typed tools must not inherit base trust.
         foreign = _git_commit(lease.path, target, "unrecorded", DEFAULT_USER_NAME, DEFAULT_USER_NAME)
-        lease.head_sha = foreign
+        object.__setattr__(lease, "head_sha", foreign)
         raw["head_sha"] = foreign
         raw_path.write_text(json.dumps(raw))
         state.record_git_head(scope.scope_id, foreign)
@@ -1620,6 +1661,22 @@ def test_unprotected_verified_base_merge_keeps_lease_reads_and_writes(
         assert decision.allowed is not extra_commit, (tool, decision)
         if extra_commit:
             assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+
+def test_unprotected_merge_scope_base_guard_mutation_is_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login,
+) -> None:
+    import inspect
+
+    source = inspect.getsource(_self_login)
+    guard = 'base == getattr(lease, "scope_base_sha", "").lower()'
+    assert source.count(guard) == 1
+    namespace = dict(vars(access_control_module))
+    exec(compile(source.replace(guard, "True"), "<scope-base-mutant>", "exec"), namespace)
+    with pytest.raises(AssertionError, match="scope-base mismatch must refuse"):
+        test_unprotected_verified_base_merge_keeps_lease_reads_and_writes(
+            tmp_path, monkeypatch, namespace["_lease_head_is_author_attested"], False,
+        )
 
 
 @pytest.mark.parametrize("invalid_base", ["rewritten", "unreported"])
