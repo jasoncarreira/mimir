@@ -1437,7 +1437,7 @@ def test_slow_trust_attestations_cannot_overrun_the_tick(monkeypatch, tmp_path):
 
     def very_slow_author(repo, extras, token):
         started.append("author")
-        _time.sleep(5.0)  # >> the allowance; only a real deadline stops this
+        _time.sleep(10.0)  # >> the allowance; only a real deadline stops this
         return "outside-contributor"
 
     monkeypatch.setattr(poller, "_github_content_author", very_slow_author)
@@ -1451,9 +1451,11 @@ def test_slow_trust_attestations_cannot_overrun_the_tick(monkeypatch, tmp_path):
     )
 
     assert started, "trust path never reached — the test cannot see the bug"
-    # Without enforcement this is >=5s per uncached author; with it, each lookup
-    # is cut at ~0.05s.
-    assert elapsed < 3.0, f"tick ran {elapsed:.2f}s; deadline not enforced"
+    # Without enforcement a single uncached lookup alone takes 10s; with it, each
+    # lookup is cut at the 0.05s allowance plus timer-delivery slack. That slack is
+    # host-dependent (macOS delivers a 0.05s ITIMER_REAL ~0.2s late, and this tick
+    # makes 16 lookups), so bound below one unenforced lookup, not near 16x0.05s.
+    assert elapsed < 8.0, f"tick ran {elapsed:.2f}s; deadline not enforced"
     assert len(saved) == 1
 
 
