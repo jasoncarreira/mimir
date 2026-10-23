@@ -68,6 +68,17 @@ CONFIG = Path("/home/mimir/worklink-opencode/opencode.json")
 DATA = Path("/home/mimir/worklink-opencode/data")
 CLI = "/tmp/opencode-proof"
 
+GATE_TEST = r'''test "$(id -u)" = 1002
+printf 'gate-euid=%s\\n' "$(id -u)"
+test "$(cat tracked)" = worker-modified
+test "$(cat created)" = worker-created
+test "$(cat controller-continuation)" = continued
+! test -e deleted
+test -r "$HOME/.config/opencode/opencode.json"
+test -r "$HOME/.local/share/opencode/auth.json"
+! cat /home/mimir/worklink-canary
+'''
+
 async def main():
     if os.geteuid() != 1001:
         raise RuntimeError("controller proof is not running as mimir")
@@ -83,10 +94,18 @@ async def main():
     sibling = create_isolated_checkout(
         REPO, issue_id=1411, attempt=1, base="main", worker_eligible=True
     )
-    if lease.worker_authorized or lease.authorization is not None:
-        raise RuntimeError("Worklink unexpectedly selected the contained checkout path")
-    if sibling.worker_authorized or sibling.authorization is not None:
-        raise RuntimeError("concurrent checkout unexpectedly selected the contained path")
+    # Selected Cultivate issues worker-eligible checkouts through the contained,
+    # authorized path, exactly as WorklinkOrchestrator does (worker_uid_drop):
+    # an issued authorization under the root-owned checkout tree, verified
+    # before the worker runs. A path-only checkout here is the regression.
+    for name, issued in (("lease", lease), ("concurrent sibling", sibling)):
+        if not issued.worker_authorized or issued.authorization is None:
+            raise RuntimeError(f"selected Worklink {name} did not take the authorized checkout path")
+        issued.authorization.verify(issued.path)
+        if not issued.path.is_relative_to("/var/lib/mimir-worklink/checkouts"):
+            raise RuntimeError(f"authorized {name} escaped the root-owned checkout tree: {issued.path}")
+    if lease.path.parent == sibling.path.parent:
+        raise RuntimeError("concurrent checkouts share an authorization boundary")
     sibling.path.joinpath("sibling-canary").write_text("sibling-original")
     source_object = next(REPO.joinpath(".git/objects").glob("[0-9a-f][0-9a-f]/*"))
     checkout_object = lease.path / ".git/objects" / source_object.relative_to(REPO / ".git/objects")
@@ -99,7 +118,7 @@ async def main():
         )
     finally:
         os.close(checkout_fd)
-    compute = LocalSubprocessComputeBackend.for_path_checkout(1002)
+    compute = LocalSubprocessComputeBackend.for_authorized_checkout(lease.authorization, worker_uid=1002)
     backend = OpenCodeBackend(bin=CLI)
     order = WorkOrder(
         issue_id=1410,
@@ -115,7 +134,9 @@ async def main():
         repo_url=str(REPO),
         base_ref="main",
         branch=lease.branch,
-        test_command="unused",
+        # The evidence gate runs only the command its authorized work spec
+        # carries, as the orchestrator passes one test_cmd to both.
+        test_command=GATE_TEST,
     )
     projections = spec.backend_config.get("worker_projections", ())
     if len(projections) != 2:
@@ -139,16 +160,7 @@ async def main():
         started_at=datetime.now(UTC),
         base_ref=lease.local_base,
         backend_status="completed",
-        test_command=r'''test "$(id -u)" = 1002
-printf 'gate-euid=%s\\n' "$(id -u)"
-test "$(cat tracked)" = worker-modified
-test "$(cat created)" = worker-created
-test "$(cat controller-continuation)" = continued
-! test -e deleted
-test -r "$HOME/.config/opencode/opencode.json"
-test -r "$HOME/.local/share/opencode/auth.json"
-! cat /home/mimir/worklink-canary
-''',
+        test_command=GATE_TEST,
         safe_git=publication,
         work_spec=spec,
         compute=compute,
@@ -178,10 +190,20 @@ test -r "$HOME/.local/share/opencode/auth.json"
         raise RuntimeError("worker changed controller canary")
     if sibling.path.joinpath("sibling-canary").read_text() != "sibling-original":
         raise RuntimeError("worker changed concurrent sibling checkout")
-    cleanup_checkout(lease, outcome="completed")
-    cleanup_checkout(sibling, outcome="completed")
+    # Authorized checkouts are removed through the controller's safe Git, as the
+    # orchestrator does; each lease brings its own captured publication.
+    cleanup_checkout(lease, outcome="completed", safe_git=publication)
+    sibling_fd = os.open(sibling.path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        sibling_publication = ControllerGitPublication.capture(
+            sibling_fd, REPO, sibling.branch, METADATA.with_name("worklink-publication-sibling")
+        )
+    finally:
+        os.close(sibling_fd)
+    cleanup_checkout(sibling, outcome="completed", safe_git=sibling_publication)
+    sibling_publication.close()
     publication.close()
-    if lease.path.exists():
+    if lease.path.parent.exists() or sibling.path.parent.exists():
         raise RuntimeError("production checkout cleanup failed")
 
 asyncio.run(main())
@@ -405,7 +427,7 @@ PY
             /command/s6-setuidgid mimir sh -ceu 'printf controller-writable > /home/mimir/worklink-canary; printf controller-reset > /home/mimir/worklink-canary'
             test "$(cat /home/mimir/worklink-canary)" = controller-reset
             /command/s6-setuidgid mimir sh -ceu '
-              rm -rf "$WORKLINK_REPO" /workspace/.worklink /home/mimir/worklink-remote.git /home/mimir/worklink-opencode /home/mimir/worklink-publication
+              rm -rf "$WORKLINK_REPO" /workspace/.worklink /home/mimir/worklink-remote.git /home/mimir/worklink-opencode /home/mimir/worklink-publication /home/mimir/worklink-publication-sibling
               mkdir -p /workspace
               git init --bare -q /home/mimir/worklink-remote.git
               git init -q "$WORKLINK_REPO"
@@ -470,9 +492,23 @@ if (Path("../b") / "cross-write").read_text() != "detector-live":
     raise SystemExit("sibling-access negative control did not detect a cross-write")
 os.fchdir(checkout_fd)
 os.close(checkout_fd)
-sibling = checkout.parent / "1411-1" / "sibling-canary"
-if sibling.read_text() != "sibling-original":
-    raise SystemExit("worker could not reach the intentionally shared sibling checkout")
+# Each selected checkout is issued inside its own mimir:worklink 0700 boundary,
+# and the worker reaches it only through the executor's FD. A concurrent sibling
+# must therefore be unreachable. Only PermissionError counts: a wrong path
+# (FileNotFoundError) must fail the proof, not pass it.
+sibling = checkout.parent.parent / "1411-1" / "checkout" / "sibling-canary"
+try:
+    sibling.read_text()
+except PermissionError:
+    pass
+else:
+    raise SystemExit("worker reached a concurrent sibling checkout outside its issued boundary")
+for boundary in (checkout.parent, sibling.parent.parent):
+    try:
+        os.listdir(boundary)
+    except PermissionError:
+        continue
+    raise SystemExit(f"worker could list an issued checkout boundary: {boundary}")
 parent = home.parent
 repo = Path(Path("/tmp/worklink-proof-repo").read_text())
 checks = [
@@ -497,27 +533,27 @@ for name in ("pre-commit", "pre-push"):
     hook = hooks / name
     hook.write_text("#!/bin/sh\ntouch /tmp/worklink-publication-attack\nexit 91\n")
     hook.chmod(0o755)
-# The worker runs as ``worklink`` while the checkout is owned by ``mimir``, so bare
-# git refuses with "detected dubious ownership" and plants nothing. Name the checkout
-# explicitly and mark it safe: a hostile worker would do exactly this, and a proof that
-# cannot plant proves nothing.
-checkout = str(Path.cwd().resolve())
-git = ["git", "-c", f"safe.directory={checkout}", "-C", checkout]
+# Plant hostile Git metadata the way a hostile worker in an issued checkout can:
+# by writing ``.git/config`` directly. The checkout is FD-anchored and its 0700
+# boundary is closed to the worker, so the git binary cannot even stat the
+# working tree ("failed to stat ... Permission denied"); a raw config write is
+# the remaining channel, and the controller publication must ignore it.
 hostile_helper = "!f() { touch /tmp/worklink-publication-attack; echo username=worker; echo password=hostile; }; f"
-subprocess.run([*git, "config", "--local", "core.hooksPath", str(hooks.resolve())], check=True)
-subprocess.run([*git, "config", "--local", "credential.helper", hostile_helper], check=True)
-subprocess.run([*git, "remote", "set-url", "--push", "origin", "/tmp/worklink-hostile.git"], check=True)
+config = Path(".git/config")
+config.write_text(
+    config.read_text()
+    + f"[core]\n\thooksPath = {hooks.resolve()}\n"
+    + f'[credential]\n\thelper = "{hostile_helper}"\n'
+    + '[remote "origin"]\n\tpushurl = /tmp/worklink-hostile.git\n'
+)
 
 # Read every planted value back. Without this the proof passes vacuously whenever the
 # plant silently fails, which is the failure mode it exists to rule out.
-def planted(args, expected):
-    got = subprocess.run([*git, *args], capture_output=True, text=True, check=True).stdout.strip()
-    if expected not in got:
-        raise SystemExit(f"hostile setup did not persist: {args} -> {got!r}")
-
-planted(["config", "--local", "--get", "core.hooksPath"], str(hooks.resolve()))
-planted(["config", "--local", "--get", "credential.helper"], "worklink-publication-attack")
-planted(["remote", "get-url", "--push", "origin"], "/tmp/worklink-hostile.git")
+planted_config = config.read_text()
+for expected in (f"hooksPath = {hooks.resolve()}", "worklink-publication-attack",
+                 "pushurl = /tmp/worklink-hostile.git"):
+    if expected not in planted_config:
+        raise SystemExit(f"hostile setup did not persist: {expected!r}")
 print(f"build-euid={os.geteuid()}")
 PY
             chmod 0755 /tmp/opencode-proof

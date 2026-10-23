@@ -571,7 +571,11 @@ def test_ci_runs_the_committed_live_image_proof() -> None:
     assert 'stat -c %U:%G /opt/mimir-worklink/uv-cache' in proof
     assert 'stat -c %a /opt/mimir-worklink/uv-cache' in proof
     assert "sibling-access negative control did not detect a cross-write" in proof
-    assert "intentionally shared sibling checkout" in proof
+    # Issued checkouts are isolated from each other: the worker must be DENIED
+    # its concurrent sibling, and a wrong path must fail rather than pass.
+    assert "worker reached a concurrent sibling checkout outside its issued boundary" in proof
+    assert "except PermissionError:" in proof
+    assert "intentionally shared sibling checkout" not in proof
     parsed = yaml.safe_load(workflow)
     configured_repo = parsed["jobs"]["worklink-image-identity"]["env"]["WORKLINK_REPO"]
     assert configured_repo == "/workspace/worklink-base"
@@ -581,7 +585,15 @@ def test_ci_runs_the_committed_live_image_proof() -> None:
     assert 'shlex.quote(str(repo / \'tracked\'))' in proof
     assert "/workspace/mimir" not in proof
     assert "worklink-publication-attack" in proof
-    assert 'remote", "set-url", "--push"' in proof
+    # The worker plants hostile push/hook/credential metadata by writing the
+    # config file (git cannot stat an FD-anchored checkout), read back verbatim.
+    assert "pushurl = /tmp/worklink-hostile.git" in proof
+    assert "hostile setup did not persist" in proof
     assert "ControllerGitPublication.capture" in proof
-    assert "Worklink unexpectedly selected the contained checkout path" in proof
+    # Selected Cultivate issues worker checkouts through the authorized path,
+    # as WorklinkOrchestrator does; the proof drives the worker through it.
+    assert "did not take the authorized checkout path" in proof
+    assert "issued.authorization.verify(issued.path)" in proof
+    assert "for_authorized_checkout(lease.authorization, worker_uid=1002)" in proof
+    assert "Worklink unexpectedly selected the contained checkout path" not in proof
     assert "issue_id=1411" in proof

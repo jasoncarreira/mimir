@@ -85,6 +85,43 @@ def test_selected_checkout_path_and_pruning_ignore_legacy_flag(
     assert not path.parent.exists()
 
 
+def test_selected_worker_boundary_carries_the_worker_group_the_executor_requires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The boundary must be mimir:worklink 0700, as worker_exec validates it.
+
+    Synthetic identities elsewhere set worklink_gid to the primary group, which
+    is exactly what mkdir produces, so they cannot see a boundary left in the
+    controller's own group. Use a distinct supplementary group instead.
+    """
+    worker_gid = next((gid for gid in os.getgroups() if gid != os.getgid()), None)
+    if worker_gid is None:
+        pytest.skip("requires a supplementary group distinct from the primary group")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    root = tmp_path / "worker-checkouts"
+    monkeypatch.setattr(checkout, "_ENABLED_CHECKOUT_ROOT", root)
+    monkeypatch.setattr(checkout, "get_identities", lambda: SimpleNamespace(
+        mimir_uid=os.getuid(), worklink_gid=worker_gid,
+    ))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (("init", "-b", "main", str(repo)),
+                 ("-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.org",
+                  "commit", "--allow-empty", "-m", "initial"),
+                 ("-C", str(repo), "remote", "add", "origin", str(repo))):
+        subprocess.run(["git", *args], capture_output=True, text=True, check=True)
+
+    lease = checkout.create_isolated_checkout(repo, issue_id=1950, attempt=1, worker_eligible=True)
+    try:
+        boundary = lease.path.parent.stat()
+        assert (boundary.st_uid, boundary.st_gid) == (os.getuid(), worker_gid)
+        assert stat.S_IMODE(boundary.st_mode) == 0o700
+        assert lease.path.stat().st_gid == worker_gid
+    finally:
+        if lease.authorization is not None:
+            lease.authorization.close()
+
+
 def test_selected_worker_checkout_issues_capability_and_cleans_up(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

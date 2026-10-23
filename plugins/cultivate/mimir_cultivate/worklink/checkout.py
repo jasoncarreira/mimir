@@ -552,6 +552,17 @@ def create_isolated_checkout(
         path.parent.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         if selected_worker:
             path.parent.mkdir(mode=0o700)
+            # worker_exec accepts an issued checkout only inside a mimir:worklink
+            # 0700 boundary. mkdir leaves the controller's primary group, so the
+            # executor refused every selected checkout as "isolation boundary is
+            # invalid". The controller is a member of the worklink group.
+            assert identities is not None
+            try:
+                os.chown(path.parent, -1, identities.worklink_gid)
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                path.parent.rmdir()
+                raise
         else:
             path.parent.mkdir(mode=0o755, exist_ok=True)
     else:
