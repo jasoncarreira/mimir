@@ -37,8 +37,16 @@ from mimir.plugins.manager import load_plugins
 
 if mode == "seed":
     from mimir.plugins.defaults import seed_plugin_defaults
+    from dataclasses import replace
     manager = load_plugins(enable="cultivate")
-    seed_plugin_defaults(home, selected=manager.policy.selected_plugin_candidates)
+    candidate, = manager.policy.selected_plugin_candidates
+    # Reproduce a home seeded by the previous manifest (all six defaults).
+    old = replace(candidate, manifest=replace(candidate.manifest, defaults={
+        **candidate.manifest.defaults,
+        "skills": [*candidate.manifest.defaults["skills"],
+                   *(path for path, _ in candidate.manifest.optional_skills)],
+    }, optional_skills=()))
+    seed_plugin_defaults(home, selected=(old,))
     for skill in seeded:
         assert (home / "skills" / skill / "SKILL.md").is_file(), skill
     sys.exit(0)

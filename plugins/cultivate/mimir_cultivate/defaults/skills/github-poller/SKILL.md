@@ -1,6 +1,6 @@
 ---
 name: cultivate-github-poller
-description: "Watch configured GitHub repositories for actionable issues, pull requests, comments and reviews. Install mimir-cultivate and select MIMIR_PLUGINS=cultivate to seed <home>/skills/cultivate-github-poller/, then configure GITHUB_REPOS and MIMIR_GITHUB_SELF_LOGIN."
+description: "Watch configured GitHub repositories for actionable issues, pull requests, comments and reviews. Select MIMIR_PLUGINS=cultivate and run mimir skills install cultivate:github-poller, then configure GITHUB_REPOS and MIMIR_GITHUB_SELF_LOGIN."
 env:
   required:
     - name: GITHUB_REPOS

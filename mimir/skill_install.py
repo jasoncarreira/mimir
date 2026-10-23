@@ -581,8 +581,8 @@ def _format_skill_row(skill: OptionalSkill, name_width: int) -> str:
 def add_argparse_install(parser) -> None:
     """Wire ``mimir skills install <name> [--home PATH] [--force]``."""
     parser.add_argument(
-        "name",
-        help="Skill bundle name (directory under optional-skills/). "
+        "name", nargs="?",
+        help="Skill name or <plugin>:<skill> (omit with --forge). "
              "Run `mimir skills list-optional` to see what's available.",
     )
     parser.add_argument(
@@ -597,6 +597,9 @@ def add_argparse_install(parser) -> None:
              "Recursive rm under <home>/skills/<name>/ — any "
              "custom edits there are lost.",
     )
+    parser.add_argument("--forge", help="Install all optional skills tagged for this forge in selected plugins.")
+    parser.add_argument("--restore", action="store_true",
+                        help="Back up and replace an existing plugin skill with its packaged copy.")
     parser.add_argument(
         "--configure", action="store_true",
         help="Interactively prompt for env vars declared in SKILL.md frontmatter "
@@ -615,6 +618,8 @@ def add_argparse_install(parser) -> None:
 
 def add_argparse_list_optional(parser) -> None:
     """Wire ``mimir skills list-optional``."""
+    parser.add_argument("--home", type=Path, default=None,
+                        help="Mimir home to inspect (default: $MIMIR_HOME or cwd).")
     parser.set_defaults(skill_install_cmd=cmd_list_optional)
 
 
@@ -703,6 +708,62 @@ def cmd_install(args) -> int:
     if not home.is_dir():
         print(f"home not a directory: {home}")
         return 2
+    from mimir.plugins.skills import install_skill, resolve_skill, selected_skills, skill_state
+    forge = getattr(args, "forge", None)
+    restore = getattr(args, "restore", False)
+    if forge or restore or (args.name and ":" in args.name):
+        try:
+            if forge:
+                if args.name or restore or args.force:
+                    raise ValueError("--forge takes no skill name, --restore or --force")
+                matches = [s for s in selected_skills() if not s.default and s.forge == forge]
+                if not matches:
+                    raise ValueError(f"no selected plugin skills for forge {forge!r}; check MIMIR_PLUGINS")
+                conflicts = [s.label for s in matches if skill_state(home, s) == "modified"]
+                if conflicts:
+                    raise FileExistsError(f"modified plugin skills: {', '.join(conflicts)}; "
+                                          "restore them individually with --restore")
+                for skill in matches:
+                    if skill_state(home, skill) == "not installed":
+                        dest, _ = install_skill(home, skill)
+                        print(f"installed skill {skill.label} into {dest}")
+                    else:
+                        print(f"{skill.label}: {skill_state(home, skill)} (skipped)")
+                return 0
+            if not args.name:
+                raise ValueError("specify a skill name or --forge")
+            skill = resolve_skill(args.name, {s.name for s in list_available()})
+            if skill is None:
+                raise ValueError("--restore is only for plugin skills")
+            if args.force:
+                raise ValueError("use --restore for plugin skills (preserves a backup)")
+            dest, backup = install_skill(home, skill, restore=restore)
+            print(f"{'restored' if backup else 'installed'} skill {skill.label} into {dest}" +
+                  (f"; replaced {dest} (backup: {backup})" if backup else ""))
+            return 0
+        except FileExistsError as exc:
+            print(str(exc))
+            return 3
+        except (ValueError, FileNotFoundError) as exc:
+            print(str(exc))
+            return 2
+    if args.name is None:
+        print("specify a skill name or --forge")
+        return 2
+    try:
+        skill = resolve_skill(args.name, {s.name for s in list_available()})
+        if skill is not None:
+            if args.force:
+                raise ValueError("use --restore for plugin skills (preserves a backup)")
+            dest, _ = install_skill(home, skill)
+            print(f"installed skill {skill.label} into {dest}")
+            return 0
+    except FileExistsError as exc:
+        print(str(exc))
+        return 3
+    except ValueError as exc:
+        print(str(exc))
+        return 2
     try:
         result = install(args.name, home, force=args.force)
     except FileNotFoundError as exc:
@@ -774,15 +835,26 @@ def cmd_list_optional(args) -> int:
         return 2
 
     skills = list_available()
-    if not skills:
+    from mimir.plugins.skills import selected_skills, skill_files, skill_state
+    plugin_skills = selected_skills()
+    if not skills and not plugin_skills:
         print(f"no optional skills found under {resolved}")
         return 0
-    width = max(len(s.name) for s in skills)
+    width = max((len(s.name) for s in skills), default=0)
     for s in skills:
         print(_format_skill_row(s, width))
+    if plugin_skills:
+        print("\nplugin  skill  poller  forge  install state  kind")
+        for skill in plugin_skills:
+            files = skill_files(skill)
+            poller = any(path.name == "pollers.json" for path in files)
+            print(f"{skill.candidate.name}  {skill.name}  "
+                  f"{'[poller]' if poller else '-'}  {skill.forge or '-'}  "
+                  f"{skill_state(_resolve_home(getattr(args, 'home', None)), skill)}  "
+                  f"{'default' if skill.default else 'optional'}")
     print(
         f"\ninstall: mimir skills install <name> [--home PATH]\n"
-        f"source:  {resolved}"
+        f"source:  {resolved}\nplugin:  mimir skills install <plugin>:<skill> [--home PATH]"
     )
     return 0
 

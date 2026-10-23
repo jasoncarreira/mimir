@@ -93,6 +93,22 @@ def test_manifest_validates_required_fields_and_reserved_keys():
         parse_manifest(_toml(), entry_name="Bad_Name")
 
 
+def test_optional_skill_schema_and_name_collisions():
+    default = b'[defaults]\nversion = "1"\nskills = ["skills/github"]\n'
+    optional = b'[optional]\nskills = [{path = "skills/gitlab", forge = "gitlab"}]\n'
+    manifest = parse_manifest(_toml() + default + optional, entry_name="alpha")
+    assert manifest.optional_skills == (("skills/gitlab", "gitlab"),)
+    for payload in (
+        b'[optional]\nskills = [{path = "skills/a", unknown = true}]\n',
+        b'[optional]\nskills = [{path = "skills/a", forge = "GitHub"}]\n',
+        b'[optional]\nskills = [{path = "skills/a"}, {path = "other/a"}]\n',
+        default + b'[optional]\nskills = [{path = "other/github"}]\n',
+        b'[optional]\nother = []\n',
+    ):
+        with pytest.raises(PluginManifestError):
+            parse_manifest(_toml() + payload, entry_name="alpha")
+
+
 def test_reserved_resources_must_belong_to_distribution(tmp_path):
     root = tmp_path / "pkg"
     root.mkdir()

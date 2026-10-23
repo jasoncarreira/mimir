@@ -14,7 +14,7 @@ metadata without importing provider code. Its entry-point name must match the
 manifest `name` and match `[a-z][a-z0-9-]*`. Required TOML string keys are
 `name`, `version` (PEP 440), `license` (SPDX expression), and `requires_mimir`
 (PEP 440 specifier for the installed Mimir version). The optional keys
-`dockerfile`, `themes`, `frontend`, `defaults`, and `config` describe the
+`dockerfile`, `themes`, `frontend`, `defaults`, `optional`, and `config` describe the
 contributions below; other unknown top-level keys are rejected.
 
 Export `MIMIR_PLUGINS=one,two` in the operator-owned **process environment**,
@@ -226,6 +226,7 @@ an executable reference (it is a test fixture, not a published Mimir plugin).
 | `[frontend]` | `api_major` positive integer, required `module` ES-module resource, optional `css` resource and `assets` array of package-relative files. |
 | `[dockerfile]` | `system_packages: string[]`, `build_args: {NAME: "default"}`, `users: string[]`, `directories: string[]` (absolute), `root_run: string[]`, `s6_services: string[]` (package-relative service directories). |
 | `[defaults]` | Required string `version`, and optional arrays `skills` (directories), `prompts` (files), `scheduler_jobs` (files). |
+| `[optional]` | `skills` is an array of tables with required package-relative directory `path` and optional `forge` tag (lowercase name, e.g. `{ path = "defaults/skills/github-poller", forge = "github" }`). Names must be unique across default and optional skills; unknown fields are rejected. |
 | `[config.MIMIR_PLUGIN_<NAME>_<KEY>]` | Each declared key has `type = "string" | "integer" | "boolean"`, optional `description`, `secret` and `security` booleans. Hyphens in the plugin name become underscores in the prefix; normalized-name collisions are rejected. |
 
 ### Skins and frontend bundles
@@ -344,6 +345,13 @@ existing operator files are not overwritten. Subsequent package versions
 surface per-owner versioned defaults-upgrade proposals rather than refreshing
 plugin files through the unconditional core built-in-skill path. Keep plugin
 defaults separate from core-shipped defaults.
+Optional skills are installed only on request. `mimir skills list-optional`
+shows selected plugins' defaults and optional skills with their forge and install
+state. Use `mimir skills install <plugin>:<skill>` or
+`mimir skills install --forge github`; `--restore` backs up a modified plugin
+skill to a timestamped sibling before replacing it. Previously seeded skills
+remain installed. An unselected plugin's skills are unavailable even if its
+distribution is installed or a prior seed remains in the home.
 
 `plugin_config_rows(owner, manifests)` reads only declared keys of an enabled
 owner, with secret/security values redacted and `mutable: false`;

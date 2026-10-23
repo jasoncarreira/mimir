@@ -942,6 +942,8 @@ def setup_home(
     from ..plugins.defaults import seed_plugin_defaults
 
     plugin_defaults = seed_plugin_defaults(home)
+    from ..plugins.skills import uninstalled_optional
+    plugin_optional = [skill.label for skill in uninstalled_optional(home)]
     files_created.extend(path for path, status in plugin_defaults.items()
                          if status == "created" and not path.startswith("scheduler.yaml:"))
 
@@ -1007,6 +1009,7 @@ def setup_home(
         "subagents": seeded_subagents,
         "skills": seeded_skills,
         "plugin_defaults": plugin_defaults,
+        "plugin_optional": plugin_optional,
         "api_key_action": api_key_action,
         "git_bootstrap": git_bootstrap_status,
         "embedding_preset": embedding,
@@ -1121,6 +1124,9 @@ def _print_setup_report(status: dict[str, object]) -> None:
         new_subs = sorted(n for n, s in subs.items() if s == "created")
         if new_subs:
             print(f"  subagents seeded: {', '.join(new_subs)}")
+    if status.get("plugin_optional"):
+        print(f"  optional plugin skills: {', '.join(status['plugin_optional'])}")
+        print("  install: mimir skills install <plugin>:<skill> --home PATH (or --forge <name>)")
     if status.get("api_key_action") == "generated":
         print("  MIMIR_API_KEY:  generated (see .env; rotate via `mimir regenerate-api-key`)")
     # Model + usage-monitor routing — surface what setup decided so

@@ -1233,6 +1233,16 @@ def build_app(config: Config) -> web.Application:
     seed_plugin_defaults(
         config.home, selected=config.plugin_manager.policy.selected_plugin_candidates,
     )
+    from .plugins.skills import PluginSkill, uninstalled_optional
+    optional_missing = uninstalled_optional(config.home, [
+        PluginSkill(candidate, Path(path).name, forge, False)
+        for candidate in config.plugin_manager.policy.selected_plugin_candidates
+        for path, forge in (candidate.manifest.optional_skills if candidate.manifest else ())
+    ])
+    if optional_missing:
+        log.info("optional plugin skills available: %s; install with `mimir skills install <plugin>:<skill>` "
+                 "or `mimir skills install --forge <name>`",
+                 ", ".join(skill.label for skill in optional_missing))
     # Refresh reference docs on upgrade: rewrite docs still present in
     # <home>/docs/ to the shipped version, seed docs new in this release, and
     # leave operator-deleted ones deleted. No-ops unless the version changed

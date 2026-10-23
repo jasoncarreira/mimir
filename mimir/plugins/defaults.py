@@ -110,7 +110,8 @@ def seed_namespaces(home: Path) -> SeedNamespaces:
         candidates = ()
     for candidate in candidates:
         manifest = candidate.manifest
-        for directory in (manifest.defaults.get("skills", ()) if manifest and manifest.defaults else ()):
+        for directory in ((*manifest.defaults.get("skills", ()), *(path for path, _ in manifest.optional_skills))
+                          if manifest else ()):
             skills.setdefault(f"{candidate.name}-{Path(directory).name}", candidate.name)
         for name in _seeded_job_names(candidate):
             jobs.setdefault(name, candidate.name)
@@ -144,10 +145,10 @@ def unselected_seeded_skills(home: Path, selected: frozenset[str]) -> dict[str, 
     return hidden
 
 
-def plugin_default_files(candidate: PluginCandidate) -> dict[Path, str]:
+def plugin_default_files(candidate: PluginCandidate, *, skill: str | None = None) -> dict[Path, str]:
     """Read only inventoried package data, never the provider's Python module."""
     manifest = candidate.manifest
-    if manifest is None or not manifest.defaults:
+    if manifest is None or (not manifest.defaults and skill is None):
         return {}
     dist = candidate.entry_point.dist
     if dist is None or dist.files is None:
@@ -164,7 +165,13 @@ def plugin_default_files(candidate: PluginCandidate) -> dict[Path, str]:
             raise ValueError(f"{candidate.name}: invalid defaults resource {path}")
         return path.read_text(encoding="utf-8")
 
-    for directory in manifest.defaults.get("skills", ()):
+    directories = (manifest.defaults.get("skills", ()) if skill is None else
+                   [path for path in (*manifest.defaults.get("skills", ()),
+                                      *(path for path, _ in manifest.optional_skills))
+                    if Path(path).name == skill])
+    if skill is not None and len(directories) != 1:
+        raise ValueError(f"{candidate.name}: undeclared skill {skill!r}")
+    for directory in directories:
         source = root / directory
         for path in sorted(source.rglob("*")):
             if path.is_file():
@@ -173,7 +180,7 @@ def plugin_default_files(candidate: PluginCandidate) -> dict[Path, str]:
                 if dest in output:
                     raise ValueError(f"{candidate.name}: duplicate skill path {dest}")
                 output[dest] = read(path)
-    for resource in manifest.defaults.get("prompts", ()):
+    for resource in (manifest.defaults.get("prompts", ()) if skill is None else ()):
         path = root / resource
         rel = Path("prompts") / candidate.name / path.name
         if rel in output:
@@ -183,7 +190,7 @@ def plugin_default_files(candidate: PluginCandidate) -> dict[Path, str]:
     jobs = []
     from mimir.scheduler import load_jobs_from_text
 
-    for resource in manifest.defaults.get("scheduler_jobs", ()):
+    for resource in (manifest.defaults.get("scheduler_jobs", ()) if skill is None else ()):
         text = read(root / resource)
         parsed, rejections = load_jobs_from_text(text)
         if rejections:

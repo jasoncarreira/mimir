@@ -15,6 +15,7 @@ from mimir.chat_skills import ChatSkillError, ChatSkillInvocation, ChatSkillRegi
 from mimir.config import Config
 from mimir.plugins.defaults import plugin_default_files, seed_plugin_defaults
 from mimir.plugins.discovery import enabled_plugins
+from mimir.plugins.skills import install_skill, selected_skills
 from mimir.skill_catalog import load_skill
 
 
@@ -24,14 +25,16 @@ NAMES = {
     "github-poller", "github-ci-watch", "chainlink-orchestrator",
     "worklink-tool-pins", "github", "review",
 }
+DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
 
 
 def test_selected_provider_seeds_only_its_coding_skills() -> None:
     [candidate] = enabled_plugins(enable="cultivate")
     manifest = tomllib.loads((ROOT / "plugins/cultivate/mimir-plugin.toml").read_text())
-    assert {Path(path).name for path in manifest["defaults"]["skills"]} == NAMES
+    assert {Path(path).name for path in manifest["defaults"]["skills"]} == DEFAULTS
+    assert {Path(entry["path"]).name for entry in manifest["optional"]["skills"]} == NAMES - DEFAULTS
     files = plugin_default_files(candidate)
-    for name in NAMES:
+    for name in DEFAULTS:
         assert files[Path("skills") / f"cultivate-{name}" / "SKILL.md"] == (
             SKILLS / name / "SKILL.md"
         ).read_text()
@@ -50,7 +53,7 @@ def test_unselected_provider_has_no_defaults() -> None:
 def test_moved_poller_resources_are_inventoried() -> None:
     [candidate] = enabled_plugins(enable="cultivate")
     files = plugin_default_files(candidate)
-    for name in NAMES - {"github", "review"}:
+    for name in DEFAULTS:
         prefix = Path("skills") / f"cultivate-{name}"
         assert (SKILLS / name / "pollers.json").is_file()
         assert (SKILLS / name / "scripts/poller.py").is_file()
@@ -73,6 +76,10 @@ def test_selected_home_catalog_commands_and_documented_paths(
     )
 
     created = seed_plugin_defaults(home, selected=(candidate,))
+    assert not (home / "skills/cultivate-github-poller").exists()
+    for skill in selected_skills():
+        if not skill.default:
+            install_skill(home, skill)
     registry = ChatSkillRegistry.from_config(Config.from_env())
     assert {skill.command for skill in registry.list_discoverable()} == {
         f"/cultivate-{name}" for name in NAMES
@@ -80,7 +87,8 @@ def test_selected_home_catalog_commands_and_documented_paths(
     for name in NAMES:
         source = SKILLS / name
         installed = home / "skills" / f"cultivate-{name}"
-        assert created[f"skills/cultivate-{name}/SKILL.md"] == "created"
+        if name in DEFAULTS:
+            assert created[f"skills/cultivate-{name}/SKILL.md"] == "created"
         assert installed.joinpath("SKILL.md").read_bytes() == source.joinpath("SKILL.md").read_bytes()
         assert load_skill(installed).name == f"cultivate-{name}"
         if name not in {"github", "review"}:
@@ -106,8 +114,12 @@ def test_selected_home_github_poller_emits_resolvable_review_guidance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     [candidate] = enabled_plugins(enable="cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     home = tmp_path / "home"
     seed_plugin_defaults(home, selected=(candidate,))
+    for skill in selected_skills():
+        if not skill.default:
+            install_skill(home, skill)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_GITHUB_PRELOAD_REVIEW_SKILL", "1")
     monkeypatch.delenv("MIMIR_GITHUB_REVIEW_SKILL_PATH", raising=False)
