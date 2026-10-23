@@ -252,7 +252,7 @@ async def test_selected_provider_gate_never_runs_controller_shell(
             issue_id=1949, attempt=1,
         )
         compute._launch_contained = lambda *_: called.append("should not launch")
-    with pytest.raises(ComputeLaunchError, match="authorized worker checkout"):
+    with pytest.raises(ComputeLaunchError, match="worker-bound checkout"):
         await observe_evidence(
             issue=1949, attempt=1, backend="opencode", branch="feature/1949",
             checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",

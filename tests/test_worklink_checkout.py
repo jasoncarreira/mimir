@@ -1361,15 +1361,13 @@ def test_fd_normalization_rejects_special_files(
         os.close(checkout_fd)
 
 
-def test_enabled_eligible_checkout_uses_worker_root_and_authorization(
+def test_enabled_eligible_checkout_is_a_worker_group_path_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = _repo_with_main(tmp_path)
     calls: list[list[str]] = []
     pytest.importorskip("mimir_cultivate")
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
-    worker_root = tmp_path / "enabled"
-    monkeypatch.setattr(checkout_module, "_ENABLED_CHECKOUT_ROOT", worker_root)
     monkeypatch.setattr(
         checkout_module,
         "get_identities",
@@ -1389,11 +1387,12 @@ def test_enabled_eligible_checkout_uses_worker_root_and_authorization(
         worker_eligible=True,
     )
     try:
-        assert lease.path.is_relative_to(worker_root)
-        assert lease.path.name == "checkout"
-        assert lease.worker_authorized is True
-        assert lease.authorization is not None
-        lease.authorization.verify(lease.path)
+        # Leaf builds use base's path-addressed checkout: the worklink uid
+        # reaches it through the shared, worklink-group parent, and no
+        # FD-anchored authorization is minted.
+        assert lease.path == repo.parent / ".worklink" / repo.name / "1410-1"
+        assert lease.worker_authorized is False
+        assert lease.authorization is None
         assert stat.S_IMODE(lease.path.stat().st_mode) == 0o2770
         assert lease.path.stat().st_gid == os.getgid()
         assert stat.S_IMODE((lease.path / ".git").stat().st_mode) == 0o2770
