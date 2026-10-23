@@ -3872,6 +3872,11 @@ class WorklinkRunner:
         status = factory_record.status
         if status is None:
             raise WorklinkError("factory terminal projection is missing")
+        if not (status.is_parked or status.is_terminal):
+            raise WorklinkError("factory OpenCode prune requires a parked or terminal status")
+        from .factory_store import prune_factory_store
+
+        await asyncio.to_thread(prune_factory_store, factory_record)
         if status.is_parked:
             diagnosis = factory_record.controller_error or "factory run is parked"
             park_report = (

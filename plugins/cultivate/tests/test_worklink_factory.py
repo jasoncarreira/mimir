@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -17,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mimir_cultivate.worklink import autonomy, evidence, orchestrator, worker_client, worker_exec
+from mimir_cultivate.worklink import autonomy, evidence, factory_store, orchestrator, worker_client, worker_exec
 from mimir_cultivate.worklink.backends.base import ComputeLaunchError
 from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend, parse_factory_status
 from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
@@ -147,6 +148,14 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     checkout.parent.parent.chmod(0o755)
     checkout.parent.chmod(0o2750)
     checkout.chmod(0o2770)
+    db_path = checkout.parent / ".factory-runtime" / "data" / "opencode" / "opencode.db"
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as db:
+        db.execute("CREATE TABLE event (type TEXT)")
+        db.execute("INSERT INTO event VALUES ('message.part.updated')")
+    # The controller must not open the worker-owned store itself. The executor
+    # invokes the same script under the checkout owner, outside this process.
+    monkeypatch.setattr(factory_store, "_prune_db", lambda path: pytest.fail("controller opened worker store"))
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".factory.json").write_text(json.dumps({
@@ -183,8 +192,10 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", lambda self, *a, **kw: ClaimResult(True, claim))
     monkeypatch.setattr(orchestrator.ChainlinkClaims, "transition_issue", lambda *a, **kw: None)
     monkeypatch.setattr(orchestrator.ChainlinkClaims, "release_issue", lambda *a, **kw: True)
+    dead = subprocess.Popen(["true"])
+    dead.wait()
     monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "launch", lambda self, spec: asyncio.sleep(
-        0, result=LaunchHandle("local_subprocess", "handle", 123),
+        0, result=LaunchHandle("local_subprocess", str(dead.pid), 1, dead.pid),
     ))
     cancelled = asyncio.Event()
     waits: list[LaunchHandle] = []
@@ -298,6 +309,8 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     assert payload["checkout"] == str(result.checkout)
     assert payload["tests"]["exit_code"] == 0
     assert "1949" in payload["tests"]["summary"]
+    with sqlite3.connect(db_path) as db:
+        assert db.execute("SELECT count(*) FROM event").fetchone() == (0,)
 
 
 @pytest.mark.asyncio

@@ -391,12 +391,32 @@ def prune_stale_attempt_checkouts_for_home(
                 (record := records.get(child.resolve())) is None
                 or record.publication_outcome != "determined-unpublished"
             ),
+            prepare_prune=lambda child: _prepare_factory_runtime_prune(child, factory_records),
         )
         for child in pruned:
             record = records.get(child.resolve())
             if record is not None and record.publication_outcome == "undetermined":
                 _clear_pruned_orphan_block(home, record, run=run)
         return pruned
+
+
+def _prepare_factory_runtime_prune(child: Path, factory_records: Sequence[object]) -> bool:
+    """Empty worker-owned subdirectories before the controller removes the attempt."""
+    runtime = child / ".factory-runtime"
+    if not runtime.exists() and not runtime.is_symlink():
+        return True
+    # The same interlock protects the record read and this operation. An unknown
+    # or unverified process is not authority to clear another run's store.
+    for record in factory_records:
+        if f"{getattr(record, 'issue_id', None)}-{getattr(record, 'attempt', None)}" == child.name and not factory_process_is_verified_dead(record):
+            return False
+    try:
+        from .factory_store import clear_prunable_runtime
+
+        clear_prunable_runtime(child)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
 
 
 def _clear_pruned_orphan_block(

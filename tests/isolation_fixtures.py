@@ -218,7 +218,7 @@ def synthetic_worklink_identities(monkeypatch, request):
     # Every loaded provider binding of the real accessor, including the
     # accessor's own module so call-time ``from .identities import`` sees it.
     if real_accessor is not None:
-        for module_name, module in list(sys.modules.items()):
+        for module_name, module in sys.modules.copy().items():
             if (
                 module_name.startswith("mimir_cultivate.")
                 and getattr(module, "get_identities", None) is real_accessor
