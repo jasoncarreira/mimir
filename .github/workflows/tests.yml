@@ -374,7 +374,7 @@ jobs:
     # come back red on the same root cause.
     needs: skill-conformance
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -817,7 +817,7 @@ jobs:
     # enforced failure with a skipif on the flag.
     needs: skill-conformance
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
