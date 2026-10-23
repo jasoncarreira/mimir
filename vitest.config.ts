@@ -19,5 +19,8 @@ export default defineConfig({
   test: {
     setupFiles: ["./frontend/src/vitest.setup.ts"],
     exclude: [...configDefaults.exclude, "**/.factory/**", "**/.factory-sandboxes/**"],
+    // Hang guards sized for parallel full-suite load, not latency assertions.
+    testTimeout: 30000,
+    hookTimeout: 30000,
   },
 });

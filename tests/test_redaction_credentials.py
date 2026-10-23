@@ -127,10 +127,10 @@ def test_benign_structured_keys() -> None:
 def test_repeated_key_candidates_have_bounded_cost(fragment: str) -> None:
     texts = {
         size: (fragment * (size // len(fragment) + 1))[:size]
-        for size in (65536, 131072, 262144)
+        for size in (16384, 262144)
     }
     # Warm both paths before measuring; neither input contains YAML block
-    # indicators, so doubling does not switch between parser and scanner paths.
+    # indicators, so the 16x span does not switch between parser and scanner paths.
     for text in texts.values():
         assert redaction.redact_text(text) == text
 
@@ -148,12 +148,12 @@ def test_repeated_key_candidates_have_bounded_cost(fragment: str) -> None:
             assert result == texts[size]
             samples[size].append(elapsed)
 
-    t_1x = min(samples[65536])
-    t_4x = min(samples[262144])
-    # Across this 4x size span, linear and quadratic work grow ~4x and ~16x.
-    # Their geometric midpoint (8x) tolerates up to 2x multiplicative noise in
+    t_1x = min(samples[16384])
+    t_16x = min(samples[262144])
+    # Across this 16x size span, linear and quadratic work grow ~16x and ~256x.
+    # Their geometric midpoint (64x) tolerates up to 4x multiplicative noise in
     # either direction while still discriminating the two complexity classes.
-    assert t_4x < t_1x * 8, (fragment, t_1x, t_4x)
+    assert t_16x < t_1x * 64, (fragment, t_1x, t_16x)
 
 
 def test_shared_pattern_registration() -> None:
