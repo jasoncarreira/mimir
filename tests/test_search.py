@@ -286,6 +286,167 @@ async def test_sweep_skips_workspace_paths(tmp_path: Path):
     assert "state/neighbor.md" in paths
 
 
+# ---- Sweep shutdown -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing", [False, True], ids=["add", "update"])
+async def test_stop_finishes_only_in_flight_sweep_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing: bool,
+) -> None:
+    """Exercise the real sweep/reindex: stop skips later embeds and deletions."""
+    import threading
+
+    paths = [tmp_path / "state" / f"{n}.md" for n in range(3)]
+    paths[0].parent.mkdir()
+    for path in paths:
+        path.write_text("old content", encoding="utf-8")
+    deleted = tmp_path / "state" / "deleted.md"
+    deleted.write_text("keep this indexed row during shutdown", encoding="utf-8")
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=False, sweep_loop=False)
+    await idx.reindex_path("state/deleted.md")
+    deleted.unlink()
+    if existing:
+        for path in paths:
+            await idx.reindex_path(path.relative_to(tmp_path).as_posix())
+            old_mtime = path.stat().st_mtime
+            path.write_text("new content", encoding="utf-8")
+            os.utime(path, (old_mtime + 5, old_mtime + 5))
+    # Filesystem enumeration order is not part of the shutdown contract.
+    monkeypatch.setattr(idx, "_walk_indexable", lambda: iter(paths))
+    entered = asyncio.Event()
+    stop_started = asyncio.Event()
+    release = threading.Event()
+    stop_returned = threading.Event()
+    embedded: list[list[str]] = []
+    loop = asyncio.get_running_loop()
+    original_embed = idx._embedder.embed
+
+    def held_embed(texts, input_type="passage"):
+        assert not stop_returned.is_set(), "embedding started after stop returned"
+        embedded.append(list(texts))
+        loop.call_soon_threadsafe(entered.set)
+        if not release.wait(30):
+            raise TimeoutError("in-flight embedding was not released")
+        return original_embed(texts, input_type=input_type)
+
+    monkeypatch.setattr(idx._embedder, "embed", held_embed)
+
+    async def stop_indexer() -> None:
+        stop_started.set()
+        await idx.stop()
+        stop_returned.set()
+
+    sweep = asyncio.create_task(idx.sweep())
+    stop = None
+    try:
+        await asyncio.wait_for(entered.wait(), 30)
+        stop = asyncio.create_task(stop_indexer())
+        await asyncio.wait_for(stop_started.wait(), 30)
+        assert idx._closed
+        assert not stop.done(), "stop did not join the in-flight file"
+        release.set()
+        await asyncio.wait_for(asyncio.shield(stop), 30)
+        stats = await asyncio.wait_for(asyncio.shield(sweep), 30)
+        assert stats == {"added": 0 if existing else 1,
+                         "updated": 1 if existing else 0, "removed": 0}
+        assert len(embedded) == 1, "shutdown embedded later files"
+        assert sweep.done() and not idx._active_sweeps
+        with sqlite3.connect(idx._db_path) as conn:
+            rows = dict(conn.execute("SELECT path, mtime FROM files"))
+        assert "state/deleted.md" in rows, "shutdown continued into deletions"
+        assert rows["state/0.md"] == paths[0].stat().st_mtime
+        for path in paths[1:]:
+            rel = path.relative_to(tmp_path).as_posix()
+            if existing:
+                assert rows[rel] < path.stat().st_mtime
+            else:
+                assert rel not in rows
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(sweep, *([stop] if stop else [])), 30)
+        await idx.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_skips_remaining_sweep_deletions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop inside a real SQLite deletion, not just before the deletion loop."""
+    import threading
+
+    (tmp_path / "state").mkdir()
+    idx = _make_indexer(tmp_path)
+    await idx.start(run_initial_sweep=False, sweep_loop=False)
+    for n in range(3):
+        path = tmp_path / "state" / f"{n}.md"
+        path.write_text(f"content {n}", encoding="utf-8")
+        await idx.reindex_path(f"state/{n}.md")
+        path.unlink()
+    entered = asyncio.Event()
+    stop_started = asyncio.Event()
+    release = threading.Event()
+    # SQLite may trace the same statement again while executing FK triggers.
+    deletions: set[str] = set()
+    loop = asyncio.get_running_loop()
+    original_connect = idx._connect
+
+    def trace(sql: str) -> None:
+        if sql.startswith("DELETE FROM files"):
+            deletions.add(sql)
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(30):
+                raise TimeoutError("in-flight deletion was not released")
+
+    def traced_connect():
+        conn = original_connect()
+        conn.set_trace_callback(trace)
+        return conn
+
+    monkeypatch.setattr(idx, "_connect", traced_connect)
+
+    async def stop_indexer() -> None:
+        stop_started.set()
+        await idx.stop()
+
+    sweep = asyncio.create_task(idx.sweep())
+    stop = None
+    try:
+        await asyncio.wait_for(entered.wait(), 30)
+        stop = asyncio.create_task(stop_indexer())
+        await asyncio.wait_for(stop_started.wait(), 30)
+        assert idx._closed and not stop.done()
+        release.set()
+        await asyncio.wait_for(asyncio.shield(stop), 30)
+        stats = await asyncio.wait_for(asyncio.shield(sweep), 30)
+        assert stats == {"added": 0, "updated": 0, "removed": 1}
+        assert len(deletions) == 1
+        assert sweep.done() and not idx._active_sweeps
+        with sqlite3.connect(idx._db_path) as conn:
+            for table in ("files", "chunks", "chunks_fts"):
+                assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 2
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(sweep, *([stop] if stop else [])), 30)
+        await idx.stop()
+
+
+@pytest.mark.asyncio
+async def test_sweep_after_stop_does_not_submit_executor_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    idx = _make_indexer(tmp_path)
+    await idx.stop()
+
+    def executor_closed(*args, **kwargs):
+        raise RuntimeError("Executor shutdown has been called")
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "run_in_executor", executor_closed)
+    assert await idx.sweep() == {"added": 0, "updated": 0, "removed": 0}
+    assert not idx._active_sweeps
+
+
 # ---- Incremental reindex --------------------------------------------------
 
 

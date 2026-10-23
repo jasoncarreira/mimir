@@ -4133,6 +4133,64 @@ def deterministic_server_embeddings():
 
 
 @pytest.mark.asyncio
+async def test_cleanup_joins_cancelled_startup_index_sweep_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling the startup task must not leave its file-writing thread alive."""
+    import threading
+
+    from mimir.search import Indexer
+
+    entered = asyncio.Event()
+    finished = threading.Event()
+    stop_entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    marker = tmp_path / "state" / "sweep-finished"
+
+    def held_sweep(indexer: Indexer) -> dict[str, int]:
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            if not release.wait(HANG_GUARD_SECONDS):
+                raise TimeoutError("startup index sweep was not released")
+            marker.write_text("done", encoding="utf-8")
+            return {"added": 0, "updated": 0, "removed": 0}
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(Indexer, "_check_dim_mismatch", lambda self: None)
+    monkeypatch.setattr(Indexer, "_sweep_sync", held_sweep)
+    original_stop = Indexer.stop
+
+    async def checked_stop(indexer: Indexer) -> None:
+        stop_entered.set()
+        await original_stop(indexer)
+        assert finished.is_set(), "indexer.stop returned while its sweep worker could still write"
+
+    monkeypatch.setattr(Indexer, "stop", checked_stop)
+    app, _ = _controlled_server_app(
+        tmp_path, monkeypatch, _ServerControl(real_dispatcher=True, real_runtime=True),
+    )
+    await _run_startup(app)
+    cleanup: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
+        cleanup = asyncio.create_task(_run_cleanup(app))
+        await asyncio.wait_for(stop_entered.wait(), HANG_GUARD_SECONDS)
+        release.set()
+        await asyncio.wait_for(asyncio.shield(cleanup), HANG_GUARD_SECONDS)
+        assert finished.is_set()
+        assert marker.read_text(encoding="utf-8") == "done"
+    finally:
+        release.set()
+        if cleanup is None:
+            await _run_cleanup(app)
+        else:
+            await asyncio.wait_for(cleanup, HANG_GUARD_SECONDS)
+        assert await asyncio.to_thread(finished.wait, HANG_GUARD_SECONDS)
+
+
+@pytest.mark.asyncio
 async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_healthy(
     monkeypatch: pytest.MonkeyPatch,
     deterministic_server_embeddings,
