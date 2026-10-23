@@ -12005,17 +12005,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     class Authorization:
         def __init__(self):
             self.closed = 0
-            self.path = checkout
-            self.issue_id = 1410
-            self.attempt = 1
             self.fd = os.open(checkout, os.O_RDONLY | os.O_DIRECTORY)
-            self.device = os.fstat(self.fd).st_dev
-            self.inode = os.fstat(self.fd).st_ino
-
-        def verify(self, path):
-            assert self.closed == 0 and path == self.path
-            observed = os.stat(path, follow_symlinks=False)
-            assert (observed.st_dev, observed.st_ino) == (self.device, self.inode)
 
         def duplicate_fd(self):
             assert self.closed == 0
@@ -12083,15 +12073,15 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     publication = Publication()
 
     class BoundCompute(LocalSubprocessComputeBackend):
-        name = "local_subprocess"
-
-        async def _launch_contained(self, spec, command):
-            self._authorized_checkout.verify(spec.local_checkout)
-            assert command == tuple(spec.local_argv)
-            return await self.launch(spec)
-
+        # A worker-bound, path-addressed compute (base's leaf model): the gate
+        # enters _launch_contained, never launch()'s controller fallback.
         def capabilities(self):
             return ComputeCaps(True, False, True, False)
+
+        async def _launch_contained(self, spec, command):
+            assert self._worker_uid == worker_uid
+            assert command == tuple(spec.local_argv)
+            return await self.launch(spec)
 
         async def launch(self, spec):
             bound_specs.append(spec)
@@ -12128,7 +12118,8 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         async def cancel(self, handle):
             return None
 
-    bound = BoundCompute(_authorized_checkout=authorization, _worker_uid=4242)
+    worker_uid = 4242
+    bound = BoundCompute(_worker_uid=worker_uid)
 
     class WorkerBackend(FakeBackend):
         name = "opencode"
@@ -12187,8 +12178,8 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             "main",
             local_base="base-sha",
             isolated_checkout=True,
-            worker_authorized=True,
-            authorization=authorization,
+            worker_authorized=False,
+            authorization=None,
         )
 
     def capture(*args, **kwargs):
@@ -12197,8 +12188,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
 
     requested_uids = []
 
-    def bind(cls, issued, *, worker_uid, **kwargs):
-        assert issued is authorization
+    def bind(cls, worker_uid, **kwargs):
         requested_uids.append(worker_uid)
         return bound
 
@@ -12231,7 +12221,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     monkeypatch.setattr(orchestrator, "OpenCodeBackend", WorkerBackend)
     monkeypatch.setattr(orchestrator, "create_isolated_checkout", create_checkout)
     monkeypatch.setattr(orchestrator.ControllerGitPublication, "capture", capture)
-    monkeypatch.setattr(LocalSubprocessComputeBackend, "for_authorized_checkout", classmethod(bind))
+    monkeypatch.setattr(LocalSubprocessComputeBackend, "for_path_checkout", classmethod(bind))
     if scenario == "evidence_exception":
         async def fail_evidence(**kwargs):
             raise RuntimeError("evidence failed")
@@ -12246,9 +12236,10 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     assert checkout_kwargs["worker_eligible"] is True
     assert requested_uids == [worker_uid]
     assert lifecycle.count("publication-acquired") == 1
-    assert lifecycle[-2:] == ["publication", "authorization"]
+    assert lifecycle[-1:] == ["publication"]
     assert publication.closed == 1
-    assert authorization.closed == 1
+    assert authorization.closed == 0
+    authorization.close()
     expected_published = scenario in {"success", "branch_cleanup_exception"}
     expected_blocked = scenario in {
         "blocked",
@@ -12258,7 +12249,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     }
     assert result.status == (
         "completed" if expected_published else ("blocked" if expected_blocked else "failed")
-    ), result.reason
+    )
     assert checkout.exists() is (not expected_published)
     assert sibling_marker.read_text() == "keep me\n"
     expected_launches = {

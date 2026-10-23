@@ -579,7 +579,7 @@ jobs:
 
       - name: Run retained-remediation coverage as root with distinct identities
         # Coding integration: Cultivate is installed (above) and selected here.
-        # All three tests importorskip mimir_cultivate and skip without Linux
+        # All four tests importorskip mimir_cultivate and skip without Linux
         # root or distinct identities, so a passing exit code alone proves
         # nothing: the JUnit check below requires every one of them to EXECUTE.
         env:
@@ -596,9 +596,10 @@ jobs:
               --basetemp "$PYTEST_EVIDENCE_ROOT/remediation-root" \
               --junitxml "$junit" \
               tests/test_worklink_remediation_e2e.py::test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests \
+              tests/test_worklink_remediation_e2e.py::test_leaf_checkout_lets_the_worklink_uid_run_real_git \
               tests/test_worklink_worker_exec.py::test_factory_file_rpc_creates_as_worklink_not_controller \
               tests/test_repo_tools.py::test_project_test_real_executor_preserves_active_lease_for_later_commit
-          # Fail unless exactly the three selected tests ran and passed: one
+          # Fail unless exactly the four selected tests ran and passed: one
           # quiet skip (a missing account, a lost import) is the regression.
           sudo .venv/bin/python - "$junit" <<'PY'
           import sys
@@ -608,7 +609,7 @@ jobs:
           cases = list(root.iter("testcase"))
           ran = [c.get("name") for c in cases
                  if not any(c.find(tag) is not None for tag in ("skipped", "failure", "error"))]
-          if len(cases) != 3 or len(ran) != 3:
+          if len(cases) != 4 or len(ran) != 4:
               skipped = {c.get("name"): (c.find("skipped").get("message") if c.find("skipped") is not None else None)
                          for c in cases}
               print(f"::error::real-identity coding tests did not all execute: ran={ran} all={skipped}")

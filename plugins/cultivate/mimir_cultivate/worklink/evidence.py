@@ -679,16 +679,26 @@ async def _observe_evidence_from_ref(
             or work_spec.backend != backend
             or work_spec.test_command != test_command
         )
-        worker_bound = worker_bound or (
-            authorization is None
-            or not all(hasattr(authorization, member) for member in ("verify", "duplicate_fd", "path"))
-            or authorization.path != checkout
-            or authorization.issue_id != issue
-            or authorization.attempt != attempt
-        )
+        if authorization is None:
+            # Leaf builds (base's model): a path-addressed checkout that the
+            # root executor opens for the configured worklink uid. Never the
+            # controller uid, and never launch()'s controller fallback.
+            from .identities import get_identities
+
+            worker_bound = worker_bound or (
+                getattr(compute, "_worker_uid", None) != get_identities().worklink_uid
+            )
+        else:
+            worker_bound = worker_bound or (
+                not all(hasattr(authorization, member) for member in ("verify", "duplicate_fd", "path"))
+                or authorization.path != checkout
+                or authorization.issue_id != issue
+                or authorization.attempt != attempt
+            )
         if worker_bound:
-            raise ComputeLaunchError("Cultivate evidence gate requires an authorized worker checkout")
-        authorization.verify(checkout)
+            raise ComputeLaunchError("Cultivate evidence gate requires a worker-bound checkout")
+        if authorization is not None:
+            authorization.verify(checkout)
     range_ref = f"{base_ref}...{head_ref}"
     def git_run(*args: str) -> subprocess.CompletedProcess[str]:
         if safe_git is not None:

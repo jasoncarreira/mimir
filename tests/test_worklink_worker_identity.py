@@ -222,7 +222,7 @@ def test_ci_worker_uid_leg_seeds_the_state_that_makes_it_discriminating() -> Non
 def test_ci_worker_uid_leg_executes_the_selected_cultivate_identity_tests() -> None:
     """The root real-identity leg must run Cultivate, not skip it to exit 5.
 
-    All three tests importorskip ``mimir_cultivate``; with only core synced they
+    All four tests importorskip ``mimir_cultivate``; with only core synced they
     all skip and pytest exits 5. Pin the order: the workspace provider is synced
     before the tree becomes read-only, selected for the root leg, every selected
     test must have executed, and the whole-suite worker leg is core-only again.
@@ -248,10 +248,11 @@ def test_ci_worker_uid_leg_executes_the_selected_cultivate_identity_tests() -> N
     assert 'MIMIR_PLUGINS="$MIMIR_PLUGINS"' in root["run"]
     assert "--junitxml" in root["run"]
     # The executed-count check, not just the pytest exit status.
-    assert 'len(cases) != 3 or len(ran) != 3' in root["run"]
+    assert 'len(cases) != 4 or len(ran) != 4' in root["run"]
     assert "|| true" not in root["run"]
     for selector in (
         "tests/test_worklink_remediation_e2e.py::test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests",
+        "tests/test_worklink_remediation_e2e.py::test_leaf_checkout_lets_the_worklink_uid_run_real_git",
         "tests/test_worklink_worker_exec.py::test_factory_file_rpc_creates_as_worklink_not_controller",
         "tests/test_repo_tools.py::test_project_test_real_executor_preserves_active_lease_for_later_commit",
     ):
@@ -571,11 +572,7 @@ def test_ci_runs_the_committed_live_image_proof() -> None:
     assert 'stat -c %U:%G /opt/mimir-worklink/uv-cache' in proof
     assert 'stat -c %a /opt/mimir-worklink/uv-cache' in proof
     assert "sibling-access negative control did not detect a cross-write" in proof
-    # Issued checkouts are isolated from each other: the worker must be DENIED
-    # its concurrent sibling, and a wrong path must fail rather than pass.
-    assert "worker reached a concurrent sibling checkout outside its issued boundary" in proof
-    assert "except PermissionError:" in proof
-    assert "intentionally shared sibling checkout" not in proof
+    assert "intentionally shared sibling checkout" in proof
     parsed = yaml.safe_load(workflow)
     configured_repo = parsed["jobs"]["worklink-image-identity"]["env"]["WORKLINK_REPO"]
     assert configured_repo == "/workspace/worklink-base"
@@ -585,15 +582,7 @@ def test_ci_runs_the_committed_live_image_proof() -> None:
     assert 'shlex.quote(str(repo / \'tracked\'))' in proof
     assert "/workspace/mimir" not in proof
     assert "worklink-publication-attack" in proof
-    # The worker plants hostile push/hook/credential metadata by writing the
-    # config file (git cannot stat an FD-anchored checkout), read back verbatim.
-    assert "pushurl = /tmp/worklink-hostile.git" in proof
-    assert "hostile setup did not persist" in proof
+    assert 'remote", "set-url", "--push"' in proof
     assert "ControllerGitPublication.capture" in proof
-    # Selected Cultivate issues worker checkouts through the authorized path,
-    # as WorklinkOrchestrator does; the proof drives the worker through it.
-    assert "did not take the authorized checkout path" in proof
-    assert "issued.authorization.verify(issued.path)" in proof
-    assert "for_authorized_checkout(lease.authorization, worker_uid=1002)" in proof
-    assert "Worklink unexpectedly selected the contained checkout path" not in proof
+    assert "Worklink unexpectedly selected the contained checkout path" in proof
     assert "issue_id=1411" in proof

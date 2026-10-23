@@ -541,30 +541,15 @@ def create_isolated_checkout(
 
     _assert_base_separate_from_controller(repo)
 
-    selected_worker = _cultivate_selected() and worker_eligible and not factory_worker
-    worker_accessible = factory_worker or selected_worker
+    worker_accessible = factory_worker or (_cultivate_selected() and worker_eligible)
     identities = get_identities() if worker_accessible else None
     path = _isolated_checkout_path(
-        repo, worklink_dir, issue_id, attempt, worker_authorized=selected_worker
+        repo, worklink_dir, issue_id, attempt, worker_authorized=False
     )
     branch = checkout_branch or f"issue/{issue_id}-a{attempt}"
-    if factory_worker or selected_worker:
+    if factory_worker:
         path.parent.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-        if selected_worker:
-            path.parent.mkdir(mode=0o700)
-            # worker_exec accepts an issued checkout only inside a mimir:worklink
-            # 0700 boundary. mkdir leaves the controller's primary group, so the
-            # executor refused every selected checkout as "isolation boundary is
-            # invalid". The controller is a member of the worklink group.
-            assert identities is not None
-            try:
-                os.chown(path.parent, -1, identities.worklink_gid)
-                os.chmod(path.parent, 0o700)
-            except OSError:
-                path.parent.rmdir()
-                raise
-        else:
-            path.parent.mkdir(mode=0o755, exist_ok=True)
+        path.parent.mkdir(mode=0o755, exist_ok=True)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -663,12 +648,9 @@ def create_isolated_checkout(
     try:
         _assert_self_contained_checkout(path, runner=runner)
         if worker_accessible:
-            checkout_fd = (
-                _open_worklink_checkout(path.relative_to(_ENABLED_CHECKOUT_ROOT))
-                if selected_worker else os.open(
-                    path,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                )
+            checkout_fd = os.open(
+                path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
             )
             try:
                 assert identities is not None
@@ -677,12 +659,8 @@ def create_isolated_checkout(
                     owner_uid=identities.mimir_uid,
                     group_gid=identities.worklink_gid,
                 )
-                if selected_worker:
-                    authorization = _mint_checkout_authorization(path, issue_id, attempt, checkout_fd)
-                    checkout_fd = -1
             finally:
-                if checkout_fd >= 0:
-                    os.close(checkout_fd)
+                os.close(checkout_fd)
     except (OSError, RuntimeError):
         shutil.rmtree(path, ignore_errors=True)
         raise
@@ -696,7 +674,7 @@ def create_isolated_checkout(
         base_ref=base,
         local_base=local_base,
         isolated_checkout=True,
-        worker_authorized=selected_worker,
+        worker_authorized=False,
         authorization=authorization,
     )
 

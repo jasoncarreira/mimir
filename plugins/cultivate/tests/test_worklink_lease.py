@@ -85,46 +85,15 @@ def test_selected_checkout_path_and_pruning_ignore_legacy_flag(
     assert not path.parent.exists()
 
 
-def test_selected_worker_boundary_carries_the_worker_group_the_executor_requires(
+def test_selected_worker_leaf_checkout_is_path_addressed_like_base(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The boundary must be mimir:worklink 0700, as worker_exec validates it.
+    """Leaf builds keep base's model: a worker-traversable path checkout.
 
-    Synthetic identities elsewhere set worklink_gid to the primary group, which
-    is exactly what mkdir produces, so they cannot see a boundary left in the
-    controller's own group. Use a distinct supplementary group instead.
+    The worklink uid still runs the build (through the executor's
+    path-addressed RPC), but the checkout is not FD-only: coding CLIs and git
+    must be able to stat their own tree, and siblings share one parent.
     """
-    worker_gid = next((gid for gid in os.getgroups() if gid != os.getgid()), None)
-    if worker_gid is None:
-        pytest.skip("requires a supplementary group distinct from the primary group")
-    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
-    root = tmp_path / "worker-checkouts"
-    monkeypatch.setattr(checkout, "_ENABLED_CHECKOUT_ROOT", root)
-    monkeypatch.setattr(checkout, "get_identities", lambda: SimpleNamespace(
-        mimir_uid=os.getuid(), worklink_gid=worker_gid,
-    ))
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    for args in (("init", "-b", "main", str(repo)),
-                 ("-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.org",
-                  "commit", "--allow-empty", "-m", "initial"),
-                 ("-C", str(repo), "remote", "add", "origin", str(repo))):
-        subprocess.run(["git", *args], capture_output=True, text=True, check=True)
-
-    lease = checkout.create_isolated_checkout(repo, issue_id=1950, attempt=1, worker_eligible=True)
-    try:
-        boundary = lease.path.parent.stat()
-        assert (boundary.st_uid, boundary.st_gid) == (os.getuid(), worker_gid)
-        assert stat.S_IMODE(boundary.st_mode) == 0o700
-        assert lease.path.stat().st_gid == worker_gid
-    finally:
-        if lease.authorization is not None:
-            lease.authorization.close()
-
-
-def test_selected_worker_checkout_issues_capability_and_cleans_up(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
     monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     root = tmp_path / "worker-checkouts"
@@ -153,32 +122,21 @@ def test_selected_worker_checkout_issues_capability_and_cleans_up(
     lease = checkout.create_isolated_checkout(
         repo, issue_id=1949, attempt=1, worker_eligible=True, runner=runner,
     )
-    assert lease.path.parent.parent.parent == root
-    assert lease.path.name == "checkout"
-    assert lease.worker_authorized
-    assert lease.authorization is not None
-    lease.authorization.verify(lease.path)
-    assert stat.S_IMODE(lease.path.parent.stat().st_mode) == 0o700
-    assert stat.S_IMODE(lease.path.stat().st_mode) == 0o2770
-    assert "--no-hardlinks" in next(call for call in calls if call[:3] == ["git", "clone", "--local"])
-    assert not (tmp_path / ".worklink").exists()
-
-    class SafeGit:
-        def run(self, *args, **kwargs):
-            assert args == ("update-ref", "-d", "refs/heads/issue/1949-a1")
-            assert kwargs == {"check": True}
-
-    assert checkout.cleanup_checkout(lease, outcome="completed", safe_git=SafeGit())
-    assert not lease.path.parent.exists()
-    with pytest.raises(ValueError, match="closed"):
-        lease.authorization.verify(lease.path)
-
-    controller = checkout.create_isolated_checkout(
-        repo, issue_id=1949, attempt=3, worker_eligible=False, runner=runner,
+    sibling = checkout.create_isolated_checkout(
+        repo, issue_id=1950, attempt=1, worker_eligible=True, runner=runner,
     )
-    assert controller.path == tmp_path / ".worklink" / "repo" / "1949-3"
-    assert not controller.worker_authorized and controller.authorization is None
-    assert checkout.cleanup_checkout(controller, outcome="completed", runner=runner)
+    assert lease.path == tmp_path / ".worklink" / "repo" / "1949-1"
+    assert sibling.path.parent == lease.path.parent
+    assert not lease.worker_authorized and lease.authorization is None
+    assert not root.exists(), "leaf builds must not use the FD-only issued-checkout root"
+    observed = lease.path.stat()
+    assert stat.S_IMODE(observed.st_mode) == 0o2770
+    assert observed.st_gid == os.getgid()
+    assert "--no-hardlinks" in next(call for call in calls if call[:3] == ["git", "clone", "--local"])
+
+    assert checkout.cleanup_checkout(lease, outcome="completed", runner=runner)
+    assert checkout.cleanup_checkout(sibling, outcome="completed", runner=runner)
+    assert not lease.path.exists() and not sibling.path.exists()
 
 
 def test_selected_worker_checkout_refuses_replaced_checkout_symlink(

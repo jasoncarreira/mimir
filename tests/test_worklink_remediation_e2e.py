@@ -1164,3 +1164,127 @@ async def test_external_read_taints_the_same_retained_turn_and_blocks_every_effe
             assert decision.reason == "write_blocked_by_untrusted_ingest"
             assert decision.refusal_detail == ac._TAINTED_WRITE_REFUSAL
     assert not (case.sandbox / "blocked.txt").exists()
+
+
+@pytest.mark.real_worklink_identities
+def test_leaf_checkout_lets_the_worklink_uid_run_real_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leaf build's worker uid runs real git in its own checkout.
+
+    Production path end to end: the controller (``mimir``, in the ``worklink``
+    group) issues a selected, worker-eligible leaf checkout, then launches
+    through the root executor's path-addressed RPC, which drops to the
+    ``worklink`` uid. Git must be able to stat and write that tree: an FD-only
+    checkout behind a closed 0700 boundary fails here with "failed to stat".
+    """
+    identities = _system_identities()
+    from mimir_cultivate.worklink import checkout as worklink_checkout
+    from mimir_cultivate.worklink import worker_client, worker_exec
+    from mimir_cultivate.worklink.backends.base import WorkSpec
+    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+
+    workspace = Path("/tmp") / f"mimir-leaf-git-{uuid.uuid4()}"
+    repo = workspace / "leaf-repo"
+    worklink_root = workspace / ".worklink"
+    executor_homes = workspace / "executor-homes"
+    controller_home = workspace / "controller-home"
+    socket_path = workspace / "executor.sock"
+    try:
+        repo.mkdir(parents=True)
+        controller_home.mkdir()
+        executor_homes.mkdir()
+        workspace.chmod(0o755)
+        os.chown(executor_homes, 0, identities.worklink_gid)
+        executor_homes.chmod(0o710)
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com",
+             "commit", "-q", "--allow-empty", "-m", "base")
+        _git(repo, "remote", "add", "origin", str(repo))
+        _chown_tree(repo, identities.mimir_uid, identities.mimir_gid)
+        os.chown(controller_home, identities.mimir_uid, identities.mimir_gid)
+        os.chown(workspace, identities.mimir_uid, identities.mimir_gid)
+
+        monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+        monkeypatch.setenv("HOME", str(controller_home))
+        monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", worklink_root)
+        monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", worklink_root)
+        monkeypatch.setattr(worker_exec, "HOME_ROOT", executor_homes)
+        script = "\n".join((
+            "set -eu",
+            f'test "$(id -u)" = {identities.worklink_uid}',
+            # The tree is controller-owned; a worker names it safe explicitly.
+            'g() { git -c safe.directory="$PWD" -c user.name=worker -c user.email=w@example.com "$@"; }',
+            "g status --porcelain",
+            "printf 'worker change\\n' > worker-file",
+            "g add worker-file",
+            "g commit -q -m 'worker commit'",
+            "g log -1 --format=%s",
+            "printf 'git-euid=%s\\n' \"$(id -u)\"",
+        ))
+
+        read_fd, write_fd = os.pipe()
+        with _ExecutorServer(socket_path, controller_uid=identities.mimir_uid):
+            pid = os.fork()
+            if pid == 0:
+                os.close(read_fd)
+                try:
+                    os.setgroups([identities.worklink_gid])
+                    os.setresgid(identities.mimir_gid, identities.mimir_gid, identities.mimir_gid)
+                    os.setresuid(identities.mimir_uid, identities.mimir_uid, identities.mimir_uid)
+                    lease = worklink_checkout.create_isolated_checkout(
+                        repo, issue_id=1412, attempt=1, base="main", worker_eligible=True,
+                    )
+                    assert not lease.worker_authorized and lease.authorization is None
+                    assert lease.path == worklink_root / repo.name / "1412-1"
+                    compute = LocalSubprocessComputeBackend.for_path_checkout(
+                        identities.worklink_uid,
+                        worker_client=worker_client.WorkerClient.for_path_checkout(
+                            lease.path, issue_id=1412, attempt=1,
+                            run_uid=identities.worklink_uid, socket_path=socket_path,
+                        ),
+                    )
+                    argv = ("/bin/sh", "-c", script)
+                    spec = WorkSpec(
+                        issue_id=1412, attempt=1, repo_url=str(repo), base_ref="main",
+                        branch=lease.branch, prompt="", rules=None, test_command="",
+                        backend="opencode", timeout_s=60, local_checkout=lease.path,
+                        local_argv=argv,
+                    )
+
+                    async def build():
+                        handle = await compute._launch_contained(spec, argv)
+                        try:
+                            return await compute.wait(handle, 60)
+                        finally:
+                            await compute.cleanup(handle)
+
+                    result = asyncio.run(build())
+                    committed = subprocess.run(
+                        ["git", "-c", f"safe.directory={lease.path}", "-C", str(lease.path),
+                         "log", "-1", "--format=%s"],
+                        capture_output=True, text=True, check=True,
+                    ).stdout.strip()
+                    owner = (lease.path / "worker-file").stat().st_uid
+                    payload = {"exit": result.exit_code, "stdout": result.stdout,
+                               "stderr": result.stderr, "committed": committed, "owner": owner}
+                except BaseException as exc:
+                    payload = {"error": repr(exc), "traceback": traceback.format_exc()}
+                os.write(write_fd, json.dumps(payload).encode())
+                os._exit(0)
+            os.close(write_fd)
+            chunks = []
+            while chunk := os.read(read_fd, 65536):
+                chunks.append(chunk)
+            os.close(read_fd)
+            _, status = os.waitpid(pid, 0)
+        payload = json.loads(b"".join(chunks))
+        assert os.waitstatus_to_exitcode(status) == 0, payload
+        assert "error" not in payload, payload
+        assert payload["exit"] == 0, payload
+        assert "worker commit" in payload["stdout"], payload
+        assert f"git-euid={identities.worklink_uid}" in payload["stdout"], payload
+        assert payload["committed"] == "worker commit"
+        assert payload["owner"] == identities.worklink_uid != identities.mimir_uid
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
