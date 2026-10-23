@@ -859,8 +859,9 @@ protect an admitted seed from code the operator already approved.
 
 ### Worklink And Factory Runs
 
-Poller-dispatched Worklink OpenCode builds use the `worklink` uid in a
-group-writable checkout under `/workspace/.worklink`. This prevents generated
+With the Cultivate plugin selected, poller-dispatched Worklink OpenCode builds
+use the `worklink` uid in a group-writable checkout under `/workspace/.worklink`.
+Core-only deployments have no `worklink` identity or Worklink paths. This prevents generated
 code from writing the source repository checkout as the agent user. It is not a
 sandbox, does not provide cross-run isolation, and is explicitly not credential
 isolation: the virtiofs home mount remains readable across guest identities

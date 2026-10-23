@@ -26,8 +26,10 @@ container with `MIMIR_PLUGINS=cultivate` in its environment. Without the build
 argument the image is core-only and has no Worklink executor. See
 [upgrading a coding deployment](../docs/plugins.md#upgrading-a-coding-deployment).
 
-The root-owned Worklink executor is installed into the image under
-`/opt/mimir-worklink`; it is not updated by a bind-mounted controller checkout.
+With Cultivate selected, and only then, the image also creates the `worklink`
+user and group (UID/GID 1002), the `/var/lib/mimir-worklink` checkout roots and
+the `worklink-execd` service. A core-only image has none of them. The root-owned
+Worklink executor is installed into the image under `/opt/mimir-worklink`; it is not updated by a bind-mounted controller checkout.
 Its source is cloned from `MIMIR_GIT_URL` (the upstream repository by default)
 and fetched from the required, fully qualified `MIMIR_GIT_REF`. The build requires
 the fetched commit to equal the full `MIMIR_EXECUTOR_COMMIT` SHA, so the ref makes
