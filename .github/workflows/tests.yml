@@ -515,8 +515,11 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
 
-      - name: Sync dependencies (with dev and bench extras)
-        run: uv sync --extra dev --extra bench
+      - name: Sync dependencies (with dev and bench extras and the Cultivate member)
+        # The real-identity coding tests below exercise the Cultivate worker, so
+        # the workspace provider must be installed BEFORE the tree is made
+        # read-only to the worker. The whole-suite leg re-syncs to core-only.
+        run: uv sync --locked --all-packages --extra dev --extra bench
 
       - name: Install AppArmor syntax checker (no kernel enforcement required)
         run: |
@@ -575,17 +578,55 @@ jobs:
           echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
       - name: Run retained-remediation coverage as root with distinct identities
+        # Coding integration: Cultivate is installed (above) and selected here.
+        # All three tests importorskip mimir_cultivate and skip without Linux
+        # root or distinct identities, so a passing exit code alone proves
+        # nothing: the JUnit check below requires every one of them to EXECUTE.
+        env:
+          MIMIR_PLUGINS: cultivate
         run: |
           set -euo pipefail
+          junit="$PYTEST_EVIDENCE_ROOT/remediation-junit.xml"
           sudo env \
             HOME="$HOME" \
             PATH="$PATH" \
             PYTHONDONTWRITEBYTECODE=1 \
-            .venv/bin/python -m pytest -q --tb=short -p no:cacheprovider \
+            MIMIR_PLUGINS="$MIMIR_PLUGINS" \
+            .venv/bin/python -m pytest -q --tb=short -rs -p no:cacheprovider \
               --basetemp "$PYTEST_EVIDENCE_ROOT/remediation-root" \
+              --junitxml "$junit" \
               tests/test_worklink_remediation_e2e.py::test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests \
               tests/test_worklink_worker_exec.py::test_factory_file_rpc_creates_as_worklink_not_controller \
               tests/test_repo_tools.py::test_project_test_real_executor_preserves_active_lease_for_later_commit
+          # Fail unless exactly the three selected tests ran and passed: one
+          # quiet skip (a missing account, a lost import) is the regression.
+          sudo .venv/bin/python - "$junit" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          cases = list(root.iter("testcase"))
+          ran = [c.get("name") for c in cases
+                 if not any(c.find(tag) is not None for tag in ("skipped", "failure", "error"))]
+          if len(cases) != 3 or len(ran) != 3:
+              skipped = {c.get("name"): (c.find("skipped").get("message") if c.find("skipped") is not None else None)
+                         for c in cases}
+              print(f"::error::real-identity coding tests did not all execute: ran={ran} all={skipped}")
+              sys.exit(1)
+          print("executed and passed:", ", ".join(ran))
+          PY
+
+      - name: Return the venv to core-only for the whole-suite worker leg
+        # The non-owning-worker leg below keeps its core-only coverage: an exact
+        # sync removes the workspace provider again, and nothing selects it.
+        run: |
+          set -euo pipefail
+          uv sync --locked --extra dev --extra bench
+          if .venv/bin/python -c 'import mimir_cultivate' 2>/dev/null; then
+            echo "::error::mimir_cultivate is still installed for the core-only leg"; exit 1
+          fi
+          sudo -u worklink test -x .venv/bin/python \
+            || { echo "::error::worker uid cannot execute the re-synced venv interpreter"; exit 1; }
 
       - name: Report pytest worker capacity
         run: .venv/bin/python -c 'import os; from types import SimpleNamespace; from xdist.plugin import pytest_xdist_auto_num_workers as workers; print("logical CPUs:", os.cpu_count(), "; xdist -n auto workers:", workers(SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))))'

@@ -219,6 +219,53 @@ def test_ci_worker_uid_leg_seeds_the_state_that_makes_it_discriminating() -> Non
     assert env.get("MIMIR_FILE_TOOL_ROOTS")
 
 
+def test_ci_worker_uid_leg_executes_the_selected_cultivate_identity_tests() -> None:
+    """The root real-identity leg must run Cultivate, not skip it to exit 5.
+
+    All three tests importorskip ``mimir_cultivate``; with only core synced they
+    all skip and pytest exits 5. Pin the order: the workspace provider is synced
+    before the tree becomes read-only, selected for the root leg, every selected
+    test must have executed, and the whole-suite worker leg is core-only again.
+    """
+    job = _worker_uid_job()
+    names = [step.get("name", "") for step in job["steps"]]
+    index = {name: i for i, name in enumerate(names)}
+
+    def step(prefix: str) -> tuple[int, dict]:
+        matches = [(i, s) for i, s in enumerate(job["steps"]) if s.get("name", "").startswith(prefix)]
+        assert len(matches) == 1, prefix
+        return matches[0]
+
+    sync_i, sync = step("Sync dependencies")
+    readonly_i, _ = step("Create distinct controller and worker identities")
+    root_i, root = step("Run retained-remediation coverage as root")
+    core_i, core = step("Return the venv to core-only")
+    suite_i = index["Run mimir test suite as the non-owning worker uid"]
+    assert sync_i < readonly_i < root_i < core_i < suite_i
+
+    assert "--all-packages" in sync["run"].split()
+    assert root.get("env", {}).get("MIMIR_PLUGINS") == "cultivate"
+    assert 'MIMIR_PLUGINS="$MIMIR_PLUGINS"' in root["run"]
+    assert "--junitxml" in root["run"]
+    # The executed-count check, not just the pytest exit status.
+    assert 'len(cases) != 3 or len(ran) != 3' in root["run"]
+    assert "|| true" not in root["run"]
+    for selector in (
+        "tests/test_worklink_remediation_e2e.py::test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests",
+        "tests/test_worklink_worker_exec.py::test_factory_file_rpc_creates_as_worklink_not_controller",
+        "tests/test_repo_tools.py::test_project_test_real_executor_preserves_active_lease_for_later_commit",
+    ):
+        assert selector in root["run"]
+
+    resync = core["run"]
+    assert "uv sync --locked --extra dev --extra bench" in resync
+    assert "--all-packages" not in resync
+    assert "import mimir_cultivate" in resync
+    suite = job["steps"][suite_i]
+    assert "MIMIR_PLUGINS" not in (suite.get("env") or {})
+    assert "MIMIR_PLUGINS" not in suite["run"]
+
+
 def test_ci_evidence_fixtures_stay_outside_controller_home() -> None:
     """Evidence retention must not move fixtures into controller-owned ancestry."""
     workflow = yaml.safe_load(
