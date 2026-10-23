@@ -29,12 +29,14 @@ from mimir_cultivate.worklink.run_state import WorklinkRunState, load_run_state,
 
 
 @contextmanager
-def _executor_in_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root: Path):
+def _executor_in_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root: Path, socket_dir: Path,
+):
     """Run the provider executor protocol without deployment-only root credentials."""
     identities = SimpleNamespace(
         mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid(),
     )
-    socket_path = tmp_path / "executor.sock"
+    socket_path = socket_dir / "executor.sock"
     homes = tmp_path / "homes"
     homes.mkdir()
     monkeypatch.setattr(worker_client.identities, "get_identities", lambda: identities)
@@ -136,7 +138,7 @@ def test_provider_runner_dry_run_uses_default_work_order(tmp_path: Path, capsys:
 @pytest.mark.asyncio
 @pytest.mark.skipif(sys.platform != "linux", reason="factory executor requires Linux")
 async def test_provider_completion_uses_emitted_record_and_worker_gate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, short_socket_dir: Path,
 ) -> None:
     root = tmp_path / "worklink"
     checkout = root / "repository" / "1949-1" / "checkout"
@@ -151,6 +153,18 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
         "publishing_identity": "factory-owner", "bootstrap": "uv sync",
     }))
     gate_command = "uv run python -c 'print(1949)'"
+    # Pin the opencode model/auth inputs work_spec resolves, as the core factory
+    # tests do; otherwise the launch reads the host's ~/.local/share/opencode and
+    # fails with feature_factory_opencode_resolution_failed:auth_missing anywhere
+    # that file is absent (CI, containers).
+    operator_home = tmp_path / "operator-home"
+    monkeypatch.setenv("HOME", str(operator_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    auth = operator_home / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}))
     (tmp_path / "worklink.yaml").write_text(f"defaults:\n  test_command: \"{gate_command}\"\n")
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", root)
     monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(
@@ -250,7 +264,7 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
 
     monkeypatch.setattr(FeatureFactoryBackend, "status", status)
     sandbox = checkout / ".factory-sandboxes" / "chainlink-1949"
-    with _executor_in_process(tmp_path, monkeypatch, root) as requests:
+    with _executor_in_process(tmp_path, monkeypatch, root, short_socket_dir) as requests:
         result = await orchestrator.WorklinkRunner(home=tmp_path, repo=repo, runner=runner).run_epic(1949)
         record = load_factory_record(tmp_path, "chainlink-1949")
         assert record is not None and record.sandbox == str(sandbox)

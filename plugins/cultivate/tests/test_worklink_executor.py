@@ -111,10 +111,10 @@ def test_provider_worker_wire_and_executor_contract(tmp_path: Path) -> None:
 )
 @pytest.mark.asyncio
 async def test_provider_worker_client_refuses_non_root_peer_before_sending(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, short_socket_dir: Path,
 ) -> None:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    path = tmp_path / "executor.sock"
+    path = short_socket_dir / "executor.sock"
     server.bind(str(path))
     server.listen(1)
     client = worker_client.WorkerClient.for_factory_checkout(

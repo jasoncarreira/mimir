@@ -332,6 +332,10 @@ async def test_agent_assembles_registered_worklink_runner_and_dispatches(
     from mimir_cultivate.worklink import autonomy, orchestrator
 
     monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    # The startup prerequisite probe looks for the opencode CLI on PATH. This test
+    # is about dispatch, not that probe (test_tool_registry covers it), so it must
+    # not depend on whether the host happens to have opencode installed.
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setattr("mimir.tools.all_mimir_tools", registry.all_mimir_tools)
     repository = tmp_path / "repo"
     repository.mkdir()
