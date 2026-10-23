@@ -11288,6 +11288,18 @@ def protected_result_source(
             retained_checkout=retained_checkout,
         )
         integrity, integrity_effect = anchor.integrity
+        # A DeepAgents offload is not a self-authored reference file. Its
+        # content-bound, server-owned record is the only way to raise its path
+        # label above the untrusted HOME default; missing/stale records stay
+        # active ingest. The original input labels are attached by the backend.
+        from ._deepagents_summarization import read_offload_labels
+
+        offload_sources = read_offload_labels(resource_id)
+        if offload_sources is not None and all(
+            source.is_complete and source.integrity == "trusted"
+            for source in offload_sources
+        ):
+            integrity, integrity_effect = "trusted", "informational"
         if anchor is FilesystemReadTrust.AUTHOR_ATTESTATION:
             principal = requester
             domain = "repository"

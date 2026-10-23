@@ -2,11 +2,119 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import tempfile
 from functools import wraps
+from pathlib import Path
 from typing import Any
 
 
 _OFFLOAD_LOGGING_PATCH_MARKER = "_mimir_offload_traceback_logging"
+
+
+def _history_file(path: str) -> Path | None:
+    """Only the DeepAgents session file under the configured home is eligible."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    requested = Path(path)
+    if not home or requested.suffix != ".md":
+        return None
+    root = Path(home).resolve()
+    candidate = (
+        root / "conversation_history" / requested.name
+        if requested.parts[:2] == ("/", "conversation_history") and len(requested.parts) == 3
+        else requested
+    )
+    try:
+        return candidate if candidate.parent == root / "conversation_history" and candidate.resolve(strict=True) == candidate else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _label_file(path: Path) -> Path:
+    home = Path(os.environ["MIMIR_HOME"]).resolve()
+    return home / ".mimir" / "conversation_history_labels" / (hashlib.sha256(str(path).encode()).hexdigest() + ".json")
+
+
+def read_offload_labels(path: str) -> tuple[Any, ...] | None:
+    """Return authenticated-by-content provenance; absent or stale records fail closed."""
+    from .models import SourceLabel
+
+    file = _history_file(path)
+    if file is None:
+        return None
+    try:
+        record = json.loads(_label_file(file).read_text(encoding="utf-8"))
+        if record["version"] != 1 or record["sha256"] != hashlib.sha256(file.read_bytes()).hexdigest():
+            return None
+        sources = tuple(SourceLabel.from_record(item) for item in record["sources"])
+        return sources or None
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+
+
+def _source_record(source: Any) -> dict[str, Any]:
+    # Do not persist owner attestations: only the server's original ingress can
+    # mint them. Dropping one restricts egress rather than granting authority.
+    return {
+        "principal": source.principal, "domain": source.domain,
+        "domain_qualifier": source.domain_qualifier, "resource_id": source.resource_id,
+        "bridge_instance": source.bridge_instance, "sensitivity": source.sensitivity,
+        "authorized_principals": sorted(source.authorized_principals),
+        "source_kind": source.source_kind, "integrity": source.integrity,
+        "integrity_effect": source.integrity_effect,
+    }
+
+
+def _record_offload(path: str, previous_hash: str | None, previous_sources: tuple[Any, ...] | None) -> None:
+    from ._context import get_current_turn
+    from .models import InformationFlowLabels
+    from .access_control import protected_result_source
+
+    file = _history_file(path)
+    turn = get_current_turn()
+    auth = getattr(turn, "auth_context", None)
+    state = getattr(auth, "ifc_state", None)
+    labels = state.current(getattr(auth, "ifc_labels", None)) if state is not None else getattr(auth, "ifc_labels", None)
+    if file is None or not isinstance(labels, InformationFlowLabels) or not labels.sources:
+        return
+    # Upstream appends to an existing file. If those bytes were not attested,
+    # retain their untrusted provenance even if this turn itself is clean.
+    sources = list(previous_sources or ())
+    if previous_hash is not None and previous_sources is None:
+        sources.append(protected_result_source(
+            auth, principal="filesystem", domain="filesystem",
+            resource_id=str(file), bridge_instance="filesystem",
+        ))
+    sources.extend(labels.sources)
+    try:
+        record = {"version": 1, "sha256": hashlib.sha256(file.read_bytes()).hexdigest(),
+                  "sources": [_source_record(source) for source in dict.fromkeys(sources)]}
+        destination = _label_file(file)
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(dir=destination.parent, prefix=".offload-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(record, stream)
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    except (OSError, ValueError, TypeError, RuntimeError):
+        # A missing or stale record is always an untrusted filesystem read.
+        return
+
+
+def _previous_offload(path: str) -> tuple[str | None, tuple[Any, ...] | None]:
+    file = _history_file(path)
+    if file is None:
+        return None, None
+    try:
+        digest = hashlib.sha256(file.read_bytes()).hexdigest()
+    except (OSError, RuntimeError):
+        return None, None
+    return digest, read_offload_labels(path)
 
 
 class _LoggingBackendProxy:
@@ -111,7 +219,13 @@ def _wrap_sync_offload(original: Any, logger: Any) -> Any:
         # ``(self, backend, messages)`` then raises "takes 3 positional arguments but
         # 4 were given" on every turn that offloads. The pin is ``>=0.7.1,<0.8``, so a
         # signature change inside that range is expected rather than exceptional.
-        return original(self, _LoggingBackendProxy(backend, logger), *args, **kwargs)
+        history = getattr(original, "__name__", "") == "_offload_to_backend"
+        path = self._get_history_path(args[-1] if args else kwargs.get("session_id")) if history else None
+        previous_hash, previous_sources = _previous_offload(path) if path else (None, None)
+        result = original(self, _LoggingBackendProxy(backend, logger), *args, **kwargs)
+        if history and result is not None:
+            _record_offload(result, previous_hash, previous_sources)
+        return result
 
     setattr(wrapped, _OFFLOAD_LOGGING_PATCH_MARKER, True)
     return wrapped
@@ -122,9 +236,15 @@ def _wrap_async_offload(original: Any, logger: Any) -> Any:
     async def wrapped(self: Any, backend: Any, *args: Any, **kwargs: Any) -> Any:
         # See _wrap_sync_offload: forward past ``backend`` without restating upstream's
         # signature.
-        return await original(
+        history = getattr(original, "__name__", "") == "_aoffload_to_backend"
+        path = self._get_history_path(args[-1] if args else kwargs.get("session_id")) if history else None
+        previous_hash, previous_sources = _previous_offload(path) if path else (None, None)
+        result = await original(
             self, _LoggingBackendProxy(backend, logger), *args, **kwargs
         )
+        if history and result is not None:
+            _record_offload(result, previous_hash, previous_sources)
+        return result
 
     setattr(wrapped, _OFFLOAD_LOGGING_PATCH_MARKER, True)
     return wrapped
