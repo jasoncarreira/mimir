@@ -113,6 +113,7 @@ def _record_offload(
                 os.unlink(temporary)
     except (OSError, ValueError, TypeError, RuntimeError):
         # A missing or stale record is always an untrusted filesystem read.
+        _discard_offload_record(path)
         return
 
 
@@ -128,13 +129,25 @@ def _previous_offload(path: str) -> tuple[str | None, tuple[Any, ...] | None]:
 
 
 class _LoggingBackendProxy:
-    __slots__ = ("_backend", "_logger", "_downloaded", "written_hashes")
+    __slots__ = ("_backend", "_logger", "_downloaded", "written_hashes", "provenance_failed")
+
+    def _capture_safely(self, capture: Any, *args: Any) -> Any:
+        # The backend operation has already succeeded. Provenance is optional;
+        # never turn a bookkeeping exception into an upstream operation failure.
+        try:
+            return capture(*args)
+        except Exception:
+            self.provenance_failed = True
+            self.written_hashes.clear()
+            self._logger.exception("DeepAgents offload provenance capture failed")
+            return args[-1]
 
     def __init__(self, backend: Any, logger: Any) -> None:
         self._backend = backend
         self._logger = logger
         self._downloaded: dict[str, bytes] = {}
         self.written_hashes: dict[str, str] = {}
+        self.provenance_failed = False
 
     def _capture_download(self, results: Any) -> Any:
         for result in results:
@@ -180,14 +193,14 @@ class _LoggingBackendProxy:
     def download_files(self, paths: list[str]) -> Any:
         path = paths[0] if paths else "<empty download>"
         try:
-            return self._capture_download(self._backend.download_files(paths))
+            return self._capture_safely(self._capture_download, self._backend.download_files(paths))
         except Exception:
             self._log_exception("download_files", path)
             raise
 
     def write(self, file_path: str, content: str) -> Any:
         try:
-            return self._capture_write(file_path, content, self._backend.write(file_path, content))
+            return self._capture_safely(self._capture_write, file_path, content, self._backend.write(file_path, content))
         except Exception:
             self._log_exception("write", file_path)
             raise
@@ -203,7 +216,7 @@ class _LoggingBackendProxy:
             result = self._backend.edit(
                 file_path, old_string, new_string, replace_all=replace_all
             )
-            return self._capture_edit(file_path, old_string, new_string, replace_all, result)
+            return self._capture_safely(self._capture_edit, file_path, old_string, new_string, replace_all, result)
         except Exception:
             self._log_exception("edit", file_path)
             raise
@@ -219,7 +232,7 @@ class _LoggingBackendProxy:
     async def adownload_files(self, paths: list[str]) -> Any:
         path = paths[0] if paths else "<empty download>"
         try:
-            return self._capture_download(await self._backend.adownload_files(paths))
+            return self._capture_safely(self._capture_download, await self._backend.adownload_files(paths))
         except Exception:
             self._log_exception("adownload_files", path)
             raise
@@ -227,7 +240,7 @@ class _LoggingBackendProxy:
     async def awrite(self, file_path: str, content: str) -> Any:
         try:
             result = await self._backend.awrite(file_path, content)
-            return await asyncio.to_thread(self._capture_write, file_path, content, result)
+            return await asyncio.to_thread(self._capture_safely, self._capture_write, file_path, content, result)
         except Exception:
             self._log_exception("awrite", file_path)
             raise
@@ -244,7 +257,8 @@ class _LoggingBackendProxy:
                 file_path, old_string, new_string, replace_all=replace_all
             )
             return await asyncio.to_thread(
-                self._capture_edit, file_path, old_string, new_string, replace_all, result,
+                self._capture_safely, self._capture_edit,
+                file_path, old_string, new_string, replace_all, result,
             )
         except Exception:
             self._log_exception("aedit", file_path)
@@ -266,6 +280,43 @@ def _finish_offload(
     )
 
 
+def _discard_offload_record(path: str) -> None:
+    """Best-effort invalidation: history bytes must remain readable as untrusted."""
+    try:
+        file = _history_file(path)
+        if file is not None:
+            _label_file(file).unlink(missing_ok=True)
+    except Exception:
+        # If invalidation itself is unavailable, changed bytes still invalidate
+        # the old digest. No fallback may mint a replacement provenance record.
+        pass
+
+
+def _prepare_offload(self: Any, session_id: Any, logger: Any) -> tuple[Any, ...]:
+    try:
+        path = self._get_history_path(session_id)
+        previous_hash, previous_sources = _previous_offload(path) if path else (None, None)
+        return path, previous_hash, previous_sources, False
+    except Exception:
+        logger.exception("DeepAgents offload provenance snapshot failed")
+        return None, None, None, True
+
+
+def _complete_offload(
+    proxy: _LoggingBackendProxy, path: str | None, result: str,
+    previous_hash: str | None, previous_sources: tuple[Any, ...] | None,
+    failed: bool,
+) -> None:
+    try:
+        if failed or proxy.provenance_failed:
+            _discard_offload_record(result)
+            return
+        _finish_offload(proxy, path, result, previous_hash, previous_sources)
+    except Exception:
+        _discard_offload_record(result)
+        proxy._logger.exception("DeepAgents offload provenance persistence failed")
+
+
 def _wrap_sync_offload(original: Any, logger: Any) -> Any:
     @wraps(original)
     def wrapped(self: Any, backend: Any, *args: Any, **kwargs: Any) -> Any:
@@ -278,12 +329,13 @@ def _wrap_sync_offload(original: Any, logger: Any) -> Any:
         # signature change inside that range is expected rather than exceptional.
         history = getattr(original, "__name__", "") == "_offload_to_backend"
         session_id = kwargs.get("session_id", args[1] if len(args) > 1 else None)
-        path = self._get_history_path(session_id) if history else None
-        previous_hash, previous_sources = _previous_offload(path) if path else (None, None)
+        path, previous_hash, previous_sources, failed = (
+            _prepare_offload(self, session_id, logger) if history else (None, None, None, False)
+        )
         proxy = _LoggingBackendProxy(backend, logger)
         result = original(self, proxy, *args, **kwargs)
         if history and result is not None:
-            _finish_offload(proxy, path, result, previous_hash, previous_sources)
+            _complete_offload(proxy, path, result, previous_hash, previous_sources, failed)
         return result
 
     setattr(wrapped, _OFFLOAD_LOGGING_PATCH_MARKER, True)
@@ -297,15 +349,15 @@ def _wrap_async_offload(original: Any, logger: Any) -> Any:
         # signature.
         history = getattr(original, "__name__", "") == "_aoffload_to_backend"
         session_id = kwargs.get("session_id", args[1] if len(args) > 1 else None)
-        path = self._get_history_path(session_id) if history else None
-        previous_hash, previous_sources = (
-            await asyncio.to_thread(_previous_offload, path) if path else (None, None)
+        path, previous_hash, previous_sources, failed = (
+            await asyncio.to_thread(_prepare_offload, self, session_id, logger)
+            if history else (None, None, None, False)
         )
         proxy = _LoggingBackendProxy(backend, logger)
         result = await original(self, proxy, *args, **kwargs)
         if history and result is not None:
             await asyncio.to_thread(
-                _finish_offload, proxy, path, result, previous_hash, previous_sources,
+                _complete_offload, proxy, path, result, previous_hash, previous_sources, failed,
             )
         return result
 

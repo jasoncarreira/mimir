@@ -34,6 +34,9 @@ download plus exact edit, rather than later disk contents. A subsequent writer
 therefore makes the record stale. Downloaded prefixes differing from the
 pre-offload snapshot are unknown, not attested by the old record. Async
 snapshotting, hashing and atomic record persistence run in worker threads.
+Provenance bookkeeping is non-fatal: a snapshot, capture or persistence failure
+preserves the upstream offload result and invalidates the sidecar best-effort.
+Missing or stale records still read back as untrusted; no fallback mints labels.
 
 Records live in `.mimir/conversation_history_labels/`, outside file-tool writable
 roots. Version 1, nonempty complete sources, an exact digest, a direct parent
@@ -53,7 +56,7 @@ The same applies to shell `rg`/`grep`: these routes do not use the native backen
 path publisher or restore the saved original labels. Thus a later clean turn
 can ingest untrusted history through shell without activating the write veto.
 This predates #1994 and is not fixed by this file-tool provenance change. It
-requires a separate shell-read classification follow-up (requested in PR #2420),
+is tracked by **chainlink #1996**, the separate shell-read classification follow-up,
 including direct, recursive and indirect shell reads without relaxing existing
 authorization. Do not claim every read-back route is protected until that lands.
 
