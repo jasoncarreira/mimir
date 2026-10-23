@@ -45,9 +45,20 @@ def test_workspace_metadata_and_manifest() -> None:
         "cultivate": "mimir_cultivate:provider"}
     assert manifest["name"] == "cultivate"
     assert manifest["requires_mimir"] == f"=={version}"
-    assert set(manifest) == {"name", "version", "license", "requires_mimir", "defaults", "frontend", "themes"}
+    assert set(manifest) == {
+        "name", "version", "license", "requires_mimir", "defaults", "optional", "frontend", "themes",
+    }
     assert manifest["defaults"]["version"] == version
-    assert len(manifest["defaults"]["skills"]) == 6
+    assert set(manifest["defaults"]["skills"]) == {
+        "defaults/skills/chainlink-orchestrator", "defaults/skills/worklink-tool-pins",
+    }
+    optional = manifest["optional"]["skills"]
+    assert len(optional) == 4
+    assert {entry["path"] for entry in optional} == {
+        f"defaults/skills/{name}"
+        for name in ("github-poller", "github-ci-watch", "github", "review")
+    }
+    assert all(set(entry) == {"path", "forge"} and entry["forge"] == "github" for entry in optional)
     assert (PLUGIN / "brand/LICENSE").read_bytes() == (ROOT / "brand/LICENSE").read_bytes()
 
 
