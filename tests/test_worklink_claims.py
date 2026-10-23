@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import fcntl
 import json
@@ -20,7 +21,9 @@ from mimir_cultivate.worklink.claims import (
     ShutdownAbortRecord,
     _ChainlinkContentionExhausted,
     claim_records_from_comments,
+    record_clean_park,
 )
+from mimir_cultivate.worklink.factory_state import FactoryRunRecord, FactoryStatus, save_factory_record
 from mimir_cultivate.worklink.evidence import TestResult, WorklinkEvidence
 from mimir_cultivate.worklink.orchestrator import _write_evidence
 
@@ -1596,3 +1599,160 @@ def test_normal_failed_transition_cannot_write_shutdown_abort_marker() -> None:
     claims.transition_issue(1033, status="failed", review_ready=False, attempt=1)
 
     assert not any(SHUTDOWN_ABORT_PREFIX in token for call in calls for token in call)
+
+
+def test_repeated_verified_parks_do_not_use_attempt_budget(tmp_path: Path, caplog) -> None:
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "chainlink-1985"
+    snapshot.mkdir(parents=True)
+    base = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session",
+        handle=None, status=None, observed_at=None, controller_phase="running",
+    )
+    parked = replace(base, status=FactoryStatus(
+        run_id=base.run_id, valid=True, sandbox_path=str(sandbox),
+        status="needs-human", park_snapshot=str(snapshot),
+    ), controller_phase="parked")
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, max_attempts=2)
+    history: list[str] = []
+    with caplog.at_level("INFO"):
+        for attempt in range(1, 9):
+            claim = ClaimRecord(1985, attempt, "agent", datetime(2026, 10, 1, tzinfo=UTC)
+                                + timedelta(minutes=attempt))
+            history.append(claim.to_comment())
+            assert claims.attempts_used(history) == 1
+            current_park = replace(parked, observed_at=(claim.claimed_at + timedelta(seconds=1)).isoformat())
+            save_factory_record(tmp_path, current_park)
+            assert record_clean_park(tmp_path, claim, current_park)
+            save_factory_record(tmp_path, base)
+            assert claims.attempts_used(history) == 0
+            assert claims.next_attempt(history) == attempt + 1
+    assert "clean_parks=8" in caplog.text
+
+
+@pytest.mark.parametrize("damage", [
+    "failed", "phase", "snapshot", "wrong_path", "invalid", "agent_id", "claimed_at",
+    "attempt", "observed_at", "symlink",
+])
+def test_only_matching_durable_clean_parks_are_free(tmp_path: Path, damage: str) -> None:
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "chainlink-1985"
+    snapshot.mkdir(parents=True)
+    record = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session",
+        handle=None, status=FactoryStatus(
+            run_id="chainlink-1985", valid=True, sandbox_path=str(sandbox),
+            status="needs-human", park_snapshot=str(snapshot),
+        ), observed_at="2026-10-01T00:00:01+00:00", controller_phase="parked",
+    )
+    claim = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, max_attempts=1)
+    save_factory_record(tmp_path, record)
+    assert record_clean_park(tmp_path, claim, record)
+    marker = tmp_path / "state" / "worklink" / "clean-parks" / "1985-1.json"
+    if damage in {"agent_id", "claimed_at", "attempt"}:
+        payload = json.loads(marker.read_text())
+        payload["claim"][damage] = (
+            "other" if damage == "agent_id" else
+            "2026-10-02T00:00:00+00:00" if damage == "claimed_at" else 2
+        )
+        marker.write_text(json.dumps(payload))
+    elif damage == "snapshot":
+        snapshot.rmdir()
+    elif damage == "symlink":
+        original = marker.with_name("copy.json")
+        marker.rename(original)
+        marker.symlink_to(original)
+    else:
+        payload = json.loads(marker.read_text())
+        if damage == "failed":
+            payload["record"]["status"]["status"] = "failed"
+        elif damage == "invalid":
+            payload["record"]["status"]["valid"] = False
+        elif damage == "wrong_path":
+            payload["record"]["status"]["park_snapshot"] = str(tmp_path / "unrelated")
+        elif damage == "observed_at":
+            payload["record"]["observed_at"] = "2026-09-30T00:00:00+00:00"
+        else:
+            payload["record"]["controller_phase"] = "failed"
+        marker.write_text(json.dumps(payload))
+    assert claims.attempts_used([claim.to_comment()]) == 1
+
+
+def test_park_credit_requires_retained_record_at_publication(tmp_path: Path) -> None:
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "chainlink-1985"
+    snapshot.mkdir(parents=True)
+    claim = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    record = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session",
+        handle=None, status=FactoryStatus(
+            run_id="chainlink-1985", valid=True, sandbox_path=str(sandbox),
+            status="needs-human", park_snapshot=str(snapshot),
+        ), observed_at="2026-10-01T00:00:01+00:00", controller_phase="parked",
+    )
+    assert not record_clean_park(tmp_path, claim, record)
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used(
+        [claim.to_comment()]
+    ) == 1
+
+
+def test_stale_park_cannot_discount_a_later_crashed_claim(tmp_path: Path) -> None:
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "chainlink-1985"
+    snapshot.mkdir(parents=True)
+    old = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    crashed = ClaimRecord(1985, 2, "agent", old.claimed_at + timedelta(days=1))
+    record = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session",
+        handle=None, status=FactoryStatus(
+            run_id="chainlink-1985", valid=True, sandbox_path=str(sandbox),
+            status="needs-human", park_snapshot=str(snapshot),
+        ), observed_at=(old.claimed_at + timedelta(minutes=1)).isoformat(),
+        controller_phase="parked",
+    )
+    save_factory_record(tmp_path, record)
+    assert record_clean_park(tmp_path, old, record)
+    assert not record_clean_park(tmp_path, crashed, record)
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used(
+        [old.to_comment(), crashed.to_comment()]
+    ) == 1
+
+
+@pytest.mark.parametrize("outcome", ["failed", "driver_killed", "startup_deadline", "unpublished"])
+def test_non_clean_run_cannot_publish_park_credit(tmp_path: Path, outcome: str) -> None:
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "chainlink-1985"
+    if outcome != "unpublished":
+        snapshot.mkdir(parents=True)
+    record = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session",
+        handle=None, status=None if outcome == "startup_deadline" else FactoryStatus(
+            run_id="chainlink-1985", valid=True, sandbox_path=str(sandbox),
+            status="failed" if outcome == "failed" else
+                   "running" if outcome == "driver_killed" else "needs-human",
+            park_snapshot=str(snapshot),
+        ), observed_at="2026-10-01T00:00:01+00:00",
+        controller_phase="failed" if outcome != "unpublished" else "parked",
+    )
+    claim = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    save_factory_record(tmp_path, record)
+    assert record_clean_park(tmp_path, claim, record) is False
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used(
+        [claim.to_comment()]
+    ) == 1

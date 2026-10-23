@@ -7703,6 +7703,38 @@ class _FactoryLifecycleClaims:
         return None
 
 
+def test_factory_decision_park_archives_claim_before_resume(tmp_path: Path) -> None:
+    """A driver-reported needs-human decision receives the same credit as a budget park."""
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+    from mimir_cultivate.worklink.factory_state import save_factory_record
+
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "700"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "700"
+    snapshot.mkdir(parents=True)
+    claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
+    record = _factory_lifecycle_record(
+        sandbox, LaunchHandle("local_subprocess", "123", 456),
+    ).observed(
+        _factory_lifecycle_status(sandbox, status="needs-human", park_snapshot=str(snapshot)),
+        datetime.now(UTC).isoformat(),
+    )
+    record = replace(record, controller_phase="parked")
+    save_factory_record(tmp_path, record)
+
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+        issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+        claim_record=claim, claims=_FactoryLifecycleClaims(), backend=object(),
+        compute=object(), factory_record=record, test_cmd="pytest -q",
+        runner=lambda args: cp(args), started_at=datetime.now(UTC),
+    ))
+
+    assert result.status == "needs-human"
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used([claim.to_comment()]) == 0
+    save_factory_record(tmp_path, replace(record, controller_phase="running"))
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used([claim.to_comment()]) == 0
+
+
 @pytest.mark.parametrize(
     ("factory_status", "expected_status", "review_ready", "pr_url"),
     [

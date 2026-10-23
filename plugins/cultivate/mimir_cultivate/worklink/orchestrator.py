@@ -48,7 +48,7 @@ from .compute import (
 )
 from .claims import (
     ChainlinkClaims, ClaimRecord, ShutdownAbortRecord, OPERATOR_STOP_PREFIX,
-    SHUTDOWN_ABORT_PREFIX, QUOTA_HOLD_PREFIX, WORKLINK_EPIC_LABEL,
+    SHUTDOWN_ABORT_PREFIX, QUOTA_HOLD_PREFIX, WORKLINK_EPIC_LABEL, record_clean_park,
 )
 from .control import operator_stop_requested
 from .autonomy import chainlink_bin
@@ -92,6 +92,7 @@ from .backends.feature_factory import (
 from .backends.registry import factory_run_timeout_s
 from .backends.opencode import transcript_path, write_transcript
 from .factory_state import (
+    FactoryRecordError,
     FactoryRunRecord,
     factory_checkout_interlock,
     factory_issue_resource_lock,
@@ -3914,6 +3915,16 @@ class WorklinkRunner:
                 run_id=factory_record.run_id, attempt=factory_record.attempt,
                 factory_record=factory_record,
             )
+            # Preserve this claim's observed park before the next resume replaces
+            # the retained status. Missing snapshots and failed phases stay charged.
+            if status.park_snapshot is not None:
+                try:
+                    if not record_clean_park(self.home, claim_record, factory_record):
+                        _log_event("worklink_clean_park_unverified", issue_id=issue.issue_id,
+                                   attempt=claim_record.attempt)
+                except (OSError, FactoryRecordError) as exc:
+                    _log_event("worklink_clean_park_unverified", issue_id=issue.issue_id,
+                               attempt=claim_record.attempt, reason=str(exc)[:300])
             return result
         if status.status in {"blocked", "partial"}:
             claims.transition_issue(

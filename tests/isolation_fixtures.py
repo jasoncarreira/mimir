@@ -215,12 +215,13 @@ def synthetic_worklink_identities(monkeypatch, request):
         module = sys.modules.get(module_name)
         if module is not None and hasattr(module, "get_identities"):
             monkeypatch.setattr(module, "get_identities", synthetic)
-    # Every loaded provider binding of the real accessor, including the
-    # accessor's own module so call-time ``from .identities import`` sees it.
+    # Patch each known provider binding, including the accessor's own module.
+    # Walking sys.modules here can race imports from a running background task.
     if real_accessor is not None:
-        for module_name, module in list(sys.modules.items()):
+        for module_name in _PROVIDER_IDENTITY_MODULES:
+            module = sys.modules.get(module_name)
             if (
-                module_name.startswith("mimir_cultivate.")
+                module is not None
                 and getattr(module, "get_identities", None) is real_accessor
             ):
                 monkeypatch.setattr(module, "get_identities", synthetic)

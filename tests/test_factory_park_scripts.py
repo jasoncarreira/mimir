@@ -149,6 +149,10 @@ def _park_stub(calls: list[list[str]], comments: list[str], *, release_rc: int =
 def _home_with(record, tmp_path: Path) -> Path:
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
+    if record.status is not None and record.status.is_parked:
+        snapshot = tmp_path / ".factory" / ".parked" / record.run_id
+        snapshot.mkdir(parents=True, exist_ok=True)
+        record = replace(record, status=replace(record.status, park_snapshot=str(snapshot)))
     save_factory_record(home, record)
     _plane(Path(record.sandbox) / ".factory" / record.run_id)
     return home
@@ -163,7 +167,11 @@ def _park_main(record, home: Path, monkeypatch, run, tmp_path: Path, *, extra=()
     ])
     monkeypatch.setattr(park, "factory_status", lambda *a, **k: next(statuses))
     monkeypatch.setattr(park, "verify_controller", lambda pid, issue: "mimir worklink run-epic")
-    monkeypatch.setattr(park, "publish_snapshot", lambda *a, **k: tmp_path / "snap")
+    def publish(*args, **kwargs):
+        snapshot = tmp_path / ".factory" / ".parked" / record.run_id
+        snapshot.mkdir(parents=True, exist_ok=True)
+        return snapshot
+    monkeypatch.setattr(park, "publish_snapshot", publish)
     monkeypatch.setattr(park, "_run", run)
     return park.main([
         "--run-id", record.run_id, "--sandbox", record.sandbox,
@@ -331,7 +339,7 @@ def _record(
     sandbox = tmp_path / ".factory-sandboxes" / "chainlink-1783"
     sandbox.mkdir(parents=True, exist_ok=True)
     return FactoryRunRecord(
-        run_id="chainlink-1783", issue_id=1783, attempt=10,
+        run_id="chainlink-1783", issue_id=1783, attempt=1,
         repository="jasoncarreira/mimir", base_ref="base/chainlink-1783",
         branch="feature/chainlink-1783", launcher="/opt/factory/factory.js",
         sandbox=str(sandbox), session=session,
@@ -339,7 +347,7 @@ def _record(
         status=None if status is None else FactoryStatus(
             run_id="chainlink-1783", valid=True, sandbox_path=str(sandbox), status=status,
         ),
-        observed_at="2026-09-21T00:00:00+00:00", controller_phase=phase,
+        observed_at="2026-09-21T05:00:00+00:00", controller_phase=phase,
     )
 
 
@@ -356,6 +364,9 @@ def _status(
     a record must therefore pass ``sandbox_path``; the preflight never reads it,
     so its callers leave the default in place.
     """
+    if sandbox_path is not None and snapshot == "/c/.factory/.parked/x":
+        sandbox = Path(sandbox_path)
+        snapshot = str(sandbox.parent.parent / ".factory" / ".parked" / sandbox.name)
     return {
         "run_id": "chainlink-1783",
         "valid": True,
@@ -743,14 +754,10 @@ class TestParkToImmediateDispatch:
         assert ["chainlink", "locks", "release", "1783"] in calls
         assert ["chainlink", "issue", "unlabel", "1783", "worklink:in-progress"] in calls
 
-    def test_forgiveness_is_recorded_before_the_release(
+    def test_clean_park_is_recorded_before_the_release(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """Order matters, and it is the established shutdown path's order.
-
-        Recording forgiveness first means a failure between the two steps leaves
-        the claim held but already credited, rather than released and charged.
-        """
+        """Evidence must be durable before the lock can be released."""
         record = _record(tmp_path, phase="running", status="running")
         home = _home_with(record, tmp_path)
         calls: list[list[str]] = []
@@ -759,16 +766,13 @@ class TestParkToImmediateDispatch:
         monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
         monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
 
-        assert _park_main(
-            record, home, monkeypatch, _park_stub(calls, _claim_history(1)), tmp_path,
-        ) == 0
-
-        staged = [
-            "forgive" if argv[1:3] == ["issue", "comment"] else "release"
-            for argv in calls
-            if argv[1:3] in (["issue", "comment"], ["locks", "release"])
-        ]
-        assert staged == ["forgive", "release"]
+        run = _park_stub(calls, _claim_history(1))
+        def checked_run(cmd, **kwargs):
+            if list(cmd)[1:3] == ["locks", "release"]:
+                assert (home / "state/worklink/clean-parks/1783-1.json").is_file()
+            return run(cmd, **kwargs)
+        assert _park_main(record, home, monkeypatch, checked_run, tmp_path) == 0
+        assert ["chainlink", "locks", "release", "1783"] in calls
 
     def test_a_park_on_the_last_attempt_stays_resumable(
         self, tmp_path: Path, monkeypatch
@@ -796,8 +800,7 @@ class TestParkToImmediateDispatch:
             record, home, monkeypatch, _park_stub(calls, history), tmp_path,
         ) == 0
 
-        marker = next(argv[4] for argv in calls if argv[1:3] == ["issue", "comment"])
-        after = history + [marker]
+        after = history
 
         # Judged by the real admission gate, not by re-deriving the arithmetic.
         resumed = ChainlinkClaims(
@@ -806,7 +809,7 @@ class TestParkToImmediateDispatch:
             clock=lambda: datetime(2026, 9, 21, 5, 0, tzinfo=UTC),
             max_attempts=3,
         )
-        result = resumed.claim_issue(1783, after, home_path=tmp_path)
+        result = resumed.claim_issue(1783, after, home_path=home)
         assert result.attempts_exhausted is False
         assert result.claimed is True, result.reason
 
@@ -842,7 +845,7 @@ class TestParkToImmediateDispatch:
         run = _park_stub(calls, _claim_history(1, agent="someone-else"))
         with mock.patch.object(park, "_run", run):
             with pytest.raises(park.ParkError, match="held by 'someone-else'"):
-                park.release_claim_with_forgiveness("chainlink", 1783, AGENT, tmp_path)
+                park.release_parked_claim("chainlink", 1783, AGENT, tmp_path)
         assert not any(argv[1:3] == ["issue", "comment"] for argv in calls)
         assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
 
@@ -854,6 +857,8 @@ class TestParkToImmediateDispatch:
         exist. This is why the script reads through `_issue_comments` rather than
         stringifying whatever it is handed.
         """
+        record = _record(tmp_path)
+        home = _home_with(record, tmp_path)
         stored = [{"content": c} for c in _claim_history(1)]
         calls: list[list[str]] = []
 
@@ -871,24 +876,18 @@ class TestParkToImmediateDispatch:
             return subprocess.CompletedProcess(argv, 0, "{}", "")
 
         with mock.patch.object(park, "_run", run):
-            code, detail = park.release_claim_with_forgiveness(
-                "chainlink", 1783, AGENT, tmp_path,
+            code, detail = park.release_parked_claim(
+                "chainlink", 1783, AGENT, home,
             )
 
         assert code == 0
-        assert "forgiven" in detail
-        assert any(argv[1:3] == ["issue", "comment"] for argv in calls)
+        assert "cleanly parked" in detail
+        assert ["chainlink", "locks", "release", "1783"] in calls
 
-    def test_exhausted_forgiveness_refuses_before_anything_is_destroyed(
+    def test_exhausted_shutdown_forgiveness_does_not_block_clean_park(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """The park must decide the claim outcome before it stops anything.
-
-        Forgiveness is bounded. If the budget is spent, the claim cannot be
-        credited back -- and discovering that *after* terminalizing leaves a
-        parked run whose claim is still held and charged, which is precisely the
-        unresumable state parking exists to avoid.
-        """
+        """Clean parks do not use the bounded shutdown-abort allowance."""
         record = _record(tmp_path, phase="running", status="running")
         home = _home_with(record, tmp_path)
         history = _exhausted_forgiveness_history()
@@ -899,15 +898,11 @@ class TestParkToImmediateDispatch:
         monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
         monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
 
-        with pytest.raises(park.ParkError, match="forgiveness marker would not discount"):
-            _park_main(record, home, monkeypatch, _park_stub(calls, history), tmp_path)
-
-        assert stopped == [], "the controller was stopped before the claim was decided"
-        assert not any("terminal" in argv for argv in calls), "the run was terminalized"
-        assert not any(argv[1:3] == ["issue", "comment"] for argv in calls)
-        assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
+        assert _park_main(record, home, monkeypatch, _park_stub(calls, history), tmp_path) == 0
+        assert stopped == ["controller"]
+        assert ["chainlink", "locks", "release", "1783"] in calls
         settled = load_factory_record(home, record.run_id)
-        assert settled is not None and settled.controller_phase == "running"
+        assert settled is not None and settled.controller_phase == "parked"
 
     def test_an_already_parked_run_completes_its_claim_reconciliation(
         self, tmp_path: Path, monkeypatch
@@ -936,7 +931,7 @@ class TestParkToImmediateDispatch:
 
         assert rc == 0
         assert ["chainlink", "locks", "release", "1783"] in calls
-        assert any(argv[1:3] == ["issue", "comment"] for argv in calls)
+        assert (home / "state/worklink/clean-parks/1783-1.json").is_file()
 
     def test_an_already_parked_run_with_nothing_to_do_still_refuses(
         self, tmp_path: Path, monkeypatch

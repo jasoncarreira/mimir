@@ -71,10 +71,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mimir_cultivate.worklink.autonomy import DEFAULT_AGENT_ID  # noqa: E402
 from mimir_cultivate.worklink.backends.feature_factory import parse_factory_status  # noqa: E402
 from mimir_cultivate.worklink.claims import (  # noqa: E402
-    MAX_SHUTDOWN_ABORT_FORGIVENESS,
     ChainlinkClaims,
-    ShutdownAbortRecord,
+    _read_clean_park,
     claim_records_from_comments,
+    record_clean_park,
 )
 from mimir_cultivate.worklink.factory_state import (  # noqa: E402
     factory_checkout_interlock,
@@ -395,16 +395,14 @@ class ClaimPlan(NamedTuple):
     """What releasing this run's claim would do, computed without writing."""
 
     claim: object
-    abort: ShutdownAbortRecord
     comments: list[str]
     before: int
-    after: int
 
 
 def plan_claim_release(
     chainlink_bin: str, issue_id: int, agent_id: str, home: Path,
 ) -> ClaimPlan:
-    """Decide whether the claim can be released and forgiven, writing nothing.
+    """Verify ownership before stopping the controller, writing nothing.
 
     This runs *before* the park stops anything. Every refusal below is
     unrecoverable once the run is terminalized: the park's own already-parked
@@ -418,7 +416,7 @@ def plan_claim_release(
     if claim is None:
         raise ParkError(
             f"issue {issue_id} has no claim record, so there is nothing to release; "
-            "refusing to invent forgiveness for a claim that was never recorded"
+            "refusing to credit a claim that was never recorded"
         )
     if claim.agent_id != agent_id:
         raise ParkError(
@@ -427,43 +425,21 @@ def plan_claim_release(
             "pass --agent-id if this run really was claimed under a different identity."
         )
 
-    abort = ShutdownAbortRecord(
-        issue_id=issue_id,
-        attempt=claim.attempt,
-        agent_id=claim.agent_id,
-        claimed_at=claim.claimed_at,
-        aborted_at=datetime.now(UTC),
-    )
-    before = claims.attempts_used(comments)
-    after = claims.attempts_used(comments + [abort.to_comment()])
-    if after >= before:
+    before = claims.attempts_used(comments, home_path=home)
+    if before == 0 and not _read_clean_park(home, claim):
         raise ParkError(
-            f"a forgiveness marker would not discount this claim (attempts_used stays {before}). "
-            f"Forgiveness is bounded at {MAX_SHUTDOWN_ABORT_FORGIVENESS} per issue, and this run "
-            "has spent it, so a park would leave the claim charged and the run unresumable. "
-            "Nothing has been stopped or published; resolve the attempt budget first."
+            "this claim is already discounted; nothing to reconcile"
         )
-    return ClaimPlan(claim=claim, abort=abort, comments=comments, before=before, after=after)
+    return ClaimPlan(claim=claim, comments=comments, before=before)
 
 
-def release_claim_with_forgiveness(
+def release_parked_claim(
     chainlink_bin: str, issue_id: int, agent_id: str, home: Path,
 ) -> tuple[int, str]:
-    """Release the parked run's claim without charging it an attempt.
+    """Release a parked run's claim after archiving its verified park.
 
-    Mirrors ``release_owned_claims_for_shutdown``, which is the established
-    protocol, including its ordering: record forgiveness *first*, then release
-    the lock, and only then drop ``worklink:in-progress``, so a partial failure
-    never leaves the issue both undispatchable and uncredited.
-
-    Forgiveness is the point. ``claim_issue`` charges an attempt for every
-    successful claim and judges exhaustion from ``attempts_used``, which
-    discounts a claim only when a ``ShutdownAbortRecord`` matches it on
-    ``(issue_id, attempt, agent_id, claimed_at)``. Without that marker a park
-    followed by a resume spends a second attempt on one run, and a run parked on
-    its last attempt comes back ``attempts_exhausted`` instead of resuming. The
-    attempt *ordinal* still advances, which is what keeps branch, checkout and
-    evidence paths from colliding.
+    Evidence is published before releasing the lock, so a partial failure
+    cannot leave an undispatchable, charged park. Claim ordinals still advance.
 
     One deliberate departure: the shutdown path also adds ``worklink:ready``,
     because it is handing work back to the queue. A park is not doing that --
@@ -471,21 +447,19 @@ def release_claim_with_forgiveness(
     auto-dispatch a parked epic.
     """
     plan = plan_claim_release(chainlink_bin, issue_id, agent_id, home)
-    marked = _run([chainlink_bin, "issue", "comment", str(issue_id), plan.abort.to_comment()])
-    if marked.returncode != 0:
+    already_credited = _read_clean_park(home, plan.claim)
+    record = load_factory_record(home, f"chainlink-{issue_id}")
+    if record is None or not record_clean_park(home, plan.claim, record):
         raise ParkError(
-            "could not record the forgiveness marker: "
-            f"{(marked.stderr or marked.stdout).strip()[:200]}. The claim is untouched, so the "
-            "run is still owned and no attempt has been mis-charged."
+            "could not verify and archive the published park; claim remains charged and held"
         )
 
-    # Postcondition, not the decision: the plan already proved the marker would
-    # count. This catches the marker landing differently than projected.
+    # Re-read the durable evidence before releasing the lock.
     claims = claims_client(chainlink_bin, agent_id, home)
-    observed = claims.attempts_used(issue_comments(claims, issue_id))
-    if observed >= plan.before:
+    observed = claims.attempts_used(issue_comments(claims, issue_id), home_path=home)
+    if observed >= plan.before and not already_credited:
         raise ParkError(
-            f"the recorded forgiveness marker did not discount the claim (attempts_used stayed "
+            f"the recorded clean park did not discount the claim (attempts_used stayed "
             f"{plan.before}). The claim is still charged; resolve it before resuming."
         )
 
@@ -493,13 +467,13 @@ def release_claim_with_forgiveness(
     if released.returncode != 0:
         return released.returncode, (released.stderr or released.stdout).strip()[:200]
     _run([chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:in-progress"])
-    return 0, f"attempt {plan.claim.attempt} forgiven, attempts_used {plan.before} -> {observed}"
+    return 0, f"attempt {plan.claim.attempt} cleanly parked, attempts_used {plan.before} -> {observed}"
 
 
 def claim_needs_reconciliation(
     chainlink_bin: str, issue_id: int, agent_id: str, home: Path,
 ) -> bool:
-    """True when a parked run's claim is still charged and can still be forgiven."""
+    """True when a parked run's claim is still charged."""
     try:
         plan_claim_release(chainlink_bin, issue_id, agent_id, home)
     except ParkError:
@@ -567,7 +541,7 @@ def main(argv: list[str] | None = None) -> int:
                 "run is already parked and its claim needs no reconciliation; nothing to do"
             )
         print("already parked: completing the claim reconciliation a previous run left undone")
-        code, detail = release_claim_with_forgiveness(
+        code, detail = release_parked_claim(
             args.chainlink_bin, record.issue_id, args.agent_id, args.home,
         )
         if code != 0:
@@ -607,7 +581,7 @@ def main(argv: list[str] | None = None) -> int:
     plan = plan_claim_release(args.chainlink_bin, record.issue_id, args.agent_id, args.home)
     print(
         f"claim      : attempt {plan.claim.attempt} owned by {plan.claim.agent_id}; "
-        f"forgiveness would take attempts_used {plan.before} -> {plan.after}"
+        f"clean park would take attempts_used {plan.before} -> {plan.before - 1}"
     )
 
     if args.dry_run:
@@ -710,16 +684,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     print("settled    : record re-read and still parked")
 
-    # Release the claim the stopped controller held, and forgive its attempt.
+    # Release the claim the stopped controller held after recording the clean park.
     # Two separate reasons, both of which bite:
     #   * unreleased, the next dispatch is refused as `duplicate_run_live`,
     #     because the chainlink CLI answers a same-agent re-claim with "You
     #     already hold the lock" and `claim_issue` reads that string as the
     #     trigger for its duplicate-liveness guard;
-    #   * unforgiven, the resume's own claim is charged a second attempt for
+    #   * uncredited, the resume's own claim is charged a second attempt for
     #     one run, and a run parked on its last attempt returns
     #     `attempts_exhausted` rather than resuming.
-    code, detail = release_claim_with_forgiveness(
+    code, detail = release_parked_claim(
         args.chainlink_bin, record.issue_id, args.agent_id, args.home,
     )
     if code == 0:
