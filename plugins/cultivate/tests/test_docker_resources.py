@@ -11,6 +11,8 @@ from zipfile import ZipFile
 
 import pytest
 
+from tests.uv_subprocess import isolated_uv_env
+
 from mimir.plugin_dockerfile import cultivate_scripts, has_trusted_cultivate, services
 from mimir.scaffold_docker import render_dockerfile, scaffold
 
@@ -44,8 +46,10 @@ def test_selected_cultivate_uses_only_inventoried_first_party_scripts() -> None:
 
 
 def test_built_wheel_and_installed_inventory_contain_exact_scripts(tmp_path: Path) -> None:
+    env = isolated_uv_env(tmp_path)
     subprocess.run(["uv", "build", "--package", "mimir-cultivate", "--wheel",
-                    "--out-dir", str(tmp_path)], cwd=ROOT, check=True, capture_output=True, text=True)
+                    "--out-dir", str(tmp_path)], cwd=ROOT, check=True, capture_output=True, text=True,
+                   env=env)
     wheel, = tmp_path.glob("mimir_cultivate-*.whl")
     with ZipFile(wheel) as archive:
         for name in SCRIPT_NAMES:
@@ -53,7 +57,7 @@ def test_built_wheel_and_installed_inventory_contain_exact_scripts(tmp_path: Pat
             assert archive.read(relative) == (SCRIPTS / name).read_bytes()
     target = tmp_path / "installed"
     subprocess.run(["uv", "pip", "install", "--target", str(target), "--no-deps", str(wheel)],
-                   check=True, capture_output=True, text=True)
+                   check=True, capture_output=True, text=True, env=env)
     dist, = (dist for dist in importlib.metadata.distributions(path=[str(target)])
              if dist.metadata["Name"] == "mimir-cultivate")
     candidate = SimpleNamespace(name="cultivate", distribution="mimir-cultivate",

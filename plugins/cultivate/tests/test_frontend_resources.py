@@ -8,6 +8,7 @@ import tomllib
 from pathlib import Path
 from zipfile import ZipFile
 
+from tests.uv_subprocess import isolated_uv_env
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +54,7 @@ def test_wheel_inventory_contains_manifest_resources(tmp_path: Path) -> None:
     result = subprocess.run(
         ["uv", "build", "--package", "mimir-cultivate", "--wheel", "--out-dir", str(tmp_path)],
         cwd=ROOT.parents[1], capture_output=True, text=True, check=False,
+        env=isolated_uv_env(tmp_path),
     )
     assert result.returncode == 0, result.stderr
     wheel, = tmp_path.glob("*.whl")

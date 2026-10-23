@@ -14,6 +14,8 @@ from zipfile import ZipFile
 
 import pytest
 
+from tests.uv_subprocess import isolated_uv_env
+
 
 ROOT = Path(__file__).resolve().parents[3]
 PLUGIN = ROOT / "plugins/cultivate"
@@ -22,9 +24,10 @@ PLUGIN = ROOT / "plugins/cultivate"
 @pytest.fixture(scope="module")
 def built_packages(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     dest = tmp_path_factory.mktemp("cultivate-packages")
+    env = isolated_uv_env(tmp_path_factory.mktemp("cultivate-packages-uv"))
     for name in ("mimir-agent", "mimir-cultivate"):
         subprocess.run(["uv", "build", "--package", name, "--out-dir", str(dest)],
-                       cwd=ROOT, check=True, capture_output=True, text=True)
+                       cwd=ROOT, check=True, capture_output=True, text=True, env=env)
     return {path.name: path for path in dest.iterdir()}
 
 
