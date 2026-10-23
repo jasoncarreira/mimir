@@ -1,47 +1,67 @@
 # Conversation-history offload provenance
 
 DeepAgents' `SummarizationMiddleware._offload_to_backend` and
-`_aoffload_to_backend` append the evicted messages (excluding earlier summary
-messages) to `/conversation_history/{session_id}.md`. Mimir wraps these methods
-in `_deepagents_summarization.py`. `config.DEFAULT_FOLDERS` makes the directory
-writable by the middleware; write permission does **not** establish content trust.
+`_aoffload_to_backend` append evicted messages (excluding previous summaries)
+to `/conversation_history/{session_id}.md`. Mimir wraps these methods in
+`_deepagents_summarization.py`. `config.DEFAULT_FOLDERS` permits middleware
+writes; that permission does **not** establish content trust.
 
-Before #1994, `readonly_backend._publish_read_paths` called
-`access_control.protected_result_source` for each successful file read. The
-`_filesystem_read_trust_anchor` HOME rule excludes `conversation_history` from
-`_SELF_AUTHORED_FILE_ROOTS`, so the resulting filesystem source was **untrusted,
-active_ingest** for both same-turn and later-turn reads, even for trusted-only
-conversations. There was no per-file persistence of the original labels. An
-admin could read the file; the non-admin protected-read boundary normally
-refuses direct reads of this HOME subtree before any content is returned.
+## File-tool reads: same turn and later turns
 
-Now each successful offload snapshots the live turn's complete IFC source set
-(a conservative superset of the messages evicted), plus the labels of the
-existing bytes when appending. A content digest and source records are written
-atomically in the server-owned `.mimir/conversation_history_labels/` directory,
-outside the agent's file-tool writable roots. An existing offload without a
-matching record contributes an untrusted filesystem source. Missing turn labels,
-missing/stale/malformed records, and changed file bytes retain the untrusted
-HOME default. Earlier untrusted input cannot be raised by a later clean append.
-Owner attestations are not recreated from disk.
+Before and after #1994, `_filesystem_read_trust_anchor` excludes
+`conversation_history` from `_SELF_AUTHORED_FILE_ROOTS`. Its HOME path label is
+**untrusted active_ingest**, even for trusted-only conversations. There is no
+trust raise or ad-hoc anchor override. A clean original source remains trusted
+in the attached provenance, but cannot declassify the filesystem path. Admins
+can read it; the non-admin protected-read boundary normally refuses this HOME
+subtree before returning content.
 
-For `read_file`/`aread`, `grep`/`agrep`, and `glob`/`aglob`, the native backend
-publishes the resolved match paths via `_publish_read_paths`. A matching record
-adds the original sources to the protected-result capture; only if *all* stored
-sources are trusted does `protected_result_source` raise the offload's filesystem
-source to trusted. `classify_protected_result` merges the captured sources into
-the turn's live IFC state through BudgetGate. This is the same route for a read
-in the offloading turn and one in a subsequent turn. `ls`/`als` report directory
-entries using the same path publisher; the directory itself retains the
-untrusted HOME classification. Unlabelled/non-native reads cannot assert a
-trusted result through `classify_protected_result`'s incomplete-provenance
-fallback.
+`read_file`/`aread`, `grep`/`agrep`, and `glob`/`aglob` publish resolved paths
+through `readonly_backend._publish_read_paths`. The backend attaches the HOME
+label plus any matching original-source record. BudgetGate merges the capture
+via `classify_protected_result` into live IFC state. Reads in the offloading
+turn and subsequent turns use the same mechanism. `ls`/`als` names and the
+directory itself remain untrusted HOME. Unlabelled native-file results use the
+incomplete-provenance fallback; that fallback does not assert trust.
 
-`file_search` only queries its memory/state index (`tools/extra.py`); it does
-not index `conversation_history`. `memory_query` and `memory_get` query SAGA
-atoms (`tools/memory.py`) and publish their own per-atom IFC metadata; agent
-auto-recall uses that separate memory path. None of these recall routes reads
-the offload directory. A model that explicitly reads an offload through file
-tools receives the captured labels above, and an untrusted active source
-re-enables the `_TAINTED_TURN_WRITE_TOOLS` and file-write vetoes in either
-access-control mode.
+The additional source attachment preserves original ACLs and sensitivity.
+Offload snapshots use `ifc_state.current`, not ingress-only `auth.ifc_labels`:
+web, MCP and poller inputs observed mid-turn are retained. Existing bytes add
+their earlier sources; an unknown prefix or a disagreement between the
+anticipated and returned history paths adds an untrusted filesystem source.
+The proxy hashes the content supplied to a successful write, or the observed
+download plus exact edit, rather than later disk contents. A subsequent writer
+therefore makes the record stale. Downloaded prefixes differing from the
+pre-offload snapshot are unknown, not attested by the old record. Async
+snapshotting, hashing and atomic record persistence run in worker threads.
+
+Records live in `.mimir/conversation_history_labels/`, outside file-tool writable
+roots. Version 1, nonempty complete sources, an exact digest, a direct parent
+under HOME/conversation_history, and a non-symlink path are required. Missing,
+stale, malformed, unsupported or incomplete records add no original sources;
+the untrusted HOME label still applies. Owner attestations are never recreated.
+This is server-owned **relative to file tools**, not a cryptographic signature:
+a clean turn's authorized `shell_exec` can delete or forge records. Deletion
+fails closed. Forgery requires that clean-turn model's shell authority; the
+record never raises path trust even then.
+
+## Shell read-back: known gap, follow-up required
+
+`classify_protected_result("shell_exec", {"command": "cat .../conversation_history/x.md"}, ...)`
+currently yields an untrusted **informational** shell source, not active ingest.
+The same applies to shell `rg`/`grep`: these routes do not use the native backend
+path publisher or restore the saved original labels. Thus a later clean turn
+can ingest untrusted history through shell without activating the write veto.
+This predates #1994 and is not fixed by this file-tool provenance change. It
+requires a separate shell-read classification follow-up (requested in PR #2420),
+including direct, recursive and indirect shell reads without relaxing existing
+authorization. Do not claim every read-back route is protected until that lands.
+
+## Recall
+
+`file_search` queries the memory/state index (`tools/extra.py`), not this
+directory. `memory_query`/`memory_get` and auto-recall query SAGA atoms
+(`tools/memory.py`) and publish their separate per-atom IFC metadata. None reads
+these offload files. Explicit file-tool read-back activates
+`_TAINTED_TURN_WRITE_TOOLS` and file-write vetoes in either enforcement mode;
+the shell exception above remains outstanding.

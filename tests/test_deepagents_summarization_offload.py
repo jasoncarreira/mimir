@@ -515,3 +515,96 @@ def test_offload_wrappers_forward_upstream_signature_changes(is_async: bool) -> 
         three = _wrap_sync_offload(original, logging.getLogger(__name__))
         assert three(None, "raw-backend", ["m"]) == "ok"
         assert seen["args"] == (["m"],)
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("fault", ["none", "path", "writer", "old_bytes"])
+async def test_offload_attests_written_bytes_and_unknown_append_inputs(
+    tmp_path, monkeypatch, is_async, fault,
+):
+    import threading
+    from mimir.models import InformationFlowLabels, InformationFlowState, SourceLabel
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    source = SourceLabel(principal="operator", domain="channel", resource_id="slack-C1",
+                         bridge_instance="slack", sensitivity="private",
+                         authorized_principals=frozenset({"operator"}),
+                         integrity="trusted", integrity_effect="informational")
+    labels = InformationFlowLabels(sources=(source,))
+    auth = AuthContext(principal="operator", canonical_principal="operator",
+                       roles=("admin",), event_ingress=None, trigger="user_message",
+                       channel_id="slack-C1", interactivity=None, ifc_labels=labels,
+                       ifc_state=InformationFlowState(labels=labels))
+    backend = FilesystemBackend(root_dir=tmp_path, virtual_mode=True)
+    actual = "/conversation_history/actual.md"
+    path = tmp_path / actual.lstrip("/")
+    path.parent.mkdir()
+    path.write_text("existing\n")
+    offload_patch._record_offload(actual, None, None, hashlib.sha256(path.read_bytes()).hexdigest())
+    # Seed an authenticated clean prefix under the same turn, then inject races
+    # after the wrapper's snapshot but before the upstream read/write returns.
+    token = set_current_turn(SimpleNamespace(turn_id="offload-race", auth_context=auth))
+    try:
+        offload_patch._record_offload(actual, None, None, hashlib.sha256(path.read_bytes()).hexdigest())
+        middleware = _middleware(actual)
+        snapshot_threads = []
+        record_threads = []
+        snapshot = offload_patch._previous_offload
+        record = offload_patch._record_offload
+
+        def previous(p):
+            snapshot_threads.append(threading.get_ident())
+            return snapshot(p)
+
+        def recording(*args, **kwargs):
+            record_threads.append(threading.get_ident())
+            return record(*args, **kwargs)
+
+        monkeypatch.setattr(offload_patch, "_previous_offload", previous)
+        monkeypatch.setattr(offload_patch, "_record_offload", recording)
+
+        def operation(proxy):
+            if fault == "old_bytes":
+                path.write_text("unknown prefix\n")
+            downloaded = proxy.download_files([actual])[0].content.decode()
+            result = proxy.edit(actual, downloaded, downloaded + "appended\n")
+            assert result.error is None
+            if fault == "writer":
+                path.write_text("concurrent writer\n")
+            return actual
+
+        if is_async:
+            async def original(self, proxy, messages, session_id):
+                # Use the real async proxy methods, not a sync stand-in.
+                if fault == "old_bytes":
+                    path.write_text("unknown prefix\n")
+                downloaded = (await proxy.adownload_files([actual]))[0].content.decode()
+                result = await proxy.aedit(actual, downloaded, downloaded + "appended\n")
+                assert result.error is None
+                if fault == "writer":
+                    path.write_text("concurrent writer\n")
+                return actual
+            original.__name__ = "_aoffload_to_backend"
+            wrapper = offload_patch._wrap_async_offload(original, logging.getLogger(__name__))
+        else:
+            def original(self, proxy, messages, session_id):
+                return operation(proxy)
+            original.__name__ = "_offload_to_backend"
+            wrapper = offload_patch._wrap_sync_offload(original, logging.getLogger(__name__))
+        if fault == "path":
+            middleware._get_history_path = MethodType(lambda self, session: "/conversation_history/other.md", middleware)
+        if is_async:
+            await wrapper(middleware, backend, [], "session")
+        else:
+            wrapper(middleware, backend, [], "session")
+        saved = offload_patch.read_offload_labels(str(path))
+        if fault == "writer":
+            assert saved is None
+        else:
+            assert saved is not None and source in saved
+            assert any(s.has_untrusted_active_ingest for s in saved) is (fault in {"path", "old_bytes"})
+        assert snapshot_threads and record_threads
+        if is_async:
+            assert all(t != threading.get_ident() for t in snapshot_threads + record_threads)
+    finally:
+        reset_current_turn(token)
