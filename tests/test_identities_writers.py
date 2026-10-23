@@ -18,6 +18,10 @@ from mimir.commands import identities as identity_cmd
 from mimir.commands import setup
 
 
+# Hang guard sized for parallel full-suite load, not a latency assertion.
+_PROCESS_GUARD_S = 60
+
+
 def _people(home: Path) -> list[dict]:
     return yaml.safe_load((home / "state" / "identities.yaml").read_text())["people"]
 
@@ -272,18 +276,18 @@ def _assert_transactions_serialize(tmp_path: Path, operation: str, *, unlocked=F
     first = spawn("A")
     second = None
     try:
-        assert select.select([first.stdout], [], [], 15)[0]
+        assert select.select([first.stdout], [], [], _PROCESS_GUARD_S)[0]
         assert first.stdout.readline().strip() == b"started"
-        assert select.select([first.stdout], [], [], 15)[0]
+        assert select.select([first.stdout], [], [], _PROCESS_GUARD_S)[0]
         assert first.stdout.readline().strip() == b"loaded"
         second = spawn("B")
-        assert select.select([second.stdout], [], [], 15)[0]
+        assert select.select([second.stdout], [], [], _PROCESS_GUARD_S)[0]
         assert second.stdout.readline().strip() == b"started"
-        assert select.select([second.stdout], [], [], 15)[0], "B never reached the transaction"
+        assert select.select([second.stdout], [], [], _PROCESS_GUARD_S)[0], "B never reached the transaction"
         assert second.stdout.readline().strip() == b"blocked", "B loaded before A committed"
-        _, error = first.communicate(b"continue\n", timeout=15)
+        _, error = first.communicate(b"continue\n", timeout=_PROCESS_GUARD_S)
         assert first.returncode == 0, error
-        output, error = second.communicate(timeout=15)
+        output, error = second.communicate(timeout=_PROCESS_GUARD_S)
         assert second.returncode == 0, error
         assert b"loaded" in output
         people = _people(tmp_path)

@@ -1,0 +1,1 @@
+- Size test hang guards for parallel full-suite load: redaction cost-bound span, Vitest and Testing Library timeouts, the identities writer process guard, and the ACP journal faulthandler period (carried from epic #1949).
