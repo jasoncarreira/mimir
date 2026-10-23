@@ -1213,13 +1213,16 @@ def test_leaf_checkout_lets_the_worklink_uid_run_real_git(
         script = "\n".join((
             "set -eu",
             f'test "$(id -u)" = {identities.worklink_uid}',
-            # The tree is controller-owned; a worker names it safe explicitly.
-            'g() { git -c safe.directory="$PWD" -c user.name=worker -c user.email=w@example.com "$@"; }',
-            "g status --porcelain",
+            "git status --porcelain",
             "printf 'worker change\\n' > worker-file",
-            "g add worker-file",
-            "g commit -q -m 'worker commit'",
-            "g log -1 --format=%s",
+            "git add worker-file",
+            "export GIT_AUTHOR_NAME=worker GIT_AUTHOR_EMAIL=w@example.com",
+            "export GIT_COMMITTER_NAME=worker GIT_COMMITTER_EMAIL=w@example.com",
+            "git commit -q -m 'worker commit'",
+            "git log -1 --format=%s",
+            'test "$(git config --get-all safe.directory)" = "$(pwd)"',
+            f'if git -C "{worklink_root / repo.name / "1413-1"}" status > sibling-out 2>&1; then exit 20; fi',
+            'grep -q "dubious ownership" sibling-out',
             "printf 'git-euid=%s\\n' \"$(id -u)\"",
         ))
 
@@ -1237,6 +1240,10 @@ def test_leaf_checkout_lets_the_worklink_uid_run_real_git(
                     )
                     assert not lease.worker_authorized and lease.authorization is None
                     assert lease.path == worklink_root / repo.name / "1412-1"
+                    sibling = worklink_root / repo.name / "1413-1"
+                    sibling.mkdir(mode=0o2770)
+                    os.chown(sibling, identities.mimir_uid, identities.worklink_gid)
+                    _git(sibling, "init", "-q")
                     compute = LocalSubprocessComputeBackend.for_path_checkout(
                         identities.worklink_uid,
                         worker_client=worker_client.WorkerClient.for_path_checkout(

@@ -843,6 +843,35 @@ def test_executor_rejects_mismatched_launch_protocol_identity() -> None:
         worker_exec._handle_launch(object(), request, [-1, -1, -1])
 
 
+def test_leaf_git_environment_trusts_only_the_validated_checkout(tmp_path: Path) -> None:
+    checkout = tmp_path / "issued"
+    env = {"PATH": "/usr/bin:/bin"}
+    worker_exec._leaf_git_environment(env, checkout)
+    assert env == {
+        "PATH": "/usr/bin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": str(checkout),
+    }
+
+
+@pytest.mark.parametrize("name,value", [
+    ("GIT_CONFIG_COUNT", "2"),
+    ("GIT_CONFIG_KEY_1", "safe.directory"),
+    ("GIT_CONFIG_PARAMETERS", "'safe.directory=*'"),
+    ("GIT_CONFIG_GLOBAL", "/tmp/hostile-config"),
+])
+def test_leaf_git_environment_rejects_supplied_git_config(
+    tmp_path: Path, name: str, value: str,
+) -> None:
+    env = {name: value}
+    with pytest.raises(RuntimeError, match="assigned by the executor"):
+        worker_exec._leaf_git_environment(env, tmp_path / "issued")
+    assert env == {name: value}
+
+
 @pytest.mark.parametrize("operation,handler", [
     ("launch_path", "_handle_launch"),
     ("launch_factory", "_handle_launch_factory"),

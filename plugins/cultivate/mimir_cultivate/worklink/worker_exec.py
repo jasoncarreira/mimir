@@ -765,6 +765,19 @@ def _validate_environment(value: object) -> dict[str, str]:
     return dict(value)
 
 
+def _leaf_git_environment(environment: dict[str, str], checkout: Path) -> None:
+    """Trust only the executor-validated leaf checkout for this process's Git."""
+    if any(name.startswith("GIT_CONFIG_") for name in environment):
+        raise RuntimeError("leaf worker Git configuration must be assigned by the executor")
+    environment.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": str(checkout),
+    })
+
+
 def _project_home(home: Path, projections: object) -> None:
     if not isinstance(projections, list) or len(projections) > 2:
         raise RuntimeError("at most two worker projections are allowed")
@@ -1165,6 +1178,10 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
     try:
         if path_addressed:
             fds.insert(0, _open_factory_checkout(request, for_launch=True) if factory else _open_path_checkout(request))
+            if not factory:
+                # _open_path_checkout checked the canonical path, shape and owner.
+                # The worker request must not supply or widen protected Git config.
+                _leaf_git_environment(environment, Path(request["path"]))
         anchored_fd = os.open(
             ".",
             os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
