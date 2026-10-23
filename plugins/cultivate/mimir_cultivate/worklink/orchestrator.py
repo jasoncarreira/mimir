@@ -84,6 +84,7 @@ from mimir.secret_scan import secret_matches
 from .safe_git import ControllerGitPublication, _git_credential_settings
 from .backends.feature_factory import (
     FACTORY_PUBLISHING_IDENTITY_ENV,
+    FactoryContractError,
     FactoryStatus,
     FactoryRunLockContended,
     FeatureFactoryBackend,
@@ -109,7 +110,6 @@ _PR_BODY_SECTION_FILE = ".worklink-pr-body.md"
 _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
 _FACTORY_CONTROLLER_ERROR_MAX_BYTES = 4000
-_RECOVERABLE_FACTORY_PHASES = {"running", "parked", "failed", "terminal"}
 _EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
 # GitHub's documented closing-keyword set:
 # https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue
@@ -2550,7 +2550,7 @@ class WorklinkRunner:
                 return
             candidate = candidates[0]
             try:
-                _verify_factory_recovery_target(
+                sandbox = _verify_factory_recovery_target(
                     runner=self,
                     issue=issue,
                     retained=candidate,
@@ -2559,6 +2559,19 @@ class WorklinkRunner:
                     base=base,
                     command_runner=runner,
                 )
+                live = selected.status(
+                    candidate.run_id, sandbox=sandbox, launcher=candidate.launcher,
+                )
+                _require_factory_status(live, candidate)
+                candidate = candidate.observed(live, datetime.now(UTC).isoformat())
+                save_factory_record(self.home, candidate)
+                if not live.is_terminal and live.status != "needs-human":
+                    raise WorklinkError(
+                        "factory resume requires current status needs-human; "
+                        f"found {live.status!r}"
+                    )
+            except FactoryContractError as exc:
+                raise FactoryRecoveryBlocked(candidate, f"factory status is unavailable: {exc}") from exc
             except WorklinkError as exc:
                 raise FactoryRecoveryBlocked(candidate, str(exc)) from exc
             retained = candidate
@@ -4118,19 +4131,8 @@ def _verify_factory_recovery_target(
         raise WorklinkError("retained factory base does not match recovery request")
     if retained.launcher != str(launcher):
         raise WorklinkError("retained factory launcher does not match recovery request")
-    if retained.controller_phase not in _RECOVERABLE_FACTORY_PHASES:
-        raise WorklinkError("retained factory lifecycle is not recoverable")
     if not retained.session:
         raise WorklinkError("retained factory session is missing")
-    if (
-        retained.status is not None
-        and not retained.status.is_terminal
-        and retained.status.status != "needs-human"
-    ):
-        raise WorklinkError(
-            "factory resume requires current status needs-human; "
-            f"found {retained.status.status!r}"
-        )
     sandbox = Path(retained.sandbox)
     from .worker_client import WORKLINK_CHECKOUT_ROOT, factory_checkout_for_path
 

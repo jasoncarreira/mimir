@@ -391,8 +391,7 @@ class TestResumePreflight:
         """The exact failure that cost an attempt: status no longer needs-human."""
         record = _record(tmp_path, phase="running", status="running")
         problems = resume.preflight(record, _status("running"), Path(record.sandbox))
-        assert any("requires 'needs-human'" in problem for problem in problems)
-        assert any("factory resume" in problem for problem in problems)
+        assert any("recovery resumes only" in problem for problem in problems)
 
     @pytest.mark.skipif(
         sys.platform != "linux",
@@ -469,14 +468,12 @@ class TestResumePreflight:
         problems = resume.preflight(record, _status(snapshot=None), Path(record.sandbox))
         assert any("park_snapshot is null" in problem for problem in problems)
 
-    def test_recoverable_phases_come_from_the_gate_not_a_restatement(self) -> None:
-        """A local copy of this set would silently drift from the code it reports on."""
-        assert resume._RECOVERABLE_FACTORY_PHASES is orchestrator._RECOVERABLE_FACTORY_PHASES
-
-    def test_an_unrecoverable_phase_names_the_recoverable_ones(self, tmp_path: Path) -> None:
-        record = _record(tmp_path, phase="archived")
-        problems = resume.preflight(record, _status(), Path(record.sandbox))
-        assert any("recoverable phases are" in problem for problem in problems)
+    @pytest.mark.parametrize("cached", ["running", "failed"])
+    def test_stale_cached_status_and_phase_do_not_block_live_park(
+        self, tmp_path: Path, cached: str,
+    ) -> None:
+        record = _record(tmp_path, phase="stopped", status=cached)
+        assert resume.preflight(record, _status(), Path(record.sandbox)) == []
 
 
 class TestResumeDoesNotUnpark:

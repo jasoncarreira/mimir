@@ -6661,7 +6661,8 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
     )
 
     async def recover(self: object, **kwargs: object) -> object:
-        assert kwargs["retained"] == retained
+        assert kwargs["retained"] == load_factory_record(tmp_path, "700")
+        assert kwargs["retained"].status == live
         kwargs["claims"].transition_issue(700, status="completed", review_ready=True)
         return expected
 
@@ -6669,6 +6670,8 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
         raise AssertionError("new-run identity preflight reached during recovery")
 
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(retained.launcher))
+    live = _factory_lifecycle_status(tmp_path / "sandbox", status="needs-human")
+    monkeypatch.setattr(FeatureFactoryBackend, "status", lambda self, *args, **kwargs: live)
 
     def claim_issue(self: object, *args: object, **kwargs: object) -> ClaimResult:
         kwargs["before_claim"]()
@@ -6708,8 +6711,9 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
     assert signals == ([tmp_path] if release_confirmed else [])
 
 
+@pytest.mark.parametrize("status_readable", [True, False])
 def test_retained_running_factory_precondition_does_not_consume_attempt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status_readable: bool,
 ) -> None:
     import mimir_cultivate.worklink.orchestrator as orchestrator
     from mimir_cultivate.worklink.dispatch_failures import (
@@ -6770,6 +6774,13 @@ def test_retained_running_factory_precondition_does_not_consume_attempt(
         )
 
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(retained.launcher))
+    def live_status(self: object, *args: object, **kwargs: object) -> Any:
+        if not status_readable:
+            raise FactoryContractError("factory status unavailable")
+        return _factory_lifecycle_status(sandbox, status="running")
+
+    monkeypatch.setattr(FeatureFactoryBackend, "status", live_status)
+    monkeypatch.setattr(orchestrator, "factory_process_is_alive", lambda record: True)
     monkeypatch.setattr(
         WorklinkConfig,
         "load",
@@ -6793,7 +6804,10 @@ def test_retained_running_factory_precondition_does_not_consume_attempt(
         for _ in range(3)
     ]
 
-    reason = "factory resume requires current status needs-human; found 'running'"
+    reason = (
+        "factory resume requires current status needs-human; found 'running'"
+        if status_readable else "factory status is unavailable: factory status unavailable"
+    )
     assert allocations == 0
     assert [result.status for result in results] == ["blocked"] * 3
     assert all(result.reason is not None and reason in result.reason for result in results)
@@ -6804,6 +6818,8 @@ def test_retained_running_factory_precondition_does_not_consume_attempt(
     assert incident["attempt_consumed"] is False
     assert reason in incident["terminal_error"]
     assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
+    if not status_readable:
+        assert load_factory_record(tmp_path, "700") == retained
 
 
 def test_post_work_factory_failure_consumes_attempt(tmp_path: Path) -> None:
@@ -6842,7 +6858,6 @@ def test_post_work_factory_failure_consumes_attempt(tmp_path: Path) -> None:
         "launcher",
         "base",
         "session",
-        "lifecycle",
         "checkout_root",
         "checkout_root_command",
         "checkout_root_unavailable",
@@ -6911,8 +6926,6 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
         retained = replace(retained, base_ref="develop")
     elif refusal == "session":
         retained = replace(retained, session=None)
-    elif refusal == "lifecycle":
-        retained = replace(retained, controller_phase="stopped")
     save_factory_record(tmp_path, retained)
     claim = ClaimRecord(700, 2, "agent", datetime.now(UTC), budget_attempt=2)
     lease = CheckoutLease(
@@ -7134,7 +7147,6 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
         "launcher": "retained factory launcher does not match recovery request",
         "base": "retained factory base does not match recovery request",
         "session": "retained factory session is missing",
-        "lifecycle": "retained factory lifecycle is not recoverable",
         "checkout_root": "factory checkout root mismatch",
         "checkout_root_command": "cannot inspect root",
         "checkout_root_unavailable": "factory checkout root is unavailable",
@@ -7208,14 +7220,6 @@ def test_factory_launch_preflight_refuses_existing_run_sandbox(tmp_path: Path) -
         orchestrator._create_factory_sandbox(record, lease)
 
     assert sandbox.is_dir()
-
-
-@pytest.mark.parametrize("phase", ["running", "parked", "failed", "terminal"])
-def test_factory_recovery_phases_are_explicit(phase: str) -> None:
-    import mimir_cultivate.worklink.orchestrator as orchestrator
-
-    assert phase in orchestrator._RECOVERABLE_FACTORY_PHASES
-    assert "stopped" not in orchestrator._RECOVERABLE_FACTORY_PHASES
 
 
 def test_autonomous_leaf_incident_fence_precedes_issue_reads_and_mutations(
@@ -10281,7 +10285,11 @@ print(json.dumps([str(path) for path in pruned]))
             payload["next"] = next_value
         return parse_factory_status(payload)
 
-    statuses = [status("needs-human", lock)]
+    live_parked = parse_factory_status({
+        **status("needs-human", lock).to_json(),
+        "park_snapshot": str(sandbox / ".factory" / ".parked" / "700"),
+    })
+    statuses = [live_parked, live_parked]
     credential_settings = (("credential.https://github.com.helper", "!recovery-helper"),)
 
     def capture_credentials(trusted_repo):
@@ -10350,7 +10358,7 @@ print(json.dumps([str(path) for path in pruned]))
                 self.handle = LaunchHandle("local_subprocess", str(self.process.pid), ticks)
                 # The durable record still names the dead worker while the
                 # replacement is launching, before save_factory_record.
-                assert load_factory_record(tmp_path, "700") == retained
+                assert load_factory_record(tmp_path, "700").status == live_parked
                 assert prune_in_child() == []
                 assert self.process.poll() is None
                 assert sandbox.is_dir()
@@ -10420,9 +10428,12 @@ print(json.dumps([str(path) for path in pruned]))
         sandbox=str(sandbox),
         session=retained_session,
         handle=LaunchHandle("local_subprocess", "99999999", 456),
-        status=status("needs-human", lock),
+        status=status(
+            "running" if lock == "absent" else "failed" if lock == "stale" else "needs-human",
+            lock,
+        ),
         observed_at="2026-08-18T12:00:00+00:00",
-        controller_phase="parked",
+        controller_phase="stopped" if lock == "stale" else "parked",
         controller_error=(
             "factory driver idle: no progress since 2026-08-18T11:45:00+00:00"
             if idle_park else None
@@ -10438,6 +10449,11 @@ print(json.dumps([str(path) for path in pruned]))
         if local_compute:
             assert prune_in_child() == []
         kwargs["before_claim"]()
+        refreshed = load_factory_record(tmp_path, "700")
+        assert refreshed is not None
+        assert refreshed.status == live_parked
+        assert refreshed.observed_at != retained.observed_at
+        assert refreshed.controller_error is None
         return ClaimResult(True, claim)
 
     def release_issue(*args: object, **kwargs: object) -> bool:
@@ -10467,7 +10483,7 @@ print(json.dumps([str(path) for path in pruned]))
                 compute.process.kill()
             compute.process.wait(timeout=10)
     assert result.status == "needs-human", result.reason
-    expected = [("status", "700", str(sandbox), retained.launcher)]
+    expected = [("status", "700", str(sandbox), retained.launcher)] * 2
     if action is not None:
         expected.extend([
             ("lock", "700", action, retained_session, str(sandbox)),
@@ -11137,7 +11153,6 @@ def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or
         "repository",
         "base",
         "launcher",
-        "lifecycle",
         "session",
         "claim_issue",
         "claim_owner",
@@ -11165,8 +11180,6 @@ def test_factory_recovery_binding_rejects_every_precontrol_mismatch(
         replacements["base_ref"] = "develop"
     elif case == "launcher":
         replacements["launcher"] = "/opt/other/factory.js"
-    elif case == "lifecycle":
-        replacements["controller_phase"] = "stopped"
     elif case == "session":
         replacements["session"] = None
     elif case == "sandbox":

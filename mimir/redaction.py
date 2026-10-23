@@ -94,6 +94,11 @@ def _sub_colon_credentials(
         checked_to = word_start
         while checked_to < len(text) and _COLON_KEY_CHAR.fullmatch(text[checked_to]):
             checked_to += 1
+        # A key reaching end-of-input cannot have the colon/value required by
+        # any grammar. Matching the whole run otherwise backtracks over every
+        # repeated credential word in quadratic time.
+        if checked_to == len(text):
+            continue
         starts = [key_start]
         if key_start and text[key_start - 1] in {'"', "'"}:
             starts.insert(0, key_start - 1)

@@ -3,8 +3,8 @@
 
 This script deliberately does **not** call ``factory resume``.
 
-mimir's recovery path does the whole transition as one operation: it refuses a
-status that is not ``running`` or ``needs-human``, requires the retained process
+mimir's recovery path does the whole transition as one operation: it requires
+live ``needs-human`` status and the retained process
 to be verifiably dead, steals or claims the session lock as needed, resumes,
 checks the returned status is owned and running, validates the recovery binding,
 launches a driver, saves the new handle and enters supervision. Unparking from
@@ -43,7 +43,6 @@ from mimir_cultivate.worklink.factory_state import (  # noqa: E402
     factory_process_is_verified_dead,
     load_factory_record,
 )
-from mimir_cultivate.worklink.orchestrator import _RECOVERABLE_FACTORY_PHASES  # noqa: E402
 
 PARKED = "needs-human"
 
@@ -73,35 +72,19 @@ def preflight(record, status: dict, sandbox: Path) -> list[str]:
     """Return the recovery preconditions that do not hold, most specific first.
 
     Each check mirrors one in ``_verify_factory_recovery_target`` or the resume
-    block that follows it. ``_RECOVERABLE_FACTORY_PHASES`` is imported rather
-    than restated so this cannot drift from the gate it is reporting on.
+    block that follows it. Resumability follows the live status, not cached
+    controller lifecycle observations.
     """
     problems: list[str] = []
 
     reported = status.get("status")
-    if reported not in {"running", PARKED}:
+    if reported != PARKED:
         problems.append(
-            f"factory status is {reported!r}; recovery resumes only 'running' or 'needs-human'"
-        )
-
-    if record.controller_phase not in _RECOVERABLE_FACTORY_PHASES:
-        problems.append(
-            f"retained controller_phase is {record.controller_phase!r}; recoverable phases are "
-            f"{sorted(_RECOVERABLE_FACTORY_PHASES)}"
+            f"factory status is {reported!r}; recovery resumes only 'needs-human'"
         )
 
     if not record.session:
         problems.append("retained session is missing; recovery resumes with the recorded session")
-
-    if (
-        record.status is not None
-        and not record.status.is_terminal
-        and record.status.status != PARKED
-    ):
-        problems.append(
-            f"retained status is {record.status.status!r}; recovery requires 'needs-human'. "
-            "An out-of-band 'factory resume' is the usual cause."
-        )
 
     if factory_process_is_alive(record):
         problems.append("the retained factory process is still alive; recovery refuses a live run")
