@@ -5,7 +5,14 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from mimir.worklink.planning import _REQUIRED_SECTIONS
+import os
+
+import pytest
+
+if "cultivate" not in os.environ.get("MIMIR_PLUGINS", "").split(","):
+    pytest.skip("Worklink validator requires selected Cultivate", allow_module_level=True)
+
+from mimir_cultivate.worklink.planning import _REQUIRED_SECTIONS
 
 
 ROOT = Path(__file__).resolve().parent.parent

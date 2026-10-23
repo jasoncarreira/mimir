@@ -4,6 +4,7 @@ import type { ComponentType } from "react";
 import * as React from "react";
 import * as ReactDOM from "react-dom";
 import * as ReactDOMClient from "react-dom/client";
+import * as UI from "./ui";
 import { authenticatedPluginFetch, localPluginUrl } from "./api/http";
 import type { SkinManifest } from "./skins/types";
 import { sanitizeHref } from "./routeState";
@@ -150,11 +151,19 @@ export interface PluginNavEntry {
   detail?: string;
 }
 
+export interface PluginUiKit {
+  version: 1;
+  components: typeof UI;
+}
+
+const pluginUiKit: PluginUiKit = Object.freeze({ version: 1, components: UI });
+
 export interface PluginHost {
   apiMajor: 1;
   react: typeof React;
   reactDOM: typeof ReactDOM;
   reactDOMClient: typeof ReactDOMClient;
+  uiKit: PluginUiKit;
   themeTokens: SkinManifest["tokens"];
   registerRoute: (route: PluginRoute) => void;
   registerNavEntry: (entry: PluginNavEntry) => void;
@@ -206,6 +215,7 @@ export async function loadPluginBundles(
     react: React,
     reactDOM: ReactDOM,
     reactDOMClient: ReactDOMClient,
+    uiKit: pluginUiKit,
     themeTokens: tokens,
     authenticatedFetch: authenticatedPluginFetch,
     registerRoute(route) {

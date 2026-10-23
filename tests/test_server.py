@@ -53,7 +53,6 @@ from mimir.server import (
     _handle_event,
     _handle_root,
     build_app,
-    reattach_inflight_worklink_runs,
     _http_runner,
     _record_shutdown_signal,
 )
@@ -226,8 +225,10 @@ def test_server_startup_routes_factory_recovery_to_run_epic(
     # this test asserts ambient state it does not own: green in CI, red in every
     # Worklink sandbox that inherits the container env.
     monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
-    import mimir.worklink.control as control
-    import mimir.worklink.factory_state as factory_state
+    pytest.importorskip("mimir_cultivate")
+    import mimir_cultivate.worklink.control as control
+    import mimir_cultivate.worklink.factory_state as factory_state
+    from mimir_cultivate.server import reattach_inflight_worklink_runs
 
     record = factory_state.FactoryRunRecord(
         run_id="chainlink-700",
@@ -269,9 +270,11 @@ def test_server_startup_routes_factory_recovery_to_run_epic(
 def test_server_factory_spawn_failure_records_all_recovery_pointers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import mimir.worklink.control as control
-    import mimir.worklink.factory_state as factory_state
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    pytest.importorskip("mimir_cultivate")
+    import mimir_cultivate.worklink.control as control
+    import mimir_cultivate.worklink.factory_state as factory_state
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.server import reattach_inflight_worklink_runs
 
     transcript = tmp_path / "factory-transcript.json"
     record = factory_state.FactoryRunRecord(
@@ -318,10 +321,12 @@ def test_server_factory_spawn_failure_records_all_recovery_pointers(
 def test_server_leaf_spawn_failure_records_retained_identity_and_actual_log(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.control as control
-    import mimir.worklink.factory_state as factory_state
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
-    from mimir.worklink.run_state import WorklinkRunState
+    pytest.importorskip("mimir_cultivate")
+    import mimir_cultivate.worklink.control as control
+    import mimir_cultivate.worklink.factory_state as factory_state
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.server import reattach_inflight_worklink_runs
+    from mimir_cultivate.worklink.run_state import WorklinkRunState
 
     state = WorklinkRunState(
         issue_id=441,
@@ -396,9 +401,12 @@ def test_runtime_is_only_production_mcp_tools_writer() -> None:
 def _writer_call_sites(writer_names: set[str]) -> dict[str, set[str]]:
     root = Path(__file__).resolve().parent.parent
     sites = {name: set() for name in writer_names}
-    for path in (root / "mimir").rglob("*.py"):
+    for path in (*(root / "mimir").rglob("*.py"),
+                 *(root / "plugins" / "cultivate" / "mimir_cultivate").rglob("*.py")):
         relative = path.relative_to(root).as_posix()
         module_name = relative.removesuffix(".py").replace("/", ".")
+        if relative.startswith("plugins/cultivate/"):
+            module_name = module_name.removeprefix("plugins.cultivate.")
         package_parts = module_name.split(".")[:-1]
         tree = ast.parse(path.read_text(encoding="utf-8"))
         aliases: dict[str, str] = {}
@@ -458,11 +466,14 @@ def test_production_global_writers_are_confined() -> None:
     expected = {
         "init_logger": {
             "mimir/server.py",
-            "mimir/commands/worklink.py",
+            "plugins/cultivate/mimir_cultivate/commands.py",
             "mimir/wiki_backlinks.py",
         },
-        "set_github_identity_degraded_callback": {"mimir/runtime.py"},
-        "set_forge_client": {"mimir/runtime.py", "mimir/tools/forge.py"},
+        "set_github_identity_degraded_callback": {"plugins/cultivate/mimir_cultivate/registration.py"},
+        "set_forge_client": {
+            "plugins/cultivate/mimir_cultivate/registration.py",
+            "plugins/cultivate/mimir_cultivate/forge.py",
+        },
         "set_memory_client": {"mimir/agent.py", "mimir/runtime.py"},
         "set_indexer": {"mimir/runtime.py"},
         "set_index_generator": {"mimir/runtime.py"},
@@ -490,7 +501,9 @@ def test_production_global_writers_are_confined() -> None:
     assert saga_config_writers == set()
 
     server_source = (root / "mimir" / "server.py").read_text(encoding="utf-8")
-    assert 'os.environ["MIMIR_WORKLINK_AGENT_ID"] = worklink_agent_id' in server_source
+    provider_source = (root / "plugins" / "cultivate" / "mimir_cultivate" / "server.py").read_text(encoding="utf-8")
+    assert 'os.environ["MIMIR_WORKLINK_AGENT_ID"] =' in provider_source
+    assert 'os.environ["MIMIR_WORKLINK_AGENT_ID"] =' not in server_source
     assert "_access_log.addFilter(_MaskApiKeyInAccessLog())" in server_source
 
     server_tree = ast.parse(
@@ -934,7 +947,6 @@ def _controlled_server_app(
     import mimir.skill_install
     import mimir.tools
     import mimir.update_on_start
-    import mimir.worklink.autonomy
     from mimir.config import Config
     from mimir.history import set_global_buffer
 
@@ -1040,6 +1052,15 @@ def _controlled_server_app(
             assert tuple(jobs) == tuple(self.policy.scheduler_jobs.values())
             control.hit("scheduler:bind_plugin_jobs")
             return control.plugin_jobs_installed
+
+        def register_callable(
+            self, name: str, fn: Any, default_cron: str, *, job_id: str | None = None,
+            **kwargs: Any,
+        ) -> bool:
+            assert callable(fn)
+            assert name and job_id
+            assert isinstance(default_cron, str)
+            return bool(default_cron)
 
         def start(self) -> None:
             self._started = True
@@ -1265,8 +1286,6 @@ def _controlled_server_app(
             control.hit(f"log:{kind}"),
         ),
     )
-    monkeypatch.setattr("mimir.server.repo_binding_startup_alerts", lambda: [])
-    monkeypatch.setattr("mimir.server.reattach_inflight_worklink_runs", lambda home: [])
     monkeypatch.setattr("mimir.server.cancel_background_tasks", cancel_tasks)
     monkeypatch.setattr("mimir.server._start_mcp_servers", start_mcp)
     if not control.real_web_routes:
@@ -1294,11 +1313,6 @@ def _controlled_server_app(
         mimir.liveness,
         "mark_clean_shutdown",
         lambda home: (control.hit("liveness:clean"), True)[1],
-    )
-    monkeypatch.setattr(
-        mimir.worklink.autonomy,
-        "release_claims_for_graceful_shutdown",
-        lambda *args, **kwargs: control.hit("claims:release") or ([], []),
     )
     monkeypatch.setattr(mimir.mcp_client, "MCPManager", MCPManager)
     monkeypatch.setattr(mimir.mcp_client, "MCPPolicyStore", MCPPolicyStore)
@@ -1527,9 +1541,13 @@ def _fail_mcp_client_import(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selected_plugins", ["", "cultivate"])
 async def test_source_repo_hook_uses_pushed_from_repo_not_running_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_plugins: str,
 ) -> None:
+    if selected_plugins:
+        pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", selected_plugins)
     pushed_from = tmp_path / "pushed-from"
     running_source = tmp_path / "running-source"
     (pushed_from / ".git" / "hooks").mkdir(parents=True)
@@ -1786,7 +1804,9 @@ async def test_startup_logs_effective_lease_read_scope(tmp_path, monkeypatch, en
     home.mkdir()
     root = tmp_path / "leases"
     root.mkdir()
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1" if enabled else "0")
+    if enabled:
+        pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if enabled else "")
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
     app, control = _controlled_server_app(home, monkeypatch)
@@ -1797,7 +1817,6 @@ async def test_startup_logs_effective_lease_read_scope(tmp_path, monkeypatch, en
             if kind == "filesystem_read_scope"
         ]
         assert payloads == [{
-            "coding_enabled": enabled,
             "derived_pr_checkout_read_roots": [str(root)] if enabled else [],
             "effective_non_admin_read_roots": [
                 str(path) for path in configured_non_admin_read_roots()
@@ -2415,7 +2434,6 @@ async def test_server_startup_and_cleanup_resource_order(
 
     ordered = [
         "liveness:clean",
-        "claims:release",
         "log:shutdown",
         "scheduler:stop",
         "dispatcher:drain",
@@ -2481,8 +2499,8 @@ async def test_server_cleanup_stops_scheduler_before_final_channel_drain(
 
     async def drain(*, timeout: float) -> None:
         callback = control.dispatcher._on_channel_drained
-        assert callback is not None
-        callback("poller:github-activity")
+        if callback is not None:
+            callback("poller:github-activity")
         control.hit("dispatcher:drain")
 
     control.dispatcher.drain = drain
@@ -2491,7 +2509,9 @@ async def test_server_cleanup_stops_scheduler_before_final_channel_drain(
     assert control.events.index("scheduler:stop") < control.events.index(
         "dispatcher:drain"
     )
-    assert "scheduler:trigger:github-activity:remediation_queue_drained" in control.events
+    assert ("scheduler:trigger:github-activity:remediation_queue_drained" in control.events) == bool(
+        app["plugin_manager"].policy.server_hooks
+    )
     assert control.scheduler._started is False
 
 
@@ -2500,6 +2520,8 @@ async def test_part_b_startup_summary_emits_when_nothing_dispatched(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     app, control = _controlled_server_app(tmp_path, monkeypatch)
 
     await _run_startup(app)
@@ -2516,21 +2538,32 @@ async def test_part_c_server_shutdown_summary_includes_released_and_failed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.autonomy
-    from mimir.worklink.claims import ShutdownClaimFailure
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    import mimir_cultivate.worklink.autonomy as autonomy
+    from mimir_cultivate.worklink.claims import ShutdownClaimFailure
 
     app, control = _controlled_server_app(tmp_path, monkeypatch)
     await _run_startup(app)
-    monkeypatch.setattr(
-        mimir.worklink.autonomy,
-        "release_claims_for_graceful_shutdown",
-        lambda *args, **kwargs: (
+    issued_agent_id = os.environ["MIMIR_WORKLINK_AGENT_ID"]
+    monkeypatch.setenv("MIMIR_WORKLINK_AGENT_ID", "mimir-worklink:another-generation")
+    observed: list[str] = []
+
+    def release(*args: Any, **kwargs: Any) -> tuple[list[Any], list[Any]]:
+        observed.append(kwargs["agent_id"])
+        return (
             [SimpleNamespace(issue_id=1400)],
             [ShutdownClaimFailure(issue_id=1401, reason="release denied")],
-        ),
+        )
+
+    monkeypatch.setattr(
+        autonomy,
+        "release_claims_for_graceful_shutdown",
+        release,
     )
 
     await _run_cleanup(app)
+    assert observed == [issued_agent_id]
 
     assert (
         "worklink_shutdown_claims_released",
@@ -2578,7 +2611,6 @@ async def test_server_cleanup_continues_aggregates_errors_and_clears_state(
     control.failures.update(
         {
             "liveness:clean": RuntimeError("liveness cleanup"),
-            "claims:release": RuntimeError("claims cleanup"),
             "log:shutdown": RuntimeError("log cleanup"),
             "dispatcher:drain": RuntimeError("drain cleanup"),
             "cancel:server cleanup": RuntimeError("task cleanup"),
@@ -2594,7 +2626,7 @@ async def test_server_cleanup_continues_aggregates_errors_and_clears_state(
     with pytest.raises(ExceptionGroup, match="server cleanup failed") as caught:
         await _run_cleanup(app)
 
-    assert len(caught.value.exceptions) == 11
+    assert len(caught.value.exceptions) == 10
     for event_name in control.failures:
         assert event_name in control.events
     assert app["agent"] is None
@@ -2975,9 +3007,14 @@ class TestMaskApiKeyInAccessLog:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _health_app() -> web.Application:
+def _health_app(with_worker: bool = False) -> web.Application:
     """Minimal app with only the /health route."""
     app = web.Application()
+    if with_worker:
+        pytest.importorskip("mimir_cultivate")
+        from mimir.plugins.manager import load_plugins
+
+        app["plugin_manager"] = load_plugins(enable="cultivate")
     app.router.add_get("/health", _handle_health)
     app.on_startup.append(_capture_controller_source_commit)
     return app
@@ -3022,7 +3059,7 @@ class TestHandleHealth:
     async def test_health_reports_stale_root_executor_before_launch(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from mimir.worklink import worker_client
+        worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
 
         socket_path = tmp_path / "executor.sock"
         socket_path.touch()
@@ -3034,7 +3071,7 @@ class TestHandleHealth:
             )
 
         monkeypatch.setattr(worker_client, "verify_executor_identity", stale)
-        app = _health_app()
+        app = _health_app(with_worker=True)
         app["check_worker_executor_health"] = True
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/health")
@@ -3049,7 +3086,7 @@ class TestHandleHealth:
     async def test_health_reports_root_executor_source_commit(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from mimir.worklink import worker_client
+        worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
 
         monkeypatch.delenv("WORKLINK_REPO", raising=False)
         socket_path = tmp_path / "executor.sock"
@@ -3060,7 +3097,7 @@ class TestHandleHealth:
             return "c" * 40
 
         monkeypatch.setattr(worker_client, "verify_executor_identity", identity)
-        app = _health_app()
+        app = _health_app(with_worker=True)
         app["check_worker_executor_health"] = True
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/health")
@@ -3083,7 +3120,7 @@ class TestHandleHealth:
     ) -> None:
         import subprocess
         import threading
-        from mimir.worklink import worker_client
+        worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
 
         monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
         socket_path = tmp_path / "executor.sock"
@@ -3110,7 +3147,7 @@ class TestHandleHealth:
             return executor_commit
 
         monkeypatch.setattr(worker_client, "verify_executor_identity", identity)
-        app = _health_app()
+        app = _health_app(with_worker=True)
         app["check_worker_executor_health"] = True
         async with TestClient(TestServer(app)) as client:
             # Move/repair the checkout AFTER startup but BEFORE the first probe.
@@ -3129,7 +3166,7 @@ class TestHandleHealth:
             assert calls == [boot_commit]
 
         # A fresh server startup (restart) captures the new source instead.
-        restarted = _health_app()
+        restarted = _health_app(with_worker=True)
         restarted["check_worker_executor_health"] = True
         async with TestClient(TestServer(restarted)) as client:
             resp = await client.get("/health")
@@ -3146,7 +3183,8 @@ class TestHandleHealth:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         import subprocess
-        from mimir.worklink import worker_client, worker_exec
+        worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
+        from mimir_cultivate.worklink import worker_exec
 
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -3205,7 +3243,7 @@ class TestHandleHealth:
             return IdentitySocket()
 
         monkeypatch.setattr(worker_client.WorkerClient, "_connect", connect)
-        app = _health_app()
+        app = _health_app(with_worker=True)
         app["check_worker_executor_health"] = True
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/health")
@@ -3579,7 +3617,7 @@ class TestHandleEvent:
         # client-controlled, so a forged chat-skill invocation must be stripped
         # before enqueue — only the WebChatBridge may produce one.
         from mimir.chat_skills import CHAT_SKILL_EXTRA_KEY, LEGACY_CHAT_SKILL_EXTRA_KEY
-        from mimir.worklink.continuation import (
+        from mimir.http_ingress import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,
             HTTP_EVENT_INGRESS_EXTRA_VALUE,
         )
@@ -3611,7 +3649,7 @@ class TestHandleEvent:
         }
 
     async def test_event_strips_client_asserted_bridge_authority(self) -> None:
-        from mimir.worklink.continuation import (
+        from mimir.http_ingress import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,
             HTTP_EVENT_INGRESS_EXTRA_VALUE,
         )
@@ -3651,7 +3689,7 @@ class TestHandleEvent:
 
     async def test_event_strips_server_and_worklink_extra(self) -> None:
         from mimir.http_ingress import SERVER_OWNED_EXTRA_KEYS
-        from mimir.worklink.continuation import (
+        from mimir.http_ingress import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,
             HTTP_EVENT_INGRESS_EXTRA_VALUE,
             WORKLINK_HINT_EXTRA_KEYS,
@@ -3671,7 +3709,7 @@ class TestHandleEvent:
         }
 
     async def test_event_strips_client_asserted_saga_session_id(self) -> None:
-        from mimir.worklink.continuation import (
+        from mimir.http_ingress import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,
             HTTP_EVENT_INGRESS_EXTRA_VALUE,
         )
@@ -3697,7 +3735,7 @@ class TestHandleEvent:
         }
 
     async def test_event_strips_client_asserted_delivery_channel(self) -> None:
-        from mimir.worklink.continuation import (
+        from mimir.http_ingress import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,
             HTTP_EVENT_INGRESS_EXTRA_VALUE,
         )
@@ -3721,7 +3759,7 @@ class TestHandleEvent:
         }
 
     async def test_event_strips_forged_worklink_hint_extra(self) -> None:
-        from mimir.worklink.continuation import (
+        from mimir.http_ingress import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,
             HTTP_EVENT_INGRESS_EXTRA_VALUE,
         )
@@ -3758,7 +3796,7 @@ class TestHandleEvent:
         }
 
     async def test_event_stamps_http_ingress_as_untrusted_for_privileged_side_effects(self) -> None:
-        from mimir.worklink.continuation import (
+        from mimir.http_ingress import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,
             HTTP_EVENT_INGRESS_EXTRA_VALUE,
         )
@@ -4183,7 +4221,7 @@ class TestHandleEvent:
     async def test_source_forwarded_but_http_ingress_marker_added(self) -> None:
         """chainlink #890: client-supplied source is forwarded but the HTTP
         ingress marker is added so the dispatcher knows it's untrusted."""
-        from mimir.worklink.continuation import (
+        from mimir.http_ingress import (
             HTTP_EVENT_INGRESS_EXTRA_KEY,
             HTTP_EVENT_INGRESS_EXTRA_VALUE,
         )

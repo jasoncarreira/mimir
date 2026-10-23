@@ -156,7 +156,10 @@ vi.mock("./routes/WikiRoute", () => {
   };
 });
 vi.mock("./routes/ChainlinkBoardRoute", () => ({ ChainlinkBoardRoute: () => <div>tasks-stub</div> }));
-vi.mock("./routes/FactoryRunsRoute", () => ({ FactoryRunsRoute: () => <div>factory-stub</div> }));
+vi.mock("./routes/OpsRoute", () => ({
+  OpsRoute: ({ PullRequests }: { PullRequests?: () => ReactNode }) => <div>ops-stub{PullRequests ? <PullRequests /> : null}</div>,
+  UsageRoute: () => <div>usage-stub</div>
+}));
 vi.mock("./routes/TurnsRoute", () => ({ TurnsRoute: () => <div>turns-stub</div> }));
 vi.mock("./routes/AdminRoute", async (original) => {
   const { AdminRoute } = await original<typeof import("./routes/AdminRoute")>();
@@ -206,11 +209,102 @@ afterEach(() => {
   liveEventsState.status = "idle";
   routeFailures.chat = false;
   pluginImport.current = null;
+  delete (window as Window & { mimirCultivate?: unknown }).mimirCultivate;
   vi.clearAllMocks();
   vi.restoreAllMocks();
 });
 
 describe("plugin compatibility notices in the dashboard shell", () => {
+  const cultivate = {
+    id: "cultivate-factory-runs", plugin: "cultivate", route_path: "/cultivate/factory-runs", label: "Factory Runs",
+    icon: null, nav_position: 10, enabled: true, bundle: "main.js", css: [],
+    api_namespace: "cultivate", trusted_first_party: true, requires_role: "admin"
+  };
+
+  function selectCultivate() {
+    bootstrapOverride = {
+      ...protectedBootstrap,
+      plugin_bundles: [{ plugin: "cultivate", apiMajor: 1, moduleUrl: "/plugins/cultivate/assets/main.js", cssUrl: null }],
+      dashboard_extensions: [
+        ...protectedBootstrap.dashboard_extensions,
+        { ...protectedBootstrap.dashboard_extensions[0], id: "ops", route_path: "/ops", label: "Ops", nav_position: 5, requires_role: "admin" },
+        { ...protectedBootstrap.dashboard_extensions[0], id: "factory-runs", route_path: "/factory-runs", label: "Old runs", nav_position: 9, requires_role: "admin" },
+        cultivate
+      ]
+    } as typeof protectedBootstrap;
+    pluginImport.current = async () => {
+      window.mimirPluginHost!.registerRoute({ plugin: "cultivate", id: cultivate.id, path: cultivate.route_path,
+        component: () => <div data-testid="cultivate-factory-runs">selected-run-detail</div> });
+      window.mimirPluginHost!.registerNavEntry({ plugin: "cultivate", id: cultivate.id, label: "Factory Runs" });
+      (window as Window & { mimirCultivate?: { PullRequests: () => ReactNode } }).mimirCultivate = {
+        PullRequests: () => <div data-testid="cultivate-pr-panel">selected-pr-board</div>
+      };
+    };
+  }
+
+  it("loads the selected admin route on a deep link and navigates to it from Ops", async () => {
+    selectCultivate();
+    sessionKey = "admin-key";
+    useUiState.setState({ apiKeyPresent: true });
+    renderApp(["/cultivate/factory-runs?run=run-1"]);
+    expect(await screen.findByText("selected-run-detail")).toBeTruthy();
+    expect(screen.getByTestId("nav-cultivate-factory-runs").getAttribute("href")).toBe("/cultivate/factory-runs");
+    expect(screen.queryByTestId("nav-factory-runs")).toBeNull();
+    fireEvent.click(screen.getByTestId("nav-ops"));
+    expect(await screen.findByTestId("cultivate-pr-panel")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("nav-cultivate-factory-runs"));
+    expect(await screen.findByText("selected-run-detail")).toBeTruthy();
+  });
+
+  it("keeps the selected route reachable and focusable in the narrow sidebar shell", async () => {
+    selectCultivate();
+    skinLayout = "sidebar";
+    sessionKey = "admin-key";
+    useUiState.setState({ apiKeyPresent: true });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<div style={{ width: 320 }}><QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={["/chat"]}><AppFrame /></MemoryRouter>
+    </QueryClientProvider></div>);
+    const link = await screen.findByTestId("nav-cultivate-factory-runs");
+    link.focus();
+    expect(document.activeElement).toBe(link);
+    expect(link.getAttribute("href")).toBe("/cultivate/factory-runs");
+    fireEvent.click(link);
+    expect(await screen.findByTestId("cultivate-factory-runs")).toBeTruthy();
+    expect(link.getAttribute("aria-current")).toBe("page");
+  });
+
+  it("omits the bundle and its PR panel when not selected, including the legacy route", async () => {
+    bootstrapOverride = {
+      ...protectedBootstrap,
+      auth: { ...protectedBootstrap.auth, required: false },
+      dashboard_extensions: [...protectedBootstrap.dashboard_extensions,
+        { ...protectedBootstrap.dashboard_extensions[0], id: "ops", route_path: "/ops", label: "Ops" },
+        { ...protectedBootstrap.dashboard_extensions[0], id: "factory-runs", route_path: "/factory-runs", label: "Old runs" }]
+    } as typeof protectedBootstrap;
+    renderApp(["/ops"]);
+    expect(await screen.findByText("ops-stub")).toBeTruthy();
+    expect(screen.queryByTestId("nav-factory-runs")).toBeNull();
+    expect(screen.queryByTestId("cultivate-pr-panel")).toBeNull();
+    expect(screen.queryByText("Open PRs")).toBeNull();
+  });
+
+  it("hides the selected administration from non-admin users", async () => {
+    selectCultivate();
+    bootstrapOverride = { ...bootstrapOverride!, dashboard_extensions: bootstrapOverride!.dashboard_extensions.map((entry) =>
+      entry.id === "ops" ? { ...entry, requires_role: undefined } : entry) } as typeof protectedBootstrap;
+    sessionKey = "user-key";
+    vi.mocked(whoami.getWhoami).mockResolvedValueOnce({ data: { is_admin: false } });
+    useUiState.setState({ apiKeyPresent: true });
+    renderApp(["/cultivate/factory-runs"]);
+    expect(await screen.findByText("chat-stub")).toBeTruthy();
+    expect(screen.queryByTestId("nav-cultivate-factory-runs")).toBeNull();
+    expect(screen.queryByTestId("cultivate-factory-runs")).toBeNull();
+    fireEvent.click(screen.getByTestId("nav-ops"));
+    expect(await screen.findByText("ops-stub")).toBeTruthy();
+    expect(screen.queryByTestId("cultivate-pr-panel")).toBeNull();
+  });
+
   const incompatible = {
     plugin: "old-plugin", apiMajor: 2, moduleUrl: "/plugins/old-plugin/assets/main.js", cssUrl: null
   };
@@ -397,7 +491,6 @@ describe("stale chunk recovery in the dashboard", () => {
 describe("protected deep links await initial identity (#1547)", () => {
   const links = [
     { id: "chainlink-board", path: "/chainlink", query: "?issue=1521", label: "Tasks", body: "tasks-stub" },
-    { id: "factory-runs", path: "/factory-runs", query: "?run=chainlink-1521", label: "Factory Runs", body: "factory-stub" },
     { id: "turns", path: "/turns", query: "?turn=turn-1521&tab=events", label: "Turns", body: "turns-stub" },
     { id: "admin-config", path: "/admin", query: "?tab=users", label: "Admin", body: "admin-stub" }
   ];

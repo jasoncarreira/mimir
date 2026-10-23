@@ -5,6 +5,14 @@ decomposition and execution. Chainlink is the coordination surface and
 source of truth; mimir plans; pluggable coding/maintenance CLIs build;
 deterministic machinery connects them.
 
+Worklink's executor, backends and factory integration are supplied by the
+optional `mimir-cultivate` package (`mimir_cultivate.worklink`), installed from
+the in-repo `plugins/cultivate` workspace member at the same commit as core.
+Install it (`uv sync --all-packages`, or `MIMIR_PLUGIN_SELECTION=cultivate` at
+image build) and select `cultivate` in `MIMIR_PLUGINS` to enable coding; core-only Mimir does not
+load this provider or expose Worklink commands and tools. Historical rollout
+notes below describe the original architecture, not the current package boundary.
+
 Status: **Live and autonomous** (as of 2026-07-08; the original #380 slices
 have all shipped, and the #832 substrate cleanup has retired the
 `docker-sibling` broker and `ecs-runtask` compute paths). The production model
@@ -263,7 +271,7 @@ vague parent issue can never be handed directly to a coding agent:
 | Role | Who | Intelligence | Output |
 |---|---|---|---|
 | **Planner / decomposer** | mimir, in LLM turns | mimir's model | Ready *leaf* issues: acceptance criteria, dependency edges, review criteria, labels |
-| **Executor** | `mimir/worklink/` — deterministic machinery (no model calls of its own) | opencode's own agent loop | A claimed issue → isolated checkout → backend run → **observed** evidence bundle → state transition |
+| **Executor** | `mimir_cultivate/worklink/` — deterministic machinery (no model calls of its own) | opencode's own agent loop | A claimed issue → isolated checkout → backend run → **observed** evidence bundle → state transition |
 
 The executor is a process supervisor. It claims, prepares, spawns,
 observes, and reports. All building intelligence lives inside the
@@ -376,7 +384,7 @@ Chainlink mutations. Use the opt-in `chainlink-orchestrator` skill (install with
 `mimir skills install chainlink-orchestrator`) and the
 operator-tunable `mimir/prompt_templates/decompose.md` prompt to turn a parent issue into leaf
 subissues. The canonical leaf-description template is
-`mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN`; the planner prompt and skill
+`mimir_cultivate.worklink.planning.LEAF_TEMPLATE_MARKDOWN`; the planner prompt and skill
 render that exact text from the constant, and executor tests assert they stay in sync.
 
 A leaf may receive `worklink:ready` only when it includes:
@@ -398,10 +406,10 @@ them ready. When a planner needs ordering, it records it with
 comes first, then the blocker. Readiness comes from Chainlink's ready queue plus
 `worklink:ready`, not from prose alone.
 
-## 3. Executor anatomy (`mimir/worklink/`)
+## 3. Executor anatomy (`mimir_cultivate/worklink/`)
 
 ```
-mimir/worklink/
+mimir_cultivate/worklink/
   __init__.py
   orchestrator.py   # claim → checkout → backend → evidence → transition
   claims.py         # lock protocol + TTL reaper (chainlink locks or O_EXCL fallback)
@@ -415,20 +423,11 @@ mimir/worklink/
   compute.py       # ComputeBackend protocol, WorkSpec, LaunchHandle, LocalSubprocessComputeBackend
 ```
 
-**Packaging (decided 2026-06-12).** The executor above (`mimir/worklink/`) and
-the `mimir worklink run` CLI stay in **core** — it is the security-critical,
-integration-coupled engine (it imports `event_logger`; slice-3 dispatch consults
-`HomeostaticArbiter.should_fire()`), and the safety claim that *state transitions
-never depend on a model following instructions* is strongest with claim/evidence/
-transition as core Python behind a hard CLI/tool boundary. The two model-touching
-surfaces ship as **one opt-in skill** (`chainlink-orchestrator`): the planner
-(slice 2) and the ready-queue poller (slice 3). The skill's poller **invokes
-`mimir worklink run` as a subprocess and never reimplements the state machine**;
-SKILL.md tells the agent to dispatch via the CLI/tool, not to hand-run claim/
-evidence/transition. This buys opt-in per-home enablement (mimirbot yes, muninn
-no) and an auto-registering poller via `skill_install.py` without model-mediating
-the deterministic core. The slice-3 `worklink_run` *tool* stays core regardless
-(tools have no skill-contributed mechanism).
+**Packaging.** Cultivate owns the executor above, the `mimir worklink run` CLI,
+the ready-queue poller and the `worklink_run` tool. The poller invokes the CLI
+as a subprocess; it does not reimplement claim, evidence or transition. The
+deterministic executor remains behind the CLI/tool boundary, and neither the
+command nor tool is available in a core-only installation.
 
 **Root executor provenance (decided 2026-08-25).** Deployment builds must never
 install the root-owned executor from a local directory or named context backed
@@ -494,10 +493,10 @@ Per-issue flow (one `run`):
    never resets or cleans the shared base automatically.
 4. **Render the prompt** from issue fields: description, acceptance
    criteria, review criteria, parent context, repo conventions pointer.
-   Template lives at `mimir/prompt_templates/worklink-order.md` (operator-tunable). The
+   Template lives at `mimir_cultivate/prompt_templates/worklink-order.md` (operator-tunable). The
    planner-side decomposition prompt lives at `mimir/prompt_templates/decompose.md`; its
    `{leaf_template}` slot is rendered from the single
-   `mimir.worklink.planning.LEAF_TEMPLATE_MARKDOWN` contract, which the
+   `mimir_cultivate.worklink.planning.LEAF_TEMPLATE_MARKDOWN` contract, which the
    `chainlink-orchestrator` skill also embeds, so the executor validates the
    same template the planner emits.
 5. **Spawn the backend** (adapter `run(WorkOrder)`) under a timeout.
@@ -576,7 +575,7 @@ class Caps:
 class WorkOrder:
     issue_id: int
     checkout: Path
-    prompt: str               # rendered from mimir/prompt_templates/worklink-order.md
+    prompt: str               # rendered from mimir_cultivate/prompt_templates/worklink-order.md
     rules: str | None         # backend-appropriate rules/system content
     timeout_s: int
     env: dict[str, str]       # explicit allowlist, assembled like poller env
@@ -796,7 +795,7 @@ content verbatim into acceptance criteria.
   `reason` added to epic refusal and transition records is additive.
 - **Tool-pin inventory (external-toolchain drift).** `worklink.yaml`
   may carry deployment-specific `tool_pins:`, but the source-controlled
-  seed inventory lives in `mimir.worklink.tool_pins.DEFAULT_TOOL_PINS`.
+  seed inventory lives in `mimir_cultivate.worklink.tool_pins.DEFAULT_TOOL_PINS`.
   The seed covers pinned external executables that affect agent/worklink
   operation: chainlink, mermaid-cli, osv-scanner, gmail-poller's gogcli
   helper, and the OpenCode CLI and plugins. Each entry records category,
@@ -837,7 +836,7 @@ an **explicit accept-the-risk fallback** rather than an isolated substrate. With
 no built-in isolated substrate to fall back to after #832, the only escape from
 the autonomous refusal is the `allow_autonomous_local_subprocess: true` opt-in.
 
-**Policy (enforced in the core executor, `WorklinkConfig.autonomous_compute_allowed`):**
+**Policy (enforced in the Cultivate executor, `WorklinkConfig.autonomous_compute_allowed`):**
 
 - **Autonomous dispatch** — the ready-queue poller (which invokes `mimir
   worklink run --autonomous`) and the in-turn `worklink_run` tool (which passes
@@ -852,7 +851,7 @@ the autonomous refusal is the `allow_autonomous_local_subprocess: true` opt-in.
   gated** — it always proceeds. Enabled OpenCode receives the same repo-checkout
   uid protection, but not credential or cross-run isolation; other backends keep
   the agent uid. Reserve manual runs for issues you've scoped and trust. The gate
-  lives in core Python ahead of the claim, so no model-facing caller can bypass
+  lives in Cultivate's executor ahead of the claim, so no model-facing caller can bypass
   it.
 
 ## 7. Operator runbook

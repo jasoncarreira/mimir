@@ -1933,3 +1933,32 @@ def test_poller_surface_requires_directory_boundary(wiki_home: Path, poller: Pol
     outside.write_text("outside\n")
     result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="t", rationale="r", open_pr=_opener([]))
     assert result.reason == "outside_surface" and not result.pushed
+
+
+def test_default_open_pr_gives_gh_the_process_token_without_a_provider(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The home's own ``gh pr create`` inherits the process env, not the
+    direct-exec service-shell floor, so core-only proposal PRs stay authenticated."""
+    from mimir.plugins.core import core_policy_registry, policy_scope
+    from mimir.proposals import _default_open_pr
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    seen = tmp_path / "seen-token"
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        f'printf %s "$GITHUB_TOKEN" > "{seen}"\n'
+        'echo "https://github.com/owner/repo/pull/7"\n',
+        encoding="utf-8",
+    )
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setenv("GITHUB_TOKEN", "home-proposal-token")
+    with policy_scope(core_policy_registry()) as policy:
+        assert policy.policy_consumer_hooks is None
+        url = _default_open_pr(tmp_path, "proposal/x", "main", "title", "body")
+
+    assert url == "https://github.com/owner/repo/pull/7"
+    assert seen.read_text(encoding="utf-8") == "home-proposal-token"

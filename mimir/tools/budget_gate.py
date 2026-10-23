@@ -37,20 +37,24 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import fcntl
 import inspect
 import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import stat
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import UnionType
-from typing import Annotated, Any, Awaitable, Callable, Union, get_args, get_origin
+from typing import Annotated, Any, Awaitable, Callable, Iterator, Union, get_args, get_origin
 
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
@@ -60,7 +64,7 @@ import yaml
 
 from ..env import env_bool
 from ..event_logger import emit_event_background as _emit_event_sync
-from ..models import AuthContext, InformationFlowState
+from ..models import AuthContext, InformationFlowLabels, InformationFlowState
 from ..plugins.core import policy_membership, scoped_policy_call, selected_policy_registry
 from ..redaction import redact_text
 from ..tool_descriptors import (
@@ -121,6 +125,108 @@ from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
 log = logging.getLogger(__name__)
 
+_pr_acquisition_lock: ContextVar[tuple[Path, int] | None] = ContextVar(
+    "pr_checkout_host_acquisition_lock", default=None,
+)
+
+
+def lock_pr_checkout_acquisition_root() -> tuple[Path, int]:
+    """Lock the server-configured lease root before the checkout handler starts."""
+    value = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
+    if not value or not Path(value).is_absolute():
+        raise RuntimeError("MIMIR_PR_CHECKOUT_LEASE_ROOT must be an absolute path")
+    root = Path(value)
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink():
+        raise RuntimeError("PR checkout lease root may not be a symlink")
+    root = root.resolve(strict=True)
+    fd = os.open(root, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(fd)
+        raise
+    return root, fd
+
+
+@contextmanager
+def bind_pr_checkout_acquisition(root: Path, fd: int) -> Iterator[Path]:
+    """Keep an acquired root lock on this dispatch through result observation."""
+    try:
+        token = _pr_acquisition_lock.set((root, fd))
+        try:
+            yield root
+        finally:
+            _pr_acquisition_lock.reset(token)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextmanager
+def hold_pr_checkout_acquisition() -> Iterator[Path]:
+    with bind_pr_checkout_acquisition(*lock_pr_checkout_acquisition_root()) as root:
+        yield root
+
+
+def borrowed_pr_checkout_lock(root: Path) -> bool:
+    """Only the current host-held acquisition can reuse its exclusive lock."""
+    binding = _pr_acquisition_lock.get()
+    if binding is None:
+        return False
+    if binding[0] != root:
+        raise RuntimeError("PR checkout acquisition root changed during dispatch")
+    return binding[1] >= 0
+
+
+def _assert_observed_pr_checkout_lease(lease: Any) -> None:
+    """Validate the host-held lease identity against its recorded checkout."""
+    root = Path(lease.lease_root)
+    path = Path(lease.path)
+    if root.is_symlink() or path.is_symlink() or not lease.is_active:
+        raise RuntimeError("PR checkout lease is no longer live")
+    root = root.resolve(strict=True)
+    if path.parent.resolve(strict=True) != root or not path.is_dir():
+        raise RuntimeError("PR checkout lease path changed")
+    git_dir = path / ".git"
+    metadata = git_dir / "mimir-pr-checkout-lease.json"
+    if (
+        git_dir.is_symlink() or not git_dir.is_dir() or metadata.is_symlink()
+        or not metadata.is_file()
+        or (git_dir / "mimir-pr-checkout-lease-reclamation.json").exists()
+    ):
+        raise RuntimeError("PR checkout lease metadata is unavailable")
+    raw = json.loads(metadata.read_text(encoding="utf-8"))
+    expected = {
+        "canonical_repo": lease.canonical_repo,
+        "canonical_origin": lease.canonical_origin,
+        "scope_id": lease.scope_id,
+        "owner": lease.owner,
+        "recovery_id": lease.recovery_id,
+        "head_sha": lease.head_sha,
+        "expires_at": lease.expires_at.isoformat(),
+        "path": str(path),
+        "lease_root": str(root),
+        "pr_number": lease.pr_number,
+    }
+    if not isinstance(raw, dict) or any(raw.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("PR checkout lease identity changed")
+
+
+@contextmanager
+def _hold_observed_pr_checkout_lease(lease: Any) -> Iterator[None]:
+    root = Path(lease.lease_root)
+    if root.is_symlink():
+        raise RuntimeError("PR checkout lease root may not be a symlink")
+    fd = os.open(root.resolve(strict=True), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        _assert_observed_pr_checkout_lease(lease)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
 def _plugin_tool(tool_name: str, policy: Any) -> Any:
     selected = policy if policy is not None else selected_policy_registry()
     registered = selected.tools.get(tool_name)
@@ -178,17 +284,35 @@ def _resolve_standing_review(
     ):
         return None
     retained_scope = getattr(auth_context, "retained_factory_scope", None)
+    from ..access_control import _is_worklink_retained_checkout_service
+
     if (
-        tool_name in {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
+        tool_name in policy_membership("retained_repo_tools")
         and retained_scope is not None
         and arguments.get("repository") == retained_scope.repository
         and arguments.get("pull_request") == retained_scope.issue_id
+        and _is_worklink_retained_checkout_service(
+            get_trusted_service_from_auth_context(auth_context), auth_context=auth_context,
+        )
     ):
         return None
-    from .forge import (
-        revalidate_review_head_for_context,
-        resolve_review_state_for_context,
-    )
+    selected = policy if policy is not None else selected_policy_registry()
+    registered = selected.tools.get(tool_name)
+    hooks = selected.policy_consumer_hooks
+    if registered is not None and hooks is not None and registered.owner == hooks.owner:
+        resolve_review_state_for_context = hooks.resolve_review
+        revalidate_review_head_for_context = hooks.revalidate_head
+    elif registered is not None and registered.owner == getattr(selected, "_projected_owner", None):
+        return "repository review provider unavailable"
+    elif registered is not None and registered.owner != "core":
+        from ..access_control import resolve_registered_review_state
+
+        resolve_review_state_for_context = resolve_registered_review_state
+        if tool_name == "pr_submit_review":
+            return "repository review head validator unavailable"
+        revalidate_review_head_for_context = None
+    else:
+        return "repository review provider unavailable"
 
     try:
         resolve_review_state_for_context(
@@ -2332,14 +2456,16 @@ def _result_labels_for_call(
     policy_refusal: ToolPolicyRefusal | None = None,
     failed: bool = False,
     operator_declared_shell: bool = False,
+    retained_receipt: Any = None,
 ) -> Any:
     if not failed and tool_name == "repo_checkout" and auth_context is not None:
         original_scope = authorization.repo_pr_action_scope
         repository = arguments.get("repository")
         pull_request = arguments.get("pull_request")
-        discovered = auth_context.server_discovered_pr_states.resolve(
-            repository, pull_request,
-        ) if isinstance(repository, str) and isinstance(pull_request, int) else None
+        cache = auth_context.server_discovered_pr_states
+        discovered = cache.resolve(repository, pull_request) if (
+            cache is not None and isinstance(repository, str) and type(pull_request) is int
+        ) else None
         state = discovered
         if state is None and auth_context.repo_pr_scope_registry is not None:
             state = auth_context.repo_pr_scope_registry.resolve(repository, pull_request)
@@ -2366,6 +2492,7 @@ def _result_labels_for_call(
         provenance=provenance,
         policy_refusal=policy_refusal,
         failed=failed,
+        retained_receipt=retained_receipt,
     )
     if operator_declared_shell and labels is not None:
         from dataclasses import replace
@@ -3412,6 +3539,7 @@ class _PreparedToolCall:
 
 @dataclass
 class _ToolExecutionCapture:
+    execution_id: str = field(default_factory=lambda: secrets.token_hex(16))
     review_claim: Any = None
     direct_argv_token: Any = None
     capture_token: Any = None
@@ -3420,6 +3548,7 @@ class _ToolExecutionCapture:
     policy_refusal: ToolPolicyRefusal | None = None
     fetch_token: Any = None
     fetched_body_recorder_token: Any = None
+    retained_receipt: Any = None
 
 
 def _prepare_tool_call_review(
@@ -3586,6 +3715,19 @@ def _prepare_tool_call_execution(
             call, admin_denial, arguments=arguments,
             operator_shell_audit=operator_shell_audit,
         )
+    registered = _plugin_tool(tool_name, policy)
+    if (registered is not None and registered.resource_scope == "repo_pr"
+            and (authorization is None or authorization.reason is not None
+                 or authorization.would_block or not authorization.allowed)):
+        _emit_hard_boundary_denied(
+            tool=tool_name, boundary="scoped_pr_grant",
+            reason=getattr(authorization, "reason", None) or "repo_pr_scope_denied",
+            auth_context=auth_context,
+        )
+        return _tool_call_refusal(
+            call, "scoped PR grant refused before execution", arguments=None,
+            record_outcome=True,
+        )
     if arguments is None:
         return _tool_call_refusal(
             call, _argument_validation_refusal(request), arguments=None,
@@ -3644,6 +3786,18 @@ def _prepare_tool_call_execution(
         )
     if privacy_refusal is not None:
         return _tool_call_refusal(call, privacy_refusal, arguments=None)
+
+    selected = policy if policy is not None else selected_policy_registry()
+    validated_mcp = (
+        tool_name.startswith("mcp_") and getattr(request, "tool", None) is not None
+        and authorization is not None and authorization.decision is not OperationDecision.UNKNOWN
+        and not authorization.would_block
+    )
+    if tool_name not in selected.tools and not validated_mcp:
+        return _tool_call_refusal(
+            call, f"{tool_name} was refused before execution (unknown_operation).",
+            arguments=None, record_outcome=True,
+        )
 
     # This is an accident deterrent, not a security boundary; see #259.
     prohibition = _check_prohibited(tool_name, request)
@@ -3790,9 +3944,43 @@ def _prepare_tool_call_execution(
 
 
 def _review_submission_for_call(call: _PreparedToolCall) -> Any:
-    from .github_review_guard import review_submission_from_request
+    selected = call.policy if call.policy is not None else selected_policy_registry()
+    hooks = selected.policy_consumer_hooks
+    if hooks is not None:
+        return hooks.review_submission(call.execution_request)
+    if getattr(selected, "_projected_owner", None) is not None and call.tool_name in {
+        "shell_exec", "bash_async", "Bash", "bash", "pr_submit_review",
+    }:
+        raise ToolException("selected review submission guard unavailable")
+    if call.tool_name not in {"shell_exec", "bash_async", "Bash", "bash", "pr_submit_review"}:
+        return None
+    if call.tool_name == "pr_submit_review":
+        return None
+    args = call.execution_request.tool_call.get("args") or {}
+    direct = args.get("mimir_direct_argv")
+    command = args.get("command")
+    possible_gh = (
+        isinstance(direct, list) and len(direct) >= 3
+        and isinstance(direct[0], str) and Path(direct[0]).name == "gh"
+        and direct[1:3] == ["pr", "review"]
+    ) or (
+        isinstance(command, str) and re.search(
+            r"(?:^|[\s;&|])(?:[^\s;&|]*/)?gh\s+pr\s+review(?:\s|$)", command,
+        ) is not None
+    )
+    if possible_gh:
+        raise ToolException("GitHub review submission guard unavailable")
+    return None
 
-    return review_submission_from_request(call.execution_request)
+
+def _claim_review_submission_for_call(call: _PreparedToolCall, spec: Any) -> Any:
+    selected = call.policy if call.policy is not None else selected_policy_registry()
+    hooks = selected.policy_consumer_hooks
+    if hooks is not None:
+        return hooks.claim_review(spec)
+    if getattr(selected, "_projected_owner", None) is not None:
+        raise ToolException("selected review submission guard unavailable")
+    raise ToolException("GitHub review submission guard unavailable")
 
 
 def _begin_tool_execution(
@@ -3994,8 +4182,6 @@ def _finish_tool_result(
     result: ToolMessage | Command,
 ) -> ToolMessage | Command:
     is_error = _result_is_error(call.tool_name, result, policy=call.policy)
-    if not is_error:
-        _record_tool_outcome(call.tool_name, policy=call.policy)
     result_labels = _result_labels_for_call(
         call.tool_name,
         call.arguments,
@@ -4005,12 +4191,20 @@ def _finish_tool_result(
         provenance=capture.provenance,
         policy_refusal=capture.policy_refusal,
         failed=is_error,
+        retained_receipt=capture.retained_receipt,
         operator_declared_shell=bool(call.operator_shell_preparation and call.operator_shell_preparation.declaration),
     )
+    lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+    if lease_refusal is not None:
+        return lease_refusal
     _merge_result_labels_from_result(
         call.auth_context, result_labels, result,
         tool_name=call.tool_name, failed=is_error, policy=call.policy,
     )
+    lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+    if lease_refusal is not None:
+        _taint_expired_pr_result(call)
+        return lease_refusal
     _emit_tool_call_sync(
         call.tool_name,
         ok=not is_error,
@@ -4019,7 +4213,305 @@ def _finish_tool_result(
         arguments=call.arguments,
         operator_shell_audit=call.operator_shell_audit,
     )
+    lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+    if lease_refusal is not None:
+        _taint_expired_pr_result(call)
+        return lease_refusal
+    if not is_error:
+        _record_tool_outcome(call.tool_name, policy=call.policy)
+    lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+    if lease_refusal is not None:
+        _taint_expired_pr_result(call)
+        return lease_refusal
     return result
+
+
+def _scoped_pr_checkout_call(call: _PreparedToolCall) -> bool:
+    registered = _plugin_tool(call.tool_name, call.policy)
+    protocol = (call.policy.scoped_actions.get(registered.owner)
+                if registered is not None and call.policy is not None else None)
+    return (
+        registered is not None and protocol is not None
+        and registered.resource_scope == "repo_pr"
+        and registered.typed_action is protocol.checkout_action
+        and (getattr(protocol, "checkout_tool", None) is None
+             or registered.name == protocol.checkout_tool)
+    )
+
+
+def _scoped_pr_dispatch_refusal(call: _PreparedToolCall) -> ToolMessage | None:
+    """Revalidate turn authority and the owner's live lease after permission waits."""
+    registered = _plugin_tool(call.tool_name, call.policy)
+    if registered is None or registered.resource_scope != "repo_pr":
+        return None
+    from ..access_control import _is_registered_retained_scope
+
+    if _is_registered_retained_scope(call.authorization.repo_pr_action_scope):
+        if _retained_dispatch_scope(call) is not None:
+            return None
+        return _tool_call_refusal(
+            call, "retained factory scope refused before execution", arguments=None,
+            record_outcome=True,
+        )
+    from ..access_control import _valid_scoped_pr_grant
+
+    protocol = (call.policy.scoped_actions.get(registered.owner)
+                if call.policy is not None else None)
+    scope = getattr(call.authorization, "repo_pr_action_scope", None)
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = (
+        discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+        if discovered is not None else None
+    )
+    if state is None and registry is not None:
+        state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    if (state is None or state.action_scope is not scope
+            or not _valid_scoped_pr_grant(
+                call.auth_context, registered.owner, registered.typed_action,
+                protocol, scope, state, tool_name=call.tool_name,
+            )):
+        _emit_hard_boundary_denied(
+            tool=call.tool_name, boundary="scoped_pr_grant",
+            reason="repo_pr_grant_denied", auth_context=call.auth_context,
+        )
+        return _tool_call_refusal(
+            call, "scoped PR grant refused before execution", arguments=None,
+            record_outcome=True,
+        )
+    return None
+
+
+def _retained_dispatch_scope(call: _PreparedToolCall) -> Any:
+    from ..access_control import _is_registered_retained_scope, _is_worklink_retained_checkout_service
+
+    scope = getattr(call.authorization, "repo_pr_action_scope", None)
+    registered = _plugin_tool(call.tool_name, call.policy)
+    service = get_trusted_service_from_auth_context(call.auth_context)
+    if (
+        not _is_registered_retained_scope(scope)
+        or scope is not getattr(call.auth_context, "retained_factory_scope", None)
+        or registered is None or "retained_repo_tools" not in registered.memberships
+        or registered.resource_scope != "repo_pr"
+        or not call.authorization.allowed
+        or call.authorization.would_block
+        or call.authorization.decision != OperationDecision.RESOURCE_SCOPED
+        or not _is_worklink_retained_checkout_service(service, auth_context=call.auth_context)
+        or call.arguments.get("repository") != scope.repository
+        or call.arguments.get("pull_request") != scope.issue_id
+    ):
+        return None
+    return scope
+
+
+@contextmanager
+def _retained_execution(call: _PreparedToolCall):
+    scope = _retained_dispatch_scope(call)
+    if scope is None:
+        yield None
+        return
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        raise ToolException("retained factory home unavailable")
+    selected_lease = getattr(call.policy, "retained_effect_lease", None)
+    if selected_lease is not None:
+        from ..access_control import _host_retained_invocation
+
+        owner, lease_callback, _runner = selected_lease
+        if owner != "cultivate":
+            raise ToolException("retained factory lease owner mismatch")
+        with lease_callback(Path(home), scope) as lease:
+            if lease.scope is not scope:
+                raise ToolException(lease.refusal_reason or "retained factory lease unavailable")
+            with _host_retained_invocation(scope, call.auth_context):
+                yield scope
+        return
+    raise ToolException("retained factory lease provider unavailable")
+
+
+def _capture_retained_result(call: _PreparedToolCall, capture: _ToolExecutionCapture,
+                              scope: Any, result: Any) -> None:
+    if scope is None or not isinstance(result, ToolMessage):
+        return
+    content = result.content
+    if not isinstance(content, (str, bytes)):
+        return
+    if result.tool_call_id != _tool_call_id(call.request):
+        return
+    from ..access_control import _RetainedResultReceipt, _retained_checkout_binding
+
+    selected = call.policy if call.policy is not None else selected_policy_registry()
+    registered = _plugin_tool(call.tool_name, selected)
+    if registered is None or "retained_repo_tools" not in registered.memberships:
+        return
+    binding = _retained_checkout_binding(scope)
+    if binding is None:
+        return
+    head, lease_identity = binding
+    capture.retained_receipt = _RetainedResultReceipt(
+        call.tool_name, call.auth_context, scope, result,
+        _result_is_error(call.tool_name, result, policy=selected), selected,
+        execution_id=capture.execution_id, head=head,
+        lease_identity=lease_identity,
+    )
+
+
+def _consume_scoped_pr_checkout(call: _PreparedToolCall) -> object | None:
+    from ..access_control import consume_scoped_pr_checkout
+
+    scope = call.authorization.repo_pr_action_scope
+    registered = _plugin_tool(call.tool_name, call.policy)
+    return scope is not None and registered is not None and consume_scoped_pr_checkout(
+        call.auth_context, scope, registered.owner,
+    )
+
+
+def _observe_scoped_pr_checkout(call: _PreparedToolCall, result: Any, token: object) -> bool:
+    if _result_is_error(call.tool_name, result, policy=call.policy):
+        return True
+    from ..access_control import observe_scoped_pr_checkout
+
+    scope = call.authorization.repo_pr_action_scope
+    registered = _plugin_tool(call.tool_name, call.policy)
+    protocol = call.policy.scoped_actions.get(registered.owner) if registered is not None else None
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request")) if discovered is not None else None
+    if state is None and registry is not None:
+        state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    if state is not None and state.action_scope is not scope:
+        return False
+    return scope is not None and state is not None and observe_scoped_pr_checkout(
+        call.auth_context, scope, state, token, registered.owner, protocol,
+    )
+
+
+def _hold_scoped_pr_dispatch(call: _PreparedToolCall, stack: ExitStack) -> None:
+    """Pin the live checkout through result classification, not just execution."""
+    if not call.tool_name.startswith("repo_") or call.tool_name == "repo_cleanup":
+        return
+    retained = getattr(call.auth_context, "retained_factory_scope", None)
+    if (retained is not None
+            and call.arguments.get("repository") == retained.repository
+            and call.arguments.get("pull_request") == retained.issue_id):
+        return
+    scope = call.authorization.repo_pr_action_scope
+    if scope is None:
+        return
+    if call.tool_name == "repo_checkout":
+        stack.enter_context(hold_pr_checkout_acquisition())
+        return
+    registered = _plugin_tool(call.tool_name, call.policy)
+    if registered is not None and registered.resource_scope != "repo_pr":
+        return
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = (discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+             if discovered is not None else None)
+    if state is None and registry is not None:
+        state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    if state is None or state.action_scope is not scope:
+        raise ToolPolicyRefusal("scoped PR checkout state changed before dispatch")
+    lease = state.checkout_lease
+    if lease is None:
+        if registered is None:
+            return
+        raise ToolPolicyRefusal("scoped PR checkout lease is unavailable")
+    try:
+        stack.enter_context(_hold_observed_pr_checkout_lease(lease))
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ToolPolicyRefusal("scoped PR checkout lease is no longer live") from exc
+
+
+def _scoped_pr_lease_observation_refusal(
+    call: _PreparedToolCall, result: Any,
+) -> ToolMessage | None:
+    """Do not classify output against a lease that expired during execution."""
+    if call.tool_name == "repo_cleanup" or not call.tool_name.startswith("repo_"):
+        return None
+    retained = getattr(call.auth_context, "retained_factory_scope", None)
+    if (retained is not None
+            and call.arguments.get("repository") == retained.repository
+            and call.arguments.get("pull_request") == retained.issue_id):
+        return None
+    scope = call.authorization.repo_pr_action_scope
+    if scope is None or (
+        call.tool_name == "repo_checkout"
+        and _result_is_error(call.tool_name, result, policy=call.policy)
+    ):
+        return None
+    discovered = getattr(call.auth_context, "server_discovered_pr_states", None)
+    registry = getattr(call.auth_context, "repo_pr_scope_registry", None)
+    state = (
+        discovered.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+        if discovered is not None else None
+    )
+    if state is None and registry is not None:
+        state = registry.resolve(call.arguments.get("repository"), call.arguments.get("pull_request"))
+    if (
+        call.tool_name != "repo_checkout" and _plugin_tool(call.tool_name, call.policy) is None
+        and state is not None and state.checkout_lease is None
+    ):
+        # Core's pre-lease refusals are still classified by the core wrapper;
+        # there was no lease for this middleware invocation to hold or observe.
+        return None
+    try:
+        if state is None or state.action_scope is not scope or state.checkout_lease is None:
+            raise RuntimeError("scoped checkout state changed")
+        _assert_observed_pr_checkout_lease(state.checkout_lease)
+        if call.tool_name == "repo_checkout":
+            if Path(state.checkout_lease.lease_root) != Path(
+                os.environ["MIMIR_PR_CHECKOUT_LEASE_ROOT"]
+            ).resolve(strict=True):
+                raise RuntimeError("checkout root changed")
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+            json.JSONDecodeError):
+        return _tool_call_refusal(
+            call, "scoped PR checkout lease expired or changed before observation",
+            arguments=None, record_outcome=True,
+        )
+    return None
+
+
+def _taint_expired_pr_result(call: _PreparedToolCall) -> None:
+    """Never leave a late-expired, already merged read as clean turn evidence."""
+    scope = call.authorization.repo_pr_action_scope
+    if scope is None:
+        return
+    from ..access_control import protected_result_source
+
+    _merge_result_labels(call.auth_context, InformationFlowLabels().with_source(protected_result_source(
+        call.auth_context,
+        principal=scope.principal,
+        domain="repository",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+        bridge_instance="forge",
+    )))
+
+
+async def _hold_scoped_pr_dispatch_async(call: _PreparedToolCall, stack: ExitStack) -> None:
+    """Acquire potentially contended root locks without blocking the event loop."""
+    if call.tool_name == "repo_checkout" and call.authorization.repo_pr_action_scope is not None:
+        lock = asyncio.create_task(asyncio.to_thread(lock_pr_checkout_acquisition_root))
+        try:
+            root, fd = await asyncio.shield(lock)
+        except asyncio.CancelledError:
+            # A canceled to_thread keeps running. Take ownership of its fd before
+            # propagating cancellation so no root lock survives this invocation.
+            root, fd = await lock
+            with bind_pr_checkout_acquisition(root, fd):
+                pass
+            raise
+        stack.enter_context(bind_pr_checkout_acquisition(root, fd))
+        return
+    acquisition = asyncio.create_task(
+        asyncio.to_thread(_hold_scoped_pr_dispatch, call, stack)
+    )
+    try:
+        await asyncio.shield(acquisition)
+    except asyncio.CancelledError:
+        await acquisition
+        raise
 
 
 class BudgetGateMiddleware(AgentMiddleware):
@@ -4085,12 +4577,13 @@ class BudgetGateMiddleware(AgentMiddleware):
         if not isinstance(call, _PreparedToolCall):
             return call
         capture = _ToolExecutionCapture()
+        checkout_token = None
+        lease_stack = ExitStack()
+        capture_ended = False
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
-                from .github_review_guard import claim_review_submission
-
-                capture.review_claim = claim_review_submission(review_spec)
+                capture.review_claim = _claim_review_submission_for_call(call, review_spec)
             result = _begin_tool_execution(call, capture)
             if result is None:
                 permission_denial = _request_permission_sync(
@@ -4101,7 +4594,30 @@ class BudgetGateMiddleware(AgentMiddleware):
             if result is None:
                 result = _soft_live_execution_refusal(call)
             if result is None:
-                result = handler(call.execution_request)
+                result = _scoped_pr_dispatch_refusal(call)
+            if result is None:
+                if _scoped_pr_checkout_call(call):
+                    checkout_token = _consume_scoped_pr_checkout(call)
+                    if checkout_token is None:
+                        return _tool_call_refusal(call, "scoped PR checkout grant already used", arguments=None)
+                _hold_scoped_pr_dispatch(call, lease_stack)
+                with _retained_execution(call) as retained_scope:
+                    result = handler(call.execution_request)
+                    if retained_scope is not None and getattr(call.policy, "retained_effect_lease", None):
+                        _capture_retained_result(call, capture, retained_scope, result)
+                        _end_tool_execution(capture)
+                        capture_ended = True
+                        return _finish_tool_result(call, capture, result)
+                if retained_scope is not None:
+                    _capture_retained_result(call, capture, retained_scope, result)
+                lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+                if lease_refusal is not None:
+                    return lease_refusal
+                if checkout_token is not None and not _observe_scoped_pr_checkout(call, result, checkout_token):
+                    return _tool_call_refusal(call, "scoped PR checkout lease was not observed", arguments=None)
+            _end_tool_execution(capture)
+            capture_ended = True
+            return _finish_tool_result(call, capture, result)
         except ToolException as exc:
             refusal = _finish_tool_exception(call, capture, exc)
             if refusal is None:
@@ -4113,8 +4629,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             _finish_tool_exception(call, capture, exc)
             raise
         finally:
-            _end_tool_execution(capture)
-        return _finish_tool_result(call, capture, result)
+            if not capture_ended:
+                _end_tool_execution(capture)
+            lease_stack.close()
 
     @scoped_policy_call(lambda bound: bound.arguments["self"]._policy)
     async def awrap_tool_call(
@@ -4185,13 +4702,14 @@ class BudgetGateMiddleware(AgentMiddleware):
             if privacy_refusal is not None:
                 return _tool_call_refusal(call, privacy_refusal, arguments=None)
         capture = _ToolExecutionCapture()
+        checkout_token = None
+        lease_stack = ExitStack()
+        capture_ended = False
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
-                from .github_review_guard import claim_review_submission
-
                 capture.review_claim = await _claim_review_submission_async(
-                    lambda: claim_review_submission(review_spec)
+                    lambda: _claim_review_submission_for_call(call, review_spec)
                 )
             result = _begin_tool_execution(call, capture)
             if result is None:
@@ -4203,7 +4721,30 @@ class BudgetGateMiddleware(AgentMiddleware):
             if result is None:
                 result = _soft_live_execution_refusal(call)
             if result is None:
-                result = await handler(call.execution_request)
+                result = _scoped_pr_dispatch_refusal(call)
+            if result is None:
+                if _scoped_pr_checkout_call(call):
+                    checkout_token = _consume_scoped_pr_checkout(call)
+                    if checkout_token is None:
+                        return _tool_call_refusal(call, "scoped PR checkout grant already used", arguments=None)
+                await _hold_scoped_pr_dispatch_async(call, lease_stack)
+                with _retained_execution(call) as retained_scope:
+                    result = await handler(call.execution_request)
+                    if retained_scope is not None and getattr(call.policy, "retained_effect_lease", None):
+                        _capture_retained_result(call, capture, retained_scope, result)
+                        _end_tool_execution(capture)
+                        capture_ended = True
+                        return _finish_tool_result(call, capture, result)
+                if retained_scope is not None:
+                    _capture_retained_result(call, capture, retained_scope, result)
+                lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
+                if lease_refusal is not None:
+                    return lease_refusal
+                if checkout_token is not None and not _observe_scoped_pr_checkout(call, result, checkout_token):
+                    return _tool_call_refusal(call, "scoped PR checkout lease was not observed", arguments=None)
+            _end_tool_execution(capture)
+            capture_ended = True
+            return _finish_tool_result(call, capture, result)
         except ToolException as exc:
             refusal = _finish_tool_exception(call, capture, exc)
             if refusal is None:
@@ -4215,5 +4756,6 @@ class BudgetGateMiddleware(AgentMiddleware):
             _finish_tool_exception(call, capture, exc)
             raise
         finally:
-            _end_tool_execution(capture)
-        return _finish_tool_result(call, capture, result)
+            if not capture_ended:
+                _end_tool_execution(capture)
+            lease_stack.close()

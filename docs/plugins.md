@@ -26,6 +26,69 @@ providers' invalid or duplicate manifests are diagnostics only, while selected
 missing, invalid, duplicate, or version-incompatible providers reject startup
 by name. Disabled provider modules are not imported.
 
+### Cultivate (optional coding provider)
+
+Coding is supplied by the separately packaged `mimir-cultivate` distribution
+(`BUSL-1.1`), not by an extra on the MIT `mimir-agent` distribution. It is
+**not published to a package index**: it is installed from the in-repo
+`plugins/cultivate` workspace member at the same commit as core. From a source
+checkout, `uv sync --all-packages` (plus your usual `--extra` flags) installs
+both; a plain `uv sync` or `uv sync --extra …` removes it again. Images build it
+from the pinned source commit when `MIMIR_PLUGIN_SELECTION=cultivate` (see
+[Docker image assembly](#docker-image-assembly-and-services)). Then set
+`MIMIR_PLUGINS=cultivate` in the operator-owned process environment and restart.
+Installing without selecting does not activate or import the provider.
+Selecting without installing it fails startup. The retired `MIMIR_CODING_ENABLED`
+flag cannot enable coding. Core alone keeps the chainlink tracker, ACP, hands,
+proposal PR lane and generic shell.
+
+#### Upgrading a coding deployment
+
+Before this split, coding was core functionality behind `MIMIR_CODING_ENABLED`.
+Upgrading such a deployment without the steps below boots a core-only agent:
+it keeps running, but Worklink, the GitHub and CI pollers, the Forge/PR tools and
+OpenCode are gone. Boot logs a warning when that happens, for each of
+`MIMIR_CODING_ENABLED` and a home `worklink.yaml` or `repositories.yaml` that no
+selected plugin owns. Startup does not fail.
+
+1. **Install Cultivate from the same source as core.**
+   - Source checkout (systemd, `uv run`, or the workspace scaffold):
+     `uv sync --all-packages --extra <your extras>`. Keep `--all-packages` on
+     every later `uv sync`, including any wrapper script. The workspace-mode
+     `start.sh` that `mimir scaffold-docker` generates does this when Cultivate is
+     selected at scaffold time.
+   - Root `Dockerfile`: rebuild with
+     `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` (and
+     `--build-arg MIMIR_ENABLE_OPENCODE=1` for the OpenCode CLI the coding tools
+     require). Do not list `mimir-cultivate` in `MIMIR_PLUGIN_PACKAGES`; the
+     build refuses it.
+   - PyPI-mode scaffold: re-run `mimir scaffold-docker` with
+     `MIMIR_PLUGINS=cultivate` exported, then rebuild. The image installs core
+     and Cultivate from `MIMIR_CONTROLLER_COMMIT`.
+2. **Select it in the process environment.** Set `MIMIR_PLUGINS=cultivate`
+   where the supervisor starts Mimir: shell export, systemd `Environment=`, or
+   compose `environment:`/`env_file`. The agent home's `.env` cannot select
+   plugins; a value there is ignored with a warning.
+3. **Remove `MIMIR_CODING_ENABLED`** from the home `.env` and the deployment.
+   It is ignored.
+4. **Restart and check.** `mimir plugins list` shows `cultivate` enabled, and
+   boot logs no `CODING IS DISABLED` or `no selected plugin owns it` warning.
+   Selected coding also needs the OpenCode CLI on `PATH` and an absolute
+   `MIMIR_PR_CHECKOUT_LEASE_ROOT`; startup names any that are missing.
+
+Your `worklink.yaml`, `repositories.yaml` and existing Worklink state are read
+unchanged once Cultivate is selected.
+
+Cultivate supplies Worklink, Forge/repository/CI tools, OpenCode execution,
+coding defaults, the Factory Runs and PR-board pages and the `squashmerge`
+default skin. The Coding status prompt block appears only for operator turns
+and includes only server-owned in-flight builds and PRs under remediation.
+Factory Runs and PR-board APIs are registered under
+`/api/v1/plugins/cultivate/`; administrative actions remain server-side
+admin-gated. The brand logo is used unchanged on Cultivate overview/about only;
+it is not a core asset or a navigation icon. Brand assets have their own
+`brand/LICENSE`, separate from both the MIT core and Cultivate's BSL license.
+
 Use `mimir plugins list` for a human-readable inventory, or
 `mimir plugins list --json` for an array of objects with `name`, `version`,
 `license`, `distribution`, `enabled`, and `diagnostic` fields. Absent manifest
@@ -101,7 +164,10 @@ The hook callable returns `PollerHooks` (for example, a
 `recovery_relevance` factory). Plugin skill `pollers.json` is packaged under
 the declared skill defaults; hook code comes from the selected provider module,
 not from importing a script inside a skill directory. Core poller identities
-and poller properties remain reserved. Poller service authority still requires
+remain reserved, and poller properties (`github_activity`, `github_ci_watch`,
+`worklink_retained_checkout`) and the retained checkout operation are accepted
+only from core or the selected first-party Cultivate owner; any other owner is
+refused at registration. Poller service authority still requires
 registered capabilities/profiles and `build_trigger_service_principal` checks.
 Scheduler declarations are attached via `Scheduler.register_callable` after
 core jobs and before reload/start; both name and job-ID conflicts reject boot.
@@ -197,7 +263,7 @@ returns only public bootstrap fields before authentication.
 
 For API major 1, an enabled compatible ES module runs with
 `window.mimirPluginHost`: `apiMajor`, shared `react`, `reactDOM`,
-`reactDOMClient`, `themeTokens`, `authenticatedFetch`, `registerRoute` and
+`reactDOMClient`, `uiKit`, `themeTokens`, `authenticatedFetch`, `registerRoute` and
 `registerNavEntry`. The example bundle registers
 `{plugin: "example", id: "example-page", path: "/example", component: ExamplePage}`
 and a matching `{plugin, id, label}` nav entry. The route must match that
@@ -218,8 +284,11 @@ Without `--all-installed`, only process-enabled providers contribute;
 bundled skill fragments remain separate. `mimir scaffold-docker --all-installed`
 uses the same explicit selection switch; otherwise the scaffold uses enabled
 plugins and pins selected distribution versions. PyPI scaffolds install the
-selected pins after `mimir-agent`; provide private/local wheels to the image
-build. Workspace scaffolds include/verify selected provider pins at startup.
+selected third-party pins after `mimir-agent`; provide private/local wheels to
+the image build. Workspace scaffolds include/verify selected third-party pins at
+startup. Cultivate is never installed from an index: PyPI scaffolds build core
+and `plugins/cultivate` from `MIMIR_CONTROLLER_COMMIT`, and workspace scaffolds
+sync the boot clone with `uv sync --all-packages`.
 Generated service scripts are copied from installed package data into the
 scaffold-owned `.mimir-scaffold/plugin-services/` build context; regeneration
 removes stale service entries, rather than running mutable workspace scripts
@@ -239,16 +308,33 @@ wrapper executing `s6-setuidgid mimir /usr/local/bin/start.sh`. `start.sh`
 still ends by execing `mimir run`; it does not background plugin services.
 Unsupported architecture fails the image build.
 
-The repository-root production `Dockerfile` already has s6 and the `mimir`,
-`watchdog`, and `worklink-execd` services. It only installs plugin services at
-**build time**: set `MIMIR_PLUGIN_PACKAGES` to comma-separated exact
-`distribution==version` pins, `MIMIR_PLUGIN_SELECTION` to the selected names,
-and optionally `MIMIR_PLUGIN_ALL_INSTALLED=1` to include disabled installed
-packages. The build verifies installed versions/selection and assembles
-services; a non-installable selected provider fails the build. Runtime
-`MIMIR_PLUGINS` alone neither installs packages nor changes s6 definitions.
-Rebuild the image when adding services. Without selected packages the three
-existing root-image services remain unchanged.
+The repository-root production `Dockerfile` has s6 and the core `mimir` and
+`watchdog` services. With `MIMIR_PLUGIN_SELECTION=cultivate` (or `all`) at
+build time it also assembles the trusted first-party fragment: pinned OpenCode
+and factory adapters, UID 1002 Worklink user, data directories,
+`opencode-bootstrap` and the exact `worklink-execd` s6 service (not a generic
+prefixed plugin service). Both venvs run Cultivate built from the verified
+source commit, never from an index: the root executor venv overlays core and
+`plugins/cultivate` from `MIMIR_EXECUTOR_COMMIT` with `--no-deps` (so the
+plugin's exact `mimir-agent==` pin cannot replace the overlaid core), and the
+user-owned controller venv installs core and `plugins/cultivate` together from
+`MIMIR_CONTROLLER_COMMIT`, which the build requires to equal the executor commit.
+Without the selection the image is core-only: no executor venv, no `worklink`
+user and no `worklink-execd` service. Third-party plugins are installed at
+**build time** too: set `MIMIR_PLUGIN_PACKAGES` to comma-separated exact
+`distribution==version` pins (never `mimir-cultivate`, which the build refuses),
+`MIMIR_PLUGIN_SELECTION` to the selected names, and optionally
+`MIMIR_PLUGIN_ALL_INSTALLED=1` to include disabled installed packages. The build
+verifies installed versions/selection and assembles services; a non-installable
+selected provider fails the build. Runtime `MIMIR_PLUGINS` alone neither installs
+packages nor changes s6 definitions. Rebuild the image when adding services.
+The PyPI self-update paths (the approved pending-update flag,
+`request_mimir_update` and `mimir update --apply`) refuse wherever Cultivate is
+installed from source, which is detected from `<venv>/controller-source-commit` or
+a `file://` install of `mimir-cultivate`. A refused startup update consumes the
+flag and boots the current version, the same as a failed install. To update,
+rebuild the image or re-sync the checkout at the new commit, so core and the
+plugin stay paired.
 
 ### Defaults and configuration
 
@@ -273,9 +359,15 @@ The example under `tests/fixtures/plugins/example/` is installable for tests
 only and excluded from the published `mimir-agent` wheel. It exercises tool,
 poller/hook, scheduler, CLI, route/dashboard, prompt, skin/frontend, Docker/s6,
 defaults, config and typed state contributions; disabled-provider nonimport is
-checked in a child process. For repository CI, run `uv run pytest -q`, then
-each optional-skill suite alone with
-`for d in mimir/optional-skills/*/tests; do uv run pytest -q "$d"; done`,
-and frontend tests plus `npm run build`. For changes to a test file also run
-that file alone before the full suite. None of these tests makes installed
-provider code untrusted or relaxes no-plugin core policy parity.
+checked in a child process. For repository CI, run
+`env -u MIMIR_PLUGINS uv run pytest -q` for core only and
+`MIMIR_PLUGINS=cultivate uv run --all-packages --extra dev --extra bench
+pytest -q tests plugins/cultivate/tests` for the selected provider. Run both
+with access control unset and enforced. Run each test-bearing directory under
+`mimir/optional-skills/` and
+`plugins/cultivate/mimir_cultivate/defaults/skills/` in its own pytest process
+with `--all-packages`, then `npm ci`, `npm run test` and `npm run build` for
+the frontend. `sh scripts/test_full_access_control.sh` runs this matrix.
+For changes to a test file also run that file alone before the full suite.
+None of these tests makes installed provider code untrusted or relaxes
+no-plugin core policy parity.

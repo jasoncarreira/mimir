@@ -26,7 +26,6 @@ from dotenv import dotenv_values, load_dotenv
 
 from .access_control import resolve_access_control_enforcement
 from .billing import BillingMode, detect_billing_mode
-from .coding import coding_enabled
 from .env import _ENV_BOOL_FALSY, _ENV_BOOL_TRUTHY, env_bool
 
 if TYPE_CHECKING:
@@ -690,15 +689,68 @@ def _parse_file_tool_roots(
     return tuple(out.items())
 
 
-def _configure_declared_repositories(home: Path) -> None:
-    """Validate the repository inventory and reconcile its legacy projections."""
-    from .repository_config import RepositoryInventory
-    from .worklink.backends.registry import WorklinkConfig
+#: How an operator gets coding back after it moved out of core. Emitted verbatim
+#: by the boot warnings below: agents and operators act on this string, so it
+#: must stay exact (see docs/plugins.md, "Upgrading a coding deployment").
+CULTIVATE_UPGRADE_HINT = (
+    "Coding now ships as the Cultivate plugin (the plugins/cultivate workspace "
+    "member). To keep coding: install it from this source checkout with "
+    "`uv sync --all-packages` (keep your --extra flags; a plain `uv sync` removes "
+    "it), or rebuild the image with `--build-arg MIMIR_PLUGIN_SELECTION=cultivate`; "
+    "then set MIMIR_PLUGINS=cultivate in the process or supervisor environment "
+    "(shell export, systemd Environment=, compose environment:/env_file) and "
+    "restart. Do NOT put MIMIR_PLUGINS in the agent home's .env: that file cannot "
+    "select plugins. See docs/plugins.md, \"Upgrading a coding deployment\"."
+)
+#: Home files that only a selected forge/coding provider consumes.
+_PROVIDER_OWNED_HOME_FILES = ("worklink.yaml", "repositories.yaml")
+#: One warning per message per process: from_env runs more than once per boot.
+_retired_coding_warned: set[str] = set()
 
-    inventory = RepositoryInventory.load(home / "repositories.yaml")
+
+def _warn_once(message: str, *args: object) -> None:
+    rendered = message % args if args else message
+    if rendered in _retired_coding_warned:
+        return
+    _retired_coding_warned.add(rendered)
+    log.warning(rendered)
+
+
+def _warn_retired_coding_configuration(home: Path, provider_selected: bool) -> None:
+    """Make an upgrade that silently lost coding loud, without failing boot."""
+    raw = os.environ.get("MIMIR_CODING_ENABLED")
+    if raw is not None:
+        if provider_selected or raw.strip().lower() not in _ENV_BOOL_TRUTHY:
+            _warn_once(
+                "MIMIR_CODING_ENABLED is retired and ignored; coding is selected only "
+                "by MIMIR_PLUGINS. Remove MIMIR_CODING_ENABLED from the deployment"
+            )
+        else:
+            _warn_once(
+                "MIMIR_CODING_ENABLED=%s is retired and ignored: CODING IS DISABLED "
+                "because no coding provider is selected (MIMIR_PLUGINS=%r). %s",
+                raw, os.environ.get("MIMIR_PLUGINS", ""), CULTIVATE_UPGRADE_HINT,
+            )
+    if provider_selected:
+        return
+    for name in _PROVIDER_OWNED_HOME_FILES:
+        if (home / name).exists():
+            _warn_once(
+                "%s exists but no selected plugin owns it (MIMIR_PLUGINS=%r): it is "
+                "IGNORED and coding is disabled. %s",
+                home / name, os.environ.get("MIMIR_PLUGINS", ""), CULTIVATE_UPGRADE_HINT,
+            )
+
+
+def _configure_declared_repositories(
+    home: Path, inventory_loader: Any = None, repository_selection: Any = None,
+) -> None:
+    """Validate the repository inventory and reconcile its legacy projections."""
+    if inventory_loader is None:
+        return
+    inventory = inventory_loader(home / "repositories.yaml")
     if not inventory.declared:
         return
-    worklink = WorklinkConfig.load(home / "worklink.yaml")
 
     declared_roots = tuple(
         (str(item.root), item.mode)
@@ -737,25 +789,8 @@ def _configure_declared_repositories(home: Path) -> None:
     else:
         os.environ["GITHUB_REPOS"] = ",".join(declared_slugs)
 
-    target = inventory.repository(worklink.repository) if worklink.repository else None
-    if worklink.repository is not None and target is None:
-        raise RuntimeError(
-            "worklink.yaml repository does not name a declared repository: "
-            f"{worklink.repository}"
-        )
-    declared_target = str(target.root) if target is not None else None
-    for name in ("WORKLINK_REPO", "MIMIR_WORKLINK_REPO"):
-        legacy_target = os.environ.get(name)
-        if legacy_target and (
-            declared_target is None
-            or Path(legacy_target).resolve() != Path(declared_target)
-        ):
-            raise RuntimeError(
-                f"{name} disagrees with worklink.yaml: "
-                f"legacy={legacy_target!r}, declared={declared_target!r}"
-            )
-    if declared_target is not None and not os.environ.get("WORKLINK_REPO"):
-        os.environ["WORKLINK_REPO"] = declared_target
+    if repository_selection is not None:
+        repository_selection(home, inventory)
 
     git = shutil.which("git")
     if git is None and inventory.repositories:
@@ -1328,12 +1363,6 @@ class Config:
     # default; the allowlist is normalized, lowercased skill slugs only.
     chat_skills_enabled: bool = False
     chat_skill_allowlist: tuple[str, ...] = ()
-    # The OpenCode binary being installed is not operator consent to expose a
-    # code-writing tool to the model. This capability is explicitly opt-in.
-    coding_enabled: bool = False
-    # Native OpenCode JSON/JSONC selected through OPENCODE_CONFIG, or its
-    # standard XDG/HOME location. Provider/plugin settings remain OpenCode-owned.
-    opencode_config_path: Path | None = None
     # Operator-declared absolute roots OUTSIDE the home the file tools may
     # read/edit, as ``(abs_path, "ro"|"rw")`` pairs (chainlink #650). Empty =
     # home-only (today's behavior). ``MIMIR_FILE_TOOL_ROOTS``.
@@ -1369,7 +1398,12 @@ class Config:
         if "MIMIR_UNAUTHORIZED_USER_BEHAVIOR" in os.environ and not getattr(cls, "_retired_intake_warned", False):
             log.warning("MIMIR_UNAUTHORIZED_USER_BEHAVIOR is retired; use intake.unknown_senders in identities.yaml")
             cls._retired_intake_warned = True
-        _configure_declared_repositories(home)
+        hooks = plugin_manager.policy.policy_consumer_hooks
+        _warn_retired_coding_configuration(home, provider_selected=hooks is not None)
+        _configure_declared_repositories(
+            home, hooks.repository_inventory if hooks is not None else None,
+            hooks.repository_selection if hooks is not None else None,
+        )
         if "MIMIR_FILE_OP_ROOTS" in os.environ:
             log.warning(
                 "MIMIR_FILE_OP_ROOTS is retired and ignored; migrate its required "
@@ -1380,14 +1414,6 @@ class Config:
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
         model_spec = _env("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
-        coding_enabled_value = coding_enabled()
-        from .opencode_config import opencode_config_path
-
-        resolved_opencode_config = opencode_config_path()
-        log.info(
-            "coding assistant capability: %s",
-            "enabled" if coding_enabled_value else "disabled",
-        )
         # Resolve once — used by both ``billing_mode`` (to detect QUOTA
         # vs API_KEY billing) and ``oauth_credentials_path`` (the field
         # itself). Computing it twice was redundant and could in theory
@@ -1495,7 +1521,6 @@ class Config:
             access_control_enforced=resolve_access_control_enforcement(
                 _env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False),
                 model_spec=model_spec,
-                coding_enabled=coding_enabled_value,
                 policy=plugin_manager.policy,
             ),
             open_bridge=_env_bool("MIMIR_OPEN_BRIDGE", False),
@@ -1535,8 +1560,6 @@ class Config:
             chat_skill_allowlist=_parse_chat_skill_allowlist(
                 _env("MIMIR_CHAT_SKILL_ALLOWLIST", "")
             ),
-            coding_enabled=coding_enabled_value,
-            opencode_config_path=resolved_opencode_config,
             api_key=_env("MIMIR_API_KEY"),
             web_host=_env("MIMIR_WEB_HOST", "127.0.0.1"),
             chat_stream_max_subscribers=_env_int(

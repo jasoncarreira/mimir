@@ -2,11 +2,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mimir.worklink.backends.feature_factory import (
+import os
+import re
+
+import pytest
+
+if "cultivate" not in os.environ.get("MIMIR_PLUGINS", "").split(","):
+    pytest.skip("factory documentation requires selected Cultivate", allow_module_level=True)
+
+from mimir_cultivate.worklink.backends.feature_factory import (
     FACTORY_VERSION,
     _DEFAULT_FACTORY_MAX_RETRIES,
     _MAX_FACTORY_MAX_RETRIES,
 )
+from mimir_cultivate.worklink.tool_pins import DEFAULT_TOOL_PINS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,12 +26,23 @@ FACTORY_DOCS = (
 )
 
 
+def _image_factory_version() -> str:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    match = re.search(r"(?m)^ARG FACTORY_VERSION=([^\s]+)$", dockerfile)
+    assert match is not None
+    return match.group(1)
+
+
 def test_current_factory_documentation_matches_runtime_version() -> None:
-    assert FACTORY_VERSION == "0.10.18"
+    factory_version = _image_factory_version()
+    assert FACTORY_VERSION == factory_version
+    for tool in DEFAULT_TOOL_PINS:
+        if tool.name in {"feature-factory", "opencode-feature-factory"}:
+            assert tool.pin == factory_version
     for relative_path in FACTORY_DOCS:
         text = (ROOT / relative_path).read_text(encoding="utf-8")
-        assert text.count(f"`feature-factory@{FACTORY_VERSION}`") == 1, relative_path
-        assert text.count(f"`opencode-feature-factory@{FACTORY_VERSION}`") == 1, relative_path
+        assert text.count(f"`feature-factory@{factory_version}`") == 1, relative_path
+        assert text.count(f"`opencode-feature-factory@{factory_version}`") == 1, relative_path
         assert "`feature-factory@0.7.0`" not in text, relative_path
         assert "`opencode-feature-factory@0.7.0`" not in text, relative_path
 
@@ -31,14 +51,15 @@ def test_current_factory_admission_claims_match_runtime_version() -> None:
     configuration = (ROOT / "docs/configuration.md").read_text(encoding="utf-8")
     worklink = (ROOT / "docs/internal/WORKLINK.md").read_text(encoding="utf-8")
 
-    assert f"Package-bound feature-factory {FACTORY_VERSION} launcher" in configuration
-    assert configuration.count(f"no {FACTORY_VERSION} runtime consumes it.") == 4
+    factory_version = _image_factory_version()
+    assert f"Package-bound feature-factory {factory_version} launcher" in configuration
+    assert configuration.count(f"no {factory_version} runtime consumes it.") == 4
     assert (
         "`defaults.trusted_test_retries` is **retired**, not an operator setting in\n"
-        f"{FACTORY_VERSION}."
+        f"{factory_version}."
     ) in configuration
-    assert f"ship in\n{FACTORY_VERSION}." in configuration
-    assert f"package/adapter {FACTORY_VERSION} verification" in worklink
+    assert f"ship in\n{factory_version}." in configuration
+    assert f"package/adapter {factory_version} verification" in worklink
 
 
 def test_factory_launch_contract_is_identical_in_bounded_documentation() -> None:

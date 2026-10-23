@@ -29,16 +29,25 @@ _TRUSTED_PATH_DIRS = (
     "/bin",
 )
 _TRUSTED_PATH = os.pathsep.join(_TRUSTED_PATH_DIRS)
-_GH_CONFIG_DIR = tempfile.mkdtemp(prefix="mimir-gh-config-")
-Path(_GH_CONFIG_DIR).chmod(0o500)
 _MODEL_SELECTION_ENV = "MIMIR_MODEL_SPEC"
 _MINIMAL_ENV_NAMES = frozenset({"HOME", "LANG", "TZ"})
 _INTERACTIVE_ENV_NAMES = _MINIMAL_ENV_NAMES | frozenset({
     "TERM", "TMPDIR", "USER", "LOGNAME", "MIMIR_HOME",
 })
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_CREDENTIAL_ENV_BY_EXECUTABLE = {
-    "gh": frozenset({"GITHUB_TOKEN"}),
+# Core's floor for gh: an empty, non-writable config dir, so gh can never
+# discover ambient on-disk auth ($HOME/.config/gh/hosts.yml). Its only
+# credential is the process GITHUB_TOKEN, confirmed against
+# MIMIR_GITHUB_SELF_LOGIN before every call. A selected forge hook may
+# substitute its own isolated dir, never an ambient one.
+_GH_CONFIG_DIR = tempfile.mkdtemp(prefix="mimir-gh-config-")
+Path(_GH_CONFIG_DIR).chmod(0o500)
+# Core's floor for git, shared with the authorization-time probe so the probe
+# and the executed child resolve the same configuration sources.
+GIT_ENV_PINS = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_PAGER": "cat",
+    "GIT_OPTIONAL_LOCKS": "0",
 }
 
 
@@ -101,7 +110,7 @@ def direct_exec_redact_names(argv: list[str] | None) -> tuple[str, ...]:
     executable = Path(argv[0]).name if argv else ""
     return tuple(dict.fromkeys((
         *direct_exec_pass_env(argv),
-        *sorted(_CREDENTIAL_ENV_BY_EXECUTABLE.get(executable, ())),
+        *(("GITHUB_TOKEN",) if executable == "gh" else ()),
     )))
 
 
@@ -131,17 +140,6 @@ def login_shell_command(command: str) -> str:
         part for part in (_TRUSTED_PATH, venv_bin) if part
     )
     return f"export PATH={shlex.quote(path)}\n{command}"
-
-
-def _is_git_argv(argv: list[str] | None) -> bool:
-    """Return whether *argv* invokes the server-pinned maintenance Git binary."""
-    return bool(argv) and Path(argv[0]).name == "git"
-
-
-def _is_gh_argv(argv: list[str] | None) -> bool:
-    # Authorization replaces the command with an operator-pinned absolute path,
-    # which may differ from the image default used in production.
-    return bool(argv) and Path(argv[0]).name == "gh"
 
 
 def _minimal_direct_exec_env() -> dict[str, str]:
@@ -281,9 +279,9 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     workspace virtualenv. The project test executable and fixed arguments come
     from operator configuration rather than language-specific inference here.
     Children receive only non-secret process settings by default. Executables
-    can receive exact names from the matching operator declaration. The legacy
-    gh credential grant retains its config isolation and identity confirmation
-    for non-declared service commands.
+    can receive exact names from the matching operator declaration. Non-declared
+    gh receives only the process ``GITHUB_TOKEN`` and an isolated config dir,
+    and is refused unless that token belongs to ``MIMIR_GITHUB_SELF_LOGIN``.
     """
     binding = _DIRECT_EXEC_ARGV.get()
     if binding is not None and binding.operator_declared:
@@ -306,7 +304,8 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
         for name in os.environ.get("MIMIR_SHELL_PASS_ENV", "").split(","):
             name = name.strip()
             if (name != "PATH" and _ENV_NAME.fullmatch(name) and name in os.environ
-                    and not (_is_gh_argv(argv) and (name == "GITHUB_TOKEN" or name.startswith("GH_")))):
+                    and not (argv and Path(argv[0]).name == "gh"
+                             and (name == "GITHUB_TOKEN" or name.startswith("GH_")))):
                 env[name] = os.environ[name]
     names = direct_exec_pass_env(argv)
     passed = [key for key in names if key in os.environ]
@@ -317,28 +316,56 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
 
         log_event_sync("service_shell_env_passthrough", pass_env=passed)
     executable = Path(argv[0]).name if argv else ""
-    for key in (() if binding is not None and binding.operator_declared
-                else _CREDENTIAL_ENV_BY_EXECUTABLE.get(executable, ())):
-        if key in os.environ:
-            env[key] = os.environ[key]
-    if _is_gh_argv(argv):
-        # Non-declared gh must not discover ambient on-disk auth.
-        env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
-        from .forge import confirm_github_tool_identity
+    if executable in {"gh", "git"}:
+        # The hook is installed only for an authenticated, selected first-party
+        # owner; importing this core module cannot load a disabled provider.
+        from ..plugins.core import selected_policy_registry
 
-        confirm_github_tool_identity(
-            os.environ.get("MIMIR_GITHUB_SELF_LOGIN", ""),
-            env.get("GITHUB_TOKEN", ""),
-        )
-    if _is_git_argv(argv):
-        # The maintenance profile binds Git to a configured -C root and injects
-        # config-neutralizing argv. Inherited GIT_* variables must not select a
-        # different repository, config source, helper executable, or diff tool.
-        env.update({
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_PAGER": "cat",
-            "GIT_OPTIONAL_LOCKS": "0",
-        })
+        hooks = selected_policy_registry().policy_consumer_hooks
+        env = _core_forge_cli_floor(executable, env)
+        if hooks is not None:
+            # The hook may strengthen the floor (its own isolated config dir,
+            # its own latch on identity failure) but the floor is re-applied.
+            env = _core_forge_cli_floor(
+                executable, hooks.shell_environment(argv, env), hooked=True,
+            )
+        if executable == "gh":
+            # Whatever credential reaches gh, it must be the declared identity.
+            from ..github_identity import confirm_gh_cli_identity
+
+            confirm_gh_cli_identity(env.get("GITHUB_TOKEN", ""))
+    return env
+
+
+def _is_isolated_gh_config_dir(value: str | None) -> bool:
+    if not value or value == os.environ.get("GH_CONFIG_DIR"):
+        return False
+    try:
+        mode = Path(value).stat().st_mode
+    except OSError:
+        return False
+    return Path(value).is_dir() and mode & 0o222 == 0
+
+
+def _core_forge_cli_floor(
+    executable: str, env: dict[str, str], *, hooked: bool = False,
+) -> dict[str, str]:
+    """Apply core's gh/git isolation, with or without a selected forge hook."""
+    env = dict(env)
+    if executable == "git":
+        # Inherited GIT_* never reach the child (minimal env); these pins also
+        # stop /etc/gitconfig drivers the authorization probe never saw.
+        env.update(GIT_ENV_PINS)
+        return env
+    # A declaration or pass-through cannot select a credential, host or
+    # config: core's only gh credential is the process GITHUB_TOKEN.
+    allowed = {"GITHUB_TOKEN", "GH_CONFIG_DIR"} if hooked else set()
+    env = {key: value for key, value in env.items()
+           if not ((key == "GITHUB_TOKEN" or key.startswith("GH_")) and key not in allowed)}
+    if not hooked and os.environ.get("GITHUB_TOKEN"):
+        env["GITHUB_TOKEN"] = os.environ["GITHUB_TOKEN"]
+    if not _is_isolated_gh_config_dir(env.get("GH_CONFIG_DIR")):
+        env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
     return env
 
 

@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from mimir.worklink import checkout as checkout_module
-from mimir.worklink.backends.base import WorkOrder
-from mimir.worklink.backends.opencode import OpenCodeBackend
+import pytest
+
+pytest.importorskip("mimir_cultivate", reason="Worklink worker projections belong to Cultivate")
+
+from mimir_cultivate.worklink import checkout as checkout_module
+from mimir_cultivate.worklink.backends.base import WorkOrder
+from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
 
 
 def _write_native_files(home: Path) -> None:
@@ -34,7 +38,8 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
 ) -> None:
     _write_native_files(tmp_path)
     # ``y`` used to be accepted by Config but rejected by Worklink's copy.
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "y")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setenv("HOME", str(tmp_path))
     # Redirecting HOME alone does not seal config resolution: opencode_config
     # prefers XDG_CONFIG_HOME and only falls back to HOME/.config. Left set,
@@ -98,7 +103,7 @@ def test_disabled_opencode_spec_preserves_direct_environment(
     monkeypatch, tmp_path: Path
 ) -> None:
     _write_native_files(tmp_path)
-    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
     monkeypatch.setenv("HOME", str(tmp_path))
     # See the note above: HOME alone does not seal opencode config resolution.
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
@@ -139,7 +144,8 @@ def test_enabled_opencode_projects_conventional_ambient_key(
     config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
     config.parent.mkdir(parents=True)
     config.write_text('{"model":"proxy/model"}', encoding="utf-8")
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)

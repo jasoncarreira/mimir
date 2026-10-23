@@ -1,0 +1,102 @@
+---
+name: cultivate-worklink-tool-pins
+description: "Low-priority Worklink tool-pin drift poller. Install mimir-cultivate and select MIMIR_PLUGINS=cultivate to seed <home>/skills/cultivate-worklink-tool-pins/, then configure tool_pins in <home>/worklink.yaml."
+env:
+  optional:
+    - name: MIMIR_HOME
+      description: "Agent home containing worklink.yaml and the Chainlink tracker. Supplied by the framework when it launches the poller; the poller refuses to run (emits worklink_tool_pins_misconfigured) if unset — no container-path fallback."
+      example: "/path/to/agent-home"
+---
+
+# Cultivate Worklink Tool Pins — external-tool drift poller
+
+This selected-provider poller ships in `mimir-cultivate`, not core. Selecting
+`MIMIR_PLUGINS=cultivate` seeds `<home>/skills/cultivate-worklink-tool-pins/`.
+It watches the `tool_pins:` section of `<home>/worklink.yaml` and files or reuses
+low-priority Chainlink bump issues when an upstream version differs
+from the configured pin.
+
+## What it does
+
+- Loads the documented `tool_pins:` section from `<home>/worklink.yaml`
+  with a standalone stdlib parser. Poller subprocesses run outside
+  mimir's venv/import path, so this skill intentionally does not import
+  `mimir.*` or PyYAML at runtime.
+- Inventories configured `tool_pins:` against supported upstream
+  sources (`npm` and GitHub release sources).
+- Files or reuses low-priority Chainlink issues carrying the stable
+  `Dedupe-Key: worklink-tool-pin:<category>:<name>:<old>-><new>`.
+- Fails closed when the dedupe search exits non-zero or returns malformed
+  data: no issue is created, the cycle still completes, and the framework
+  records a durable `worklink_tool_pin_dedupe_check_failed` signal with the
+  tool, dedupe key, and bounded reason.
+- Emits JSONL when at least one bump issue was filed/reused or a dedupe check
+  failed. Healthy no-drift runs remain silent.
+
+The search is the pre-create defence: creation is skipped unless it returns a
+valid result set. A second search immediately before creation would repeat the
+same check but would not make the separate search/create operations atomic, so
+it is not claimed as additional race protection. Chainlink has no atomic
+unique-key constraint; concurrent poller instances remain serialized by the
+scheduler's per-poller job. The fix is forward-only: existing valid duplicate
+issues are reused and are never compounded, but historical duplicates are not
+auto-closed because cleanup requires an operator disposition decision.
+
+## What it does not do
+
+- It does **not** auto-edit `worklink.yaml`.
+- It does **not** run smoke commands. Smoke commands are copied into
+  the Chainlink issue as the suggested validation command for the
+  eventual bump PR.
+- It does **not** alert on missing config or no drift; silence is the
+  expected healthy path.
+
+## Installation
+
+Install `mimir-cultivate`, select `MIMIR_PLUGINS=cultivate`, and configure
+`tool_pins:` in `<home>/worklink.yaml`. Provider defaults seed the skill from
+`plugins/cultivate/mimir_cultivate/defaults/skills/worklink-tool-pins/` to
+`<home>/skills/cultivate-worklink-tool-pins/` at startup. Ensure `MIMIR_HOME`
+points at that home.
+
+From the repository root, run the isolated poller suite with
+`uv run --all-packages --extra dev --extra bench pytest -q plugins/cultivate/mimir_cultivate/defaults/skills/worklink-tool-pins/tests/`.
+
+Operator/admin turns only: an interactive admin with the `reload_pollers`
+tool available may call it after installation to register the poller.
+
+The shipped cadence is weekly Sunday 08:00 UTC with low priority so it
+is shed before interactive or high-value pollers under resource pressure.
+
+## `worklink.yaml` shape
+
+```yaml
+tool_pins:
+  - name: opencode
+    category: coding-cli
+    pin: "1.18.21"
+    smoke: "opencode --version"
+    source: npm
+    package: "opencode-ai"
+  - name: chainlink
+    category: tracker
+    pin: "chainlink-1.6.0"
+    smoke: "chainlink --version"
+    source: github-release
+    repo: dollspace-gay/chainlink
+```
+
+Supported `source` values:
+
+- `npm` — resolves `package` (or `name`) via `npm view <package> version`.
+- `github-release`, `github`, or `github-tag` — resolves `repo` via
+  `gh release view --repo <owner/repo> --json tagName`.
+
+Pins with `source: manual` / `local`, missing resolvers, or resolver
+failures are skipped as diagnostics on stderr; they do not make the
+poller non-zero.
+
+The parser is intentionally narrow rather than a full YAML interpreter:
+it supports the documented top-level `tool_pins:` list of scalar
+mappings. If the Worklink config format grows nested tool-pin fields,
+update this poller parser and its subprocess smoke test in the same PR.

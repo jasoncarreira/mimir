@@ -1,0 +1,54 @@
+{
+  "pollers": [
+    {
+      "name": "worklink-ready-queue",
+      "command": "python3 scripts/poller.py",
+      "cron": "*/10 * * * *",
+      "priority": "normal",
+      "hooks": "worklink",
+      "trust_source": "trusted_system",
+      "deliver": "OPERATOR_CHANNEL",
+      "authority": {
+        "profile": "github",
+        "tier": "code-execution",
+        "saga_full_corpus_read": true,
+        "capabilities": ["chainlink_issue_show", "worklink_run", "worklink_resume", "read_file", "ls", "grep", "write_file", "edit_file", "repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit", "shell_exec", "bash_jobs_list", "bash_job_output", "send_message", "operator_alert"],
+        "scoped_roots": ["state"]
+      },
+      "env_required": [
+        "WORKLINK_REPO"
+      ],
+      "pass_env": [
+        "MIMIR_HOME",
+        "MIMIR_MODEL_SPEC",
+        "MIMIR_MODEL_REASONING_EFFORT",
+        "MIMIR_WORKLINK_REASONING_EFFORT",
+        "MIMIR_SOURCE_DIR",
+        "MIMIR_PLUGINS",
+        "CHAINLINK_BIN",
+        "WORKLINK_RUN_BIN",
+        "WORKLINK_REPO",
+        "WORKLINK_MAX_CONCURRENT",
+        "MIMIR_FACTORY_EPICS_ENABLED",
+        "MIMIR_FACTORY_ENTRYPOINT",
+        "MIMIR_FACTORY_MAX_CONCURRENT",
+        "MIMIR_FACTORY_MAX_RETRIES",
+        "MIMIR_FACTORY_RUN_TIMEOUT_S",
+        "MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S",
+        "MIMIR_FACTORY_STALE_HEARTBEAT_S",
+        "MIMIR_FACTORY_PUBLISHING_IDENTITY",
+        "FACTORY_PUBLISHING_IDENTITY",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
+        "OPENROUTER_API_KEY",
+        "GROQ_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "VOYAGE_API_KEY"
+      ]
+    }
+  ]
+}

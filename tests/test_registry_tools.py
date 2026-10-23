@@ -2353,7 +2353,7 @@ class TestSendMessageInteractivityGuard:
         self, tmp_path,
     ) -> None:
         from mimir.event_logger import init_logger
-        from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
+        from mimir.http_ingress import HTTP_EVENT_INGRESS_EXTRA_VALUE
 
         init_logger(tmp_path / "events.jsonl", session_id="test-session")
         bridge = _StubBridge()

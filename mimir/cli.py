@@ -142,10 +142,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .commands import memory as _memory_cmd
     mem_p = _memory_cmd.add_argparse(sub)
 
-    # `mimir worklink run <issue>` — operator-invoked Worklink executor.
-    from .commands import worklink as _worklink_cmd
-    worklink_p = _worklink_cmd.add_argparse(sub)
-
     regen_p = sub.add_parser(
         "regenerate-api-key",
         help="Rotate MIMIR_API_KEY in <home>/.env. Prints the new value.",
@@ -322,19 +318,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     from . import scaffold_docker as _scaffold_docker
     _scaffold_docker.add_argparse(scaffold_docker_p)
-
-    # `mimir opencode-bootstrap` — preserving global plugin-config merge.
-    opencode_bootstrap_p = sub.add_parser(
-        "opencode-bootstrap",
-        help=(
-            "Create or preserving-merge mimir's pinned plugins into "
-            "OpenCode's global XDG config path."
-        ),
-    )
-    opencode_bootstrap_p.add_argument(
-        "--home", type=Path, default=None,
-        help="User home containing .config/opencode (default: $HOME).",
-    )
 
     # `mimir commitments`
     commitments_p = sub.add_parser(
@@ -524,9 +507,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             sys.exit(code)
         return
 
-    def handle_worklink(args: argparse.Namespace) -> None:
-        sys.exit(_worklink_cmd.dispatch(args, worklink_p))
-
     def handle_watchdog(args: argparse.Namespace) -> None:
         import asyncio
         from .liveness import run_watchdog
@@ -706,13 +686,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         # ``parser.set_defaults`` rather than re-importing here.
         sys.exit(args.scaffold_docker_cmd(args))
 
-    def handle_opencode_bootstrap(args: argparse.Namespace) -> None:
-        user_home = (args.home or Path.home()).expanduser().resolve()
-        config_path = _scaffold_docker.opencode_config_path(user_home)
-        changed = _scaffold_docker.ensure_opencode_config(config_path)
-        print(f"{'updated' if changed else 'unchanged'} {config_path}")
-        return
-
     def handle_commitments(args: argparse.Namespace) -> None:
         if args.commitments_action is None:
             commitments_p.print_help()
@@ -872,7 +845,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         "identities": (id_p, handle_identities),
         "reflection": (refl_p, handle_reflection),
         "memory": (mem_p, handle_memory),
-        "worklink": (worklink_p, handle_worklink),
         "regenerate-api-key": (regen_p, handle_regenerate_api_key),
         "stats": (stats_p, handle_stats),
         "verify-cred": (verify_cred_p, handle_verify_cred),
@@ -887,7 +859,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         "skills": (skills_p, handle_skills),
         "plugins": (plugins_p, handle_plugins),
         "scaffold-docker": (scaffold_docker_p, handle_scaffold_docker),
-        "opencode-bootstrap": (opencode_bootstrap_p, handle_opencode_bootstrap),
         "commitments": (commitments_p, handle_commitments),
         "feedback": (feedback_p, handle_feedback),
         "reindex": (reindex_p, handle_reindex),

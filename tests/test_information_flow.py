@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -70,17 +71,16 @@ from mimir.models import (
     IngestedURLState,
     Integrity,
     IntegrityEffect,
-    RepoPRActionScope,
-    RepoReviewState,
     SourceLabel,
     TurnContext,
     TurnInteractivity,
 )
-from mimir.pr_checkout_lease import PRCheckoutLease, _metadata
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.policy import RepoPRActionScope, RepoReviewState, issue_repo_scope
 from mimir.prompt_sources import prompt_source_label
 from mimir.skill_install import install
 from mimir.turn_event_bus import TurnEventBus, TurnEventEmitter
-from mimir.worklink.continuation import (
+from mimir.http_ingress import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     HTTP_EVENT_INGRESS_EXTRA_VALUE,
 )
@@ -1087,6 +1087,7 @@ def _runtime_operator_context(
 
 @pytest.mark.parametrize("visibility", [None, "private"])
 @pytest.mark.parametrize("tool_name", ["pr_comment", "repo_push"])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_operator_runtime_ingress_admits_scoped_forge(
     ingress_resolver: IdentityResolver, visibility: str | None, tool_name: str,
 ) -> None:
@@ -1818,6 +1819,9 @@ def _lease_read_auth(
     *,
     pull_request_author: str,
 ) -> AuthContext:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.repository import PRCheckoutLease, _metadata
+
     scope = RepoPRActionScope(
         provenance="server_discovered",
         canonical_repo="o/r",
@@ -1863,6 +1867,7 @@ def _lease_read_auth(
     return replace(_auth(), repo_review_state=state, repo_pr_action_scope=scope)
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_attested_author_active_lease_is_trusted_but_arbitrary_root_is_not(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1940,6 +1945,7 @@ def test_non_self_authored_active_lease_is_untrusted_active_ingest(
     )
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_active_lease_does_not_trust_sibling_path_within_lease_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2003,6 +2009,7 @@ def test_invalid_configured_lease_root_is_rejected(
     assert _configured_pr_checkout_lease_root() is None
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_active_lease_record_supersedes_generic_file_integrity_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2466,6 +2473,7 @@ def test_every_known_label_can_flow_to_compatible_same_channel(label: str):
     assert decision.reason == "ifc_allowed"
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_source_only_carrier_obeys_forge_allowed_sinks():
     source = SourceLabel(
         principal="user-1", domain="channel", resource_id="slack-C1",
@@ -2492,6 +2500,7 @@ def test_source_only_carrier_obeys_forge_allowed_sinks():
 
 
 @pytest.mark.parametrize("labelled", [False, True])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_sourceless_carrier_only_skips_sink_gate_when_unlabelled(labelled):
     labels = InformationFlowLabels(
         labels=frozenset({"private"}) if labelled else frozenset(),
@@ -2899,6 +2908,7 @@ def test_poller_payload_cannot_bypass_active_sink_ifc(
     tool_name: str,
     target: str,
     sink_category: str,
+    selected_cultivate_policy,
 ):
     poller = AuthContext(
         principal="service:poller",
@@ -3143,6 +3153,7 @@ def test_fetch_redirect_pin_includes_only_approved_ingested_urls() -> None:
 def test_worklink_integrity_gate_uses_only_untrusted_active_ingest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    selected_cultivate_policy,
     integrity: str,
     integrity_effect: str,
     expected: bool,
@@ -3174,6 +3185,7 @@ def test_worklink_integrity_gate_uses_only_untrusted_active_ingest(
 def test_worklink_repo_service_adapter_allows_only_configured_repo(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    selected_cultivate_policy,
 ) -> None:
     repo = tmp_path / "repo"
     wrong_repo = tmp_path / "wrong-repo"
@@ -3222,6 +3234,7 @@ def test_upgrade_service_add_schedule_allows_same_scope() -> None:
 def test_generic_spawn_is_blocked_even_for_trusted_trigger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    selected_cultivate_policy,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     service = ServicePrincipal(
@@ -3379,16 +3392,30 @@ def test_heartbeat_fetches_multiple_approved_exact_urls_after_untrusted_ingest(
 
 
 @pytest.fixture
-def shipped_github_fetch_context(request, tmp_path, monkeypatch):
+def selected_cultivate_policy():
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("selected coding policy requires installed Cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+@pytest.fixture
+def shipped_github_fetch_context(request, tmp_path, monkeypatch, selected_cultivate_policy):
     from mimir.pollers import _parse_poller_authority
-    from mimir.models import RepoPRActionScope, RepoReviewState
+    from mimir_cultivate.policy import RepoReviewState, issue_repo_scope
     import mimir.access_control as access_control
 
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
     monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
     manifest = (
-        Path(__file__).parents[1] / "mimir/optional-skills"
+        Path(__file__).parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills"
         / request.param / "pollers.json"
     )
     raw = json.loads(manifest.read_text())["pollers"][0]
@@ -3398,11 +3425,11 @@ def shipped_github_fetch_context(request, tmp_path, monkeypatch):
         state_root=None, manifest_path=manifest,
     )
     auth, labels = _trigger_service_context(service, integrity="untrusted")
-    scope = RepoPRActionScope(
+    scope = issue_repo_scope(
+        is_remediation=True,
         provenance="poller_payload", canonical_repo="acme/widget",
         canonical_root=str(tmp_path), canonical_origin="https://github.com/acme/widget.git",
         principal="mimir-bot", event_type="pr_ci_failure",
-        allowed_operations=access_control._REPO_PR_CI_REMEDIATION_ACTIONS,
         pr_number=42, head_repo="acme/widget", head_remote="origin",
         destination_ref="refs/heads/fix", observed_head_sha="a" * 40,
         base_ref="main", observed_base_sha="b" * 40, pull_request_author="mimir-bot",
@@ -4879,6 +4906,7 @@ def test_failed_first_party_file_read_keeps_incomplete_label(
     assert source.authorized_principals == frozenset()
 
 
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_review_skill_read_admits_scoped_forge_sinks_under_enforcement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4969,6 +4997,7 @@ def test_review_skill_read_admits_scoped_forge_sinks_under_enforcement(
 def test_worklink_run_is_blocked_after_shell_result_with_external_provenance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    selected_cultivate_policy,
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -5796,6 +5825,7 @@ def test_file_and_shell_sinks_still_refuse_untrusted_active_ingest(
 ])
 @pytest.mark.parametrize("enforce", [False, True])
 @pytest.mark.parametrize("stale_snapshot", [False, True])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_tainted_code_and_live_mutations_have_uniform_refusal(
     tool_name: str, enforce: bool, stale_snapshot: bool,
 ) -> None:
@@ -6612,11 +6642,12 @@ def test_service_shell_policy_rejects_write_read_and_exec_flags(command: str):
 @pytest.mark.parametrize("source", [
     "collaborator_pr", "noncollaborator_pr", "noncollaborator_pr_diff", "fetch_url", "channel",
 ])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_shell_gate_after_real_source_labelling(
     tmp_path, monkeypatch, maintenance_git_home, tool_name, profile, source,
 ):
     from mimir import access_control
-    from mimir.tools import forge
+    from mimir_cultivate import forge
 
     if profile in {"user", "admin"}:
         auth = _auth(roles=(profile,))
@@ -6658,6 +6689,10 @@ def test_shell_gate_after_real_source_labelling(
             )
         finally:
             provenance = access_control.end_protected_result_capture(token)
+        assert provenance is not None
+        assert provenance.sources[0].integrity == (
+            "trusted" if source == "collaborator_pr" else "untrusted"
+        )
         forge_tool = "pr_diff" if source == "noncollaborator_pr_diff" else "pr_metadata"
         added = classify_protected_result(
             forge_tool, {}, auth,
@@ -6689,27 +6724,14 @@ def test_shell_gate_after_real_source_labelling(
             content="untrusted channel content",
         ))
     assert added is not None
-    assert added.has_untrusted_active_ingest is (source != "collaborator_pr")
+    assert added.has_untrusted_active_ingest
     current = auth.ifc_state.merge(added, fallback=labels)
     decision = SinkGate.check_sink_flow(
         tool_name, "git status --short" if profile == "github" else "printf gate",
         current, auth, enforce=True, repo_review_state=review_state,
     )
-    assert decision.allowed is (source == "collaborator_pr"), (decision.reason, decision.refusal_detail)
-    if source == "collaborator_pr":
-        output = classify_protected_result(
-            tool_name, {}, auth, decision, result="ordinary shell output",
-        )
-        if output is not None:
-            assert all(item.integrity == "untrusted" for item in output.sources)
-            auth.ifc_state.merge(output, fallback=current)
-        second = SinkGate.check_sink_flow(
-            tool_name, "git status --short" if profile == "github" else "printf gate",
-            current, auth, enforce=True, repo_review_state=review_state,
-        )
-        assert second.allowed, second.reason
-        assert not auth.ifc_state.has_untrusted_active_ingest(current)
-    if source != "collaborator_pr":
+    assert not decision.allowed, (decision.reason, decision.refusal_detail)
+    if source in {"collaborator_pr", "noncollaborator_pr", "noncollaborator_pr_diff", "fetch_url", "channel"}:
         # Native shells retain their existing IFC reason and detail, rather than
         # the uniform code/live-state refusal used by the hands entry points.
         assert decision.reason == "ifc_label_blocked:shell_process"
@@ -6765,13 +6787,10 @@ def test_service_shell_policy_rejects_multicommand_line_breaks(separator: str):
     assert decision.reason == "service_sink_destination_denied"
 
 
-@pytest.mark.parametrize(("kind", "reason", "fields"), [
-    ("none", "no_published_provenance", None),
-    ("mismatch", "provenance_field_mismatch", ["resource_id", "principal"]),
-    ("untrusted", "published_untrusted", None),
-])
-def test_repository_result_fallback_records_closed_reason_once_per_turn(
-    monkeypatch: pytest.MonkeyPatch, kind: str, reason: str, fields: list[str] | None,
+@pytest.mark.parametrize("kind", ["none", "mismatch", "untrusted"])
+@pytest.mark.usefixtures("selected_cultivate_policy")
+def test_nonretained_plugin_result_never_issues_repository_fallback_receipt(
+    monkeypatch: pytest.MonkeyPatch, kind: str,
 ) -> None:
     from mimir import event_logger
 
@@ -6807,14 +6826,12 @@ def test_repository_result_fallback_records_closed_reason_once_per_turn(
             "pr_metadata", {}, auth, authorization, provenance=published,
         )
         assert result.sources[0].integrity == "untrusted"
-    assert events == [("repository_result_untrusted_default", {
-        "tool": "pr_metadata", "scope_id": scope.scope_id, "pr_number": 2364,
-        "observed_head_sha": "a" * 40, "reason": reason,
-        **({"mismatched_fields": fields} if fields is not None else {}),
-    })]
+        assert result.sources[0].resource_id == "<unresolved-resource:protected_tool:pr_metadata>"
+    assert events == []
 
 
 @pytest.mark.parametrize("field", ["resource_id", "principal"])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_repository_result_attestation_requires_each_exact_boundary_field(
     monkeypatch: pytest.MonkeyPatch, field: str,
 ) -> None:
@@ -7024,6 +7041,7 @@ def test_exact_file_grant_refuses_tainted_write_without_clearing_or_spending(
     ("write_file", "registry_file_path"), ("write_file", "registry_path"),
     ("repo_commit", "sink"), ("repo_push", "sink"), ("repo_test", "sink"),
 ])
+@pytest.mark.usefixtures("selected_cultivate_policy")
 def test_live_declassification_cannot_bypass_tainted_write_veto(
     tmp_path: Path, bind_approval_turn, origin: str, enforce: bool,
     tool_name: str, gate: str,
@@ -7775,6 +7793,7 @@ async def test_real_graph_tool_runtime_preserves_but_does_not_serialize_audience
 
 async def test_agent_graph_tool_call_survives_populated_auth_context(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """End-to-end #971 regression through the production assembly.
 
@@ -7792,7 +7811,14 @@ async def test_agent_graph_tool_call_survives_populated_auth_context(
     from deepagents import create_deep_agent
 
     from mimir._deepagents_patches import install_deepagents_grep_context_tool
+    from mimir.tools import memory
     from mimir.tools.store import memory_store
+
+    # The carrier under test is the tool-call parse, not memory_store's body.
+    # Pin the process-wide store slot so the body is deterministic (it returns
+    # the unconfigured message) instead of depending on which store a prior
+    # test on this worker left behind.
+    monkeypatch.setitem(memory._MEMORY_STATE, "client", None)
 
     class _ToolCallingFakeModel(GenericFakeChatModel):
         def bind_tools(self, tools, **kwargs):  # noqa: ARG002 - fake binds nothing

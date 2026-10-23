@@ -415,7 +415,7 @@ assert not manager.policy.prompt_providers
 assert not manager.policy.state_slots
 assert "example-hello" not in manager.policy.cli_commands
 assert not select_plugins(enable="")
-assert select_plugins(enable="", all_installed=True)[0].name == "example"
+assert "example" in {candidate.name for candidate in select_plugins(enable="", all_installed=True)}
 assert discover_pollers(home / "skills", policy=manager.policy) == []
 with contextlib.redirect_stderr(io.StringIO()):
     try:
@@ -457,6 +457,71 @@ assert "mimir_example_plugin" not in sys.modules
     result = subprocess.run([sys.executable, "-c", script, str(tmp_path)],
                             env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_unselected_third_party_seeds_are_skipped_without_import(example_distribution, tmp_path):
+    """Any plugin's seeded home pollers, jobs and skills stay withheld once it is deselected.
+
+    Covers the installed-but-unselected case (package metadata names the seed)
+    and the uninstalled case (only the home's seed marker names it). Fresh
+    interpreters own the import claim.
+    """
+    script = '''
+import sys
+from pathlib import Path
+from mimir.plugins.discovery import enabled_plugins
+from mimir.plugins.defaults import seed_plugin_defaults
+from mimir.plugins.manager import load_plugins
+from mimir.pollers import discover_pollers
+mode, home = sys.argv[1], Path(sys.argv[2])
+if mode == "seed":
+    seed_plugin_defaults(home, selected=enabled_plugins(enable="example"))
+    assert (home / "skills/example-example-watch/pollers.json").is_file()
+    assert "example-example-daily" in (home / "scheduler.yaml").read_text()
+else:
+    from mimir.scheduler import Scheduler
+    from mimir.skill_visibility import visible_skill_names
+    policy = load_plugins(enable="").policy
+    scheduler = Scheduler(home / "scheduler.yaml", lambda event: None, home=home, policy=policy)
+    scheduler.reload()
+    ids = {job.id for job in scheduler._scheduler.get_jobs()}
+    assert "scheduler:operator-daily" in ids and "scheduler:example-example-daily" not in ids, ids
+    assert visible_skill_names(home, ["example-example-watch", "operator-watch"], policy) == [
+        "operator-watch"]
+    invalid = []
+    pollers = discover_pollers(home / "skills", policy=policy,
+                               invalid_entries=invalid)
+    assert [p.name for p in pollers] == ["operator-watch"], pollers
+    assert [(path.parent.name, name) for path, name, reason in invalid
+            if "seeded by plugin 'example'" in reason] == [("example-example-watch", "<manifest>")], invalid
+    assert "mimir_example_plugin" not in sys.modules
+'''
+    home = tmp_path / "home"
+    operator = home / "skills" / "operator-watch"
+    operator.mkdir(parents=True)
+    (operator / "pollers.json").write_text(json.dumps({"pollers": [{
+        "name": "operator-watch", "command": "python3 poller.py", "cron": "*/5 * * * *",
+    }]}), encoding="utf-8")
+    (home / "scheduler.yaml").write_text(
+        "- name: operator-daily\n  prompt: operator tick\n  cron: '0 9 * * *'\n",
+        encoding="utf-8",
+    )
+    installed = {**os.environ, "PYTHONPATH": str(example_distribution),
+                 "MIMIR_PLUGINS": "", "MIMIR_HOME": str(home)}
+    uninstalled = {key: value for key, value in installed.items() if key != "PYTHONPATH"}
+    def run(mode, env):
+        result = subprocess.run([sys.executable, "-c", script, mode, str(home)],
+                                env=env, capture_output=True, text=True)
+        assert result.returncode == 0, f"{mode}: {result.stderr[-4000:]}"
+
+    for mode, env in (("seed", installed), ("installed", installed), ("uninstalled", uninstalled)):
+        run(mode, env)
+    # Without the seed marker, the installed package's declared defaults alone
+    # still name the seeded skill and job exactly.
+    marker = home / ".mimir" / "seed-plugin-defaults" / "example"
+    assert marker.is_file()
+    marker.unlink()
+    run("installed", installed)
 
 
 def _policy(factory, *, result_domain="plugin-data", service_constraints=False, boundary=False):

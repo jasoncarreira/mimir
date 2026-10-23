@@ -5,6 +5,15 @@
 # editing the install step below, but the default + supported flow is
 # PyPI.
 #
+# Cultivate (the coding provider) is not published to an index. Select it with
+# ``--build-arg MIMIR_PLUGIN_SELECTION=cultivate``: the image then installs core
+# AND the in-repo ``plugins/cultivate`` workspace member from the verified
+# MIMIR_CONTROLLER_COMMIT, into both the controller venv and the root worker
+# venv, so the plugin always runs with the core of its own commit. Without the
+# selection the image is core-only: no worker venv, no ``worklink`` user, no
+# ``worklink-execd`` service. Enable it at runtime with ``MIMIR_PLUGINS=cultivate``
+# in the container environment (compose ``environment:``/``env_file``).
+#
 # ── Auth: pick ONE of these at runtime via -e or compose env: ─────────
 #   A. Max plan (subscription, requires the ``claude-code`` extra and
 #      an operator-provided Claude Code CLI):
@@ -51,6 +60,7 @@ RUN set -eu; \
     fi
 
 FROM provenance-validation AS base
+COPY plugins/cultivate/mimir_cultivate/docker/ /opt/cultivate-docker/
 
 # OS deps:
 #   - ca-certificates curl gnupg: prereqs for adding NodeSource +
@@ -73,22 +83,8 @@ ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factor
 ENV PATH="/opt/mimir-opencode/bin:${PATH}"
 ARG MIMIR_ENABLE_OPENCODE=0
 ARG FACTORY_VERSION=0.10.18
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg git jq procps ripgrep xz-utils \
-        poppler-utils tesseract-ocr tesseract-ocr-eng libjemalloc2 \
-    && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then \
-        npm install --global --prefix /opt/mimir-opencode \
-            opencode-ai@1.18.21 \
-            feature-factory@${FACTORY_VERSION} \
-            opencode-feature-factory@${FACTORY_VERSION} \
-            opencode-project-memory@0.1.0 \
-            opencode-openai-codex-auth@4.4.0 \
-            opencode-anthropic-auth@0.0.13 ; \
-    fi \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+RUN NODE_VERSION="$NODE_VERSION" MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" FACTORY_VERSION="$FACTORY_VERSION" \
+    sh /opt/cultivate-docker/base.sh
 
 # jemalloc: under glibc malloc the long-running agent's RSS crept to ~2 GB, and
 # ~500 MB of that was freed-but-retained fragmentation (one malloc_trim(0)
@@ -130,16 +126,36 @@ RUN set -eu; \
 # ``pip install --upgrade mimir-agent`` from inside the container
 # without escalating to root. ``/home/mimir/`` is also where the
 # Claude Code CLI keeps its OAuth credential under ``.claude/``.
-RUN groupadd --gid 1001 mimir \
-    && groupadd --gid 1002 worklink \
-    && useradd --create-home --uid 1001 --gid mimir --groups worklink --shell /bin/bash mimir \
-    && useradd --no-create-home --uid 1002 --gid worklink --home-dir /nonexistent --shell /usr/sbin/nologin worklink \
-    && chmod 0700 /home/mimir \
-    && install -d -o root -g root -m 0711 /var/lib/mimir-worklink \
-    && install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/checkouts \
-    && install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/repo-test-checkouts \
-    && install -d -o root -g mimir -m 0771 /var/lib/mimir-worklink/opencode-checkouts \
-    && install -d -o root -g worklink -m 0710 /var/lib/mimir-worklink/homes
+#
+# MIMIR_PLUGIN_SELECTION is the build-time MIMIR_PLUGINS selection. ``cultivate``
+# (or ``all``) selects the first-party provider, which is built from the pinned
+# source below; MIMIR_PLUGIN_PACKAGES names only pinned third-party
+# distributions from an index, so it refuses mimir-cultivate.
+ARG MIMIR_PLUGIN_PACKAGES=""
+ARG MIMIR_PLUGIN_SELECTION=""
+ARG MIMIR_PLUGIN_ALL_INSTALLED=0
+RUN set -eu; \
+    selected=0; \
+    selection="$(printf '%s' "$MIMIR_PLUGIN_SELECTION" | tr -d ' ')"; \
+    case ",${selection}," in *,cultivate,*|,all,) selected=1 ;; esac; \
+    old_ifs="$IFS"; IFS=,; \
+    for package in $MIMIR_PLUGIN_PACKAGES; do \
+        name="$(printf '%s' "${package%%==*}" | tr 'A-Z_.' 'a-z--' | tr -d ' ')"; \
+        if [ "$name" = mimir-cultivate ]; then \
+            echo >&2 "mimir-cultivate is built from plugins/cultivate at MIMIR_CONTROLLER_COMMIT; remove it from MIMIR_PLUGIN_PACKAGES and set MIMIR_PLUGIN_SELECTION=cultivate"; \
+            exit 2; \
+        fi; \
+    done; IFS="$old_ifs"; \
+    printf '%s\n' "$selected" > /opt/cultivate-docker/selected
+# Core-only images create just the controller user; the worklink identity and
+# its state directories belong to the selected Cultivate worker.
+RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        sh /opt/cultivate-docker/users.sh; \
+    else \
+        groupadd --gid 1001 mimir \
+        && useradd --create-home --uid 1001 --gid mimir --shell /bin/bash mimir \
+        && chmod 0700 /home/mimir; \
+    fi
 USER mimir
 # Land ``docker exec -it <ctn> bash`` at a predictable home dir.
 # Docker's default of ``/`` is technically fine but operators
@@ -177,11 +193,8 @@ ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 
-# Optional pinned provider packages must be supplied at image build time.
-# Private wheels require an operator-supplied pip index or build context.
-ARG MIMIR_PLUGIN_PACKAGES=""
-ARG MIMIR_PLUGIN_SELECTION=""
-ARG MIMIR_PLUGIN_ALL_INSTALLED=0
+# Optional pinned third-party provider packages must be supplied at image build
+# time. Private wheels require an operator-supplied pip index or build context.
 RUN set -eu; old_ifs="$IFS"; IFS=,; \
     for package in $MIMIR_PLUGIN_PACKAGES; do \
         case "$package" in *==*) ;; *) echo >&2 "plugin package must be pinned: $package"; exit 2 ;; esac; \
@@ -201,39 +214,25 @@ LABEL org.opencontainers.image.revision="${MIMIR_EXECUTOR_COMMIT}"
 # went red on 19d7c517 because cab16d11 landed ~1 minute later). The ref remains as a
 # fallback for commits a bare-SHA fetch cannot reach, and the SHA assertion below is
 # unchanged either way, so provenance is identical: a mismatch still fails the build.
-RUN git check-ref-format "$MIMIR_GIT_REF" \
-    && git init /opt/mimir-worklink/source \
-    && git -C /opt/mimir-worklink/source remote add origin "$MIMIR_GIT_URL" \
-    && { \
-        git -C /opt/mimir-worklink/source fetch --no-tags --depth=1 \
-            origin "$MIMIR_EXECUTOR_COMMIT" \
-        || git -C /opt/mimir-worklink/source fetch --no-tags --depth=1 \
-            origin "$MIMIR_GIT_REF"; \
-    } \
-    && test "$(git -C /opt/mimir-worklink/source rev-parse FETCH_HEAD)" = "$MIMIR_EXECUTOR_COMMIT" \
-    && git -C /opt/mimir-worklink/source checkout --detach FETCH_HEAD \
-    && test "$(git -C /opt/mimir-worklink/source rev-parse HEAD)" = "$MIMIR_EXECUTOR_COMMIT" \
-    && test -z "$(git -C /opt/mimir-worklink/source status --porcelain=v1)" \
-    && printf '%s\n' "$MIMIR_EXECUTOR_COMMIT" > /opt/mimir-worklink/executor-source-commit \
-    && rm -rf /opt/mimir-worklink/source/.git \
-    && python3 -m venv /opt/mimir-worklink/venv \
-    && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
-# The published package above supplies the worker venv's dependency set, while
-# the no-deps source overlay keeps the image proof on the pinned commit's code. A
-# newly introduced runtime dependency is not in the previously published wheel,
-# so install it explicitly before importing the overlay during this PR's proof.
-RUN /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "pypdf>=6.16" \
-    && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source \
-    && /opt/mimir-worklink/venv/bin/pip install --no-cache-dir uv \
-    && ln -s /opt/mimir-worklink/venv/bin/uv /usr/local/bin/uv \
-    && UV_CACHE_DIR=/opt/mimir-worklink/uv-cache uv sync --directory /opt/mimir-worklink/source \
-        --locked --extra dev --extra bench --no-install-workspace \
-    && rm -rf /opt/mimir-worklink/source/.venv \
-    && rm -rf /opt/mimir-worklink/source \
-    && chown -R root:root /opt/mimir-worklink \
-    && chmod -R go-w /opt/mimir-worklink
+#
+# The worker venv takes its dependency set from the published mimir-agent, then
+# overlays BOTH this commit's core and its plugins/cultivate member with --no-deps,
+# so every line of Worklink and worker_exec code it runs is from the commit in the
+# label, and no wheel's exact ``mimir-agent==`` pin can replace the overlaid core.
+# A runtime dependency newer than the published wheel must be installed
+# explicitly in executor.sh. Core-only images have no worker venv.
+RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        MIMIR_GIT_REF="$MIMIR_GIT_REF" MIMIR_EXECUTOR_COMMIT="$MIMIR_EXECUTOR_COMMIT" \
+        MIMIR_GIT_URL="$MIMIR_GIT_URL" MIMIR_EXTRAS="$MIMIR_EXTRAS" sh /opt/cultivate-docker/executor.sh; \
+    fi
 USER mimir
+# The controller venv gets core and Cultivate from the same pinned commit (the
+# provenance stage requires it to equal the executor commit). Runs as mimir, so
+# the venv stays user-owned for the pending-update flow.
+RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        MIMIR_GIT_REF="$MIMIR_GIT_REF" MIMIR_CONTROLLER_COMMIT="$MIMIR_CONTROLLER_COMMIT" \
+        MIMIR_GIT_URL="$MIMIR_GIT_URL" MIMIR_EXTRAS="$MIMIR_EXTRAS" sh /opt/cultivate-docker/controller.sh; \
+    fi
 
 # Optional: install the Claude Code model-provider adapter. The CLI remains an
 # operator-provided runtime dependency and is not bundled in this image.
@@ -255,8 +254,9 @@ RUN mkdir -p /home/mimir/agent && mimir setup --home /home/mimir/agent || true
 # OpenCode reads this XDG-global config before walking project-local
 # opencode.json files, so the registrations apply in outer repos and nested
 # Worklink worktrees alike. The bootstrap is a preserving, idempotent merge.
-RUN if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then \
-        mimir opencode-bootstrap --home /home/mimir ; \
+RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        MIMIR_PLUGINS=cultivate MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" \
+        sh /opt/cultivate-docker/bootstrap.sh; \
     fi
 
 # Auto-update behavior on this image:
@@ -311,19 +311,32 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 # bundle defines what runs.
 USER root
 COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+RUN set -eu; \
+    if [ "$(cat /opt/cultivate-docker/selected)" != 1 ]; then \
+        rm -rf /etc/s6-overlay/s6-rc.d/worklink-execd \
+               /etc/s6-overlay/s6-rc.d/user/contents.d/worklink-execd; \
+    fi
 # Use the assembler from this image build context, not an older published wheel.
 # MIMIR_PLUGIN_SELECTION chooses enabled providers at build time; disabled pinned
 # distributions add no services unless MIMIR_PLUGIN_ALL_INSTALLED=1 is explicit.
+# A selected Cultivate is pinned to the version controller.sh just built.
 COPY mimir/ /opt/mimir-image-assembly/mimir/
-RUN /home/mimir/venv/bin/python -c 'import sys; sys.path.insert(0, "/opt/mimir-image-assembly"); from mimir.plugin_dockerfile import main; main()' \
-        --packages "$MIMIR_PLUGIN_PACKAGES" \
+RUN set -eu; \
+    packages="$MIMIR_PLUGIN_PACKAGES"; \
+    if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        version="$(/home/mimir/venv/bin/python -c 'import importlib.metadata as m; print(m.version("mimir-cultivate"))')"; \
+        packages="${packages:+$packages,}mimir-cultivate==$version"; \
+    fi; \
+    /home/mimir/venv/bin/python -c 'import sys; sys.path.insert(0, "/opt/mimir-image-assembly"); from mimir.plugin_dockerfile import main; main()' \
+        --packages "$packages" \
         --enable "$MIMIR_PLUGIN_SELECTION" \
         --all-installed "$MIMIR_PLUGIN_ALL_INSTALLED" \
         --destination /etc/s6-overlay/s6-rc.d \
         --scripts /usr/local/libexec/mimir-plugin-services \
     && rm -rf /opt/mimir-image-assembly
-RUN install -d -o root -g root -m 0755 /usr/local/libexec \
-    && printf '%s\n' '#!/bin/sh' 'exec /opt/mimir-worklink/venv/bin/python -m mimir.worklink.worker_exec "$@"' > /usr/local/libexec/worklink-execd \
-    && chmod 0755 /usr/local/libexec/worklink-execd \
-    && chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/watchdog/run /etc/s6-overlay/s6-rc.d/worklink-execd/run
+RUN if [ -d /etc/s6-overlay/s6-rc.d/worklink-execd ]; then \
+        sh /opt/cultivate-docker/service.sh; \
+    else \
+        chmod +x /etc/s6-overlay/s6-rc.d/mimir/run /etc/s6-overlay/s6-rc.d/watchdog/run; \
+    fi
 ENTRYPOINT ["/init"]

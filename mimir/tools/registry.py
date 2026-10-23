@@ -10,7 +10,6 @@ Tools ported:
                        set_poller_overrides, reload_pollers
   committools.py:     commitment_complete, commitment_snooze,
                        commitment_dismiss, commitment_list
-  spawn.py:           spawn_open_code
 
 Plus combined with extra_tools.py, memory_tool.py, store_tool.py, and the
 other split-out tool modules, this is mimir's agent-facing surface.
@@ -29,11 +28,9 @@ import logging
 import os
 import re
 import shlex
-import stat
 import subprocess
 import tempfile
 import time
-import uuid
 from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -60,7 +57,7 @@ from ..pollers import (
     PollerOverridesValidationError,
     validate_poller_overrides_text,
 )
-from ..models import AuthContext, Integrity, IntegrityEffect, RetainedFactoryScope, TurnInteractivity
+from ..models import AuthContext, Integrity, IntegrityEffect, TurnInteractivity
 from ..scheduler import SchedulerJob
 from ..plugins.core import scoped_policy_call, selected_policy_registry
 
@@ -2225,6 +2222,10 @@ _SPAWN_MAX_DEPTH_DEFAULT = 2
 # before checking against the depth cap.
 _SPAWN_DEPTH_ENV = "MIMIR_SPAWN_DEPTH"
 
+
+def _spawn_current_depth() -> int:
+    return _env_int_floor1(_SPAWN_DEPTH_ENV, 0) if os.environ.get(_SPAWN_DEPTH_ENV) else 0
+
 # Minimal-env allowlist for spawned CLI subprocesses (#494). The child
 # runs an independently-prompted agent with shell + web; handing it the
 # parent's full ``os.environ`` would expose every unrelated secret
@@ -2347,513 +2348,6 @@ async def _spawn_release_rate_slot(guard: _SpawnGuard, token: float | None) -> N
             pass
 
 
-def _confined_artifact_base(artifact_root: str, home: str | Path) -> Path:
-    """Resolve a model-supplied ``artifact_root``, confined to the agent home.
-
-    ``spawn_open_code`` persists run artifacts (prompt.md / stdout.txt /
-    stderr.txt / manifest.json) with raw filesystem writes that BYPASS the
-    file-tool WriteGuard, at a path the model chose. Confine them to the home
-    so a steered / prompt-injected call can't persist the task prompt and
-    subprocess output to an arbitrary (e.g. externally-synced or world-readable)
-    location outside the sandbox. ``resolve()`` collapses ``..`` and follows
-    symlinks, so a link that escapes the home is caught. Raises ``ValueError``
-    if the resolved root is not the home or under it.
-    """
-    base = Path(artifact_root).expanduser().resolve()
-    home_resolved = Path(home).expanduser().resolve()
-    if base != home_resolved and not base.is_relative_to(home_resolved):
-        raise ValueError(
-            "artifact_root must be within the agent home "
-            f"({home_resolved}); got {base}"
-        )
-    return base
-
-
-async def _spawn_open_code_impl(
-    prompt: str,
-    cwd: Optional[str] = None,
-    timeout_s: int = 1800,
-    name: Optional[str] = None,
-    model: Optional[str] = None,
-    agent: Optional[str] = None,
-    artifact_root: Optional[str] = None,
-    *,
-    contained_runner: Any,
-    checkout_factory: Any,
-    execution_identifier: str | None = None,
-) -> str:
-    import shlex
-
-    from ..contained_execution import (
-        SensitiveMaterialScrubber,
-        base_worker_environment,
-        opencode_worker_environment,
-    )
-    from ..contained_snapshot import (
-        SnapshotCredentialsRefused,
-        SnapshotEmbeddedRepository,
-        SnapshotSourceChanged,
-        SnapshotUnsafeEntry,
-    )
-    from ..event_logger import safe_log_event
-    from ..opencode_config import (
-        OpenCodeAuthError,
-        OpenCodeConfigError,
-        opencode_auth_path,
-        opencode_config_path,
-        opencode_worker_documents,
-        resolve_opencode_invocation,
-    )
-    from ..opencode_proposal import (
-        build_opencode_proposal,
-        classify_spawn_terminal_state,
-        cleanup_failure_event,
-        prompt_contains_sensitive_source_path,
-        resolve_artifact_handle,
-    )
-    from ..worklink.worker_client import WorkerProjection
-
-    cfg = _STATE["spawn_config"]
-    if cfg is None:
-        return "spawn_open_code failed: no spawn config"
-    if not prompt or not prompt.strip():
-        return "spawn_open_code failed: prompt is required"
-
-    guard = _spawn_guard_init()
-    current_depth = (
-        _env_int_floor1(_SPAWN_DEPTH_ENV, 0)
-        if os.environ.get(_SPAWN_DEPTH_ENV)
-        else 0
-    )
-    if current_depth >= guard.max_depth:
-        return (
-            "spawn_open_code refused: recursion depth cap reached "
-            f"({current_depth} >= MIMIR_SPAWN_MAX_DEPTH={guard.max_depth})."
-        )
-    rate_token, rate_err = await _spawn_acquire_rate_slot(guard, "spawn_open_code")
-    if rate_err is not None:
-        return rate_err
-
-    run_id = f"opencode-{uuid.uuid4().hex[:12]}"
-    default_cwd = Path(cfg.get("default_cwd") or os.environ.get("HOME", "."))
-    seed = Path(cwd).expanduser() if cwd else default_cwd
-    home = Path(os.environ.get("HOME", str(default_cwd))).expanduser()
-    config_path = opencode_config_path(override=cfg.get("opencode_config_path"))
-    auth_path = opencode_auth_path()
-    scrubber = SensitiveMaterialScrubber(
-        home=home,
-        checkout=seed,
-        artifact_root=artifact_root,
-        source_paths=(config_path, auth_path),
-    )
-    selected_artifact_root = Path(
-        artifact_root
-        or cfg.get("artifact_root")
-        or (home / ".factory" / "runs")
-    ).expanduser()
-    artifact_directory_fd = -1
-    try:
-        artifact_base = _confined_artifact_base(
-            str(selected_artifact_root), home
-        )
-        artifact_base.mkdir(mode=0o700, parents=True, exist_ok=True)
-        artifact_directory = resolve_artifact_handle(artifact_base, run_id)
-        artifact_directory.mkdir(mode=0o700, exist_ok=False)
-        for artifact_name in (
-            "prompt.md", "stdout.txt", "stderr.txt", "manifest.json"
-        ):
-            artifact_path = artifact_directory / artifact_name
-            artifact_path.write_bytes(b"")
-            artifact_path.chmod(0o600)
-        artifact_directory_fd = os.open(
-            artifact_directory,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
-    except (OSError, RuntimeError, ValueError):
-        if artifact_directory_fd >= 0:
-            os.close(artifact_directory_fd)
-        terminal = classify_spawn_terminal_state(artifact_available=False)
-        await safe_log_event(
-            terminal.event_type,
-            run_id=run_id,
-            status=terminal.status,
-            reason_code=terminal.reason_code,
-        )
-        await _spawn_release_rate_slot(guard, rate_token)
-        return json.dumps({
-            "run_id": run_id,
-            "status": terminal.status,
-            "reason_code": terminal.reason_code,
-            "exit_code": None,
-            "stdout": "",
-            "result": "",
-            "stderr": "Artifact storage unavailable",
-            "artifact_dir": None,
-            "name": name,
-            "proposal": None,
-        }, indent=2)
-
-    stdout = b""
-    stderr = b""
-    invocation = None
-    checkout = None
-    execution = None
-    terminal = None
-    seed_tree = None
-
-    try:
-        try:
-            invocation = resolve_opencode_invocation(
-                model, config_path=cfg.get("opencode_config_path")
-            )
-            documents = opencode_worker_documents(invocation)
-            scrubber = documents.scrubber
-            scrubber.add_path(seed)
-            scrubber.add_path(artifact_base)
-        except OpenCodeAuthError as exc:
-            terminal = classify_spawn_terminal_state(
-                authentication_reason=exc.reason_code
-            )
-        except OpenCodeConfigError as exc:
-            terminal = classify_spawn_terminal_state(
-                configuration_reason=exc.reason_code
-            )
-
-        if terminal is None and invocation is not None:
-            prompt_reason = prompt_contains_sensitive_source_path(
-                prompt,
-                agent_home=home,
-                source_paths=(invocation.config_path, invocation.auth_path),
-            )
-            if prompt_reason is not None:
-                terminal = classify_spawn_terminal_state(prompt_reason=prompt_reason)
-
-        if terminal is None and invocation is not None and agent:
-            agent_reason = prompt_contains_sensitive_source_path(
-                agent,
-                agent_home=home,
-                source_paths=(invocation.config_path, invocation.auth_path),
-            )
-            if agent_reason is not None:
-                terminal = classify_spawn_terminal_state(prompt_reason=agent_reason)
-
-        if terminal is None and invocation is not None:
-            try:
-                spawn_arguments = shlex.split(
-                    os.environ.get("MIMIR_OPENCODE_SPAWN_ARGS", "")
-                )
-                argv = ["opencode", "run", "--dir", ".", *spawn_arguments]
-                argv += ["-m", invocation.model]
-                if agent:
-                    argv += ["--agent", agent]
-                argv += ["--", prompt]
-                selectors = {
-                    "MIMIR_SPAWN_DEPTH": str(current_depth + 1),
-                    "OPENCODE_MODEL": invocation.model,
-                    "OPENCODE_PROVIDER": invocation.provider,
-                }
-                if agent:
-                    selectors["OPENCODE_AGENT"] = agent
-                worker_env = opencode_worker_environment(
-                    base_worker_environment(run_id), selectors
-                )
-            except ValueError:
-                terminal = classify_spawn_terminal_state(
-                    configuration_reason="config_provider_selection"
-                )
-
-        if terminal is None and invocation is not None:
-            sensitive_execution_value = any(
-                prompt_contains_sensitive_source_path(
-                    value,
-                    agent_home=home,
-                    source_paths=(invocation.config_path, invocation.auth_path),
-                ) is not None
-                for value in (*argv, *worker_env.values())
-            )
-            if sensitive_execution_value:
-                terminal = classify_spawn_terminal_state(
-                    configuration_reason="config_provider_selection"
-                )
-
-        if terminal is None and invocation is not None:
-            try:
-                checkout = checkout_factory(
-                    seed,
-                    default_cwd=default_cwd,
-                    known_sensitive=tuple(
-                        document
-                        for document in (
-                            documents.config_document,
-                            documents.auth_document,
-                        )
-                        if document is not None
-                    ),
-                )
-                seed_tree = checkout.base_tree
-            except SnapshotCredentialsRefused:
-                terminal = classify_spawn_terminal_state(
-                    provisioning_reason="seed_credentials"
-                )
-            except SnapshotEmbeddedRepository:
-                # Must precede SnapshotUnsafeEntry, which it subclasses. A seed
-                # tree with a nested checkout is an ordinary layout, not a
-                # hostile path, and the two want different reasons.
-                terminal = classify_spawn_terminal_state(
-                    provisioning_reason="embedded_seed_repository"
-                )
-            except SnapshotUnsafeEntry:
-                terminal = classify_spawn_terminal_state(
-                    provisioning_reason="unsafe_seed_entry"
-                )
-            except SnapshotSourceChanged:
-                terminal = classify_spawn_terminal_state(
-                    provisioning_reason="seed_changed"
-                )
-            except ValueError:
-                terminal = classify_spawn_terminal_state(
-                    provisioning_reason="invalid_seed"
-                )
-            except (OSError, RuntimeError):
-                terminal = classify_spawn_terminal_state(
-                    provisioning_reason="provisioning_unavailable"
-                )
-
-        if terminal is None and invocation is not None and checkout is not None:
-            projections = [
-                WorkerProjection(
-                    path=".config/opencode/opencode.json",
-                    document=documents.config_document,
-                )
-            ]
-            if documents.auth_document is not None:
-                projections.append(WorkerProjection(
-                    path=".local/share/opencode/auth.json",
-                    document=documents.auth_document,
-                ))
-            assert guard.sem is not None
-            try:
-                async with guard.sem:
-                    execution = await contained_runner(
-                        argv,
-                        checkout.capability,
-                        worker_env,
-                        tuple(projections),
-                        identifier=execution_identifier or run_id,
-                        timeout_s=timeout_s,
-                        stdout_limit=1024 * 1024,
-                        stderr_limit=1024 * 1024,
-                        scrubber=scrubber,
-                    )
-                stdout = execution.stdout
-                stderr = execution.stderr
-            except (OSError, RuntimeError, ValueError):
-                terminal = classify_spawn_terminal_state(
-                    containment_available=False
-                )
-
-        if terminal is None and execution is not None and checkout is not None:
-            proposal_result = None
-            if (
-                execution.exit_code == 0
-                and not execution.timed_out
-                and not execution.output_overflow
-            ):
-                proposal_result = build_opencode_proposal(
-                    checkout.path, scrubber=scrubber, base_tree=seed_tree
-                )
-            auth_required = False
-            if execution.exit_code not in (None, 0):
-                blob = scrubber.scrub_text(stderr + b"\n" + stdout).lower()
-                auth_required = any(marker in blob for marker in (
-                    "unauthorized", "not logged in", "credential", "auth", "401"
-                ))
-            terminal = classify_spawn_terminal_state(
-                timed_out=execution.timed_out,
-                output_overflow=execution.output_overflow,
-                exit_code=execution.exit_code,
-                worker_authentication_required=auth_required,
-                proposal_result=proposal_result,
-            )
-    except BaseException:
-        os.close(artifact_directory_fd)
-        artifact_directory_fd = -1
-        if execution is None:
-            await _spawn_release_rate_slot(guard, rate_token)
-        raise
-    finally:
-        if checkout is not None:
-            try:
-                checkout.close()
-            except (OSError, RuntimeError):
-                event = cleanup_failure_event(run_id)
-                await safe_log_event(
-                    event["type"],
-                    run_id=event["run_id"],
-                    reason_code=event["reason_code"],
-                )
-                log.warning("spawn_open_code cleanup failed")
-
-    assert terminal is not None
-    if execution is None:
-        await _spawn_release_rate_slot(guard, rate_token)
-    manifest = {
-        "schema_version": 2,
-        "run_id": run_id,
-        "launcher": "mimir.spawn_open_code",
-        "name": scrubber.scrub_text(name) if name is not None else None,
-        "model": (
-            scrubber.scrub_text(invocation.model)
-            if invocation is not None
-            else None
-        ),
-        "agent": scrubber.scrub_text(agent) if agent is not None else None,
-        "status": terminal.status,
-        "reason_code": terminal.reason_code,
-        "exit_code": terminal.exit_code,
-        "seed_tree": seed_tree,
-        "timed_out": bool(execution and execution.timed_out),
-        "output_overflow": bool(execution and execution.output_overflow),
-        "stdout_dropped_bytes": execution.stdout_dropped_bytes if execution else 0,
-        "stderr_dropped_bytes": execution.stderr_dropped_bytes if execution else 0,
-    }
-    artifact_handle = run_id
-    try:
-        directory_state = os.stat(artifact_directory, follow_symlinks=False)
-        anchored_state = os.fstat(artifact_directory_fd)
-        if (
-            not stat.S_ISDIR(directory_state.st_mode)
-            or not os.path.samestat(directory_state, anchored_state)
-        ):
-            raise OSError("artifact directory identity changed")
-
-        def write_existing_artifact(name: str, document: bytes) -> None:
-            descriptor = os.open(
-                name,
-                os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
-                dir_fd=artifact_directory_fd,
-            )
-            try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    raise OSError("artifact is not a regular file")
-                with os.fdopen(descriptor, "wb", closefd=False) as destination:
-                    destination.write(document)
-            finally:
-                os.close(descriptor)
-
-        write_existing_artifact(
-            "prompt.md", scrubber.scrub_text(prompt).encode("utf-8")
-        )
-        write_existing_artifact(
-            "stdout.txt", scrubber.scrub_text(stdout).encode("utf-8")
-        )
-        write_existing_artifact(
-            "stderr.txt", scrubber.scrub_text(stderr).encode("utf-8")
-        )
-        scrubbed_manifest = json.loads(
-            scrubber.scrub_text(json.dumps(manifest, ensure_ascii=False))
-        )
-        manifest_document = (
-            json.dumps(scrubbed_manifest, ensure_ascii=True, sort_keys=True) + "\n"
-        ).encode("utf-8")
-        write_existing_artifact("manifest.json", manifest_document)
-        if terminal.proposal is not None:
-            proposal_document = (
-                json.dumps(
-                    terminal.proposal.as_dict(), ensure_ascii=True, sort_keys=True
-                ) + "\n"
-            ).encode("utf-8")
-            proposal_descriptor = os.open(
-                ".proposal.json.tmp",
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=artifact_directory_fd,
-            )
-            try:
-                with os.fdopen(
-                    proposal_descriptor, "wb", closefd=False
-                ) as destination:
-                    destination.write(proposal_document)
-            finally:
-                os.close(proposal_descriptor)
-            os.replace(
-                ".proposal.json.tmp",
-                "proposal.json",
-                src_dir_fd=artifact_directory_fd,
-                dst_dir_fd=artifact_directory_fd,
-            )
-    except (OSError, RuntimeError, ValueError):
-        log.warning("spawn_open_code artifact write failed")
-        for failed_proposal_name in ("proposal.json", ".proposal.json.tmp"):
-            try:
-                os.unlink(failed_proposal_name, dir_fd=artifact_directory_fd)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
-        terminal = classify_spawn_terminal_state(artifact_available=False)
-        artifact_handle = None
-    finally:
-        os.close(artifact_directory_fd)
-
-    await safe_log_event(
-        terminal.event_type,
-        run_id=run_id,
-        status=terminal.status,
-        reason_code=terminal.reason_code,
-    )
-    safe_stdout = scrubber.scrub_text(stdout).strip()[:2000]
-    safe_stderr = scrubber.scrub_text(stderr).strip()[:500]
-    if terminal.status == "configuration_refused":
-        safe_stderr = "OpenCode configuration unavailable"
-    elif terminal.status == "authentication_refused":
-        safe_stderr = "OpenCode authentication unavailable"
-    elif terminal.status == "prompt_refused":
-        safe_stderr = "Prompt contains a sensitive controller path"
-    elif terminal.status == "containment_unavailable":
-        safe_stderr = "Contained execution unavailable"
-    return json.dumps({
-        "run_id": run_id,
-        "status": terminal.status,
-        "reason_code": terminal.reason_code,
-        "exit_code": terminal.exit_code,
-        "stdout": safe_stdout,
-        "result": safe_stdout,
-        "stderr": safe_stderr,
-        "artifact_dir": artifact_handle,
-        "name": name,
-        "proposal": terminal.proposal.as_dict() if terminal.proposal else None,
-    }, indent=2)
-
-
-@tool
-async def spawn_open_code(
-    prompt: str,
-    cwd: Optional[str] = None,
-    timeout_s: int = 1800,
-    name: Optional[str] = None,
-    model: Optional[str] = None,
-    agent: Optional[str] = None,
-    artifact_root: Optional[str] = None,
-) -> str:
-    """Run OpenCode in a fresh contained checkout and return a bounded proposal."""
-    from ..contained_checkout import create_opencode_checkout
-    from ..contained_execution import execute_contained
-
-    return await _spawn_open_code_impl(
-        prompt,
-        cwd,
-        timeout_s,
-        name,
-        model,
-        agent,
-        artifact_root,
-        contained_runner=execute_contained,
-        checkout_factory=create_opencode_checkout,
-        execution_identifier=str(uuid.uuid4()),
-    )
-
-
 # ────────────────────────────────────────────────────────────────────
 # Pending mimir-package update (mimir/update_on_start.py)
 # ────────────────────────────────────────────────────────────────────
@@ -2903,7 +2397,9 @@ async def request_mimir_update(
     """
     from packaging.version import InvalidVersion, Version
     from .. import __version__, approval_requests
-    from ..update_on_start import parse_target_version, write_flag
+    from ..update_on_start import (
+        cultivate_source_install, cultivate_source_refusal, parse_target_version, write_flag,
+    )
 
     home_env = os.environ.get("MIMIR_HOME")
     if not home_env:
@@ -2919,6 +2415,11 @@ async def request_mimir_update(
         return f"request_mimir_update refused: invalid PEP 440 target version {cleaned_target!r}"
     if target is not None and target < Version(__version__):
         return f"request_mimir_update refused: {cleaned_target} is older than running version {__version__}"
+    source = cultivate_source_install()
+    if source is not None:
+        # Startup would refuse this install anyway; don't ask the operator to
+        # approve an update that cannot apply.
+        return f"request_mimir_update refused: {cultivate_source_refusal(source)}. Tell the operator."
     dispatcher = _STATE.get("dispatcher")
     channel = (getattr(getattr(dispatcher, "_config", None), "operator_alert_channel", "") or "").strip()
     if not channel:
@@ -2960,259 +2461,14 @@ async def request_mimir_update(
 # Convenience: assemble all tools for the deepagent factory
 # ────────────────────────────────────────────────────────────────────
 
-@tool
-async def worklink_run(
-    issue_id: int,
-    backend: Optional[str] = None,
-    config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
-) -> str:
-    """Dispatch a Worklink job for a ready Chainlink leaf issue, from this turn.
-
-    Claims the issue, runs the configured coding backend in an isolated git
-    worktree, validates observed evidence (diff + tests), and transitions the
-    issue label — all via the deterministic core executor (the same path as
-    ``mimir worklink run``; this tool never re-implements claim/evidence).
-
-    Autonomous-dispatch guards apply here but NOT to the operator CLI:
-      * Sheds under resource pressure — if the HomeostaticArbiter says the
-        worklink priority can't fire (e.g. severity TIGHT), the dispatch is
-         refused and you should try later. Ask the operator to run the CLI
-         if manual dispatch is needed.
-       * Respects the concurrent-claim cap (``defaults.max_concurrent`` in
-         worklink.yaml, default 2) across all in-flight Worklink workers.
-      * Refuses fresh work while an unresolved incident or retained run exists.
-        Inspect the retained state and escalate when no authorized recovery is
-        available; do not use this fresh-run tool as incident recovery.
-
-    Note: a leaf run is synchronous and can take minutes — pick small,
-    well-scoped ready leaves. Per-issue exclusivity is guaranteed by the
-    Chainlink lock, so this never collides with another worker on the same issue.
-
-    Args:
-        issue_id: Chainlink issue id — must be a worklink-ready leaf.
-        backend: Optional backend-name override (else worklink.yaml routing).
-    """
-    home_env = os.environ.get("MIMIR_HOME")
-    if not home_env:
-        raise ToolException("worklink_run failed: MIMIR_HOME not set")
-    home = Path(home_env)
-
-    from ..worklink.autonomy import check_concurrency, worklink_priority, worklink_repo
-
-    # Honor the documented WORKLINK_REPO (MIMIR_WORKLINK_REPO compat); never
-    # silently run the executor against the server process cwd.
-    try:
-        repo = Path(worklink_repo())
-    except Exception as exc:
-        raise ToolException(f"worklink_run failed: {exc}") from exc
-
-    # 1) Arbiter gate: shed autonomous dispatch under pressure. ``should_fire``
-    #    may scan turns.jsonl, so keep it off the event loop. The CLI path never
-    #    injects an arbiter, so it bypasses this.
-    arbiter = _STATE.get("arbiter")
-    if arbiter is not None:
-        try:
-            priority = worklink_priority(home)
-        except Exception:
-            priority = "normal"
-        try:
-            loop = asyncio.get_running_loop()
-            decision = await asyncio.to_thread(
-                arbiter.should_fire,
-                priority=priority,
-                event_loop=loop,
-            )
-        except Exception as exc:  # never let arbiter errors block dispatch silently
-            log.warning("worklink_run arbiter check failed: %s", exc)
-            decision = None
-        if decision is not None and not decision.fire:
-            raise ToolException(
-                f"worklink_run shed: resource pressure {decision.severity.name} "
-                f"(priority={decision.priority}) — {decision.reason}. "
-                "Try again later, or ask the operator to run `mimir worklink run`."
-            )
-
-    # 2) Concurrency cap (chainlink query): bound total in-flight workers.
-    try:
-        cc = check_concurrency(home)
-    except Exception as exc:
-        raise ToolException(f"worklink_run failed: concurrency check error: {exc}") from exc
-    if not cc.allowed:
-        raise ToolException(f"worklink_run skipped: {cc.reason} — try again when a slot frees.")
-
-    # 3) Dispatch via the deterministic core executor. ``run_worklink`` is
-    #    synchronous (and opens its own event loop), so run it off the agent's
-    #    loop in a worker thread.
-    from ..worklink.orchestrator import run_worklink
-
-    try:
-        result = await asyncio.to_thread(
-            run_worklink,
-            home=home,
-            repo=repo,
-            issue_id=int(issue_id),
-            backend=backend,
-            autonomous=True,  # in-turn dispatch is autonomous → policy-gated (#460)
-        )
-    except Exception as exc:
-        raise ToolException(f"worklink_run failed: {exc}") from exc
-
-    parts = [f"worklink_run #{result.issue_id}: {result.status}"]
-    if result.attempt is not None:
-        parts.append(f"attempt={result.attempt}")
-    if result.review_ready:
-        parts.append("review-ready")
-    if result.pr_url:
-        parts.append(f"PR {result.pr_url}")
-    if result.evidence_path:
-        parts.append(f"evidence={result.evidence_path}")
-    if result.reason:
-        parts.append(f"reason={result.reason}")
-    content = " ".join(parts)
-    if result.status in {"blocked", "failed"}:
-        raise ToolException(content)
-    return content
-
-
-worklink_run.handle_tool_error = True
-
-
-@tool
-async def worklink_resume(
-    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
-) -> str:
-    """Dispatch exact recovery of the factory run bound to this incident turn.
-
-    This tool takes no run identity arguments. It uses only the server-derived
-    retained factory scope and returns promptly after launching a detached child.
-    Leaf incidents cannot be resumed; diagnose them and notify the operator.
-    """
-    context = getattr(runtime, "context", None)
-    scope = getattr(context, "retained_factory_scope", None)
-    if not isinstance(scope, RetainedFactoryScope):
-        reason = getattr(context, "retained_factory_scope_refusal", None)
-        return (
-            "worklink_resume refused: "
-            f"{reason or 'this turn has no exact retained factory incident'}; "
-            "leaf incidents must be diagnosed and reported to the operator"
-        )
-    home_value = os.environ.get("MIMIR_HOME", "").strip()
-    if not home_value:
-        return "worklink_resume refused: MIMIR_HOME not set"
-    home = Path(home_value)
-
-    from ..worklink.autonomy import (
-        factory_max_concurrent, make_claims, worklink_priority, worklink_repo,
-    )
-    from ..worklink.claims import WORKLINK_EPIC_LABEL
-    from ..worklink.detached_dispatch import (
-        FactoryRecoveryIdentity, launch_detached_worklink,
-    )
-    from ..worklink.dispatch_failures import current_failure_record, dispatch_failure_state_dir
-    from ..worklink.factory_state import (
-        factory_process_is_alive, factory_process_is_verified_dead,
-        load_factory_records_for_issue,
-    )
-
-    try:
-        repo = Path(worklink_repo())
-    except Exception as exc:
-        return f"worklink_resume refused: {exc}"
-
-    arbiter = _STATE.get("arbiter")
-    if arbiter is not None:
-        try:
-            priority = worklink_priority(home)
-        except Exception:
-            priority = "normal"
-        try:
-            loop = asyncio.get_running_loop()
-            decision = await asyncio.to_thread(
-                arbiter.should_fire, priority=priority, event_loop=loop,
-            )
-        except Exception as exc:
-            log.warning("worklink_resume arbiter check failed: %s", exc)
-            decision = None
-        if decision is not None and not decision.fire:
-            return f"worklink_resume shed: resource pressure {decision.severity.name}: {decision.reason}"
-
-    try:
-        incident = current_failure_record(dispatch_failure_state_dir(home), scope.issue_id)
-        records = load_factory_records_for_issue(home, scope.issue_id)
-        if incident is None or (
-            incident["signature"] != scope.signature
-            or incident["occurrence_id"] != scope.occurrence_id
-        ):
-            return "worklink_resume refused: incident occurrence is not current"
-        if not records:
-            return "worklink_resume refused: retained factory record is missing"
-        if len(records) != 1:
-            return "worklink_resume refused: retained factory record is ambiguous"
-        record = records[0]
-        if (
-            record.run_id != scope.run_id
-            or record.attempt != scope.attempt
-            or record.session != scope.session
-            or record.repository != scope.repository
-            or record.branch != scope.branch
-            or record.sandbox != scope.sandbox
-            or incident.get("run_id") != scope.run_id
-            or incident.get("attempt") != scope.attempt
-            or incident.get("work_path") != scope.sandbox
-        ):
-            return "worklink_resume refused: retained factory target was replaced"
-        if record.status is None or record.status.status != "needs-human":
-            return "worklink_resume refused: retained factory run is not needs-human"
-        if factory_process_is_alive(record):
-            return "worklink_resume refused: retained factory process is alive"
-        if not factory_process_is_verified_dead(record):
-            return "worklink_resume refused: retained factory process death cannot be verified"
-        claims = make_claims(home)
-        active_ids = claims._active_worklink_lock_ids_for_scope(label=WORKLINK_EPIC_LABEL)
-        if scope.issue_id in active_ids:
-            return "worklink_resume refused: another run for this issue is live"
-        cap = factory_max_concurrent()
-        if len(active_ids) >= cap:
-            return f"worklink_resume refused: factory concurrency cap reached ({len(active_ids)}/{cap})"
-    except Exception as exc:
-        return f"worklink_resume refused: recovery preflight failed: {exc}"
-
-    state_dir = dispatch_failure_state_dir(home)
-    try:
-        launched = launch_detached_worklink(
-            command="run-epic",
-            issue_id=scope.issue_id,
-            home=home,
-            repo=repo,
-            state_dir=state_dir,
-            run_bin=shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir"),
-            recovery=FactoryRecoveryIdentity(
-                signature=scope.signature,
-                occurrence_id=scope.occurrence_id,
-                run_id=scope.run_id,
-                attempt=scope.attempt,
-                session=scope.session,
-            ),
-            env_overrides={"STATE_DIR": str(state_dir)},
-        )
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
-        return f"worklink_resume failed: detached recovery dispatch failed: {exc}"
-    return (
-        f"worklink_resume: recovery dispatched run_id={scope.run_id} "
-        f"retained_attempt={scope.attempt} pid={launched.pid} log={launched.log_path}. "
-        "The child may still refuse under the claim; only a successful child claim "
-        "consumes a new Chainlink claim attempt."
-    )
-
-
 @scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def all_mimir_tools(
     model_spec: str | None = None,
     *,
-    coding_enabled: bool = False,
-    require_coding_available: bool = True,
+    require_provider_available: bool = True,
     policy: "PolicyRegistry | None" = None,
     materialize_plugins: bool = True,
+    unready_plugin_owners: frozenset[str] = frozenset(),
 ) -> list:
     """Return the full mimir tool surface for create_deep_agent.
 
@@ -3224,11 +2480,9 @@ def all_mimir_tools(
     surface before the agent is constructed. Runtime callers may omit it and
     use ``MIMIR_MODEL_SPEC`` as before.
 
-    ``coding_enabled`` is the operator's explicit opt-in to the coding-assistant
-    surface. Runtime assembly validates all local coding prerequisites before
-    identity degradation can hide registration. Declarative inventory
-    checks may pass ``require_coding_available=False`` to enumerate the enabled
-    surface without probing ambient CLI availability.
+    Selected-owner assembly validates local prerequisites before identity
+    degradation can hide registration. Declarative inventory checks may pass
+    ``require_provider_available=False`` without probing ambient CLI availability.
 
     Web tools (Tavily ``web_search`` + ``fetch_url``) are appended
     only when the active LLM provider is not ``claude_code`` — Claude
@@ -3241,9 +2495,13 @@ def all_mimir_tools(
     registry = policy if policy is not None else selected_policy_registry()
     if not registry.frozen:
         raise ValueError("tool assembly requires a frozen policy")
+    unavailable_owners = set(unready_plugin_owners)
 
     def materialize(surface: str) -> list:
-        return [registry.tools[name].factory() for name in core_runtime_names(surface)]
+        return [declared.factory() for name in core_runtime_names(surface)
+                if (declared := registry.tools.get(name)) is not None
+                and declared.owner not in unavailable_owners
+                and (materialize_plugins or declared.owner == "core")]
 
     tools = materialize("default")
     web_search_on, fetch_url_on = web_tools_enabled(model_spec)
@@ -3252,15 +2510,13 @@ def all_mimir_tools(
             tools.extend(materialize("web_search"))
         if fetch_url_on:
             tools.extend(materialize("fetch_url"))
-    if coding_enabled:
-        if require_coding_available:
-            from ..providers import opencode_available
+    selected_owner = getattr(registry.policy_consumer_hooks, "owner", None)
+    if selected_owner is not None:
+        if require_provider_available:
             missing = []
-            if not opencode_available():
-                missing.append(
-                    "the opencode CLI is not "
-                    "installed or is not on PATH"
-                )
+            for (owner, stage), hook in registry.turn_hooks.items():
+                if owner == selected_owner and stage == "startup_prerequisites" and owner not in unavailable_owners:
+                    missing.extend(hook())
             git = Path("/usr/bin/git")
             if not git.is_file() or not os.access(git, os.X_OK):
                 missing.append(
@@ -3288,15 +2544,16 @@ def all_mimir_tools(
                     )
             if missing:
                 raise RuntimeError(
-                    "MIMIR_CODING_ENABLED is true, but coding prerequisites are missing:\n- "
+                    "selected coding plugin prerequisites are missing:\n- "
                     + "\n- ".join(missing)
                 )
-        from .forge import github_identity_is_degraded
-        coding_enabled = not github_identity_is_degraded()
-    if coding_enabled:
-        tools.extend(materialize("coding"))
+    for (owner, stage), hook in registry.turn_hooks.items():
+        if owner != "core" and stage == "tool_readiness" and hook() is False:
+            unavailable_owners.add(owner)
+    existing = {tool.name for tool in tools}
     for declared in registry.tools.values() if materialize_plugins else ():
-        if declared.owner == "core" or declared.factory is None:
+        if (declared.owner == "core" or declared.factory is None
+                or declared.owner in unavailable_owners or declared.name in existing):
             continue
         tool = declared.factory()
         if getattr(tool, "name", None) != declared.name:
@@ -3305,6 +2562,7 @@ def all_mimir_tools(
                 f"{getattr(tool, 'name', None)!r}"
             )
         tools.append(tool)
+        existing.add(tool.name)
     # MCP-bridged tools (populated by server.py:_on_startup after the
     # MCP servers come up; empty when MCP is unconfigured).
     from .mcp import get_mcp_tools

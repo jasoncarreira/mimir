@@ -30,7 +30,6 @@ import { OpsRoute, UsageRoute } from "./routes/OpsRoute";
 import { SchedulerRoute } from "./routes/SchedulerRoute";
 import { StateMemoryRoute } from "./routes/StateMemoryRoute";
 import { TurnsRoute } from "./routes/TurnsRoute";
-import { FactoryRunsRoute } from "./routes/FactoryRunsRoute";
 import { scrubSecretQueryParams, useRouteState } from "./routeState";
 import { SkinProvider, useSkin } from "./skins/SkinProvider";
 import type { AgentCharacterState, SkinId } from "./skins/types";
@@ -652,20 +651,25 @@ interface ShellProps {
 }
 
 // Routed surfaces — identical across shells; only the surrounding chrome differs.
-function DashboardRouteElement({ surface, plugins }: { surface: DashboardSurface; plugins: LoadedPlugins }) {
+function DashboardRouteElement({ surface, plugins, cultivateSelected }: {
+  surface: DashboardSurface;
+  plugins: LoadedPlugins;
+  cultivateSelected: boolean;
+}) {
   const PluginPage = plugins.routes.find((route) => route.id === surface.id && route.path === surface.path)?.component;
+  const CultivatePullRequests = cultivateSelected
+    ? (window as Window & { mimirCultivate?: { PullRequests: React.ComponentType } }).mimirCultivate?.PullRequests
+    : undefined;
   const content = PluginPage ? <PluginPage /> : surface.id === "saga"
     ? <SagaDashboard />
     : surface.id === "usage"
       ? <UsageRoute />
       : surface.id === "ops"
-        ? <OpsRoute />
+        ? <OpsRoute PullRequests={CultivatePullRequests} />
         : surface.id === "chainlink-board"
           ? <ChainlinkBoardRoute />
-          : surface.id === "factory-runs"
-            ? <FactoryRunsRoute surface={surface} />
-            : surface.id === "turns"
-              ? <TurnsRoute />
+          : surface.id === "turns"
+            ? <TurnsRoute />
               : surface.id === "admin-config"
                 ? <AdminRoute />
                 : surface.id === "scheduler"
@@ -686,6 +690,8 @@ function DashboardRoutes({ surfaces, firstRoute, plugins, pendingSurfaces }: {
   plugins: LoadedPlugins;
   pendingSurfaces: DashboardSurface[];
 }) {
+  const cultivateSelected = surfaces.some((surface) => surface.id === "cultivate-factory-runs" && surface.path === "/cultivate/factory-runs") &&
+    plugins.routes.some((route) => route.plugin === "cultivate" && route.id === "cultivate-factory-runs" && route.path === "/cultivate/factory-runs");
   return (
     <Routes>
       <Route element={<Navigate replace to={firstRoute} />} path="/" />
@@ -700,7 +706,7 @@ function DashboardRoutes({ surfaces, firstRoute, plugins, pendingSurfaces }: {
       <Route element={<Navigate replace to="/admin?tab=mcp" />} path="/admin/mcp" />
       {surfaces.map((surface) => (
         <Route
-          element={<DashboardRouteElement surface={surface} plugins={plugins} />}
+          element={<DashboardRouteElement surface={surface} plugins={plugins} cultivateSelected={cultivateSelected} />}
           key={surface.id}
           path={surface.path}
         />
@@ -857,8 +863,8 @@ function AppFrameContent() {
   const surfaces = React.useMemo(
     () => (bootstrap
       ? visibleSurfaces(getDashboardSurfaces((bootstrap.dashboard_extensions ?? []).filter((manifest) =>
-          !manifest.bundle || (plugins.routes.some((route) => route.id === manifest.id && route.path === manifest.route_path) &&
-            plugins.navEntries.some((entry) => entry.id === manifest.id))
+          manifest.id !== "factory-runs" && (!manifest.bundle || (plugins.routes.some((route) => route.id === manifest.id && route.path === manifest.route_path) &&
+            plugins.navEntries.some((entry) => entry.id === manifest.id)))
         )).map((surface) => {
           const entry = plugins.navEntries.find((nav) => nav.id === surface.id);
           return entry ? { ...surface, label: entry.label, detail: entry.detail ?? surface.detail } : surface;

@@ -175,7 +175,7 @@ async def test_prompt_assembles_commitments_off_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_assemble_self_state_block", lambda *args, **kwargs: None)
     monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *args: None)
     monkeypatch.setattr("mimir.core_blocks.load_channel_memory", lambda *args: None)
-    monkeypatch.setattr("mimir.skill_resolver.find_skill_for_channel", lambda *args: None)
+    monkeypatch.setattr("mimir.skill_resolver.find_skill_for_channel", lambda *args, **kwargs: None)
     entered = threading.Event()
     release = threading.Event()
     loop_thread = threading.get_ident()

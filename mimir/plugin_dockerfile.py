@@ -13,6 +13,36 @@ from packaging.utils import canonicalize_name
 from .plugins.discovery import PluginCandidate, PluginDiscoveryError, discover_plugins
 
 
+_CULTIVATE_PACKAGE = "mimir-cultivate"
+_CULTIVATE_SCRIPTS = ("base.sh", "users.sh", "executor.sh", "controller.sh", "bootstrap.sh", "service.sh")
+
+
+def has_trusted_cultivate(candidates: tuple[PluginCandidate, ...]) -> bool:
+    """The privileged image slot belongs to the first-party distribution only."""
+    return any(c.name == "cultivate" and canonicalize_name(c.distribution) == _CULTIVATE_PACKAGE
+               for c in candidates)
+
+
+def cultivate_scripts(candidate: PluginCandidate) -> dict[str, str]:
+    """Read only inventoried resources from the selected first-party distribution."""
+    if not has_trusted_cultivate((candidate,)):
+        raise ValueError("trusted Docker scripts require the Cultivate distribution")
+    dist = candidate.entry_point.dist
+    if dist is None or dist.files is None:
+        raise ValueError("Cultivate Docker resource inventory is missing")
+    inventory = {str(path): path for path in dist.files}
+    scripts = {}
+    for name in _CULTIVATE_SCRIPTS:
+        relative = f"mimir_cultivate/docker/{name}"
+        if relative not in inventory:
+            raise ValueError(f"Cultivate Docker resource is missing: {relative}")
+        path = Path(dist.locate_file(inventory[relative]))
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"Cultivate Docker resource is not a regular file: {relative}")
+        scripts[name] = path.read_text(encoding="utf-8")
+    return scripts
+
+
 @dataclass(frozen=True)
 class Service:
     plugin: str

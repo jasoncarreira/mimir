@@ -74,6 +74,11 @@ from .feedback import FeedbackLog
 from . import health
 from . import mid_turn_injection
 from . import _deepagents_patches
+from .skill_visibility import (
+    SeedFilteredSkillsMiddleware,
+    hidden_home_skill_dirs,
+    visible_skill_names,
+)
 from .history import Message, MessageBuffer
 from .harness_egress import harness_sink_allowed
 from .index import IndexGenerator
@@ -100,7 +105,6 @@ from .models import (
     PromptBlock,
     OwnerAttestation,
     SourceLabel,
-    ServerDiscoveredPRScopeStore,
     TurnInteractivity,
     TurnContext,
     TurnRecord,
@@ -194,6 +198,8 @@ def _render_plugin_prompt(provider: Any, auth: AuthContext, event: AgentEvent,
         served.append(resource)
         return text
 
+    reader.home = home  # type: ignore[attr-defined]  # Configured by the host, never by the provider.
+
     if provider.static:
         with _STATIC_PROMPT_LOCK:
             cached = _STATIC_PROMPT_BLOCKS.get(id(provider))
@@ -238,11 +244,16 @@ def _report_plugin_prompt(kind: str, name: str) -> None:
         log.debug("plugin prompt telemetry unavailable", exc_info=True)
 
 
-def maybe_create_worklink_budget_continuation(**kwargs):
-    """Defer Worklink recovery until a turn actually exhausts its budget."""
-    from .worklink.continuation import maybe_create_worklink_budget_continuation as create
+def _selected_turn_hooks(policy: Any, name: str) -> tuple[Callable[..., Any], ...]:
+    """Use only callbacks published by the selected, frozen policy."""
+    return tuple(callback for (_owner, stage), callback in policy.turn_hooks.items()
+                 if stage == name)
 
-    return create(**kwargs)
+
+def _unready_tool_owners(policy: Any) -> frozenset[str]:
+    owners = {tool.owner for tool in policy.tools.values() if tool.owner != "core"}
+    return frozenset(owner for (owner, stage), hook in policy.turn_hooks.items()
+                     if stage == "tool_readiness" and owner in owners and hook() is False)
 
 
 def _transient_provider_failure(exc: BaseException) -> tuple[str | None, float | None]:
@@ -677,7 +688,7 @@ def _create_turn_auth_context(
     ifc_labels: InformationFlowLabels,
     audience_provider: Any = None,
     cross_platform_pull: bool = True,
-    server_discovered_pr_scope_store: ServerDiscoveredPRScopeStore | None = None,
+    server_discovered_pr_scope_store: Any = None,
     policy: Any = None,
 ) -> AuthContext:
     inherited = _shell_continuation_auth_context(event)
@@ -1423,7 +1434,11 @@ class Agent:
         self._sessions = session_manager
         # Only bounded human acknowledgements persist, never turn IFC labels.
         self._chat_ingest_acknowledgements: dict[tuple[str, str], IngestAcknowledgement] = {}
-        self._server_discovered_pr_scope_store = ServerDiscoveredPRScopeStore()
+        self._server_discovered_pr_scope_store = None
+        for protocol in selected_policy_registry().scoped_actions.values():
+            constructors = getattr(protocol, "trusted_scope", None)
+            if constructors is not None:
+                self._server_discovered_pr_scope_store = constructors.store()
         self._scheduler = scheduler
         self._channels = channel_registry
         self._dispatcher = dispatcher
@@ -1581,10 +1596,11 @@ class Agent:
         self._agent_model: Any | None = None
         self._agent_tools: list[Any] | None = None
         self._agent_middleware: tuple[Any, ...] | None = None
+        self._agent_skills_middleware: Any | None = None
         self._cached_skill_catalog_fingerprint: str | None = None
         self._skill_fingerprint_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._skill_fingerprint_cache: tuple[tuple, str] | None = None
-        self._cached_coding_enabled: bool | None = None
+        self._cached_unready_tool_owners: frozenset[str] = frozenset()
 
         # Memory-tool dep injection — only used if saga_client is a
         # SagaStore (post-saga cutover). Wires up the @tool's
@@ -1849,11 +1865,7 @@ class Agent:
         )
         skill_sources = self._current_skill_sources()
         skill_catalog_fingerprint = await self._skill_catalog_fingerprint(skill_sources)
-        coding_enabled = self._config.coding_enabled
-        if coding_enabled:
-            from .tools.forge import github_identity_is_degraded
-
-            coding_enabled = not github_identity_is_degraded()
+        unready_tool_owners = _unready_tool_owners(self._config.plugin_manager.policy)
         if self._agent is not None and self._cached_system_prompt is None:
             # Unit tests inject a fake graph directly to avoid constructing
             # deepagents. Production-built graphs always set
@@ -1864,7 +1876,7 @@ class Agent:
             self._agent is not None
             and system_prompt == self._cached_system_prompt
             and skill_catalog_fingerprint == self._cached_skill_catalog_fingerprint
-            and coding_enabled == self._cached_coding_enabled
+            and unready_tool_owners == self._cached_unready_tool_owners
         ):
             return self._agent
 
@@ -1879,16 +1891,12 @@ class Agent:
             )
             skill_sources = self._current_skill_sources()
             skill_catalog_fingerprint = await self._skill_catalog_fingerprint(skill_sources)
-            coding_enabled = self._config.coding_enabled
-            if coding_enabled:
-                from .tools.forge import github_identity_is_degraded
-
-                coding_enabled = not github_identity_is_degraded()
+            unready_tool_owners = _unready_tool_owners(self._config.plugin_manager.policy)
             if (
                 self._agent is not None
                 and system_prompt == self._cached_system_prompt
                 and skill_catalog_fingerprint == self._cached_skill_catalog_fingerprint
-                and coding_enabled == self._cached_coding_enabled
+                and unready_tool_owners == self._cached_unready_tool_owners
             ):
                 return self._agent
 
@@ -1904,7 +1912,7 @@ class Agent:
                     and system_prompt == self._cached_system_prompt
                     and skill_catalog_fingerprint
                     == self._cached_skill_catalog_fingerprint
-                    and coding_enabled == self._cached_coding_enabled
+                    and unready_tool_owners == self._cached_unready_tool_owners
                 ):
                     return self._agent
 
@@ -1940,10 +1948,11 @@ class Agent:
                 candidate = Path(lease_root)
                 if candidate.is_absolute() and candidate.is_dir() and not candidate.is_symlink():
                     roots = (*roots, (str(candidate.resolve()), "rw"))
-            retained_root = worklink_retained_checkout_root().resolve(strict=False)
-            # The exact retained route must override even an operator-declared
-            # writable parent; retained effects always require a live lease.
-            roots = (*roots, (str(retained_root), "retained"))
+            retained_root = worklink_retained_checkout_root()
+            if retained_root is not None:
+                # The exact retained route overrides even an operator-declared
+                # writable parent; retained effects require a live lease.
+                roots = (*roots, (str(retained_root.resolve(strict=False)), "retained"))
             routes = build_file_tool_routes(roots) if roots else {}
             if routes:
                 self._backend = FileToolRouter(default=home_backend, routes=routes)
@@ -1972,11 +1981,11 @@ class Agent:
 
             if (
                 self._agent_tools is None
-                or coding_enabled != self._cached_coding_enabled
+                or unready_tool_owners != self._cached_unready_tool_owners
             ):
                 self._agent_tools = all_mimir_tools(
-                    coding_enabled=coding_enabled,
                     policy=self._config.plugin_manager.policy,
+                    unready_plugin_owners=unready_tool_owners,
                 )
 
             # Skills surfaced via SkillsMiddleware: pass operator +
@@ -2021,6 +2030,13 @@ class Agent:
                 # one-shot wrap-up land before the other before_model hooks.
                 from .tools.iteration_gate import IterationGateMiddleware
                 from .tools.service_tool_surface import ServiceToolSurfaceMiddleware
+                # Replaces deepagents' default skills slot (main agent and the
+                # general-purpose subagent) so skills seeded by a deselected
+                # plugin never reach the catalog.
+                self._agent_skills_middleware = SeedFilteredSkillsMiddleware(
+                    backend=self._backend, sources=skill_sources,
+                    home=self._config.home, policy=self._config.plugin_manager.policy,
+                )
                 self._agent_middleware = (
                     TodoListMiddleware(),
                     IterationGateMiddleware(),
@@ -2031,7 +2047,7 @@ class Agent:
                     MidTurnInjectionMiddleware(),
                 )
 
-            for middleware in self._agent_middleware:
+            for middleware in (*self._agent_middleware, self._agent_skills_middleware):
                 set_skill_sources = getattr(middleware, "set_skill_sources", None)
                 if callable(set_skill_sources):
                     set_skill_sources(skill_sources)
@@ -2046,8 +2062,10 @@ class Agent:
                 tools=self._agent_tools,
                 system_prompt=system_prompt,
                 backend=self._backend,
-                skills=skill_sources or None,
-                middleware=self._agent_middleware,
+                middleware=(
+                    (*self._agent_middleware, self._agent_skills_middleware)
+                    if skill_sources else self._agent_middleware
+                ),
                 subagents=build_mimir_subagents(
                     home=self._config.home, policy=self._config.plugin_manager.policy,
                 ),
@@ -2055,7 +2073,7 @@ class Agent:
             )
             self._cached_system_prompt = system_prompt
             self._cached_skill_catalog_fingerprint = skill_catalog_fingerprint
-            self._cached_coding_enabled = coding_enabled
+            self._cached_unready_tool_owners = unready_tool_owners
             return self._agent
 
     @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
@@ -2155,7 +2173,8 @@ class Agent:
 
         plugin_manager = self._config.plugin_manager
         preflight_emitter = None
-        if plugin_manager.plugins:
+        async def run_plugin_preflight() -> None:
+            nonlocal turn_id, preflight_emitter, initial_ifc_labels, initial_auth_context
             initial_ifc_labels, initial_auth_context = prepare_preflight_context()
             turn_id = turn_id or make_turn_id()
             preflight_emitter = TurnEventEmitter(
@@ -2179,8 +2198,17 @@ class Agent:
                 except Exception:  # noqa: BLE001 — emission must not mask rejection
                     pass
                 raise
+
         bare_reply = (event.content or "").strip().lower() in {"approve", "decline"}
         named_reply = is_non_turn_bound_reply(event)
+        # When no request is known, providers with preflight hooks still guard
+        # turns that look like replies. Empty providers have no hook to invoke:
+        # let the authenticated approval resolver consult durable/recent state
+        # before entering ordinary turn setup.
+        if (plugin_manager.plugins and named_reply and not pending_approvals(event.channel_id)
+                and any(getattr(plugin.contributor, "turn_preflight", None) is not None
+                        for plugin in plugin_manager.plugins)):
+            await run_plugin_preflight()
         if _is_authenticated_operator(event, self._identity_resolver, allow_web=named_reply) and (named_reply or bare_reply):
             sync_pending(self._config.home)
             await asyncio.to_thread(
@@ -2234,6 +2262,8 @@ class Agent:
                         ) else "operator_approval"
                     ),
                 )
+        if plugin_manager.plugins and preflight_emitter is None:
+            await run_plugin_preflight()
         turn_id = turn_id or make_turn_id()
         t_total_start = time.monotonic()
         if not plugin_manager.plugins:
@@ -3525,9 +3555,9 @@ class Agent:
             # channel couldn't surface its own result — post the mechanical
             # failure notice there. (Mirrored in the outer early-failure guard
             # for crashes before the model loop; disjoint via outcome_emitted.)
-            from .worklink.dispatch_failures import is_dispatch_failure_intervention
-
-            if error or is_dispatch_failure_intervention(event):
+            if error or any(hook(event) for hook in _selected_turn_hooks(
+                self._config.plugin_manager.policy, "failure_intervention",
+            )):
                 failure_detail = (
                     error
                     or str(result_fields["result_subtype"] or result_fields["stop_reason"])
@@ -3786,9 +3816,13 @@ class Agent:
         )
         await self._turn_logger.write(record)
         # Continuation sidecars are server-owned bookkeeping, not model writes.
-        from .worklink.dispatch_failures import is_dispatch_failure_intervention
-
-        if ctx.tool_call_budget_exhausted and not is_dispatch_failure_intervention(event):
+        intervention = any(hook(event) for hook in _selected_turn_hooks(
+            self._config.plugin_manager.policy, "failure_intervention",
+        ))
+        continuation_hooks = _selected_turn_hooks(
+            self._config.plugin_manager.policy, "budget_continuation",
+        )
+        if ctx.tool_call_budget_exhausted and not intervention and continuation_hooks:
             continuation_timeout_s = _worklink_continuation_timeout_seconds(self._config)
             try:
                 try:
@@ -3801,23 +3835,24 @@ class Agent:
                         ctx.ifc_labels, event.channel_id, ctx.auth_context,
                     ),
                 )
-                await asyncio.wait_for(
-                    asyncio.to_thread(
-                        maybe_create_worklink_budget_continuation,
-                        home=self._config.home,
-                        event=continuation_event,
-                        ctx=ctx,
-                        record=record,
-                        repo=current_worktree,
-                        current_worktree=current_worktree,
-                        run_id=(
-                            continuation_event.extra.get("run_id")
-                            if isinstance(continuation_event.extra.get("run_id"), str)
-                            else None
+                for continuation_hook in continuation_hooks:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            continuation_hook,
+                            home=self._config.home,
+                            event=continuation_event,
+                            ctx=ctx,
+                            record=record,
+                            repo=current_worktree,
+                            current_worktree=current_worktree,
+                            run_id=(
+                                continuation_event.extra.get("run_id")
+                                if isinstance(continuation_event.extra.get("run_id"), str)
+                                else None
+                            ),
                         ),
-                    ),
-                    timeout=continuation_timeout_s,
-                )
+                        timeout=continuation_timeout_s,
+                    )
             except asyncio.TimeoutError:
                 log.warning(
                     "worklink continuation recovery exceeded timeout (%ss) for turn %s",
@@ -4634,7 +4669,10 @@ class Agent:
                 render_skill_telemetry,
             )
             from .skill_defs import installed_skill_names
-            seeded = installed_skill_names(self._config.home)
+            seeded = visible_skill_names(
+                self._config.home, installed_skill_names(self._config.home),
+                self._config.plugin_manager.policy,
+            )
             if not seeded:
                 return None
             # Per-skill success_criteria refines load-kind outcomes
@@ -5039,9 +5077,12 @@ class Agent:
                 event_loop=event_loop,
             ),
             asyncio.to_thread(
-                find_skill_for_channel,
-                event.channel_id,
-                skills_dirs,
+                lambda: find_skill_for_channel(
+                    event.channel_id, skills_dirs,
+                    hidden=hidden_home_skill_dirs(
+                        self._config.home, self._config.plugin_manager.policy,
+                    ),
+                ),
             ),
             saga_query_task
             if saga_query_task is not None

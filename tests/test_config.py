@@ -468,22 +468,118 @@ class TestConfigFromEnv:
         assert cfg.chat_skills_enabled is True
         assert cfg.chat_skill_allowlist == ("memory", "github", "review")
 
-    def test_coding_capability_is_off_by_default_and_opt_in(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    def test_coding_capability_requires_selected_installed_plugin(
+        self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         self._base(monkeypatch)
-        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+        monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
         from mimir.config import Config
 
-        with caplog.at_level(logging.INFO, logger="mimir.config"):
-            assert Config.from_env().coding_enabled is False
-        assert "coding assistant capability: disabled" in caplog.text
+        assert not Config.from_env().plugin_manager.plugins
 
-        caplog.clear()
         monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
-        with caplog.at_level(logging.INFO, logger="mimir.config"):
-            assert Config.from_env().coding_enabled is True
-        assert "coding assistant capability: enabled" in caplog.text
+        assert not Config.from_env().plugin_manager.plugins
+        pytest.importorskip("mimir_cultivate")
+        monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+        selected = Config.from_env().plugin_manager
+        assert {plugin.candidate.name for plugin in selected.plugins} == {"cultivate"}
+        assert selected.policy.policy_consumer_hooks is not None
+
+    def _coding_warnings(self, monkeypatch, caplog, home: Path, *, plugins: str = "") -> list[str]:
+        import logging
+
+        import mimir.config as config_module
+
+        # The once-per-process ledger is owned by mimir.config; give each test
+        # a fresh one instead of asserting against whatever ran earlier.
+        monkeypatch.setattr(config_module, "_retired_coding_warned", set())
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "")
+        monkeypatch.setenv("MIMIR_PLUGINS", plugins)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="mimir.config"):
+            config_module.Config.from_env()
+        return [r.getMessage() for r in caplog.records
+                if r.name == "mimir.config" and ("CODING IS DISABLED" in r.getMessage()
+                                                 or "no selected plugin owns it" in r.getMessage())]
+
+    def _assert_upgrade_hint(self, message: str) -> None:
+        assert "uv sync --all-packages" in message
+        assert "--build-arg MIMIR_PLUGIN_SELECTION=cultivate" in message
+        assert "set MIMIR_PLUGINS=cultivate in the process or supervisor environment" in message
+        assert "Do NOT put MIMIR_PLUGINS in the agent home's .env" in message
+
+    def test_retired_coding_flag_without_provider_warns_with_upgrade_steps(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+        warnings = self._coding_warnings(monkeypatch, caplog, tmp_path)
+        assert len(warnings) == 1
+        assert warnings[0].startswith("MIMIR_CODING_ENABLED=true is retired and ignored: CODING IS DISABLED")
+        assert "MIMIR_PLUGINS=''" in warnings[0]
+        self._assert_upgrade_hint(warnings[0])
+
+    def test_retired_coding_flag_from_home_dotenv_warns_and_still_boots(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path,
+    ) -> None:
+        # The realistic upgrade: the flag was set in the home .env, which still
+        # loads, and selecting a plugin there is impossible.
+        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+        (tmp_path / ".env").write_text("MIMIR_CODING_ENABLED=yes\n")
+        warnings = self._coding_warnings(monkeypatch, caplog, tmp_path)
+        assert len(warnings) == 1 and "CODING IS DISABLED" in warnings[0]
+        self._assert_upgrade_hint(warnings[0])
+
+    def test_falsy_retired_coding_flag_only_asks_for_removal(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path,
+    ) -> None:
+        import logging
+
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", "false")
+        self._coding_warnings(monkeypatch, caplog, tmp_path)
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert ("MIMIR_CODING_ENABLED is retired and ignored; coding is selected only by "
+                "MIMIR_PLUGINS. Remove MIMIR_CODING_ENABLED from the deployment") in messages
+        assert not any("CODING IS DISABLED" in message for message in messages)
+
+    def test_provider_owned_home_files_without_provider_warn_and_still_boot(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path,
+    ) -> None:
+        monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+        (tmp_path / "worklink.yaml").write_text("tool_pins: {}\n")
+        (tmp_path / "repositories.yaml").write_text("repositories: []\n")
+        warnings = self._coding_warnings(monkeypatch, caplog, tmp_path)
+        assert len(warnings) == 2
+        for name, message in zip(("worklink.yaml", "repositories.yaml"), warnings, strict=True):
+            assert message.startswith(f"{tmp_path / name} exists but no selected plugin owns it")
+            assert "IGNORED and coding is disabled" in message
+            self._assert_upgrade_hint(message)
+
+    def test_retired_coding_warnings_fire_once_per_process(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path,
+    ) -> None:
+        import logging
+
+        from mimir.config import Config
+
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+        (tmp_path / "worklink.yaml").write_text("tool_pins: {}\n")
+        assert len(self._coding_warnings(monkeypatch, caplog, tmp_path)) == 2
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="mimir.config"):
+            Config.from_env()
+        assert not [r for r in caplog.records if "CODING IS DISABLED" in r.getMessage()
+                    or "no selected plugin owns it" in r.getMessage()]
+
+    def test_selected_provider_owns_home_files_and_flag_only_asks_for_removal(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path,
+    ) -> None:
+        pytest.importorskip("mimir_cultivate")
+        monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+        (tmp_path / "worklink.yaml").write_text("tool_pins: {}\n")
+        assert self._coding_warnings(monkeypatch, caplog, tmp_path, plugins="cultivate") == []
+        assert any(r.getMessage().startswith("MIMIR_CODING_ENABLED is retired and ignored; coding is "
+                                             "selected only by MIMIR_PLUGINS") for r in caplog.records)
 
     def test_opencode_config_uses_native_surface(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -493,25 +589,35 @@ class TestConfigFromEnv:
         monkeypatch.setenv("OPENCODE_CONFIG", str(path))
         from mimir.config import Config
 
-        assert Config.from_env().opencode_config_path == path
+        assert not hasattr(Config.from_env(), "opencode_config_path")
+        pytest.importorskip("mimir_cultivate")
+        from mimir_cultivate.opencode import opencode_config_path
+
+        assert opencode_config_path() == path
 
     def test_enforced_coding_config_does_not_require_opencode_on_path(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         self._base(monkeypatch)
         monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
-        monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+        pytest.importorskip("mimir_cultivate")
+        monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
 
-        def unexpected_probe() -> bool:
-            raise AssertionError("config inventory validation must not probe PATH")
+        import shutil
+        original_which = shutil.which
 
-        monkeypatch.setattr("mimir.providers.opencode_available", unexpected_probe)
+        def unexpected_probe(binary: str) -> str | None:
+            if binary == "opencode":
+                raise AssertionError("config inventory validation must not probe OpenCode on PATH")
+            return original_which(binary)
+
+        monkeypatch.setattr("mimir.providers.shutil.which", unexpected_probe)
 
         from mimir.config import Config
 
         config = Config.from_env()
         assert config.access_control_enforced is True
-        assert config.coding_enabled is True
+        assert config.plugin_manager.policy.policy_consumer_hooks is not None
 
     def test_startup_logs_effective_file_roots_with_origin(
         self,

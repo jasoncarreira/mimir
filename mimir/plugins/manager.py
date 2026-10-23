@@ -151,8 +151,10 @@ def load_plugins(*, enable: str) -> PluginManager:
         raise PluginDiscoveryError("conflicting plugin default skins: " +
                                    ", ".join(f"{owner}:{skin}" for owner, skin in defaults))
     policy = PolicyRegistry()
-    register_core_tools(policy)
     policy.select_plugin_candidates(selected)
+    register_core_tools(policy, selected_owners=frozenset(
+        candidate.name for candidate in selected
+    ))
     loaded = []
     for candidate in selected:
         try:
@@ -166,6 +168,17 @@ def load_plugins(*, enable: str) -> PluginManager:
                 f"plugin {candidate.name!r} from {candidate.distribution}: registration failed: {exc}"
             ) from exc
         loaded.append(LoadedPlugin(candidate, contributor))
+    for plugin in loaded:
+        if plugin.candidate.name != "cultivate":
+            continue
+        try:
+            projection = getattr(plugin.contributor, "host_membership_projection", None)
+            memberships = projection() if callable(projection) else {}
+            policy._project_first_party_memberships(plugin.candidate, memberships)
+        except Exception as exc:
+            raise PluginDiscoveryError(
+                f"plugin {plugin.candidate.name!r}: membership projection failed: {exc}"
+            ) from exc
     try:
         policy.freeze()
     except Exception as exc:

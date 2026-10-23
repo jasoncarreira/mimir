@@ -63,12 +63,14 @@ bare flag themselves as a manual override.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import logging
 import os
 import subprocess
 import sys
 import time
+from urllib.parse import unquote, urlparse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -627,6 +629,56 @@ def _read_flag(path: Path) -> PendingUpdate:
 
 
 
+#: Written into the controller venv by Cultivate's ``controller.sh`` image step.
+_CONTROLLER_SOURCE_COMMIT_BASENAME = "controller-source-commit"
+
+
+def cultivate_source_install() -> str | None:
+    """Return where this interpreter's Cultivate was built from, or ``None``.
+
+    Cultivate is not published to an index: images build it, with core, from
+    one pinned commit (``controller.sh`` leaves ``<venv>/controller-source-commit``)
+    and checkouts install it with ``uv sync --all-packages`` (a ``file://``
+    install). Either way a PyPI upgrade of ``mimir-agent`` alone would leave the
+    plugin on a different commit than core. Core-only and index installs return
+    ``None`` and keep the ordinary self-update path.
+    """
+    try:
+        commit = (Path(sys.prefix) / _CONTROLLER_SOURCE_COMMIT_BASENAME).read_text().strip()
+    except OSError:
+        commit = ""
+    if commit:
+        return commit
+    try:
+        dist = importlib.metadata.distribution("mimir-cultivate")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    try:
+        url = str((json.loads(dist.read_text("direct_url.json") or "{}") or {}).get("url") or "")
+    except ValueError:
+        url = ""
+    if not url.startswith("file://"):
+        return None
+    path = unquote(urlparse(url).path)
+    try:
+        head = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--verify", "HEAD"],
+            capture_output=True, text=True, check=False, timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        head = ""
+    return head or f"{path} (commit unknown)"
+
+
+def cultivate_source_refusal(source: str) -> str:
+    """The operator-facing refusal; agents and operators act on this text."""
+    return (
+        f"this deployment installs Cultivate from source at {source}; rebuild the "
+        "image or re-sync the checkout to update (a PyPI upgrade of mimir-agent "
+        "would move core away from the plugin's commit)"
+    )
+
+
 def _install_spec(pkg: str, parsed: PendingUpdate) -> str:
     """Build the pip install spec. ``mimir-agent`` for "latest stable",
     ``mimir-agent==0.2.0rc1`` for a pinned release. The
@@ -880,6 +932,19 @@ def apply_pending_update(
         return True
     pkg = _pypi_package_name()
     spec = _install_spec(pkg, parsed)
+    source = cultivate_source_install()
+    if source is not None:
+        # Same outcome as a failed install: flag consumed, keep booting the
+        # current version, event surfaced on the first turn after restart.
+        message = cultivate_source_refusal(source)
+        log.error("pending mimir update REFUSED: %s", message)
+        emit("mimir_update_failed", spec=spec, reason="cultivate_source_install",
+             source=source, error=message)
+        try:
+            path.unlink()
+        except OSError as exc:
+            log.warning("pending-update flag unlink failed: %s", exc)
+        return True
     prior_version = _current_version()
     rc = _run_pip_install(spec, parsed.include_prereleases, emit)
 

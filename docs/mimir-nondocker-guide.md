@@ -31,6 +31,17 @@ See the [README Quickstart](../README.md#quickstart) for the full extras table,
 the Claude Max (OAuth subprocess) path, and alternative providers
 (Minimax/Kimi). For a development checkout, `uv sync --extra dev`.
 
+### Coding (the Cultivate plugin)
+
+Coding is not in the PyPI package. Cultivate installs from the in-repo
+`plugins/cultivate` workspace member, at the same commit as core, so run from a
+source checkout: `uv sync --all-packages --extra <extras>` (a plain `uv sync`
+removes it), then export `MIMIR_PLUGINS=cultivate` in the shell or service
+unit that starts mimir — not in `<home>/.env`. **Upgrading a deployment that
+used `MIMIR_CODING_ENABLED`?** Follow
+[upgrading a coding deployment](plugins.md#upgrading-a-coding-deployment); without
+it the agent boots core-only and logs a `CODING IS DISABLED` warning.
+
 ### System tools mimir uses
 
 The container image installs these for you; off-Docker you install them with

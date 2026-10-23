@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import hmac
 import http.client
 import json
@@ -32,11 +33,11 @@ from mimir.access_control import (
 from mimir.models import (
     AuthContext,
     InformationFlowLabels,
-    RepoPRAction,
-    RepoPRActionScope,
-    RepoReviewState,
-    ServerDiscoveredPRStates,
 )
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.policy import (
+        RepoPRAction, RepoPRActionScope, RepoReviewState, ServerDiscoveredPRStates,
+    )
 from mimir import outbound_privacy
 from mimir.outbound_privacy import scan_outbound
 from mimir.read_policy import _has_protected_read_name, is_protected_read_path
@@ -194,6 +195,8 @@ def _run_sync(
     arguments: dict[str, Any],
     auth: AuthContext,
     executed: list[bool],
+    *,
+    policy: Any = None,
 ) -> ToolMessage:
     def handler(request: ToolCallRequest) -> ToolMessage:
         executed.append(True)
@@ -201,7 +204,7 @@ def _run_sync(
             content="executed", tool_call_id=request.tool_call["id"], name=tool,
         )
 
-    return BudgetGateMiddleware().wrap_tool_call(_request(tool, arguments, auth), handler)
+    return BudgetGateMiddleware(policy).wrap_tool_call(_request(tool, arguments, auth), handler)
 
 
 @pytest.mark.asyncio
@@ -693,13 +696,15 @@ def test_send_message_operator_alert_exemption_is_exact(
 )
 def test_github_text_credentials_are_refused_on_both_paths(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     tool_name: str,
     argument: str,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
     monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
     monkeypatch.setattr(
-        "mimir.tools.forge.revalidate_review_head_for_context",
+        "mimir_cultivate.forge.revalidate_review_head_for_context",
         lambda *_args, **_kwargs: None,
     )
     events = _capture_events(monkeypatch)
@@ -710,14 +715,38 @@ def test_github_text_credentials_are_refused_on_both_paths(
     }
     executed: list[bool] = []
 
-    auth = _repo_auth()
-    middleware_result = _run_sync(tool_name, arguments, auth, executed)
-    claude_result = _claude_code_pre_tool_enforcement(
-        f"mcp__langchain-tools__{tool_name}",
-        arguments,
-        f"toolu_{tool_name}",
-        auth_context=auth,
+    from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
+    from mimir_cultivate.policy import RepoPRScopeRegistry
+    from mimir.plugins.manager import load_plugins
+    from tests.test_repo_tools import _repo_scope_and_state
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
+    selected = load_plugins(enable="cultivate").policy
+    auth = replace(
+        _auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
     )
+    grants = ScopedPRGrants(
+        auth.canonical_principal, (scope,), protocols=selected.scoped_actions,
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    token = grants.consume_checkout("cultivate", scope)
+    assert token is not None
+    assert grants.observe_checkout("cultivate", scope, state.checkout_lease, token)
+    auth = replace(auth, scoped_pr_grants=grants)
+    arguments["pull_request"] = scope.pr_number
+
+    from mimir.plugins.core import policy_scope
+
+    with policy_scope(selected):
+        middleware_result = _run_sync(tool_name, arguments, auth, executed, policy=selected)
+        claude_result = _claude_code_pre_tool_enforcement(
+            f"mcp__langchain-tools__{tool_name}",
+            arguments,
+            f"toolu_{tool_name}",
+            auth_context=auth,
+        )
 
     assert middleware_result.status == "error"
     assert "credential detector" in str(middleware_result.content)
@@ -732,10 +761,19 @@ def test_github_text_credentials_are_refused_on_both_paths(
 
 
 def test_non_text_github_tools_remain_unscanned() -> None:
-    for tool_name in ("repo_push", "pr_rerequest_review"):
-        descriptor = get_tool_descriptor(tool_name)
-        assert descriptor is not None
-        assert descriptor.sink_payload_extractor is None
+    assert get_tool_descriptor("pr_rerequest_review") is None
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        return
+    from mimir.plugins.manager import load_plugins
+
+    selected = load_plugins(enable="cultivate").policy
+    for name in ("pr_rerequest_review", "repo_push"):
+        descriptor = get_tool_descriptor(name, policy=selected)
+        assert descriptor is not None and descriptor.sink_payload_extractor is None
 
 
 def test_github_private_term_shadows_then_enforces(
@@ -745,15 +783,26 @@ def test_github_private_term_shadows_then_enforces(
     (tmp_path / "private-terms.txt").write_text(PRIVATE_TERM + "\n", encoding="utf-8")
     events = _capture_events(monkeypatch)
 
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        selected = None
+    else:
+        from mimir.plugins.manager import load_plugins
+
+        selected = load_plugins(enable="cultivate").policy
     assert _outbound_privacy_refusal(
-        "repo_commit", {"message": PRIVATE_TERM}, _auth(),
+        "repo_commit", {"message": PRIVATE_TERM}, _auth(), policy=selected,
     ) is None
-    assert any(event == "shadow_tool_decision" for event, _fields in events)
+    assert any(event == "shadow_tool_decision" for event, _fields in events) is (selected is not None)
 
     monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1")
-    assert _outbound_privacy_refusal(
-        "mcp__langchain-tools__pr_comment", {"body": PRIVATE_TERM}, _auth(),
-    ) is not None
+    if selected is not None:
+        assert _outbound_privacy_refusal(
+            "pr_comment", {"body": PRIVATE_TERM}, _auth(), policy=selected,
+        ) is not None
 
 
 @pytest.mark.parametrize(

@@ -18,8 +18,10 @@ from mimir.access_control import (
     build_trigger_service_principal,
     service_filesystem_read_roots,
 )
-from mimir.models import AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState
-from mimir.pr_checkout_lease import PRCheckoutLease
+pytest.importorskip("mimir_cultivate")
+from mimir.models import AuthContext
+from mimir_cultivate.policy import RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState
+from mimir_cultivate.repository import PRCheckoutLease
 from mimir.read_policy import configured_non_admin_read_roots, resolve_non_admin_read_target
 from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file_tool_routes
 
@@ -61,7 +63,7 @@ def leased_reader(tmp_path, monkeypatch, request):
         canonical="poller:github-activity", trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION,
         capabilities=json.loads((Path(__file__).resolve().parents[1] /
-            "mimir/optional-skills/github-poller/pollers.json").read_text())["pollers"][0]["authority"]["capabilities"],
+            "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json").read_text())["pollers"][0]["authority"]["capabilities"],
         creation_path="test",
     )
     auth = AuthContext(
@@ -299,7 +301,7 @@ def test_shell_refusal_names_only_held_tools(leased_reader, command, restricted)
         parse_service_shell_argv_with_diagnostics,
     )
 
-    manifest = Path(__file__).resolve().parents[1] / "mimir/optional-skills/github-poller/pollers.json"
+    manifest = Path(__file__).resolve().parents[1] / "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/pollers.json"
     poller = next(
         item for item in json.loads(manifest.read_text())["pollers"]
         if item["name"] == "github-activity"

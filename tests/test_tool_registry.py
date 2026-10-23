@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError, replace
@@ -110,8 +111,6 @@ def test_coding_tool_is_absent_when_gate_is_unset_even_if_cli_exists(
     from mimir.tools import all_mimir_tools
 
     monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
-
     assert "spawn_open_code" not in {tool.name for tool in all_mimir_tools()}
 
 
@@ -149,19 +148,67 @@ def test_subagent_budget_gates_share_frozen_parent_policy() -> None:
         assert gates[0]._policy is policy
 
 
-def test_default_surface_does_not_import_coding_modules() -> None:
+@pytest.mark.parametrize("selection", [None, "cultivate"])
+def test_default_surface_does_not_import_coding_modules(selection: str | None) -> None:
+    """An unselected, installed provider stays out of the process tool surface.
+
+    The retired core modules no longer exist, so their absence alone proves
+    nothing. The child builds the surface the way the process does, from its own
+    ``MIMIR_PLUGINS`` (never this suite's), and the selected case is the control
+    showing the probe sees provider tools and imports when they are present.
+    """
+    pytest.importorskip(
+        "mimir_cultivate", reason="the provider must be installed for its absence to mean anything",
+    )
+    from tests.test_plugin_policy_parity import CODING_TOOLS
+
     script = """\
+import importlib.util
+import os
 import sys
+from mimir.plugins.manager import load_plugins
 from mimir.tools.registry import all_mimir_tools
-all_mimir_tools(model_spec='openai:test')
-for name in ('mimir.tools.forge', 'mimir.tools.repo', 'mimir.forge',
-             'mimir.repo_tools', 'mimir.pr_checkout_lease'):
-    assert name not in sys.modules, name
+assert importlib.util.find_spec('mimir_cultivate') is not None
+policy = load_plugins(enable=os.environ.get('MIMIR_PLUGINS', '')).policy
+names = {tool.name for tool in all_mimir_tools(
+    model_spec='openai:test', policy=policy, require_provider_available=False,
+)}
+assert 'send_message' in names, sorted(names)
+exposed = sorted(names & set(sys.argv[1:]))
+loaded = sorted(name for name in sys.modules
+                if name == 'mimir_cultivate' or name.startswith('mimir_cultivate.'))
+if os.environ.get('MIMIR_PLUGINS'):
+    assert 'worklink_run' in exposed and 'pr_list' in exposed, exposed
+    assert 'mimir_cultivate' in loaded, loaded
+else:
+    assert not exposed, exposed
+    assert not loaded, loaded
 """
+    env = dict(os.environ)
+    env.pop("MIMIR_PLUGINS", None)
+    if selection is not None:
+        env["MIMIR_PLUGINS"] = selection
     result = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, check=False,
+        [sys.executable, "-c", script, *sorted(CODING_TOOLS)],
+        env=env, capture_output=True, text=True, check=False, timeout=60,
     )
     assert result.returncode == 0, result.stderr
+
+
+def _selected_cultivate_policy():
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.manager import load_plugins
+
+    return load_plugins(enable="cultivate").policy
+
+
+def test_explicitly_selected_missing_provider_is_refused(monkeypatch) -> None:
+    from mimir.plugins import discovery
+    from mimir.plugins.manager import load_plugins
+
+    monkeypatch.setattr(discovery.metadata, "entry_points", lambda **_kwargs: ())
+    with pytest.raises(discovery.PluginDiscoveryError, match=r"missing plugin\(s\): cultivate"):
+        load_plugins(enable="cultivate")
 
 
 def test_coding_tool_is_registered_only_when_enabled_and_available(
@@ -169,28 +216,41 @@ def test_coding_tool_is_registered_only_when_enabled_and_available(
     tmp_path,
 ) -> None:
     from mimir.tools import all_mimir_tools
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate import forge
 
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
 
-    names = {tool.name for tool in all_mimir_tools(coding_enabled=True)}
+    names = {tool.name for tool in all_mimir_tools(policy=selected)}
     assert "spawn_open_code" in names
+    from mimir_cultivate.opencode import spawn_open_code
+    assert next(tool for tool in all_mimir_tools(
+        policy=selected,
+    ) if tool.name == "spawn_open_code") is spawn_open_code
 
 
 def test_identity_degradation_removes_coding_tools_and_does_not_auto_recover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
     from mimir.tools import all_mimir_tools
-    from mimir.tools import forge as forge_tools
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge as forge_tools
 
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    selected = load_plugins(enable="cultivate").policy
     monkeypatch.setattr(forge_tools, "_github_identity_degraded", True)
-    names = {
-        tool.name
-        for tool in all_mimir_tools(
-            coding_enabled=True,
-            require_coding_available=False,
-        )
-    }
+    with policy_scope(selected):
+        names = {
+            tool.name
+            for tool in all_mimir_tools(
+                require_provider_available=False, policy=selected,
+            )
+        }
 
     assert "spawn_open_code" not in names
     assert "repo_test" not in names
@@ -204,10 +264,11 @@ def test_enabled_coding_without_opencode_fails_loudly(
 ) -> None:
     from mimir.tools import all_mimir_tools
 
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: False)
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: False)
 
     with pytest.raises(RuntimeError, match="opencode CLI.*not installed"):
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(policy=selected)
 
 
 def test_enabled_coding_without_checkout_config_fails_loudly(
@@ -215,11 +276,12 @@ def test_enabled_coding_without_checkout_config_fails_loudly(
 ) -> None:
     from mimir.tools import all_mimir_tools
 
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
 
     with pytest.raises(RuntimeError, match="MIMIR_PR_CHECKOUT_LEASE_ROOT"):
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(policy=selected)
 
 
 @pytest.mark.parametrize("degraded", [False, True])
@@ -229,9 +291,13 @@ def test_coding_startup_aggregates_missing_prerequisites(
 ) -> None:
     from mimir.tools import all_mimir_tools
     from mimir.tools import registry
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge
 
-    monkeypatch.setattr("mimir.tools.forge._github_identity_degraded", degraded)
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: False)
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(forge, "_github_identity_degraded", degraded)
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: False)
     real_access = registry.os.access
     monkeypatch.setattr(
         registry.os, "access",
@@ -257,7 +323,7 @@ def test_coding_startup_aggregates_missing_prerequisites(
         )
 
     with pytest.raises(RuntimeError) as error:
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(policy=selected)
     message = str(error.value)
     assert "opencode CLI" in message
     assert "pinned Git binary /usr/bin/git" in message
@@ -269,14 +335,20 @@ def test_coding_startup_aggregates_missing_prerequisites(
 
 @pytest.mark.parametrize("degraded", [False, True])
 def test_coding_startup_writable_root_and_identity_gate(monkeypatch, tmp_path, degraded):
+    pytest.importorskip("mimir_cultivate")
     from mimir.tools import all_mimir_tools
     from mimir.tools import registry
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge
 
-    monkeypatch.setattr("mimir.tools.forge._github_identity_degraded", degraded)
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(forge, "_github_identity_degraded", degraded)
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setattr(registry.os, "access", lambda path, mode: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
-    names = {tool.name for tool in all_mimir_tools(coding_enabled=True)}
+    with policy_scope(selected):
+        names = {tool.name for tool in all_mimir_tools(policy=selected)}
     assert ("spawn_open_code" in names) is not degraded
     assert ("repo_test" in names) is not degraded
     assert list(tmp_path.iterdir()) == []
@@ -285,12 +357,13 @@ def test_coding_startup_writable_root_and_identity_gate(monkeypatch, tmp_path, d
 def test_coding_startup_rejects_existing_relative_lease_root(monkeypatch, tmp_path):
     from mimir.tools import all_mimir_tools
 
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.chdir(tmp_path)
     (tmp_path / "leases").mkdir()
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", "leases")
     with pytest.raises(RuntimeError, match="not configured as an absolute path"):
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(policy=selected)
 
 
 def test_coding_startup_rejects_executable_directory_as_git(monkeypatch, tmp_path):
@@ -303,62 +376,85 @@ def test_coding_startup_rejects_executable_directory_as_git(monkeypatch, tmp_pat
         registry, "Path",
         lambda value: git_directory if value == "/usr/bin/git" else Path(value),
     )
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
+    selected = _selected_cultivate_policy()
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
     with pytest.raises(RuntimeError, match="pinned Git binary /usr/bin/git"):
-        all_mimir_tools(coding_enabled=True)
+        all_mimir_tools(policy=selected)
 
 
 def test_declarative_coding_inventory_does_not_probe_cli_availability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.tools import all_mimir_tools
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate import forge
+
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    selected = _selected_cultivate_policy()
 
     def unexpected_probe() -> bool:
         raise AssertionError("declarative inventory must not probe PATH")
 
-    monkeypatch.setattr("mimir.providers.opencode_available", unexpected_probe)
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", unexpected_probe)
 
     names = {
         tool.name
         for tool in all_mimir_tools(
-            coding_enabled=True,
-            require_coding_available=False,
+            require_provider_available=False,
+            policy=selected,
         )
     }
     assert "spawn_open_code" in names
 
 
-def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled() -> None:
+def test_core_only_policy_exposes_no_typed_repo_pr_tools() -> None:
+    from mimir.access_control import _TYPED_REPO_PR_TOOL_ACTIONS
+    from mimir.plugins.core import core_policy_registry
+
+    assert not _TYPED_REPO_PR_TOOL_ACTIONS
+    assert not {name for name, tool in core_policy_registry().tools.items()
+                if tool.resource_scope == "repo_pr"}
+
+
+def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
     from mimir.access_control import (
-        OperationDecision,
         SinkCategory,
         ToolFlowDirection,
         _TYPED_REPO_PR_TOOL_ACTIONS,
-        get_sink_category,
-        get_tool_flow_direction,
     )
     from mimir.tools import all_mimir_tools
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate import forge
 
     default_names = {
-        tool.name for tool in all_mimir_tools(require_coding_available=False)
+        tool.name for tool in all_mimir_tools(require_provider_available=False)
     }
-    enabled_names = {
-        tool.name for tool in all_mimir_tools(
-            coding_enabled=True, require_coding_available=False,
-        )
-    }
-    typed_names = set(_TYPED_REPO_PR_TOOL_ACTIONS)
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        enabled_names = {
+            tool.name for tool in all_mimir_tools(
+                require_provider_available=False, policy=selected,
+            )
+        }
+    typed_names = {name for name, tool in selected.tools.items()
+                   if tool.resource_scope == "repo_pr"}
 
     assert typed_names
+    assert not _TYPED_REPO_PR_TOOL_ACTIONS
     assert typed_names.isdisjoint(default_names)
     assert typed_names <= enabled_names
     for name in typed_names:
-        assert OperationCatalog().get_decision(name) is OperationDecision.RESOURCE_SCOPED
-        direction = get_tool_flow_direction(name)
+        assert selected.tools[name].typed_action is not None
+        direction = ToolFlowDirection(selected.tools[name].flow)
         assert direction is not ToolFlowDirection.UNKNOWN
         if direction in {ToolFlowDirection.SINK, ToolFlowDirection.BOTH}:
-            assert get_sink_category(name) is not SinkCategory.UNKNOWN
+            assert selected.tools[name].descriptor.sink_category is not SinkCategory.UNKNOWN
 
 
 def test_typed_repo_pr_sinks_all_have_destination_extraction() -> None:
@@ -378,33 +474,43 @@ def test_typed_repo_pr_sinks_all_have_destination_extraction() -> None:
     assert all(TOOL_DESCRIPTORS[name].sink_destination is not None for name in sinks)
 
 
-def test_typed_repo_pr_schemas_only_name_exact_registry_selectors() -> None:
-    from mimir.access_control import _TYPED_REPO_PR_TOOL_ACTIONS
+def test_typed_repo_pr_schemas_only_name_exact_registry_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from mimir.tools import all_mimir_tools
+    selected = _selected_cultivate_policy()
+    from mimir_cultivate import forge
 
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
     tools = {
         tool.name: tool
         for tool in all_mimir_tools(
-            coding_enabled=True, require_coding_available=False,
+            require_provider_available=False, policy=selected,
         )
     }
+    typed_names = {
+        name for name, declared in selected.tools.items()
+        if declared.resource_scope == "repo_pr" and declared.factory is not None
+    }
+    assert typed_names
     forbidden = {"repo", "pr", "pr_number", "url", "host"}
-    for name in _TYPED_REPO_PR_TOOL_ACTIONS:
+    for name in typed_names:
         properties = tools[name].tool_call_schema.model_json_schema()["properties"]
         assert forbidden.isdisjoint(properties), (name, properties)
         assert {"repository", "pull_request"} <= set(properties), (name, properties)
 
 
 def test_repo_test_schema_exposes_no_execution_authority() -> None:
-    from mimir.tools import all_mimir_tools
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.manager import load_plugins
 
-    tools = {
-        tool.name: tool
-        for tool in all_mimir_tools(
-            coding_enabled=True, require_coding_available=False,
-        )
-    }
-    schema = tools["repo_test"].tool_call_schema.model_json_schema()
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("repo_test schema belongs to installed Cultivate")
+    selected = load_plugins(enable="cultivate").policy
+    assert selected.tools["repo_test"].owner == "cultivate"
+    schema = selected.tools["repo_test"].factory().tool_call_schema.model_json_schema()
     properties = schema["properties"]
     assert set(properties) == {"repository", "pull_request", "selectors", "suite", "include_output"}
     assert properties["include_output"]["default"] is False
@@ -416,7 +522,7 @@ def test_repo_test_schema_exposes_no_execution_authority() -> None:
 def test_build_app_checks_enabled_coding_surface_at_startup() -> None:
     from mimir.server import build_app
 
-    config = SimpleNamespace(coding_enabled=True)
+    config = SimpleNamespace()
     with (
         patch(
             "mimir.tools.all_mimir_tools",
@@ -426,7 +532,7 @@ def test_build_app_checks_enabled_coding_surface_at_startup() -> None:
     ):
         build_app(config)
 
-    assemble.assert_called_once_with(coding_enabled=True)
+    assemble.assert_called_once_with()
 
 
 @pytest.mark.parametrize("shell_tool", [shell_exec, bash_async])
@@ -450,10 +556,12 @@ def test_shell_tool_description_states_both_execution_contracts(shell_tool) -> N
 
 def test_admin_catalog_never_shrinks_and_preserves_mcp_suffixes() -> None:
     catalog = OperationCatalog()
-    resource_scoped = {"write_file", "edit_file", "worklink_run"}
+    resource_scoped = {"write_file", "edit_file"}
+    moved = {"worklink_run", "spawn_open_code"}
 
-    assert _OLD_ADMIN_TOOLS - resource_scoped <= catalog._ADMIN_REQUIRED_OPERATIONS
+    assert _OLD_ADMIN_TOOLS - resource_scoped - moved <= catalog._ADMIN_REQUIRED_OPERATIONS
     assert resource_scoped <= catalog._RESOURCE_SCOPED_OPERATIONS
+    assert moved.isdisjoint(catalog._ADMIN_REQUIRED_OPERATIONS | catalog._RESOURCE_SCOPED_OPERATIONS)
     assert catalog.get_decision("mcp__mimir__shell_exec") == OperationDecision.ADMIN_REQUIRED
     assert catalog.get_decision("mcp_mimir_shell_exec") == OperationDecision.ADMIN_REQUIRED
 
@@ -522,15 +630,26 @@ def test_web_search_ifc_target_is_the_configured_search_endpoint(
 
 @pytest.mark.parametrize("operation", ["spawn_open_code", "task"])
 def test_factory_operations_are_cataloged_as_admin_required(operation: str) -> None:
-    catalog = OperationCatalog()
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
 
-    assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
+    catalog = OperationCatalog()
+    if operation == "task":
+        assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
+        return
+    pytest.importorskip("mimir_cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        assert catalog.get_decision(operation) == OperationDecision.ADMIN_REQUIRED
 
 
 def test_spawn_open_code_declares_spawn_sink_destination() -> None:
+    pytest.importorskip("mimir_cultivate")
     from mimir.tool_descriptors import TOOL_DESCRIPTORS
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
 
-    assert TOOL_DESCRIPTORS["spawn_open_code"].sink_destination == "spawn_process"
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        assert TOOL_DESCRIPTORS["spawn_open_code"].sink_destination == "spawn_process"
 
 
 @pytest.mark.parametrize(
@@ -565,8 +684,11 @@ def test_scheduler_service_principal_can_invoke_factory_operations(
 
     assert decision.allowed is expected
     assert decision.decision == OperationDecision.ADMIN_REQUIRED
-    assert decision.reason == (None if expected else "ifc_label_blocked:spawn")
-    assert decision.service_principal is get_service_principal("scheduled_tick")
+    assert decision.reason == (None if expected else "unknown_sink_category")
+    if expected:
+        assert decision.service_principal is get_service_principal("scheduled_tick")
+    else:
+        assert decision.service_principal is None
 
 
 def test_unknown_operation_fails_closed_only_when_enforced() -> None:
@@ -870,6 +992,9 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
     assert denied.allowed is False
     if trigger == "saga_session_end":
         assert denied.reason == "session_boundary_capability_denied"
+    elif denied_operation == "spawn_open_code":
+        assert denied.reason == "unknown_sink_category"
+        assert denied.service_principal is None
     else:
         assert denied.reason == "admin_required"
         assert denied.service_principal is get_service_principal(trigger)
@@ -1414,17 +1539,17 @@ def test_scheduler_principal_has_required_capabilities_for_heartbeat() -> None:
     read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn"}
     write_ops = {"write_file", "edit_file"}
     shell_ops = {"shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"}
-    spawn_ops = {"spawn_open_code", "task"}
+    spawn_ops = {"task"}
     schedule_ops = {"list_schedules"}
     proposal_ops = {"open_proposal", "submit_proposal", "abandon_proposal"}
     saga_ops = {"saga_forget"}
-    worklink_ops = {"worklink_run"}
 
-    all_expected = read_ops | write_ops | shell_ops | spawn_ops | schedule_ops | proposal_ops | saga_ops | worklink_ops
+    all_expected = read_ops | write_ops | shell_ops | spawn_ops | schedule_ops | proposal_ops | saga_ops
     for cap in all_expected:
         assert scheduler.has_capability(cap), f"scheduler missing {cap}"
 
-    forbidden = {"request_mimir_update", "remove_schedule", "reload_pollers"}
+    forbidden = {"request_mimir_update", "remove_schedule", "reload_pollers",
+                 "spawn_open_code", "worklink_run"}
     for cap in forbidden:
         assert not scheduler.has_capability(cap), f"scheduler should NOT have {cap}"
 
@@ -1572,6 +1697,7 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal(
                 "service_capability_denied",
                 "session_boundary_capability_denied",
                 "ifc_label_blocked:spawn",
+                "unknown_sink_category",
             ), f"{trigger} {operation} denied for wrong reason: {result.reason}"
 
 
@@ -1912,7 +2038,8 @@ def test_runtime_worklink_cli_hints_require_operator():
     from pathlib import Path
 
     import mimir
-    from mimir.tools.registry import worklink_run
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.registration import worklink_run
 
     root = Path(mimir.__file__).parent
     hints = []
@@ -1926,5 +2053,7 @@ def test_runtime_worklink_cli_hints_require_operator():
                     assert not re.search(r"(?:use|run|try).*mimir worklink (?:run|resume).*force", text, re.I), module
                     assert not re.search(r"force.*mimir worklink (?:run|resume)", text, re.I), module
     assert hints  # Scan must continue to cover actual runtime literals.
-    assert "ask the operator to run `mimir worklink run`" in root.joinpath("tools/registry.py").read_text()
+    from mimir_cultivate import registration
+
+    assert "ask the operator to run `mimir worklink run`" in Path(registration.__file__).read_text()
     assert "Use ``mimir worklink run`` to force" not in worklink_run.description

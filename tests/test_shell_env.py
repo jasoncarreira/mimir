@@ -14,8 +14,88 @@ from pathlib import Path
 
 import pytest
 
+from mimir import github_identity as core_identity
+
 from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
+
+
+@pytest.fixture
+def selected_shell_policy():
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import _selected_policy
+    from mimir.plugins.manager import load_plugins
+
+    selected = load_plugins(enable="cultivate").policy
+    assert selected.policy_consumer_hooks is not None
+    token = _selected_policy.set(selected)
+    try:
+        yield selected
+    finally:
+        _selected_policy.reset(token)
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_generic_sync_and_async_shell_execute_through_middleware(
+    tmp_path: Path, selected: bool,
+) -> None:
+    if selected and os.environ.get("MIMIR_PLUGINS") != "cultivate":
+        pytest.skip("requires selected Cultivate in this process")
+    script = '''
+import asyncio, builtins, os, sys, threading
+from pathlib import Path
+old = builtins.__import__
+def no_disabled_provider(name, globals=None, locals=None, fromlist=(), level=0):
+    if os.environ.get("MIMIR_PLUGINS") != "cultivate" and name.startswith("mimir_cultivate"):
+        raise AssertionError("core-only shell imported disabled provider")
+    return old(name, globals, locals, fromlist, level)
+builtins.__import__ = no_disabled_provider
+from langchain.agents.middleware import ToolCallRequest
+from langgraph.runtime import Runtime
+from mimir.tools.budget_gate import BudgetGateMiddleware
+from mimir.tools.extra import shell_exec
+from mimir.tools import shell_async
+from mimir.shell_jobs import ShellJobRegistry
+from tests.auth_helpers import middleware_auth_context
+if os.environ.get("MIMIR_PLUGINS") == "cultivate":
+    from mimir.plugins.manager import load_plugins
+    selected = load_plugins(enable="cultivate").policy
+    assert selected.policy_consumer_hooks is not None
+else:
+    from mimir.plugins.core import core_policy_registry
+    selected = core_policy_registry()
+gate = BudgetGateMiddleware(selected)
+def request(name, tool):
+    return ToolCallRequest(tool_call={"name": name, "args": {"command": "printf direct-ok"},
+                                 "id": "generic-shell", "type": "tool_call"},
+                           tool=tool, state=None, runtime=Runtime(context=middleware_auth_context()))
+sync = gate.wrap_tool_call(request("shell_exec", shell_exec), lambda call: call.tool.invoke(call.tool_call["args"]))
+assert "direct-ok" in str(sync) and "exit=0" in str(sync), sync
+async def run():
+    registry = ShellJobRegistry(jobs_dir=Path(sys.argv[1]))
+    done = threading.Event()
+    completed = []
+    shell_async.set_shell_job_registry(registry, on_complete=lambda job: (completed.append(job), done.set()))
+    try:
+        async def execute(call):
+            return await call.tool.ainvoke(call.tool_call["args"])
+        output = await gate.awrap_tool_call(request("bash_async", shell_async.bash_async), execute)
+        assert "Spawned job" in str(output), output
+        assert await asyncio.to_thread(done.wait, 15)
+        assert completed[0].exit_code == 0
+        assert completed[0].stdout_path.read_text().strip() == "direct-ok"
+    finally:
+        shell_async.set_shell_job_registry(None)
+asyncio.run(run())
+'''
+    env = os.environ.copy()
+    env["MIMIR_PLUGINS"] = "cultivate" if selected else ""
+    env["SHELL_SECRET"] = "hidden-secret"
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "jobs")],
+        capture_output=True, text=True, timeout=45, env=env,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.asyncio
@@ -106,6 +186,13 @@ assert "PermissionError" in result.stderr
 def test_real_cli_non_run_sibling_environment_unreadable(subcommand):
     if os.geteuid() == 0:
         pytest.skip("root may bypass procfs access controls; exercise as worker uid")
+    if subcommand == "worklink":
+        import importlib.util
+
+        if importlib.util.find_spec("mimir_cultivate") is None:
+            if {"cultivate", "all"}.intersection(os.environ.get("MIMIR_PLUGINS", "").split(",")):
+                pytest.fail("selected Cultivate distribution is not installed")
+            pytest.skip("Worklink CLI requires installed Cultivate")
     # Drive the real CLI entry in an isolated sibling process, keeping it alive
     # after --help exits. Prove readability before CLI startup to avoid a
     # vacuous pass on hosts which already restrict same-uid procfs reads.
@@ -124,9 +211,13 @@ with contextlib.redirect_stdout(io.StringIO()):
 print("after", flush=True)
 sys.stdin.read()
 '''
+    child_env = os.environ.copy()
+    child_env.pop("MIMIR_PLUGINS", None)
+    if subcommand == "worklink":
+        child_env["MIMIR_PLUGINS"] = "cultivate"
     sibling = subprocess.Popen(
         [sys.executable, "-c", script, subcommand], stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=child_env,
     )
     try:
         assert sibling.stdout.readline().strip() == "before"
@@ -196,11 +287,11 @@ def test_output_mask_includes_only_granted_child_values(monkeypatch, executable)
 @pytest.mark.parametrize("async_job", [False, True], ids=["sync", "async-job"])
 @pytest.mark.parametrize("exit_code", [0, 1])
 async def test_implicit_gh_token_is_masked_in_child_output(
-    tmp_path, monkeypatch, async_job, exit_code,
+    tmp_path, monkeypatch, selected_shell_policy, async_job, exit_code,
 ):
-    from mimir.forge import github as github_module
+    from mimir_cultivate import forge as provider_forge
     from mimir.shell_jobs import ShellJobRegistry
-    from mimir.tools import forge as forge_tools, shell_async
+    from mimir.tools import shell_async
     from mimir.tools.extra import shell_exec
 
     secret = "opaque-private-value-1666"
@@ -208,11 +299,11 @@ async def test_implicit_gh_token_is_masked_in_child_output(
     monkeypatch.setenv("GH_TOKEN", "ungranted-alternate")
     monkeypatch.setenv("UNDECLARED_TOKEN", "ungranted-private")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
-    monkeypatch.setattr(github_module, "_verified_identity", (
+    monkeypatch.setattr(core_identity, "_verified_identity", (
         "reviewer", hashlib.sha256(secret.encode()).hexdigest(),
     ))
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setattr(provider_forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(provider_forge, "_github_identity_degraded_error", None)
     executable = tmp_path / "gh"
     executable.write_text(
         f"#!{sys.executable}\n"
@@ -315,7 +406,6 @@ def test_operator_declared_gh_refused_before_identity_or_credentials(
     tmp_path, monkeypatch, overlay, gh_name,
 ):
     from mimir.access_control import parse_declared_shell_commands
-    from mimir.tools import forge as forge_tools
     from mimir.tools.refusals import ToolPolicyRefusal
 
     # Construct a binding via the job parser to exercise execution even if a
@@ -328,11 +418,10 @@ def test_operator_declared_gh_refused_before_identity_or_credentials(
         "pass_env": ["GITHUB_TOKEN"],
     }])
     monkeypatch.setenv("GITHUB_TOKEN", "explicit-test-token")
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
-    checks = []
-    monkeypatch.setattr(forge_tools, "confirm_github_tool_identity",
-                        lambda *args: checks.append(args))
+    monkeypatch.setattr(
+        "mimir.plugins.core.selected_policy_registry",
+        lambda: pytest.fail("declared gh reached selected owner"),
+    )
     monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *a, **kw: None)
     argv = [str(executable), "issue", "list"]
     token = _shell_env.bind_direct_exec_argv(
@@ -342,8 +431,6 @@ def test_operator_declared_gh_refused_before_identity_or_credentials(
         assert _shell_env.direct_exec_pass_env(argv) == ("GITHUB_TOKEN",)
         with pytest.raises(ToolPolicyRefusal, match="operator-declared gh is refused"):
             direct_exec_env_overlay(argv) if overlay else direct_exec_env(argv)
-        assert checks == []
-        assert not forge_tools.github_identity_is_degraded()
     finally:
         _shell_env.reset_direct_exec_argv(token)
 
@@ -361,7 +448,6 @@ def test_operator_declared_wrapped_gh_refused_before_env_or_identity(
     tmp_path, monkeypatch, overlay, wrapper, prefix, args, gh_name,
 ):
     from mimir.access_control import parse_declared_shell_commands
-    from mimir.tools import forge as forge_tools
     from mimir.tools.refusals import ToolPolicyRefusal
 
     prefix = [token.replace("gh", gh_name) for token in prefix]
@@ -375,12 +461,11 @@ def test_operator_declared_wrapped_gh_refused_before_env_or_identity(
     }])
     monkeypatch.setenv("HOME", str(tmp_path / "ambient-home"))
     monkeypatch.setenv("GITHUB_TOKEN", "explicit-test-token")
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
-    checks = []
+    monkeypatch.setattr(
+        "mimir.plugins.core.selected_policy_registry",
+        lambda: pytest.fail("wrapped declared gh reached selected owner"),
+    )
     env_builds = []
-    monkeypatch.setattr(forge_tools, "confirm_github_tool_identity",
-                        lambda *args: checks.append(args))
     monkeypatch.setattr(_shell_env, "_minimal_direct_exec_env",
                         lambda: env_builds.append(True) or {})
     argv = [str(executable), *args]
@@ -395,8 +480,6 @@ def test_operator_declared_wrapped_gh_refused_before_env_or_identity(
         index = next(i for i, value in enumerate(argv) if Path(value).name == gh_name)
         assert f"argv[{index}]={argv[index]!r}" in str(caught.value)
         assert env_builds == []
-        assert checks == []
-        assert not forge_tools.github_identity_is_degraded()
     finally:
         _shell_env.reset_direct_exec_argv(token)
 
@@ -584,7 +667,30 @@ def test_direct_exec_env_uv_run_uses_project_virtualenv(
     assert Path(completed.stdout.strip()).resolve() == (project / ".venv").resolve()
 
 
-def test_direct_exec_env_scrubs_git_repository_and_helper_injection(monkeypatch) -> None:
+@pytest.fixture(params=["core", "selected"])
+def shell_policy_mode(request):
+    """Run a floor assertion with no selected hook and with Cultivate's hook."""
+    if request.param == "selected":
+        pytest.importorskip("mimir_cultivate")
+        from mimir_cultivate import forge as provider_forge
+
+        # Cultivate's degraded latch is process state another test may have set.
+        monkeypatch = request.getfixturevalue("monkeypatch")
+        monkeypatch.setattr(provider_forge, "_github_identity_degraded", False)
+        monkeypatch.setattr(provider_forge, "_github_identity_degraded_error", None)
+        monkeypatch.setattr(provider_forge, "_github_identity_degraded_callback", None)
+        yield request.getfixturevalue("selected_shell_policy")
+        return
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
+    with policy_scope(core_policy_registry()) as policy:
+        assert policy.policy_consumer_hooks is None
+        yield policy
+
+
+def test_direct_exec_env_scrubs_git_repository_and_helper_injection(
+    monkeypatch, shell_policy_mode,
+) -> None:
     injected = {
         "GIT_DIR": "/outside/.git",
         "GIT_WORK_TREE": "/outside",
@@ -609,7 +715,7 @@ def test_direct_exec_env_scrubs_git_repository_and_helper_injection(monkeypatch)
     assert env["GIT_OPTIONAL_LOCKS"] == "0"
 
 
-def test_git_uses_minimal_env_and_repository_credentials(monkeypatch) -> None:
+def test_git_uses_minimal_env_and_repository_credentials(monkeypatch, selected_shell_policy) -> None:
     """Only review pull/push need auth, supplied by the configured helper.
 
     Inspection Git has ``credential.helper=`` injected into argv. Authorized
@@ -629,20 +735,22 @@ def test_git_uses_minimal_env_and_repository_credentials(monkeypatch) -> None:
     } | {key for key in env if key.startswith("LC_")}
 
 
-def test_gh_env_uses_isolated_config_and_scrubs_alternate_credentials(monkeypatch) -> None:
-    from mimir.forge import github as github_module
+def test_gh_env_uses_isolated_config_and_scrubs_alternate_credentials(
+    monkeypatch, selected_shell_policy,
+) -> None:
+    from mimir_cultivate import forge as provider_forge
+    from mimir_cultivate import review_guard
 
     monkeypatch.setenv("GITHUB_TOKEN", "declared-token")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
     monkeypatch.setenv("GH_TOKEN", "stray-token")
     monkeypatch.setenv("GH_HOST", "attacker.invalid")
     monkeypatch.setenv("GH_CONFIG_DIR", "/tmp/stray-gh-config")
-    monkeypatch.setattr(github_module, "_verified_identity", (
+    monkeypatch.setattr(core_identity, "_verified_identity", (
         "reviewer", hashlib.sha256(b"declared-token").hexdigest(),
     ))
-    from mimir.tools import forge as forge_tools
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setattr(provider_forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(provider_forge, "_github_identity_degraded_error", None)
 
     env = direct_exec_env(["/usr/bin/gh", "api", "user"])
     overlay = direct_exec_env_overlay(["/usr/bin/gh", "api", "user"])
@@ -650,7 +758,7 @@ def test_gh_env_uses_isolated_config_and_scrubs_alternate_credentials(monkeypatc
     assert env["GITHUB_TOKEN"] == "declared-token"
     assert "GH_TOKEN" not in env
     assert "GH_HOST" not in env
-    assert env["GH_CONFIG_DIR"] == _shell_env._GH_CONFIG_DIR
+    assert env["GH_CONFIG_DIR"] == review_guard._GH_CONFIG_DIR
     assert env["GH_CONFIG_DIR"] != "/tmp/stray-gh-config"
     assert Path(env["GH_CONFIG_DIR"]).stat().st_mode & 0o777 == 0o500
     assert overlay["GH_TOKEN"] is None
@@ -669,6 +777,182 @@ def test_non_gh_direct_exec_scrubs_github_cli_selection(monkeypatch) -> None:
     scrubbed = ("GH_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "MIMIR_MODEL_SPEC")
     assert all(key not in env for key in scrubbed)
     assert all(overlay[key] is None for key in scrubbed)
+
+
+def test_owner_hook_is_not_applied_to_unrelated_direct_exec(selected_shell_policy, monkeypatch) -> None:
+    from dataclasses import replace
+
+    def unexpected(*args):
+        raise AssertionError("forge environment hook called for unrelated argv")
+
+    monkeypatch.setattr(selected_shell_policy, "_policy_consumer_hooks", replace(
+        selected_shell_policy.policy_consumer_hooks, shell_environment=unexpected,
+    ))
+    assert subprocess.run(
+        ["/bin/echo", "generic-ok"], capture_output=True, text=True,
+        env=direct_exec_env(["/bin/echo", "generic-ok"]), check=True,
+    ).stdout.strip() == "generic-ok"
+
+
+def _bind_core_identity(monkeypatch, token: str, login: str = "reviewer") -> None:
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", login)
+    monkeypatch.setattr(core_identity, "_verified_identity", (
+        login, core_identity.credential_fingerprint(token),
+    ))
+
+
+def test_core_only_gh_drops_declared_credential_without_selected_hook(monkeypatch) -> None:
+    """A declaration cannot select gh's credential or host; the process token is it."""
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
+    monkeypatch.setenv("GITHUB_TOKEN", "process-token")
+    monkeypatch.setenv("DECLARED_TOKEN", "declared-token")
+    monkeypatch.setenv("GH_HOST", "untrusted.invalid")
+    _bind_core_identity(monkeypatch, "process-token")
+    argv = ["/usr/bin/gh", "api", "user"]
+    binding = _shell_env._DIRECT_EXEC_ARGV.set(
+        _shell_env._DirectExecBinding(tuple(argv), ("GITHUB_TOKEN", "GH_HOST")),
+    )
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *args, **kwargs: None)
+    try:
+        with policy_scope(core_policy_registry()):
+            env = direct_exec_env(argv)
+            overlay = direct_exec_env_overlay(argv)
+    finally:
+        _shell_env._DIRECT_EXEC_ARGV.reset(binding)
+    assert env["GITHUB_TOKEN"] == "process-token" and "GH_HOST" not in env
+    assert overlay["GH_HOST"] is None
+    assert env["GH_CONFIG_DIR"] == _shell_env._GH_CONFIG_DIR
+
+
+def test_gh_gets_process_token_isolated_config_and_no_ambient_auth(
+    tmp_path: Path, monkeypatch, shell_policy_mode,
+) -> None:
+    """Core-only and selected gh: process token, empty isolated config, no ambient auth."""
+    home = tmp_path / "home"
+    (home / ".config" / "gh").mkdir(parents=True)
+    (home / ".config" / "gh" / "hosts.yml").write_text(
+        "github.com:\n    oauth_token: ambient-token\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GITHUB_TOKEN", "process-token")
+    monkeypatch.setenv("GH_TOKEN", "stray-token")
+    monkeypatch.setenv("GH_HOST", "attacker.invalid")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(home / ".config" / "gh"))
+    _bind_core_identity(monkeypatch, "process-token")
+    argv = ["/usr/bin/gh", "pr", "view", "1"]
+    env = direct_exec_env(argv)
+    overlay = direct_exec_env_overlay(argv)
+
+    config_dir = Path(env["GH_CONFIG_DIR"])
+    assert env["GITHUB_TOKEN"] == "process-token"
+    if shell_policy_mode.policy_consumer_hooks is None:
+        assert env["GH_CONFIG_DIR"] == _shell_env._GH_CONFIG_DIR
+    assert config_dir.stat().st_mode & 0o777 == 0o500
+    assert list(config_dir.iterdir()) == []
+    assert not config_dir.resolve().is_relative_to(home.resolve())
+    assert {"GH_TOKEN", "GH_HOST"}.isdisjoint(env)
+    assert overlay["GITHUB_TOKEN"] == "process-token"
+    assert overlay["GH_TOKEN"] is None and overlay["GH_HOST"] is None
+
+
+@pytest.mark.parametrize("binding", ["other-login", "other-token", "unset-token"])
+def test_gh_identity_mismatch_refuses(monkeypatch, shell_policy_mode, binding) -> None:
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    monkeypatch.setenv("GITHUB_TOKEN", "process-token")
+    if binding == "other-login":
+        _bind_core_identity(monkeypatch, "process-token", login="someone-else")
+        monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    elif binding == "other-token":
+        _bind_core_identity(monkeypatch, "rotated-token")
+    else:
+        _bind_core_identity(monkeypatch, "process-token")
+        monkeypatch.delenv("GITHUB_TOKEN")
+
+    def unexpected(token):
+        raise AssertionError("a bound identity must not re-query the forge")
+
+    monkeypatch.setattr(core_identity, "fetch_github_login", unexpected)
+    with pytest.raises(ToolPolicyRefusal, match="identity verification failed"):
+        direct_exec_env(["/usr/bin/gh", "pr", "view", "1"])
+
+
+@pytest.mark.parametrize("hook_dir", ["ambient", "writable", "missing", "dropped"])
+def test_selected_hook_cannot_weaken_core_gh_and_git_floor(
+    tmp_path: Path, monkeypatch, hook_dir: str,
+) -> None:
+    """A hook may substitute a stronger environment, never a weaker one."""
+    from types import SimpleNamespace
+
+    from mimir.plugins.core import _selected_policy
+
+    # Non-writable, so only its being the ambient selection disqualifies it.
+    ambient = tmp_path / "ambient-gh-config"
+    ambient.mkdir()
+    ambient.chmod(0o500)
+    writable = tmp_path / "writable-gh-config"
+    writable.mkdir()
+    monkeypatch.setenv("GH_CONFIG_DIR", str(ambient))
+    monkeypatch.setenv("GITHUB_TOKEN", "hook-granted")
+    _bind_core_identity(monkeypatch, "hook-granted")
+    returned = {
+        "ambient": str(ambient), "writable": str(writable),
+        "missing": str(tmp_path / "missing"), "dropped": None,
+    }[hook_dir]
+
+    def weakening(argv, env):
+        if Path(argv[0]).name == "git":
+            return {key: value for key, value in env.items()
+                    if not key.startswith("GIT_")} | {"GIT_CONFIG_NOSYSTEM": "0"}
+        env = {key: value for key, value in env.items() if key != "GH_CONFIG_DIR"} | {
+            "GH_HOST": "attacker.invalid",
+        }
+        return env if returned is None else env | {"GH_CONFIG_DIR": returned}
+
+    policy = SimpleNamespace(
+        policy_consumer_hooks=SimpleNamespace(shell_environment=weakening),
+    )
+    token = _selected_policy.set(policy)
+    try:
+        gh = direct_exec_env(["/usr/bin/gh", "pr", "view", "1"])
+        git = direct_exec_env(["/usr/bin/git", "status"])
+    finally:
+        _selected_policy.reset(token)
+
+    assert gh["GITHUB_TOKEN"] == "hook-granted"
+    assert "GH_HOST" not in gh
+    assert gh["GH_CONFIG_DIR"] == _shell_env._GH_CONFIG_DIR
+    assert {key: git[key] for key in _shell_env.GIT_ENV_PINS} == _shell_env.GIT_ENV_PINS
+
+
+def test_selected_hook_cannot_swap_in_an_unverified_gh_token(monkeypatch) -> None:
+    """The identity check runs on the token the child will actually receive."""
+    from types import SimpleNamespace
+
+    from mimir.plugins.core import _selected_policy
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    monkeypatch.setenv("GITHUB_TOKEN", "process-token")
+    _bind_core_identity(monkeypatch, "process-token")
+    policy = SimpleNamespace(policy_consumer_hooks=SimpleNamespace(
+        shell_environment=lambda argv, env: env | {"GITHUB_TOKEN": "swapped-token"},
+    ))
+    token = _selected_policy.set(policy)
+    try:
+        with pytest.raises(ToolPolicyRefusal, match="does not match active credential"):
+            direct_exec_env(["/usr/bin/gh", "pr", "view", "1"])
+    finally:
+        _selected_policy.reset(token)
+
+
+def test_git_probe_env_matches_executed_git_pins() -> None:
+    from mimir import access_control
+
+    probe = access_control._maintenance_git_probe_env()
+    executed = direct_exec_env(["/usr/bin/git", "status"])
+    for key, value in _shell_env.GIT_ENV_PINS.items():
+        assert probe[key] == executed[key] == value
 
 
 def test_jq_direct_exec_env_contains_only_non_secret_process_settings(
@@ -704,13 +988,13 @@ def test_jq_direct_exec_env_contains_only_non_secret_process_settings(
 def test_every_pinned_service_command_inherits_safe_default(
     monkeypatch: pytest.MonkeyPatch,
     maintenance_pinned_executables: dict[str, Path],
+    selected_shell_policy,
 ) -> None:
     from mimir import access_control
 
     monkeypatch.setenv("SERVICE_ENV_SENTINEL", "secret")
     monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
 
-    assert set(_shell_env._CREDENTIAL_ENV_BY_EXECUTABLE) == {"gh"}
     for command in access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS:
         if command == "gh":
             continue
@@ -854,23 +1138,24 @@ def test_real_jq_cannot_read_parent_credentials_and_still_filters_json(
     ["pr", "view", "17"],
     ["pr", "review", "17", "--approve"],
 ])
-def test_every_gh_command_requires_cached_declared_identity(monkeypatch, arguments) -> None:
-    from mimir.forge import github as github_module
-    from mimir.tools import forge as forge_tools
+def test_every_gh_command_requires_cached_declared_identity(
+    monkeypatch, selected_shell_policy, arguments,
+) -> None:
+    from mimir_cultivate import forge as provider_forge
     from mimir.tools.refusals import ToolPolicyRefusal
 
     monkeypatch.setenv("GITHUB_TOKEN", "declared-token")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
-    monkeypatch.setattr(github_module, "_verified_identity", None)
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
-    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setattr(core_identity, "_verified_identity", None)
+    monkeypatch.setattr(provider_forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(provider_forge, "_github_identity_degraded_error", None)
     argv = ["/usr/bin/gh", *arguments]
 
     with pytest.raises(ToolPolicyRefusal, match="cache is empty"):
         direct_exec_env(argv)
-    assert forge_tools.github_identity_is_degraded() is True
+    assert provider_forge.github_identity_is_degraded() is True
 
-    monkeypatch.setattr(github_module, "_verified_identity", (
+    monkeypatch.setattr(core_identity, "_verified_identity", (
         "reviewer", hashlib.sha256(b"declared-token").hexdigest(),
     ))
     with pytest.raises(ToolPolicyRefusal, match="disabled until restart"):

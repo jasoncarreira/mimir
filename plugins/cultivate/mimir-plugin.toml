@@ -1,0 +1,21 @@
+name = "cultivate"
+version = "0.9.10"
+license = "BUSL-1.1"
+requires_mimir = "==0.9.10"
+themes = ["skins/squashmerge.json"]
+
+[frontend]
+api_major = 1
+module = "frontend/cultivate.v1.js"
+css = "frontend/cultivate.v1.css"
+
+[defaults]
+version = "0.9.10"
+skills = [
+  "defaults/skills/github-poller",
+  "defaults/skills/github-ci-watch",
+  "defaults/skills/chainlink-orchestrator",
+  "defaults/skills/worklink-tool-pins",
+  "defaults/skills/github",
+  "defaults/skills/review",
+]

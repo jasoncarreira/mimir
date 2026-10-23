@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import fields, replace
 from pathlib import Path
 
@@ -14,6 +15,8 @@ import pytest
 
 from mimir import access_control as policy
 from mimir import read_policy
+from mimir.plugins.core import core_policy_registry, policy_membership, policy_scope
+from mimir.plugins.manager import load_plugins
 from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel, TurnInteractivity
 from mimir.tool_descriptors import (
     TOOL_DESCRIPTORS,
@@ -36,6 +39,23 @@ SERVICE_CASES = {
 SERVICE_READABLE = ("filesystem", "repository", "schedule_metadata")
 SERVICE_SINKS = ("message", "filesystem", "network", "bound_pull_request")
 HOME_TOKEN = "<oracle-home>"
+# Explicitly pin the entire coding-enabled runtime inventory, including the
+# Worklink tools exposed on the default surface rather than the coding surface.
+CODING_TOOLS = frozenset("""spawn_open_code pr_list pr_metadata pr_spec pr_files pr_diff
+    pr_file_content pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews
+    pr_comments pr_review_requests pr_submit_review pr_inline_review_comment
+    pr_comment pr_edit_body issue_comment pr_rerequest_review unsupported_operation
+    repo_checkout repo_cleanup repo_fetch repo_status repo_test repo_diff
+    repo_unmerged repo_stage repo_commit repo_merge repo_merge_abort repo_rebase
+    repo_rebase_abort repo_revert repo_revert_abort repo_push worklink_run
+    worklink_resume""".split())
+# This flag is a separate declaration from the target-aware tainted-write
+# membership: both must survive migration to the selected plugin registry.
+CODING_WRITES_CODE_OR_STATE = frozenset("""spawn_open_code worklink_run
+    worklink_resume repo_checkout repo_cleanup repo_fetch repo_test repo_stage
+    repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort repo_revert
+    repo_revert_abort repo_push pr_submit_review pr_inline_review_comment pr_comment
+    pr_edit_body issue_comment pr_rerequest_review""".split())
 
 
 def _canonical(value: object, home: Path) -> bytes:
@@ -172,11 +192,10 @@ def _middleware_results(home: Path) -> dict[str, object]:
 
 
 def _conditional_surface(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
-    from mimir.tools import forge, mcp, registry
+    from mimir.tools import mcp, registry
 
     result = {}
     with monkeypatch.context() as controlled:
-        controlled.setattr(forge, "github_identity_is_degraded", lambda: False)
         controlled.setattr(mcp, "get_mcp_tools", lambda: ())
         controlled.setenv("TAVILY_API_KEY", "oracle-key")
         controlled.delenv("MIMIR_FETCH_URL_DISABLED", raising=False)
@@ -184,7 +203,7 @@ def _conditional_surface(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]
             for coding in (False, True):
                 names = {
                     tool.name for tool in registry.all_mimir_tools(
-                        model_spec, coding_enabled=coding, require_coding_available=False,
+                        model_spec, policy=core_policy_registry(), require_provider_available=False,
                     )
                 }
                 result[f"{model_spec}:coding={coding}"] = sorted(names)
@@ -192,7 +211,7 @@ def _conditional_surface(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]
         controlled.delenv("TAVILY_API_KEY", raising=False)
         result["openai:oracle:web_disabled"] = sorted(
             tool.name for tool in registry.all_mimir_tools(
-                "openai:oracle", coding_enabled=False,
+                "openai:oracle", policy=core_policy_registry(),
             )
         )
     return result
@@ -311,6 +330,7 @@ def _snapshot(home: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
             "forge_actions": dict(sorted(policy._FORGE_TOOL_ACTIONS.items())),
             "repo_actions": dict(sorted(policy._REPO_TOOL_ACTIONS.items())),
             "retained_repo_tools": sorted(policy._RETAINED_REPO_TOOLS),
+            "repo_publish_tools": sorted(policy_membership("repo_publish_tools")),
             "protected_domains": dict(sorted(policy._PROTECTED_RESULT_DOMAINS.items())),
             "readable_domains": dict(sorted(policy._OPERATION_READABLE_DOMAIN.items())),
             "read_resource_operations": sorted(read_policy.READ_RESOURCE_OPERATIONS),
@@ -378,4 +398,170 @@ def test_original_core_policy_matches_frozen_oracle(
     assert expected["baseline_sha"] == BASELINE
     assert len(expected["descriptors"]) == 103
     assert _canonical(expected, home) == fixture_bytes
-    assert _canonical(_snapshot(home, monkeypatch), home) == fixture_bytes
+    retired = CODING_TOOLS | {"pr_review_others"}
+
+    def without_retired(value):
+        if isinstance(value, dict):
+            return {key: without_retired(item) for key, item in value.items()
+                    if key not in retired}
+        if isinstance(value, list):
+            return [without_retired(item) for item in value
+                    if not (isinstance(item, str) and item in retired)]
+        return value
+
+    observed = without_retired(json.loads(_canonical(_snapshot(home, monkeypatch), home)))
+    projected = without_retired(expected)
+    projected["tables"]["profile_capability_companions"] = {
+        profile: companions for profile, companions in
+        projected["tables"]["profile_capability_companions"].items() if companions
+    }
+    scheduler = projected["tables"]["trusted_service_principals"]["scheduled_tick"]
+    scheduler["sink_destinations"] = [
+        destination for destination in scheduler["sink_destinations"]
+        if destination not in {"spawn_process", "worklink"}
+    ]
+    scheduler["sink_policies"] = [
+        item for item in scheduler["sink_policies"] if len(item) == 3
+    ]
+    for key, value in scheduler.items():
+        assert observed["tables"]["trusted_service_principals"]["scheduled_tick"][key] == value, key
+    assert observed.keys() == projected.keys()
+    for category, value in observed.items():
+        if isinstance(value, dict):
+            assert value.keys() == projected[category].keys(), category
+            for name, item in value.items():
+                assert item == projected[category][name], (category, name)
+        else:
+            assert value == projected[category], category
+
+
+def test_pre_extraction_coding_policy_is_frozen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    home = tmp_path / "oracle-home"
+    _prepare_inputs(home, monkeypatch)
+    frozen = json.loads(FIXTURE.read_bytes())
+    tables = frozen["tables"]
+    registry = core_policy_registry()
+    retired = CODING_TOOLS
+
+    assert len(CODING_TOOLS) == 40
+    assert CODING_TOOLS <= frozen["descriptors"].keys()
+    assert CODING_TOOLS <= frozen["authorization"].keys()
+    assert CODING_TOOLS <= frozen["extractor_results"].keys()
+    assert retired.isdisjoint(registry.tools)
+    required_memberships = (
+        "retained_repo_tools", "worklink_build_tools", "repo_publish_tools",
+        "tainted_writes",
+    )
+    assert set(required_memberships) <= tables.keys()
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        observed = _outcomes(home)
+    for name in sorted(CODING_TOOLS):
+        tool = selected.tools[name]
+        descriptor = frozen["descriptors"][name]
+        assert tool.flow == tables["flow"].get(name)
+        assert tool.tier == tables["tier"].get(name)
+        assert tool.operation_class == tables["catalog"][name]
+        assert tool.result_domain == tables["protected_domains"].get(name)
+        assert tool.readable_domain == tables["readable_domains"].get(name)
+        assert tool.descriptor is not None
+        assert tool.descriptor.sink_category == descriptor["sink_category"]
+        assert tool.descriptor.sink_destination == descriptor["sink_destination"]
+        assert tool.writes_code_or_state == (name in CODING_WRITES_CODE_OR_STATE)
+        assert tool.profiles == frozenset(
+            profile for profile, names in tables["profiles"].items() if name in names
+        )
+        for membership in required_memberships:
+            assert (membership in tool.memberships) == (name in tables[membership])
+        assert len(frozen["authorization"][name]) == 18
+    for name in sorted(CODING_TOOLS):
+        assert observed[name].keys() == frozen["authorization"][name].keys()
+        for case, original in frozen["authorization"][name].items():
+            current = observed[name][case]
+            tool = selected.tools[name]
+            if current == original:
+                continue
+            enforced = case.endswith(":enforced")
+            tainted = "_tainted_" in case
+            # These oracle contexts have neither a server-issued PR grant nor
+            # a review state. Previously they stopped at the legacy scope gate;
+            # selected tools must now fail at the more specific owner grant or
+            # fail to extract a target from that missing state.
+            if (tool.resource_scope == "repo_pr" and original[3] == "repo_pr_scope_denied"
+                    and current[3] == "repo_pr_grant_denied"):
+                assert tool.typed_action is not None and tool.flow == "source"
+                expected = [*original[:3], "repo_pr_grant_denied", *original[4:]]
+            elif (tool.resource_scope == "repo_pr" and original[3] == "repo_pr_scope_denied"
+                  and current[3] == "sink_target_required"):
+                assert tool.typed_action is not None and tool.flow in {"both", "sink"}
+                expected = [*original[:3], "sink_target_required", "admin", *original[5:]]
+            elif name == "unsupported_operation" and current[3] == "channel_target_required":
+                assert tool.resource_scope == "channel" and original[3] == "repo_pr_scope_denied"
+                expected = [*original[:3], "channel_target_required", "admin", *original[5:]]
+            elif (tool.writes_code_or_state and "worklink_build_tools" not in tool.memberships
+                  and tainted and current[3] == "write_blocked_by_untrusted_ingest"):
+                assert original[3] in {
+                    "repo_pr_scope_denied", "ifc_label_blocked:forge", "ifc_label_blocked:spawn",
+                    "issue_repository_source_required", "admin_required", None,
+                }
+                expected = ["admin_required", False, True,
+                            "write_blocked_by_untrusted_ingest", "admin", "unknown", False]
+            elif name in {"worklink_run", "worklink_resume"}:
+                assert tool.resource_scope == "worklink"
+                assert not os.environ.get("WORKLINK_REPO") and not os.environ.get("MIMIR_WORKLINK_REPO")
+                expected = ["resource_scoped", not enforced, True,
+                            "sink_target_required", "admin", "both", not enforced]
+            elif name == "spawn_open_code":
+                assert not tainted and tool.descriptor.sink_destination == "spawn_process"
+                expected = ["admin_required", not enforced, True,
+                            "sink_target_required", "admin", "both", not enforced]
+            else:
+                pytest.fail(f"unreviewed coding authorization change: {name} {case}: {original} -> {current}")
+            assert current == expected, (name, case, original, current)
+
+
+def test_selected_coding_tools_reach_a_permitted_production_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from tests.test_repo_tools import _selected_checkout_and_follow_on_with_live_grants
+
+    selected, scope, _auth, _follow_on, checkout, fetched = (
+        _selected_checkout_and_follow_on_with_live_grants(tmp_path, monkeypatch)
+    )
+    assert selected.tools["repo_checkout"].owner == "cultivate"
+    assert selected.tools["repo_fetch"].owner == "cultivate"
+    assert scope.observed_head_sha
+    assert checkout.status != "error"
+    assert fetched.status != "error"
+
+
+def test_selected_spawn_and_build_admit_clean_bound_destinations(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        for tool, target, arguments in (
+            ("spawn_open_code", str(home), {"cwd": str(home)}),
+            ("worklink_run", str(repo), {}),
+        ):
+            for enforce in (False, True):
+                decision = policy.ToolRegistry().authorize_tool(
+                    tool, _context("admin", False), enforce=enforce,
+                    target_channel=target, arguments=arguments,
+                )
+                assert decision.allowed and not decision.would_block, (tool, enforce, decision.reason)
+                assert decision.flow_direction.value == "both"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from importlib.util import find_spec
 import os
 import json
 from pathlib import Path
@@ -17,8 +18,11 @@ from mimir.tools.registry import (
     _spawn_release_rate_slot,
     _spawn_reset_for_tests,
     set_spawn_config,
-    spawn_open_code,
 )
+if find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.opencode import spawn_open_code
+else:
+    spawn_open_code = None
 
 
 @pytest.fixture(autouse=True)
@@ -168,8 +172,8 @@ def test_reset_clears_loop_bound_state() -> None:
 
 
 def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from mimir import contained_checkout, contained_execution
-    from mimir.contained_execution import CollectedExecutionResult
+    from mimir_cultivate import contained_checkout, contained_execution
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
 
     home = tmp_path / "home"
     seed = tmp_path / "seed"
@@ -220,6 +224,7 @@ def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(spawn_open_code is None, reason="requires installed Cultivate")
 async def test_tool_depth_refusal_and_below_cap_propagation(tmp_path, monkeypatch):
     seed, calls, _module = _surface_setup(tmp_path, monkeypatch)
     monkeypatch.setenv("MIMIR_SPAWN_MAX_DEPTH", "2")
@@ -237,8 +242,9 @@ async def test_tool_depth_refusal_and_below_cap_propagation(tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
+@pytest.mark.skipif(spawn_open_code is None, reason="requires installed Cultivate")
 async def test_tool_semaphore_bounds_concurrent_contained_spawns(tmp_path, monkeypatch):
-    from mimir.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
     seed, calls, contained_execution = _surface_setup(tmp_path, monkeypatch)
     monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "1")
     entered = asyncio.Event()

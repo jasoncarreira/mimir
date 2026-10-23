@@ -1,5 +1,6 @@
 """#1937: always-on same-PR veto, egress-only grants, and scratch closure."""
 from dataclasses import replace
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +9,19 @@ import pytest
 from mimir import access_control as ac
 from mimir.models import InformationFlowState, IntegrityEffect, Integrity
 from tests.test_access_control import _trusted_operator_write_auth, _review_state, _repository_result_labels
+
+
+@pytest.fixture
+def selected_repository_policy():
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("repository write tools require installed Cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
 
 
 def tainted():
@@ -32,7 +46,7 @@ def test_every_tainted_write_same_pr_refused(tool, enforce):
 
 @pytest.mark.parametrize("tool", ["repo_test", "repo_push", "repo_commit"])
 @pytest.mark.parametrize("enforce", [False, True])
-def test_egress_grant_never_unlocks_repo_write(tool, enforce):
+def test_egress_grant_never_unlocks_repo_write(tool, enforce, selected_repository_policy):
     auth, scope = tainted()
     target = "owner/repo#pull/7"
     assert auth.ifc_state.approve_sink_once(fallback=auth.ifc_labels, sink_category="forge",
@@ -46,13 +60,58 @@ def test_egress_grant_never_unlocks_repo_write(tool, enforce):
     assert auth.ifc_state._declassification is not None
 
 
-def test_unbound_grant_does_not_open_write():
+def test_unbound_grant_does_not_open_write(selected_repository_policy):
     auth, scope = tainted()
     assert auth.ifc_state.approve_sink_once(fallback=auth.ifc_labels, sink_category="forge",
         destination="owner/repo#pull/7", canonical_principal=auth.canonical_principal,
         lifetime_seconds=30, durable_audit=lambda *_: True)
-    assert not ac.SinkGate.check_sink_flow("repo_push", "owner/repo#pull/7", auth.ifc_labels,
-        auth, enforce=True, repo_pr_action_scope=scope).allowed
+    decision = ac.SinkGate.check_sink_flow("repo_push", "owner/repo#pull/7", auth.ifc_labels,
+        auth, enforce=True, repo_pr_action_scope=scope)
+    assert not decision.allowed
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.parametrize("tool", ["repo_test", "repo_push", "repo_commit"])
+@pytest.mark.parametrize("enforce", [False, True])
+def test_retired_core_repository_tool_is_unavailable(tool, enforce):
+    from mimir.plugins.core import core_policy_registry, policy_scope
+
+    auth, _ = tainted()
+    with policy_scope(core_policy_registry()):
+        decision = ac.ToolRegistry().authorize_tool(tool, auth, enforce=enforce)
+    assert tool not in core_policy_registry().tools
+    assert decision.allowed is not enforce
+    assert decision.would_block
+    assert decision.reason == ("unknown_sink_category" if enforce else "unknown_operation")
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("tool", ["repo_test", "repo_push", "repo_commit"])
+def test_retired_core_repository_tool_cannot_dispatch(tool, enforce):
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langgraph.runtime import Runtime
+
+    from mimir.plugins.core import core_policy_registry
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, _ = tainted()
+    auth = replace(auth, enforcement_enabled=enforce)
+    request = ToolCallRequest(
+        tool_call={"name": tool, "args": {"repository": "owner/repo", "pull_request": 7},
+                   "id": "core-only", "type": "tool_call"},
+        tool=None, state={}, runtime=Runtime(context=auth),
+    )
+    called = []
+
+    def handler(_request):
+        called.append(True)
+        return ToolMessage(content="executed", tool_call_id="core-only")
+
+    result = BudgetGateMiddleware(core_policy_registry()).wrap_tool_call(request, handler)
+    assert result.status == "error"
+    assert ("unknown_sink_category" if enforce else "unknown_operation") in str(result.content)
+    assert not called
 
 
 @pytest.mark.parametrize("path", ["state/wiki/a.md", "memory/a.md", "skills/x/SKILL.md",
@@ -62,7 +121,7 @@ def test_only_scratch_file_writes(path, tmp_path):
     assert not ac.tainted_file_write_target("scratch/turns/a.md", tmp_path)
 
 
-def test_registered_file_aliases_keep_target_aware_veto(tmp_path, monkeypatch):
+def test_registered_file_aliases_keep_target_aware_veto(tmp_path, monkeypatch, selected_repository_policy):
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     for tool in ac._TAINTED_FILE_WRITE_TOOLS:
         assert ac.tainted_write_target(tool, "state/live.md")

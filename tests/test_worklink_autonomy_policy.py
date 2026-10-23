@@ -21,9 +21,12 @@ from typing import Sequence
 
 import pytest
 
-from mimir.worklink import BackendRegistry, Caps, ComputeCaps, WorklinkConfig
-from mimir.worklink.backends.registry import WorklinkDefaults
-from mimir.worklink.orchestrator import WorklinkRunner
+pytest.importorskip("mimir_cultivate")
+
+from mimir_cultivate.worklink.backends.base import Caps
+from mimir_cultivate.worklink.compute import ComputeCaps
+from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
+from mimir_cultivate.worklink.orchestrator import WorklinkRunner
 
 ISSUE_JSON = (
     '{"id": 441, "title": "worklink slice",'

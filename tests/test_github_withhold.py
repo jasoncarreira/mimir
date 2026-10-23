@@ -7,11 +7,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from mimir.github_withhold import (
+from tests.plugin_selection import cultivate_selected
+
+from tests.withhold_probe import OUTSIDER_MARKER, assert_marker_absent
+
+if not cultivate_selected():
+    pytest.skip("Cultivate is not selected", allow_module_level=True)
+
+from mimir_cultivate.github_trust import (
     WithheldItem, partition, placeholder, sanitize_login, sanitize_timestamp,
     sanitize_url, summarise,
 )
-from tests.withhold_probe import OUTSIDER_MARKER, assert_marker_absent
 
 
 def _candidate(kind: str, author: str) -> dict[str, object]:
@@ -75,7 +81,7 @@ def test_partition_withholds_truthy_non_bool_attestations(verdict: object) -> No
 def test_truthy_attestation_mutant_fails_regression(
     monkeypatch: pytest.MonkeyPatch, verdict: object,
 ) -> None:
-    import mimir.github_withhold as withhold
+    import mimir_cultivate.github_trust as withhold
 
     source = Path(withhold.__file__).read_text(encoding="utf-8")
     assert source.count("if verdict is True:") == 1
@@ -164,14 +170,19 @@ def test_marker_probe_reads_events_jsonl(tmp_path: Path) -> None:
 
 
 def _assert_github_fetch_cache_closed(root: Path) -> None:
-    sources = [root / "mimir/tools/forge.py", root / "mimir/pollers.py"]
-    sources.extend((root / "mimir/forge").rglob("*.py"))
+    provider = root / "plugins/cultivate/mimir_cultivate"
+    sources = [
+        provider / "forge.py", provider / "ci.py", provider / "github_trust.py",
+        root / "mimir/pollers.py",
+    ]
     sources.extend((root / "mimir/pollers").rglob("*.py"))
-    # Include both shipped GitHub pollers and any future GitHub skill scripts.
-    skills = root / "mimir/optional-skills"
+    # Include both shipped GitHub pollers and any future core GitHub skill scripts.
+    skills = root / "plugins/cultivate/mimir_cultivate/defaults/skills"
     for name in ("github-poller", "github-ci-watch"):
         assert (skills / name / "scripts/poller.py").is_file(), name
     for skill in skills.glob("github-*"):
+        sources.extend(skill.rglob("*.py"))
+    for skill in (root / "mimir/optional-skills").glob("github-*"):
         sources.extend(skill.rglob("*.py"))
     for source in sources:
         # Also catches component-built paths, not just the slash spelling.
@@ -183,11 +194,12 @@ def test_forge_and_github_pollers_do_not_read_fetch_cache() -> None:
 
 
 @pytest.mark.parametrize("relative_path", [
-    "mimir/tools/forge.py",
-    "mimir/forge/nested/client.py",
+    "plugins/cultivate/mimir_cultivate/forge.py",
+    "plugins/cultivate/mimir_cultivate/ci.py",
+    "plugins/cultivate/mimir_cultivate/github_trust.py",
     "mimir/pollers/nested/github.py",
-    "mimir/optional-skills/github-poller/scripts/poller.py",
-    "mimir/optional-skills/github-ci-watch/scripts/poller.py",
+    "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/scripts/poller.py",
+    "plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/scripts/poller.py",
     "mimir/optional-skills/github-future/scripts/poller.py",
 ])
 @pytest.mark.parametrize("injected_source", [
@@ -199,9 +211,12 @@ def test_fetch_cache_closure_detects_injected_path_spellings(
     tmp_path: Path, relative_path: str, injected_source: str,
 ) -> None:
     for required in (
-        "mimir/tools/forge.py", "mimir/pollers.py",
-        "mimir/optional-skills/github-poller/scripts/poller.py",
-        "mimir/optional-skills/github-ci-watch/scripts/poller.py",
+        "plugins/cultivate/mimir_cultivate/forge.py",
+        "plugins/cultivate/mimir_cultivate/ci.py",
+        "plugins/cultivate/mimir_cultivate/github_trust.py",
+        "mimir/pollers.py",
+        "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/scripts/poller.py",
+        "plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/scripts/poller.py",
     ):
         source = tmp_path / required
         source.parent.mkdir(parents=True, exist_ok=True)

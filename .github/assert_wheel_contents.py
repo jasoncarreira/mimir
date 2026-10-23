@@ -62,6 +62,11 @@ def main() -> None:
     direct_members = wheel_members(args.direct_wheel)
 
     for members in (sdist_members, direct_members):
+        plugin_members = [name for name in members if name.startswith("plugins/") or
+                          name.startswith("mimir_cultivate/") or
+                          name.startswith("mimir_cultivate-")]
+        if plugin_members:
+            raise SystemExit(f"Cultivate leaked into mimir-agent wheel: {plugin_members}")
         example_members = [name for name in members if "mimir_example_plugin" in name or
                            "tests/fixtures/plugins/example/" in name]
         if example_members:

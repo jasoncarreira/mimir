@@ -48,15 +48,15 @@ ALLOWLIST = {
     "CODEX_HOME",         # Codex CLI's own config dir; read to locate auth.
     "CLAUDE_CONFIG_DIR",  # Claude Code CLI's own config dir.
     "CHAINLINK_BIN",      # Path override for the external chainlink CLI binary.
-    "WORKLINK_RUN_BIN",   # Path override for the external worklink runner.
-    "WORKLINK_RUN_LOG",   # Poller-supplied run-log path for failure escalation.
+    "GH_CONFIG_DIR",      # gh CLI's own config dir; read only to refuse an
+                          # ambient one as the forced isolation dir.
     "MIMIR_SPAWN_DEPTH",  # Harness-set on child processes to track spawn depth;
                           # read to enforce the recursion cap, not operator-set.
 }
 
 # Only read to warn once at boot; retired and deliberately absent from the
 # operator configuration reference.
-RETIRED_KEYS = {"MIMIR_UNAUTHORIZED_USER_BEHAVIOR"}
+RETIRED_KEYS = {"MIMIR_UNAUTHORIZED_USER_BEHAVIOR", "MIMIR_CODING_ENABLED"}
 
 _ENV_ACCESSOR_HINT = "env"  # substring identifying env-reading helper callees
 # Double-underscore suffixes are namespace prefixes (for example

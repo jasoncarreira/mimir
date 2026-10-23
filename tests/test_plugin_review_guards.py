@@ -781,43 +781,151 @@ def test_poller_builder_uses_registry_properties_not_canonical_literals(canonica
     from mimir.access_control import build_trigger_service_principal
     from mimir.plugins.core import PollerProperties, core_policy_registry
 
-    def build(policy):
+    def build(policy, *, owner=None):
         return build_trigger_service_principal(
             canonical=canonical, trigger="poller", profile="github",
             tier=CapabilityTier.SCOPE_CONTAINED, capabilities=(),
-            creation_path="test:poller", policy=policy,
+            creation_path="test:poller", policy=policy, poller_owner=owner,
         )
 
-    assert getattr(build(core_policy_registry()), flag) is True
+    assert getattr(build(core_policy_registry()), flag) is False
     registry = PolicyRegistry()
     register_core_tools(registry)
-    # Test-only replacement isolates the declaration's effect. A literal-name
-    # fallback would incorrectly keep the property despite the selected policy.
-    registry._poller_properties[canonical] = PollerProperties()
     selected = registry.freeze()
     assert getattr(build(selected), flag) is False
-    assert getattr(build(core_policy_registry()), flag) is True
+    assert getattr(build(core_policy_registry()), flag) is False
+    import importlib.util
+    from mimir.plugins.manager import load_plugins
+
+    if importlib.util.find_spec("mimir_cultivate") is None:
+        from mimir.plugins.discovery import PluginDiscoveryError
+
+        with pytest.raises(PluginDiscoveryError, match="missing plugin"):
+            load_plugins(enable="cultivate")
+    else:
+        cultivate = load_plugins(enable="cultivate").policy
+        assert cultivate.frozen
+        assert getattr(build(cultivate), flag) is False
+        assert getattr(build(cultivate, owner="example"), flag) is False
+        assert getattr(build(cultivate, owner="cultivate"), flag) is True
     with pytest.raises(TypeError):
         selected.poller_properties[canonical] = PollerProperties()
     with pytest.raises(PolicyRegistrationError, match="frozen"):
         selected.register_poller_properties("poller:another", PollerProperties())
 
 
-def test_poller_properties_are_core_only_and_duplicate_safe():
+_POLLER_PROPERTY_GRANTS = (
+    {},
+    {"github_activity": True},
+    {"github_ci_watch": True},
+    {"worklink_retained_checkout": True},
+)
+
+
+def _first_party_bound_registry() -> PolicyRegistry:
+    """A writable registry bound to the real Cultivate candidate and an enabled
+    third-party candidate, so "selected and enabled" alone cannot pass."""
+    pytest.importorskip("mimir_cultivate")
+    from dataclasses import replace
+    from importlib.metadata import EntryPoint
+
+    from mimir.plugins.manager import load_plugins
+
+    (cultivate,) = load_plugins(enable="cultivate").policy.selected_plugin_candidates
+    third_party = replace(
+        cultivate, name="example", distribution="example-plugin",
+        entry_point=EntryPoint("example", "example_plugin:provider", "mimir.plugins"),
+    )
+    assert third_party.enabled and third_party.diagnostic is None
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((cultivate, third_party))
+    return registry
+
+
+@pytest.mark.parametrize("grant", _POLLER_PROPERTY_GRANTS, ids=lambda grant: next(iter(grant), "none"))
+def test_third_party_owner_cannot_register_any_poller_property(grant):
     from mimir.plugins.core import PollerProperties
 
     registry = PolicyRegistry()
-    with pytest.raises(PolicyRegistrationError, match="core-only"):
-        registry.register_poller_properties(
-            "poller:example", PollerProperties(github_activity=True), owner="example",
+    with pytest.raises(PolicyRegistrationError, match="example: poller properties require core"):
+        registry.registrar("example").register_poller_properties(
+            "poller:example", PollerProperties(**grant),
         )
-    assert not registry.poller_properties
-    assert not hasattr(registry.registrar("example"), "register_poller_properties")
+    assert not registry.plugin_poller_properties
+
+
+@pytest.mark.parametrize("grant", _POLLER_PROPERTY_GRANTS, ids=lambda grant: next(iter(grant), "none"))
+def test_enabled_third_party_owner_is_refused_beside_selected_first_party(grant):
+    """Being selected and enabled is not enough: only the first-party owner passes."""
+    from mimir.plugins.core import PollerProperties
+
+    registry = _first_party_bound_registry()
+    for owner in ("example", "cultivate-fork"):
+        with pytest.raises(PolicyRegistrationError, match="poller properties require core"):
+            registry.registrar(owner).register_poller_properties(
+                f"poller:{owner}", PollerProperties(**grant),
+            )
+    assert not registry.plugin_poller_properties
+
+
+def test_core_poller_properties_are_duplicate_safe():
+    from mimir.plugins.core import PollerProperties
+
+    registry = PolicyRegistry()
     properties = PollerProperties(github_activity=True)
-    registry.register_poller_properties("poller:example", properties)
+    registry.register_poller_properties("poller:core-example", properties)
+    with pytest.raises(PolicyRegistrationError, match="duplicate"):
+        registry.register_poller_properties("poller:core-example", PollerProperties())
+    assert registry.poller_properties["poller:core-example"] is properties
+    selected = registry.freeze()
+    with pytest.raises(TypeError):
+        selected.poller_properties["poller:core-example"] = properties
+
+
+@pytest.mark.parametrize("grant", _POLLER_PROPERTY_GRANTS[1:], ids=lambda grant: next(iter(grant)))
+def test_selected_first_party_poller_properties_are_owner_bound(grant):
+    from mimir.plugins.core import PollerProperties, poller_properties
+
+    registry = _first_party_bound_registry()
+    (flag,) = grant
+    registry.registrar("cultivate").register_poller_properties(
+        "poller:example", PollerProperties(**grant),
+    )
+    assert not registry.poller_properties
+    assert registry.plugin_poller_properties["poller:example"][0] == "cultivate"
+    with pytest.raises(PolicyRegistrationError, match="duplicate"):
+        registry.registrar("cultivate").register_poller_properties(
+            "poller:example", PollerProperties(),
+        )
     with pytest.raises(PolicyRegistrationError, match="duplicate"):
         registry.register_poller_properties("poller:example", PollerProperties())
-    assert registry.poller_properties["poller:example"] is properties
+    selected = registry.freeze()
+    assert not getattr(poller_properties("poller:example", policy=selected), flag)
+    assert not getattr(poller_properties("poller:example", owner="other", policy=selected), flag)
+    assert getattr(poller_properties("poller:example", owner="cultivate", policy=selected), flag)
+    with pytest.raises(TypeError):
+        selected.plugin_poller_properties["poller:example"] = ("other", PollerProperties())
+
+
+def test_retained_checkout_operation_requires_selected_first_party_owner():
+    def operation(**_kwargs):
+        return {}
+
+    unbound = PolicyRegistry()
+    for owner in ("example", "cultivate"):
+        # Without selection even the first-party name is refused.
+        with pytest.raises(PolicyRegistrationError, match="invalid retained checkout operation"):
+            unbound.registrar(owner).register_retained_checkout_operation(operation)
+    with pytest.raises(PolicyRegistrationError, match="invalid retained checkout operation"):
+        unbound.register_retained_checkout_operation(operation)
+    assert unbound.retained_checkout_operation is None
+
+    registry = _first_party_bound_registry()
+    with pytest.raises(PolicyRegistrationError, match="example: invalid retained checkout operation"):
+        registry.registrar("example").register_retained_checkout_operation(operation)
+    assert registry.retained_checkout_operation is None
+    registry.registrar("cultivate").register_retained_checkout_operation(operation)
+    assert registry.retained_checkout_operation == ("cultivate", operation)
 
 
 def test_authorization_module_contains_no_reserved_poller_name_literals():

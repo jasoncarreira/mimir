@@ -117,8 +117,6 @@ def _app(home: Path, master_key: str) -> web.Application:
     app.router.add_get(
         "/api/v1/chainlink-board/artifact", _echo,
     )  # Worklink artifacts
-    app.router.add_get("/api/v1/factory-runs", _echo)  # global factory artifacts
-    app.router.add_get("/api/v1/factory-runs/{run_id:.+}", _echo)
     app.router.add_get("/health", _echo)               # exempt
     return app
 
@@ -174,8 +172,6 @@ async def test_global_dashboard_routes_are_admin_only(tmp_path: Path) -> None:
         "/api/v1/scheduler",
         "/api/v1/chainlink-board",
         "/api/v1/chainlink-board/artifact",
-        "/api/v1/factory-runs",
-        "/api/v1/factory-runs/chainlink-834",
     )
     async with TestClient(TestServer(_app(tmp_path, "master-secret"))) as c:
         for path in admin_only_paths:
@@ -238,8 +234,6 @@ def test_admin_required_prefix_matching_is_segment_aware() -> None:
         "/api/v1/scheduler/jobs",
         "/api/v1/chainlink-board",
         "/api/v1/chainlink-board/artifact",
-        "/api/v1/factory-runs",
-        "/api/v1/factory-runs/chainlink-834",
         "/api/v1/saga",
         "/api/v1/saga/sql",
         "/api/v1/memory",

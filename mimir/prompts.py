@@ -127,8 +127,6 @@ informational and never gates.
 - External MCP posture is per tool: an operator may configure trusted results
   and/or allowed arguments; otherwise the tool fails closed with an untrusted
   result and taint-gated arguments.
-- ``worklink_run`` and other write-capable code execution require a trusted turn
-  with no untrusted active ingest. Generic ``spawn_*`` is blocked.
 - Durable memory (``memory_store``, ``saga_*`` writes, commitments) and writes into
   ``memory/`` or ``state/`` outside your own persist directory require a turn with
   no untrusted active ingest. Poller turns never qualify, so do not attempt them;
@@ -417,20 +415,6 @@ def build_turn_prompt(
                 "call ``operator_alert(text=...)``. Its destination is fixed by the "
                 "operator; do not use shell or file writes as a notification path."
             )
-        if "worklink_run" in capabilities:
-            lines.append(
-                "``worklink_run`` is usable only before any untrusted active ingest "
-                "in this turn."
-            )
-        if trigger_authority_profile == "github":
-            lines.append(
-                "Complete review work in this turn. Do not call "
-                "``approve_declassification`` (a taint-gated poller cannot approve "
-                "its own release) or any spawn tool (review authority does not "
-                "delegate into a coding process); neither capability is available."
-            )
-            if "pr_spec" in capabilities:
-                lines.append("To read the spec of record for the PR you are remediating, call `pr_spec`.")
         _add_labeled("Autonomous trigger authority", "\n".join(lines))
 
     # Algedonic channel (v0.4 §2): self-feedback signals between identities

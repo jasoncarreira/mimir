@@ -10,18 +10,22 @@ import pytest
 from pathlib import Path
 from typing import Sequence
 
-from mimir.worklink.backends import Caps, ComputeCaps, ComputeResult, RawResult, WorkOrder
-from mimir.worklink.backends.feature_factory import parse_factory_status
-from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
-from mimir.worklink.compute import LaunchHandle, WorkSpec
-from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
-from mimir.worklink.orchestrator import (
+pytestmark = pytest.mark.usefixtures("authorized_fake_backend_gate")
+
+pytest.importorskip("mimir_cultivate", reason="Worklink reattachment belongs to Cultivate")
+
+from mimir_cultivate.worklink.backends.base import Caps, RawResult, WorkOrder
+from mimir_cultivate.worklink.compute import ComputeCaps, ComputeResult, LaunchHandle, WorkSpec
+from mimir_cultivate.worklink.backends.feature_factory import parse_factory_status
+from mimir_cultivate.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
+from mimir_cultivate.worklink.factory_state import FactoryRunRecord, save_factory_record
+from mimir_cultivate.worklink.orchestrator import (
     WorklinkRunResult,
     WorklinkRunner,
     run_worklink,
     run_worklink_reattach,
 )
-from mimir.worklink.run_state import (
+from mimir_cultivate.worklink.run_state import (
     WorklinkRunState,
     clear_run_state,
     list_run_states,
@@ -337,9 +341,14 @@ def _write_completed_evidence(
     return path
 
 
+@pytest.mark.parametrize("release_ok", [True, False])
 def test_reattach_completed_evidence_reconciles_without_worker_or_push(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, release_ok: bool,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink import orchestrator as provider_orchestrator
+    from mimir_cultivate.worklink.run_state import load_run_state
+
     repo = tmp_path / "repo"
     repo.mkdir()
     issue_id = 564
@@ -352,32 +361,37 @@ def test_reattach_completed_evidence_reconciles_without_worker_or_push(
         if isinstance(args, list) and args[:3] == ["gh", "pr", "view"]:
             calls.append(args)
             return cp(args, stdout='{"state":"OPEN","headRefOid":"abc123"}')
+        if not release_ok and isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="release denied")
         return base_runner(args, cwd=cwd)
 
     events: list[tuple[str, dict]] = []
     monkeypatch.setattr(
-        "mimir.worklink.orchestrator._log_event",
+        "mimir_cultivate.worklink.orchestrator._log_event",
         lambda event_type, **payload: events.append((event_type, payload)),
     )
-    compute = FakeRemoteCompute()
-    registry = BackendRegistry(WorklinkConfig())
-    registry.register(FakeBackend())
-    registry.register_compute(compute)
+
+    async def unexpected_wait(*args: object, **kwargs: object) -> None:
+        pytest.fail("completed evidence must not restart the worker")
+
+    monkeypatch.setattr(provider_orchestrator.LocalSubprocessComputeBackend, "wait", unexpected_wait)
 
     result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(issue_id)
+        provider_orchestrator.WorklinkRunner(home=tmp_path, repo=repo, runner=runner).reattach(issue_id)
     )
 
-    assert result.status == "completed"
-    assert result.review_ready is True
+    assert result.status == ("completed" if release_ok else "failed")
+    assert result.review_ready is release_ok
     assert result.evidence_path == evidence_path
-    assert compute.waited == []
     assert not any(isinstance(a, list) and "push" in a for a in calls)
-    assert ["chainlink", "issue", "label", str(issue_id), "worklink:review"] in calls
+    assert (["chainlink", "issue", "label", str(issue_id), "worklink:review"] in calls) is release_ok
     assert ["chainlink", "locks", "release", str(issue_id)] in calls
-    assert any(event == "worklink_reattach_reconciled" for event, _ in events)
+    assert any(event == "worklink_reattach_reconciled" for event, _ in events) is release_ok
     assert not any(event == "worklink_reattach_branch_mismatch" for event, _ in events)
-    assert load_run_state(tmp_path, issue_id) is None
+    assert (load_run_state(tmp_path, issue_id) is None) is release_ok
+    if not release_ok:
+        assert result.reason == "terminal recovery incomplete: Chainlink lock release failed"
 
 
 def test_reattach_completed_evidence_remote_head_mismatch_warns_without_push(
@@ -399,7 +413,7 @@ def test_reattach_completed_evidence_remote_head_mismatch_warns_without_push(
 
     events: list[tuple[str, dict]] = []
     monkeypatch.setattr(
-        "mimir.worklink.orchestrator._log_event",
+        "mimir_cultivate.worklink.orchestrator._log_event",
         lambda event_type, **payload: events.append((event_type, payload)),
     )
     compute = FakeRemoteCompute()
@@ -481,8 +495,8 @@ def test_reattach_waits_on_original_handle_and_resolves_startup_incident(
     registry = BackendRegistry(WorklinkConfig())
     registry.register(ReattachWriteBackend())
     registry.register_compute(compute)
-    from mimir.worklink import orchestrator
-    from mimir.worklink.dispatch_failures import (
+    from mimir_cultivate.worklink import orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
         record_failure,
@@ -500,7 +514,7 @@ def test_reattach_waits_on_original_handle_and_resolves_startup_incident(
     monkeypatch.setattr(orchestrator, "BackendRegistry", lambda *_: registry)
     monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
     if clear_fails:
-        import mimir.worklink.dispatch_failures as dispatch_failures
+        import mimir_cultivate.worklink.dispatch_failures as dispatch_failures
 
         monkeypatch.setattr(
             dispatch_failures,
@@ -535,7 +549,7 @@ def test_reattach_waits_on_original_handle_and_resolves_startup_incident(
     assert load_failure_state(state_dir)["issues"][str(issue_id)]["active"] is clear_fails
     if not clear_fails:
         from mimir.models import AgentEvent
-        from mimir.pollers import _worklink_recovery_relevance_check
+        from mimir_cultivate.worklink.poller_hooks import recovery_relevance_check
 
         delivery_key = (
             f"worklink-run-failure:{issue_id}:{startup_incident['signature']}:"
@@ -558,14 +572,14 @@ def test_reattach_waits_on_original_handle_and_resolves_startup_incident(
             },
         )
         assert asyncio.run(
-            _worklink_recovery_relevance_check(state_dir)(queued_wake)
+            recovery_relevance_check(state_dir)(queued_wake)
         ) is False
 
 
 def test_reattach_worker_lost_is_durable_before_release_and_blocks_fresh_core(
     tmp_path: Path,
 ) -> None:
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -629,8 +643,8 @@ def test_sync_reattach_failed_result_keeps_primary_incident_when_release_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import mimir.poller_triggers as poller_triggers
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -733,8 +747,8 @@ def test_sync_reattach_failed_result_keeps_primary_incident_when_release_fails(
 def test_autonomous_reattach_failure_branch_records_original_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, branch: str, write_fails: bool,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -903,7 +917,7 @@ def test_autonomous_reattach_failure_branch_records_original_identity(
 def test_reattach_incident_write_failure_preserves_claim_and_retained_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -948,8 +962,8 @@ def test_reattach_incident_write_failure_preserves_claim_and_retained_state(
 def test_reattach_primary_incident_survives_secondary_transition_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.worklink import orchestrator
-    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir_cultivate.worklink import orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -993,8 +1007,8 @@ def test_reattach_primary_incident_survives_secondary_transition_failure(
 def test_successful_reattach_cannot_resolve_newer_concurrent_incident(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.worklink import orchestrator
-    from mimir.worklink.dispatch_failures import (
+    from mimir_cultivate.worklink import orchestrator
+    from mimir_cultivate.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         load_failure_state,
         record_failure,
@@ -1107,13 +1121,13 @@ def test_reattach_retains_state_when_transitioned_lock_release_fails(tmp_path: P
 
 
 def test_reattach_no_state_is_noop(tmp_path: Path) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.worklink.orchestrator import WorklinkRunner
+
     repo = tmp_path / "repo"
     repo.mkdir()
-    registry = BackendRegistry(WorklinkConfig())
-    registry.register(FakeBackend())
-    registry.register_compute(FakeRemoteCompute())
     result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=lambda *a, **k: cp(a), registry=registry).reattach(999)
+        WorklinkRunner(home=tmp_path, repo=repo, runner=lambda *a, **k: cp(a)).reattach(999)
     )
     assert result.status == "failed"
     assert result.reason == "reattach: no run state"
@@ -1264,7 +1278,7 @@ def test_run_persists_state_for_local_compute_then_clears(tmp_path: Path) -> Non
 
 
 def test_reattach_inflight_spawns_detached(tmp_path: Path, monkeypatch) -> None:
-    from mimir import server
+    server = pytest.importorskip("mimir_cultivate.server")
 
     _save_inflight_state(tmp_path, tmp_path / "repo", issue_id=601, job="j1")
     _save_inflight_state(tmp_path, tmp_path / "repo", issue_id=602, job="j2")
@@ -1289,7 +1303,7 @@ def test_reattach_inflight_spawns_detached(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_reattach_inflight_noop_without_repo(tmp_path: Path, monkeypatch) -> None:
-    from mimir import server
+    server = pytest.importorskip("mimir_cultivate.server")
 
     _save_inflight_state(tmp_path, tmp_path / "repo", issue_id=601, job="j1")
     monkeypatch.delenv("WORKLINK_REPO", raising=False)
@@ -1376,7 +1390,7 @@ def test_factory_startup_recovery_routes_only_verified_dead_runs_through_run_epi
     # Pin run_bin: server.py reads WORKLINK_RUN_BIN and the deployment sets it to
     # "uv run mimir", which would prepend ["uv", "run"] to the asserted argv.
     monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
-    from mimir import server
+    server = pytest.importorskip("mimir_cultivate.server")
 
     _factory_restart_record(tmp_path, status=status, ticks=ticks)
     monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
@@ -1408,7 +1422,7 @@ def test_factory_startup_recovery_does_not_spawn_run_epic_for_failed_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import server
+    server = pytest.importorskip("mimir_cultivate.server")
 
     _factory_restart_record(
         tmp_path,
@@ -1433,7 +1447,7 @@ def test_factory_startup_recovery_isolates_unparseable_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import server
+    server = pytest.importorskip("mimir_cultivate.server")
 
     valid = _factory_restart_record(tmp_path, status="running", ticks=1)
     valid_path = tmp_path / "state/worklink/factory-runs/700.json"
@@ -1480,8 +1494,8 @@ def test_part_b_startup_recovery_emits_for_all_five_outcomes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import server
-    import mimir.worklink.factory_state as factory_state
+    server = pytest.importorskip("mimir_cultivate.server")
+    import mimir_cultivate.worklink.factory_state as factory_state
 
     monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
     monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
@@ -1590,7 +1604,7 @@ def test_worker_restart_is_cleanup_only_and_retains_checkout(
     async def cancel(self, handle):
         cancel_events.append(("cancel", handle))
         if scenario == "term_kill_group_reap":
-            import mimir.worklink.worker_exec as worker_exec
+            import mimir_cultivate.worklink.worker_exec as worker_exec
 
             class Process:
                 pid = 4321
@@ -1617,17 +1631,17 @@ def test_worker_restart_is_cleanup_only_and_retains_checkout(
         if cancel_error is not None:
             raise cancel_error
 
-    monkeypatch.setattr("mimir.worklink.orchestrator.process_is_alive", lambda _state: alive)
+    monkeypatch.setattr("mimir_cultivate.worklink.orchestrator.process_is_alive", lambda _state: alive)
     monkeypatch.setattr(
-        "mimir.worklink.orchestrator.LocalSubprocessComputeBackend.cancel",
+        "mimir_cultivate.worklink.orchestrator.LocalSubprocessComputeBackend.cancel",
         cancel,
     )
     monkeypatch.setattr(
-        "mimir.worklink.orchestrator.observe_evidence",
+        "mimir_cultivate.worklink.orchestrator.observe_evidence",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("evidence must not run")),
     )
     monkeypatch.setattr(
-        "mimir.worklink.orchestrator.ControllerGitPublication.capture",
+        "mimir_cultivate.worklink.orchestrator.ControllerGitPublication.capture",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("publication must not run")),
     )
 

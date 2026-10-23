@@ -114,17 +114,14 @@ async def test_build_agent_routes_lease_root_created_after_first_build(
     agent = _make_agent(tmp_path, monkeypatch)
     _stub_deepagent_build(monkeypatch)
     lease_root = tmp_path / "leases"
+    from mimir.plugins.manager import load_plugins
+
+    agent._config.plugin_manager = load_plugins(enable="")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
-    monkeypatch.setattr("mimir.tools.forge._github_identity_degraded", False)
-    monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
     agent._config.coding_enabled = failed_first_build
     monkeypatch.setattr("mimir.tools.all_mimir_tools", registry.all_mimir_tools)
 
-    if failed_first_build:
-        with pytest.raises(RuntimeError, match="lease root is unavailable"):
-            await agent._build_agent_if_needed()
-    else:
-        await agent._build_agent_if_needed()
+    await agent._build_agent_if_needed()
     previous_backend = agent._backend
     checkout = lease_root / "checkout"
     checkout.mkdir(parents=True)
@@ -132,8 +129,7 @@ async def test_build_agent_routes_lease_root_created_after_first_build(
     target.write_text("leased checkout content\n", encoding="utf-8")
     assert "outside_file_tool_roots" in previous_backend.read(str(target)).error
 
-    if not failed_first_build:
-        _write_core(agent._config.home, "<!-- desc: test -->\n# Changed core\n")
+    _write_core(agent._config.home, "<!-- desc: test -->\n# Changed core\n")
     graph = await agent._build_agent_if_needed()
     result = agent._backend.read(str(target))
     assert result.error is None
@@ -148,13 +144,13 @@ async def test_build_agent_routes_lease_root_created_after_first_build(
 async def test_build_agent_always_routes_worklink_root_read_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.worklink import worker_client
+    from mimir import access_control
 
     retained = tmp_path / "retained"
     retained.mkdir()
     target = retained / "issue.txt"
     target.write_text("retained", encoding="utf-8")
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+    monkeypatch.setattr(access_control, "worklink_retained_checkout_root", lambda: retained)
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
     agent = _make_agent(tmp_path, monkeypatch)
     _stub_deepagent_build(monkeypatch)
@@ -174,12 +170,12 @@ async def test_build_agent_retained_route_overrides_operator_rw_root(
     monkeypatch: pytest.MonkeyPatch,
     configured_root: str,
 ) -> None:
-    from mimir.worklink import worker_client
+    from mimir import access_control
 
     operator_root = tmp_path / "workspace"
     retained = operator_root if configured_root == "same" else operator_root / ".worklink"
     retained.mkdir(parents=True)
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+    monkeypatch.setattr(access_control, "worklink_retained_checkout_root", lambda: retained)
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{operator_root}:rw")
     agent = _make_agent(tmp_path, monkeypatch)
     _stub_deepagent_build(monkeypatch)
@@ -224,15 +220,19 @@ async def test_build_agent_does_not_route_invalid_lease_root(
 async def test_build_agent_rebuilds_without_coding_tools_after_identity_latch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     agent = _make_agent(tmp_path, monkeypatch)
-    agent._config.coding_enabled = True
+    from mimir.plugins.manager import load_plugins
+
+    agent._config.plugin_manager = load_plugins(enable="cultivate")
     capture = _stub_deepagent_build(monkeypatch)
-    requested: list[bool] = []
+    requested: list[dict] = []
     monkeypatch.setattr(
         "mimir.tools.all_mimir_tools",
-        lambda **kwargs: requested.append(kwargs.get("coding_enabled", False)) or [],
+        lambda **kwargs: requested.append(kwargs) or [],
     )
-    from mimir.tools import forge as forge_tools
+    from mimir_cultivate import forge as forge_tools
     monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
 
     first = await agent._build_agent_if_needed()
@@ -240,49 +240,127 @@ async def test_build_agent_rebuilds_without_coding_tools_after_identity_latch(
     second = await agent._build_agent_if_needed()
 
     assert first is not second
-    assert requested == [True, False]
-    assert agent._cached_coding_enabled is False
+    assert len(requested) == 2
+    assert all("coding_enabled" not in kwargs for kwargs in requested)
+    assert "cultivate" in agent._cached_unready_tool_owners
 
 
 @pytest.mark.asyncio
 async def test_build_agent_restores_and_executes_real_repo_tool_after_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     agent = _make_agent(tmp_path, monkeypatch)
-    agent._config.coding_enabled = True
     capture = _stub_deepagent_build(monkeypatch)
-    from mimir.tools import forge as forge_tools
+    from mimir_cultivate import forge as forge_tools
+    from mimir_cultivate import repository as repo_tools
+    from langchain.tools import ToolRuntime
+    from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
+    from mimir.models import AuthContext
+    from mimir_cultivate.policy import RepoPRScopeRegistry, RepoReviewState
+    from mimir.plugins.core import policy_scope
+    from tests.test_pr_checkout_lease import _repo_and_scope
     from mimir.tools import registry
-    from mimir.tools import repo as repo_tools
 
     monkeypatch.setattr(forge_tools, "_github_identity_degraded", True)
     monkeypatch.setattr(
         "mimir.tools.all_mimir_tools",
         lambda **kwargs: registry.all_mimir_tools(
-            **kwargs, require_coding_available=False,
+            **kwargs, require_provider_available=False,
         ),
     )
 
     first = await agent._build_agent_if_needed()
+    assert "repo_status" not in {tool.name for tool in capture.kwargs[-1]["tools"]}
     monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
     second = await agent._build_agent_if_needed()
 
     assert first is not second
     restored = {tool.name: tool for tool in capture.kwargs[-1]["tools"]}
     assert "repo_status" in restored
-    executed: list[tuple[str, int]] = []
-    monkeypatch.setattr(
-        repo_tools,
-        "_execute",
-        lambda runtime, repository, pull_request, operation: (
-            executed.append((repository, pull_request)) or {"status": "clean"}
-        ),
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    lease = repo_tools.create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease_root, review_state=state,
     )
-    assert restored["repo_status"].invoke({
-        "repository": "owner/repo",
-        "pull_request": 17,
-    }) == {"status": "clean"}
-    assert executed == [("owner/repo", 17)]
+    selected = agent._config.plugin_manager.policy
+    grants = ScopedPRGrants(
+        scope.principal, (scope,), protocols=selected.scoped_actions,
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    checkout_token = grants.consume_checkout("cultivate", scope)
+    assert checkout_token is not None
+    assert grants.observe_checkout("cultivate", scope, lease, checkout_token)
+    auth = AuthContext(
+        principal=scope.principal, canonical_principal=scope.principal,
+        roles=("user",), event_ingress=None, trigger="user_message",
+        channel_id="web:recovery", interactivity=None, enforcement_enabled=True,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+        scoped_pr_grants=grants,
+    )
+    runtime = ToolRuntime(
+        state={}, context=auth, config={}, stream_writer=lambda _: None,
+        tool_call_id="recovered-tool", store=None,
+    )
+    with policy_scope(selected):
+        result = restored["repo_status"].invoke({
+            "repository": scope.canonical_repo, "pull_request": scope.pr_number,
+            "runtime": runtime,
+        })
+    assert result["code"] == "ok"
+    assert state.checkout_lease is lease
+
+
+@pytest.mark.asyncio
+async def test_agent_assembles_registered_worklink_runner_and_dispatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    lease_root = tmp_path / "pr-leases"
+    lease_root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    agent = _make_agent(tmp_path, monkeypatch)
+    capture = _stub_deepagent_build(monkeypatch)
+    from mimir.tools import registry
+    from mimir_cultivate import forge
+    from mimir_cultivate.worklink import autonomy, orchestrator
+
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    # The startup prerequisite probe looks for the opencode CLI on PATH. This test
+    # is about dispatch, not that probe (test_tool_registry covers it), so it must
+    # not depend on whether the host happens to have opencode installed.
+    monkeypatch.setattr("mimir_cultivate.opencode.opencode_available", lambda: True)
+    monkeypatch.setattr("mimir.tools.all_mimir_tools", registry.all_mimir_tools)
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repository))
+    monkeypatch.setattr(autonomy, "check_concurrency", lambda _home: autonomy.ConcurrencyCheck(True, 0, 2))
+    registry.set_arbiter(None)
+    calls = []
+
+    def dispatch(**kwargs):
+        calls.append(kwargs)
+        return types.SimpleNamespace(
+            issue_id=1949, status="completed", attempt=1,
+            review_ready=True, pr_url=None, evidence_path=None, reason=None,
+        )
+
+    monkeypatch.setattr(orchestrator, "run_worklink", dispatch)
+    await agent._build_agent_if_needed()
+    tools = {tool.name: tool for tool in capture.kwargs[-1]["tools"]}
+    assert "worklink_run" in tools
+    result = await tools["worklink_run"].ainvoke({"issue_id": 1949})
+    assert "worklink_run #1949: completed" in result
+    assert calls == [{
+        "home": agent._config.home, "repo": repository,
+        "issue_id": 1949, "backend": None, "autonomous": True,
+    }]
 
 
 @pytest.mark.asyncio
@@ -385,6 +463,28 @@ async def test_build_agent_rebuilds_when_skill_catalog_changes(
     assert first is not second
     assert second is third
     assert len(capture.prompts) == 2
+
+
+@pytest.mark.asyncio
+async def test_build_agent_routes_skills_through_seed_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The skills slot is the seed-filtering middleware, not deepagents' default."""
+    from mimir.skill_visibility import SeedFilteredSkillsMiddleware
+
+    agent = _make_agent(tmp_path, monkeypatch)
+    capture = _stub_deepagent_build(monkeypatch)
+    skill = agent._config.home / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: demo\ndescription: d\n---\n", encoding="utf-8")
+
+    await agent._build_agent_if_needed()
+
+    kwargs = capture.kwargs[0]
+    assert kwargs.get("skills") is None
+    [skills] = [m for m in kwargs["middleware"] if isinstance(m, SeedFilteredSkillsMiddleware)]
+    assert skills.name == "SkillsMiddleware"
+    assert skills.sources == [str(agent._config.home / "skills")]
 
 
 @pytest.mark.asyncio

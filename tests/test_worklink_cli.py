@@ -4,6 +4,7 @@ import argparse
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import errno
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,27 +17,71 @@ from unittest.mock import AsyncMock, Mock, call
 import pytest
 
 from mimir.cli import main
-from mimir.worklink.orchestrator import WorklinkRunResult
-from mimir.worklink.control import (
-    archive_worklink_factory_records, reconcile_run_states, stop_worklink, worklink_status,
-)
-from mimir.worklink import autonomy
-from mimir.worklink.autonomy import check_concurrency
-from mimir.worklink.backends.feature_factory import parse_factory_status
-from mimir.worklink.claims import ChainlinkClaims
-from mimir.worklink.compute import LaunchHandle
-from mimir.worklink.factory_state import (
-    FactoryRunRecord, factory_checkout_interlock, factory_issue_resource_lock,
-    load_factory_record, save_factory_record,
-)
-from mimir.worklink.run_state import (
-    OrphanBlockRecord,
-    WorklinkRunState,
-    load_orphan_block_record,
-    load_run_state,
-    process_start_ticks,
-    save_run_state,
-)
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.worklink.orchestrator import WorklinkRunResult
+    from mimir_cultivate.worklink.control import (
+        archive_worklink_factory_records, reconcile_run_states, stop_worklink, worklink_status,
+    )
+    from mimir_cultivate.worklink import autonomy
+    from mimir_cultivate.worklink.autonomy import check_concurrency
+    from mimir_cultivate.worklink.backends.feature_factory import parse_factory_status
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+    from mimir_cultivate.worklink.compute import LaunchHandle
+    from mimir_cultivate.worklink.factory_state import (
+        FactoryRunRecord, factory_checkout_interlock, factory_issue_resource_lock,
+        load_factory_record, save_factory_record,
+    )
+    from mimir_cultivate.worklink.run_state import (
+        OrphanBlockRecord, WorklinkRunState, load_orphan_block_record,
+        load_run_state, process_start_ticks, save_run_state,
+    )
+
+
+_PROVIDER_CLI_CASES = frozenset({
+    "test_worklink_run_cli_dispatches_operator_vertical",
+    "test_worklink_run_cli_requires_explicit_base_instead_of_using_cwd",
+    "test_worklink_emit_work_item_has_wire_clean_stdout",
+    "test_worklink_emit_work_item_failure_has_no_stdout",
+    "test_worklink_run_cli_forwards_base_flag",
+    "test_worklink_run_cli_forwards_autonomous_flag",
+    "test_worklink_run_cli_autonomous_refused_exits_1",
+    "test_worklink_run_epic_cli_routes_manual_and_autonomous_modes",
+    "test_worklink_run_epic_cli_rejects_base_flag",
+    "test_worklink_run_epic_cli_forwards_complete_recovery_identity",
+    "test_worklink_run_epic_cli_rejects_partial_recovery_identity",
+    "test_worklink_cli_has_no_factory_cancel_transition",
+    "test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records",
+    "test_worklink_cli_rejects_unknown_subcommand",
+    "test_worklink_run_failed_without_attempt_prints_reason",
+    "test_leaf_cli_interruption_records_once_with_retained_pointers_and_reraises",
+    "test_factory_cli_interruption_records_once_with_all_retained_pointers",
+    "test_cli_owned_inner_interruption_does_not_fallback_record",
+    "test_factory_stop_finds_production_record_and_cancels_verified_handle",
+    "test_stop_cli_no_live_run_is_successful_noop",
+    "test_stop_cli_reports_rejected_factory_identity",
+    "test_stop_cli_refuses_unverified_live_leaf",
+})
+
+
+@pytest.fixture(autouse=True)
+def _select_cultivate_for_cli(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    if request.node.name.split("[", 1)[0] == "test_core_cli_does_not_register_worklink":
+        return
+    pytest.importorskip("mimir_cultivate", reason="Worklink CLI belongs to Cultivate")
+    if request.node.name.split("[", 1)[0] not in _PROVIDER_CLI_CASES:
+        return
+    if importlib.util.find_spec("mimir_cultivate") is None:
+        if {"cultivate", "all"}.intersection(os.environ.get("MIMIR_PLUGINS", "").split(",")):
+            pytest.fail("selected Cultivate distribution is not installed")
+        pytest.skip("Cultivate CLI requires the installed provider")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+
+
+def test_core_cli_does_not_register_worklink(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "--help"])
+    assert exc.value.code == 2
 
 
 def test_worklink_run_cli_dispatches_operator_vertical(
@@ -55,7 +100,7 @@ def test_worklink_run_cli_dispatches_operator_vertical(
             evidence_path=tmp_path / "state" / "worklink" / "evidence" / "441-1.json",
         )
 
-    import mimir.commands.worklink as worklink_cmd
+    import mimir_cultivate.commands as worklink_cmd
 
     monkeypatch.setattr(worklink_cmd, "run_worklink", fake_run_worklink)
 
@@ -104,7 +149,7 @@ def test_worklink_run_cli_requires_explicit_base_instead_of_using_cwd(
 def test_worklink_emit_work_item_has_wire_clean_stdout(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    import mimir.commands.worklink as worklink_cmd
+    import mimir_cultivate.commands as worklink_cmd
 
     payload = '{"body":"path\\\\to\\\\file","run_id":"chainlink-441","title":"Title"}'
     monkeypatch.setattr(worklink_cmd, "read_work_item", lambda issue_id: payload)
@@ -121,8 +166,8 @@ def test_worklink_emit_work_item_has_wire_clean_stdout(
 def test_worklink_emit_work_item_failure_has_no_stdout(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    import mimir.commands.worklink as worklink_cmd
-    from mimir.worklink.orchestrator import WorklinkError
+    import mimir_cultivate.commands as worklink_cmd
+    from mimir_cultivate.worklink.orchestrator import WorklinkError
 
     def missing(_issue_id: int) -> str:
         raise WorklinkError("issue not found")
@@ -147,7 +192,7 @@ def test_worklink_run_cli_forwards_base_flag(
         calls.append(kwargs)
         return WorklinkRunResult(issue_id=441, attempt=1, status="completed")
 
-    import mimir.commands.worklink as worklink_cmd
+    import mimir_cultivate.commands as worklink_cmd
 
     monkeypatch.setattr(worklink_cmd, "run_worklink", fake_run_worklink)
 
@@ -177,7 +222,7 @@ def test_worklink_run_cli_forwards_autonomous_flag(
         calls.append(kwargs)
         return WorklinkRunResult(issue_id=441, attempt=1, status="completed")
 
-    import mimir.commands.worklink as worklink_cmd
+    import mimir_cultivate.commands as worklink_cmd
 
     monkeypatch.setattr(worklink_cmd, "run_worklink", fake_run_worklink)
 
@@ -203,7 +248,7 @@ def test_worklink_run_cli_autonomous_refused_exits_1(
     def fake_run_worklink(**kwargs: object) -> WorklinkRunResult:
         return WorklinkRunResult(issue_id=441, attempt=None, status="refused", reason="unsafe compute")
 
-    import mimir.commands.worklink as worklink_cmd
+    import mimir_cultivate.commands as worklink_cmd
 
     monkeypatch.setattr(worklink_cmd, "run_worklink", fake_run_worklink)
 
@@ -230,7 +275,7 @@ def test_worklink_run_epic_cli_routes_manual_and_autonomous_modes(
     monkeypatch: pytest.MonkeyPatch,
     autonomous: bool,
 ) -> None:
-    import mimir.commands.worklink as worklink_cmd
+    import mimir_cultivate.commands as worklink_cmd
 
     calls: list[dict[str, object]] = []
 
@@ -259,7 +304,7 @@ def test_worklink_run_epic_cli_routes_manual_and_autonomous_modes(
 
 
 def test_worklink_run_epic_cli_rejects_base_flag() -> None:
-    import mimir.commands.worklink as worklink_cmd
+    import mimir_cultivate.commands as worklink_cmd
 
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command")
@@ -272,8 +317,8 @@ def test_worklink_run_epic_cli_rejects_base_flag() -> None:
 def test_worklink_run_epic_cli_forwards_complete_recovery_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.commands.worklink as worklink_cmd
-    from mimir.worklink.detached_dispatch import FactoryRecoveryIdentity
+    import mimir_cultivate.commands as worklink_cmd
+    from mimir_cultivate.worklink.detached_dispatch import FactoryRecoveryIdentity
 
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(
@@ -307,7 +352,7 @@ def test_worklink_run_epic_cli_rejects_partial_recovery_identity(
 
 
 def test_worklink_cli_has_no_factory_cancel_transition() -> None:
-    import mimir.commands.worklink as worklink_cmd
+    import mimir_cultivate.commands as worklink_cmd
 
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command")
@@ -391,7 +436,7 @@ def test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records(
     ]
     canonical_path.write_text(json.dumps(old_payload), encoding="utf-8")
     events: list[tuple[str, dict[str, object]]] = []
-    import mimir.commands.worklink as worklink_cmd
+    import mimir_cultivate.commands as worklink_cmd
 
     monkeypatch.setattr(
         worklink_cmd,
@@ -439,7 +484,7 @@ def test_worklink_cli_rejects_unknown_subcommand(
     rejects anything else (e.g. ``mimir worklink worker …``), so the
     dispatcher's catch-all ``return 1`` for unknown actions never has to fire
     in production. This test pins that contract."""
-    import mimir.commands.worklink as worklink_cmd
+    import mimir_cultivate.commands as worklink_cmd
 
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command")
@@ -455,9 +500,9 @@ def test_worklink_cli_rejects_unknown_subcommand(
 def test_worklink_run_failed_without_attempt_prints_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from mimir.worklink.orchestrator import WorklinkRunResult
+    from mimir_cultivate.worklink.orchestrator import WorklinkRunResult
 
-    import mimir.commands.worklink as worklink_cmd
+    import mimir_cultivate.commands as worklink_cmd
 
     def fake_run_worklink(**kwargs: object) -> WorklinkRunResult:
         return WorklinkRunResult(529, None, "failed", reason="claim_failed: lock held")
@@ -500,11 +545,25 @@ def _state(
     return state
 
 
+def _provider_state(home: Path, issue_id: int, pid: int, *, ticks: int | None,
+                    started_at: datetime) -> None:
+    from mimir_cultivate.worklink.run_state import WorklinkRunState, save_run_state
+
+    save_run_state(home, WorklinkRunState(
+        issue_id=issue_id, attempt=2, backend="opencode",
+        compute_name="local_subprocess", handle_substrate="local_subprocess",
+        handle_identifier=str(pid), branch=f"issue/{issue_id}-a2",
+        base_ref="main", local_base="main", repo="/repo", repo_url="",
+        test_command="pytest", started_at=started_at.isoformat(),
+        checkout=f"/repo/.worklink/{issue_id}-2", process_start_ticks=ticks,
+    ))
+
+
 def test_leaf_cli_interruption_records_once_with_retained_pointers_and_reraises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.commands.worklink as worklink_cmd
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.commands as worklink_cmd
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     state = _state(
         tmp_path,
@@ -547,8 +606,8 @@ def test_leaf_cli_interruption_records_once_with_retained_pointers_and_reraises(
 def test_factory_cli_interruption_records_once_with_all_retained_pointers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.commands.worklink as worklink_cmd
-    import mimir.worklink.orchestrator as orchestrator
+    import mimir_cultivate.commands as worklink_cmd
+    import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / ".factory-sandboxes" / "chainlink-700"
     sandbox.mkdir(parents=True)
@@ -609,12 +668,12 @@ def test_cli_owned_inner_interruption_does_not_fallback_record(
     import asyncio
     from types import SimpleNamespace
 
-    import mimir.commands.worklink as worklink_cmd
-    import mimir.worklink.orchestrator as orchestrator
-    from mimir.worklink.backends.feature_factory import FeatureFactoryBackend
-    from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
-    from mimir.worklink.claims import ClaimRecord, ClaimResult
-    from mimir.worklink.compute import LocalSubprocessComputeBackend
+    import mimir_cultivate.commands as worklink_cmd
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.backends.feature_factory import FeatureFactoryBackend
+    from mimir_cultivate.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
+    from mimir_cultivate.worklink.claims import ClaimRecord, ClaimResult
+    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
 
     home = tmp_path / "home"
     repo = tmp_path / "repo"
@@ -896,7 +955,7 @@ def test_status_reports_labels_unavailable_instead_of_absent(tmp_path: Path) -> 
 
 
 def test_status_bounds_chainlink_subprocesses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import mimir.worklink.control as control
+    import mimir_cultivate.worklink.control as control
 
     calls: list[tuple[list[str], int | None]] = []
 
@@ -1017,11 +1076,11 @@ def test_reconcile_releases_orphan_slot_routes_label_and_leaves_live_lock(
     def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
         if args[1:3] == ["locks", "release"]:
-            from mimir.worklink.dispatch_failures import (
+            from mimir_cultivate.worklink.dispatch_failures import (
                 dispatch_failure_state_dir,
                 load_failure_state,
             )
-            from mimir.worklink.orchestrator import run_worklink
+            from mimir_cultivate.worklink.orchestrator import run_worklink
 
             incident = load_failure_state(dispatch_failure_state_dir(tmp_path))[
                 "issues"
@@ -1112,7 +1171,7 @@ def test_reconcile_releases_orphan_slot_routes_label_and_leaves_live_lock(
 def test_orphan_incident_write_failure_preserves_claim_labels_and_run_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.dispatch_failures as dispatch_failures
+    import mimir_cultivate.worklink.dispatch_failures as dispatch_failures
 
     now = datetime.now(UTC)
     state = _state(
@@ -1439,7 +1498,7 @@ def test_pruner_preserves_unpublished_checkout_and_different_block_reason(
 
     record = load_orphan_block_record(tmp_path, 17)
     assert record is not None
-    from mimir.worklink.run_state import save_orphan_block_record
+    from mimir_cultivate.worklink.run_state import save_orphan_block_record
 
     save_orphan_block_record(tmp_path, replace(record, publication_outcome="undetermined"))
     comments.append(
@@ -1450,7 +1509,7 @@ def test_pruner_preserves_unpublished_checkout_and_different_block_reason(
 
 
 def test_old_prune_cannot_clear_new_attempt_block(tmp_path: Path) -> None:
-    from mimir.worklink.run_state import save_orphan_block_record
+    from mimir_cultivate.worklink.run_state import save_orphan_block_record
 
     old = OrphanBlockRecord(
         issue_id=18,
@@ -1528,10 +1587,14 @@ def test_factory_stop_finds_production_record_and_cancels_verified_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str], stale_leaf: bool,
 ) -> None:
-    import mimir.worklink.control as control
+    import mimir_cultivate.worklink.control as control
+    from mimir_cultivate.worklink.backends.feature_factory import parse_factory_status
+    from mimir_cultivate.worklink.compute import LaunchHandle
+    from mimir_cultivate.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
+    from mimir_cultivate.worklink.run_state import load_run_state
 
     if stale_leaf:
-        _state(tmp_path, 700, 999_999_999, ticks=1, started_at=datetime.now(UTC))
+        _provider_state(tmp_path, 700, 999_999_999, ticks=1, started_at=datetime.now(UTC))
     sandbox = tmp_path / "chainlink-700"
     sandbox.mkdir()
     status = parse_factory_status(
@@ -1586,7 +1649,7 @@ def test_factory_stop_finds_production_record_and_cancels_verified_handle(
         cancelled.append(selected)
 
     monkeypatch.setattr(control, "factory_process_is_alive", lambda record: True)
-    from mimir.worklink.worker_client import WorkerClient
+    from mimir_cultivate.worklink.worker_client import WorkerClient
     monkeypatch.setattr(WorkerClient, "cancel_factory_handle", cancel)
     monkeypatch.setattr(
         control, "_runner", lambda home, binary: (
@@ -1616,10 +1679,11 @@ def test_stop_cli_no_live_run_is_successful_noop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str], stale_leaf: bool,
 ) -> None:
-    import mimir.worklink.control as control
+    import mimir_cultivate.worklink.control as control
+    from mimir_cultivate.worklink.run_state import load_run_state
 
     if stale_leaf:
-        _state(tmp_path, 700, 999_999_999, ticks=1, started_at=datetime.now(UTC))
+        _provider_state(tmp_path, 700, 999_999_999, ticks=1, started_at=datetime.now(UTC))
 
     def unexpected(*args: object) -> None:
         pytest.fail("no-live-run stop must not cancel or mutate Chainlink")
@@ -1639,7 +1703,7 @@ def test_factory_stop_refuses_unverified_or_reused_process_identity(
 ) -> None:
     from types import SimpleNamespace
 
-    import mimir.worklink.control as control
+    import mimir_cultivate.worklink.control as control
 
     monkeypatch.setattr(control, "load_run_state", lambda home, issue_id: None)
     record = SimpleNamespace(run_id="chainlink-700", handle=LaunchHandle("local_subprocess", "4321", 99))
@@ -1677,8 +1741,11 @@ def test_factory_stop_refuses_unverified_or_reused_process_identity(
 def test_stop_cli_reports_rejected_factory_identity(
     tmp_path, monkeypatch, capsys, ticks, observed, zombie, kill_error, dead,
 ):
-    import mimir.worklink.control as control
-    import mimir.worklink.factory_state as factory_state
+    import mimir_cultivate.worklink.control as control
+    import mimir_cultivate.worklink.factory_state as factory_state
+    from mimir_cultivate.worklink.compute import LaunchHandle
+    from mimir_cultivate.worklink.factory_state import FactoryRunRecord, save_factory_record, load_factory_record
+    from mimir_cultivate.worklink.run_state import load_run_state
 
     record = FactoryRunRecord(
         run_id="chainlink-700", issue_id=700, attempt=2, repository="owner/repo",
@@ -1688,7 +1755,7 @@ def test_stop_cli_reports_rejected_factory_identity(
         status=None, observed_at=None, controller_phase="running",
     )
     save_factory_record(tmp_path, record)
-    _state(tmp_path, 700, 1234, ticks=1, started_at=datetime.now(UTC))
+    _provider_state(tmp_path, 700, 1234, ticks=1, started_at=datetime.now(UTC))
     monkeypatch.setattr(control, "process_is_alive", lambda state: False)
     monkeypatch.setattr(factory_state.os, "kill", Mock(side_effect=kill_error))
     monkeypatch.setattr(factory_state, "process_is_zombie", lambda pid: zombie)
@@ -1726,7 +1793,7 @@ def test_stop_cli_reports_rejected_factory_identity(
 def test_stop_cli_refuses_unverified_live_leaf(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    import mimir.worklink.control as control
+    import mimir_cultivate.worklink.control as control
 
     state = _state(tmp_path, 700, os.getpid(), ticks=None, started_at=datetime.now(UTC))
 

@@ -211,22 +211,6 @@ export interface OpsDashboardData {
     truncated?: boolean;
     total_count?: number;
   };
-  pr_board: {
-    available: boolean;
-    error?: string | null;
-    repo?: string | null;
-    pull_requests: Array<{
-      number: number;
-      title: string;
-      url: string;
-      author: string;
-      created_at: string;
-      review_decision: string;
-      is_draft: boolean;
-    }>;
-    truncated?: boolean;
-    total_count?: number;
-  };
   usage_history: Record<string, Record<string, OpsUsagePoint[]>>;
   token_usage_history: OpsTokenUsagePoint[];
   algedonic_signals: {
@@ -947,46 +931,4 @@ export interface TurnStreamEvent {
   content_delta?: string;
   /** tool_result end: the result content. */
   content?: string;
-}
-
-export interface FactoryRunSummary {
-  run_id: string;
-  clearable: boolean;
-  issue_key: string;
-  valid: boolean;
-  sandbox_path: string;
-  status: string | null;
-  mode: string;
-  branch: string;
-  pr_base: string;
-  pr_draft: boolean;
-  lock: "fresh" | "stale" | "absent";
-  dead_lock: boolean;
-  lock_session: string | null;
-  pr_url: string | null;
-  next?: string | null;
-  controller_phase: string;
-  observed_at: string | null;
-  controller_error: string | null;
-}
-
-export interface FactoryRunDetail extends FactoryRunSummary {
-  gates: Record<string, unknown>;
-  steps: string[];
-  slices: string[];
-  validator: string | null;
-  terminal_result: Record<string, unknown> | null;
-}
-
-export interface FactoryRunsData {
-  runs: FactoryRunSummary[];
-}
-
-export interface FactoryRunArchiveRequest {
-  reason: string;
-}
-
-export interface FactoryRunArchiveData {
-  run_id: string;
-  archived: boolean;
 }

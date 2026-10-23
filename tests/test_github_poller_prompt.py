@@ -1,11 +1,4 @@
-"""The changes-requested remediation prompt's verification contract.
-
-The prompt tells a remediation turn how to verify its own fix. That guidance is
-deployment-dependent: ``repo_test`` only exists when ``MIMIR_CODING_ENABLED`` is
-true, and that defaults to false, so a prompt that names the tool
-unconditionally misdirects a default deployment. These tests pin the contract in
-both configurations, since the prompt is the only thing carrying it.
-"""
+"""The selected Cultivate poller's changes-requested verification contract."""
 
 from __future__ import annotations
 
@@ -15,9 +8,16 @@ import sys
 
 import pytest
 
+from tests.plugin_selection import cultivate_selected
+
+pytestmark = pytest.mark.skipif(
+    not cultivate_selected(),
+    reason="Cultivate poller is not selected",
+)
+
 _POLLER = (
     Path(__file__).resolve().parent.parent
-    / "mimir" / "optional-skills" / "github-poller" / "scripts" / "poller.py"
+    / "plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/scripts/poller.py"
 )
 
 
@@ -34,22 +34,8 @@ def poller():
         sys.modules.pop(spec.name, None)
 
 
-def test_guidance_names_repo_test_only_when_coding_is_enabled(poller, monkeypatch):
-    # Every truthy spelling registers the coding tools, so every one of them
-    # must also advertise repo_test. `on` and `y` are the two that a narrower
-    # 1/true/yes check silently got wrong.
-    for value in ("1", "true", "yes", "on", "y", "TRUE", "On", " yes "):
-        monkeypatch.setenv("MIMIR_CODING_ENABLED", value)
-        assert "repo_test" in poller._verification_guidance(), value
-
-    # ...and no falsy spelling may, since the tool is not registered.
-    for value in ("", "false", "0", "no", "FALSE", "off", "n", "Off"):
-        monkeypatch.setenv("MIMIR_CODING_ENABLED", value)
-        assert "repo_test" not in poller._verification_guidance(), value
-
-    # An unrecognised value must fall back to the default rather than guess.
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "maybe")
-    assert "repo_test" not in poller._verification_guidance()
+def test_selected_poller_guidance_names_provider_test_tool(poller):
+    assert "repo_test" in poller._verification_guidance()
 
 
 def test_env_flag_alphabet_matches_mimir_config(poller):
@@ -82,16 +68,7 @@ def test_env_flag_agrees_with_config_env_bool(poller, monkeypatch):
         assert poller._env_flag("MIMIR_FLAG_UNDER_TEST", default) is default
 
 
-def test_guidance_absent_flag_behaves_as_disabled(poller, monkeypatch):
-    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
-    guidance = poller._verification_guidance()
-    assert "repo_test" not in guidance
-    # Silence would let a turn present unverified work as verified.
-    assert "not present changes as verified" in guidance
-
-
 def test_enabled_guidance_is_runner_neutral_and_selector_accurate(poller, monkeypatch):
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
     guidance = poller._verification_guidance()
     # ``project_tests`` forwards ``path::node_id`` to whatever runner
     # worklink.yaml configures; only pytest-style runners accept it.
@@ -108,7 +85,6 @@ def test_enabled_guidance_is_runner_neutral_and_selector_accurate(poller, monkey
 
 def test_changes_requested_prompt_embeds_the_guidance(poller, monkeypatch):
     """The guidance must actually reach the emitted prompt, not just exist."""
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
     monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *args: True)
     emitted: list[str] = []
     monkeypatch.setattr(poller, "_emit", lambda prompt, **kw: emitted.append(prompt))

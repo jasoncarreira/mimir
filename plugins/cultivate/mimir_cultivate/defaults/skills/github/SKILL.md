@@ -1,0 +1,224 @@
+---
+name: cultivate-github
+description: Interact with GitHub via scoped PR tools on service turns or the `gh` CLI on interactive turns. Use for issues, pull requests, CI status and workflow runs.
+success_criteria:
+  # Service reads use typed tools; interactive turns may use gh.
+  any_of:
+    - tool_call:
+        name: pr_metadata
+    - tool_call:
+        name: pr_list
+    - tool_call:
+        name: pr_checks
+    - tool_call:
+        name: pr_diff
+    - tool_call:
+        name: chainlink_issue_show
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "gh *"
+    - tool_call:
+        name: Bash
+        args:
+          command_glob: "* gh *"
+---
+
+<!-- desc: Read GitHub via scoped PR tools on service turns and gh on interactive turns. -->
+
+# Cultivate GitHub
+
+The `gh` CLI is installed in the container and authenticated via `GITHUB_TOKEN`
+from the env. Commits the agent makes through `git push` go through the same
+credential helper, so `gh pr create` and `git push` both work.
+
+## Contract
+
+**Trigger**: Any interaction with GitHub that goes beyond local git — reading issues
+or PRs, filing comments, checking CI, querying the API. If the task requires GitHub
+state (not just local repo state), invoke this skill.
+
+**Requires**: `GITHUB_TOKEN` in environment (verified by `gh auth status`). The PAT's
+scope determines which repos are reachable — operations on out-of-scope repos return
+403; check what the operator configured if you hit one.
+
+**Guarantees**:
+- Service-turn PR reads use scoped typed tools; interactive CLI turns use
+  authenticated `gh`, rather than WebFetch on raw GitHub URLs.
+- PAT scope is checked mentally before any cross-repo operation — a 403 from an
+  out-of-scope repo is expected behavior, not a bug.
+
+**Does not**: Push code (that's `git push`, separate from `gh`); manage GitHub Actions
+billing; access repos outside the PAT scope; file issues on external repos without
+operator approval.
+
+When `cwd` is inside a git checkout of the target repo, you don't need `--repo`
+— gh resolves the upstream remote from the local `origin`. When working from
+elsewhere or operating on a different repo, pass `--repo owner/repo` (or use a
+URL).
+
+## Pre-merge CHANGES_REQUESTED gate (chainlink #214, rule via #217)
+
+**Before invoking `gh pr merge` on any PR, ALWAYS check the current review
+state.** A reviewer can flip to CHANGES_REQUESTED after the first approval —
+calling `gh pr merge` without a fresh check can merge a PR that has outstanding
+blocking feedback.
+
+```bash
+# Returns the login list of blocking reviewers (empty array [] if none)
+BLOCKING=$(gh pr view <PR> --json reviews --jq '
+  [.reviews | group_by(.author.login)[] | sort_by(.submittedAt)[-1]
+   | select(.state == "CHANGES_REQUESTED") | .author.login]')
+
+# Refuse if non-empty
+if [ "$BLOCKING" != "[]" ]; then
+    # blocked — do not merge; see steps below
+    echo "Merge blocked by CHANGES_REQUESTED from: $BLOCKING"
+fi
+```
+
+If `$BLOCKING` is non-empty (one or more reviewers in CHANGES_REQUESTED state):
+
+1. **Refuse the merge** — do not call `gh pr merge`.
+2. Post a `gh pr comment` explaining why the merge was blocked and listing the
+   blocking reviewers from `$BLOCKING` who need to re-approve.
+
+This is a non-negotiable hard gate — not a heuristic. "Operator approved once"
+is not sufficient if a subsequent CHANGES_REQUESTED arrived, even seconds later.
+(Structured event emission for blocked merges is tracked in chainlink #218.)
+
+## Pre-push staleness gate (chainlink #219)
+
+**Before pushing a PR branch for re-review, ALWAYS check that the branch is
+current against `origin/main`.** Between the last rebase and the next push,
+other PRs may have merged to `main`; a stale base makes the PR diff include
+complete reverts of unrelated landed work. A squash-merge would silently drop
+those commits from `main`.
+
+Exception: Worklink slice branches named `issue/<digits>-a<digits>` are based
+on their epic integration branch, and `epic/*` integration branches merge to
+main only through the single epic draft PR. Do not rebase those machinery
+branches directly onto `origin/main` for this gate.
+
+```bash
+# Step 1: fetch and check staleness
+git fetch origin main
+MERGE_BASE=$(git merge-base HEAD origin/main)
+MAIN_TIP=$(git rev-parse origin/main)
+
+if [ "$MERGE_BASE" != "$MAIN_TIP" ]; then
+    echo "Branch is stale — rebasing onto current origin/main"
+    git rebase origin/main
+fi
+
+# Step 2: inspect paths in the diff after rebase
+git diff origin/main..HEAD --name-only
+```
+
+**If the rebase fails with conflicts** (i.e. `git rebase origin/main` returned
+non-zero), abort with `git rebase --abort` and stop — **do not push**. A failed
+rebase leaves the branch in an intermediate state where the subsequent diff and
+push are both unsafe. Resolve the conflicts manually (or request operator
+guidance) before re-running the gate from step 1.
+
+After fetching (and rebasing if stale), inspect the path list:
+
+- If every path is **within the PR's declared scope** (the chainlink ID, PR
+  title, or known feature area), the push is safe — proceed.
+- If any path is **outside scope** (a revert of unrelated work, or an
+  accidentally-staged file), stop — do not push. Investigate whether a further
+  rebase is needed or whether a stale commit slipped onto the branch.
+
+**Non-negotiable rule**: do not push to a PR branch for re-review without this
+check. The cost of missing a stale base is silently reverting landed work when
+the PR is squash-merged. Pairs with the pre-merge gate above — both gates exist
+because the window between "last rebase" and "reviewer sees diff" is enough for
+main to advance.
+
+Four concrete instances from 2026-05-27 that this gate would have caught:
+#393 (would have wiped #391/#388/#389/#392), #394 round 1 (stacked on stale
+#393), #396 (would have reverted #395 ~520 lines), #394 round 2 (stale base
+after #395 merged).
+
+## Pull requests
+
+On `github-activity` and other repo-review service turns, use `pr_metadata`
+for the PR title, bounded body, state and merge time; use `pr_files`, `pr_diff`,
+`pr_reviews` and `pr_checks` for the corresponding reads. Use
+`chainlink_issue_show(issue_id)` for live Chainlink issue details. The
+`repo_review` shell profile refuses `gh pr view` and arbitrary git revision
+ranges; use `repo_diff` for a lease-bound diff. CLI examples below are for
+interactive operator turns whose shell profile admits them.
+
+Budget rule: perform required GitHub side effects before optional long
+validation or repeated polling consumes the turn. Once a PR comment,
+review, or status update is the next required durable action, do it first
+and then run extra checks if budget remains. When the tool-call count is
+visibly high, reserve roughly 10-15 calls for the side effect,
+verification (`gh pr view` / `gh pr checks`), and wrap-up.
+
+Use `pr_list(repository="owner/repo", state="open")` to list open PRs in a
+configured repository. For recently merged PRs, use
+`pr_list(repository="owner/repo", state="merged", merged_since="2026-10-01")`.
+To find a PR by text, use `pr_list(repository="owner/repo", search="1445", state="all")`.
+Search refuses `repo:`, `org:` and `user:` qualifiers, double quotes,
+parentheses, and standalone `OR`/`AND`/`NOT` tokens in any case; the repository
+is always the configured one, independently of GitHub's search parser.
+
+```bash
+gh pr view 42                                  # view a PR
+gh pr view 42 --json title,state,reviews       # structured fields
+gh pr checks 42                                # CI status
+gh pr create --title "..." --body "..."        # open a PR (uses HEREDOC for body)
+gh pr comment 42 --body "looking now"
+gh pr diff 42                                  # the PR's diff
+```
+
+For PRs the bot opens, the convention (see mimirbot/README.md) is feature
+branch + PR; do not push to `main` directly.
+
+## Issues
+
+```bash
+gh issue list --state open
+gh issue view 7
+gh issue comment 7 --body "ack — picking this up"
+gh issue create --title "..." --body "..."     # only when explicitly asked
+```
+
+## Workflow runs / CI
+
+```bash
+gh run list --limit 10
+gh run view <run-id>                           # which steps passed/failed
+gh run view <run-id> --log-failed              # logs for failed steps only
+gh run watch <run-id>                          # block until done
+```
+
+## `gh api` for advanced queries
+
+When the subcommands don't cover what you need, drop to the API:
+
+```bash
+gh api repos/jasoncarreira/mimir/pulls/42 --jq '.title, .state, .user.login'
+gh api repos/jasoncarreira/mimir/pulls/42/comments
+gh api 'repos/jasoncarreira/mimir/issues?state=open&labels=bug' --jq '.[] | "\(.number): \(.title)"'
+```
+
+`--jq` filters work like inline jq queries; chain with shell tools when needed.
+
+> **`--jq` is not available on poller or scheduled turns.** The trusted-service
+> shell profiles do not admit it: `gh` evaluates the filter in-process and jq's
+> `env` builtin reads the process environment, so the option is a credential
+> read rather than an output formatter. Use `--json <fields>` and filter the
+> returned JSON yourself. Piped and bracketed filters were already refused on
+> those turns anyway, because `|`, `[` and `]` are shell metacharacters.
+
+
+## When NOT to use this
+
+- Don't push to `main` even when you can — feature branch + PR is the
+  convention. Operator merges.
+- Don't open issues without being asked; reading and commenting is the
+  default mode.
+- Don't use `gh repo delete` or `gh release delete` ever (no destructive ops).

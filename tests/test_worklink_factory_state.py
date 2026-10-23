@@ -11,9 +11,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from mimir.worklink.backends.feature_factory import parse_factory_status
-from mimir.worklink.compute import LaunchHandle
-from mimir.worklink.factory_state import (
+pytest.importorskip("mimir_cultivate", reason="Worklink factory state belongs to Cultivate")
+
+from mimir_cultivate.worklink.backends.feature_factory import parse_factory_status
+from mimir_cultivate.worklink.compute import LaunchHandle
+from mimir_cultivate.worklink.factory_state import (
     FactoryRecordError,
     FactoryRunRecord,
     archive_factory_record,
@@ -79,7 +81,7 @@ def record(tmp_path: Path) -> FactoryRunRecord:
 def test_factory_still_going_checks_heartbeat_after_verified_death(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, minutes: int, going: bool,
 ) -> None:
-    import mimir.worklink.factory_state as state
+    import mimir_cultivate.worklink.factory_state as state
 
     now = datetime.now(UTC)
     value = record(tmp_path)
@@ -141,7 +143,7 @@ def test_factory_process_is_alive(
     observed_ticks: int | None,
     expected: bool,
 ) -> None:
-    import mimir.worklink.factory_state as factory_state
+    import mimir_cultivate.worklink.factory_state as factory_state
 
     value = replace(record(tmp_path), handle=handle)
     kill = Mock(side_effect=kill_error)
@@ -197,7 +199,7 @@ def test_factory_process_is_verified_dead(
     expected_with_ticks: bool,
     expected_without_ticks: bool,
 ) -> None:
-    import mimir.worklink.factory_state as factory_state
+    import mimir_cultivate.worklink.factory_state as factory_state
 
     value = replace(
         record(tmp_path),
@@ -234,7 +236,7 @@ def test_factory_process_is_verified_dead(
 def test_verified_dead_operator_cleanup_rejects_invalid_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, handle: LaunchHandle | None,
 ) -> None:
-    import mimir.worklink.factory_state as factory_state
+    import mimir_cultivate.worklink.factory_state as factory_state
 
     kill = Mock()
     start_ticks = Mock()
@@ -397,7 +399,7 @@ def test_factory_record_refuses_foreign_owner(
 ) -> None:
     source = save_factory_record(tmp_path, replace(record(tmp_path), status=None))
     owner = source.stat().st_uid
-    monkeypatch.setattr("mimir.worklink.factory_state.os.geteuid", lambda: owner + 1)
+    monkeypatch.setattr("mimir_cultivate.worklink.factory_state.os.geteuid", lambda: owner + 1)
 
     with pytest.raises(FactoryRecordError, match="bounded regular file"):
         archive_factory_record_for_issue(tmp_path, "1551", 1551)
@@ -432,7 +434,7 @@ def test_archive_factory_record_for_issue_refuses_unsafe_source(
 def test_archive_factory_record_for_issue_rejects_changed_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mimir.worklink.factory_state as factory_state
+    import mimir_cultivate.worklink.factory_state as factory_state
 
     source = save_factory_record(tmp_path, replace(record(tmp_path), status=None))
     real_read = factory_state._read_factory_record
@@ -506,7 +508,7 @@ def _retained_record(home: Path, repository: Path, *, sandbox_exists: bool = Tru
 
 @pytest.mark.parametrize("verified_dead", [False, True])
 def test_report_abandoned_running_record(tmp_path: Path, monkeypatch, verified_dead: bool) -> None:
-    import mimir.worklink.factory_state as factory_state
+    import mimir_cultivate.worklink.factory_state as factory_state
 
     expected = record(tmp_path)
     save_factory_record(tmp_path, expected)

@@ -20,8 +20,10 @@ from unittest.mock import Mock, call
 
 import pytest
 
-from mimir.worklink.checkout import CheckoutAuthorization, _mint_checkout_authorization
-from mimir.worklink.worker_client import (
+pytest.importorskip("mimir_cultivate", reason="Worklink executor belongs to Cultivate")
+
+from mimir_cultivate.worklink.checkout import CheckoutAuthorization, _mint_checkout_authorization
+from mimir_cultivate.worklink.worker_client import (
     EXECUTOR_PROTOCOL_IDENTITY,
     MAX_PROJECTION_BYTES,
     StaleWorkerExecutorError,
@@ -30,8 +32,8 @@ from mimir.worklink.worker_client import (
     WorkerProjection,
     verify_executor_identity,
 )
-import mimir.worklink.worker_exec as worker_exec
-from mimir.worklink import identities
+import mimir_cultivate.worklink.worker_exec as worker_exec
+from mimir_cultivate.worklink import identities
 
 
 def _issued(tmp_path: Path) -> Path:
@@ -72,7 +74,7 @@ def test_worker_clients_resolve_the_default_socket_at_call_time(
 ) -> None:
     socket_path = tmp_path / "executor.sock"
     checkout = tmp_path / ".worklink" / "repo" / "41-2"
-    monkeypatch.setattr("mimir.worklink.worker_client.DEFAULT_EXECUTOR_SOCKET", socket_path)
+    monkeypatch.setattr("mimir_cultivate.worklink.worker_client.DEFAULT_EXECUTOR_SOCKET", socket_path)
     monkeypatch.setattr(identities, "get_identities", lambda: synthetic_worklink_identities)
 
     assert WorkerClient(None).socket_path == socket_path
@@ -1408,13 +1410,11 @@ def factory_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("coding_enabled", [False, True])
 async def test_factory_compute_requires_executor_without_agent_fallback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coding_enabled: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.worklink import compute
+    from mimir_cultivate.worklink import compute
 
-    monkeypatch.setattr("mimir.worklink.checkout.coding_enabled", lambda: coding_enabled)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", Mock(side_effect=AssertionError("agent spawn")))
     monkeypatch.setattr(compute, "_fd_anchored_opencode_argv", Mock(side_effect=AssertionError("leaf argv handler")))
     launches = []
@@ -2574,7 +2574,7 @@ def test_factory_descendant_cannot_write_controller_canary_and_negative_control_
 ) -> None:
     if sys.platform != "linux" or os.geteuid() != 0:
         pytest.skip("requires Linux root, unavailable in unprivileged sandboxes")
-    from mimir.worklink.compute import LocalSubprocessComputeBackend, WorkSpec
+    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend, WorkSpec
 
     observed = worker_exec.get_identities()
     monkeypatch.setattr(identities, "get_identities", lambda: observed)

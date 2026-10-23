@@ -35,6 +35,22 @@ from mimir.update_on_start import (
 )
 
 
+import mimir.update_on_start as _uos
+
+_REAL_PROBE = _uos.cultivate_source_install
+
+
+@pytest.fixture(autouse=True)
+def _pypi_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests own the update path, not the venv they run in.
+
+    The selected-mode suite runs from ``uv sync --all-packages``, a ``file://``
+    Cultivate install, which the source-install guard refuses. Pin the probe to
+    "PyPI/core-only"; the probe's own tests call ``_REAL_PROBE`` directly.
+    """
+    monkeypatch.setattr("mimir.update_on_start.cultivate_source_install", lambda: None)
+
+
 # ─── flag_path / write_flag ─────────────────────────────────────────
 
 
@@ -1238,3 +1254,126 @@ async def test_version_bump_excludes_accepted_only_skill_drift(tmp_path, monkeyp
     kind, fields = calls[0]
     assert kind == "mimir_update_digest"
     assert fields["skills_drift"] == {"github-poller": {"differs": ["SKILL.md"]}}
+
+
+# ─── Cultivate installed from source: core must not move alone ──────
+
+
+class _Dist:
+    def __init__(self, direct_url: str | None) -> None:
+        self._direct_url = direct_url
+
+    def read_text(self, name: str) -> str | None:
+        assert name == "direct_url.json"
+        return self._direct_url
+
+
+def _no_cultivate(name):
+    import importlib.metadata
+    raise importlib.metadata.PackageNotFoundError(name)
+
+
+def test_probe_reads_controller_source_commit_marker(tmp_path, monkeypatch) -> None:
+    import mimir.update_on_start as uos
+
+    (tmp_path / "controller-source-commit").write_text("a" * 40 + "\n")
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    monkeypatch.setattr(uos.importlib.metadata, "distribution", _no_cultivate)
+    assert _REAL_PROBE() == "a" * 40
+
+
+def test_probe_reports_file_install_head_and_ignores_index_or_absent(tmp_path, monkeypatch) -> None:
+    import mimir.update_on_start as uos
+
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / "venv"))
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-C", str(checkout)]
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    plugin_url = (checkout / "plugins/cultivate").as_uri()
+    for direct_url, expected in (
+        (json.dumps({"url": checkout.as_uri(), "dir_info": {"editable": True}}), head),
+        # Not a git work tree (path gone): still refused, commit unknown.
+        (json.dumps({"url": plugin_url}), f"{checkout / 'plugins/cultivate'} (commit unknown)"),
+        (json.dumps({"url": "https://example.invalid/mimir_cultivate-1.0-py3-none-any.whl"}), None),
+        (None, None),  # an ordinary index install has no direct_url.json
+    ):
+        monkeypatch.setattr(uos.importlib.metadata, "distribution", lambda name, d=direct_url: _Dist(d))
+        assert _REAL_PROBE() == expected, direct_url
+    monkeypatch.setattr(uos.importlib.metadata, "distribution", _no_cultivate)
+    assert _REAL_PROBE() is None
+
+
+def test_apply_refuses_when_cultivate_is_source_installed(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    write_flag(tmp_path, target_version="0.2.0")
+    monkeypatch.setattr("mimir.update_on_start.cultivate_source_install", lambda: "b" * 40)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("pip must not run"))
+    events: list[tuple[str, dict]] = []
+    exec_called: list[tuple] = []
+    with caplog.at_level(logging.ERROR, logger="mimir.update_on_start"):
+        result = apply_pending_update(tmp_path, lambda kind, **f: events.append((kind, f)),
+                                      _exec=lambda *a: exec_called.append(a))
+    expected = (f"this deployment installs Cultivate from source at {'b' * 40}; rebuild the "
+                "image or re-sync the checkout to update")
+    # Same as a failed install: attempted, flag consumed, no re-exec.
+    assert result is True
+    assert not flag_path(tmp_path).exists()
+    assert exec_called == []
+    assert [kind for kind, _ in events] == ["mimir_update_failed"]
+    fields = events[0][1]
+    assert fields["reason"] == "cultivate_source_install" and fields["source"] == "b" * 40
+    assert fields["error"].startswith(expected)
+    sidecar = tmp_path / ".mimir" / "startup-events.jsonl"
+    assert json.loads(sidecar.read_text().splitlines()[-1])["reason"] == "cultivate_source_install"
+    assert any(r.levelno == logging.ERROR and expected in r.getMessage() for r in caplog.records)
+
+
+def test_apply_without_source_cultivate_still_installs(tmp_path, monkeypatch) -> None:
+    write_flag(tmp_path)
+    calls: list[list[str]] = []
+
+    def _run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    exec_called: list[tuple] = []
+    assert apply_pending_update(tmp_path, lambda *a, **k: None, _exec=lambda *a: exec_called.append(a)) is True
+    assert calls and calls[0][:5] == [sys.executable, "-m", "pip", "install", "--upgrade"]
+    assert len(exec_called) == 1
+
+
+@pytest.mark.parametrize("source", [None, "c" * 40])
+def test_cli_update_apply_refuses_only_source_cultivate(monkeypatch, capsys, source) -> None:
+    import argparse
+    from types import SimpleNamespace
+
+    from mimir.commands import update
+
+    monkeypatch.setattr("mimir.version_check.check_for_update", lambda **kw: SimpleNamespace(
+        error_msg=None, current="0.9.10", latest="9.0.0", is_newer=True))
+    monkeypatch.setattr("mimir.update_on_start.cultivate_source_install", lambda: source)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: calls.append(argv)
+                        or subprocess.CompletedProcess(argv, 0))
+    rc = update.dispatch(argparse.Namespace(pre=False, apply=True, check=False))
+    err = capsys.readouterr().err
+    if source is None:
+        assert rc == 0 and calls and calls[0][3:5] == ["install", "--upgrade"]
+    else:
+        assert rc == 2 and calls == []
+        assert f"installs Cultivate from source at {source}; rebuild the image or re-sync" in err
+
+
+def test_refusal_renders_without_re_request_advice() -> None:
+    from mimir.feedback.renderers import _render_event_line
+
+    message = "this deployment installs Cultivate from source at abc; rebuild the image or re-sync the checkout to update"
+    text = _render_event_line("mimir_update_failed", {
+        "type": "mimir_update_failed", "reason": "cultivate_source_install", "error": message})
+    assert text.startswith("mimir update REFUSED: " + message)
+    assert "re-approve" not in text

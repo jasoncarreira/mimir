@@ -6,10 +6,16 @@ import subprocess
 import tarfile
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+try:
+    version("mimir-cultivate")
+except PackageNotFoundError:
+    pytest.skip("PR checkout leases require installed Cultivate", allow_module_level=True)
 
 from mimir.access_control import (
     CapabilityTier,
@@ -19,13 +25,12 @@ from mimir.access_control import (
 from mimir.models import (
     AuthContext,
     InformationFlowLabels,
-    RepoPRAction,
-    RepoPRActionScope,
-    RepoReviewState,
-    ServerDiscoveredPRStates,
     TurnInteractivity,
 )
-from mimir.pr_checkout_lease import (
+from mimir_cultivate.policy import (
+    RepoPRAction, RepoPRActionScope, RepoReviewState, ServerDiscoveredPRStates,
+)
+from mimir_cultivate.repository import (
     PRCheckoutLease,
     _foreign_candidate_head,
     _retained_candidate_head,
@@ -126,7 +131,7 @@ def test_pr_checkout_lease_checks_out_exact_authorized_head_and_recovers(tmp_pat
 def test_unexpired_lease_renews_on_new_turn_with_injected_clock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reuse: str,
 ) -> None:
-    from mimir import pr_checkout_lease as leases
+    from mimir_cultivate import repository as leases
 
     _repo, scope = _repo_and_scope(tmp_path)
     root = tmp_path / "leases"
@@ -166,7 +171,7 @@ def test_unexpired_lease_renews_on_new_turn_with_injected_clock(
 
 
 def test_unused_lease_expires_without_renewal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from mimir import pr_checkout_lease as leases
+    from mimir_cultivate import repository as leases
 
     _repo, scope = _repo_and_scope(tmp_path)
     root = tmp_path / "leases"
@@ -252,7 +257,7 @@ def test_later_turn_reuses_same_pr_fast_forward_candidate(
     candidate_head = _git(earlier.path, "rev-parse", "HEAD")
     state = RepoReviewState(scope)
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: scope.observed_head_sha,
     )
 
@@ -288,7 +293,7 @@ def test_later_turn_refuses_same_pr_candidate_from_another_source_root(
     metadata_path.write_text(json.dumps(metadata))
     original_metadata = metadata_path.read_bytes()
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: scope.observed_head_sha,
     )
 
@@ -434,7 +439,7 @@ def test_later_turn_reuses_rebased_candidate_with_added_fix(
     metadata_path = earlier.path / ".git/mimir-pr-checkout-lease.json"
     original_metadata = metadata_path.read_bytes()
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: scope.observed_head_sha,
     )
     state = RepoReviewState(current_scope)
@@ -497,7 +502,7 @@ def test_turn_recovers_genuinely_divergent_same_pr_candidate(
         metadata_path.write_text(json.dumps(metadata))
     original_metadata = metadata_path.read_bytes()
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: scope.observed_head_sha,
     )
 
@@ -644,7 +649,7 @@ def test_reaper_reclaims_expired_published_lease(tmp_path: Path) -> None:
 def test_reaper_delete_failure_leaves_only_tombstone_and_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_number: int,
 ) -> None:
-    from mimir import pr_checkout_lease as leases
+    from mimir_cultivate import repository as leases
 
     _repo, scope = _repo_and_scope(tmp_path)
     root = tmp_path / "leases"
@@ -683,7 +688,7 @@ def test_reaper_delete_failure_leaves_only_tombstone_and_retries(
 def test_reaper_failure_on_first_lease_does_not_block_second(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import pr_checkout_lease as leases
+    from mimir_cultivate import repository as leases
 
     _repo, scope = _repo_and_scope(tmp_path)
     root = tmp_path / "leases"
@@ -732,7 +737,7 @@ def test_reaper_rechecks_live_paths_immediately_before_rename(tmp_path: Path) ->
 def test_broken_lease_is_never_recovered_and_fresh_checkout_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broken: str,
 ) -> None:
-    from mimir import pr_checkout_lease as leases
+    from mimir_cultivate import repository as leases
 
     _repo, scope = _repo_and_scope(tmp_path)
     root = tmp_path / "leases"
@@ -772,7 +777,7 @@ def test_broken_lease_is_never_recovered_and_fresh_checkout_succeeds(
 def test_marked_unpublished_head_is_preserved_and_alerted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.pr_checkout_lease import _RECLAMATION_METADATA
+    from mimir_cultivate.repository import _RECLAMATION_METADATA
 
     _repo, scope = _repo_and_scope(tmp_path)
     root = tmp_path / "leases"
@@ -800,7 +805,7 @@ def test_repo_checkout_after_half_reclaimed_lease_uses_fresh_git_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.models import InformationFlowState
-    from mimir.tools.repo import repo_checkout
+    from mimir_cultivate.repository import repo_checkout
 
     _repo, scope = _repo_and_scope(tmp_path)
     root = tmp_path / "leases"
@@ -812,14 +817,14 @@ def test_repo_checkout_after_half_reclaimed_lease_uses_fresh_git_checkout(
     state = RepoReviewState(scope)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
     monkeypatch.setattr(
-        "mimir.tools.forge.remediation_checkout_preflight",
+        "mimir_cultivate.forge.remediation_checkout_preflight",
         lambda *_args: (state, None),
     )
     monkeypatch.setattr(
-        "mimir.tools.forge._client",
+        "mimir_cultivate.forge._client",
         lambda *_args: SimpleNamespace(author_is_trusted=None),
     )
-    monkeypatch.setattr("mimir.tools.repo._publish_attested_lease_result", lambda *_args: None)
+    monkeypatch.setattr("mimir_cultivate.repository._publish_attested_lease_result", lambda *_args: None)
 
     result = repo_checkout.func(
         repository=scope.canonical_repo, pull_request=scope.pr_number,
@@ -1089,7 +1094,7 @@ def test_acquire_refuses_and_reports_foreign_scope_candidate(
         lambda kind, **fields: events.append((kind, fields)),
     )
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: scope.observed_head_sha,
     )
 
@@ -1185,7 +1190,7 @@ def test_acquire_releases_clean_superseded_scope_and_records_observed_heads(
     fresh_scope = _advance_pr_head(repo, old_scope)
     events: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: fresh_scope.observed_head_sha,
     )
     monkeypatch.setattr(
@@ -1252,7 +1257,7 @@ def test_acquire_reuses_published_head_after_stale_metadata_head(
         old_scope, observed_head_sha=published, provenance="server_discovered",
     )
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: fresh_scope.observed_head_sha,
     )
 
@@ -1298,7 +1303,7 @@ def test_acquire_fetches_missing_live_head_before_ancestry(
     metadata_path = lease.path / ".git/mimir-pr-checkout-lease.json"
     original_metadata = metadata_path.read_bytes()
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head", lambda _scope: live_head,
+        "mimir_cultivate.repository._observe_current_pr_head", lambda _scope: live_head,
     )
     fetched = False
     checked_ancestry = False
@@ -1353,7 +1358,7 @@ def test_acquire_releases_rebased_published_work_by_blob_identity(
     lease_object = old_lease.path / ".git" / "objects" / dangling[:2] / dangling[2:]
     assert source_object.stat().st_ino == lease_object.stat().st_ino
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: fresh_scope.observed_head_sha,
     )
 
@@ -1375,7 +1380,7 @@ def test_acquire_bundles_unpublished_superseded_work_and_releases_lease(
     _git(old_lease.path, "add", "unpublished.bin")
     _git(old_lease.path, "commit", "-q", "-m", "unpublished binary")
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: fresh_scope.observed_head_sha,
     )
 
@@ -1408,7 +1413,7 @@ def test_acquire_refuses_rebased_lease_when_tracked_base_is_unrelated(
     _git(old_lease.path, "checkout", "-q", branch)
     _git(old_lease.path, "update-ref", "refs/remotes/origin/main", unrelated)
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: fresh_scope.observed_head_sha,
     )
 
@@ -1434,11 +1439,11 @@ def test_acquire_refuses_second_live_scope_for_same_target(
     metadata_path = first.path / ".git" / "mimir-pr-checkout-lease.json"
     original_metadata = metadata_path.read_bytes()
     monkeypatch.setattr(
-        "mimir._context.active_pr_checkout_lease_paths",
+        "mimir_cultivate.scheduler.active_pr_checkout_lease_paths",
         lambda: {first.path},
     )
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: scope.observed_head_sha,
     )
 
@@ -1464,11 +1469,11 @@ def test_acquire_reuses_ended_scope_for_same_target(
         first_scope, owner=first_scope.principal, lease_root=lease_root,
     )
     monkeypatch.setattr(
-        "mimir._context.active_pr_checkout_lease_paths",
+        "mimir_cultivate.scheduler.active_pr_checkout_lease_paths",
         lambda: set(),
     )
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: scope.observed_head_sha,
     )
 
@@ -1508,7 +1513,7 @@ def test_acquire_keeps_foreign_lease_when_live_head_cannot_be_observed(
             raise RuntimeError(failure)
 
     monkeypatch.setattr(
-        "mimir.tools.forge._client_for_repository",
+        "mimir_cultivate.forge._client_for_repository",
         lambda _repository: UnobservableForge(),
     )
 
@@ -1530,7 +1535,7 @@ def test_acquire_does_not_trust_new_scope_sha_to_release_matching_live_head(
     )
     caller_scope = replace(old_scope, observed_head_sha="f" * 40)
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: old_scope.observed_head_sha,
     )
 
@@ -1559,7 +1564,7 @@ def test_acquire_archives_dirty_superseded_lease_before_releasing_it(
     fresh_scope = _advance_pr_head(repo, old_scope)
     events: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: fresh_scope.observed_head_sha,
     )
     monkeypatch.setattr(
@@ -1639,7 +1644,7 @@ def test_acquire_leaves_superseded_lease_when_recovery_fails(
     head = _git(old_lease.path, "rev-parse", "HEAD")
     fresh_scope = _advance_pr_head(repo, old_scope)
     monkeypatch.setattr(
-        "mimir.pr_checkout_lease._observe_current_pr_head",
+        "mimir_cultivate.repository._observe_current_pr_head",
         lambda _scope: fresh_scope.observed_head_sha,
     )
 
@@ -1966,6 +1971,23 @@ def test_review_state_refuses_mismatched_or_inactive_checkout_lease(
         assert state.checked_out is False
 
 
+@pytest.fixture
+def selected_tracked_file_policy():
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
+    pytest.importorskip("mimir_cultivate")
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+@pytest.mark.usefixtures("selected_tracked_file_policy")
 @pytest.mark.asyncio
 async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -2099,6 +2121,7 @@ async def test_protected_reads_allow_only_tracked_files_in_exact_authorized_pr_l
     assert revoked.error == result_refusal
 
 
+@pytest.mark.usefixtures("selected_tracked_file_policy")
 @pytest.mark.parametrize(
     "case",
     ["own", "no_active_lease", "different_pr", "outside", "untracked", "same_pr_other_state"],
@@ -2113,7 +2136,7 @@ def test_discovered_pr_protected_read(
     from mimir.read_policy import (
         file_contains_secret, non_admin_read_filter_enabled, protected_read_denial_reason,
     )
-    from mimir.repo_tools import RepoGitTools
+    from mimir_cultivate.repository import RepoGitTools
 
     repo, initial_scope = _repo_and_scope(tmp_path)
     credential = "ghp_" + "Synthetic9" * 4
@@ -2210,6 +2233,7 @@ def _service_auth(service) -> AuthContext:
     )
 
 
+@pytest.mark.usefixtures("selected_tracked_file_policy")
 def test_github_activity_write_grant_is_exactly_active_lease_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -210,17 +210,24 @@ def test_bundled_skill_descriptions_fit_agent_skills_limit() -> None:
 
 @pytest.fixture
 def registered_tool_names(monkeypatch: pytest.MonkeyPatch) -> set[str]:
-    """Enumerate the registry without provider, CLI, or ambient MCP gating."""
+    """Enumerate the selected tool registry without CLI or ambient MCP gating."""
+    from importlib.metadata import PackageNotFoundError, version
     from mimir.access_control import TRIGGER_CAPABILITY_TIERS
-    from mimir.tools import forge, mcp, registry, web
+    from mimir.tools import mcp, registry, web
 
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("selected skill inventory requires installed Cultivate")
     monkeypatch.setattr(web, "web_tools_enabled", lambda _: (True, True))
-    monkeypatch.setattr(forge, "github_identity_is_degraded", lambda: False)
     monkeypatch.setattr(mcp, "get_mcp_tools", lambda: [])
+    from mimir.plugins.manager import load_plugins
+
+    selected = load_plugins(enable="cultivate").policy
     tools = registry.all_mimir_tools(
         model_spec="anthropic:claude-sonnet-4-6",
-        coding_enabled=True,
-        require_coding_available=False,
+        require_provider_available=False,
+        policy=selected,
     )
     # Include the framework-native tools which do not go through this factory.
     return {tool.name for tool in tools} | set(TRIGGER_CAPABILITY_TIERS)

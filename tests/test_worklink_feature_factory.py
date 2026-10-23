@@ -11,8 +11,10 @@ from typing import Any
 
 import pytest
 
-from mimir.worklink.backends.base import WorkOrder
-from mimir.worklink.backends.feature_factory import (
+pytest.importorskip("mimir_cultivate")
+
+from mimir_cultivate.worklink.backends.base import WorkOrder
+from mimir_cultivate.worklink.backends.feature_factory import (
     FACTORY_COMMANDS,
     FACTORY_PUBLISHING_IDENTITY_ENV,
     FACTORY_VERSION,
@@ -27,7 +29,7 @@ from mimir.worklink.backends.feature_factory import (
     _factory_max_retries,
     _run_bounded,
 )
-from mimir.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
+from mimir_cultivate.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
 
 
 def status_payload(**overrides: Any) -> dict[str, Any]:
@@ -1246,18 +1248,18 @@ def test_status_control_rejects_malformed_trailing_and_nonfinite_output(tmp_path
 def test_migrated_factory_consumers_have_finite_legacy_free_inventory() -> None:
     root = Path(__file__).parent.parent
     consumers = (
-        "mimir/worklink/orchestrator.py",
-        "mimir/worklink/autonomy.py",
-        "mimir/worklink/continuation.py",
-        "mimir/worklink/control.py",
-        "mimir/worklink/run_state.py",
-        "mimir/worklink/factory_state.py",
-        "mimir/worklink/checkout.py",
-        "mimir/worklink/backends/feature_factory.py",
-        "mimir/commands/worklink.py",
-        "mimir/server.py",
+        "plugins/cultivate/mimir_cultivate/worklink/orchestrator.py",
+        "plugins/cultivate/mimir_cultivate/worklink/autonomy.py",
+        "plugins/cultivate/mimir_cultivate/worklink/continuation.py",
+        "plugins/cultivate/mimir_cultivate/worklink/control.py",
+        "plugins/cultivate/mimir_cultivate/worklink/run_state.py",
+        "plugins/cultivate/mimir_cultivate/worklink/factory_state.py",
+        "plugins/cultivate/mimir_cultivate/worklink/checkout.py",
+        "plugins/cultivate/mimir_cultivate/worklink/backends/feature_factory.py",
+        "plugins/cultivate/mimir_cultivate/commands.py",
+        "plugins/cultivate/mimir_cultivate/server.py",
         "mimir/web_ui.py",
-        "mimir/optional-skills/chainlink-orchestrator/scripts/poller.py",
+        "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator/scripts/poller.py",
     )
     forbidden = (
         '".opencode" / "factory"',
@@ -1290,7 +1292,7 @@ def test_control_environment_forwards_the_factory_publishing_identity(monkeypatc
     reads as a misconfiguration rather than a stripped variable -- so assert the
     forwarding rather than trusting that exporting it is enough.
     """
-    from mimir.worklink.backends.feature_factory import _control_environment
+    from mimir_cultivate.worklink.backends.feature_factory import _control_environment
 
     monkeypatch.setenv("FACTORY_PUBLISHING_IDENTITY", "mimir-carreira")
     assert _control_environment().get("FACTORY_PUBLISHING_IDENTITY") == "mimir-carreira"
@@ -1298,7 +1300,7 @@ def test_control_environment_forwards_the_factory_publishing_identity(monkeypatc
 
 def test_control_environment_still_drops_unlisted_variables(monkeypatch) -> None:
     """The allowlist stays an allowlist -- adding one name must not open it up."""
-    from mimir.worklink.backends.feature_factory import _control_environment
+    from mimir_cultivate.worklink.backends.feature_factory import _control_environment
 
     monkeypatch.setenv("FACTORY_PUBLISHING_IDENTITY", "mimir-carreira")
     monkeypatch.setenv("SOME_UNRELATED_SECRET", "must-not-leak")
@@ -1396,9 +1398,9 @@ async def test_launch_child_environment_carries_the_publishing_identity(
     """
     _own_opencode_resolution(tmp_path, monkeypatch)
     from types import SimpleNamespace
-    from mimir.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
 
-    from mimir.worklink.compute import LocalSubprocessComputeBackend
+    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
 
     captured: dict[str, dict[str, str]] = {}
 
@@ -1407,8 +1409,8 @@ async def test_launch_child_environment_carries_the_publishing_identity(
         capability._contained_started(SimpleNamespace(pid=None))
         return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
 
-    monkeypatch.setattr("mimir.worklink.compute.execute_contained", fake_exec)
-    monkeypatch.setattr("mimir.worklink.compute._local_child_env", dict)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute.execute_contained", fake_exec)
+    monkeypatch.setattr("mimir_cultivate.worklink.compute._local_child_env", dict)
 
     spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(
         _factory_order(tmp_path, "mimir-carreira"),
@@ -1452,7 +1454,7 @@ def test_unusable_factory_retry_budget_warns_instead_of_degrading_silently(
     because every check short of the live launch argv reported the intended value.
     """
     monkeypatch.setenv("MIMIR_FACTORY_MAX_RETRIES", configured)
-    with caplog.at_level(logging.WARNING, logger="mimir.worklink.backends.feature_factory"):
+    with caplog.at_level(logging.WARNING, logger="mimir_cultivate.worklink.backends.feature_factory"):
         assert _factory_max_retries() == _DEFAULT_FACTORY_MAX_RETRIES
     messages = [r.getMessage() for r in caplog.records]
     assert any("MIMIR_FACTORY_MAX_RETRIES" in m for m in messages), caplog.text
@@ -1468,7 +1470,7 @@ def test_absent_factory_retry_budget_is_silent(
     would satisfy the test above while telling an operator nothing.
     """
     monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
-    with caplog.at_level(logging.WARNING, logger="mimir.worklink.backends.feature_factory"):
+    with caplog.at_level(logging.WARNING, logger="mimir_cultivate.worklink.backends.feature_factory"):
         assert _factory_max_retries() == _DEFAULT_FACTORY_MAX_RETRIES
     assert not caplog.records, caplog.text
 
@@ -1477,7 +1479,7 @@ def test_usable_factory_retry_budget_is_silent(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setenv("MIMIR_FACTORY_MAX_RETRIES", "8")
-    with caplog.at_level(logging.WARNING, logger="mimir.worklink.backends.feature_factory"):
+    with caplog.at_level(logging.WARNING, logger="mimir_cultivate.worklink.backends.feature_factory"):
         assert _factory_max_retries() == 8
     assert not caplog.records, caplog.text
 
@@ -1495,7 +1497,7 @@ def test_control_classifies_only_the_run_lock_timeout_as_contention(
     monkeypatch, tmp_path: Path, detail: str, contended: bool, command: str,
 ) -> None:
     """status and heartbeat wait 1s on a lock a live driver holds for whole transitions."""
-    from mimir.worklink.backends.feature_factory import (
+    from mimir_cultivate.worklink.backends.feature_factory import (
         FactoryContractError,
         FactoryRunLockContended,
     )

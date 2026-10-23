@@ -21,7 +21,7 @@ from mimir._context import reset_current_turn, set_current_turn
 from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
 from mimir.event_logger import init_logger
 from mimir.models import (
-    InformationFlowLabels, InformationFlowState, RetainedFactoryScope, SourceLabel,
+    InformationFlowLabels, InformationFlowState, SourceLabel,
     TurnContext,
 )
 from mimir.pollers import discover_pollers, run_poller
@@ -30,8 +30,23 @@ from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file
 
 
 @pytest.fixture
-def retained_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from mimir.worklink import worker_client
+def selected_cultivate_policy():
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("retained repository tools require installed Cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+@pytest.fixture
+def retained_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_cultivate_policy):
+    from mimir_cultivate.policy import RetainedFactoryScope
+    from mimir_cultivate.worklink import worker_client
 
     home = tmp_path / "home"
     (home / "state").mkdir(parents=True)
@@ -50,7 +65,7 @@ def retained_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     manifest = json.loads((
         Path(__file__).parents[1]
-        / "mimir/optional-skills/chainlink-orchestrator/pollers.json"
+        / "plugins/cultivate/mimir_cultivate/defaults/skills/chainlink-orchestrator/pollers.json"
     ).read_text(encoding="utf-8"))["pollers"][0]
     service = ac.build_trigger_service_principal(
         canonical="poller:worklink-ready-queue",
@@ -59,6 +74,7 @@ def retained_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         tier=ac.CapabilityTier.CODE_EXECUTION,
         capabilities=tuple(manifest["authority"]["capabilities"]),
         creation_path="mimir.pollers.run_poller:chainlink-orchestrator/pollers.json",
+        poller_owner="cultivate",
     )
     initial = InformationFlowLabels().with_source(SourceLabel(
         principal="worklink", domain="poller_payload", resource_id="incident:1806",
@@ -136,12 +152,19 @@ class _CapturingEnqueue:
 
 @pytest.mark.asyncio
 async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_anchor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_cultivate_policy,
 ) -> None:
-    from mimir.worklink import dispatch_failures as failures
-    from mimir.worklink.compute import LaunchHandle
-    from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
-    from mimir.worklink import worker_client
+    await exercise_real_worklink_failure_turn(tmp_path, monkeypatch, selected_provider=True)
+
+
+async def exercise_real_worklink_failure_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, selected_provider: bool = False,
+) -> None:
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate.worklink import dispatch_failures as failures
+    from mimir_cultivate.worklink.compute import LaunchHandle
+    from mimir_cultivate.worklink.factory_state import FactoryRunRecord, save_factory_record
+    from mimir_cultivate.worklink import worker_client
 
     home = tmp_path / "home"
     state_root = home / "state" / "pollers"
@@ -164,10 +187,17 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{external}:ro")
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+    if selected_provider:
+        from mimir_cultivate.worklink import worker_client as provider_worker_client
 
-    skills = Path(__file__).parents[1] / "mimir" / "optional-skills"
+        monkeypatch.setattr(provider_worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+
+    skills = home / "skills"
     ready = next(
-        config for config in discover_pollers(skills, state_root=state_root)
+        config for config in discover_pollers(
+            skills, state_root=state_root,
+            policy=load_plugins(enable="cultivate").policy,
+        )
         if config.name == "worklink-ready-queue"
     )
     failures.record_failure(
@@ -191,6 +221,10 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
         ready,
         command=f"{sys.executable} scripts/poller.py",
     )
+    if selected_provider:
+        from mimir_cultivate.scheduler import worklink_poller_hooks
+
+        ready = replace(ready, hooks=worklink_poller_hooks())
     enqueued = _CapturingEnqueue()
 
     emitted = await run_poller(ready, enqueue=enqueued, home=home)
@@ -198,8 +232,13 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
     assert emitted == 1, event_log.read_text(encoding="utf-8")
     [event] = enqueued.events
     labels = _initialize_ifc_labels(event)
+    selected = None
+    if selected_provider:
+        from mimir.plugins.manager import load_plugins
+
+        selected = load_plugins(enable="cultivate").policy
     auth = _create_turn_auth_context(
-        event, None, policy_version=None, enforce=True, ifc_labels=labels,
+        event, None, policy_version=None, enforce=True, ifc_labels=labels, policy=selected,
     )
     turn = TurnContext(
         turn_id="real-worklink-remediation",
@@ -217,12 +256,52 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
         assert service.canonical == "poller:worklink-ready-queue"
         assert retained in ac.service_filesystem_read_roots(
             service, auth_context=auth,
-        )
+        ), auth.retained_factory_scope_refusal
         decision = ac.ToolRegistry().authorize_tool(
             "read_file", auth, enforce=True,
             arguments={"file_path": str(retained_target)},
         )
         assert decision.allowed, (decision.reason, decision.refusal_detail)
+        if selected_provider:
+            from mimir.access_control import create_auth_context
+            from mimir.plugins.core import policy_scope
+            from mimir_cultivate.policy import CultivateState
+
+            owner_state = auth.plugin_state("cultivate")
+            assert type(owner_state) is CultivateState
+            assert owner_state.retained_factory_scope is auth.retained_factory_scope
+            assert owner_state.retained_factory_scope is not None
+            assert owner_state.retained_factory_scope_refusal is None
+            arguments = {"repository": owner_state.retained_factory_scope.repository,
+                         "pull_request": owner_state.retained_factory_scope.issue_id}
+            with policy_scope(selected):
+                retained_decision = ac.ToolRegistry().authorize_tool(
+                    "repo_status", auth, enforce=True, arguments=arguments,
+                )
+                assert retained_decision.allowed, retained_decision.reason
+                untrusted_event = create_auth_context(
+                    event, policy=selected, enforce=True, event_ingress="http_event",
+                )
+                assert untrusted_event.plugin_state("cultivate").retained_factory_scope is None
+                assert untrusted_event.plugin_state("cultivate").retained_factory_scope_refusal
+                assert ac.ToolRegistry().authorize_tool(
+                    "repo_status", untrusted_event, enforce=True, arguments=arguments,
+                ).would_block
+                original_slots = auth.plugin_slots
+                object.__setattr__(auth, "plugin_slots", (("cultivate", CultivateState()),))
+                assert ac.ToolRegistry().authorize_tool(
+                    "repo_status", auth, enforce=True, arguments=arguments,
+                ).would_block
+                shadow = ac.ToolRegistry().authorize_tool(
+                    "repo_status", auth, enforce=False, arguments=arguments,
+                )
+                assert shadow.allowed and shadow.would_block
+                unbound_read = ac.ToolRegistry().authorize_tool(
+                    "read_file", auth, enforce=True,
+                    arguments={"file_path": str(retained_target)},
+                )
+                assert unbound_read.result_integrity == "untrusted"
+                object.__setattr__(auth, "plugin_slots", original_slots)
         for tool in ("write_file", "edit_file"):
             write_target = sandbox / "fix.py"
             write_decision = ac.ToolRegistry().authorize_tool(
@@ -263,7 +342,7 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
 async def _invoke_retained_tool(
     name, tool, arguments, auth, runtime, registry, gate, node,
 ) -> ToolMessage:
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate import repository as repo_module
 
     decision = registry.authorize_tool(
         name, auth, enforce=True, arguments=arguments,
@@ -311,15 +390,17 @@ async def _invoke_retained_tool(
 
 @pytest.mark.asyncio
 async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_cultivate_policy,
 ) -> None:
     __tracebackhide__ = True
-    from mimir.project_tests import ProjectTestResult
-    from mimir.tools import repo as repo_module
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate.repository import ProjectTestResult
+    from mimir_cultivate import repository as repo_module
     from mimir.tools.budget_gate import BudgetGateMiddleware
-    from mimir.worklink import dispatch_failures as failures, worker_client
-    from mimir.worklink.compute import LaunchHandle
-    from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate.worklink import dispatch_failures as failures, worker_client
+    from mimir_cultivate.worklink.compute import LaunchHandle
+    from mimir_cultivate.worklink.factory_state import FactoryRunRecord, save_factory_record
 
     home = tmp_path / "home"
     state_root = home / "state" / "pollers"
@@ -344,12 +425,16 @@ async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
+        lambda _record: False,
     )
 
-    skills = Path(__file__).parents[1] / "mimir" / "optional-skills"
+    skills = home / "skills"
     ready = next(
-        config for config in discover_pollers(skills, state_root=state_root)
+        config for config in discover_pollers(
+            skills, state_root=state_root,
+            policy=load_plugins(enable="cultivate").policy,
+        )
         if config.name == "worklink-ready-queue"
     )
     failures.record_failure(
@@ -372,9 +457,12 @@ async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow
     assert emitted == 1
     [event] = enqueued.events
     labels = _initialize_ifc_labels(event)
+    selected = selected_policy_registry()
     auth = _create_turn_auth_context(
         event, None, policy_version=None, enforce=True, ifc_labels=labels,
+        policy=selected,
     )
+    assert auth.retained_factory_scope is not None, auth.retained_factory_scope_refusal
     turn = TurnContext(
         turn_id="real-worklink-tool-remediation", session_id=event.channel_id,
         trigger=event.trigger, channel_id=event.channel_id, started_at=0.0,
@@ -391,6 +479,7 @@ async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow
         owner_calls.append(tuple(argv))
         return subprocess.run(argv, env=env, capture_output=True, check=False)
 
+    monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
     monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
 
     async def passing_test(self, selectors, *, suite):
@@ -412,7 +501,7 @@ async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow
         },
     }
     registry = ac.ToolRegistry()
-    gate = BudgetGateMiddleware()
+    gate = BudgetGateMiddleware(selected)
     node = ToolNode(list(tools.values()))
 
     token = set_current_turn(turn)

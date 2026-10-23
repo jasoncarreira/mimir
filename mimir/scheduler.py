@@ -64,7 +64,7 @@ from .access_control import (
 )
 from .core_blocks import read_text_lossy
 from .event_logger import get_events_path, log_event, log_event_sync, safe_log_event
-from ._context import active_pr_checkout_lease_paths, active_turn_snapshots
+from ._context import active_turn_snapshots
 from .loop_watchdog import (
     LoopStallWatchdog,
     stack_is_apscheduler_logging_flush,
@@ -91,7 +91,6 @@ log = logging.getLogger(__name__)
 # Process-lifetime pools start threads lazily and cannot starve DNS/turn IO.
 _SCRATCH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scratch-sweep")
 _MALLOC_TRIM_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="malloc-trim")
-_WORKLINK_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="worklink-reap")
 
 UTC = timezone.utc
 
@@ -1165,7 +1164,8 @@ class Scheduler:
                 self._yaml_path,
                 writable_roots=agent_writable_roots(self._home),
             )
-        return self._apply_reload(yaml_jobs, rejections)
+        yaml_jobs, skipped = self._drop_unselected_plugin_jobs(yaml_jobs)
+        return self._apply_reload(yaml_jobs, rejections, skipped=skipped)
 
     async def _reload_async(self) -> dict[str, int]:
         """``reload`` with the yaml read off the loop (``to_thread``) and
@@ -1186,12 +1186,51 @@ class Scheduler:
                     self._yaml_path, writable_roots=agent_writable_roots(home),
                 ),
             )
-        return self._apply_reload(yaml_jobs, rejections)
+        yaml_jobs, skipped = await asyncio.to_thread(
+            self._drop_unselected_plugin_jobs, yaml_jobs,
+        )
+        return self._apply_reload(yaml_jobs, rejections, skipped=skipped)
+
+    def _drop_unselected_plugin_jobs(
+        self, jobs: list[SchedulerJob],
+    ) -> tuple[list[SchedulerJob], list[dict[str, Any]]]:
+        """Withhold jobs seeded by a plugin that is not selected in this process.
+
+        Seeding merges ``<plugin>-<job>`` entries into the operator's
+        scheduler.yaml, and they stay there after the operator deselects the
+        plugin. Ownership is decided from package metadata and the home's seed
+        markers only, so the deselected provider is never imported. The entries
+        remain in the file (add/remove rewrites keep them); they just never fire.
+        """
+        from .plugins.defaults import seed_namespaces, selected_plugin_owners
+
+        home = self._home if self._home is not None else self._yaml_path.parent
+        namespaces = seed_namespaces(home)
+        selected = selected_plugin_owners(self._policy)
+        kept: list[SchedulerJob] = []
+        skipped: list[dict[str, Any]] = []
+        for job in jobs:
+            owner = namespaces.job_owner(job.name)
+            if owner is None or owner in selected:
+                kept.append(job)
+                continue
+            reason = (
+                f"job seeded by plugin {owner!r}, which is not selected; "
+                f"set MIMIR_PLUGINS to include {owner!r} to run it"
+            )
+            log.warning(
+                "scheduler_plugin_seed_unselected: %s job=%r — %s; job not scheduled",
+                self._yaml_path, job.name, reason,
+            )
+            skipped.append({"path": str(self._yaml_path), "job": job.name, "reason": reason})
+        return kept, skipped
 
     def _apply_reload(
         self,
         yaml_jobs: list[SchedulerJob],
         rejections: list[dict[str, Any]] | None = None,
+        *,
+        skipped: list[dict[str, Any]] | None = None,
     ) -> dict[str, int]:
         """Apply pre-loaded jobs and mutate APScheduler on the loop thread.
 
@@ -1308,6 +1347,7 @@ class Scheduler:
             )
             registered += 1
         self._dispatch_reload_events("scheduler_job_rejected", rejection_events)
+        self._dispatch_reload_events("scheduler_plugin_job_skipped", list(skipped or []))
         return {"registered": registered, "invalid": invalid}
 
     async def _consult_arbiter(self, *, priority: str) -> Any | None:
@@ -2001,6 +2041,7 @@ class Scheduler:
                 yaml_jobs, _rejections = load_jobs(self._yaml_path)
             except Exception:  # noqa: BLE001 — already logged inside load_jobs
                 yaml_jobs = []
+            yaml_jobs, _skipped = self._drop_unselected_plugin_jobs(yaml_jobs)
 
         effective_cron, source = _resolve_callable_cron(
             yaml_jobs, cdef.name, cdef.default_cron,
@@ -3263,131 +3304,6 @@ class Scheduler:
             default_cron=cron_expr,
             job_id=job_id,
             misfire_grace_time=3600,
-            max_instances=1,
-            coalesce=True,
-        )
-
-    # ---- Worklink TTL reaper cron (slice-3 autonomy, #444) -----------
-
-    def add_worklink_factory_park_alert_job(
-        self, home: Path, channel: str, channels: Any,
-    ) -> bool:
-        """Check retained factory parks every five minutes without a model turn."""
-        from .worklink.park_alerts import alert_parked_factory_runs
-
-        async def _fire() -> None:
-            await alert_parked_factory_runs(home, channel, channels)
-
-        return self.register_callable(
-            name="worklink-factory-park-alert", fn=_fire,
-            default_cron="*/5 * * * *", job_id="worklink-factory-park-alert",
-            max_instances=1, coalesce=True,
-        )
-
-    def add_worklink_reaper_job(
-        self,
-        home: Path,
-        cron_expr: str = "",
-        *,
-        job_id: str = "worklink-reaper",
-    ) -> bool:
-        """Register the Worklink stale-claim TTL reaper.
-
-        Recovers leaves whose worker died: any ``worklink:in-progress`` claim
-        with no heartbeat past ``defaults.reaper_ttl_s`` is stolen back to
-        ``worklink:ready`` (or ``worklink:blocked`` once attempts are spent) so
-        the ready queue can re-dispatch it. Delegates discovery + staleness to
-        the tested :func:`mimir.worklink.autonomy.reap_stale_claims_for_home`,
-        which runs ``chainlink`` subprocesses — so the body hops to a worker
-        thread to keep the event loop free.
-
-        Default cron is **empty** → no job is installed unless an operator opts
-        in (``MIMIR_WORKLINK_REAPER_CRON`` env or a ``callable: worklink-reaper``
-        scheduler.yaml entry). Worklink is opt-in per home; non-Worklink
-        deployments install nothing.
-        """
-        from .worklink.autonomy import (
-            close_merged_chainlinks_for_home,
-            prune_stale_attempt_checkouts_for_home,
-            reap_stale_claims_for_home,
-            report_foreign_owned_git_objects_for_home,
-        )
-        from .worklink.claims import ReapResult
-        from .worklink.identities import get_identities
-
-        async def _fire() -> None:
-            def _reap() -> tuple[ReapResult, list[Path], list[Path], list[object]]:
-                return (
-                    reap_stale_claims_for_home(home),
-                    report_foreign_owned_git_objects_for_home(
-                        home, expected_uid=get_identities().mimir_uid
-                    )
-                    if os.environ.get("WORKLINK_REPO")
-                    or os.environ.get("MIMIR_WORKLINK_REPO")
-                    else [],
-                    prune_stale_attempt_checkouts_for_home(home),
-                    close_merged_chainlinks_for_home(home),
-                )
-
-            reap_result, _, pruned_paths, closed_chainlinks = await run_in_pool(
-                _WORKLINK_POOL, _reap,
-            )
-            await log_event(
-                "worklink_claims_reaped",
-                count=len(reap_result.reaped),
-                issue_ids=[record.issue_id for record in reap_result.reaped],
-                examined=reap_result.examined,
-                skipped=reap_result.skipped,
-                skipped_issue_ids=reap_result.skipped_issue_ids,
-            )
-            if pruned_paths:
-                await log_event(
-                    "worklink_attempt_checkouts_pruned",
-                    count=len(pruned_paths),
-                    paths=[str(path) for path in pruned_paths],
-                )
-            if closed_chainlinks:
-                await log_event(
-                    "worklink_merged_chainlinks_closed",
-                    count=len(closed_chainlinks),
-                    issue_ids=[record.issue_id for record in closed_chainlinks],
-                )
-
-        return self.register_callable(
-            name=job_id,
-            fn=_fire,
-            default_cron=cron_expr,
-            job_id=job_id,
-            misfire_grace_time=3600,
-            max_instances=1,
-            coalesce=True,
-        )
-
-    # ---- PR checkout lease reaper cron -------------------------------
-
-    def add_pr_checkout_lease_reaper_job(
-        self,
-        lease_root: Path,
-        cron_expr: str = "*/15 * * * *",
-        *,
-        job_id: str = "pr-checkout-lease-reaper",
-    ) -> bool:
-        """Register expiry enforcement for isolated PR checkout leases."""
-        from .pr_checkout_lease import reclaim_expired_pr_checkout_leases
-
-        async def _fire() -> None:
-            await asyncio.to_thread(
-                reclaim_expired_pr_checkout_leases,
-                lease_root,
-                active_paths=active_pr_checkout_lease_paths,
-            )
-
-        return self.register_callable(
-            name=job_id,
-            fn=_fire,
-            default_cron=cron_expr,
-            job_id=job_id,
-            misfire_grace_time=900,
             max_instances=1,
             coalesce=True,
         )

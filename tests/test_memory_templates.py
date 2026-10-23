@@ -233,3 +233,10 @@ def test_setup_seeds_init_block_on_fresh_home_only(tmp_path: Path) -> None:
     status2 = setup_home(home)
     assert not block.exists(), "init block must not be recreated after deletion"
     assert f"memory/core/{INIT_BLOCK_NAME}" not in status2["files_created"]
+
+
+def test_action_boundaries_keep_generic_spawn_policy_without_coding_tool_names():
+    text = core_template_text("06-action-boundaries.md")
+    assert "server-defined authority profile" in text
+    assert "elevated budgets are **escalate-first**" in text
+    assert "spawn_open_code" not in text

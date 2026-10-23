@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, dataclass
+from enum import StrEnum
+from types import SimpleNamespace
 
 import pytest
 
 from mimir.access_control import ServicePrincipal
-from mimir.models import RepoPRAction
-from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry
+from mimir.plugins import manager
+from mimir.plugins.discovery import PluginDiscoveryError
+from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry, TrustedScopeConstructors
 from mimir.tool_descriptors import (
     ResultOriginKind, SinkCategory, _PAYLOAD_EXTRACTOR_UNDECLARED,
     _TARGET_EXTRACTOR_UNDECLARED,
 )
+
+
+class ExampleAction(StrEnum):
+    INSPECT = "repo.inspect"
 
 
 def tool_fields(**overrides):
@@ -88,6 +95,49 @@ def test_matching_tool_and_capability_tiers_project_one_value():
     registry.register_capability("sample", tier="scope-contained")
     registry.register_tool(**tool_fields())
     assert registry.freeze().tiers["sample"] == "scope-contained"
+
+
+def test_plugin_non_tool_capability_has_owner_bound_tier_and_core_profile_membership():
+    registry = PolicyRegistry()
+    registry.register_authority_profile("review")
+    plugin = registry.registrar("example")
+    plugin.register_capability("review_other_authors", tier="scoped-with-provenance")
+    plugin.add_to_profile("review", "review_other_authors")
+
+    policy = registry.freeze()
+    assert policy.tiers["review_other_authors"] == "scoped-with-provenance"
+    assert "review_other_authors" in policy.authority_profiles["review"]
+    assert "review_other_authors" not in policy.tools
+
+
+def test_plugin_non_tool_capability_cannot_grant_foreign_policy():
+    registry = PolicyRegistry()
+    registry.register_authority_profile("review")
+    registry.register_capability("core_grant", tier="unbounded")
+    registry.register_authority_profile("core_review", capabilities={"core_grant"})
+    one = registry.registrar("one")
+    two = registry.registrar("two")
+    one.register_capability("one_grant", tier="scoped-with-provenance")
+    two.register_capability("two_grant", tier="scope-contained")
+    with pytest.raises(PolicyRegistrationError, match="foreign tool"):
+        two.add_to_profile("review", "one_grant")
+    with pytest.raises(PolicyRegistrationError, match="foreign tool"):
+        one.add_to_profile("review", "core_grant")
+    with pytest.raises(PolicyRegistrationError, match="owner cannot be overridden"):
+        one.register_tool(**tool_fields(owner="core"))
+    with pytest.raises(PolicyRegistrationError, match="invalid capability tier"):
+        one.register_capability("bad_grant", tier="unrecognized")
+    assert "bad_grant" not in registry.capabilities
+    assert registry.authority_profiles["review"] == frozenset()
+
+
+def test_plugin_cannot_override_registered_tool_tier_with_non_tool_api():
+    registry = PolicyRegistry()
+    plugin = registry.registrar("example")
+    plugin.register_tool(**tool_fields())
+    with pytest.raises(PolicyRegistrationError, match="invalid capability tier"):
+        plugin.register_capability("sample", tier="unbounded")
+    assert "sample" not in registry.capabilities
 
 
 def test_plugin_cannot_exclude_its_descriptor_or_flow():
@@ -221,12 +271,182 @@ def test_plugin_profile_membership_must_be_declared_on_both_sides():
     assert not registry.frozen
 
 
-@pytest.mark.parametrize("membership", ["retained_repo_tools", "fixed_service_sinks", "worklink_build_tools", "catalog_admin_builtin", "repo_publish_tools"])
+@pytest.mark.parametrize("membership", [
+    "retained_repo_tools", "fixed_service_sinks", "worklink_build_tools",
+    "taint_independent_egress", "catalog_admin_builtin", "acp_hands_result_tools",
+    "repo_publish_tools",
+])
 def test_core_only_memberships_are_not_plugin_grants(membership):
     registry = PolicyRegistry()
     with pytest.raises(PolicyRegistrationError, match=f"example: tool sample: core-only memberships.*{membership}"):
         registry.registrar("example").register_tool(**tool_fields(memberships={membership}))
     assert not registry.tools
+
+
+def selected_candidate(**overrides):
+    ep = SimpleNamespace(
+        group="mimir.plugins", name="cultivate", value="mimir_cultivate:provider",
+        dist=SimpleNamespace(metadata={"Name": "mimir-cultivate"}),
+    )
+    fields = dict(name="cultivate", distribution="mimir-cultivate", entry_point=ep,
+                  manifest=SimpleNamespace(config={}), enabled=True, diagnostic=None)
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def selected_registry(candidate=None):
+    candidate = candidate or selected_candidate()
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((candidate,))
+    registry.registrar("cultivate").register_tool(**tool_fields(name="owned"))
+    return registry, candidate
+
+
+def test_selected_first_party_worklink_sink_has_bound_service_adapter():
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((selected_candidate(),))
+    registrar = registry.registrar("cultivate")
+    registrar.register_tool(**tool_fields(
+        name="build_job", flow="both", tier="code-execution",
+        sink_category=SinkCategory.SPAWN, sink_destination="worklink",
+        service_sink_adapter="worklink_repo", profiles=("builder",),
+    ))
+    registrar.register_capability("build_job")
+    registrar.register_authority_profile("builder", capabilities=("build_job",))
+    assert registry.freeze().tools["build_job"].service_sink_adapter == "worklink_repo"
+
+
+def test_foreign_provider_cannot_declare_worklink_sink_or_null_forge_payload():
+    registry = PolicyRegistry()
+    plugin = registry.registrar("other")
+    with pytest.raises(PolicyRegistrationError, match="outbound sink requires a callable"):
+        plugin.register_tool(**tool_fields(
+            sink_category=SinkCategory.FORGE, sink_destination="bound_pull_request",
+        ))
+    plugin.register_tool(**tool_fields(
+        name="foreign_spawn", sink_category=SinkCategory.SPAWN,
+        sink_destination="worklink", service_sink_adapter="worklink_repo",
+    ))
+    with pytest.raises(PolicyRegistrationError, match="invalid service sink adapter"):
+        registry.freeze()
+
+
+def test_selected_provider_credential_probes_are_owner_namespaced():
+    registry = PolicyRegistry()
+    candidate = SimpleNamespace(name="example", enabled=True, diagnostic=None)
+    registry.select_plugin_candidates((candidate,))
+    registrar = registry.registrar("example")
+    with pytest.raises(PolicyRegistrationError, match="credential probe"):
+        registrar.register_credential_probe(
+            "GITHUB_TOKEN", "A", ("GITHUB_TOKEN",), "foreign shadow", lambda: (True, "ok"),
+        )
+    registrar.register_credential_probe(
+        "MIMIR_PLUGIN_EXAMPLE_TOKEN", "A", ("MIMIR_PLUGIN_EXAMPLE_TOKEN",),
+        "own token", lambda: (True, "ok"),
+    )
+    with pytest.raises(PolicyRegistrationError, match="duplicate"):
+        registrar.register_credential_probe(
+            "MIMIR_PLUGIN_EXAMPLE_TOKEN", "A", ("MIMIR_PLUGIN_EXAMPLE_TOKEN",),
+            "own token", lambda: (True, "ok"),
+        )
+    assert "MIMIR_PLUGIN_EXAMPLE_TOKEN" in registry.freeze().credential_probes
+
+
+def test_first_party_projection_is_owner_bound_and_frozen():
+    registry, candidate = selected_registry()
+    registry._project_first_party_memberships(candidate, {
+        "retained_repo_tools": ("owned",), "repo_publish_tools": ("owned",),
+    })
+    assert registry.freeze().tools["owned"].memberships == {
+        "retained_repo_tools", "repo_publish_tools",
+    }
+    with pytest.raises(PolicyRegistrationError, match="frozen"):
+        registry._project_first_party_memberships(candidate, {})
+    with pytest.raises(FrozenInstanceError):
+        registry.tools["owned"].memberships = frozenset()
+
+
+@pytest.mark.parametrize("projection", [
+    {"retained_repo_tools": ("missing",)},
+    {"retained_repo_tools": ("foreign",)},
+    {"retained_repo_tools": ("owned", "owned")},
+    {"fixed_service_sinks": ("owned",)},
+    {"acp_hands_result_tools": ("owned",)},
+    {"catalog_admin_builtin": ("owned",)},
+    {"taint_independent_egress": ("owned",)},
+])
+def test_first_party_projection_rejects_invalid_entries_atomically(projection):
+    registry, candidate = selected_registry()
+    registry.register_tool(**tool_fields(name="foreign"))
+    with pytest.raises(PolicyRegistrationError):
+        registry._project_first_party_memberships(candidate, projection)
+    assert registry.tools["owned"].memberships == frozenset()
+
+
+@pytest.mark.parametrize("change", [
+    {"distribution": "foreign"}, {"name": "foreign"}, {"enabled": False},
+    {"manifest": None}, {"diagnostic": "invalid"},
+])
+def test_first_party_projection_requires_selected_installed_identity(change):
+    candidate = selected_candidate(**change)
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((candidate,))
+    with pytest.raises(PolicyRegistrationError, match="invalid selected"):
+        registry._project_first_party_memberships(candidate, {})
+
+
+def test_first_party_projection_rejects_unselected_and_repeated_calls():
+    registry, candidate = selected_registry()
+    with pytest.raises(PolicyRegistrationError, match="invalid selected"):
+        registry._project_first_party_memberships(selected_candidate(), {})
+    registry._project_first_party_memberships(candidate, {})
+    with pytest.raises(PolicyRegistrationError, match="invalid selected"):
+        registry._project_first_party_memberships(candidate, {})
+
+
+def test_first_party_projection_rejects_duplicate_selected_owner():
+    candidate = selected_candidate()
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((candidate, selected_candidate()))
+    with pytest.raises(PolicyRegistrationError, match="invalid selected"):
+        registry._project_first_party_memberships(candidate, {})
+
+
+def test_manager_projects_only_selected_first_party_provider(monkeypatch):
+    candidate = selected_candidate()
+    from mimir.plugins.core import register_core_tools
+
+    monkeypatch.setattr(manager, "register_core_tools", lambda registry, **_kw: register_core_tools(registry))
+
+    class Contributor:
+        def register(self, registrar):
+            registrar.register_tool(**tool_fields(name="owned"))
+
+        def host_membership_projection(self):
+            return {"worklink_build_tools": ("owned",)}
+
+    candidate.entry_point.load = lambda: Contributor()
+    monkeypatch.setattr(manager, "enabled_plugins", lambda *, enable: (candidate,))
+    policy = manager.load_plugins(enable="cultivate").policy
+    assert policy.tools["owned"].memberships == {"worklink_build_tools"}
+    with pytest.raises(TypeError):
+        policy.tools["new"] = policy.tools["owned"]
+
+
+def test_manager_rejects_invalid_first_party_projection(monkeypatch):
+    candidate = selected_candidate()
+
+    class Contributor:
+        def register(self, registrar):
+            registrar.register_tool(**tool_fields(name="owned"))
+
+        def host_membership_projection(self):
+            return {"retained_repo_tools": ("missing",)}
+
+    candidate.entry_point.load = lambda: Contributor()
+    monkeypatch.setattr(manager, "enabled_plugins", lambda *, enable: (candidate,))
+    with pytest.raises(PluginDiscoveryError, match="membership projection failed.*absent or foreign"):
+        manager.load_plugins(enable="cultivate")
 
 
 def test_unknown_membership_is_not_accepted():
@@ -272,12 +492,163 @@ def test_freeze_rejects_unknown_references_and_resource_scopes():
 
 def test_repo_pr_action_must_be_typed():
     registry = PolicyRegistry()
+    registry.registrar("example").register_scoped_action(ExampleAction, lambda *_: True)
     registry.registrar("example").register_tool(**tool_fields(
         operation_class="resource_scoped", resource_scope="repo_pr", typed_action="unknown",
     ))
     with pytest.raises(PolicyRegistrationError, match="invalid repo/PR action"):
         registry.freeze()
-    assert list(RepoPRAction)
+    assert list(ExampleAction)
+
+
+def test_scoped_action_protocol_is_owner_bound_and_frozen():
+    class Action(StrEnum):
+        INSPECT = "resource.inspect"
+
+    class OtherAction(StrEnum):
+        INSPECT = "resource.inspect"
+
+    registry = PolicyRegistry()
+    alpha = registry.registrar("alpha")
+    beta = registry.registrar("beta")
+    validator = lambda *_: True
+    alpha.register_scoped_action(Action, validator)
+    alpha.register_tool(**tool_fields(
+        operation_class="resource_scoped", resource_scope="repo_pr",
+        typed_action=Action.INSPECT,
+    ))
+    with pytest.raises(PolicyRegistrationError, match="duplicate scoped action protocol"):
+        alpha.register_scoped_action(Action, validator)
+    with pytest.raises(PolicyRegistrationError, match="scoped action protocol"):
+        beta.register_scoped_action(Action, validator)
+    beta.register_scoped_action(OtherAction, validator)
+    beta.register_tool(**tool_fields(name="foreign", operation_class="resource_scoped",
+                                      resource_scope="repo_pr", typed_action=Action.INSPECT))
+    with pytest.raises(PolicyRegistrationError, match="invalid repo/PR action"):
+        registry.freeze()
+    assert not registry.frozen
+    assert registry.scoped_actions["alpha"].validate_scope is validator
+
+
+def test_trusted_scope_constructors_require_selected_owner_and_freeze():
+    class Action(StrEnum):
+        INSPECT = "resource.inspect"
+
+    def construct(*args, **kwargs):
+        return args, kwargs
+
+    constructors = TrustedScopeConstructors(
+        scope_type=object,
+        issue=construct, review=construct, registry=construct,
+        discovered=construct, store=construct, retained=construct,
+    )
+    with pytest.raises(PolicyRegistrationError, match="scoped action protocol"):
+        PolicyRegistry().registrar("cultivate").register_scoped_action(
+            Action, lambda *_: True, trusted_scope=constructors,
+        )
+    registry, _ = selected_registry()
+    with pytest.raises(PolicyRegistrationError, match="scoped action protocol"):
+        registry.registrar("foreign").register_scoped_action(
+            Action, lambda *_: True, trusted_scope=constructors,
+        )
+    registry.registrar("cultivate").register_scoped_action(
+        Action, lambda *_: True, trusted_scope=constructors,
+    )
+    protocol = registry.freeze().scoped_actions["cultivate"]
+    assert protocol.trusted_scope is constructors
+    with pytest.raises(FrozenInstanceError):
+        protocol.trusted_scope = None
+    with pytest.raises(FrozenInstanceError):
+        constructors.issue = None
+    with pytest.raises(PolicyRegistrationError, match="frozen"):
+        registry.registrar("cultivate")
+
+
+def test_trusted_scope_constructors_reject_incomplete_bundle():
+    class Action(StrEnum):
+        INSPECT = "resource.inspect"
+
+    registry, _ = selected_registry()
+    with pytest.raises(PolicyRegistrationError, match="scoped action protocol"):
+        registry.registrar("cultivate").register_scoped_action(
+            Action, lambda *_: True,
+            trusted_scope=TrustedScopeConstructors(
+                scope_type=object,
+                issue=lambda: None, review=lambda: None, registry=lambda: None,
+                discovered=lambda: None, store=lambda: None, retained=None,
+            ),
+        )
+    assert not registry.scoped_actions
+
+
+def test_registered_owner_action_freezes():
+    class Action(StrEnum):
+        INSPECT = "resource.inspect"
+
+    registry = PolicyRegistry()
+    plugin = registry.registrar("example")
+    plugin.register_scoped_action(Action, lambda *_: True)
+    plugin.register_tool(**tool_fields(operation_class="resource_scoped",
+                                       resource_scope="repo_pr", typed_action=Action.INSPECT))
+    assert registry.freeze().tools["sample"].typed_action is Action.INSPECT
+
+
+def test_registered_action_freezes_without_legacy_model_type(monkeypatch):
+    from mimir import models
+
+    class Action(StrEnum):
+        INSPECT = "resource.inspect"
+
+    registry = PolicyRegistry()
+    plugin = registry.registrar("example")
+    plugin.register_scoped_action(Action, lambda *_: True)
+    plugin.register_tool(**tool_fields(operation_class="resource_scoped",
+                                       resource_scope="repo_pr", typed_action=Action.INSPECT))
+    assert not hasattr(models, "RepoPRAction")
+    assert registry.freeze().tools["sample"].typed_action is Action.INSPECT
+
+
+def test_plugin_cannot_borrow_legacy_core_action_without_own_protocol():
+    registry = PolicyRegistry()
+    registry.registrar("example").register_tool(**tool_fields(
+        operation_class="resource_scoped", resource_scope="repo_pr",
+        typed_action=ExampleAction.INSPECT,
+    ))
+    with pytest.raises(PolicyRegistrationError, match="requires owner action protocol"):
+        registry.freeze()
+    assert not registry.frozen
+
+
+def test_core_legacy_action_freezes_without_plugin_protocol():
+    registry = PolicyRegistry()
+    registry.register_tool(**tool_fields(
+        operation_class="resource_scoped", resource_scope="repo_pr",
+        typed_action=ExampleAction.INSPECT,
+    ))
+    assert registry.freeze().tools["sample"].typed_action is ExampleAction.INSPECT
+
+
+def test_registered_action_cannot_be_replaced_by_legacy_action():
+    class Action(StrEnum):
+        INSPECT = "resource.inspect"
+
+    registry = PolicyRegistry()
+    plugin = registry.registrar("example")
+    plugin.register_scoped_action(Action, lambda *_: True)
+    plugin.register_tool(**tool_fields(operation_class="resource_scoped",
+                                       resource_scope="repo_pr", typed_action=ExampleAction.INSPECT))
+    with pytest.raises(PolicyRegistrationError, match="invalid repo/PR action"):
+        registry.freeze()
+
+
+@pytest.mark.parametrize("action_type,validator", [
+    (str, lambda *_: True), (ExampleAction, None),
+])
+def test_invalid_action_protocol_does_not_publish(action_type, validator):
+    registry = PolicyRegistry()
+    with pytest.raises(PolicyRegistrationError, match="scoped action protocol"):
+        registry.registrar("example").register_scoped_action(action_type, validator)
+    assert not registry.scoped_actions
 
 
 def test_freeze_exposes_immutable_projections_and_refuses_writes():

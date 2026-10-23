@@ -1,7 +1,11 @@
 import { afterEach } from "vitest";
+import { configure } from "@testing-library/react";
 
 import { useChatStore } from "./chatStore";
 import { useUiState } from "./uiState";
+
+// Async utility timeout is a hang guard for parallel full-suite load, not a latency assertion.
+configure({ asyncUtilTimeout: 5000 });
 
 // chainlink #564: the Zustand UI store (collapsedRegions, detailsPanelOpen,
 // selectedChatMessageId) is a module singleton. Without a reset, collapse

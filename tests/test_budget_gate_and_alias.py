@@ -22,9 +22,14 @@ These tests exercise the middleware via two surfaces:
 from __future__ import annotations
 
 import asyncio
+import builtins
 import contextvars
+import fcntl
+import importlib.util
 import json
+import os
 import subprocess
+import threading
 import time
 from dataclasses import asdict, fields, replace
 from pathlib import Path
@@ -38,7 +43,6 @@ from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool, ToolException
 from langgraph.runtime import Runtime
-
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
 from mimir.access_control import (
     OperationDecision,
@@ -55,14 +59,14 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
-    RepoPRAction,
-    RepoPRActionScope,
-    RepoPRScopeRegistry,
-    RepoReviewState,
-    ServerDiscoveredPRStates,
     SourceLabel,
     TurnContext,
 )
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.policy import (
+        RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry,
+        RepoReviewState, ServerDiscoveredPRStates,
+    )
 from mimir.identities import IdentityResolver
 from mimir.plugins.core import register_core_tools
 from mimir.plugins.registry import PolicyRegistry
@@ -78,8 +82,295 @@ from mimir.tools.budget_gate import (
     _result_labels_for_call,
 )
 from tests.auth_helpers import attach_middleware_auth_context
+from tests.test_repo_tools import _fixture_git_env, _repo_scope_and_state
 
 pytestmark = pytest.mark.usefixtures("middleware_event_logger")
+
+
+def _selected_repository_types():
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("typed repository results require installed Cultivate")
+    from mimir_cultivate import repository
+
+    return repository
+
+
+@pytest.fixture
+def selected_repository_policy():
+    _selected_repository_types()
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+def _repo_granted_auth(auth, scope, state, *, follow_on: bool, policy=None):
+    from mimir.access_control import ScopedPRGrants, _SCOPED_PR_ISSUER
+    from mimir.plugins.core import selected_policy_registry
+
+    selected = policy if policy is not None else selected_policy_registry()
+    grants = ScopedPRGrants(
+        auth.canonical_principal, (scope,),
+        protocols=selected.scoped_actions,
+        _issuer=_SCOPED_PR_ISSUER,
+    )
+    if follow_on:
+        token = grants.consume_checkout("cultivate", scope)
+        assert token is not None
+        assert grants.observe_checkout("cultivate", scope, state.checkout_lease, token)
+    return replace(auth, scoped_pr_grants=grants)
+
+
+def _selected_repo_middleware():
+    from mimir.plugins.core import selected_policy_registry
+
+    return BudgetGateMiddleware(policy=selected_policy_registry())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_core_only_shell_without_review_guard_keeps_generic_execution_and_refuses_review(
+    monkeypatch: pytest.MonkeyPatch, asynchronous: bool,
+) -> None:
+    from mimir.tools import budget_gate
+    from tests.auth_helpers import middleware_auth_context
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(budget_gate, "_request_for_authorized_execution", lambda request, *_: request)
+    imported = builtins.__import__
+
+    def without_retired_guard(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("mimir_cultivate"):
+            raise AssertionError("disabled Cultivate was imported")
+        if name == "github_review_guard" and level == 1:
+            raise ModuleNotFoundError("retired review guard", name="mimir.tools.github_review_guard")
+        return imported(name, globals, locals, fromlist, level)
+
+    calls = []
+
+    def handler(_request):
+        calls.append(True)
+        return ToolMessage(content="ran", tool_call_id="core-shell")
+
+    async def async_handler(request):
+        return handler(request)
+
+    with monkeypatch.context() as absent:
+        absent.setattr(builtins, "__import__", without_retired_guard)
+        gate = BudgetGateMiddleware()
+        for command in ("pwd", "gh pr review 7 --repo owner/repo --approve"):
+            request = ToolCallRequest(
+                tool_call={"name": "shell_exec", "args": {"command": command},
+                           "id": "core-shell", "type": "tool_call"},
+                tool=None, state=None, runtime=Runtime(context=middleware_auth_context()),
+            )
+            result = (
+                await gate.awrap_tool_call(request, async_handler)
+                if asynchronous else gate.wrap_tool_call(request, handler)
+            )
+            if command == "pwd":
+                assert result.status != "error", result.content
+                assert calls == [True]
+            else:
+                assert result.status == "error"
+                assert "review submission guard unavailable" in str(result.content)
+                assert calls == [True]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("operation", ["repo_checkout", "repo_status"])
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_pr_lease_stays_locked_from_handler_through_result_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_mode: bool, operation: str,
+) -> None:
+    from mimir_cultivate import repository as pr_checkout_lease
+    from mimir.tools import budget_gate
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    root = state.checkout_lease.lease_root
+    if operation == "repo_checkout":
+        root = tmp_path / "new-leases"
+        root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = replace(
+        _untainted_ifc_auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+    )
+    auth = _repo_granted_auth(auth, scope, state, follow_on=operation != "repo_checkout")
+    def runner(argv):
+        return subprocess.run(
+            argv, capture_output=True, text=True, check=False, env=_fixture_git_env(),
+        )
+    observed: list[str] = []
+    rebound: list[object] = []
+    threads: list[threading.Thread] = []
+    competitor_ready = threading.Event()
+    release_competitor = threading.Event()
+    completed = threading.Event()
+    original_finish = budget_gate._finish_tool_result
+
+    def competitor(lease):
+        assert exclusive_is_blocked()
+        competitor_ready.set()
+        assert release_competitor.wait(10)
+        rebound.append(pr_checkout_lease.recover_pr_checkout_lease(
+            lease.path, scope, owner=scope.principal, lease_root=root, runner=runner,
+        ))
+        completed.set()
+
+    def exclusive_is_blocked() -> bool:
+        fd = os.open(root, os.O_RDONLY)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
+
+    def handler(req):
+        if operation == "repo_checkout":
+            lease, _ = pr_checkout_lease.acquire_pr_checkout_lease(
+                scope, owner=scope.principal, lease_root=root,
+                review_state=state, runner=runner,
+            )
+        else:
+            lease = state.checkout_lease
+        assert exclusive_is_blocked()
+        competitor_thread = threading.Thread(target=competitor, args=(lease,))
+        threads.append(competitor_thread)
+        competitor_thread.start()
+        assert competitor_ready.wait(5)
+        observed.append("handler")
+        return ToolMessage(content='{"ok": true}', tool_call_id=req.tool_call["id"])
+
+    def finish(call, capture, result):
+        assert result.status != "error", result.content
+        assert exclusive_is_blocked()
+        assert not completed.is_set()
+        assert state.checkout_lease.is_active
+        observed.append("observed")
+        return original_finish(call, capture, result)
+
+    monkeypatch.setattr(budget_gate, "_finish_tool_result", finish)
+    token = set_current_turn(_ifc_turn(auth))
+    try:
+        request = _make_request(
+            operation, "held", auth,
+            {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        )
+        if async_mode:
+            async def async_handler(req):
+                return handler(req)
+
+            result = asyncio.run(_selected_repo_middleware().awrap_tool_call(request, async_handler))
+        else:
+            result = _selected_repo_middleware().wrap_tool_call(request, handler)
+    finally:
+        release_competitor.set()
+        reset_current_turn(token)
+    assert result.status != "error", result.content
+    assert observed == ["handler", "observed"]
+    assert completed.wait(10)
+    assert rebound[0].recovery_id != state.checkout_lease.recovery_id
+    threads[0].join(timeout=10)
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("operation", ["repo_checkout", "repo_status"])
+@pytest.mark.parametrize("expiry_point", ["handler", "classification", "label_merge"])
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_pr_lease_expiry_during_handler_refuses_post_handler_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, async_mode: bool,
+    operation: str, expiry_point: str,
+) -> None:
+    from datetime import datetime, timedelta
+    from mimir_cultivate import repository as pr_checkout_lease
+    from mimir.tools import budget_gate
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    root = state.checkout_lease.lease_root
+    if operation == "repo_checkout":
+        root = tmp_path / "new-leases"
+        root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = replace(
+        _untainted_ifc_auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+    )
+    auth = _repo_granted_auth(auth, scope, state, follow_on=operation != "repo_checkout")
+    def runner(argv):
+        return subprocess.run(
+            argv, capture_output=True, text=True, check=False, env=_fixture_git_env(),
+        )
+    clock: dict[str, datetime | None] = {"now": None}
+    classified: list[str] = []
+
+    class LeaseClock:
+        @staticmethod
+        def now(tz):
+            return clock["now"] or datetime.now(tz)
+
+    monkeypatch.setattr(pr_checkout_lease, "datetime", LeaseClock)
+    original_classify = budget_gate._result_labels_for_call
+    original_merge = budget_gate._merge_result_labels_from_result
+
+    def classification(*args, **kwargs):
+        labels = original_classify(*args, **kwargs)
+        classified.append("classified")
+        if expiry_point == "classification":
+            clock["now"] = state.checkout_lease.expires_at + timedelta(seconds=1)
+        return labels
+
+    def merge(*args, **kwargs):
+        original_merge(*args, **kwargs)
+        if expiry_point == "label_merge":
+            clock["now"] = state.checkout_lease.expires_at + timedelta(seconds=1)
+
+    monkeypatch.setattr(budget_gate, "_result_labels_for_call", classification)
+    monkeypatch.setattr(budget_gate, "_merge_result_labels_from_result", merge)
+
+    def handler(req):
+        if operation == "repo_checkout":
+            lease, _ = pr_checkout_lease.acquire_pr_checkout_lease(
+                scope, owner=scope.principal, lease_root=root,
+                review_state=state, runner=runner,
+            )
+        else:
+            lease = state.checkout_lease
+        clock["now"] = lease.expires_at + timedelta(seconds=(1 if expiry_point == "handler" else -1))
+        return ToolMessage(content='{"ok": true}', tool_call_id=req.tool_call["id"])
+
+    ctx = _ifc_turn(auth)
+    token = set_current_turn(ctx)
+    try:
+        request = _make_request(
+            operation, "expired", auth,
+            {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        )
+        if async_mode:
+            async def async_handler(req):
+                return handler(req)
+
+            result = asyncio.run(_selected_repo_middleware().awrap_tool_call(request, async_handler))
+        else:
+            result = _selected_repo_middleware().wrap_tool_call(request, handler)
+    finally:
+        reset_current_turn(token)
+    assert result.status == "error"
+    assert "expired or changed" in str(result.content)
+    assert classified == ([] if expiry_point == "handler" else ["classified"])
+    if expiry_point == "label_merge":
+        assert ctx.ifc_labels.has_untrusted_active_ingest
 
 
 @pytest.mark.asyncio
@@ -1212,7 +1503,8 @@ def _ifc_turn(auth: AuthContext) -> TurnContext:
 
 
 @pytest.mark.parametrize("trigger", ["poller", "user_message"])
-def test_repository_result_uses_revalidated_post_execution_scope(
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_unattested_repository_result_does_not_claim_revalidated_scope(
     trigger: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1277,7 +1569,9 @@ def test_repository_result_uses_revalidated_post_execution_scope(
     repository_source = next(
         source for source in labels.sources if source.domain == "repository"
     )
-    assert repository_source.resource_id == f"owner/repo#pull/17@{'c' * 40}"
+    assert repository_source.resource_id == "<unresolved-resource:protected_tool:repo_checkout>"
+    assert repository_source.integrity == "untrusted"
+    assert repository_source.integrity_effect == "active_ingest"
     stale_labels = InformationFlowLabels().with_source(SourceLabel(
         principal="user-1",
         domain="repository",
@@ -1297,7 +1591,7 @@ def test_repository_result_uses_revalidated_post_execution_scope(
     assert before_fix.allowed is False
     assert before_fix.refusal_detail is not None
     assert "mismatched component: observed_head_sha" in before_fix.refusal_detail
-    assert _forge_repository_scope_mismatch(labels, current_scope) is None
+    assert _forge_repository_scope_mismatch(labels, current_scope) is not None
 
     # Exercise the caller boundary with the real forge refusal, not a hand-written detail.
     admin_auth = replace(auth, roles=("user", "admin"))
@@ -2387,7 +2681,6 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
 ) -> None:
     from mimir.access_control import protected_result_source, publish_protected_result
     from mimir.tools import budget_gate
-    from mimir.tools.github_review_guard import ReviewSubmission
     from mimir.tools.web import _record_fetched_body
 
     home = tmp_path / "home"
@@ -2412,15 +2705,15 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
                 released_claims.append(self.key)
                 self.released = True
 
-    def submission(request: ToolCallRequest) -> ReviewSubmission | None:
+    def submission(request: ToolCallRequest) -> SimpleNamespace | None:
         if request.tool_call["id"] not in {"review", "review_permission_denied"}:
             return None
-        return ReviewSubmission(
+        return SimpleNamespace(
             executable="gh", repo="owner/repo", number=17,
             state="APPROVED", cwd=None,
         )
 
-    def claim(review: ReviewSubmission) -> Claim:
+    def claim(review: SimpleNamespace) -> Claim:
         key = f"{review.repo}#{review.number}"
         claims.append(key)
         return Claim(key)
@@ -2436,10 +2729,12 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
     )
     monkeypatch.setattr(budget_gate, "_validated_arguments", validate)
     monkeypatch.setattr(
-        "mimir.tools.github_review_guard.review_submission_from_request", submission,
+        budget_gate, "_review_submission_for_call",
+        lambda call: submission(call.execution_request),
     )
     monkeypatch.setattr(
-        "mimir.tools.github_review_guard.claim_review_submission", claim,
+        budget_gate, "_claim_review_submission_for_call",
+        lambda _call, review: claim(review),
     )
     monkeypatch.setattr(
         budget_gate,
@@ -3588,7 +3883,7 @@ async def test_admin_sensitive_tool_denied_for_non_admin(
 
     token = set_current_turn(ctx)
     try:
-        out = await mw.awrap_tool_call(_make_request("worklink_run", "id-admin"), handler)
+        out = await mw.awrap_tool_call(_make_request("shell_exec", "id-admin"), handler)
     finally:
         reset_current_turn(token)
 
@@ -3600,7 +3895,7 @@ async def test_admin_sensitive_tool_denied_for_non_admin(
     assert "admin_tool_call_denied" in kinds
     assert "tool_call_denied" in kinds
     admin_event = next(kw for kind, kw in captured if kind == "admin_tool_call_denied")
-    assert admin_event["tool"] == "worklink_run"
+    assert admin_event["tool"] == "shell_exec"
     assert admin_event["canonical_author"] == "alice"
     assert admin_event["denial_reason"] == "admin_required"
 
@@ -6185,6 +6480,34 @@ def test_operator_shell_live_taint_refusal_names_only_working_remedies() -> None
         assert dead_end not in text
 
 
+def test_core_shell_review_without_provider_guard_fails_closed() -> None:
+    from mimir.plugins.core import core_policy_registry
+    from mimir.tools import budget_gate
+
+    policy = core_policy_registry()
+
+    def call(name: str, args: dict[str, object]) -> SimpleNamespace:
+        return SimpleNamespace(
+            policy=policy, tool_name=name,
+            execution_request=SimpleNamespace(tool_call={"name": name, "args": args}),
+        )
+
+    with pytest.raises(ToolException, match="GitHub review submission guard unavailable"):
+        budget_gate._review_submission_for_call(call(
+            "shell_exec", {"command": "gh pr review 17 --approve"},
+        ))
+    with pytest.raises(ToolException, match="GitHub review submission guard unavailable"):
+        budget_gate._review_submission_for_call(call(
+            "bash_async", {"mimir_direct_argv": ["/usr/bin/gh", "pr", "review", "17"]},
+        ))
+    assert budget_gate._review_submission_for_call(call(
+        "shell_exec", {"command": "printf 'gh pr review is not running'"},
+    )) is None
+    assert budget_gate._review_submission_for_call(call(
+        "pr_submit_review", {"repository": "owner/repo", "pull_request": 17},
+    )) is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("middleware_path", ["sync", "async"])
 @pytest.mark.parametrize("enforcement_enabled", [False, True])
@@ -6198,7 +6521,6 @@ async def test_operator_soft_fallback_rechecks_transitions_after_blocking_steps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.tools import budget_gate
-    from mimir.tools.github_review_guard import ReviewClaim, ReviewSubmission
 
     state = _Arm2LiveState(False)
     auth = _arm2_operator_auth(state, enforcement_enabled=enforcement_enabled)
@@ -6215,8 +6537,8 @@ async def test_operator_soft_fallback_rechecks_transitions_after_blocking_steps(
             state.outcome = final_outcome
         return result
 
-    def submission(_request: ToolCallRequest) -> ReviewSubmission:
-        return ReviewSubmission(
+    def submission(_request: ToolCallRequest) -> SimpleNamespace:
+        return SimpleNamespace(
             executable="gh",
             repo="owner/repo",
             number=1,
@@ -6224,18 +6546,19 @@ async def test_operator_soft_fallback_rechecks_transitions_after_blocking_steps(
             cwd=None,
         )
 
-    def claim(_submission: ReviewSubmission) -> ReviewClaim:
+    def claim(_submission: SimpleNamespace) -> SimpleNamespace:
         nonlocal claim_calls
         claim_calls += 1
         if transition_point == "review_claim":
             state.outcome = final_outcome
-        return ReviewClaim(
+        return SimpleNamespace(
             repo="owner/repo",
             number=1,
             head="a" * 40,
             reviewer="operator",
             state="APPROVED",
             duplicate=False,
+            release=lambda: None,
         )
 
     def sync_handler(request: ToolCallRequest) -> ToolMessage:
@@ -6248,10 +6571,12 @@ async def test_operator_soft_fallback_rechecks_transitions_after_blocking_steps(
 
     monkeypatch.setattr(ToolRegistry, "authorize_tool", authorize)
     monkeypatch.setattr(
-        "mimir.tools.github_review_guard.review_submission_from_request", submission,
+        budget_gate, "_review_submission_for_call",
+        lambda call: submission(call.execution_request),
     )
     monkeypatch.setattr(
-        "mimir.tools.github_review_guard.claim_review_submission", claim,
+        budget_gate, "_claim_review_submission_for_call",
+        lambda _call, spec: claim(spec),
     )
     request = _make_request(
         "shell_exec",
@@ -6600,10 +6925,8 @@ async def test_middleware_records_raised_returned_and_typed_failures(
         )
 
     async def typed_handler(req: ToolCallRequest) -> ToolMessage:
-        from mimir.project_tests import ProjectTestResult
-
         return ToolMessage(
-            content=json.dumps(asdict(ProjectTestResult(False, "tests_failed", 1))),
+            content=json.dumps({"ok": False, "code": "tests_failed", "returncode": 1}),
             tool_call_id=req.tool_call["id"],
             name=req.tool_call["name"],
         )
@@ -6696,14 +7019,20 @@ async def test_converted_tool_failure_is_accounted_from_typed_status(
     arguments: dict[str, Any],
     expected_text: str,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    from mimir.tools import extra, registry, shell_async, web
+    from mimir.tools import extra, shell_async, web
+    from mimir_cultivate.registration import worklink_run
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
 
     monkeypatch.delenv("MIMIR_HOME", raising=False)
+    if tool_name == "worklink_run":
+        monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
     monkeypatch.setattr(shell_async, "_REGISTRY", None)
     monkeypatch.setitem(extra._TURN_STATE, "turns_log_path", None)
     tools = {
-        "worklink_run": registry.worklink_run,
+        "worklink_run": worklink_run,
         "web_search": web.web_search,
         "fetch_url": web.fetch_url,
         "bash_job_output": shell_async.bash_job_output,
@@ -6711,7 +7040,9 @@ async def test_converted_tool_failure_is_accounted_from_typed_status(
         "mimir_get_turn": extra.mimir_get_turn,
     }
     request = _make_request(tool_name, f"typed-{tool_name}", args=arguments)
-    produced = await tools[tool_name].ainvoke(request.tool_call)
+    selected = load_plugins(enable="cultivate").policy if tool_name == "worklink_run" else None
+    with policy_scope(selected):
+        produced = await tools[tool_name].ainvoke(request.tool_call)
     assert isinstance(produced, ToolMessage)
     assert produced.status == "error"
     assert produced.content == expected_text
@@ -6735,9 +7066,10 @@ async def test_converted_tool_failure_is_accounted_from_typed_status(
         monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", json.dumps([arguments["url"]]))
     token = set_current_turn(ctx)
     try:
-        result = await BudgetGateMiddleware().awrap_tool_call(
-            _make_request(tool_name, f"typed-{tool_name}", args=arguments), handler,
-        )
+        with policy_scope(selected):
+            result = await BudgetGateMiddleware().awrap_tool_call(
+                _make_request(tool_name, f"typed-{tool_name}", args=arguments), handler,
+            )
     finally:
         reset_current_turn(token)
 
@@ -6799,16 +7131,15 @@ def test_converted_tool_prose_is_not_classified_as_error(
 
 @pytest.mark.parametrize("tool_name", ["repo_test", "repo_status", "spawn_open_code"])
 @pytest.mark.parametrize("added_fields", [False, True])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_returned_typed_errors_allow_added_producer_fields(tool_name, added_fields):
-    from mimir.opencode_proposal import SpawnTerminalResult
-    from mimir.project_tests import ProjectTestResult
-    from mimir.repo_tools import GitOperationResult
+    from mimir_cultivate.opencode import SpawnTerminalResult
     from mimir.tools.budget_gate import _returned_value_is_error
 
     if tool_name == "repo_test":
-        producer = ProjectTestResult(False, "tests_failed", 1)
+        producer = _selected_repository_types().ProjectTestResult(False, "tests_failed", 1)
     elif tool_name == "repo_status":
-        producer = GitOperationResult(False, "git_failed")
+        producer = _selected_repository_types().GitOperationResult(False, "git_failed")
     else:
         producer = SpawnTerminalResult("failed", 1, "process_failed", "spawn_failed")
     payload = {field.name: getattr(producer, field.name) for field in fields(producer)}
@@ -6857,12 +7188,11 @@ async def test_fetch_url_max_age_validation_is_returned_error():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ok", [False, True])
 async def test_real_repo_test_payload_error_detection(monkeypatch, ok):
-    from mimir.project_tests import ProjectTestResult
-    from mimir.tools import repo as repo_module
+    repo_module = _selected_repository_types()
     from mimir.tools.budget_gate import _result_is_error
     from unittest.mock import AsyncMock
 
-    producer = ProjectTestResult(ok, "tests_passed" if ok else "tests_failed", 0 if ok else 1)
+    producer = repo_module.ProjectTestResult(ok, "tests_passed" if ok else "tests_failed", 0 if ok else 1)
     monkeypatch.setattr(repo_module, "_state", lambda *_args: object())
     monkeypatch.setattr(repo_module.RepoProjectTests, "execute", AsyncMock(return_value=producer))
     payload = await repo_module.repo_test.coroutine(repository="owner/repo", pull_request=1)
@@ -7156,6 +7486,7 @@ def test_checkout_proof_has_no_legacy_shell_adapter() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("execution_path", ["sync", "async"])
 @pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.usefixtures("selected_repository_policy")
 async def test_repo_review_shell_cutover_cannot_create_checkout_proof(
     execution_path: str,
     enforce: bool,
@@ -7164,6 +7495,7 @@ async def test_repo_review_shell_cutover_cannot_create_checkout_proof(
     maintenance_pinned_executables: dict[str, Path],
 ) -> None:
     from mimir.access_control import CapabilityTier, build_trigger_service_principal
+    from mimir.plugins.core import selected_policy_registry
 
     root = tmp_path / "repo"
     root.mkdir()
@@ -7204,6 +7536,7 @@ async def test_repo_review_shell_cutover_cannot_create_checkout_proof(
         is_service=True, service_authority=service, enforcement_enabled=enforce,
         ifc_labels=InformationFlowLabels(),
         repo_review_state=state, repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        _plugin_slot_policy=selected_policy_registry(),
     )
     seen: list[list[str]] = []
 
@@ -7240,31 +7573,19 @@ async def test_repo_review_shell_cutover_cannot_create_checkout_proof(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("selected_repository_policy")
 async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from mimir.tools.refusals import ToolPolicyRefusal
     from mimir.tools import budget_gate as budget_gate_module
 
-    middleware = BudgetGateMiddleware()
+    middleware = _selected_repo_middleware()
     calls: list[str] = []
-    scope = RepoPRActionScope(
-        provenance="poller_payload",
-        canonical_repo="owner/repo",
-        canonical_root="/srv/repo",
-        canonical_origin="https://github.com/owner/repo.git",
-        principal="mimir-bot",
-        event_type="pr_changes_requested_stale",
-        allowed_operations=frozenset(action.value for action in RepoPRAction),
-        pr_number=17,
-        head_repo="owner/repo",
-        head_remote="origin",
-        destination_ref="refs/heads/fix",
-        observed_head_sha="a" * 40,
-        base_ref="main",
-        observed_base_sha="b" * 40,
-    )
-    state = RepoReviewState(scope)
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
     from dataclasses import replace
 
     auth = replace(
@@ -7273,6 +7594,7 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
         repo_review_state=state,
         repo_pr_action_scope=scope,
     )
+    auth = _repo_granted_auth(auth, scope, state, follow_on=True)
     ctx = _ifc_turn(auth)
     repo_classification_failures: list[bool] = []
     repo_events: list[bool] = []
@@ -7310,7 +7632,7 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
         refusal = await middleware.awrap_tool_call(
             _make_request(
                 "pr_metadata", "refused", auth,
-                {"repository": "owner/repo", "pull_request": 17},
+                {"repository": "owner/repo", "pull_request": scope.pr_number},
             ),
             handler,
         )
@@ -7318,21 +7640,24 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
         stale = await middleware.awrap_tool_call(
             _make_request(
                 "repo_push", "stale", auth,
-                {"repository": "owner/repo", "pull_request": 17},
+                {"repository": "owner/repo", "pull_request": scope.pr_number},
             ),
             handler,
         )
         adapted = await middleware.awrap_tool_call(
             _make_request(
                 "repo_push", "adapted", auth,
-                {"repository": "owner/repo", "pull_request": 17},
+                {"repository": "owner/repo", "pull_request": scope.pr_number},
             ),
             handler,
         )
-        unsupported = await middleware.awrap_tool_call(
+        safe_read = await middleware.awrap_tool_call(
+            _make_request("list_schedules", "safe-read", auth, {}), handler,
+        )
+        tainted_unsupported = await middleware.awrap_tool_call(
             _make_request(
-                "unsupported_operation", "unsupported", auth,
-                {"repository": "owner/repo", "pull_request": 17},
+                "unsupported_operation", "tainted-unsupported", auth,
+                {"repository": "owner/repo", "pull_request": scope.pr_number},
             ),
             handler,
         )
@@ -7347,39 +7672,70 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
     assert "remains unpushed in preserved checkout" in str(stale.content)
     assert adapted.status == "error"
     assert "scratch/" in str(adapted.content) and "proposal PR" in str(adapted.content)
-    assert unsupported.content == "adapted"
-    assert calls == ["refused", "stale", "unsupported"]
+    assert safe_read.content == "adapted"
+    assert tainted_unsupported.status == "error"
+    assert "ifc_label_blocked:forge" in str(tainted_unsupported.content)
+    assert calls == ["refused", "stale", "safe-read"]
     assert ctx.ifc_labels.has_untrusted_active_ingest is True
     source = next(iter(ctx.ifc_labels.sources))
     assert source.domain == "repository"
-    assert source.resource_id == f"owner/repo#pull/17@{'a' * 40}"
+    assert source.resource_id == "<unresolved-resource:protected_tool:repo_push>"
+    assert source.integrity == "untrusted"
     assert ctx.tool_call_count == 3
-    assert ctx.hard_boundary_denials == [
-        {
-            "tool": "pr_metadata",
-            "boundary": "tool_policy",
-            "reason": "pull-request operation rejected: repo.inspect not granted",
-        },
-        {
-            "tool": "unsupported_operation",
-            "boundary": "typed_action_set",
-            "reason": "unsupported_operation",
-        },
-    ]
+    assert ctx.hard_boundary_denials == [{
+        "tool": "pr_metadata",
+        "boundary": "tool_policy",
+        "reason": "pull-request operation rejected: repo.inspect not granted",
+    }]
     assert ctx.remediation_effects == []
-    assert state.checked_out is False
-    assert state.checkout_lease is None
+    assert state.checked_out is True
+    assert state.checkout_lease is lease
     assert repo_classification_failures == [True]
     assert repo_events == [False, False]
 
 
 @pytest.mark.asyncio
-async def test_real_repo_test_policy_refusal_does_not_taint_turn(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.usefixtures("selected_repository_policy")
+async def test_unsupported_repo_action_records_typed_boundary_without_trusting_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from dataclasses import replace
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
+    auth = replace(
+        _untainted_ifc_auth(), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        repo_review_state=state, repo_pr_action_scope=scope,
+    )
+    auth = _repo_granted_auth(auth, scope, state, follow_on=True)
+    turn = _ifc_turn(auth)
 
-    from mimir.tools.repo import repo_test
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content="adapted", tool_call_id=request.tool_call["id"])
+
+    token = set_current_turn(turn)
+    try:
+        result = await _selected_repo_middleware().awrap_tool_call(
+            _make_request(
+                "unsupported_operation", "unsupported", auth,
+                {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.content == "adapted"
+    assert turn.hard_boundary_denials == [{
+        "tool": "unsupported_operation",
+        "boundary": "typed_action_set",
+        "reason": "unsupported_operation",
+    }]
+    assert turn.ifc_labels.has_untrusted_active_ingest
+
+
+@pytest.mark.asyncio
+async def test_core_only_repo_test_refusal_does_not_taint_turn() -> None:
+    from dataclasses import replace
+    from mimir.plugins.core import core_policy_registry, policy_scope
 
     middleware = BudgetGateMiddleware()
     scope = RepoPRActionScope(
@@ -7408,67 +7764,33 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
     ctx = _ifc_turn(auth)
     calls: list[str] = []
 
-    original_authorize = ToolRegistry.authorize_tool
-
-    def authorize_without_action_gate(
-        self,
-        tool_name,
-        auth_context=None,
-        *,
-        enforce=False,
-        target_channel=None,
-        ifc_labels=None,
-        mcp_tool=None,
-        arguments=None,
-    ):  # type: ignore[no-untyped-def]
-        decision = original_authorize(
-            self,
-            tool_name,
-            auth_context,
-            enforce=enforce,
-            target_channel=target_channel,
-            ifc_labels=ifc_labels,
-            mcp_tool=mcp_tool,
-            arguments=arguments,
-        )
-        if tool_name != "repo_test":
-            return decision
-        return replace(decision, allowed=True, reason=None)
-
-    monkeypatch.setattr(ToolRegistry, "authorize_tool", authorize_without_action_gate)
-
     async def handler(request: ToolCallRequest) -> ToolMessage:
         calls.append(request.tool_call["id"])
-        if request.tool_call["id"] == "repo-refused":
-            await repo_test.coroutine(
-                repository="owner/repo",
-                pull_request=17,
-                runtime=Runtime(context=auth),
-            )
         return ToolMessage(content="adapted", tool_call_id=request.tool_call["id"])
 
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
     token = set_current_turn(ctx)
     try:
-        refusal = await middleware.awrap_tool_call(
-            _make_request(
-                "repo_test", "repo-refused", auth,
-                {"repository": "owner/repo", "pull_request": 17},
-            ),
-            handler,
-        )
-        assert not auth.ifc_state.current(auth.ifc_labels).sources
-        adapted = await middleware.awrap_tool_call(
-            _make_request("shell_exec", "adapted", auth, {"command": "pwd"}),
-            handler,
-        )
+        with policy_scope(core_policy_registry()):
+            refusal = await middleware.awrap_tool_call(
+                _make_request(
+                    "repo_test", "repo-refused", auth,
+                    {"repository": "owner/repo", "pull_request": 17},
+                ),
+                handler,
+            )
+            assert not auth.ifc_state.current(auth.ifc_labels).sources
+            adapted = await middleware.awrap_tool_call(
+                _make_request("shell_exec", "adapted", auth, {"command": "pwd"}),
+                handler,
+            )
     finally:
         reset_current_turn(token)
 
     assert refusal.status == "error"
-    assert "scope does not grant repo.test" in str(refusal.content)
+    assert "unknown_sink_category" in str(refusal.content)
     assert adapted.content == "adapted"
-    assert calls == ["repo-refused", "adapted"]
+    assert calls == ["adapted"]
     assert ctx.ifc_labels.has_untrusted_active_ingest is False
 
 
@@ -7476,39 +7798,27 @@ async def test_real_repo_test_policy_refusal_does_not_taint_turn(
     "refusal_code",
     ("stale_scope", "base_advanced", "base_history_rewritten"),
 )
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_real_repo_execution_fault_taints_turn(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     refusal_code: str,
 ) -> None:
     from dataclasses import replace
 
-    from mimir.repo_tools import GitRefusal
-    from mimir.tools.repo import repo_fetch
+    from mimir_cultivate import repository as repo_module
+    from mimir_cultivate.repository import GitRefusal, repo_fetch
 
-    middleware = BudgetGateMiddleware()
-    scope = RepoPRActionScope(
-        provenance="poller_payload",
-        canonical_repo="owner/repo",
-        canonical_root="/srv/repo",
-        canonical_origin="https://github.com/owner/repo.git",
-        principal="mimir-bot",
-        event_type="pr_changes_requested_stale",
-        allowed_operations=frozenset(action.value for action in RepoPRAction),
-        pr_number=17,
-        head_repo="owner/repo",
-        head_remote="origin",
-        destination_ref="refs/heads/fix",
-        observed_head_sha="a" * 40,
-        base_ref="main",
-        observed_base_sha="b" * 40,
-    )
-    state = RepoReviewState(scope)
+    middleware = _selected_repo_middleware()
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
     auth = replace(
         _untainted_ifc_auth(),
         repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
         repo_review_state=state,
         repo_pr_action_scope=scope,
     )
+    auth = _repo_granted_auth(auth, scope, state, follow_on=True)
     ctx = _ifc_turn(auth)
 
     class FailingRepoGitTools:
@@ -7522,12 +7832,12 @@ def test_real_repo_execution_fault_taints_turn(
                 "remote ref changed after fetch",
             )
 
-    monkeypatch.setattr("mimir.tools.repo.RepoGitTools", FailingRepoGitTools)
+    monkeypatch.setattr(repo_module, "RepoGitTools", FailingRepoGitTools)
 
     def handler(request: ToolCallRequest) -> ToolMessage:
         repo_fetch.func(
             repository="owner/repo",
-            pull_request=17,
+            pull_request=scope.pr_number,
             runtime=Runtime(context=auth),
         )
         raise AssertionError("repo_fetch should have raised")
@@ -7538,7 +7848,7 @@ def test_real_repo_execution_fault_taints_turn(
         result = middleware.wrap_tool_call(
             _make_request(
                 "repo_fetch", "repo-fault", auth,
-                {"repository": "owner/repo", "pull_request": 17},
+                {"repository": "owner/repo", "pull_request": scope.pr_number},
             ),
             handler,
         )
@@ -7552,14 +7862,17 @@ def test_real_repo_execution_fault_taints_turn(
     assert auth.ifc_state.current(auth.ifc_labels).sources
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_checkout_post_fetch_failure_taints_turn(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from dataclasses import replace
 
-    from mimir.tools.repo import repo_checkout
+    from mimir_cultivate.repository import repo_checkout
 
-    middleware = BudgetGateMiddleware()
+    middleware = _selected_repo_middleware()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path))
     scope = RepoPRActionScope(
         provenance="poller_payload",
         canonical_repo="owner/repo",
@@ -7583,13 +7896,14 @@ def test_repo_checkout_post_fetch_failure_taints_turn(
         repo_review_state=state,
         repo_pr_action_scope=scope,
     )
+    auth = _repo_granted_auth(auth, scope, state, follow_on=False)
     ctx = _ifc_turn(auth)
     monkeypatch.setattr(
-        "mimir.tools.forge.remediation_checkout_preflight",
+        "mimir_cultivate.forge.remediation_checkout_preflight",
         lambda *_args: (state, None),
     )
     monkeypatch.setattr(
-        "mimir.tools.repo.acquire_pr_checkout_lease",
+        "mimir_cultivate.repository.acquire_pr_checkout_lease",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("git fetch failed after contacting origin")
         ),
@@ -7620,38 +7934,26 @@ def test_repo_checkout_post_fetch_failure_taints_turn(
     assert auth.ifc_state.current(auth.ifc_labels).sources
 
 
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_repo_test_post_execution_permission_failure_taints_turn(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from dataclasses import replace
 
-    from mimir.project_tests import ProjectTestRefusal
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate.repository import ProjectTestRefusal
+    from mimir_cultivate import repository as repo_module
 
-    middleware = BudgetGateMiddleware()
-    scope = RepoPRActionScope(
-        provenance="poller_payload",
-        canonical_repo="owner/repo",
-        canonical_root="/srv/repo",
-        canonical_origin="https://github.com/owner/repo.git",
-        principal="mimir-bot",
-        event_type="pr_changes_requested_stale",
-        allowed_operations=frozenset(action.value for action in RepoPRAction),
-        pr_number=17,
-        head_repo="owner/repo",
-        head_remote="origin",
-        destination_ref="refs/heads/fix",
-        observed_head_sha="a" * 40,
-        base_ref="main",
-        observed_base_sha="b" * 40,
-    )
-    state = RepoReviewState(scope)
+    middleware = _selected_repo_middleware()
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
     auth = replace(
         _untainted_ifc_auth(),
         repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
         repo_review_state=state,
         repo_pr_action_scope=scope,
     )
+    auth = _repo_granted_auth(auth, scope, state, follow_on=True)
     ctx = _ifc_turn(auth)
     monkeypatch.setattr(repo_module, "_state", lambda *_args: state)
 
@@ -7671,7 +7973,7 @@ def test_repo_test_post_execution_permission_failure_taints_turn(
         asyncio.run(
             repo_module.repo_test.coroutine(
                 repository="owner/repo",
-                pull_request=17,
+                pull_request=scope.pr_number,
                 runtime=Runtime(context=auth),
             )
         )
@@ -7682,7 +7984,7 @@ def test_repo_test_post_execution_permission_failure_taints_turn(
         result = middleware.wrap_tool_call(
             _make_request(
                 "repo_test", "test-fault", auth,
-                {"repository": "owner/repo", "pull_request": 17},
+                {"repository": "owner/repo", "pull_request": scope.pr_number},
             ),
             handler,
         )

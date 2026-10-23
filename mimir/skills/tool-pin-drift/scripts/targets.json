@@ -1,41 +1,5 @@
 [
   {
-    "name": "opencode",
-    "source": "npm",
-    "package": "opencode-ai",
-    "pinned_version": "1.18.21"
-  },
-  {
-    "name": "feature-factory",
-    "source": "npm",
-    "package": "feature-factory",
-    "pinned_version": "0.10.18"
-  },
-  {
-    "name": "opencode-feature-factory",
-    "source": "npm",
-    "package": "opencode-feature-factory",
-    "pinned_version": "0.10.18"
-  },
-  {
-    "name": "opencode-project-memory",
-    "source": "npm",
-    "package": "opencode-project-memory",
-    "pinned_version": "0.1.0"
-  },
-  {
-    "name": "opencode-openai-codex-auth",
-    "source": "npm",
-    "package": "opencode-openai-codex-auth",
-    "pinned_version": "4.4.0"
-  },
-  {
-    "name": "opencode-anthropic-auth",
-    "source": "npm",
-    "package": "opencode-anthropic-auth",
-    "pinned_version": "0.0.13"
-  },
-  {
     "name": "mermaid-cli",
     "source": "npm",
     "package": "@mermaid-js/mermaid-cli",

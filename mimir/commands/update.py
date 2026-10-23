@@ -87,6 +87,13 @@ def dispatch(args: argparse.Namespace) -> int:
         print("  (or restart the mimir process by hand for bare-metal)")
         return 0
 
+    from ..update_on_start import cultivate_source_install, cultivate_source_refusal
+
+    source = cultivate_source_install()
+    if source is not None:
+        print(f"Refusing to update: {cultivate_source_refusal(source)}.", file=sys.stderr)
+        return 2
+
     # --apply path. Use python -m pip directly so this works regardless
     # of whether the operator's environment uses pip, uv, or pipx for
     # the original install — they all expose ``python -m pip``. The

@@ -4,7 +4,7 @@ import * as React from "react";
 import * as ReactDOM from "react-dom";
 import * as ReactDOMClient from "react-dom/client";
 
-import { getDashboardSurfaces, loadPluginBundles, visibleSurfaces, type DashboardSurface } from "./dashboardExtensions";
+import { getDashboardSurfaces, loadPluginBundles, visibleSurfaces, type DashboardSurface, type PluginUiKit } from "./dashboardExtensions";
 import { authenticatedPluginFetch } from "./api/http";
 import type { DashboardExtensionManifest, PluginBundleData } from "./api/generated/contracts";
 
@@ -131,6 +131,12 @@ afterEach(() => {
 });
 
 describe("plugin bundle host", () => {
+  function supportedKit(value: unknown): value is PluginUiKit {
+    if (typeof value !== "object" || value === null) return false;
+    const kit = value as Partial<PluginUiKit>;
+    return kit.version === 1 && typeof kit.components?.Button === "function";
+  }
+
   const bundle = (plugin: string, apiMajor = 1): PluginBundleData => ({
     plugin, apiMajor, moduleUrl: `/plugins/${plugin}/assets/main.js?v=1`,
     cssUrl: `/plugins/${plugin}/assets/style.css?v=1`
@@ -177,6 +183,9 @@ describe("plugin bundle host", () => {
       expect(host.react).toBe(React);
       expect(host.reactDOM).toBe(ReactDOM);
       expect(host.reactDOMClient).toBe(ReactDOMClient);
+      expect(host.uiKit).toBe(window.mimirPluginHost!.uiKit);
+      expect(host.uiKit.version).toBe(1);
+      expect(supportedKit(host.uiKit)).toBe(true);
       expect(host.themeTokens).toEqual({ colorText: "skin text" });
       expect(host.authenticatedFetch).toBe(authenticatedPluginFetch);
       host.registerRoute({ plugin, id: plugin, path: `/dashboard/${plugin}`, component: () => React.createElement("p", null, plugin) });
@@ -193,6 +202,55 @@ describe("plugin bundle host", () => {
     dispose();
     expect(window.mimirPluginHost).toBeUndefined();
     expect(document.head.querySelectorAll('link[rel="stylesheet"]')).toHaveLength(0);
+  });
+
+  it("renders shared UI components on the host React singleton without bundling a second renderer", async () => {
+    const updates = vi.fn();
+    const container = document.createElement("div");
+    const dispose = await loadPluginBundles([bundle("alpha")], manifests, {} as never, updates,
+      undefined, async () => {
+        const host = window.mimirPluginHost!;
+        expect(host.react).toBe(React);
+        expect(host.uiKit.components.Button).toBe((await import("./ui")).Button);
+        const root = host.reactDOMClient.createRoot(container);
+        await host.react.act(async () => {
+          root.render(host.react.createElement(host.uiKit.components.Button, { variant: "primary" }, "Open run"));
+        });
+        expect(container.querySelector("button.ui-button--primary")?.textContent).toBe("Open run");
+        await host.react.act(async () => root.unmount());
+        host.registerRoute({ plugin: "alpha", id: "alpha", path: "/dashboard/alpha", component: () => null });
+      });
+    expect(updates.mock.lastCall?.[0].routes).toHaveLength(1);
+    dispose();
+  });
+
+  it("lets a browser plugin reject an unsupported UI-kit shape without losing other bundles", async () => {
+    expect(supportedKit(undefined)).toBe(false);
+    expect(supportedKit({ version: 2, components: { Button: () => null } })).toBe(false);
+    expect(supportedKit({ version: 1, components: {} })).toBe(false);
+
+    const updates = vi.fn();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const dispose = await loadPluginBundles([bundle("alpha"), bundle("beta")], manifests,
+      {} as never, updates, undefined, async (url) => {
+        const host = window.mimirPluginHost!;
+        if (url.includes("/alpha/")) {
+          const original = host.uiKit;
+          try {
+            host.uiKit = { version: 2, components: {} } as unknown as PluginUiKit;
+            if (!supportedKit(host.uiKit)) throw new Error("Unsupported UI kit");
+          } finally {
+            host.uiKit = original;
+          }
+        }
+        expect(supportedKit(host.uiKit)).toBe(true);
+        host.registerRoute({ plugin: "beta", id: "beta", path: "/dashboard/beta", component: () => null });
+      });
+    expect(updates.mock.lastCall?.[0].routes.map((route: { id: string }) => route.id)).toEqual(["beta"]);
+    expect(updates.mock.lastCall?.[0].notices).toEqual(["alpha: dashboard bundle could not be loaded."]);
+    expect(errors).toHaveBeenCalledTimes(1);
+    dispose();
+    errors.mockRestore();
   });
 
   it("skips a mismatched major and isolates a failed registration from another plugin", async () => {

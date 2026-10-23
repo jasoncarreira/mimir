@@ -18,6 +18,9 @@ from packaging.version import Version
 
 @pytest.fixture
 def setup_update(tmp_path, monkeypatch):
+    # The selected-mode suite's own venv is a file:// Cultivate install; these
+    # tests own the request path, so pin the source-install probe to PyPI.
+    monkeypatch.setattr("mimir.update_on_start.cultivate_source_install", lambda: None)
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.setitem(registry._STATE, "dispatcher", SimpleNamespace(
         _config=SimpleNamespace(operator_alert_channel="discord-1")))
@@ -86,6 +89,7 @@ async def test_decline_and_latest_never_write_without_approval(setup_update):
 
 @pytest.mark.asyncio
 async def test_missing_home_and_operator_channel_refuse(tmp_path, monkeypatch):
+    monkeypatch.setattr("mimir.update_on_start.cultivate_source_install", lambda: None)
     monkeypatch.delenv("MIMIR_HOME", raising=False)
     assert "MIMIR_HOME" in await registry.request_mimir_update.ainvoke({})
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
@@ -97,3 +101,16 @@ async def test_missing_home_and_operator_channel_refuse(tmp_path, monkeypatch):
 def test_tool_shape():
     assert asyncio.iscoroutinefunction(registry.request_mimir_update.coroutine)
     assert "request_mimir_update" in {t.name for t in registry.all_mimir_tools()}
+
+
+@pytest.mark.asyncio
+async def test_source_installed_cultivate_refuses_before_registering(setup_update, monkeypatch):
+    home, _ = setup_update
+    monkeypatch.setattr("mimir.update_on_start.cultivate_source_install", lambda: "d" * 40)
+    registered = []
+    monkeypatch.setattr(approval_requests, "register", lambda **kw: registered.append(kw))
+    result = await registry.request_mimir_update.ainvoke({})
+    assert result.startswith("request_mimir_update refused: this deployment installs Cultivate "
+                             f"from source at {'d' * 40}; rebuild the image or re-sync the checkout")
+    assert registered == []
+    assert not flag_path(home).exists()

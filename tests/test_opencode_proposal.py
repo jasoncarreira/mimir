@@ -8,9 +8,11 @@ import subprocess
 
 import pytest
 
-import mimir.opencode_proposal as proposal_module
-from mimir.contained_execution import SensitiveMaterialScrubber
-from mimir.opencode_proposal import (
+pytest.importorskip("mimir_cultivate.opencode")
+
+import mimir_cultivate.opencode as proposal_module
+from mimir_cultivate.opencode import SensitiveMaterialScrubber
+from mimir_cultivate.opencode import (
     ProposalBuildResult,
     build_opencode_proposal,
     classify_spawn_terminal_state,

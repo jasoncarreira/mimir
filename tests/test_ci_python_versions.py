@@ -70,10 +70,10 @@ def test_ci_python_versions_match_package(job_name: str) -> None:
             "worklink-image-identity", "claude-code-extra-smoke", "frontend",
         }
         suites = {
-            "pytest": (15, "Run mimir test suite"),
+            "pytest": (35, "Run mimir test suite"),
             "pytest-macos": (25, "Run mimir test suite"),
             "pytest-worker-uid": (20, "Run mimir test suite as the non-owning worker uid"),
-            "pytest-enforced": (15, "Run mimir test suite (enforcement on)"),
+            "pytest-enforced": (35, "Run mimir test suite (enforcement on)"),
             "pytest-fresh-resolve": (20, "Run mimir test suite against the fresh resolution"),
         }
         for name, (cap, suite_name) in suites.items():

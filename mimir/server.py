@@ -17,7 +17,6 @@ import logging
 import os
 import re
 import signal
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +35,7 @@ from .dispatcher import Dispatcher
 from .event_logger import init_logger, log_durable_event_sync, log_event, log_event_sync
 from .http_ingress import sanitize_http_extra, stamp_http_event_ingress_extra
 from .models import AgentEvent, make_process_session_id
-from .access_control import builtin_trigger_service_principal, repo_binding_startup_alerts
+from .access_control import builtin_trigger_service_principal
 from .rate_limits import RateLimitStore
 from .scheduler import Scheduler
 from .session_manager import ChannelSession
@@ -57,6 +56,11 @@ if TYPE_CHECKING:
     from .plugins.registry import PolicyRegistry
 
 log = logging.getLogger(__name__)
+
+
+def _server_hooks(policy: PolicyRegistry, name: str) -> tuple[Any, ...]:
+    """Select frozen callbacks without resolving unselected provider modules."""
+    return tuple(hook for (_, phase), hook in policy.server_hooks.items() if phase == name)
 
 # Generic HTTP callers may submit user turns only. Internal trigger constructors
 # carry server-owned service authority; authenticated admins retain the legacy
@@ -762,9 +766,10 @@ def _is_auth_exempt(method: str, path: str) -> bool:
 # dashboards expose global operational/project state and Worklink artifacts
 # (chainlink #593). SAGA and file-backed memory/state dashboards expose global
 # cross-channel history and raw markdown content (chainlink #592); wiki viewer
-# APIs expose global markdown state and graph health (chainlink #690). The
-# factory-runs dashboard exposes global Worklink run state and PR URLs. This
-# is the SECURITY gate; React section-hiding (a manifest ``requires_role``) is
+# APIs expose global markdown state and graph health (chainlink #690). Plugin
+# routes live under ``/api/v1/plugins/<owner>/`` and are gated by their declared
+# role in ``dashboard_extensions.add_plugin_routes`` (Cultivate's Factory Runs and
+# PR-board APIs are admin). This is the SECURITY gate; React section-hiding (a manifest ``requires_role``) is
 # UX only and must never be the sole control.
 _ADMIN_REQUIRED_PREFIXES: tuple[str, ...] = (
     "/api/v1/admin",
@@ -772,7 +777,6 @@ _ADMIN_REQUIRED_PREFIXES: tuple[str, ...] = (
     "/api/v1/ops",
     "/api/v1/scheduler",
     "/api/v1/chainlink-board",
-    "/api/v1/factory-runs",
     "/api/v1/saga",
     "/api/v1/memory",
     "/api/v1/wiki",
@@ -1006,68 +1010,24 @@ class _MaskApiKeyInAccessLog(logging.Filter):
 
 
 async def _capture_controller_source_commit(app: web.Application) -> None:
-    """Snapshot the boot source, not a checkout that may move after startup.
-
-    Cache unavailable results too: a later checkout repair cannot change the
-    code already loaded by this server. Never resolve lazily from /health.
-    """
-    if "worklink_controller_source_commit" in app:
-        return
-    controller_source_commit = None
-    repo = os.environ.get("WORKLINK_REPO")
-    if app.get("check_worker_executor_health") and repo:
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["git", "-C", repo, "rev-parse", "--verify", "HEAD"],
-                capture_output=True, text=True, check=True, timeout=5,
-            )
-            commit = result.stdout.strip()
-            if re.fullmatch(r"[0-9a-f]{40}", commit):
-                controller_source_commit = commit
-        except (OSError, subprocess.SubprocessError):
-            pass
-    app["worklink_controller_source_commit"] = controller_source_commit
+    """Capture selected providers' boot source before serving health requests."""
+    manager = app.get("plugin_manager")
+    if manager is not None:
+        for hook in _server_hooks(manager.policy, "capture_source"):
+            await hook(app)
 
 
 async def _handle_health(request: web.Request) -> web.Response:
-    from .worklink.worker_client import DEFAULT_EXECUTOR_SOCKET, verify_executor_identity
-
     response: dict[str, object] = {"ok": True}
     manager = request.app.get("plugin_manager")
     if manager is not None and manager.plugins:
-        response["plugins"] = await manager.health()
-    if not request.app.get("check_worker_executor_health"):
-        return web.json_response(response)
-
-    executor_source_commit = None
-    status = 200
-    if DEFAULT_EXECUTOR_SOCKET.exists():
-        try:
-            executor_source_commit = await verify_executor_identity()
-        except (OSError, RuntimeError, ValueError) as exc:
-            response.update(ok=False, error=str(exc))
-            status = 503
-
-    controller_source_commit = request.app.get("worklink_controller_source_commit")
-
-    source_status = "unknown"
-    if executor_source_commit is not None and controller_source_commit is not None:
-        source_status = (
-            "matched" if executor_source_commit == controller_source_commit else "mismatched"
-        )
-    if source_status == "mismatched":
-        log.warning(
-            "Worklink executor source drift: executor=%s controller=%s; rebuild the root executor image",
-            executor_source_commit, controller_source_commit,
-        )
-    # Source drift is advisory, independent of the existing protocol health guard.
-    response.update(
-        worklink_executor_source_commit=executor_source_commit,
-        worklink_controller_source_commit=controller_source_commit,
-        worklink_executor_source_status=source_status,
-    )
-    return web.json_response(response, status=status)
+        plugin_health = await manager.health()
+        if plugin_health:
+            response["plugins"] = plugin_health
+    if manager is not None:
+        for hook in _server_hooks(manager.policy, "health"):
+            response.update(await hook(request.app))
+    return web.json_response(response, status=200 if response["ok"] else 503)
 
 
 async def _handle_root(request: web.Request) -> web.Response:
@@ -1174,188 +1134,6 @@ async def _handle_consolidate(request: web.Request) -> web.Response:
     return web.json_response(result or {})
 
 
-def reattach_inflight_worklink_runs(
-    home: Path,
-    *,
-    popen: Any = None,
-    event_logger: Any = None,
-) -> list[int]:
-    """Startup reconcile (#561): resume Worklink runs orphaned by a restart.
-
-    Dead local workers are reaped and reported. Persistent worker records from
-    older deployments retain the detached ``mimir worklink run <id> --reattach``
-    recovery path.
-
-    Gated on ``WORKLINK_REPO`` (the same env the ready-queue poller needs); no-op
-    on non-Worklink homes. Best-effort and non-blocking: each resume runs
-    detached so a long worker wait never delays startup; a spawn failure for one
-    leaf is logged and the rest still proceed."""
-    import shlex
-    import subprocess
-
-    from .event_logger import log_event_sync
-    from .worklink.control import reconcile_run_states
-    from .worklink.factory_state import (
-        factory_process_is_verified_dead,
-        list_factory_records,
-        report_retained_factory_records,
-    )
-    from .worklink.run_state import reattach_dispatch_argv
-    from .worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
-
-    spawn = popen or subprocess.Popen
-    event_callback = event_logger or log_event_sync
-    failures: list[dict[str, Any]] = []
-
-    def emit(event: str, **payload: Any) -> None:
-        try:
-            event_callback(event, **payload)
-        except Exception:  # noqa: BLE001 - telemetry cannot block startup recovery
-            pass
-    # Local workers cannot survive a restart. Reap their records first, even on
-    # homes without a configured reattach repository; malformed records emit an
-    # event and never abort startup.
-    states = reconcile_run_states(home, event_logger=emit)
-    try:
-        listing = list_factory_records(home)
-        report_retained_factory_records(
-            home, event_logger=emit, records=listing.records,
-        )
-        for record_failure in listing.failures:
-            failure = {
-                "issue_id": None,
-                "reason": "factory_record_load_failed",
-                "path": str(record_failure.path),
-                "error": record_failure.reason[:500],
-            }
-            failures.append(failure)
-            emit("worklink_reattach_dispatch_failed", **failure)
-        factory_records = [
-            record
-            for record in listing.records
-            if factory_process_is_verified_dead(record)
-            and record.controller_phase not in {"failed", "parked", "terminal", "stopped"}
-            and (record.status is None or not record.status.is_terminal)
-        ]
-    except Exception as exc:
-        factory_records = []
-        failure = {
-            "issue_id": None,
-            "reason": "factory_record_enumeration_failed",
-            "error": str(exc)[:500],
-        }
-        failures.append(failure)
-        emit("worklink_reattach_dispatch_failed", **failure)
-    repo = os.environ.get("WORKLINK_REPO")
-    if not repo:
-        emit(
-            "worklink_reattach_attempted",
-            examined=0,
-            dispatched_issue_ids=[],
-            failures=failures,
-        )
-        return []
-    if not states and not factory_records:
-        emit(
-            "worklink_reattach_attempted",
-            examined=0,
-            dispatched_issue_ids=[],
-            failures=failures,
-        )
-        return []
-    run_bin = shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir")
-    state_dir = home / "state" / "worklink" / "runs"
-    dispatched: list[int] = []
-    for state in states:
-        if state.compute_name == "local_subprocess":
-            # A live local worker already has its original controller; unlike a
-            # persistent remote substrate it cannot be reattached by a new one.
-            continue
-        argv = reattach_dispatch_argv(run_bin, home, repo, state.issue_id)
-        log_path = state_dir / f"reattach-{state.issue_id}.log"
-        try:
-            from .worklink.detached_dispatch import launch_detached_worklink
-
-            launch_detached_worklink(
-                command="run", issue_id=state.issue_id, home=home, repo=repo,
-                state_dir=state_dir, run_bin=run_bin, popen=spawn, argv=argv,
-                log_name=f"reattach-{state.issue_id}.log",
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            record_failure(
-                dispatch_failure_state_dir(home),
-                issue_id=state.issue_id,
-                attempt=state.attempt,
-                exit_status=1,
-                error=f"retained Worklink reattach spawn failed: {exc}",
-                log_path=str(log_path),
-                preserved_ref=state.branch or None,
-                work_path=state.checkout or None,
-            )
-            failure = {
-                "issue_id": state.issue_id,
-                "reason": "reattach_spawn_failed",
-                "error": str(exc)[:500],
-            }
-            failures.append(failure)
-            emit("worklink_reattach_dispatch_failed", **failure)
-            continue
-        dispatched.append(state.issue_id)
-    for record in factory_records:
-        argv = [
-            *run_bin,
-            "worklink",
-            "run-epic",
-            str(record.issue_id),
-            "--autonomous",
-            "--home",
-            str(home),
-            "--repo",
-            repo,
-        ]
-        log_path = state_dir / f"factory-recover-{record.issue_id}.log"
-        try:
-            from .worklink.detached_dispatch import launch_detached_worklink
-
-            launch_detached_worklink(
-                command="run-epic", issue_id=record.issue_id, home=home, repo=repo,
-                state_dir=state_dir, run_bin=run_bin, popen=spawn, argv=argv,
-                log_name=f"factory-recover-{record.issue_id}.log",
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            record_failure(
-                dispatch_failure_state_dir(home),
-                issue_id=record.issue_id,
-                attempt=record.attempt,
-                exit_status=1,
-                error=(
-                    f"retained factory recovery spawn failed: {exc}; "
-                    f"transcript={record.transcript or '(none)'}"
-                ),
-                log_path=str(log_path),
-                preserved_ref=record.branch,
-                run_id=record.run_id,
-                work_path=record.sandbox,
-                transcript_path=record.transcript,
-            )
-            failure = {
-                "issue_id": record.issue_id,
-                "reason": "factory_recovery_spawn_failed",
-                "error": str(exc)[:500],
-            }
-            failures.append(failure)
-            emit("worklink_reattach_dispatch_failed", **failure)
-            continue
-        dispatched.append(record.issue_id)
-    emit(
-        "worklink_reattach_attempted",
-        examined=len(states) + len(factory_records),
-        dispatched_issue_ids=dispatched,
-        failures=failures,
-    )
-    return dispatched
-
-
 def build_app(config: Config) -> web.Application:
     # The structured event stream does not exist until init_logger below.
     # Pending-update application, Config.from_env, and bind validation run in
@@ -1363,15 +1141,14 @@ def build_app(config: Config) -> web.Application:
     # logs-dir creation, and logger construction run here before init_logger.
     # Failures in those phases genuinely cannot emit startup_failed. Every
     # _start_application phase runs after init_logger and is covered below.
-    # Preserve the early dependency preflight: explicit coding opt-in still
-    # fails loudly before broader server construction when the runtime is absent.
+    # Preserve the early dependency preflight: selected provider prerequisites
+    # fail before broader server construction when the runtime is absent.
     from .tools import all_mimir_tools
-    requested_coding = getattr(config, "coding_enabled", False)
     manager = getattr(config, "plugin_manager", None)
     if manager is None:
-        all_mimir_tools(coding_enabled=requested_coding)
+        all_mimir_tools()
     else:
-        all_mimir_tools(coding_enabled=requested_coding, policy=manager.policy,
+        all_mimir_tools(policy=manager.policy,
                         materialize_plugins=False)
 
     process_session_id = make_process_session_id()
@@ -1384,10 +1161,11 @@ def build_app(config: Config) -> web.Application:
         agent_id=config.agent_id,
     )
 
-    worklink_agent_id = f"mimir-worklink:{process_session_id}"
-    # Detached controllers inherit this process generation. The Chainlink
-    # tracker identity stays static; structured claim ownership does not.
-    os.environ["MIMIR_WORKLINK_AGENT_ID"] = worklink_agent_id
+    server_generation = {
+        owner: hook(process_session_id)
+        for (owner, phase), hook in config.plugin_manager.policy.server_hooks.items()
+        if phase == "process_identity"
+    }
 
     # 10MB body cap (aiohttp default is 1MB). Mimir takes JSON-only bodies on
     # /event and /chat — long bluesky transcripts and seed payloads can run
@@ -1504,7 +1282,7 @@ def build_app(config: Config) -> web.Application:
     pairing_notifier = _PairingNotifier(config, channels)
 
     dispatcher = Dispatcher(config, resolver=identity_resolver)
-    async def github_outsider_notice(text: str) -> None:
+    async def operator_notice(text: str) -> None:
         channel = (config.operator_alert_channel or "").strip()
         if channel:
             await channels.send(channel, text, final=True)
@@ -1514,18 +1292,16 @@ def build_app(config: Config) -> web.Application:
         enqueue=dispatcher.enqueue,
         home=config.home,
         scheduler_tz=config.scheduler_tz,
-        operator_notice=github_outsider_notice,
+        operator_notice=operator_notice,
         policy=config.plugin_manager.policy,
     )
     set_on_channel_drained = getattr(dispatcher, "set_on_channel_drained", None)
     if set_on_channel_drained is not None:
-        set_on_channel_drained(
-            lambda channel_id: scheduler.trigger_poller(
-                "github-activity", reason="remediation_queue_drained"
+        callbacks = _server_hooks(config.plugin_manager.policy, "channel_drained")
+        if callbacks:
+            set_on_channel_drained(
+                lambda channel_id: [callback(channel_id, scheduler) for callback in callbacks]
             )
-            if channel_id == "poller:github-activity"
-            else None
-        )
     # WebChatBridge needs the dispatcher (for inbound) — built after dispatcher
     # exists, registered before channels.connect_all() runs at startup.
     web_chat = WebChatBridge(
@@ -1775,8 +1551,8 @@ def build_app(config: Config) -> web.Application:
             startup_state.activity_panel_start_attempted = True
             activity_panel.start()
         startup_state.phase = "repository_binding_alerts"
-        for alert in await asyncio.to_thread(repo_binding_startup_alerts):
-            await log_event("github_repo_binding_attention_required", **alert)
+        for hook in _server_hooks(config.plugin_manager.policy, "repository_alerts"):
+            await hook(log_event)
         startup_state.phase = "startup_preparation"
         from .defaults_upgrade import check_and_open_plugin_defaults_upgrade
 
@@ -1898,24 +1674,16 @@ def build_app(config: Config) -> web.Application:
                     error=str(exc)[:500],
                 )
 
-        # Install the pre-push staleness-gate hook to the repo branches are
-        # pushed from. This is deliberately distinct from MIMIR_SOURCE_DIR,
-        # which identifies an editable checkout containing the running code.
-        # Independent of git_tracking_enabled — protects pushes from
-        # any heartbeat, not just state commits. Non-fatal if missing.
-        # See: chainlink #249, mimir/skills/github/SKILL.md §"Pre-push staleness gate"
-        # Gated on is_dir() so deployments without a configured push workspace
-        # silently skip it. Resolved BEFORE the try so the non-fatal except
-        # handler can always reference it.
-        _src = os.environ.get("MIMIR_SOURCE_REPO", "").strip()
+        # The pre-push staleness guard protects core git tracking as well as
+        # optional coding; it must run without any selected provider.
+        source_repo = os.environ.get("MIMIR_SOURCE_REPO", "").strip()
         try:
-            from pathlib import Path as _Path
-            from .git_bootstrap import ensure_workspace_hooks as _ensure_ws_hooks
-            _source_repo = _Path(_src)
-            if _src and _source_repo.is_dir():
-                await asyncio.to_thread(_ensure_ws_hooks, _source_repo)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("pre-push hook install failed for %s: %s", _src, exc)
+            from .git_bootstrap import ensure_workspace_hooks
+
+            if source_repo and Path(source_repo).is_dir():
+                await asyncio.to_thread(ensure_workspace_hooks, Path(source_repo))
+        except Exception as exc:  # noqa: BLE001 - hook installation cannot block startup
+            log.warning("pre-push hook install failed for %s: %s", source_repo, exc)
 
         startup_state.phase = "indexer_start"
         startup_state.indexer_start_attempted = True
@@ -2023,52 +1791,14 @@ def build_app(config: Config) -> web.Application:
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc), job="index-integrity")
 
-        # Register the Worklink stale-claim TTL reaper (#444). Opt-in:
-        # MIMIR_WORKLINK_REAPER_CRON empty -> no job installed (non-Worklink
-        # homes register nothing). Recovers leaves whose worker died back to
-        # the ready queue. Detection/recovery-only; bad cron logs and continues.
-        try:
-            scheduler.add_worklink_reaper_job(
-                home=config.home,
-                cron_expr=os.environ.get("MIMIR_WORKLINK_REAPER_CRON", ""),
-            )
-        except ValueError as exc:
-            await log_event("scheduler_invalid_cron", error=str(exc), job="worklink-reaper")
-
-        # A parked factory run needs an operator even when the TTL reaper is off.
-        try:
-            scheduler.add_worklink_factory_park_alert_job(
-                config.home, config.operator_alert_channel, channels,
-            )
-        except ValueError as exc:
-            await log_event("scheduler_invalid_cron", error=str(exc), job="worklink-factory-park-alert")
-
-        # Enforce each PR checkout lease's recorded expiry. The root itself is
-        # opt-in, but configured deployments get a default-on periodic sweep.
-        lease_root_value = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
-        if lease_root_value:
-            try:
-                from .pr_checkout_lease import configured_pr_checkout_lease_root
-
-                scheduler.add_pr_checkout_lease_reaper_job(
-                    lease_root=configured_pr_checkout_lease_root(),
-                    cron_expr=os.environ.get(
-                        "MIMIR_PR_CHECKOUT_LEASE_REAPER_CRON", "*/15 * * * *",
-                    ),
-                )
-            except (OSError, RuntimeError, ValueError) as exc:
-                await log_event(
-                    "scheduler_invalid_pr_checkout_lease_reaper",
-                    error=str(exc),
-                    job="pr-checkout-lease-reaper",
-                )
+        for hook in _server_hooks(config.plugin_manager.policy, "configure_jobs"):
+            await hook(scheduler, config.home, config.operator_alert_channel, channels, log_event)
 
         from .read_policy import configured_non_admin_read_roots, derived_pr_checkout_read_root
 
         derived_lease_read_root = derived_pr_checkout_read_root()
         await log_event(
             "filesystem_read_scope",
-            coding_enabled=config.coding_enabled,
             derived_pr_checkout_read_roots=(
                 [str(derived_lease_read_root)] if derived_lease_read_root is not None else []
             ),
@@ -2099,18 +1829,8 @@ def build_app(config: Config) -> web.Application:
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc), job="malloc-trim")
 
-        # Resume Worklink runs orphaned by a restart (#561). After the #832
-        # substrate cleanup local_subprocess is the only Worklink compute and
-        # its runs die with the controller, so no run state is persisted today
-        # and this is a no-op in production. It remains in place so a stale
-        # run-state file from a pre-#832 docker-sibling / ecs-runtask run still
-        # triggers a (then-no-op) resume instead of orphaning the work.
-        # Best-effort + non-blocking (each resume runs detached).
-        try:
-            resumed = reattach_inflight_worklink_runs(config.home)
-            await log_event("worklink_reattach_dispatched", issues=resumed)
-        except Exception as exc:  # noqa: BLE001 — startup reconcile must never abort boot
-            await log_event("worklink_reattach_dispatch_failed", error=str(exc))
+        for hook in _server_hooks(config.plugin_manager.policy, "reconcile_startup"):
+            await hook(config.home, log_event)
 
         # Register the weekly viability report (SPEC §16 follow-up
         # from the 2026-05-23 VSM eval — collapse detection + curation
@@ -2424,22 +2144,8 @@ def build_app(config: Config) -> web.Application:
                 error=str(exc)[:500],
             )
 
-        # Validate Worklink before its ready-queue poller can consume a leaf.
-        # A mismatch degrades only Worklink; the server and unrelated pollers boot.
-        worklink_config_path = config.home / "worklink.yaml"
-        if worklink_config_path.exists():
-            try:
-                from .worklink.backends.registry import BackendRegistry, WorklinkConfig
-
-                BackendRegistry(WorklinkConfig.load(worklink_config_path))
-            except Exception as exc:  # noqa: BLE001 — operator config must not abort boot
-                log.warning("Worklink disabled by invalid config %s: %s", worklink_config_path, exc)
-                await log_event(
-                    "worklink_config_invalid",
-                    path=str(worklink_config_path),
-                    error=str(exc)[:500],
-                    fix=f"correct {worklink_config_path} before Worklink dispatch can resume",
-                )
+        for hook in _server_hooks(config.plugin_manager.policy, "validate_config"):
+            await hook(config.home, log_event)
 
         # Bind only selected, frozen declarations after every core callable.
         # bind_plugin_jobs rejects both callable-name and APScheduler ID collisions.
@@ -2780,33 +2486,27 @@ def build_app(config: Config) -> web.Application:
             # teardown; a slow intended stop must not look like a crash.
             if attempt_sync(persist_clean_shutdown):
                 shutdown_log("clean marker written")
-            from .worklink.autonomy import release_claims_for_graceful_shutdown
-
-            release_timeout = 5.0
-            if config.drain_timeout_seconds > 0:
-                release_timeout = min(
-                    release_timeout,
-                    float(config.drain_timeout_seconds),
-                )
-            release_result = attempt_sync(
-                lambda: release_claims_for_graceful_shutdown(
-                    config.home,
-                    agent_id=worklink_agent_id,
-                    timeout_s=release_timeout,
-                )
-            )
-            if release_result is not None:
-                released, failed = release_result
-                await attempt(
-                    lambda: log_event(
-                        "worklink_shutdown_claims_released",
-                        issue_ids=[record.issue_id for record in released],
-                        failed=[
-                            {"issue_id": failure.issue_id, "reason": failure.reason}
-                            for failure in failed
-                        ],
+            for (owner, phase), hook in config.plugin_manager.policy.server_hooks.items():
+                if phase != "shutdown_claims":
+                    continue
+                release_result = attempt_sync(
+                    lambda: hook(
+                        config.home, config.drain_timeout_seconds,
+                        server_generation.get(owner),
                     )
                 )
+                if release_result is not None:
+                    released, failed = release_result
+                    await attempt(
+                        lambda: log_event(
+                            "worklink_shutdown_claims_released",
+                            issue_ids=[record.issue_id for record in released],
+                            failed=[
+                                {"issue_id": failure.issue_id, "reason": failure.reason}
+                                for failure in failed
+                            ],
+                        )
+                    )
             await attempt(lambda: log_event("shutdown", reason="cleanup"))
             # Quiesce poller/scheduler producers before closing dispatcher
             # admission. Otherwise a channel-drained callback can queue an

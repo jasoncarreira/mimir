@@ -5,6 +5,8 @@ and the helpers that count/detect/emit escalation events.
 """
 from __future__ import annotations
 import logging
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -13,6 +15,27 @@ from .._jsonl_tail import tail_jsonl_records
 from ..jsonl_snapshot import JsonlSnapshot, iter_window_records
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FeedbackExtension:
+    rules: Mapping[str, tuple[Polarity, str]]
+    renderers: Mapping[str, Callable[[dict], str]]
+    valence_groups: Mapping[str, ValenceGroup]
+    first_only_kinds: frozenset[str] = frozenset()
+    agent_self_events: frozenset[str] = frozenset()
+
+
+def selected_feedback_extension() -> FeedbackExtension | None:
+    """Read only the selected first-party provider's frozen feedback hook."""
+    from ..plugins.core import selected_policy_registry
+
+    policy = selected_policy_registry()
+    for (owner, name), hook in policy.turn_hooks.items():
+        if name == "feedback" and policy._selected_first_party(owner):
+            extension = hook()
+            return extension if isinstance(extension, FeedbackExtension) else None
+    return None
 
 
 # Event-type → (polarity, short-tag) mapping. Anything not listed is
@@ -44,18 +67,6 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # read-path skips it: host hiccups stay queryable in the event log but don't
     # inflate the negative algedonic ×N count.
     "scheduler_loop_lag_monitor_failed": ("negative", "scheduler_loop_lag_monitor_failed"),
-    "worklink_claimed": ("positive", "worklink_claimed"),
-    "worklink_evidence": ("positive", "worklink_evidence"),
-    "worklink_transition": ("positive", "worklink_transition"),
-    "worklink_continuation_created": ("negative", "worklink_continuation"),
-    "worklink_attempts_exhausted": ("negative", "worklink_attempts_exhausted"),
-    "worklink_run_orphaned": ("negative", "worklink_run_orphaned"),
-    "worklink_run_orphan_reconcile_failed": (
-        "negative", "worklink_run_orphan_reconcile_failed",
-    ),
-    "worklink_tool_pin_dedupe_check_failed": (
-        "negative", "worklink_tool_pin_dedupe_check_failed",
-    ),
     "tool_call_budget_warning": ("negative", "tool_budget"),
     # Gap 4 fix: budget_gate.py emits these two names, not the legacy
     # "tool_call_budget_warning". All three are aliased to the same
@@ -137,9 +148,6 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "poller_service_outage": ("negative", "poller_service_outage"),
     "poller_rate_limited":   ("negative", "poller_rate_limited"),
     "poller_signal":         ("negative", "poller_signal"),
-    "pr_auto_review_skipped_untrusted_author": (
-        "negative", "pr_auto_review_skipped_untrusted_author",
-    ),
     # Framework-emitted: ``poller_nonzero_exit`` fires whenever a poller
     # subprocess exits non-zero. Independent of skill-emitted signals
     # (those can fire WITH a successful exit). Negative so the operator
@@ -187,15 +195,6 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # the operator sees the configuration gap algedonically; the poller name
     # + list of missing vars lets them provision exactly what's needed.
     "poller_missing_required_env": ("negative", "poller_missing_required_env"),
-    # github-poller review-missed-submission (Mimir's PR #234 / #235
-    # post-mortem). Fires when a PR-review-needed event reached the
-    # agent (``pr_opened`` / ``pr_synchronize``) but the turn ended
-    # without ``gh pr review`` (or the MCP equivalent) — usually because
-    # the /review skill loaded after reasoning had already committed
-    # to "write prose, don't submit." Negative so the operator sees
-    # the failure mode in introspection-report; no auto-re-fire (would
-    # burn quota for ambiguous benefit).
-    "poller_review_missed_submission": ("negative", "review_missed_submission"),
     # OAuth usage poller — plan-window quota probe runs on a cron and
     # surfaces refresh / logged-out / age-warn signals algedonically so
     # the agent can route operator-actionable alerts through.
@@ -282,9 +281,6 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # values, or filing rules. Negative so the algedonic block makes the
     # degradation visible every turn until the operator can restore the files.
     "core_prompt_degraded": ("negative", "core_prompt_degraded"),
-    # The active GitHub credential does not match the operator-declared bot
-    # login. Coding is latched off until restart; surface the security state.
-    "github_identity_degraded": ("negative", "github_identity_degraded"),
     # A home file read into the system prompt (core block / memory index) has a
     # non-UTF-8 byte. read_text_lossy keeps the turn alive by replacement-decoding,
     # but the stray byte (mojibake / cp1252 paste / mid-write artifact) silently
@@ -345,13 +341,6 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "mimir_update_digest": ("positive", "mimir_update_digest"),
     "skills_auto_update": ("positive", "skills_auto_update"),
     "skills_auto_update_failed": ("negative", "skills_auto_update_failed"),
-    # chainlink #214: pre-merge CHANGES_REQUESTED gate blocked an auto-merge.
-    # Surfaces when the agent's pre-merge review-state check finds any
-    # reviewer's current state is CHANGES_REQUESTED — the merge was refused
-    # and the PR stays open until the reviewer re-approves or withdraws the
-    # request.  Negative so the operator sees "I wanted to merge PR N but
-    # couldn't" without having to read turn transcripts.
-    "pr_merge_blocked_by_changes_requested": ("negative", "pr_merge_blocked"),
     "git_pull_ok": ("positive", "git_pull_ok"),
     "git_fetch_ok": ("positive", "git_fetch_ok"),
     "shell_job_complete_enqueue_ok": ("positive", "shell_job_complete_enqueue_ok"),
@@ -395,14 +384,6 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     # acute signals; the agent sees it once per 24h window and clears
     # the orphans on a lint pass.
     "wiki_backlinks_unhealthy": ("negative", "wiki_health"),
-    # Legacy Claude coding-tool completion signals. ``_completed``
-    # fires on a clean spawn exit; ``_auth_failed`` on 4xx + is_error
-    # (token revoked, refresh failed, server-side quota exhausted);
-    # ``_work_failed`` on the spawned agent loop ending badly
-    # (max-turns / max-budget / errored / unparseable JSON).
-    "claude_code_spawn_completed": ("positive", "spawn_ok"),
-    "claude_code_spawn_auth_failed": ("negative", "spawn_auth_fail"),
-    "claude_code_spawn_work_failed": ("negative", "spawn_work_fail"),
     # Commitments Phase 2b — periodic due-check sweep emits these.
     # ``commitment_due``: positive — "informational follow-through
     # nudge." The commitment is in its due window and the agent should
@@ -460,6 +441,11 @@ def classify(evtype: object) -> tuple[Polarity, str] | None:
     rule = _EVENT_RULES.get(evtype)
     if rule is not None:
         return rule
+    extension = selected_feedback_extension()
+    if extension is not None:
+        rule = extension.rules.get(evtype)
+        if rule is not None:
+            return rule
     if evtype.endswith("_gave_up"):
         return ("negative", evtype)
     return None
@@ -558,12 +544,6 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # the agent sees "wiki has N orphans" once per 24h window and
     # decides whether to do a lint pass.
     "wiki_health",
-    # chainlink #60: a busy spawn day can fire ``spawn_ok`` many times.
-    # Latest-only on the success side keeps positive signals from
-    # crowding out other shapes (saga_feedback, react_received, etc.).
-    # Failures stay un-deduped — each spawn_auth_fail / spawn_work_fail
-    # is a distinct incident with a distinct job_id worth seeing.
-    "spawn_ok",
     # 2026-05-09: ``saga_feedback_sent`` fires once per turn that
     # retrieves SAGA atoms (the post-message contribution-credit pass).
     # During poller-heavy windows (github-poller fires ~5/min, each
@@ -596,10 +576,6 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     # drained on next boot). Re-emitting on subsequent turns confuses the
     # operator — the digest is the one-shot "what changed on upgrade" signal.
     "mimir_update_digest",
-    # Startup may reconcile several stale records in one pass. Keep the latest
-    # per kind within the bounded negative bucket instead of crowding it out.
-    "worklink_run_orphaned",
-    "worklink_run_orphan_reconcile_failed",
 }
 
 # CR2 (memory & retrieval) invariant: polarity-dynamic kinds (their
@@ -797,16 +773,6 @@ def _build_valence_groups() -> dict[str, ValenceGroup]:
                 "oauth_usage_failed": "failed",
                 "oauth_logged_out": "logged-out",
                 "oauth_refresh_age_warn": "age-warn",
-            },
-        ),
-        "spawn": ValenceGroup(
-            label="spawn",
-            positive_kinds=frozenset({"spawn_ok"}),
-            negative_kinds=frozenset({"spawn_auth_fail", "spawn_work_fail"}),
-            verb_map={
-                "spawn_ok": "completed",
-                "spawn_auth_fail": "auth-failed",
-                "spawn_work_fail": "work-failed",
             },
         ),
         "quota": ValenceGroup(

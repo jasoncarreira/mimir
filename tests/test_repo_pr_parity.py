@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from mimir.repo_pr_parity import (
+pytest.importorskip("mimir_cultivate", reason="repository parity belongs to Cultivate")
+
+from mimir_cultivate.repository import (
     AuditEvidence,
     EffectEvidence,
     LegacyObservation,

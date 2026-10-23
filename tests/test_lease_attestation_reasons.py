@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import inspect
 import json
 import subprocess
@@ -10,12 +11,29 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("mimir_cultivate", reason="checkout lease belongs to Cultivate")
+
 from mimir import access_control as ac
-from mimir import event_logger, repo_tools
+from mimir import event_logger
+from mimir_cultivate import repository as repo_tools
 from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-from mimir.repo_tools import GitProcessResult
+from mimir_cultivate.repository import GitProcessResult
 from tests.lease_attestation_helper import assert_lease_attested
 from tests.test_lease_source_labels import _real_attested_lease
+
+
+@pytest.fixture(autouse=True)
+def selected_attestation_policy(monkeypatch):
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks,
+        git_command=lambda *args, **kwargs: repo_tools.hardened_git_command(*args, **kwargs),
+    ))
+    with policy_scope(selected):
+        yield
 
 
 @pytest.fixture
@@ -23,6 +41,31 @@ def attested(tmp_path):
     auth, scope, lease, *_ = _real_attested_lease(tmp_path)
     assert_lease_attested(auth, scope, lease)
     return auth, scope, lease
+
+
+def test_selected_checkout_state_uses_only_owner_git_reader(attested, monkeypatch):
+    from mimir.plugins.core import selected_policy_registry
+
+    _auth, scope, lease = attested
+    selected = selected_policy_registry()
+    assert ac._observed_checkout_state(lease.path) == (
+        scope.head_ref, scope.observed_head_sha,
+    )
+    commands = []
+
+    def unavailable(path, argv, *, timeout):
+        commands.append((path, argv, timeout))
+        return GitProcessResult(-9, timed_out=True)
+
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks, git_command=unavailable,
+    ))
+    assert ac._observed_checkout_state(lease.path) is None
+    assert commands == [(
+        lease.path, ("status", "--porcelain=v2", "--branch", "--untracked-files=no"),
+        ac._LEASE_GIT_TIMEOUT_S,
+    )]
+    assert ac._lease_refusal_reason.get() is ac.LeaseAttestationReason.GIT_TIMEOUT
 
 
 def _ahead(attested, monkeypatch):
@@ -350,7 +393,7 @@ def test_reason_codes_are_closed_against_source_and_cases():
 
 
 def test_refusal_event_is_content_free_and_deduped_per_turn(attested, monkeypatch):
-    from mimir.tools.repo import _publish_attested_lease_result
+    from mimir_cultivate.repository import _publish_attested_lease_result
 
     auth, scope, lease = attested
     auth.ifc_state.pr_checkout_author_trust.clear()

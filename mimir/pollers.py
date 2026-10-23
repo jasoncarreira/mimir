@@ -123,7 +123,6 @@ from .poller_hooks import (
     reserved_hook_profile_for_name,
     reserved_skill_for_name,
     resolve_poller_hooks,
-    worklink_recovery_relevance_check as _worklink_recovery_relevance_check,
 )
 from .poller_budget import (
     PollerBudgetConfig,
@@ -135,6 +134,24 @@ from .poller_write_paths import refused_poller_write_paths
 log = logging.getLogger(__name__)
 
 _ATTESTATION_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="poller-attest")
+
+
+def _safe_signal_login(value: object) -> str:
+    if isinstance(value, str) and re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?", value, re.ASCII,
+    ):
+        return value
+    return "<invalid-login>"
+
+
+def _safe_signal_url(value: object, repo: object) -> str | None:
+    if not isinstance(value, str) or not isinstance(repo, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo, re.ASCII,
+    ):
+        return None
+    pattern = rf"https://github\.com/{re.escape(repo)}/(?:issues|pull)/[0-9]+(?:\#[A-Za-z0-9_-]{{1,64}})?"
+    return value if re.fullmatch(pattern, value, re.ASCII) else None
+
 
 # Wall-clock ceiling for one poller subprocess. Overrunning it is not a partial
 # result: the timeout path discards the stdout already collected (see the
@@ -363,7 +380,7 @@ _NON_SECRET_FORWARDED_ENV_KEYS = frozenset({
     "MIMIR_SOURCE_DIR",
     "GITHUB_REPOS",
     "MIMIR_GITHUB_REPOS",
-    "MIMIR_CODING_ENABLED",
+    "MIMIR_PLUGINS",
     "MIMIR_GITHUB_PRELOAD_REVIEW_SKILL",
     "MIMIR_GITHUB_REVIEW_SKILL_PATH",
 })
@@ -371,8 +388,8 @@ _NON_SECRET_FORWARDED_ENV_KEYS = frozenset({
 
 The GitHub login is identity used by authorization and review reconciliation;
 the two home/source values are filesystem locations; the repository values are
-public repository selectors; and the remaining values are feature flags or a
-review-skill path. None is a credential. This is deliberately closed: every
+public repository selectors; plugin selection; and the remaining values are
+feature flags or a review-skill path. None is a credential. This is deliberately closed: every
 other value forwarded through ``pass_env`` or manifest ``env`` remains redacted.
 """
 
@@ -832,10 +849,11 @@ def _github_framework_trigger_is_trusted(
 
 def _drop_superseded_github_framework_items(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Discard stale framework snapshots after our own verified fast-forward."""
-    from .repo_tools import was_superseded_by_own_push
+    from .plugins.core import selected_policy_registry
 
     from .event_logger import log_event_sync
 
+    hooks = selected_policy_registry().policy_consumer_hooks
     retained = []
     for item in batch:
         extras = item["extras"]
@@ -844,7 +862,8 @@ def _drop_superseded_github_framework_items(batch: list[dict[str, Any]]) -> list
             and isinstance(extras.get("repo"), str)
             and type(extras.get("number")) is int
             and isinstance(extras.get("head_sha"), str)
-            and was_superseded_by_own_push(extras["repo"], extras["number"], extras["head_sha"])
+            and hooks is not None
+            and hooks.superseded_push(extras["repo"], extras["number"], extras["head_sha"])
         ):
             log_event_sync(
                 "github_stale_trigger_dropped", stage="poller_fire",
@@ -1174,13 +1193,56 @@ def _resolve_direct_child(candidate: Path, base: Path, *, label: str) -> Path:
     return resolved
 
 
+def _is_selected_cultivate_default(manifest_path: Path, policy: PolicyRegistry) -> bool:
+    if not policy._selected_first_party("cultivate") or manifest_path.is_symlink():
+        return False
+    candidate = next(candidate for candidate in policy.selected_plugin_candidates
+                     if candidate.name == "cultivate")
+    dist = candidate.entry_point.dist
+    root_files = [file for file in dist.files if file.name == "mimir-plugin.toml"]
+    if len(root_files) != 1:
+        return False
+    root = Path(dist.locate_file(root_files[0])).parent.resolve()
+    declared = {Path(directory) for directory in candidate.manifest.defaults.get("skills", ())}
+    for file in dist.files:
+        if (file.name != "pollers.json"
+                or not file.parent.is_relative_to(root_files[0].parent)
+                or file.parent.relative_to(root_files[0].parent) not in declared):
+            continue
+        source = Path(dist.locate_file(file))
+        if (source.is_symlink() or source.parent.parent != root / "defaults/skills"
+                or not source.is_file()):
+            continue
+        if manifest_path == source:
+            return True
+        if manifest_path.parent.name == f"cultivate-{source.parent.name}":
+            resources = [item for item in dist.files if item.parent == file.parent
+                         or file.parent in item.parents]
+            if resources and all(
+                not (dest := manifest_path.parent / item.relative_to(file.parent)).is_symlink()
+                and dest.is_file()
+                and dest.read_bytes() == Path(dist.locate_file(item)).read_bytes()
+                for item in resources
+            ):
+                return True
+    return False
+
+
 def _validate_poller_identity(
     name: str, manifest_path: Path, *, plugin_owner: str | None = None,
 ) -> None:
     """Bind names with special server-side authority to their shipped skill identity."""
     required_skill = reserved_skill_for_name(name)
+    cultivated = plugin_owner == "cultivate" and name in {
+        "github-activity", "github-ci-watch", "worklink-ready-queue"
+    }
+    allowed_skill = (
+        {required_skill, f"cultivate-{required_skill}"} if cultivated
+        else {required_skill}
+    )
     if required_skill is not None and (
-        plugin_owner is not None or manifest_path.parent.name != required_skill
+        manifest_path.parent.name not in allowed_skill
+        or (plugin_owner is not None and not cultivated)
     ):
         raise ValueError(
             f"reserved poller name {name!r} may only be declared by "
@@ -1217,7 +1279,11 @@ def _parse_poller_authority(
     profile = raw["profile"]
     if not isinstance(profile, str) or profile not in profiles:
         raise ValueError(f"unknown authority profile: {profile!r}")
-    if plugin_owner is not None and (
+    first_party_defaults = (plugin_owner == "cultivate" and policy is not None
+                            and _is_selected_cultivate_default(manifest_path, policy))
+    if plugin_owner == "cultivate" and not first_party_defaults:
+        raise ValueError("cultivate poller authority requires an inventoried default")
+    if plugin_owner is not None and not first_party_defaults and (
         policy is None or policy.profiles[profile].owner != plugin_owner
     ):
         raise ValueError(f"poller authority profile {profile!r} is not owned by {plugin_owner!r}")
@@ -1237,7 +1303,7 @@ def _parse_poller_authority(
     ):
         raise ValueError("authority capabilities must be a list of non-empty names")
     capabilities = tuple(dict.fromkeys(capabilities_raw))
-    if plugin_owner is not None and any(
+    if plugin_owner is not None and not first_party_defaults and any(
         policy.capabilities.get(capability) != plugin_owner
         or capability not in policy.tools
         or policy.tools[capability].owner != plugin_owner
@@ -1318,7 +1384,7 @@ def _parse_poller_authority(
     saga_full_corpus_read = raw.get("saga_full_corpus_read", False)
     if not isinstance(saga_full_corpus_read, bool):
         raise ValueError("authority saga_full_corpus_read must be a boolean")
-    if plugin_owner is not None and saga_full_corpus_read:
+    if plugin_owner is not None and not first_party_defaults and saga_full_corpus_read:
         raise ValueError("plugin pollers cannot request full corpus read")
 
     roots_raw = raw["scoped_roots"]
@@ -1394,6 +1460,7 @@ def _parse_poller_authority(
         proposal_surface=proposal_surface,
         creation_path=f"mimir.pollers.run_poller:{manifest_path}",
         policy=policy,
+        poller_owner=plugin_owner,
     )
 
 #: Recognized string spellings for boolean overrides. YAML 1.1 already maps
@@ -1760,7 +1827,7 @@ def discover_pollers(
     pollers: list[PollerConfig] = []
     if plugin_candidates is None:
         plugin_candidates = policy.selected_plugin_candidates if policy is not None else ()
-    if policy is not None and set(policy.poller_hooks) & {"github", "worklink"}:
+    if policy is not None and "github" in policy.poller_hooks:
         raise ValueError("plugin poller hooks collide with reserved core profiles")
     if not skills_dir.exists() and not plugin_candidates:
         return pollers
@@ -1769,7 +1836,7 @@ def discover_pollers(
     # circuit-breaker key, so two manifests declaring the same name
     # would silently conflate all of that state (and overcount
     # installs). First successfully-parsed occurrence in the
-    # deterministic sorted-rglob order wins; later duplicates are
+    # deterministic discovery order wins; later duplicates are
     # skipped loudly, naming both manifests so the operator can see
     # which skill lost.
     seen_names: dict[str, Path] = {}
@@ -1777,11 +1844,16 @@ def discover_pollers(
     manifests: dict[Path, str | None] = {
         path: None for path in skills_dir.rglob("pollers.json")
     } if skills_dir.exists() else {}
+    validated_seeds: set[Path] = set()
+    # Packaged manifest -> the byte-identical home seed that supersedes it.
+    packaged_seeds: dict[Path, Path] = {}
     for candidate in plugin_candidates:
         if not candidate.enabled or candidate.manifest is None:
             continue
         if policy is None or not policy.frozen:
             raise ValueError("plugin pollers require frozen selected policy")
+        if candidate.name == "cultivate" and not policy._selected_first_party("cultivate"):
+            raise ValueError("cultivate pollers require selected first-party owner")
         dist = candidate.entry_point.dist
         if dist is None or dist.files is None:
             raise ValueError(f"plugin {candidate.name!r} has no package file inventory")
@@ -1789,19 +1861,59 @@ def discover_pollers(
         if len(manifest_files) != 1:
             raise ValueError(f"plugin {candidate.name!r} has no unique package root")
         root = Path(dist.locate_file(manifest_files[0])).parent.resolve()
+        defaults = (candidate.manifest.defaults or {}) if candidate.name == "cultivate" else {}
+        declared_skills = {
+            Path(directory) for directory in defaults.get("skills", ())
+        } if candidate.name == "cultivate" else set()
         for file in dist.files:
             if file.name != "pollers.json":
                 continue
             path = Path(dist.locate_file(file))
+            rel = path.relative_to(root) if path.is_relative_to(root) else None
+            skill = rel.parent if rel is not None else None
+            valid_skill = (
+                skill is not None and (
+                    skill.parent == Path("skills")
+                    or (candidate.name == "cultivate" and skill in declared_skills
+                        and skill.parent == Path("defaults/skills"))
+                )
+            )
             if (path.is_symlink() or not path.resolve().is_relative_to(root)
-                    or path.parent.parent != root / "skills"
+                    or not valid_skill
                     or not path.is_file()):
                 raise ValueError(f"plugin {candidate.name!r}: invalid skill poller resource {path}")
             if path in manifests:
                 raise ValueError(f"plugin poller resource collision: {path}")
             manifests[path] = candidate.name
+            if candidate.name == "cultivate":
+                seeded = skills_dir / f"cultivate-{path.parent.name}" / "pollers.json"
+                if seeded in manifests and not seeded.is_symlink() and seeded.is_file():
+                    # A local copy cannot claim reserved provider identity after
+                    # its manifest diverges from the inventoried distribution.
+                    if seeded.read_bytes() == path.read_bytes():
+                        manifests[seeded] = candidate.name
+                        validated_seeds.add(seeded)
+                        packaged_seeds[path] = seeded
 
-    for pollers_file, plugin_owner in sorted(manifests.items()):
+    # A home skill that a plugin's defaults seeded keeps that plugin's identity
+    # even after the operator deselects the plugin; running it as an ordinary
+    # core-home poller would hand provider pollers (and their write authority)
+    # to core. Ownership is decided from package metadata and the home's seed
+    # markers only: a disabled provider is never imported to decide it.
+    from .plugins.defaults import seed_namespaces, selected_plugin_owners
+
+    namespaces = seed_namespaces(skills_dir.parent)
+    selected_owners = set(selected_plugin_owners(policy))
+    selected_owners.update(
+        candidate.name for candidate in plugin_candidates
+        if candidate.enabled and candidate.name != "cultivate"
+    )
+
+    # Only inventory-matched selected seeds precede packaged resources. All
+    # other manifests retain their absolute-path ordering and first-wins rule.
+    for pollers_file, plugin_owner in sorted(
+        manifests.items(), key=lambda item: (item[0] not in validated_seeds, item[0]),
+    ):
         from ._paths import live_loader_path_allowed
         if not live_loader_path_allowed(pollers_file):
             continue
@@ -1826,6 +1938,22 @@ def discover_pollers(
             log.info(
                 "poller_manifest_hidden_dir_skipped: %s", pollers_file,
             )
+            continue
+        seed_owner = (
+            namespaces.skill_owner(_rel_dirs[0])
+            if plugin_owner is None and _rel_dirs else None
+        )
+        if seed_owner is not None and seed_owner not in selected_owners:
+            reason = (
+                f"skill seeded by plugin {seed_owner!r}, which is not selected; "
+                f"set MIMIR_PLUGINS to include {seed_owner!r} to run it"
+            )
+            log.warning(
+                "poller_plugin_seed_unselected: %s — %s; manifest skipped",
+                pollers_file, reason,
+            )
+            if invalid_entries is not None:
+                invalid_entries.append((pollers_file, "<manifest>", reason))
             continue
         skill_dir = pollers_file.parent
         try:
@@ -1977,6 +2105,14 @@ def discover_pollers(
             # chainlink #420: duplicate-name guard. ``log.warning``
             # (sync context, same as the other discovery warnings —
             # ``log_event`` is async and there may be no loop here).
+            if name in seen_names and seen_names[name] == packaged_seeds.get(pollers_file):
+                # Expected pair: the inventory-matched home seed already
+                # registered this name, so its packaged original is redundant.
+                log.debug(
+                    "poller_packaged_default_superseded: %s name=%r by seed %s",
+                    pollers_file, name, seen_names[name],
+                )
+                continue
             if name in seen_names:
                 log.warning(
                     "poller_duplicate_name: %s declares name=%r already "
@@ -3076,17 +3212,15 @@ async def run_poller(
                 "github_outsider_issue_withheld",
                 "pr_auto_review_skipped_untrusted_author",
             }:
-                from .github_withhold import sanitize_login, sanitize_url
-
                 repo = payload.get("repo")
                 number = payload.get("number")
                 payload = {
-                    "repo": repo if isinstance(repo, str) and sanitize_url(
+                    "repo": repo if isinstance(repo, str) and _safe_signal_url(
                         f"https://github.com/{repo}/issues/1", repo,
                     ) else None,
                     "number": number if type(number) is int and number > 0 else None,
-                    "author": sanitize_login(payload.get("author")),
-                    "url": sanitize_url(payload.get("url"), repo),
+                    "author": _safe_signal_login(payload.get("author")),
+                    "url": _safe_signal_url(payload.get("url"), repo),
                 }
             try:
                 # Same ordering rule as the mid-run barrier: the receipt durably
@@ -3107,13 +3241,12 @@ async def run_poller(
                     "pr_auto_review_skipped_untrusted_author",
                 }:
                     from .bridges._mentions import neutralize_display_name
-                    from .github_withhold import sanitize_login, sanitize_url
 
                     repo = payload.get("repo")
-                    url = sanitize_url(payload.get("url"), repo)
+                    url = _safe_signal_url(payload.get("url"), repo)
                     if url:
                         login = neutralize_display_name(
-                            sanitize_login(payload.get("author")),
+                            _safe_signal_login(payload.get("author")),
                         )
                         kind = "issue" if signal_name == "github_outsider_issue_withheld" else "PR"
                         outsider_notices.append(f"Outsider {kind} withheld: {login} {url}")

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -19,7 +22,36 @@ from mimir.channel_registry import (
     resolve_deliver_channel,
 )
 from mimir.models import TurnInteractivity
-from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
+from mimir.http_ingress import HTTP_EVENT_INGRESS_EXTRA_VALUE
+
+
+def test_core_channel_fixture_does_not_import_coding_sources() -> None:
+    """The shared identity fixture must not load coding modules in a core turn."""
+    script = """
+import sys
+import pytest
+
+class ImportProbe:
+    def pytest_runtest_call(self, item):
+        forbidden = (
+            'mimir.contained_checkout', 'mimir.project_tests',
+            'mimir.worklink.checkout', 'mimir.worklink.worker_exec',
+            'mimir_cultivate',
+        )
+        assert not [name for name in forbidden if name in sys.modules]
+
+raise SystemExit(pytest.main([
+    '-q', '-o', 'addopts=',
+    'tests/test_channel_registry.py::test_register_then_find',
+], plugins=[ImportProbe()]))
+"""
+    env = os.environ.copy()
+    env.pop("MIMIR_PLUGINS", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, env=env,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @dataclass

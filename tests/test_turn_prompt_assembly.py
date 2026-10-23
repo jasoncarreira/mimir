@@ -574,7 +574,7 @@ async def test_parallel_loaders_preserve_serial_prompt_and_provenance_order(
     monkeypatch.setattr(agent, "_assemble_self_state_block", lambda *_args, **_kwargs: blocks["self_state"])
     monkeypatch.setattr(
         "mimir.skill_resolver.find_skill_for_channel",
-        lambda *_args: ("ordered-skill", "SKILL"),
+        lambda *_args, **_kwargs: ("ordered-skill", "SKILL"),
     )
 
     prompt, recent = await agent._build_turn_prompt(
@@ -773,7 +773,7 @@ async def test_auto_loaded_skill_learning_contributes_atom_provenance(
     agent._saga_store = _Store()
     monkeypatch.setattr(
         "mimir.skill_resolver.find_skill_for_channel",
-        lambda channel_id, skills_dirs: ("feed-watch", "CLEAN SKILL BODY"),
+        lambda channel_id, skills_dirs, **_kwargs: ("feed-watch", "CLEAN SKILL BODY"),
     )
     event = AgentEvent(
         trigger="poller",
@@ -902,7 +902,7 @@ async def test_self_authored_framework_prompt_sources_remain_sink_compatible(
     await agent._buffer.append(recent_message)
     monkeypatch.setattr(
         "mimir.skill_resolver.find_skill_for_channel",
-        lambda channel_id, skills_dirs: ("framework-skill", "SKILL SENTINEL"),
+        lambda channel_id, skills_dirs, **_kwargs: ("framework-skill", "SKILL SENTINEL"),
     )
     event = AgentEvent(
         trigger="user_message", channel_id="ch-current", content="now",
@@ -1050,7 +1050,7 @@ async def test_delivery_uses_trusted_poller_configuration_in_shadow_mode(
 
 @pytest.mark.asyncio
 async def test_http_delivery_extra_is_not_rendered(tmp_path: Path) -> None:
-    from mimir.worklink.continuation import (
+    from mimir.http_ingress import (
         HTTP_EVENT_INGRESS_EXTRA_KEY,
         HTTP_EVENT_INGRESS_EXTRA_VALUE,
     )
@@ -2590,9 +2590,6 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("context_boundary", "mimir/agent.py", "Agent.__init__", "ServerChannelAudienceProvider"): 1,
         ("context_boundary", "mimir/agent.py", "Agent.run_turn", "create_auth_context"): 1,
         ("context_boundary", "mimir/agent.py", "_create_turn_auth_context", "create_auth_context"): 1,
-        # Test-only helper exercises emitted poller trust verdicts through the
-        # registered-service ingress; it does not add a production boundary.
-        ("context_boundary", "mimir/optional-skills/github-poller/tests/test_github_poller_pr_scope_snapshot.py", "_framework_scope_from", "access_control.create_auth_context"): 1,
         ("context_rescope", "mimir/acp/agent.py", "MimirAcpAgent._auth_context_for", "replace"): 1,
         ("context_factory", "mimir/access_control.py", "create_auth_context", "AuthContext"): 1,
         # Added on main while this branch was diverged: the saga_session_end
@@ -2632,17 +2629,6 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/poller_recovery.py", "_restore_event", "SourceLabel"): 1,
         ("producer", "mimir/pollers.py", "run_poller", "SourceLabel"): 1,
         ("producer", "mimir/prompt_sources.py", "prompt_source_label", "SourceLabel"): 1,
-        # Native forge reads publish exact-PR/head author-attested provenance.
-        # _publish_trusted_projection delegates to this producer; it no longer
-        # constructs a separate SourceLabel after a cached author verdict.
-        ("producer", "mimir/tools/forge.py", "_publish_author_attestation", "SourceLabel"): 1,
-        ("producer", "mimir/tools/forge.py", "_attest_ci_runs", "SourceLabel"): 1,
-            ("producer", "mimir/tools/forge.py", "pr_list", "SourceLabel"): 1,
-            ("producer", "mimir/tools/forge.py", "pr_spec", "SourceLabel"): 1,
-        # Retained remediation results preserve their exact factory authority.
-        ("producer", "mimir/tools/repo.py", "_publish_retained_result", "SourceLabel"): 1,
-        # PR checkout reads inherit exact-scope author attestation.
-            ("producer", "mimir/tools/repo.py", "_publish_attested_scope_result", "SourceLabel"): 1,
         # Operator-declared shell output remains active ingest even after
         # a successful bounded read.
         ("producer", "mimir/tools/budget_gate.py", "_result_labels_for_call", "SourceLabel"): 1,
@@ -2663,6 +2649,39 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         f"unexpected channel-bearing sources: {observed - expected}; "
         f"missing inventory entries: {expected - observed}"
     )
+    provider = root.parent / "plugins/cultivate/mimir_cultivate/repository.py"
+    provider_sources: Counter[tuple[str, str, str, str]] = Counter()
+    Visitor("plugins/cultivate/mimir_cultivate/repository.py").visit(
+        ast.parse(provider.read_text(encoding="utf-8"))
+    )
+    provider_sources.update({
+        row: count for row, count in observed.items()
+        if row[1] == "plugins/cultivate/mimir_cultivate/repository.py"
+        and row[0] == "producer" and row[3] == "SourceLabel"
+    })
+    assert provider_sources == Counter({
+        ("producer", "plugins/cultivate/mimir_cultivate/repository.py",
+         "_publish_retained_result", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/repository.py",
+         "_publish_attested_scope_result", "SourceLabel"): 1,
+    })
+    forge = root.parent / "plugins/cultivate/mimir_cultivate/forge.py"
+    Visitor("plugins/cultivate/mimir_cultivate/forge.py").visit(
+        ast.parse(forge.read_text(encoding="utf-8"))
+    )
+    forge_sources = Counter({
+        row: count for row, count in observed.items()
+        if row[1] == "plugins/cultivate/mimir_cultivate/forge.py"
+        and row[0] == "producer" and row[3] == "SourceLabel"
+    })
+    assert forge_sources == Counter({
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py",
+         "_publish_author_attestation", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py",
+         "_attest_ci_runs", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py", "pr_list", "SourceLabel"): 1,
+        ("producer", "plugins/cultivate/mimir_cultivate/forge.py", "pr_spec", "SourceLabel"): 1,
+    })
 
 
 @pytest.mark.asyncio

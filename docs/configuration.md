@@ -121,20 +121,30 @@ exists — turn it on here first:
 | `MIMIR_ACTIVITY_PANEL_CHANNELS` | A passive, live-updating "working…" panel posted to the channel that accumulates the turn's steps and edits itself in place (Slack `chat.update` / Discord message edit). |
 | `MIMIR_MIDTURN_INJECTION_CHANNELS` | Fold an inbound user message into the currently-running turn instead of queuing it for the next one. |
 | `MIMIR_CHAT_SKILLS_ENABLED` | Chat slash-skill discovery + invocation from a channel. |
-| `MIMIR_CODING_ENABLED` | Single coding runtime/build flag. Requires OpenCode, pinned Git, and an existing runtime-writable PR checkout lease root; see [coding prerequisites](#coding-prerequisites). |
 | `MIMIR_FACTORY_EPICS_ENABLED` | Feature-factory epic dispatch in the chainlink-orchestrator poller (for `worklink:epic` issues). |
 
-Installed Python plugins use a separate operator-owned process-environment enable
+Coding is an optional installed provider, not a feature flag: install the
+in-repo `plugins/cultivate` workspace member (`uv sync --all-packages`, or an
+image built with `MIMIR_PLUGIN_SELECTION=cultivate`) and select `cultivate` in
+`MIMIR_PLUGINS`. The retired `MIMIR_CODING_ENABLED` flag has no effect and logs a
+warning at boot. See [coding prerequisites](#coding-prerequisites) and
+[upgrading a coding deployment](plugins.md#upgrading-a-coding-deployment).
+
+Installed Python plugins use an operator-owned process-environment enable
 list. They are trusted in-process code, not a sandbox or a remote marketplace.
 Unset or empty `MIMIR_PLUGINS` disables optional plugins only; existing core tools
 remain available. Disabled providers are inspected through package metadata, not
 imported. Set a comma-separated list of manifest names or `all` to enable them.
 Invalid or duplicate disabled providers are diagnosed in the plugin listing;
 selected missing, duplicate, invalid or incompatible providers fail startup.
-Set `MIMIR_PLUGINS` in the supervisor's process environment (for example,
-`compose.env` or a systemd unit), never in `<MIMIR_HOME>/.env`: the agent can
-write its home. The selection is captured at startup and cannot be changed by
-chat, tools or a home dotenv. `mimir plugins list [--json]` inspects installed
+Set `MIMIR_PLUGINS` in the supervisor's operator-owned process environment
+(for example, a systemd unit). With the generated Docker scaffold, export it
+in the operator's host shell for every Compose invocation: Compose interpolates
+the process value into `environment:`. Neither the mounted agent home's `.env`
+nor its `compose.env` is an authority source; both are agent-writable. In
+particular, `compose.env` cannot override the scaffold's interpolated
+`environment:` entry. The selection is captured at startup and cannot be
+changed by chat, tools or a home dotenv. `mimir plugins list [--json]` inspects installed
 metadata and the current process selection without starting the runtime; it
 reports disabled-manifest diagnostics. See [plugins](plugins.md).
 
@@ -186,7 +196,6 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_MIDTURN_INJECTION_CHANNELS` | csv-list | `""` (off) | Fold inbound `user_message` events into the running turn. Pollers / scheduled ticks excluded. |
 | `MIMIR_CHAT_SKILLS_ENABLED` | bool | `false` | Chat slash-skill discovery/invocation (chainlink #783). |
 | `MIMIR_CHAT_SKILL_ALLOWLIST` | csv-list | `""` | Skill slugs allowed as chat slash-skills (companion to the flag above). |
-| `MIMIR_CODING_ENABLED` | bool | `false` | Enable the coding tool surface and scaffold image's OpenCode install/bootstrap. See [coding prerequisites](#coding-prerequisites); missing prerequisites fail startup together. |
 
 ## Concurrency, queue & timeouts
 
@@ -826,7 +835,7 @@ by the core proposals helper that verifies social-outbox merge approval.
 | `MIMIR_SOCIAL_OUTBOX_APPROVERS` | csv-list | unset (withhold all) | Comma-separated list of GitHub logins allowed to approve social-outbox dispatch by merging the rolling outbox PR; entries are trimmed and compared case-insensitively. Unset or empty (including whitespace/comma-only) withholds every dispatch with `no_approvers_configured`; any malformed login entry withholds with `invalid_approvers_configured`; a merger outside the list is withheld with `merger_not_approved`. Both social-cli pollers forward this setting via `pass_env`. Accepted risk: an agent holding an allowlisted operator's token could self-merge; the allowlist authorizes the forge actor, not an independent human. A separate agent GitHub identity is needed to close that risk. |
 | `MIMIR_GITHUB_PRELOAD_REVIEW_SKILL` | bool | off | Preload the review-skill body into review-needed prompts. |
 | `MIMIR_GITHUB_REVIEW_SKILL_PATH` | path | `""` | Path to the review-skill file preloaded when the above is on. |
-| `MIMIR_GITHUB_SELF_LOGIN` | str | `""` | GitHub login to self-filter from poller events. |
+| `MIMIR_GITHUB_SELF_LOGIN` | str | `""` | GitHub login to self-filter from poller events. Also the identity `GITHUB_TOKEN` must belong to before an authorized service-shell `gh` command runs; when unset, those `gh` commands are refused. |
 | `MIMIR_GITHUB_TRUSTED_BOT_LOGINS` | csv exact logins | `""` (none) | Operator action: explicitly trust PR authors that are GitHub bots/apps, e.g. `dependabot[bot]`, on both forge reads and github-poller event payloads. The github-poller forwards this setting via `pass_env`. Case-insensitive exact match only; other bots remain untrusted. Set only for bot identities whose repository output you intend to attest. |
 | `MIMIR_GITHUB_REPOS` | str | unset | Non-secret repository selector available to pollers that explicitly forward it; the bundled GitHub poller uses `GITHUB_REPOS`. |
 
@@ -870,33 +879,38 @@ Optional keys that enable specific tools/skills; unset = the tool/skill is off.
 ## Build- & scaffold-time variables
 
 These are consumed by the Docker scaffold / build (`start.sh`, Dockerfiles,
-`compose.env`). `MIMIR_CODING_ENABLED` is also the Python runtime coding flag.
+`compose.env`). Build arguments do not enable a provider at runtime.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `MIMIR_GIT_URL` | str | `https://github.com/jasoncarreira/mimir.git` | `start.sh` clone URL for the runtime source (change for forks). |
 | `MIMIR_DEFAULT_BRANCH` | str | `main` | Branch `start.sh` clones. |
 | `MIMIR_ENABLE_CLAUDE_CODE` | bool (`0`/`1`) | `0` | Build arg: `1` installs the Claude Code model adapter; the CLI is operator-provided. |
-| `MIMIR_CODING_ENABLED` | bool | `false` | Single runtime/build flag: true installs the pinned OpenCode runtime and bundled plugins in scaffold images and bootstraps their config at runtime. |
+| `MIMIR_ENABLE_OPENCODE` | bool (`0`/`1`) | `0` | Root Dockerfile build arg: `1` installs pinned OpenCode and bootstraps its config. Selected Cultivate scaffold images use the same build argument and pass it to runtime bootstrap; this is not the runtime plugin selection (`MIMIR_PLUGINS`). |
 | `MIMIR_EXTRAS` | csv-list | `anthropic,discord,slack,mcp` | pip extras build arg (`mimir-agent[...]`) in the PyPI-mode Dockerfile. |
 | `MIMIR_QUOTA_POLL_ENABLED` | bool (`0`/`1`) | unset | Setup-generated compatibility marker for subscription routes. Provider-side polling is not implemented for all routes, so do not treat this marker alone as evidence that quota polling is active. |
 
 ### Coding prerequisites
 
-Coding stays disabled by default. `MIMIR_CODING_ENABLED` is the single operator
-flag for the coding tool surface, scaffold image installation, and runtime
-OpenCode bootstrap. Both workspace and PyPI scaffolds pass the same value from
-the Compose project `.env` or shell to `build.args` and `environment`.
-Compose interpolation does not read `compose.env`; putting this flag only there
-does not configure the build. The old scaffold `MIMIR_ENABLE_OPENCODE` knob is no
-longer used. `--opencode` only optionally bakes the home's config into the image;
-it is not required to install OpenCode when coding is enabled.
+Coding stays disabled by default. Install Cultivate from the in-repo
+`plugins/cultivate` workspace member at the same commit as core
+(`uv sync --all-packages`; it is not published to an index) and set
+`MIMIR_PLUGINS=cultivate` in the supervisor process environment; an unselected
+or absent provider supplies no coding tools. For image builds, select Cultivate
+at build time with `MIMIR_PLUGIN_SELECTION=cultivate` as described in
+[plugins](plugins.md#docker-image-assembly-and-services).
+`MIMIR_ENABLE_OPENCODE` is a build argument for the pinned CLI/bootstrap, not
+a runtime coding switch. Compose reads its project `.env` for build argument
+interpolation, not `compose.env`; place runtime `MIMIR_PLUGINS` in the process
+environment. Regenerate scaffolds and rebuild images after changing installed
+plugins. `--opencode` only optionally bakes the home's config into the image.
 
 Before an operator chooses to enable coding, provision all prerequisites:
 
-- Install the pinned OpenCode CLI from `mimir/worklink/tool_pins.py` on the runtime
-  `PATH`. Regenerate older scaffolds and **rebuild the image** after changing the
-  coding flag (`docker compose build`, then `docker compose up -d`). A restart
+- Install the pinned OpenCode CLI from
+  `mimir_cultivate.worklink.tool_pins` on the runtime `PATH`. Regenerate older
+  scaffolds and **rebuild the image** after selecting Cultivate for the image
+  (`docker compose build`, then `docker compose up -d`). A restart
   alone cannot install the CLI. Hand-maintained images must supply the same
   prerequisites themselves; a runtime/build mismatch with a missing CLI is
   caught at startup rather than exposing broken tools.

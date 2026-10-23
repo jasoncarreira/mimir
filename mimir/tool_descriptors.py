@@ -84,35 +84,6 @@ def _generic_target(
     return (_value(arguments.get("target") or arguments.get("destination")),)
 
 
-def _repo_pr_target(
-    tool_name: str, arguments: Mapping[str, Any], auth_context: Any | None,
-) -> tuple[str | None, ...]:
-    discovered = getattr(auth_context, "server_discovered_pr_states", None)
-    repository = arguments.get("repository")
-    pull_request = arguments.get("pull_request")
-    state = (
-        discovered.resolve_for_tool(tool_name, repository, pull_request)
-        if discovered is not None
-        and isinstance(repository, str)
-        and isinstance(pull_request, int)
-        else None
-    )
-    if state is None:
-        registry = getattr(auth_context, "repo_pr_scope_registry", None)
-        state = (
-            registry.resolve(repository, pull_request)
-            if registry is not None and hasattr(registry, "resolve")
-            else None
-        )
-    if state is None:
-        return (None,)
-    scope = state.action_scope
-    return (
-        f"{scope.canonical_repo}#pull/{scope.pr_number}"
-        f"@{scope.observed_head_sha}:{scope.scope_id}",
-    )
-
-
 def _operator_alert_target(
     _tool_name: str, _arguments: Mapping[str, Any], _auth_context: Any | None,
 ) -> tuple[str | None, ...]:
@@ -143,20 +114,6 @@ def _command_target(
     _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
 ) -> tuple[str | None, ...]:
     return (_value(arguments.get("command")),)
-
-
-def _spawn_target(
-    _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
-) -> tuple[str | None, ...]:
-    target = _value(arguments.get("cwd") or os.environ.get("MIMIR_HOME"))
-    artifact_root = _value(arguments.get("artifact_root"))
-    return (target, artifact_root) if artifact_root else (target,)
-
-
-def _worklink_target(
-    _tool_name: str, _arguments: Mapping[str, Any], _auth_context: Any | None,
-) -> tuple[str | None, ...]:
-    return (_value(os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")),)
 
 
 def _url_target(
@@ -319,7 +276,6 @@ _CORE_DESCRIPTOR_DECLARATIONS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "harness_auto_deliver": _D(SinkCategory.SAME_CHANNEL, _generic_target, "message"),
     "harness_resend_nudge": _D(SinkCategory.SAME_CHANNEL, _generic_target, "message"),
     "http_request": _D(SinkCategory.HTTP_WEBHOOK, _url_target, "network", sink_payload_extractor=_argument_payload("url", "body")),
-    "issue_comment": _D(SinkCategory.FORGE, _generic_target, "configured_repository_issue", sink_payload_extractor=_argument_payload("body")),
     "memory_store": _D(SinkCategory.SAGA, _generic_target, "saga", result_origin=_N),
     "memory_propose": _D(SinkCategory.SAGA, _fixed_target("memory_proposals"), "memory_proposals", result_origin=_N, sink_payload_extractor=_argument_payload("content", "rationale")),
     "ntfy_send": _D(SinkCategory.NOTIFICATION, _generic_target, "notification", sink_payload_extractor=None),
@@ -327,45 +283,10 @@ _CORE_DESCRIPTOR_DECLARATIONS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "proposal_diff": _D(),
     "operator_alert": _D(SinkCategory.NOTIFICATION, _operator_alert_target, "notification", result_origin=_N, sink_payload_extractor=None),
     "post_message": _D(SinkCategory.CROSS_CHANNEL, _generic_target, "message", sink_payload_extractor=None),
-    "pr_checks": _D(result_origin=_E | _R),
-    "pr_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
-    "pr_comments": _D(result_origin=_E | _R),
-    "pr_diff": _D(result_origin=_E | _R),
-    "pr_file_content": _D(result_origin=_E | _R),
-    "pr_edit_body": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
-    "pr_files": _D(result_origin=_E | _R),
-    "pr_inline_review_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
-    "pr_job_log": _D(result_origin=_E | _R),
-    "ci_run_jobs": _D(result_origin=_E | _R),
-    "ci_run": _D(result_origin=_E | _R),
-    "ci_recent_runs": _D(result_origin=_E | _R),
-    "pr_metadata": _D(result_origin=_E | _R),
-    "pr_spec": _D(result_origin=_R),
-    "pr_list": _D(result_origin=_E | _R),
-    "pr_rerequest_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
-    "pr_review_requests": _D(result_origin=_E | _R),
-    "pr_reviews": _D(result_origin=_E | _R),
-    "pr_submit_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
     "react": _D(SinkCategory.SAME_CHANNEL, _channel_target, "message", result_origin=_N, budget_exempt=True),
     "rebuild_index": _D(SinkCategory.FILE, _index_target, "filesystem", result_origin=_N),
     "reload_pollers": _D(SinkCategory.SCHEDULER, _fixed_target("scheduler:pollers"), "scheduler", result_origin=_N),
     "remove_schedule": _D(SinkCategory.SCHEDULER, _schedule_target, "scheduler", result_origin=_N),
-    "repo_checkout": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
-    "repo_cleanup": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
-    "repo_commit": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=_argument_payload("message")),
-    "repo_diff": _D(result_origin=_R, git_operation_result=True),
-    "repo_fetch": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
-    "repo_merge": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
-    "repo_merge_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
-    "repo_push": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
-    "repo_rebase": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
-    "repo_rebase_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
-    "repo_revert": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
-    "repo_revert_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
-    "repo_stage": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, git_operation_result=True, sink_payload_extractor=None),
-    "repo_status": _D(result_origin=_R, git_operation_result=True),
-    "repo_test": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
-    "repo_unmerged": _D(result_origin=_R, git_operation_result=True),
     "request_mimir_update": _D(SinkCategory.FILE, _update_target, "filesystem", result_origin=_N),
     "request_operator_approval": _D(result_origin=_N),
     "saga_end_session": _D(SinkCategory.SAGA, _generic_target, "session_boundary", result_origin=_N),
@@ -379,10 +300,8 @@ _CORE_DESCRIPTOR_DECLARATIONS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "set_schedule_cron": _D(SinkCategory.SCHEDULER, _schedule_target, "scheduler", result_origin=_N),
     "shell": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
     "shell_exec": _D(SinkCategory.SHELL_PROCESS, _command_target, "shell_process", sink_payload_extractor=_argument_payload("command")),
-    "spawn_open_code": _D(SinkCategory.SPAWN, _spawn_target, "spawn_process", ifc_delegation=True),
     "submit_proposal": _D(SinkCategory.PROPOSAL, _generic_target, "proposal", result_origin=_N),
     "task": _D(result_origin=_N, ifc_delegation=True),
-    "unsupported_operation": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
     "web_search": _D(
         SinkCategory.NETWORK,
         _web_search_target,
@@ -393,8 +312,6 @@ _CORE_DESCRIPTOR_DECLARATIONS: Mapping[str, ToolDescriptor] = MappingProxyType({
     ),
     "web_turn_events": _D(SinkCategory.SAME_CHANNEL, _generic_target),
     "webhook": _D(SinkCategory.HTTP_WEBHOOK, _url_target, "network", sink_payload_extractor=_argument_payload("url", "body")),
-    "worklink_resume": _D(SinkCategory.SPAWN, _worklink_target, "worklink"),
-    "worklink_run": _D(SinkCategory.SPAWN, _worklink_target, "worklink"),
     "write_file": _D(SinkCategory.FILE, _file_target, "filesystem", result_origin=_N),
     "write_todos": _D(result_origin=_N),
 })

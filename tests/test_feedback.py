@@ -6,6 +6,7 @@ classifies records by polarity, renders a prompt block."""
 from __future__ import annotations
 
 import ast
+from importlib import metadata
 import inspect
 import json
 import subprocess
@@ -61,6 +62,19 @@ def _make_log(tmp_path: Path, events: list[dict] | None = None,
     if turns is not None:
         _write_jsonl(turns_path, turns)
     return FeedbackLog(events_path=events_path, turns_path=turns_path)
+
+
+@pytest.fixture
+def cultivate_feedback_policy():
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        metadata.distribution("mimir-cultivate")
+    except metadata.PackageNotFoundError:
+        pytest.skip("Cultivate is not installed in the core-only test environment")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
 
 
 
@@ -1107,7 +1121,7 @@ def test_classify_gave_up_suffix_is_negative():
     assert classify(123) is None
 
 
-def test_worklink_run_orphaned_is_negative_and_names_recovery_route():
+def test_worklink_run_orphaned_is_negative_and_names_recovery_route(cultivate_feedback_policy):
     from mimir.feedback import classify
     from mimir.feedback.renderers import _render_event_line
 
@@ -1453,7 +1467,7 @@ def test_send_message_failed_classified_negative():
     assert classify("send_message_failed") == ("negative", "send_failed")
 
 
-def test_worklink_continuation_created_surfaces_as_negative_feedback(tmp_path: Path):
+def test_worklink_continuation_created_surfaces_as_negative_feedback(tmp_path: Path, cultivate_feedback_policy):
     from mimir.feedback import classify
 
     assert classify("worklink_continuation_created") == (
@@ -1478,9 +1492,8 @@ def test_worklink_continuation_created_surfaces_as_negative_feedback(tmp_path: P
     assert "worklink_continuation" in block
 
 
-def test_worklink_tool_pin_dedupe_failure_is_registered_and_rendered():
+def test_worklink_tool_pin_dedupe_failure_is_registered_and_rendered(cultivate_feedback_policy):
     from mimir.feedback import (
-        _EVENT_RULES,
         classify,
     )
     from mimir.feedback.renderers import _render_event_line
@@ -1490,7 +1503,9 @@ def test_worklink_tool_pin_dedupe_failure_is_registered_and_rendered():
 
     # Pin the canonical declaration, rather than only exercising classify(), so
     # this cannot pass through a fallback classification convention.
-    assert _EVENT_RULES[event_type] == expected_rule
+    from mimir.feedback import _EVENT_RULES
+
+    assert event_type not in _EVENT_RULES
     assert classify(event_type) == expected_rule
 
     line = _render_event_line(
@@ -1510,6 +1525,7 @@ def test_worklink_tool_pin_dedupe_failure_is_registered_and_rendered():
 
 def test_worklink_tool_pin_dedupe_failure_surfaces_with_cap_and_content_dedup(
     tmp_path: Path,
+    cultivate_feedback_policy,
 ):
     event_type = "worklink_tool_pin_dedupe_check_failed"
     log = _make_log(
@@ -1635,7 +1651,7 @@ def test_pr_review_request_gave_up_surfaces_as_negative(tmp_path: Path):
     assert "[poller:github-poller]" in block
 
 
-def test_untrusted_pr_skip_surfaces_for_operator(tmp_path: Path):
+def test_untrusted_pr_skip_surfaces_for_operator(tmp_path: Path, cultivate_feedback_policy):
     log = _make_log(
         tmp_path,
         events=[{
@@ -1889,7 +1905,7 @@ def test_content_dedup_keeps_distinct_tool_denied_variants(tmp_path: Path):
     assert "tool_denied Read: tool_call_budget_exceeded" in block
 
 
-def test_content_dedup_keeps_distinct_spawn_failures(tmp_path: Path):
+def test_content_dedup_keeps_distinct_spawn_failures(tmp_path: Path, cultivate_feedback_policy):
     """Each spawn failure has a distinct job_id baked into the
     rendered content, so multiple spawn_work_failed events surface
     distinctly. Regression guard against over-collapsing per-incident
@@ -4857,7 +4873,7 @@ def test_poller_missing_required_env_renders_poller_and_missing_vars(tmp_path: P
 # ---- chainlink #214: pre-merge CHANGES_REQUESTED gate -------------------
 
 
-def test_pr_merge_blocked_renders_pr_number_and_reviewer(tmp_path: Path) -> None:
+def test_pr_merge_blocked_renders_pr_number_and_reviewer(tmp_path: Path, cultivate_feedback_policy) -> None:
     """pr_merge_blocked_by_changes_requested renderer surfaces PR number and
     blocking reviewer — operator can see which PR/reviewer is blocking without
     reading turn transcripts."""
@@ -4879,7 +4895,7 @@ def test_pr_merge_blocked_renders_pr_number_and_reviewer(tmp_path: Path) -> None
     assert "CHANGES_REQUESTED" in negatives[0].content
 
 
-def test_pr_merge_blocked_renders_without_reviewer_list(tmp_path: Path) -> None:
+def test_pr_merge_blocked_renders_without_reviewer_list(tmp_path: Path, cultivate_feedback_policy) -> None:
     """pr_merge_blocked_by_changes_requested renderer handles missing
     blocking_reviewers field gracefully — still surfaces PR number."""
     log = _make_log(tmp_path, events=[
@@ -5013,7 +5029,7 @@ def test_sanitize_field_strips_ansi_in_error_event(tmp_path: Path) -> None:
     assert "CRITICAL" in negatives[0].content
 
 
-def test_sanitize_field_applied_to_pr_merge_blocked_author(tmp_path: Path) -> None:
+def test_sanitize_field_applied_to_pr_merge_blocked_author(tmp_path: Path, cultivate_feedback_policy) -> None:
     """pr_merge_blocked blocking_reviewers author field is sanitized before
     reaching the prompt — malicious/accidental multi-line author names
     cannot inject newlines into the algedonic block. (chainlink #224)"""

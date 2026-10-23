@@ -22,6 +22,20 @@ from mimir.access_control import (
 from mimir.models import AgentEvent, InformationFlowLabels, SourceLabel
 
 
+@pytest.fixture
+def selected_repository_policy():
+    from importlib.metadata import PackageNotFoundError, version
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("selected repository policy requires installed Cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
 def _ts(seconds_ago: float) -> str:
     return (datetime.now(tz=timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
 
@@ -87,6 +101,7 @@ class _FakeEnqueue:
 async def test_unclean_replay_reattests_live_pr_and_ignores_stashed_integrity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     live_head: str | None, live_author: str, stashed_integrity: str, expected: str,
+    selected_repository_policy,
 ) -> None:
     authority = build_trigger_service_principal(
         canonical="poller:github-activity", trigger="poller", profile="github",

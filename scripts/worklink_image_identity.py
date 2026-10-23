@@ -55,12 +55,12 @@ import os
 from pathlib import Path
 import subprocess
 
-from mimir.worklink.backends.base import WorkOrder
-from mimir.worklink.backends.opencode import OpenCodeBackend
-from mimir.worklink.checkout import cleanup_checkout, create_isolated_checkout
-from mimir.worklink.compute import LocalSubprocessComputeBackend
-from mimir.worklink.evidence import observe_evidence
-from mimir.worklink.safe_git import ControllerGitPublication
+from mimir_cultivate.worklink.backends.base import WorkOrder
+from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+from mimir_cultivate.worklink.checkout import cleanup_checkout, create_isolated_checkout
+from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
+from mimir_cultivate.worklink.evidence import observe_evidence
+from mimir_cultivate.worklink.safe_git import ControllerGitPublication
 
 REPO = Path(os.environ["WORKLINK_REPO"])
 METADATA = Path("/home/mimir/worklink-publication")
@@ -68,11 +68,22 @@ CONFIG = Path("/home/mimir/worklink-opencode/opencode.json")
 DATA = Path("/home/mimir/worklink-opencode/data")
 CLI = "/tmp/opencode-proof"
 
+GATE_TEST = r'''test "$(id -u)" = 1002
+printf 'gate-euid=%s\\n' "$(id -u)"
+test "$(cat tracked)" = worker-modified
+test "$(cat created)" = worker-created
+test "$(cat controller-continuation)" = continued
+! test -e deleted
+test -r "$HOME/.config/opencode/opencode.json"
+test -r "$HOME/.local/share/opencode/auth.json"
+! cat /home/mimir/worklink-canary
+'''
+
 async def main():
     if os.geteuid() != 1001:
         raise RuntimeError("controller proof is not running as mimir")
     os.environ.update({
-        "MIMIR_CODING_ENABLED": "true",
+        "MIMIR_PLUGINS": "cultivate",
         "MIMIR_MODEL_SPEC": "proof:model",
         "OPENCODE_CONFIG": str(CONFIG),
         "XDG_DATA_HOME": str(DATA),
@@ -115,7 +126,9 @@ async def main():
         repo_url=str(REPO),
         base_ref="main",
         branch=lease.branch,
-        test_command="unused",
+        # The evidence gate runs only the command its worker-bound work spec
+        # carries, as the orchestrator passes one test_cmd to both.
+        test_command=GATE_TEST,
     )
     projections = spec.backend_config.get("worker_projections", ())
     if len(projections) != 2:
@@ -139,16 +152,7 @@ async def main():
         started_at=datetime.now(UTC),
         base_ref=lease.local_base,
         backend_status="completed",
-        test_command=r'''test "$(id -u)" = 1002
-printf 'gate-euid=%s\\n' "$(id -u)"
-test "$(cat tracked)" = worker-modified
-test "$(cat created)" = worker-created
-test "$(cat controller-continuation)" = continued
-! test -e deleted
-test -r "$HOME/.config/opencode/opencode.json"
-test -r "$HOME/.local/share/opencode/auth.json"
-! cat /home/mimir/worklink-canary
-''',
+        test_command=GATE_TEST,
         safe_git=publication,
         work_spec=spec,
         compute=compute,
@@ -198,7 +202,8 @@ from pathlib import Path
 import subprocess
 import uuid
 
-from mimir.tools.registry import set_spawn_config, spawn_open_code
+from mimir.tools.registry import set_spawn_config
+from mimir_cultivate.opencode import spawn_open_code
 
 SEED = Path(os.environ["WORKLINK_REPO"])
 ARTIFACTS = Path("/home/mimir/worklink-spawn-artifacts")
@@ -334,10 +339,14 @@ def main() -> None:
             "--build-arg", f"MIMIR_GIT_REF={git_ref}",
             "--build-arg", f"MIMIR_CONTROLLER_COMMIT={source_commit}",
             "--build-arg", f"MIMIR_EXECUTOR_COMMIT={source_commit}",
+            # The worker exists only in a Cultivate image; select the in-repo
+            # plugin so this proof exercises it from the same commit.
+            "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate",
             "--tag", IMAGE, ".",
         ], timeout=1200)
         run([
             "docker", "run", "--detach", "--env", "HOME=/home/mimir",
+            "--env", "MIMIR_PLUGINS=cultivate",
             "--env", f"WORKLINK_REPO={repo}", "--name", CONTAINER, IMAGE,
         ])
         wait_for_runtime()
@@ -350,8 +359,22 @@ def main() -> None:
             test "$(stat -c %U:%G /opt/mimir-worklink/uv-cache)" = root:root
             test "$(stat -c %a /opt/mimir-worklink/uv-cache)" = 755
             test "$(cat /opt/mimir-worklink/executor-source-commit)" = "SOURCE_COMMIT"
+            test "$(cat /home/mimir/venv/controller-source-commit)" = "SOURCE_COMMIT"
             test "$(stat -c %a:%u:%g /var/lib/mimir-worklink/homes)" = 710:0:1002
         """.replace("SOURCE_COMMIT", source_commit))
+        # Both venvs must run Cultivate built from the pinned source tree, never an
+        # index wheel, and the worker's core must be the overlay, not a pin's.
+        docker_exec("/bin/sh", "-ceu", r"""
+            for python in /opt/mimir-worklink/venv/bin/python /home/mimir/venv/bin/python; do
+                "$python" - <<'PY'
+import importlib.metadata as metadata, json, sys
+for name in ("mimir-agent", "mimir-cultivate"):
+    origin = json.loads(metadata.distribution(name).read_text("direct_url.json") or "{}")
+    if not origin.get("url", "").startswith("file://"):
+        raise SystemExit(f"{sys.executable}: {name} is not installed from the pinned source: {origin}")
+PY
+            done
+        """)
         # Read the live uids from /proc INSIDE the container.
         #
         # ``docker top`` is unusable for this. It runs ps on the HOST, so its
@@ -377,7 +400,7 @@ def main() -> None:
         rows = [line.split("\t", 2) for line in process_table.splitlines() if line.count("\t") >= 2]
         if not any(uid == "1001" and "mimir run" in cmd for _, uid, cmd in rows):
             raise RuntimeError(f"live mimir service is not uid 1001\n{process_table}")
-        if not any(uid == "0" and "mimir.worklink.worker_exec" in cmd for _, uid, cmd in rows):
+        if not any(uid == "0" and "mimir_cultivate.worklink.worker_exec" in cmd for _, uid, cmd in rows):
             raise RuntimeError(f"live worker executor is not root\n{process_table}")
 
         setup = r"""

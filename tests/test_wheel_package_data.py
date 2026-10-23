@@ -19,12 +19,16 @@ no ``uv`` / ``hatchling`` / ``pathspec`` dependency.
 from __future__ import annotations
 
 import re
+import hashlib
 import shutil
 import subprocess
 import tomllib
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
+
+from tests.uv_subprocess import isolated_uv_env
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
@@ -41,8 +45,6 @@ CRITICAL_RUNTIME_DATA = (
     "mimir/prompt_templates/issues-audit.md",
     "mimir/prompt_templates/commitments-review.md",
     "mimir/prompt_templates/upgrade.md",  # version-triggered defaults reconciliation
-    "mimir/prompt_templates/worklink-order.md",  # Worklink operator-run prompt
-    "mimir/prompt_templates/decompose.md",  # Worklink planner/decomposer prompt
     "mimir/memory_templates/core/00-identity.md",  # setup core-memory defaults
     "mimir/memory_templates/core/05-non-goals.md",
     "mimir/memory_templates/core/06-action-boundaries.md",
@@ -56,9 +58,6 @@ CRITICAL_RUNTIME_DATA = (
     "mimir/skills/chainlink/dockerfile.fragment",  # chainlink scaffold fragment
     "mimir/skills/tool-pin-drift/scripts/check_tool_pins.py",  # declared immutable drift script
     "mimir/skills/tool-pin-drift/scripts/targets.json",  # source-controlled drift inventory
-    "mimir/optional-skills/chainlink-orchestrator/SKILL.md",  # Worklink planner skill (opt-in)
-    "mimir/optional-skills/chainlink-orchestrator/scripts/poller.py",  # ready-queue poller (#444)
-    "mimir/optional-skills/chainlink-orchestrator/pollers.json",
     "mimir/optional-skills/dependency-advisory-watch/SKILL.md",  # OSV dependency advisory poller (opt-in)
     "mimir/optional-skills/dependency-advisory-watch/scripts/poller.py",  # poller entry point
     "mimir/optional-skills/dependency-advisory-watch/pollers.json",  # poller manifest
@@ -130,6 +129,41 @@ def test_gitwildmatch_to_regex_semantics() -> None:
 def test_critical_runtime_data_files_exist_in_source() -> None:
     missing = [rel for rel in CRITICAL_RUNTIME_DATA if not (REPO_ROOT / rel).is_file()]
     assert not missing, f"runtime data files absent from the source tree: {missing}"
+
+
+def test_coding_prompts_ship_only_in_cultivate() -> None:
+    plugin_root = REPO_ROOT / "plugins/cultivate"
+    config = tomllib.loads((plugin_root / "pyproject.toml").read_text(encoding="utf-8"))
+    wheel = config["tool"]["hatch"]["build"]["targets"]["wheel"]
+    sdist = config["tool"]["hatch"]["build"]["targets"]["sdist"]
+    assert wheel["packages"] == ["mimir_cultivate"]
+    for name in ("worklink-order.md", "decompose.md"):
+        rel = f"mimir_cultivate/prompt_templates/{name}"
+        assert (plugin_root / rel).is_file()
+        assert not (REPO_ROOT / "mimir/prompt_templates" / name).exists()
+        assert "mimir_cultivate/**/*" in sdist["include"]
+        assert not any(_gitwildmatch_to_regex(pattern).match(rel)
+                        for pattern in wheel.get("exclude", ()))
+
+
+def test_cultivate_wheel_contains_original_logo_and_both_licenses(tmp_path: Path) -> None:
+    result = subprocess.run(
+        ["uv", "build", "--package", "mimir-cultivate", "--wheel", "--out-dir", str(tmp_path)],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+        env=isolated_uv_env(tmp_path),
+    )
+    assert result.returncode == 0, result.stderr
+    wheel, = tmp_path.glob("*.whl")
+    with ZipFile(wheel) as archive:
+        logo = "mimir_cultivate/brand/cultivate-logo-dark-v1.png"
+        assert archive.namelist().count(logo) == 1
+        assert hashlib.sha256(archive.read(logo)).digest() == hashlib.sha256(
+            (REPO_ROOT / "brand/logos/cultivate-logo-dark-v1.png").read_bytes()
+        ).digest()
+        for license_path in ("LICENSE", "brand/LICENSE"):
+            original = (REPO_ROOT / "plugins/cultivate" / license_path).read_bytes()
+            assert original in (archive.read(name) for name in archive.namelist()
+                                if name.endswith(license_path))
 
 
 def test_wheel_include_config_covers_critical_runtime_data() -> None:

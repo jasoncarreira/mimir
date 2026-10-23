@@ -192,23 +192,14 @@ class PollerProperties:
         }
 
 
-def poller_properties(canonical: str) -> PollerProperties:
-    return selected_policy_registry().poller_properties.get(canonical, PollerProperties())
-
-
-def register_core_poller_properties(registry: PolicyRegistry) -> None:
-    """Declare historical semantics once; manifests cannot mint these grants."""
-    registry.register_poller_properties(
-        "poller:github-activity", PollerProperties(github_activity=True),
-    )
-    registry.register_poller_properties(
-        "poller:worklink-ready-queue", PollerProperties(worklink_retained_checkout=True),
-    )
-    registry.register_poller_properties(
-        "poller:github-ci-watch", PollerProperties(github_ci_watch=True),
-    )
-
-    # All authorization consumers read properties, never canonical-name lists.
+def poller_properties(
+    canonical: str, *, owner: str | None = None, policy: PolicyRegistry | None = None,
+) -> PollerProperties:
+    policy = policy if policy is not None else selected_policy_registry()
+    registered = policy.plugin_poller_properties.get(canonical)
+    if registered is not None and registered[0] == owner:
+        return registered[1]
+    return policy.poller_properties.get(canonical, PollerProperties())
 
 
 def _names(value: str) -> frozenset[str]:
@@ -221,10 +212,7 @@ _FLOWS = {
     "source": _names("""memory_query memory_get proposal_diff file_search mimir_get_turn
         get_turn bash_jobs_list bash_job_output fetch_channel_history list_channels
         list_schedules commitment_list read_file aread ls als glob aglob grep agrep
-        hands_read Read Glob Grep chainlink_issue_show pr_metadata pr_spec pr_list pr_files pr_diff
-        pr_file_content pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs
-        pr_reviews pr_comments pr_review_requests repo_status repo_diff
-        repo_unmerged"""),
+        hands_read Read Glob Grep chainlink_issue_show"""),
     "sink": _names("""memory_store memory_propose open_proposal submit_proposal
         abandon_proposal saga_feedback saga_mark_contributions saga_end_session
         saga_forget saga_record_skill_learning rebuild_index send_message
@@ -233,15 +221,10 @@ _FLOWS = {
         reload_pollers commitment_propose_closure commitment_complete
         commitment_snooze commitment_dismiss request_mimir_update post_message webhook ntfy_send write_file edit_file
         replace_file Write Edit harness_auto_deliver harness_resend_nudge
-        activity_panel_post activity_panel_edit pr_submit_review
-        pr_inline_review_comment pr_comment pr_edit_body issue_comment
-        pr_rerequest_review unsupported_operation repo_cleanup repo_stage repo_commit
-        repo_merge repo_merge_abort repo_rebase repo_rebase_abort repo_revert
-        repo_revert_abort repo_push"""),
-    "both": _names("""shell_exec bash_async worklink_run worklink_resume web_search
-        fetch_url http_request spawn_open_code download_files adownload_files
-        Bash bash bash_exec execute aexecute shell hands_edit hands_shell hands_python
-        repo_checkout repo_fetch repo_test"""),
+        activity_panel_post activity_panel_edit"""),
+    "both": _names("""shell_exec bash_async web_search
+        fetch_url http_request download_files adownload_files
+        Bash bash bash_exec execute aexecute shell hands_edit hands_shell hands_python"""),
 }
 
 
@@ -249,18 +232,10 @@ _TIERS = {
     "scope-contained": _names("""write_file edit_file replace_file rebuild_index shell_exec
         bash_async bash_jobs_list bash_job_output read_file proposal_diff aread ls als
         glob aglob grep agrep file_search get_turn mimir_get_turn memory_get
-        send_message operator_alert task list_schedules pr_metadata chainlink_issue_show
-        pr_spec pr_list pr_files pr_diff pr_file_content pr_checks pr_job_log
-        ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests
-        repo_status repo_diff repo_unmerged"""),
+        send_message operator_alert task list_schedules chainlink_issue_show"""),
     "scoped-with-provenance": _names("""memory_store memory_propose
         commitment_propose_closure open_proposal submit_proposal abandon_proposal saga_feedback saga_mark_contributions
-        saga_end_session saga_record_skill_learning pr_review_others pr_submit_review
-        pr_inline_review_comment pr_comment pr_edit_body issue_comment
-        pr_rerequest_review unsupported_operation repo_checkout repo_cleanup repo_fetch
-        repo_stage repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort
-        repo_revert repo_revert_abort repo_push"""),
-    "code-execution": _names("worklink_run worklink_resume spawn_open_code repo_test"),
+        saga_end_session saga_record_skill_learning"""),
     "unbounded": _names("fetch_url web_search webhook http_request ntfy_send"),
 }
 _PROFILES = {
@@ -269,32 +244,19 @@ _PROFILES = {
         saga_mark_contributions send_message saga_record_skill_learning operator_alert
         shell_exec bash_jobs_list bash_job_output fetch_url open_proposal
         submit_proposal abandon_proposal"""),
-    "github": _names("""chainlink_issue_show worklink_run worklink_resume write_file edit_file replace_file
+    "github": _names("""chainlink_issue_show write_file edit_file replace_file
         shell_exec bash_async bash_jobs_list bash_job_output read_file aread ls als glob
         aglob grep agrep file_search get_turn mimir_get_turn send_message operator_alert
         task memory_store saga_mark_contributions saga_end_session
-        saga_record_skill_learning fetch_url pr_metadata pr_spec pr_list pr_files
-        pr_diff pr_file_content pr_checks pr_reviews pr_comments pr_review_requests
-        pr_submit_review pr_inline_review_comment pr_comment pr_rerequest_review
-        pr_edit_body pr_review_others pr_job_log ci_run_jobs ci_run ci_recent_runs
-        issue_comment unsupported_operation repo_checkout repo_cleanup repo_fetch
-        repo_status repo_test repo_diff repo_unmerged repo_stage repo_commit repo_merge
-        repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort
-        repo_push"""),
+        saga_record_skill_learning fetch_url"""),
     "custom": frozenset.union(*_TIERS.values()) - _names(
         "issue_comment open_proposal submit_proposal abandon_proposal proposal_diff"
     ),
     "heartbeat": _names("""chainlink_issue_show write_file edit_file replace_file
         shell_exec bash_async bash_jobs_list bash_job_output read_file aread ls als glob aglob grep agrep
         file_search get_turn mimir_get_turn memory_store saga_feedback
-        saga_mark_contributions worklink_run send_message operator_alert fetch_url
-        task list_schedules pr_metadata pr_spec pr_list pr_files pr_diff
-        pr_file_content pr_checks pr_reviews pr_comments pr_review_requests
-        pr_submit_review pr_inline_review_comment pr_comment pr_rerequest_review
-        pr_edit_body unsupported_operation repo_checkout repo_cleanup repo_fetch
-        repo_status repo_test repo_diff repo_unmerged repo_stage repo_commit repo_merge
-        repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort
-        repo_push"""),
+        saga_mark_contributions send_message operator_alert fetch_url
+        task list_schedules"""),
     "session-boundary": _names(
         "memory_get mimir_get_turn saga_feedback saga_end_session write_file"
     ),
@@ -335,7 +297,7 @@ _FETCH = {
 
 _CHANNEL_OPERATIONS = _names("send_message react fetch_channel_history")
 _WRITE_OPERATIONS = _names("write_file edit_file replace_file")
-_WRITE_RESOURCE_OPERATIONS = _WRITE_OPERATIONS | _names("worklink_run worklink_resume")
+_WRITE_RESOURCE_OPERATIONS = _WRITE_OPERATIONS
 _READ_RESOURCE_OPERATIONS = _names(
     "read_file aread ls als glob aglob grep agrep file_search get_turn mimir_get_turn"
 )
@@ -351,22 +313,9 @@ _RESULT_DOMAINS = {
     "chainlink": _names("chainlink_issue_show"),
     "shell": _names("shell_exec execute"),
     "web": _names("web_search"),
-    "worklink": _names("worklink_run worklink_resume"),
-    "coding_worker": _names("spawn_open_code"),
-    "repository": _names("""pr_metadata pr_spec pr_list pr_files pr_diff
-        pr_file_content pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs
-        pr_reviews pr_comments pr_review_requests repo_checkout repo_fetch
-        repo_status repo_test repo_diff repo_unmerged pr_submit_review
-        pr_inline_review_comment pr_comment pr_edit_body issue_comment
-        repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort
-        repo_revert repo_revert_abort repo_push"""),
     "client_provider": _names("hands_read hands_edit hands_shell hands_python"),
 }
 _READABLE_DOMAINS = {
-    "repository": _names("""pr_list ci_run_jobs ci_run ci_recent_runs
-        pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks
-        pr_job_log pr_reviews pr_comments pr_review_requests repo_checkout
-        repo_fetch repo_status repo_test repo_diff repo_unmerged"""),
     "channel_metadata": _names("list_channels"),
     "schedule_metadata": _names("list_schedules"),
     "shell_jobs": _names("bash_jobs_list bash_job_output"),
@@ -376,40 +325,28 @@ _READABLE_DOMAINS = {
     "client_provider": _names("hands_read hands_python"),
     "chainlink": _names("chainlink_issue_show"),
 }
-_READ_BACKEND = _names("""chainlink_issue_show pr_job_log ci_run_jobs ci_run ci_recent_runs Read Glob
+_READ_BACKEND = _names("""chainlink_issue_show Read Glob
     Grep read_file proposal_diff aread ls als glob aglob grep agrep fetch_url
-    pr_metadata pr_spec pr_list pr_files pr_diff pr_file_content pr_checks
-    pr_reviews pr_comments pr_review_requests repo_checkout repo_fetch
-    repo_status repo_test repo_diff repo_unmerged hands_read""")
+    hands_read""")
 _ACP_HANDS_RESULTS = _names("hands_read hands_edit hands_shell hands_python")
 _CATALOG_OPEN = _names("""commitment_list memory_query memory_get web_search fetch_url
     write_todos defer_injected_message request_operator_approval commitment_complete
     commitment_snooze commitment_dismiss""")
-_CATALOG_REPO_PR = _names("""pr_metadata pr_spec pr_files pr_diff pr_file_content
-    pr_checks pr_job_log pr_reviews pr_comments pr_review_requests pr_submit_review
-    pr_inline_review_comment pr_comment pr_edit_body pr_rerequest_review
-    unsupported_operation repo_checkout repo_cleanup repo_fetch repo_status repo_test
-    repo_diff repo_unmerged repo_stage repo_commit repo_merge repo_merge_abort
-    repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push""")
 _CATALOG_RESOURCE = (_READ_RESOURCE_OPERATIONS | _WRITE_RESOURCE_OPERATIONS
-                     | _CATALOG_REPO_PR
-                     | _names("hands_read ci_run_jobs ci_run ci_recent_runs"))
-_CATALOG_ADMIN = _names("""chainlink_issue_show pr_list issue_comment operator_alert
+                     | _names("hands_read"))
+_CATALOG_ADMIN = _names("""chainlink_issue_show operator_alert
     approve_declassification list_channels list_schedules add_schedule
     set_schedule_priority set_schedule_cron remove_schedule reload_pollers open_proposal proposal_diff
     submit_proposal abandon_proposal request_mimir_update shell_exec bash_async
-    bash_jobs_list bash_job_output spawn_open_code task memory_store memory_propose
+    bash_jobs_list bash_job_output task memory_store memory_propose
     commitment_propose_closure saga_feedback saga_mark_contributions saga_end_session saga_record_skill_learning
     saga_forget set_poller_overrides download_files adownload_files rebuild_index
     hands_edit hands_shell hands_python hands_request_scope""")
 _PROTECTED_METADATA = _names("list_channels list_schedules bash_jobs_list bash_job_output")
 _FIXED_SERVICE_SINKS = _names("rebuild_index")
 _TAINT_INDEPENDENT_EGRESS = _names("fetch_url web_search")
-_WORKLINK_BUILD_TOOLS = _names("worklink_run worklink_resume")
 _SCHEDULE_WRITES = _names("add_schedule set_schedule_priority set_schedule_cron remove_schedule set_poller_overrides")
-_REPO_PUBLISH_TOOLS = _names("repo_commit repo_merge repo_rebase repo_revert repo_push")
-_TAINTED_WRITES = _names("""repo_stage repo_commit repo_merge repo_rebase repo_revert
-    repo_push repo_test hands_edit hands_shell hands_python memory_store saga_feedback
+_TAINTED_WRITES = _names("""hands_edit hands_shell hands_python memory_store saga_feedback
     saga_mark_contributions saga_end_session saga_forget saga_record_skill_learning""")
 _TAINTED_FILE_WRITES = _names("""write_file edit_file replace_file upload
     awrite_file aedit_file areplace_file aupload write edit replace awrite aedit areplace""")
@@ -418,62 +355,29 @@ _SAGA_MUTATIONS = _names("""memory_store saga_feedback saga_mark_contributions
 _CATALOG_ADMIN_BUILTIN = _names(
     "Bash bash bash_exec execute aexecute shell Write Edit Read Glob Grep download_files"
 )
-_STANDING_REVIEW = _names("""pr_metadata pr_spec pr_files pr_diff pr_file_content
-    pr_checks pr_reviews pr_comments pr_review_requests pr_submit_review
-    pr_inline_review_comment pr_comment pr_edit_body pr_rerequest_review
-    repo_checkout repo_cleanup repo_fetch repo_status repo_test repo_diff repo_unmerged""")
-_REMEDIATION_EFFECT = _names("""repo_commit repo_push pr_comment pr_edit_body
-    pr_inline_review_comment pr_rerequest_review write_file edit_file replace_file
-    worklink_resume""")
+_REMEDIATION_EFFECT = _names("write_file edit_file replace_file")
 _TYPED_ERROR_SIGNAL = _names("""bash_job_output fetch_url get_turn mimir_get_turn
-    shell_exec web_search worklink_run""")
+    shell_exec web_search""")
 
 
-# Typed actions are inert model values, not imports of the forge/repo tools.
-from mimir.models import RepoPRAction
-
-_FORGE_ACTIONS = {
-    **{name: RepoPRAction.INSPECT for name in _names("""pr_metadata pr_spec pr_files
-        pr_diff pr_file_content pr_checks pr_job_log pr_reviews pr_comments
-        pr_review_requests""")},
-    "pr_submit_review": RepoPRAction.PR_REVIEW,
-    "pr_inline_review_comment": RepoPRAction.PR_REVIEW,
-    "pr_comment": RepoPRAction.PR_COMMENT,
-    "pr_edit_body": RepoPRAction.PR_EDIT,
-    "pr_rerequest_review": RepoPRAction.PR_REREQUEST,
-    "unsupported_operation": None,
-}
-_REPO_ACTIONS = {
-    **{name: RepoPRAction.CHECKOUT for name in _names("repo_checkout repo_cleanup repo_fetch")},
-    **{name: RepoPRAction.INSPECT for name in _names("repo_status repo_diff repo_unmerged")},
-    "repo_test": RepoPRAction.TEST,
-    **{name: RepoPRAction.WRITE for name in _names("repo_stage repo_merge_abort repo_rebase_abort repo_revert_abort")},
-    **{name: RepoPRAction.COMMIT for name in _names("repo_commit repo_merge repo_rebase repo_revert")},
-    "repo_push": RepoPRAction.PUSH,
-}
-_RETAINED_REPO_TOOLS = _names("repo_status repo_diff repo_test repo_stage repo_commit")
 # Mutation potential is descriptive metadata, not a replacement for historical
 # target-aware vetoes (e.g. scratch file writes remain permitted).
 _WRITES_CODE_OR_STATE = (
     _TAINTED_FILE_WRITES | _SAGA_MUTATIONS | _SCHEDULE_WRITES | _WRITE_RESOURCE_OPERATIONS
-    | _names("""Write Edit repo_checkout repo_cleanup repo_fetch repo_test repo_stage
-        repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort
-        repo_revert repo_revert_abort repo_push memory_propose commitment_propose_closure open_proposal
+    | _names("""Write Edit memory_propose commitment_propose_closure open_proposal
         submit_proposal abandon_proposal rebuild_index reload_pollers
         commitment_complete commitment_snooze commitment_dismiss request_mimir_update
-        shell_exec bash_async spawn_open_code Bash bash bash_exec execute aexecute
+        shell_exec bash_async Bash bash bash_exec execute aexecute
         shell hands_edit hands_shell hands_python download_files adownload_files
         approve_declassification write_todos defer_injected_message task
-        pr_submit_review pr_inline_review_comment pr_comment pr_edit_body
-        issue_comment pr_rerequest_review hands_request_scope send_message react
+        hands_request_scope send_message react
         post_message webhook ntfy_send operator_alert harness_auto_deliver
         harness_resend_nudge activity_panel_post activity_panel_edit""")
 )
 
 
 # The order is the historical model-bound tool order. A module/collection is
-# resolved only when its surface is selected; in particular the coding modules
-# must not be imported by a core-only policy or tool inventory.
+# resolved only when its surface is selected.
 _RUNTIME_SURFACES = {
     "default": (
         ("mimir.tools.chainlink", "chainlink_issue_show"),
@@ -486,16 +390,11 @@ _RUNTIME_SURFACES = {
         ("mimir.tools.extra", "file_search rebuild_index mimir_get_turn get_turn shell_exec"),
         ("mimir.tools.shell_async", "bash_async bash_jobs_list bash_job_output"),
         ("mimir.tools.operator_alert", "operator_alert"),
-        ("mimir.tools.registry", "send_message react fetch_channel_history list_channels defer_injected_message list_schedules add_schedule set_schedule_cron set_schedule_priority remove_schedule set_poller_overrides reload_pollers commitment_complete commitment_snooze commitment_dismiss commitment_list commitment_propose_closure worklink_run worklink_resume request_mimir_update"),
+        ("mimir.tools.registry", "send_message react fetch_channel_history list_channels defer_injected_message list_schedules add_schedule set_schedule_cron set_schedule_priority remove_schedule set_poller_overrides reload_pollers commitment_complete commitment_snooze commitment_dismiss commitment_list commitment_propose_closure request_mimir_update"),
         ("mimir.tools.client_provider:HANDS_TOOLS", "hands_read hands_edit hands_shell hands_python hands_request_scope"),
     ),
     "web_search": (("mimir.tools.web", "web_search"),),
     "fetch_url": (("mimir.tools.web", "fetch_url"),),
-    "coding": (
-        ("mimir.tools.registry", "spawn_open_code"),
-        ("mimir.tools.forge:FORGE_TOOLS", "pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests pr_submit_review pr_inline_review_comment pr_comment pr_edit_body issue_comment pr_rerequest_review unsupported_operation"),
-        ("mimir.tools.repo:REPO_TOOLS", "repo_checkout repo_cleanup repo_fetch repo_status repo_test repo_diff repo_unmerged repo_stage repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push"),
-    ),
 }
 
 
@@ -515,7 +414,9 @@ def _tool_factory(module_path: str, name: str):
     return materialize
 
 
-def register_core_tools(registry: PolicyRegistry) -> None:
+def register_core_tools(
+    registry: PolicyRegistry, *, selected_owners: frozenset[str] = frozenset(),
+) -> None:
     """Register core tool policy and lazy runtime factories."""
     from mimir.tool_descriptors import _CORE_DESCRIPTOR_DECLARATIONS, ResultOriginKind
 
@@ -557,18 +458,12 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             ("acp_hands_result_tools", _ACP_HANDS_RESULTS),
             ("fixed_service_sinks", _FIXED_SERVICE_SINKS),
             ("taint_independent_egress", _TAINT_INDEPENDENT_EGRESS),
-            ("worklink_build_tools", _WORKLINK_BUILD_TOOLS),
             ("schedule_writes", _SCHEDULE_WRITES),
-            ("repo_publish_tools", _REPO_PUBLISH_TOOLS),
             ("tainted_writes", _TAINTED_WRITES),
             ("tainted_file_writes", _TAINTED_FILE_WRITES),
             ("saga_mutations", _SAGA_MUTATIONS),
-            ("standing_review", _STANDING_REVIEW),
             ("remediation_effect", _REMEDIATION_EFFECT),
             ("typed_error_signal", _TYPED_ERROR_SIGNAL),
-            ("forge_actions", _FORGE_ACTIONS),
-            ("repo_actions", _REPO_ACTIONS),
-            ("retained_repo_tools", _RETAINED_REPO_TOOLS),
         ):
             if name in names:
                 memberships.add(member)
@@ -594,7 +489,6 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             read_backend=name in _READ_BACKEND,
             readable_domain=readable_domains.get(name),
             memberships=memberships,
-            typed_action=_FORGE_ACTIONS.get(name, _REPO_ACTIONS.get(name)),
         )
 
     # Framework aliases and native operations without descriptors still require
@@ -617,18 +511,12 @@ def register_core_tools(registry: PolicyRegistry) -> None:
         for member, names in (
             ("fixed_service_sinks", _FIXED_SERVICE_SINKS),
             ("taint_independent_egress", _TAINT_INDEPENDENT_EGRESS),
-            ("worklink_build_tools", _WORKLINK_BUILD_TOOLS),
             ("schedule_writes", _SCHEDULE_WRITES),
-            ("repo_publish_tools", _REPO_PUBLISH_TOOLS),
             ("tainted_writes", _TAINTED_WRITES),
             ("tainted_file_writes", _TAINTED_FILE_WRITES),
             ("saga_mutations", _SAGA_MUTATIONS),
-            ("standing_review", _STANDING_REVIEW),
             ("remediation_effect", _REMEDIATION_EFFECT),
             ("typed_error_signal", _TYPED_ERROR_SIGNAL),
-            ("forge_actions", _FORGE_ACTIONS),
-            ("repo_actions", _REPO_ACTIONS),
-            ("retained_repo_tools", _RETAINED_REPO_TOOLS),
         ):
             if name in names:
                 memberships.add(member)
@@ -642,7 +530,6 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             writes_code_or_state=name in _WRITES_CODE_OR_STATE, profiles=(), read_backend=name in _READ_BACKEND,
             readable_domain=readable_domains.get(name),
             memberships=memberships,
-            typed_action=_FORGE_ACTIONS.get(name, _REPO_ACTIONS.get(name)),
         )
 
     # Native file-write aliases have no core descriptor or flow declaration, but
@@ -665,11 +552,9 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             )
     for name, capabilities in _PROFILES.items():
         registry.register_authority_profile(
-            name, capabilities=capabilities, bounded_capabilities=_BOUNDS.get(name, ()),
-            capability_companions=(
-                {"worklink_run": _names("read_file ls shell_exec")}
-                if name == "heartbeat" else {}
-            ),
+            name, capabilities=capabilities,
+            bounded_capabilities=_BOUNDS.get(name, ()),
+            capability_companions={},
             scheduler=name == "heartbeat", fetch_url_policy=_FETCH.get(name),
             pr_review_scope=name == "heartbeat",
             builtin_trigger_config=_TRIGGERS.get(name),
@@ -678,7 +563,6 @@ def register_core_tools(registry: PolicyRegistry) -> None:
         registry.register_shell_profile_mapping(profile, shell)
     registry.register_operator_shell_profile("scheduler_read_only")
     register_core_principals(registry)
-    register_core_poller_properties(registry)
 
 
 def register_core_principals(registry: PolicyRegistry) -> None:
@@ -686,19 +570,17 @@ def register_core_principals(registry: PolicyRegistry) -> None:
     registry.register_service_principal(ServicePrincipal(
         canonical="scheduler", trigger="scheduled_tick",
         capabilities=tuple("""send_message operator_alert shell_exec bash_async bash_jobs_list
-            bash_job_output spawn_open_code task saga_forget write_file edit_file
-            replace_file open_proposal submit_proposal abandon_proposal worklink_run
+             bash_job_output task saga_forget write_file edit_file
+             replace_file open_proposal submit_proposal abandon_proposal
             read_file aread ls als glob aglob grep agrep file_search get_turn
             mimir_get_turn list_schedules""".split()),
         readable_domains=("configured_inputs", "filesystem", "turn_history", "shell_jobs", "schedule_metadata"),
-        sink_destinations=("configured_channel", "message", "notification", "filesystem", "shell_process", "spawn_process", "proposal", "saga", "worklink"),
+        sink_destinations=("configured_channel", "message", "notification", "filesystem", "shell_process", "proposal", "saga"),
         sink_policies=(
             *(ServiceSinkPolicy(name, "static_service_write_roots", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS")
               for name in ("write_file", "edit_file", "replace_file")),
             ServiceSinkPolicy("shell_exec", "shell_profile", "maintenance"),
             ServiceSinkPolicy("bash_async", "shell_profile", "maintenance"),
-            ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
-            ServiceSinkPolicy("worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"),
             ServiceSinkPolicy("operator_alert", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL"),
         ),
         saga_full_corpus_read=True, creation_path="mimir.scheduler.Scheduler._fire_job",

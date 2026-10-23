@@ -53,7 +53,7 @@ from .dashboard_extensions import (
     add_plugin_routes,
     first_party_dashboard_extensions,
 )
-from .event_logger import log_durable_event_sync, safe_log_event
+from .event_logger import safe_log_event
 from .harness_egress import harness_sink_allowed
 from .chainlink_board import (
     build_chainlink_board_payload,
@@ -101,17 +101,6 @@ from .wiki_backlinks import (
 
 log = logging.getLogger(__name__)
 
-
-def load_factory_record(home: Path, run_id: str):
-    from .worklink.factory_state import load_factory_record as load
-
-    return load(home, run_id)
-
-
-def factory_process_is_verified_dead(record: Any) -> bool:
-    from .worklink.factory_state import factory_process_is_verified_dead as is_dead
-
-    return is_dead(record)
 
 _TURN_VIEWER_HTML: str | None = None
 _WEB_AUTH_JS: str | None = None
@@ -1011,14 +1000,6 @@ def register_routes(
     Enabled manifests drive optional backend namespace hook registration; this
     is not a remote plugin loading mechanism."""
 
-    from .worklink.backends.feature_factory import _RUN_ID as _FACTORY_RUN_ID_RE
-    from .worklink.factory_state import (
-        FactoryRunRecord,
-        FactoryRecordError,
-        archive_factory_record,
-        list_factory_records,
-    )
-
     # Seed the agent-owned UI config on startup so there's a discoverable file
     # for the agent to edit (its name + skin).
     ensure_web_ui_config(home)
@@ -1726,123 +1707,6 @@ def register_routes(
         )
         return json_success(payload)
 
-    def _list_factory_runs() -> list[dict[str, Any]]:
-        if home is None:
-            return []
-        try:
-            records = list_factory_records(home).records
-        except FactoryRecordError:
-            return []
-        return [_serialize_factory_run_summary(record) for record in records[:1000]]
-
-    def _serialize_factory_run_summary(record: FactoryRunRecord) -> dict[str, Any]:
-        state = record.status
-        result: dict[str, Any] = {
-            "run_id": record.run_id,
-            "clearable": factory_process_is_verified_dead(record),
-            "issue_key": (state.issue_key if state is not None else None) or str(record.issue_id),
-            "valid": state.valid if state is not None else False,
-            "sandbox_path": record.sandbox,
-            "status": state.status if state is not None else None,
-            "mode": state.mode if state is not None else "autonomous",
-            "branch": record.branch,
-            "pr_base": record.base_ref,
-            "pr_draft": state.pr_draft if state is not None else True,
-            "lock": state.lock if state is not None else "absent",
-            "dead_lock": state.dead_lock if state is not None else False,
-            "lock_session": state.lock_session if state is not None else record.session,
-            "pr_url": state.pr_url if state is not None else None,
-            "controller_phase": record.controller_phase,
-            "observed_at": record.observed_at,
-            "controller_error": record.controller_error,
-        }
-        if state is not None and state.next_present:
-            result["next"] = state.next
-        return result
-
-    def _serialize_factory_run_detail(record: FactoryRunRecord) -> dict[str, Any]:
-        result = _serialize_factory_run_summary(record)
-        state = record.status
-        result["gates"] = state.gates if state is not None and state.gates is not None else {}
-        # Keep the dashboard's display-string contract; retained status stays structured.
-        result["steps"] = [
-            f"{row['agent']}:{row['status']}({row['attempts']})"
-            for row in (state.steps or ())
-        ] if state is not None else []
-        result["slices"] = [
-            f"{row['id']}:{row['status']}({row['attempts']})"
-            for row in (state.slices or ())
-        ] if state is not None else []
-        result["validator"] = (
-            state.validator["verdict"] if state is not None and state.validator is not None else None
-        )
-        result["terminal_result"] = (
-            state.terminal_result if state is not None else None
-        )
-        return result
-
-    async def factory_runs_list_v1(_request: web.Request) -> web.Response:
-        """GET /api/v1/factory-runs — list all factory runs."""
-        runs = await asyncio.to_thread(_list_factory_runs)
-        return json_success(
-            {"runs": runs},
-            meta=list_meta(cursor=None, limit=None, total=len(runs), truncated=False),
-        )
-
-    def _factory_run_for_request(request: web.Request) -> FactoryRunRecord | web.Response:
-        run_id = request.match_info.get("run_id", "").strip()
-        if not run_id:
-            return json_error("missing_run_id", "run_id is required", status=400)
-        if not _FACTORY_RUN_ID_RE.fullmatch(run_id) or ".." in run_id:
-            return json_error("invalid_run_id", "run_id is invalid", status=400)
-
-        if home is None:
-            return json_error("home_not_configured", "home path not configured", status=503)
-        try:
-            record = load_factory_record(home, run_id)
-        except FactoryRecordError:
-            return json_error("run_invalid", "factory run record is malformed", status=400)
-        if record is None:
-            return json_error("run_not_found", f"factory run not found: {run_id}", status=404)
-        return record
-
-    async def factory_runs_detail_v1(request: web.Request) -> web.Response:
-        """GET /api/v1/factory-runs/{run_id} — get a specific factory run."""
-        record = _factory_run_for_request(request)
-        if isinstance(record, web.Response):
-            return record
-        return json_success(_serialize_factory_run_detail(record))
-
-    async def factory_runs_archive_v1(request: web.Request) -> web.Response:
-        record = _factory_run_for_request(request)
-        if isinstance(record, web.Response):
-            return record
-        try:
-            body = await request.json()
-        except (ValueError, UnicodeDecodeError):
-            return json_error("invalid_reason", "reason must be a nonempty string", status=400)
-        reason = body.get("reason") if isinstance(body, dict) else None
-        if not isinstance(reason, str) or not reason.strip():
-            return json_error("invalid_reason", "reason must be a nonempty string", status=400)
-        if not factory_process_is_verified_dead(record):
-            return json_error(
-                "run_not_verified_dead", "cannot prove factory process is dead", status=409,
-            )
-        identity = request.get("auth_identity")
-        operator = identity.canonical if identity is not None else (
-            "master" if request.get("auth_is_master") else "anonymous"
-        )
-        try:
-            await asyncio.to_thread(
-                archive_factory_record, home, record,
-                event_logger=log_durable_event_sync,
-                source_kind="web_ui",
-                reason=f"web archive by {operator}: {reason.strip()}",
-            )
-        except FactoryRecordError:
-            return json_error("run_archive_failed", "factory run could not be archived", status=500)
-        return json_success({"run_id": record.run_id, "archived": True})
-
     async def chainlink_board_data_v1(request: web.Request) -> web.Response:
         try:
             offset = int(request.query.get("offset", "0"))
@@ -1858,6 +1722,11 @@ def register_routes(
             status=request.query.get("status", ""),
             priority=request.query.get("priority", ""),
             show_completed=completed == "true",
+            evidence_provider=next(
+                (hook for (owner, name), hook in manager.policy.server_hooks.items()
+                 if name == "chainlink_board" and owner in {plugin.candidate.name for plugin in manager.plugins}),
+                None,
+            ) if manager is not None else None,
         )
         return json_success(payload)
 
@@ -2564,13 +2433,6 @@ def register_routes(
             DashboardBackendRoute("GET", "/api/v1/chainlink-board/artifact", chainlink_board_artifact_v1),
         ]
 
-    def factory_runs_backend_routes() -> list[DashboardBackendRoute]:
-        return [
-            DashboardBackendRoute("GET", "/api/v1/factory-runs", factory_runs_list_v1),
-            DashboardBackendRoute("POST", "/api/v1/factory-runs/{run_id:.*}/archive", factory_runs_archive_v1),
-            DashboardBackendRoute("GET", "/api/v1/factory-runs/{run_id:.*}", factory_runs_detail_v1),
-        ]
-
     def scheduler_backend_routes() -> list[DashboardBackendRoute]:
         return [
             DashboardBackendRoute("GET", "/api/v1/scheduler", scheduler_data_v1),
@@ -2605,7 +2467,6 @@ def register_routes(
         hooks={
             "ops": ops_backend_routes,
             "chainlink-board": chainlink_board_backend_routes,
-            "factory-runs": factory_runs_backend_routes,
             "scheduler": scheduler_backend_routes,
             "admin-config": admin_config_backend_routes,
             "admin-users": admin_users_backend_routes,

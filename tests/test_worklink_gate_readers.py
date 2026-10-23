@@ -6,7 +6,25 @@ from pathlib import Path
 
 import pytest
 
-from mimir.worklink import evidence as ev
+from tests.plugin_selection import cultivate_selected
+
+from mimir.plugins.core import policy_scope
+from mimir.plugins.manager import load_plugins
+
+pytestmark = pytest.mark.usefixtures("selected_cultivate")
+
+
+@pytest.fixture
+def selected_cultivate(monkeypatch):
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield
+
+
+if not cultivate_selected():
+    pytest.skip("Cultivate gate readers require selected provider", allow_module_level=True)
+
+ev = pytest.importorskip("mimir_cultivate.worklink.evidence")
 
 
 @pytest.mark.parametrize("reader", ["junit", "lastfailed", "nodeids"])

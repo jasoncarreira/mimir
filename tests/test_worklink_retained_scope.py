@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import fcntl
+import importlib.util
 import os
 from pathlib import Path
 import stat
@@ -12,27 +13,33 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from mimir import access_control as ac
-from mimir.contained_execution import CollectedExecutionResult
-from mimir.models import RetainedFactoryScope
-from mimir.project_tests import ProjectTestResult, RepoProjectTests
 from mimir.readonly_backend import RetainedCheckoutFilesystemBackend
-from mimir.worklink.compute import LaunchHandle
-from mimir.worklink.backends.feature_factory import FactoryStatus
-from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
-from mimir.worklink.factory_state import (
-    FactoryRunRecord,
-    factory_issue_resource_lock,
-    save_factory_record,
-)
-from mimir.worklink.retained_scope import (
-    derive_retained_factory_scope,
-    retained_factory_effect_lease,
-)
+from mimir.plugins.core import core_policy_registry, policy_scope
+from mimir.plugins.manager import load_plugins
+if importlib.util.find_spec("mimir_cultivate") is not None:
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    from mimir_cultivate.policy import RetainedFactoryScope
+    from mimir_cultivate.worklink.compute import LaunchHandle
+    from mimir_cultivate.worklink.backends.feature_factory import FactoryStatus
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+    from mimir_cultivate.worklink.factory_state import (
+        FactoryRunRecord, factory_issue_resource_lock, save_factory_record,
+    )
+    from mimir_cultivate.worklink.retained_scope import (
+        derive_retained_factory_scope, retained_factory_effect_lease,
+    )
 
 
 @pytest.fixture
 def retained_incident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from mimir.worklink import worker_client
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        pytest.skip("requires installed Cultivate")
+    from mimir_cultivate.worklink import worker_client
+    provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
 
     home = tmp_path / "home"
     root = tmp_path / "worklink"
@@ -41,6 +48,7 @@ def retained_incident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     sandbox.mkdir(parents=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setattr(provider_worker_client, "WORKLINK_CHECKOUT_ROOT", root)
     incident = record_failure(
         dispatch_failure_state_dir(home), issue_id=1810, attempt=1,
         exit_status=1, error="factory failed", log_path="run.log",
@@ -69,10 +77,27 @@ def retained_incident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     service = SimpleNamespace(
         canonical="poller:worklink-ready-queue", trigger="poller", authority_profile="github",
     )
-    return SimpleNamespace(
+    case = SimpleNamespace(
         home=home, root=root, sandbox=sandbox, record=record,
         incident=incident, item=item, event=event, service=service,
     )
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        yield case
+
+
+def test_retained_write_refuses_without_selected_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = RetainedCheckoutFilesystemBackend(tmp_path)
+    target = tmp_path / "file.txt"
+    monkeypatch.setattr(
+        backend, "_binding",
+        lambda _path: (SimpleNamespace(), SimpleNamespace(sandbox=str(tmp_path)), target),
+    )
+    with policy_scope(core_policy_registry()):
+        assert backend.write(str(target), "content").error == (
+            "retained factory checkout provider is unavailable"
+        )
 
 
 def test_scope_is_exact_ephemeral_and_current(retained_incident) -> None:
@@ -108,20 +133,22 @@ def test_retained_file_effects_are_in_all_central_policy_inventories() -> None:
 
 
 def test_worklink_resume_is_exact_spawn_capability() -> None:
+    pytest.importorskip("mimir_cultivate")
     from mimir.tools import budget_gate
 
-    assert ac.get_sink_category("worklink_resume") is ac.SinkCategory.SPAWN
-    assert ac.get_tool_flow_direction("worklink_resume") is ac.ToolFlowDirection.BOTH
-    assert ac.TRIGGER_CAPABILITY_TIERS["worklink_resume"] is ac.CapabilityTier.CODE_EXECUTION
-    assert "worklink_resume" in budget_gate._REMEDIATION_EFFECT_TOOLS
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        assert ac.get_sink_category("worklink_resume") is ac.SinkCategory.SPAWN
+        assert ac.get_tool_flow_direction("worklink_resume") is ac.ToolFlowDirection.BOTH
+        assert ac.TRIGGER_CAPABILITY_TIERS["worklink_resume"] is ac.CapabilityTier.CODE_EXECUTION
+        assert "worklink_resume" in budget_gate._REMEDIATION_EFFECT_TOOLS
 
 
 @pytest.mark.asyncio
 async def test_worklink_resume_dispatches_exact_scope_detached(
     retained_incident, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.tools import registry
-    from mimir.worklink import autonomy, detached_dispatch, factory_state
+    from mimir_cultivate.registration import worklink_resume
+    from mimir_cultivate.worklink import autonomy, detached_dispatch, factory_state
 
     case = retained_incident
     scope = derive_retained_factory_scope(case.event, case.service).scope
@@ -147,7 +174,7 @@ async def test_worklink_resume_dispatches_exact_scope_detached(
         ),
     )
 
-    output = await registry.worklink_resume.coroutine(runtime=_retained_runtime(scope))
+    output = await worklink_resume.coroutine(runtime=_retained_runtime(scope))
 
     assert "recovery dispatched" in output
     assert "run_id=chainlink-1810" in output
@@ -162,8 +189,9 @@ async def test_worklink_resume_dispatches_exact_scope_detached(
 
 @pytest.mark.asyncio
 async def test_worklink_resume_refuses_leaf_without_launch(monkeypatch: pytest.MonkeyPatch) -> None:
-    from mimir.tools import registry
-    from mimir.worklink import detached_dispatch
+    pytest.importorskip("mimir_cultivate")
+    from mimir_cultivate.registration import worklink_resume
+    from mimir_cultivate.worklink import detached_dispatch
 
     monkeypatch.setattr(
         detached_dispatch, "launch_detached_worklink",
@@ -173,7 +201,7 @@ async def test_worklink_resume_refuses_leaf_without_launch(monkeypatch: pytest.M
         retained_factory_scope=None,
         retained_factory_scope_refusal="incident is not a retained factory run",
     ))
-    output = await registry.worklink_resume.coroutine(runtime=runtime)
+    output = await worklink_resume.coroutine(runtime=runtime)
     assert "refused" in output
     assert "leaf incidents must be diagnosed and reported" in output
 
@@ -199,8 +227,8 @@ async def test_worklink_resume_refuses_leaf_without_launch(monkeypatch: pytest.M
 async def test_worklink_resume_preflight_refuses_changed_state_without_launch(
     retained_incident, monkeypatch: pytest.MonkeyPatch, mutation: str, reason: str,
 ) -> None:
-    from mimir.tools import registry
-    from mimir.worklink import autonomy, detached_dispatch, dispatch_failures, factory_state
+    from mimir_cultivate.registration import worklink_resume
+    from mimir_cultivate.worklink import autonomy, detached_dispatch, dispatch_failures, factory_state
 
     case = retained_incident
     scope = derive_retained_factory_scope(case.event, case.service).scope
@@ -257,13 +285,16 @@ async def test_worklink_resume_preflight_refuses_changed_state_without_launch(
     launch = Mock(side_effect=AssertionError("refused recovery launched"))
     monkeypatch.setattr(detached_dispatch, "launch_detached_worklink", launch)
 
-    output = await registry.worklink_resume.coroutine(runtime=_retained_runtime(scope))
+    output = await worklink_resume.coroutine(runtime=_retained_runtime(scope))
 
     assert reason in output
     launch.assert_not_called()
 
 
 def test_central_policy_grants_only_five_retained_repo_tools(retained_incident) -> None:
+    from mimir.plugins.core import selected_policy_registry
+
+    selected = selected_policy_registry()
     scope = derive_retained_factory_scope(
         retained_incident.event, retained_incident.service,
     ).scope
@@ -275,10 +306,10 @@ def test_central_policy_grants_only_five_retained_repo_tools(retained_incident) 
         canonical="poller:worklink-ready-queue", trigger="poller",
         profile="github", tier=ac.CapabilityTier.CODE_EXECUTION,
         capabilities=tuple(sorted(allowed)), creation_path="test",
-        policy=ac.core_policy_registry(),
+        policy=selected, poller_owner="cultivate",
     )
     assert service.worklink_retained_checkout is True
-    for tool in ac._REPO_TOOL_ACTIONS:
+    for tool in (name for name in selected.tools if name.startswith("repo_")):
         decision = ac.authorize_repo_pr_tool(
             tool, scope, service_principal=service, enforce=True,
             flow_direction=ac.get_tool_flow_direction(tool),
@@ -291,7 +322,7 @@ def test_central_policy_grants_only_five_retained_repo_tools(retained_incident) 
         canonical="poller:other", trigger="poller",
         profile="github", tier=ac.CapabilityTier.CODE_EXECUTION,
         capabilities=tuple(sorted(allowed)), creation_path="test",
-        policy=ac.core_policy_registry(),
+        policy=selected, poller_owner="cultivate",
     )
     assert wrong_service.worklink_retained_checkout is False
     missing_property = replace(service, worklink_retained_checkout=False)
@@ -365,7 +396,7 @@ def test_effect_lease_revalidates_and_refuses_busy_resource(
     scope = derive_retained_factory_scope(case.event, case.service).scope
     assert scope is not None
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
     )
     with retained_factory_effect_lease(case.home, scope) as lease:
         assert lease.scope == scope
@@ -423,10 +454,10 @@ def test_session_lock_reconciliation_fails_closed(
     }
     status.update(changes)
     monkeypatch.setattr(
-        "mimir.worklink.backends.feature_factory.FeatureFactoryBackend.status",
+        "mimir_cultivate.worklink.backends.feature_factory.FeatureFactoryBackend.status",
         lambda *args, **kwargs: SimpleNamespace(**status),
     )
-    from mimir.worklink.retained_scope import _factory_session_lock_is_fresh
+    from mimir_cultivate.worklink.retained_scope import _factory_session_lock_is_fresh
 
     with pytest.raises(RuntimeError, match="status identity changed"):
         _factory_session_lock_is_fresh(case.record)
@@ -444,7 +475,10 @@ def test_retained_backend_dispatches_file_effects_under_lease(
         backend, "_binding", lambda _path: (SimpleNamespace(), scope, target),
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
     )
     calls: list[tuple[str, str, dict[str, object]]] = []
 
@@ -457,7 +491,7 @@ def test_retained_backend_dispatches_file_effects_under_lease(
             }
 
     monkeypatch.setattr(
-        "mimir.worklink.worker_client.WorkerClient.for_factory_checkout",
+        "mimir_cultivate.worklink.worker_client.WorkerClient.for_factory_checkout",
         lambda *args, **kwargs: Client(),
     )
     assert backend.write(str(target), "new\n").error is None
@@ -483,7 +517,7 @@ async def test_retained_replace_shrink_guard_and_override(
     async_path: bool, existing: int, new: int, refused: bool,
 ) -> None:
     from mimir.readonly_backend import _replace_shrink_error
-    from mimir.worklink.worker_exec import _run_factory_file_child
+    from mimir_cultivate.worklink.worker_exec import _run_factory_file_child
 
     case = retained_incident
     scope = derive_retained_factory_scope(case.event, case.service).scope
@@ -498,7 +532,10 @@ async def test_retained_replace_shrink_guard_and_override(
         backend, "_binding", lambda _path: (SimpleNamespace(), scope, target),
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
     )
     monkeypatch.chdir(case.sandbox.parents[1])
     calls = []
@@ -513,7 +550,7 @@ async def test_retained_replace_shrink_guard_and_override(
             })
 
     monkeypatch.setattr(
-        "mimir.worklink.worker_client.WorkerClient.for_factory_checkout",
+        "mimir_cultivate.worklink.worker_client.WorkerClient.for_factory_checkout",
         lambda *args, **kwargs: Client(),
     )
     if async_path:
@@ -551,15 +588,15 @@ def test_effect_lease_refuses_operation_time_races(
     scope = derive_retained_factory_scope(case.event, case.service).scope
     assert scope is not None
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh",
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
         lambda _record: race == "fresh",
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope.factory_process_is_alive",
+        "mimir_cultivate.worklink.retained_scope.factory_process_is_alive",
         lambda _record: race == "alive",
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope.factory_process_is_verified_dead",
+        "mimir_cultivate.worklink.retained_scope.factory_process_is_verified_dead",
         lambda _record: race != "unverifiable",
     )
     if race == "stale":
@@ -574,7 +611,7 @@ def test_effect_lease_refuses_operation_time_races(
         save_factory_record(case.home, replace(case.record, run_id="1810"))
 
     if race == "interlock":
-        from mimir.worklink.factory_state import factory_checkout_interlock
+        from mimir_cultivate.worklink.factory_state import factory_checkout_interlock
 
         outer = factory_checkout_interlock(case.home, pruning=True)
     else:
@@ -605,22 +642,31 @@ async def test_each_retained_effect_refuses_operation_time_race_without_mutation
     race: str,
 ) -> None:
     """Every mutating seam reacquires the exact lease before its downstream effect."""
-    from mimir.tools import repo as repo_module
-    from mimir.worklink import worker_client
+    from mimir_cultivate import repository as repo_module
+    from mimir_cultivate.worklink import worker_client
 
     case = retained_incident
     _initialize_retained_repository(case)
     scope = derive_retained_factory_scope(case.event, case.service).scope
     assert scope is not None
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope.factory_process_is_alive",
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.worklink.retained_scope.factory_process_is_alive",
         lambda _record: race == "live",
     )
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope.factory_process_is_verified_dead", lambda _record: True,
+        "mimir_cultivate.worklink.retained_scope.factory_process_is_alive", lambda _record: race == "live",
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.worklink.retained_scope.factory_process_is_verified_dead", lambda _record: True,
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.worklink.retained_scope.factory_process_is_verified_dead", lambda _record: True,
     )
     if race == "replaced":
         save_factory_record(case.home, replace(case.record, branch="replacement"))
@@ -641,10 +687,12 @@ async def test_each_retained_effect_refuses_operation_time_race_without_mutation
     project_test = AsyncMock(side_effect=AssertionError("refused effect launched tests"))
     monkeypatch.setattr(worker_client, "run_factory_control", owner_rpc)
     monkeypatch.setattr(worker_client.WorkerClient, "for_factory_checkout", file_rpc)
+    provider_worker_client = pytest.importorskip("mimir_cultivate.worklink.worker_client")
+    monkeypatch.setattr(provider_worker_client.WorkerClient, "for_factory_checkout", file_rpc)
     monkeypatch.setattr(repo_module.RepoProjectTests, "execute", project_test)
 
     if race == "interlock":
-        from mimir.worklink.factory_state import factory_checkout_interlock
+        from mimir_cultivate.worklink.factory_state import factory_checkout_interlock
 
         outer = factory_checkout_interlock(case.home, pruning=True)
     else:
@@ -702,6 +750,7 @@ async def test_each_retained_effect_refuses_operation_time_race_without_mutation
 def test_resource_lock_hardening_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe: str,
 ) -> None:
+    pytest.importorskip("mimir_cultivate", reason="factory issue locking belongs to Cultivate")
     if unsafe == "ancestor":
         target = tmp_path / "target"
         target.mkdir()
@@ -743,8 +792,7 @@ def test_resource_lock_hardening_fails_closed(
                 return SimpleNamespace(**values)
             return value
 
-        from mimir.worklink import factory_state
-
+        from mimir_cultivate.worklink import factory_state
         monkeypatch.setattr(factory_state.os, "fstat", foreign_owner)
     with factory_issue_resource_lock(tmp_path, 1810) as acquired:
         assert acquired is False
@@ -783,8 +831,8 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
     retained_incident, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-    from mimir.tools import repo as repo_module
-    from mimir.worklink import worker_client
+    from mimir_cultivate import repository as repo_module
+    from mimir_cultivate.worklink import worker_client
 
     case = retained_incident
     _initialize_retained_repository(case)
@@ -794,7 +842,11 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
     scope = derive_retained_factory_scope(case.event, case.service).scope
     assert scope is not None
     monkeypatch.setattr(
-        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+    )
+    monkeypatch.setattr(
+        "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
+        lambda _record: False,
     )
     calls: list[tuple[str, ...]] = []
 
@@ -809,6 +861,9 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
         )
 
     monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
+    from mimir_cultivate.worklink import worker_client as provider_worker_client
+
+    monkeypatch.setattr(provider_worker_client, "run_factory_control", owner_control)
     runtime = _retained_runtime(scope)
     marker = case.sandbox / "controller-executed"
     helper = case.sandbox / "malicious.sh"
@@ -830,6 +885,8 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
     assert "+after" in diff["stdout"]
 
     async def passing_test(self, selectors, *, suite):
+        from mimir_cultivate.repository import ProjectTestResult
+
         assert self._retained_scope == scope
         return ProjectTestResult(True, "tests_passed", 0)
 
@@ -863,8 +920,9 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
 async def test_retained_repo_test_runs_source_git_through_owner_control(
     retained_incident, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import contained_checkout, contained_snapshot, project_tests
-    from mimir.worklink import worker_client
+    from mimir import contained_snapshot
+    from mimir_cultivate import contained_checkout, repository as project_tests
+    from mimir_cultivate.worklink import worker_client
 
     case = retained_incident
     _initialize_retained_repository(case)
@@ -929,6 +987,8 @@ async def test_retained_repo_test_runs_source_git_through_owner_control(
         assert stat.S_IMODE(capability.path.parent.stat().st_mode) == 0o700
         return CollectedExecutionResult(0, b"passed", b"", False, False, 0, 0)
 
+    from mimir_cultivate.repository import RepoProjectTests
+
     result = await RepoProjectTests(retained_scope=scope, runner=runner).execute()
 
     assert result.ok is True
@@ -949,7 +1009,7 @@ async def test_retained_repo_test_runs_source_git_through_owner_control(
 async def test_retained_repo_test_excludes_only_factory_control_plane(
     retained_incident, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import project_tests
+    from mimir_cultivate import repository as project_tests
 
     case = retained_incident
     _initialize_retained_repository(case)
@@ -981,6 +1041,8 @@ async def test_retained_repo_test_excludes_only_factory_control_plane(
         return CollectedExecutionResult(0, b"passed", b"", False, False, 0, 0)
 
     monkeypatch.setattr(project_tests, "RepoGitTools", GitTools)
+    from mimir_cultivate.repository import RepoProjectTests
+
     result = await RepoProjectTests(
         retained_scope=scope, runner=runner, checkout_factory=checkout_factory,
     ).execute()
@@ -1007,7 +1069,7 @@ async def test_retained_repo_test_excludes_only_factory_control_plane(
 def test_retained_scope_refuses_excluded_repo_operations(
     retained_incident, monkeypatch: pytest.MonkeyPatch, name: str, arguments: tuple[str, ...],
 ) -> None:
-    from mimir.tools import repo as repo_module
+    from mimir_cultivate import repository as repo_module
 
     case = retained_incident
     scope = derive_retained_factory_scope(case.event, case.service).scope
@@ -1022,8 +1084,8 @@ def test_retained_scope_refuses_excluded_repo_operations(
 async def test_each_retained_repo_operation_refuses_stale_occurrence_before_execution(
     retained_incident, monkeypatch: pytest.MonkeyPatch, operation: str,
 ) -> None:
-    from mimir.tools import repo as repo_module
-    from mimir.worklink import worker_client
+    from mimir_cultivate import repository as repo_module
+    from mimir_cultivate.worklink import worker_client
 
     case = retained_incident
     scope = derive_retained_factory_scope(case.event, case.service).scope
