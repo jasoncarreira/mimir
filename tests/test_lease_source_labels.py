@@ -2338,10 +2338,11 @@ async def test_glob_timeout_in_lease_does_not_veto_edit(
     assert not auth.ifc_state.labels.has_untrusted_active_ingest
 
 
-@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("error_prefix", ["Glob", "glob"], ids=["generic", "timeout-prefix"])
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
 @pytest.mark.asyncio
 async def test_glob_resource_error_in_lease_still_vetoes_edit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, asynchronous: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, asynchronous: bool, error_prefix: str,
 ) -> None:
     from mimir.readonly_backend import MimirFilesystemMiddleware, _RootAwareFilesystemBackend
 
@@ -2350,9 +2351,17 @@ async def test_glob_resource_error_in_lease_still_vetoes_edit(
     checkout, target, _ = _recorded_lease(lease_root)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{checkout}:rw")
-    auth = _auth()
+    auth = replace(_auth(), roles=("admin",))
+    registry = ToolRegistry()
+    edit_args = {"file_path": str(target)}
+    before = registry.authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target), arguments=edit_args,
+    )
+    assert before.allowed, before.reason
     backend = _RootAwareFilesystemBackend(root_dir=checkout, virtual_mode=True)
-    error = f"Glob of '{checkout}' aborted partway: resource text from work.py"
+    # The lowercase variant becomes "Error: glob ..." in the stock tool and
+    # must not be mistaken for its exact, content-free executor timeout.
+    error = f"{error_prefix} of '{checkout}' aborted partway: resource text from work.py"
     monkeypatch.setattr(backend, "glob", lambda *args, **kwargs: GlobResult(error=error))
     tool = next(tool for tool in MimirFilesystemMiddleware(backend=backend).tools
                 if tool.name == "glob")
@@ -2377,10 +2386,15 @@ async def test_glob_resource_error_in_lease_still_vetoes_edit(
         result=message, provenance=provenance, failed=True,
     )
     assert labels is not None and labels.has_untrusted_active_ingest
+    assert len(labels.sources) == 1
+    source = labels.sources[0]
+    assert source.source_kind == "protected_tool"
+    assert source.resource_id == str(checkout)
+    assert source.integrity == "untrusted"
+    assert not source.is_complete
     auth.ifc_state.merge(labels)
-    decision = ToolRegistry().authorize_tool(
-        "edit_file", auth, enforce=True, target_channel=str(target),
-        arguments={"file_path": str(target)},
+    decision = registry.authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target), arguments=edit_args,
     )
     assert not decision.allowed and decision.reason == "write_blocked_by_untrusted_ingest"
 
