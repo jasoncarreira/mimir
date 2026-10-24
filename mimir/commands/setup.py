@@ -885,6 +885,8 @@ def setup_home(
     # caller passes that signal by setting saga_key to None — but for now
     # setup always generates one).
     (home / ".mimir").mkdir(parents=True, exist_ok=True)
+    from ..turn_stores import seed_home_ignore
+    seed_home_ignore(home)
     if _write_if_missing(
         home / "saga.toml",
         _default_saga_toml(home, embedding=embedding),

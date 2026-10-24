@@ -1533,6 +1533,8 @@ async def test_synthesis_only_reads_its_own_successfully_evicted_result(
 
     first = TurnContext("turn-1", "chan-a", "saga_session_end", "chan-a", 0, auth_context=auth)
     second = TurnContext("turn-2", "chan-a", "saga_session_end", "chan-a", 0, auth_context=auth)
+    first.turn_scratch_path = access_control.ensure_turn_scratch(home, first.turn_id)
+    second.turn_scratch_path = access_control.ensure_turn_scratch(home, second.turn_id)
     content = "large result from mimir_get_turn\n" * 30
     message = ToolMessage(content=content, tool_call_id="call/one", name="mimir_get_turn")
     token = set_current_turn(first)
@@ -1549,9 +1551,9 @@ async def test_synthesis_only_reads_its_own_successfully_evicted_result(
         else:
             processed, evicted = middleware._process_large_message(message, backend)
         assert evicted
-        assert "/large_tool_results/call_one" in str(processed.content)
+        assert "/large_tool_results/turn-1/call_one" in str(processed.content)
         assert first.evicted_tool_result_ids == ["call_one"]
-        own_path = "/large_tool_results/call_one"
+        own_path = "/large_tool_results/turn-1/call_one"
         assert decision("read_file", {"file_path": own_path, "offset": 0, "limit": 50}).allowed
         provenance_token = access_control.begin_protected_result_capture()
         try:
@@ -1563,7 +1565,7 @@ async def test_synthesis_only_reads_its_own_successfully_evicted_result(
         assert result.error is None
         assert content in result.file_data["content"]
         assert provenance is not None and provenance.sources == ()
-        for path in (str(other), str(root), str(nested / "call_one"), "/large_tool_results/other-id"):
+        for path in (str(other), str(root), str(nested / "call_one"), "/large_tool_results/other-id", "/large_tool_results/call_one"):
             denied = decision("read_file", {"file_path": path})
             assert (denied.allowed, denied.reason) == (False, "session_boundary_capability_denied")
         for tool, args in (
@@ -1578,7 +1580,7 @@ async def test_synthesis_only_reads_its_own_successfully_evicted_result(
     token = set_current_turn(second)
     try:
         assert not second.evicted_tool_result_ids
-        denied = decision("read_file", {"file_path": "/large_tool_results/call_one"})
+        denied = decision("read_file", {"file_path": own_path})
         assert (denied.allowed, denied.reason) == (False, "session_boundary_capability_denied")
     finally:
         reset_current_turn(token)

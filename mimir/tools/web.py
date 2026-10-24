@@ -112,7 +112,13 @@ def _fetch_cache_dir() -> Path:
             "it is wired by mimir.runtime.create_agent_runtime(); "
             "build the agent runtime before using fetch tools."
         )
-    return _home / "attachments" / "fetch-cache"
+    from ..turn_stores import turn_store
+
+    prefix = turn_store("attachments/fetch-cache")
+    from .._context import get_current_turn
+    if prefix is None and get_current_turn() is not None:
+        raise RuntimeError("fetch_url requires a valid turn scratch")
+    return _home / prefix.lstrip("/") if prefix else _home / "attachments" / "fetch-cache"
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -735,7 +741,7 @@ async def fetch_url(
                 await _add_pdf_extraction(
                     existing_meta, body_path=body_path, text_path=text_path,
                 )
-            cache_root = cache_dir.parent.parent
+            cache_root = _home
             existing_meta["file_path"] = _virtual_path(body_path, root=cache_root)
             existing_meta["metadata_path"] = _virtual_path(meta_path, root=cache_root)
             extraction = existing_meta.get("pdf_extraction")
