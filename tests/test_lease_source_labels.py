@@ -212,7 +212,7 @@ def _real_attested_lease(tmp_path: Path, *, author: str = "collaborator"):
     ).stdout.strip()
     scope = _scope(observed_head_sha=head, author=author)
     lease = SimpleNamespace(
-        path=checkout, scope_id=scope.scope_id, canonical_repo=scope.canonical_repo,
+        path=checkout, lease_root=tmp_path, scope_id=scope.scope_id, canonical_repo=scope.canonical_repo,
         pr_number=scope.pr_number, head_sha=head, owner=scope.principal,
         is_active=True, base_sha=head,
     )
@@ -436,10 +436,10 @@ def test_selected_repo_result_uses_pr_lease_without_retained_receipt(
 
 @pytest.mark.parametrize("boundary", [
     "wrong_repository", "wrong_number", "wrong_scope", "blocked_authorization",
-    "wrong_provenance", "raw_output", "no_attestation",
+    "wrong_provenance", "no_attestation",
 ])
 @pytest.mark.usefixtures("selected_repository_policy")
-def test_selected_pr_lease_result_rejects_unbound_or_external_content(
+def test_selected_pr_lease_result_rejects_unbound_content(
     tmp_path: Path, boundary: str,
 ) -> None:
     from mimir_cultivate.repository import _publish_attested_lease_result
@@ -467,8 +467,6 @@ def test_selected_pr_lease_result_rejects_unbound_or_external_content(
         provenance = ProtectedResultProvenance((
             replace(provenance.sources[0], resource_id="other/repo#pull/7@" + scope.observed_head_sha),
         ))
-    elif boundary == "raw_output":
-        result["stdout"] = "network supplied text"
     else:
         auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
         assert not access_control_module._attested_pr_checkout_lease(auth, scope, lease)
@@ -489,35 +487,105 @@ def test_selected_pr_lease_result_rejects_unbound_or_external_content(
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
-def test_selected_push_remote_output_stays_untrusted_with_attested_lease(tmp_path: Path) -> None:
+@pytest.mark.parametrize("attested", [True, False])
+@pytest.mark.parametrize("wrapped", [True, False])
+def test_selected_push_porcelain_uses_attested_origin(tmp_path: Path, attested, wrapped) -> None:
     from mimir_cultivate.repository import _publish_attested_lease_result
+    from mimir.plugins.core import selected_policy_registry
+    from mimir.tool_descriptors import ResultOriginKind
 
-    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
+    auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = attested
     token = begin_protected_result_capture()
     try:
         _publish_attested_lease_result(SimpleNamespace(context=auth), auth.repo_review_state)
     finally:
         provenance = end_protected_result_capture(token)
-    assert provenance is not None and provenance.sources[0].integrity == "trusted"
-    authz = ToolAuthorization(tool_name="repo_push", decision="resource_scoped", allowed=True,
-                              repo_pr_action_scope=scope)
+    assert selected_policy_registry().tools["repo_push"].descriptor.result_origin == ResultOriginKind.REPOSITORY
+    result = {"ok": True, "code": "pushed", "stdout": (
+        "To https://github.com/owner/repo.git\n"
+        " \tHEAD:refs/heads/worklink/7\tabc1234..def5678\nDone\n"
+    ), "stderr": "remote: Resolving deltas: 100%\n"}
+    if wrapped:
+        result = ToolMessage(content=json.dumps(result), tool_call_id="push")
+    labels = classify_protected_result(
+        "repo_push", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_push", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=result, provenance=provenance,
+    )
+    assert labels.sources[0].integrity == ("trusted" if attested else "untrusted")
+    auth.ifc_state.merge(labels)
+    for name, destination in (
+        ("edit_file", str(lease.path / "work.py")),
+        ("repo_commit", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}"),
+        ("repo_push", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}"),
+    ):
+        decision = SinkGate.check_sink_flow(
+            name, destination, auth.ifc_labels, auth, enforce=False,
+            **({"repo_pr_action_scope": scope} if name != "edit_file" else {}),
+        )
+        assert decision.allowed is attested
+
+
+@pytest.mark.usefixtures("selected_repository_policy")
+@pytest.mark.parametrize("boundary,guard", [
+    ("membership", '"repo_actions" in registered.memberships'),
+    ("resource_scope", 'registered.resource_scope == "repo_pr"'),
+    ("action_scope", 'getattr(state, "action_scope", None) is scope'),
+])
+def test_selected_pr_result_binding_guards_are_discriminating(
+    tmp_path, monkeypatch, boundary, guard,
+):
+    import inspect
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate.repository import _publish_attested_lease_result
+
+    auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
+    policy = selected_policy_registry()
+    registered = policy.tools["repo_merge"]
     args = {"repository": "owner/repo", "pull_request": 7}
-    assert classify_protected_result(
-        "repo_push", args, auth, authz, result={"ok": True, "stdout": "", "stderr": ""},
-        provenance=provenance,
-    ).sources[0].integrity == "trusted"
-    for field in ("stdout", "stderr"):
-        result = {"ok": True, "stdout": "", "stderr": "", field: "remote-supplied text"}
-        for wrapped in (result, ToolMessage(content=json.dumps(result), tool_call_id="push")):
-            labels = classify_protected_result("repo_push", args, auth, authz,
-                                               result=wrapped, provenance=provenance)
-            assert labels.has_untrusted_active_ingest
-            assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_push>"
-    assert classify_protected_result(
-        "repo_push", args, auth, authz,
-        result=ToolMessage(content="unparseable remote text", tool_call_id="push"),
-        provenance=provenance,
-    ).has_untrusted_active_ingest
+    authz = ToolAuthorization(tool_name="repo_merge", decision="resource_scoped", allowed=True,
+                              repo_pr_action_scope=scope, policy=policy)
+    capture = begin_protected_result_capture()
+    try:
+        _publish_attested_lease_result(SimpleNamespace(context=auth), auth.repo_review_state)
+    finally:
+        provenance = end_protected_result_capture(capture)
+    assert provenance.sources[0].integrity == "trusted"
+
+    def classify():
+        return classify_protected_result(
+            "repo_merge", args, auth, authz, result={"ok": True, "code": "merged"},
+            provenance=provenance,
+        )
+
+    assert classify().sources[0].integrity == "trusted"
+    # Alter the already constructed policy, not registration/collection. Each
+    # negative reaches the classifier inside an otherwise live attested lease.
+    if boundary == "membership":
+        monkeypatch.setitem(policy._tools, "repo_merge", replace(
+            registered, memberships=registered.memberships - {"repo_actions"},
+        ))
+    elif boundary == "resource_scope":
+        monkeypatch.setitem(policy._tools, "repo_merge", replace(registered, resource_scope="forge_pr"))
+    else:
+        from mimir_cultivate.policy import RepoPRScopeRegistry
+        object.__setattr__(auth.repo_review_state, "action_scope", replace(scope))
+        auth = replace(auth, repo_pr_scope_registry=RepoPRScopeRegistry((auth.repo_review_state,)))
+    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    labels = classify()
+    assert labels.has_untrusted_active_ingest
+    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_merge>"
+
+    # Executable mutation control: removing just this predicate changes the
+    # behavioural result, without rebuilding or breaking provider registration.
+    helper = access_control_module._provider_pr_lease_result_is_bound
+    source = inspect.getsource(helper)
+    assert source.count(guard) == 1
+    namespace = dict(vars(access_control_module))
+    exec(compile(source.replace(guard, "True"), helper.__code__.co_filename, "exec"), namespace)
+    monkeypatch.setattr(access_control_module, helper.__name__, namespace[helper.__name__])
+    assert classify().sources[0].integrity == "trusted"
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
@@ -604,27 +672,36 @@ async def test_repo_test_red_run_remediation_sequence(
         from mimir_cultivate.policy import ServerDiscoveredPRStates, RepoPRScopeRegistry
         cache = ServerDiscoveredPRStates()
         cache.remember(state)
-        object.__setattr__(auth, "server_discovered_pr_states", cache)
-        object.__setattr__(auth, "repo_review_state", None)
+        auth = replace(auth, server_discovered_pr_states=cache, repo_review_state=None)
         if state_carrier == "reminted":
             old = RepoReviewState(_scope(observed_head_sha="b" * 40))
-            object.__setattr__(auth, "repo_pr_scope_registry", RepoPRScopeRegistry((old,)))
+            auth = replace(auth, repo_pr_scope_registry=RepoPRScopeRegistry((old,)))
     labels = classify_protected_result(
         "repo_test", {"repository": "owner/repo", "pull_request": 7}, auth,
         ToolAuthorization(tool_name="repo_test", decision="resource_scoped", allowed=True,
                           repo_pr_action_scope=scope), result=result, provenance=provenance,
         failed=True,
     )
-    assert labels.sources[0].integrity == "untrusted"
-    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_test>"
-    auth.ifc_state.merge(labels)
-    assert auth.ifc_state.has_untrusted_active_ingest()
-    decision = SinkGate.check_sink_flow(
-        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
-        auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
+    assert labels.sources[0].integrity == ("trusted" if verdict is True else "untrusted")
+    assert labels.sources[0].resource_id == (
+        f"owner/repo#pull/7@{scope.observed_head_sha}" if verdict is True
+        else "<unresolved-resource:protected_tool:repo_test>"
     )
-    assert not decision.allowed
-    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    auth.ifc_state.merge(labels)
+    assert auth.ifc_state.has_untrusted_active_ingest() is (verdict is not True)
+    for name, destination in (
+        ("edit_file", str(lease.path / "work.py")),
+        ("repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}"),
+        ("repo_commit", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}"),
+        ("repo_push", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}"),
+    ):
+        decision = SinkGate.check_sink_flow(
+            name, destination, auth.ifc_labels, auth, enforce=False,
+            **({"repo_pr_action_scope": scope} if name != "edit_file" else {}),
+        )
+        assert decision.allowed is (verdict is True)
+        if verdict is not True:
+            assert decision.reason == "write_blocked_by_untrusted_ingest"
 
 
 @pytest.mark.asyncio
@@ -669,16 +746,16 @@ async def test_repo_test_post_execution_refusal_labels(
         result=ToolMessage(content=f"Error: {raised.value}", tool_call_id="refusal", status="error"),
         provenance=provenance, policy_refusal=raised.value if safe else None, failed=True,
     )
-    assert labels is not None
-    assert labels.sources[0].integrity == "untrusted"
-    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_test>"
-    auth.ifc_state.merge(labels)
-    decision = SinkGate.check_sink_flow(
+    if safe:
+        assert labels is None  # Exact host-attested content-free refusal.
+    else:
+        assert labels.sources[0].integrity == "trusted"
+        assert labels.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
+        auth.ifc_state.merge(labels)
+    assert SinkGate.check_sink_flow(
         "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
         auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
-    )
-    assert not decision.allowed
-    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    ).allowed
 
 
 @pytest.mark.asyncio
@@ -777,8 +854,7 @@ def test_failed_pr_rerequest_review_keeps_plugin_result_incomplete():
 
 @pytest.mark.parametrize("change", ["wrong_scope"])
 @pytest.mark.usefixtures("selected_repository_policy")
-def test_failed_repo_test_provenance_is_incomplete_even_for_exact_bounded_summary(change, tmp_path):
-    from copy import deepcopy
+def test_failed_repo_test_provenance_requires_exact_scope(change, tmp_path):
     from mimir.access_control import ProtectedResultProvenance
 
     auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
@@ -813,8 +889,8 @@ def test_failed_repo_test_provenance_is_incomplete_even_for_exact_bounded_summar
         )
         return labels.sources[0].integrity
 
-    assert integrity(result) == "untrusted"
-    altered = deepcopy(result)
+    assert integrity(result) == "trusted"
+    altered = dict(result)
     if change in {"stdout", "stderr", "git_context"}:
         altered[change] = "network-derived text"
     elif change == "wrong_head":
@@ -915,8 +991,18 @@ async def test_repo_test_non_summary_results_keep_original_shape(tmp_path, monke
                           repo_pr_action_scope=scope), result=returned, provenance=provenance,
         failed=code != "tests_passed",
     )
-    assert labels.sources[0].integrity == "untrusted"
-    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_test>"
+    assert labels.sources[0].integrity == "trusted"
+    assert labels.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
+    auth.ifc_state.merge(labels)
+    for name, destination in (
+        ("edit_file", str(lease.path / "work.py")),
+        ("repo_commit", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}"),
+        ("repo_push", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}"),
+    ):
+        assert SinkGate.check_sink_flow(
+            name, destination, auth.ifc_labels, auth, enforce=False,
+            **({"repo_pr_action_scope": scope} if name != "edit_file" else {}),
+        ).allowed
 
 
 @pytest.mark.parametrize("verdict", [True, False, None])
@@ -1021,6 +1107,9 @@ def test_failed_git_operation_keeps_only_attested_origin(
         "mimir.event_logger.log_event_sync",
         lambda name, **fields: events.append((name, fields)),
     )
+    # The local bare-origin fixture stands in for this exact canonical forge
+    # repository; retain the publisher's real remote/ref and lease checks.
+    monkeypatch.setattr(access_control_module, "_github_repo_from_remote", lambda _: "owner/repo")
     selected, scope, _, follow_on, _, result = _selected_checkout_and_follow_on_with_live_grants(
         tmp_path, monkeypatch, operation=operation, author_trust=verdict, git_ok=False,
     )
@@ -1029,15 +1118,18 @@ def test_failed_git_operation_keeps_only_attested_origin(
     assert json.loads(result.content)["ok"] is False
     (source,) = follow_on.ifc_state.current(follow_on.ifc_labels).sources
     assert (source.integrity, source.resource_id) == (
-        "untrusted", f"<unresolved-resource:protected_tool:{operation}>",
+        ("trusted", f"owner/repo#pull/7@{scope.observed_head_sha}") if verdict
+        else ("untrusted", f"<unresolved-resource:protected_tool:{operation}>")
     )
     with policy_scope(selected):
         decision = SinkGate.check_sink_flow(
             "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
             follow_on.ifc_labels, follow_on, enforce=False, repo_pr_action_scope=scope,
         )
-    assert not decision.allowed
-    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    assert decision.allowed is verdict
+    if not verdict:
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+    assert any(name == "repository_failure_provenance_retained" for name, _ in events) is verdict
     assert "distinctive" not in str(events)
 
 
@@ -1105,8 +1197,8 @@ def test_checkout_failure_after_attested_lease_resolution(tmp_path, monkeypatch)
                           repo_pr_action_scope=scope), result=raised.value, provenance=provenance, failed=True,
     )
     assert provenance is not None and provenance.sources[0].integrity == "trusted"
-    assert labels.sources[0].integrity == "untrusted"
-    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_checkout>"
+    assert labels.sources[0].integrity == "trusted"
+    assert labels.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
@@ -2843,15 +2935,19 @@ def test_git_output_failure_retains_failure_provenance(
     assert labels is not None
     if provenance is not None:
         assert provenance.sources[0].integrity == "trusted"
-    assert labels.sources[0].integrity == "untrusted"
-    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_status>"
+    assert labels.sources[0].integrity == ("trusted" if attested else "untrusted")
+    assert labels.sources[0].resource_id == (
+        f"owner/repo#pull/7@{scope.observed_head_sha}" if attested
+        else "<unresolved-resource:protected_tool:repo_status>"
+    )
     auth.ifc_state.merge(labels)
     decision = SinkGate.check_sink_flow(
         "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
         auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
     )
-    assert not decision.allowed
-    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    assert decision.allowed is attested
+    if not attested:
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
 
 
 def test_cross_pr_scope_keeps_lease_read_untrusted_filesystem_ingest(

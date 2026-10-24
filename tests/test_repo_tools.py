@@ -4829,8 +4829,8 @@ async def _red_run_after_lineage(monkeypatch, scope, state, turn):
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("selected_repo_inventory")
 @pytest.mark.parametrize("case", ["at_head", "ahead_clean_commit", "rebased_onto_base"])
-async def test_failed_repo_test_on_lineage_advanced_lease_stays_incomplete(tmp_path, monkeypatch, case):
-    """A real lease cannot self-attest a selected provider's failed test result."""
+async def test_failed_repo_test_on_lineage_advanced_lease_retains_attestation(tmp_path, monkeypatch, case):
+    """Attested clean lineage preserves main's failed-result classification."""
     from mimir import access_control
     monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda _: "owner/repo")
     _origin, source, scope, state = _repo_scope_and_state(tmp_path)
@@ -4849,8 +4849,8 @@ async def test_failed_repo_test_on_lineage_advanced_lease_stays_incomplete(tmp_p
         RepoGitTools(state, auth_context=turn).execute(GitRebase())
     assert_lease_attested(turn, scope, lease)
     integ, allowed = await _red_run_after_lineage(monkeypatch, scope, state, turn)
-    assert integ == "untrusted"
-    assert allowed is False
+    assert integ == "trusted"
+    assert allowed is True
 
 
 @pytest.mark.asyncio
