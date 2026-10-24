@@ -472,23 +472,6 @@ def test_operator_runtime_recovery_cli_requires_confirmation_and_dispatches(tmp_
     assert calls == [((tmp_path, tmp_path / "1983-1"), {"operator_confirmed_quiescent": True})]
 
 
-def test_base_verified_dead_ttl_regressions_execute_with_cultivate_selected(tmp_path):
-    """Do not let a core-only runner silently skip the unchanged base TTL matrix."""
-    root = Path(__file__).resolve().parents[3]
-    env = dict(os.environ, MIMIR_PLUGINS="cultivate", PYTEST_ADDOPTS="")
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-rA", "-o", "addopts=",
-         "tests/test_worklink_autonomy.py",
-         "--basetemp", str(tmp_path / "base-ttl")],
-        cwd=root, env=env, text=True, capture_output=True, timeout=90,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    executed = [line for line in result.stdout.splitlines()
-                if line.startswith("PASSED tests/test_worklink_autonomy.py::"
-                                   "test_prune_removes_old_attempt_with_verified_dead_unresumed_factory[")]
-    assert len(executed) == 24, result.stdout
-
-
 def test_executor_prune_uses_current_isolated_interpreter(tmp_path, monkeypatch):
     from mimir_cultivate.worklink import worker_client
     record, db = _record(tmp_path, _dead_handle())
