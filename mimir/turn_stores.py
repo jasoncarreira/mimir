@@ -181,7 +181,7 @@ def turn_store(name: str) -> str | None:
         if getattr(ctx, "turn_stores_closed", False):
             return None
         try:
-            fd = _open_directory(Path(home), (*name.split("/"), turn_id), create=True)
+            fd = _open_directory(Path(home).expanduser().resolve(), (*name.split("/"), turn_id), create=True)
             os.close(fd)
         except OSError:
             return None
@@ -255,14 +255,33 @@ def wipe_ci_logs(paths: tuple[Path, ...]) -> None:
 def _sweep_drafts(fd: int) -> None:
     """Walk research subdirectories without following links or deleting metadata."""
     for entry in os.listdir(fd):
-        if entry == "drafts" or entry.endswith("draft.md"):
-            _remove_entry(fd, entry)
-        elif stat.S_ISDIR(os.stat(entry, dir_fd=fd, follow_symlinks=False).st_mode):
-            child = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            try:
-                _sweep_drafts(child)
-            finally:
-                os.close(child)
+        try:
+            if entry == "drafts" or entry.endswith("draft.md"):
+                _remove_entry(fd, entry)
+            elif stat.S_ISDIR(os.stat(entry, dir_fd=fd, follow_symlinks=False).st_mode):
+                child = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                try:
+                    _sweep_drafts(child)
+                finally:
+                    os.close(child)
+        except OSError:
+            log.warning("research_draft_sweep_failed")
+
+
+def _research_poller_names(home: Path) -> set[str]:
+    """Only sweep pollers whose installed manifest grants research proposals."""
+    from .access_control import _is_research_proposal_poller
+    from .pollers import discover_pollers
+
+    names: set[str] = set()
+    for root in (home / "skills", home / ".mimir_builtin_skills"):
+        try:
+            configs = discover_pollers(root, state_root=home / "state/pollers")
+            names.update(config.name for config in configs
+                         if _is_research_proposal_poller(config.authority))
+        except OSError:
+            log.warning("research_poller_discovery_failed")
+    return names
 
 
 def sweep_turn_stores(home: Path) -> None:
@@ -292,42 +311,43 @@ def sweep_turn_stores(home: Path) -> None:
     # CI poller tails from a crashed delivery have no consumer on restart.
     try:
         fd = _open_directory(home, ("state", "pollers", "github-ci-watch", "logs"), create=False)
-    except FileNotFoundError:
-        pass
-    else:
         try:
             for entry in os.listdir(fd):
-                _remove_entry(fd, entry)
+                try:
+                    _remove_entry(fd, entry)
+                except OSError:
+                    log.warning("ci_log_sweep_failed")
         finally:
             os.close(fd)
-    # A process crash has no turn-finally; research poller draft notes are
-    # ephemeral too. Keep cursors, ids, hashes and Worklink diagnostic logs.
-    try:
-        pollers_fd = _open_directory(home, ("state", "pollers"), create=False)
     except FileNotFoundError:
         pass
-    else:
+    except OSError:
+        log.warning("ci_log_sweep_failed")
+    # A process crash has no turn-finally. Restrict draft deletion to installed
+    # research proposal pollers, never an arbitrary poller's drafts directory.
+    for poller in sorted(_research_poller_names(home)):
         try:
-            for poller in os.listdir(pollers_fd):
-                try:
-                    fd = _open_directory(home, ("state", "pollers", poller), create=False)
-                except OSError:
-                    continue
-                try:
-                    _sweep_drafts(fd)
-                finally:
-                    os.close(fd)
-        finally:
-            os.close(pollers_fd)
+            fd = _open_directory(home, ("state", "pollers", poller), create=False)
+            try:
+                _sweep_drafts(fd)
+            finally:
+                os.close(fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning("research_draft_sweep_failed")
     if first_start:
         # Operator-owned Gmail audit records are intentionally not purged.
-        fd = _open_directory(home, (".mimir",), create=True)
         try:
-            marker_fd = os.open(marker.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                0o600, dir_fd=fd)
-            os.close(marker_fd)
+            fd = _open_directory(home, (".mimir",), create=True)
+            try:
+                marker_fd = os.open(marker.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                    0o600, dir_fd=fd)
+                os.close(marker_fd)
+            finally:
+                os.close(fd)
         except FileExistsError:
             pass
-        finally:
-            os.close(fd)
+        except OSError:
+            log.warning("turn_store_marker_failed")
         log.info("turn_store_rollout_purge file_counts=%s", counts)

@@ -1341,6 +1341,9 @@ async def test_build_app_sweeps_crashed_turn_stores_and_seeds_home_ignore(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restart: bool, existing_ignore: bool,
 ) -> None:
     """Exercise real build_app wiring, not direct calls to the cleanup helpers."""
+    from tests.test_turn_content_followups import _install_research_manifest
+
+    _install_research_manifest(tmp_path, "papers")
     marker = tmp_path / ".mimir/turn-stores-v1"
     if restart:
         marker.parent.mkdir(parents=True)
@@ -1407,7 +1410,8 @@ async def test_build_app_sweeps_crashed_turn_stores_and_seeds_home_ignore(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("linked_root", [
     "large_tool_results", "conversation_history", "attachments/fetch-cache",
-    ".mimir/conversation_history_labels",
+    ".mimir/conversation_history_labels", "state/pollers/github-ci-watch/logs",
+    "state/pollers", ".mimir",
 ])
 async def test_build_app_skips_symlinked_store_root_and_continues_startup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1439,7 +1443,8 @@ async def test_build_app_skips_symlinked_store_root_and_continues_startup(
             assert sentinel.read_text() == "must not be swept"
             assert set(external.iterdir()) == {sentinel}
             assert not stale.parent.exists()
-            assert (home / ".mimir/turn-stores-v1").is_file()
+            if linked_root != ".mimir":
+                assert (home / ".mimir/turn-stores-v1").is_file()
             assert "large_tool_results/" in (home / ".ignore").read_text().splitlines()
             assert any(record.name == "mimir.turn_stores" and record.levelno >= logging.WARNING
                        for record in caplog.records)

@@ -61,8 +61,11 @@ cannot be established. Gmail's operator-owned `triage-dropped.jsonl` is preserve
 unchanged. A HOME `.ignore` keeps `rg` from unqualified searches of these roots,
 `logs/`, `messages/` and `state/pollers/`. This also affects the admin file-tool
 `grep` path that uses `rg`; the non-admin Python fallback does not consult `.ignore`.
-Unsafe symlinked stores or `.ignore` are skipped with a warning, not followed or
-allowed to prevent startup. Late tool threads cannot allocate a turn store after
+Unsafe symlinked stores, CI-log/poller containers, rollout-marker containers or
+`.ignore`, and unreadable sweep subdirectories, are skipped with a warning, not
+followed or allowed to prevent startup. Startup draft cleanup is limited to
+installed pollers whose manifests grant research proposal capabilities; arbitrary
+poller `drafts/` directories are preserved. Late tool threads cannot allocate a turn store after
 final cleanup has closed that context; this is not process isolation for already
 open descriptors.
 
@@ -73,7 +76,12 @@ when raw command text names `turns.jsonl`, `events.jsonl`, `chat_history.jsonl`,
 component (including leading `/logs` and `/messages`), or `worklink-ready-queue`.
 Bare prose words `logs` and `messages` do not match. A recursive
 `rg`/`ag`/`grep -r`/`grep -R` from HOME or an ancestor also taints, even with narrow
-operands, pipelines, redirections or bundled grep flags. A cwd inside a named
+operands, pipelines, redirections or bundled grep flags. From a non-HOME cwd,
+explicit HOME/ancestor operands and `$MIMIR_HOME`, `${MIMIR_HOME}`, `$HOME`,
+`${HOME}` or `~` operands (including `cd` before a recursive search) also taint.
+Narrow literal descendants/sibling checkouts do not count as ancestor operands;
+non-recursive grep long options such as `--color` do not enable this rule.
+A cwd inside a named
 content store taints ordinary reads too. Both shell tools resolve omitted cwd
 through the shell default/session cwd helper for classification. The command
 still runs; the existing tainted-turn write veto then applies. Ordinary shell

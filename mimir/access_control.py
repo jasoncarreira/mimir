@@ -11624,7 +11624,10 @@ _SHELL_CONTENT_NAME = re.compile(
     r"|(?<![\w.-])(?:logs|messages)(?=/|\\)"
     r"|/(?:logs|messages)(?=['\"\s/\\]|$)"
 )
-_SHELL_RECURSIVE_SEARCH = re.compile(r"(?<![\w.-])(?:rg|ag|grep\s+-(?:\S*[rR]\S*))(?:\s|$)")
+_SHELL_RECURSIVE_SEARCH = re.compile(
+    r"(?<![\w.-])(?:rg|ag)(?:\s|$)"
+    r"|(?<![\w.-])grep\s+(?:--recursive|-(?=[^-\s])\S*[rR]\S*)(?:\s|$)"
+)
 
 
 def _shell_reads_home_content(arguments: dict[str, Any], *, tool_name: str = "shell_exec") -> bool:
@@ -11665,11 +11668,17 @@ def _shell_reads_home_content(arguments: dict[str, Any], *, tool_name: str = "sh
     # Literal absolute HOME/ancestor operands. Match raw command text, including
     # quoted paths; avoid treating a narrower descendant as a broad search.
     broad_path = any(
-        re.search(r"(?<![\w/.-])" + re.escape(str(parent)) + r"(?=/|['\"\s]|$)", command)
+        re.search(r"(?<![\w/.$~{}-])" + re.escape(str(parent)) + r"/*(?=['\"\s;&|<>]|$)", command)
         for parent in (home, *home.parents) if str(parent) != "/"
-    ) or bool(re.search(r"(?:^|\s)['\"]?/(?:['\"\s]|$)", command))
+    ) or bool(re.search(r"(?:^|\s)['\"]?/(?:['\"\s;&|<>]|$)", command))
+    # Shell HOME spellings are operands even from a checkout cwd. This also
+    # covers `cd $HOME && grep -rn x .`; do not expand arbitrary shell text.
+    variable_home = bool(re.search(
+        r"(?<![\w/.$~-])(?:\$(?:MIMIR_HOME|HOME)(?![\w])|\$\{(?:MIMIR_HOME|HOME)\}|~)"
+        r"/*(?=['\"\s;&|<>]|$)", command,
+    ))
     # Deliberately over-taint narrow operands from HOME rather than parse shell.
-    return broad_path or broad_cwd
+    return broad_path or variable_home or broad_cwd
 
 
 def classify_protected_result(

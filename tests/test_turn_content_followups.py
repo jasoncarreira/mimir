@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,7 +34,19 @@ def test_narrow_search_from_repository_stays_clean(tmp_path, monkeypatch, tool):
     )
 
 
+def _install_research_manifest(home, name):
+    manifest = home / "skills" / name / "pollers.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"pollers": [{
+        "name": name, "command": "python3 poller.py", "cron": "0 * * * *",
+        "authority": {"profile": "research", "tier": "scoped-with-provenance",
+                      "capabilities": ["open_proposal", "submit_proposal"],
+                      "scoped_roots": ["state"]},
+    }]}))
+
+
 def test_startup_sweeps_nested_research_drafts_but_preserves_operator_audit(tmp_path):
+    _install_research_manifest(tmp_path, "arxiv-agent-memory")
     draft = tmp_path / "state/pollers/arxiv-agent-memory/research-123/notes-draft.md"
     draft.parent.mkdir(parents=True)
     draft.write_text("ephemeral")
@@ -73,3 +89,230 @@ async def test_retained_tool_thread_cannot_allocate_after_final_wipe(tmp_path, m
         assert not (tmp_path / "large_tool_results" / ctx.turn_id).exists()
     finally:
         reset_current_turn(ctx_handle)
+
+
+@pytest.mark.parametrize("tool", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize("operand", [
+    "$MIMIR_HOME", '"$MIMIR_HOME"', "${MIMIR_HOME}", '"${MIMIR_HOME}"',
+    "~", "$HOME", "${HOME}", '"$HOME"',
+])
+@pytest.mark.parametrize("cd_first", [False, True])
+def test_workspace_recursive_search_of_home_spellings_taints(
+    tmp_path, monkeypatch, tool, operand, cd_first,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    command = (f"cd {operand} && grep -rn foo ." if cd_first
+               else f"grep -rn foo {operand}")
+    assert _shell_reads_home_content({"command": command, "cwd": str(tmp_path / "checkout")}, tool_name=tool)
+
+
+@pytest.mark.parametrize("target", ["home", ".", "..", "../sibling", "home/src", "home/"])
+def test_absolute_home_operand_distinguishes_ancestors_and_descendants(tmp_path, monkeypatch, target):
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    path = str(tmp_path / target)
+    expected = target in {"home", ".", "..", "home/"}
+    # Normalize only the fixture path, as a shell would do for literal paths.
+    path = str(Path(path).resolve())
+    assert _shell_reads_home_content({"command": f'rg foo "{path}"', "cwd": str(tmp_path / "checkout")}) is expected
+
+
+@pytest.mark.parametrize("command", ["grep --color foo .", "grep --line-number foo ."])
+def test_nonrecursive_grep_long_options_are_not_recursive(tmp_path, monkeypatch, command):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    assert not _shell_reads_home_content({"command": command, "cwd": str(tmp_path)})
+
+
+def test_logs_path_component_independent_of_filename_and_recursion(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    assert _shell_reads_home_content({"command": "cat logs/2026-10-24.log", "cwd": str(tmp_path / "checkout")})
+    assert not _shell_reads_home_content({"command": "echo ordinary logs", "cwd": str(tmp_path / "checkout")})
+
+
+@pytest.mark.parametrize("invalid", ["..", ".", "../other", "a/b", "/absolute", ""])
+def test_wipe_invalid_turn_id_never_enters_destructive_helper(tmp_path, monkeypatch, invalid):
+    from mimir import turn_stores
+
+    keep = tmp_path / "memory/keep.md"
+    keep.parent.mkdir()
+    keep.write_text("operator owned")
+    (tmp_path / "large_tool_results/valid-turn").mkdir(parents=True)
+    calls = []
+
+    def safety_interlock(fd, name):
+        # Even a mutation removing the production guard cannot delete anything.
+        calls.append(name)
+        assert name == "valid-turn", "invalid id reached destructive helper"
+        return 0
+
+    monkeypatch.setattr(turn_stores, "_remove_entry", safety_interlock)
+    wipe_turn_stores(tmp_path, invalid)
+    assert calls == []
+    assert keep.read_text() == "operator owned"
+    wipe_turn_stores(tmp_path, "valid-turn")
+    assert calls == ["valid-turn"]
+
+
+@pytest.mark.parametrize("linked", ["state/pollers/github-ci-watch/logs", "state/pollers", ".mimir"])
+def test_startup_sweep_skips_symlinked_containers(tmp_path, caplog, linked):
+    home, outside = tmp_path / "home", tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    (outside / "keep").write_text("operator")
+    _install_research_manifest(home, "papers")
+    link = home / linked
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+    with caplog.at_level(logging.WARNING, logger="mimir.turn_stores"):
+        sweep_turn_stores(home)
+    assert (outside / "keep").read_text() == "operator"
+    assert link.is_symlink()
+    assert any(record.name == "mimir.turn_stores" for record in caplog.records)
+
+
+@pytest.mark.parametrize("area", ["ci", "research"])
+def test_startup_sweep_permission_error_continues_other_sections(tmp_path, monkeypatch, caplog, area):
+    from mimir import turn_stores
+
+    _install_research_manifest(tmp_path, "papers")
+    root = tmp_path / ("state/pollers/github-ci-watch/logs" if area == "ci" else "state/pollers/papers")
+    blocked = root / "unreadable"
+    blocked.mkdir(parents=True)
+    (blocked / "notes-draft.md").write_text("keep on refusal")
+    real_open = os.open
+    observed = []
+
+    def denied(path, flags, *args, **kwargs):
+        if path == "unreadable":
+            observed.append(path)
+            raise PermissionError("test-owned unreadable child")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(turn_stores.os, "open", denied)
+    with caplog.at_level(logging.WARNING, logger="mimir.turn_stores"):
+        sweep_turn_stores(tmp_path)
+    assert observed
+    assert (blocked / "notes-draft.md").read_text() == "keep on refusal"
+    assert (tmp_path / ".mimir/turn-stores-v1").is_file()
+    assert any(record.name == "mimir.turn_stores" for record in caplog.records)
+
+
+def test_nonresearch_poller_drafts_survive_restart(tmp_path):
+    _install_research_manifest(tmp_path, "papers")
+    paths = [tmp_path / f"state/pollers/{name}/drafts/keep.md"
+             for name in ("papers", "worklink-ready-queue")]
+    for path in paths:
+        path.parent.mkdir(parents=True)
+        path.write_text("draft")
+    sweep_turn_stores(tmp_path)
+    assert not paths[0].exists()
+    assert paths[1].read_text() == "draft"
+
+
+def test_symlinked_home_uses_resolved_turn_store(tmp_path, monkeypatch):
+    home, link = tmp_path / "home", tmp_path / "alias"
+    home.mkdir()
+    link.symlink_to(home, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(link))
+    token = set_current_turn(SimpleNamespace(turn_id="resolved", turn_scratch_path=ensure_turn_scratch(home, "resolved")))
+    try:
+        assert turn_store("large_tool_results") == "/large_tool_results/resolved"
+        assert (home / "large_tool_results/resolved").is_dir()
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_call", [False, True])
+async def test_refused_summary_store_does_not_write_shared_history(tmp_path, monkeypatch, async_call):
+    from deepagents.middleware.summarization import SummarizationMiddleware
+    from langchain_core.messages import HumanMessage
+    from mimir._deepagents_summarization import install_offload_traceback_logging_patch
+    from mimir.readonly_backend import WriteGuardBackend
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only")
+    backend = WriteGuardBackend(tmp_path, ["conversation_history"])
+    install_offload_traceback_logging_patch()
+    middleware = SummarizationMiddleware(model="openai:test", backend=backend)
+    token = set_current_turn(SimpleNamespace(turn_id="refused", turn_scratch_path=None))
+    try:
+        messages = [HumanMessage(content="untrusted content")]
+        pointer = (await middleware._aoffload_to_backend(backend, messages, "session") if async_call
+                   else middleware._offload_to_backend(backend, messages, "session"))
+        assert pointer is None
+        assert not (tmp_path / "conversation_history").exists()
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_call", [False, True])
+async def test_refused_large_result_store_stays_inline_within_turn(tmp_path, monkeypatch, async_call):
+    from langchain_core.messages import ToolMessage
+    from mimir.readonly_backend import MimirFilesystemMiddleware, WriteGuardBackend
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    backend = WriteGuardBackend(tmp_path, ["large_tool_results"])
+    middleware = MimirFilesystemMiddleware(backend=backend, tool_token_limit_before_evict=1)
+    message = ToolMessage(content="untrusted content " * 100, tool_call_id="large")
+    token = set_current_turn(SimpleNamespace(turn_id="refused", turn_scratch_path=None))
+    try:
+        result, evicted = (await middleware._aprocess_large_message(message, backend) if async_call
+                           else middleware._process_large_message(message, backend))
+        assert result is message and not evicted
+        assert not (tmp_path / "large_tool_results").exists()
+    finally:
+        reset_current_turn(token)
+
+
+def test_summary_label_sidecar_is_turn_owned_and_wiped(tmp_path, monkeypatch):
+    from mimir import _deepagents_summarization as offload
+    from mimir.models import InformationFlowLabels, SourceLabel
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    source = SourceLabel(principal="operator", domain="test", resource_id="fixture",
+                         bridge_instance="test", sensitivity="internal",
+                         authorized_principals=frozenset({"operator"}),
+                         integrity="trusted", integrity_effect="informational")
+    labels = InformationFlowLabels(sources=(source,))
+    ctx = SimpleNamespace(turn_id="labels-turn", auth_context=SimpleNamespace(ifc_labels=labels))
+    token = set_current_turn(ctx)
+    try:
+        path = tmp_path / "conversation_history/labels-turn/session.md"
+        path.parent.mkdir(parents=True)
+        path.write_text("summary")
+        offload._record_offload(str(path), None, None, hashlib.sha256(path.read_bytes()).hexdigest())
+        sidecars = list((tmp_path / ".mimir/conversation_history_labels").rglob("*.json"))
+        assert len(sidecars) == 1
+        assert sidecars[0].parent == tmp_path / ".mimir/conversation_history_labels/labels-turn"
+        assert offload.read_offload_labels(str(path)) == (source,)
+        wipe_turn_stores(tmp_path, ctx.turn_id)
+        assert not sidecars[0].exists() and not path.exists()
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory", "fifo"])
+def test_ci_log_delivery_skips_nonregular_files(tmp_path, kind):
+    from mimir.turn_stores import move_ci_logs_to_turn
+
+    source = tmp_path / "state/pollers/github-ci-watch/logs/42-101.log"
+    source.parent.mkdir(parents=True)
+    keep = tmp_path / "keep"
+    keep.write_text("operator")
+    if kind == "symlink":
+        source.symlink_to(keep)
+    elif kind == "directory":
+        source.mkdir()
+    else:
+        os.mkfifo(source)
+    mode = source.lstat().st_mode
+    scratch = ensure_turn_scratch(tmp_path, "ci-consumer")
+    content = f"Read CI log: {source}"
+    event = SimpleNamespace(service_principal="poller:github-ci-watch", content=content)
+    assert move_ci_logs_to_turn(tmp_path, event, scratch) == ()
+    assert source.lstat().st_mode == mode
+    assert event.content == content
+    assert keep.read_text() == "operator"
+    assert not list((scratch / "ci-logs").iterdir())
