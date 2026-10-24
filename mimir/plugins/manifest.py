@@ -18,7 +18,7 @@ from packaging.version import InvalidVersion, Version
 
 PLUGIN_NAME = re.compile(r"[a-z][a-z0-9-]*\Z")
 _FIELDS = frozenset({"name", "version", "license", "requires_mimir"})
-_RESERVED = frozenset({"dockerfile", "themes", "frontend", "defaults", "config"})
+_RESERVED = frozenset({"dockerfile", "themes", "frontend", "defaults", "optional", "config"})
 _SKIN_TOKENS = frozenset("--mimir-" + token for token in (
     "color-text color-text-muted color-background color-chrome-background color-chrome-border "
     "color-chrome-accent color-chrome-accent-text color-panel-background color-panel-background-muted "
@@ -56,6 +56,7 @@ class PluginManifest:
     frontend: Mapping[str, Any] = field(default_factory=dict)
     defaults: Mapping[str, Any] = field(default_factory=dict)
     config: Mapping[str, Any] = field(default_factory=dict)
+    optional_skills: tuple[tuple[str, str | None], ...] = ()
 
 
 def _resource(value: str, *, key: str, root: Path | None, files: frozenset[Path] | None,
@@ -287,6 +288,26 @@ def parse_manifest(data: bytes, *, entry_name: str, resource_root: Path | None =
             for path in _strings(defaults.get(key, []), f"defaults.{key}"):
                 _resource(path, key=f"defaults.{key}", root=resource_root, files=distribution_files,
                           directory=key == "skills")
+    optional = _table(raw, "optional", {"skills"})
+    entries = optional.get("skills", [])
+    if not isinstance(entries, list):
+        raise PluginManifestError("optional.skills: expected an array of skill tables")
+    optional_skills: list[tuple[str, str | None]] = []
+    seen = {Path(path).name for path in defaults.get("skills", [])}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.keys() - {"path", "forge"} or "path" not in entry:
+            raise PluginManifestError("optional.skills: expected path and optional forge only")
+        path = _resource(entry["path"], key="optional.skills.path", root=resource_root,
+                         files=distribution_files, directory=True)
+        forge = entry.get("forge")
+        if forge is not None and (not isinstance(forge, str) or not PLUGIN_NAME.fullmatch(forge)):
+            raise PluginManifestError("optional.skills.forge: invalid forge tag")
+        if Path(path).name in seen:
+            raise PluginManifestError(f"optional.skills: duplicate skill name {Path(path).name!r}")
+        seen.add(Path(path).name)
+        optional_skills.append((path, forge))
+    if len(seen) != len(defaults.get("skills", [])) + len(optional_skills):
+        raise PluginManifestError("defaults.skills: duplicate skill name")
     config = _table(raw, "config", set(raw.get("config", {})) if isinstance(raw.get("config", {}), dict) else set())
     prefix = f"MIMIR_PLUGIN_{entry_name.upper().replace('-', '_')}_"
     for key, definition in config.items():
@@ -298,4 +319,4 @@ def parse_manifest(data: bytes, *, entry_name: str, resource_root: Path | None =
             raise PluginManifestError(f"config: invalid schema for {key}")
     return PluginManifest(*(raw[key] for key in ("name", "version", "license", "requires_mimir")),
                           MappingProxyType(docker), themes, tuple(skin_defaults), MappingProxyType(frontend),
-                          MappingProxyType(defaults), MappingProxyType(config))
+                           MappingProxyType(defaults), MappingProxyType(config), tuple(optional_skills))

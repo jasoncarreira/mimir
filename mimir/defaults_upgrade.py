@@ -520,6 +520,14 @@ def check_and_open_plugin_defaults_upgrade(
         safe_destination(home, VENDOR_WORKTREE_REL)
         safe_destination(home, Path("scratch") / "proposals" / "upgrade")
         files = plugin_default_files(candidate)
+        # Keep installed optionals represented in the package vendor baseline.
+        # This does not migrate skills: proposal worktrees currently cover only
+        # core memory and prompts. Absent optionals must not enter the baseline.
+        for directory, _forge in manifest.optional_skills:
+            rel = Path("skills") / f"{name}-{Path(directory).name}"
+            installed = safe_destination(home, rel)
+            if installed.is_dir():
+                files.update(plugin_default_files(candidate, skill=Path(directory).name))
         vendor = _ensure_vendor_branch(home, branch=branch, version=version, files=files)
         if vendor.error:
             results[name] = DefaultsUpgradeResult(False, "error", version, vendor.error)

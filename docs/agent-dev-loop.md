@@ -171,15 +171,15 @@ uv run --no-sync mimir setup --home ~/agents/my-agent                # add --mod
 sed -i.bak -E 's#^(db_path|metrics_db_path) = ".*/\.mimir/#\1 = "/mimir-home/.mimir/#' ~/agents/my-agent/saga.toml
 ```
 
-**2. Seed the Cultivate skills that run the loop.** With Cultivate installed
-from the checkout and `MIMIR_PLUGINS=cultivate` exported by the operator, `mimir setup`
-seeds the provider's packaged defaults into
-`<home>/skills/cultivate-chainlink-orchestrator/` and
-`<home>/skills/cultivate-github-poller/`. Selected-provider startup also seeds
-missing defaults. Do not use `mimir skills install` for these names: that command
-searches core optional skills, not Cultivate's packaged defaults. Check the
-seeded skills and their `pollers.json` before starting the agent. Existing home
-files are not overwritten; later versions use defaults-upgrade proposals.
+**2. Install the Cultivate skills that run the loop.** With Cultivate installed
+from the checkout and `MIMIR_PLUGINS=cultivate` exported by the operator, setup
+and startup seed the forge-neutral defaults (including
+`<home>/skills/cultivate-chainlink-orchestrator/`). GitHub skills are optional:
+run `mimir skills install --forge github --home ~/agents/my-agent`, or install
+one with `mimir skills install cultivate:github-poller --home ~/agents/my-agent`.
+Inspect available skills with `mimir skills list-optional`. Existing home files
+are preserved; use `--restore` to back up and replace a modified skill. Backups
+live outside loader roots in `<home>/.mimir/plugin-skill-backups/`.
 
 - **`worklink-ready-queue`** reads `chainlink issue ready`, claims issues labelled `worklink:ready`, and starts `mimir worklink run <id> --autonomous` for each. It needs `WORKLINK_REPO` set; see the skill's `pollers.json`.
 - **`github-activity`** turns reviews, CI failures and merge conflicts on the bot's own PRs into agent turns. A `CHANGES_REQUESTED` review produces a fix and a push, then a re-requested review.

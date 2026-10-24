@@ -38,9 +38,9 @@ Vulnerabilities).
    go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.4.0
    ```
 
-2. **Copy the skill to your agent home:**
+2. **Install the skill to your agent home:**
    ```bash
-   cp -r mimir/optional-skills/dependency-advisory-watch <home>/skills/
+   mimir skills install dependency-advisory-watch --home <home>
    ```
 
 3. **Configure (optional):**

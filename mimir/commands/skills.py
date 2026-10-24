@@ -47,9 +47,7 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     skills_list_opt_p = skills_sub.add_parser(
         "list-optional",
         help=(
-            "List skills available for opt-in install (walks "
-            "mimir/optional-skills/). Use `mimir skills install <name>` "
-            "to copy one into an agent home."
+            "List core optional skills and selected plugins' default and optional skills."
         ),
     )
     _skill_install.add_argparse_list_optional(skills_list_opt_p)
@@ -68,8 +66,8 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     skills_install_p = skills_sub.add_parser(
         "install",
         help=(
-            "Install an opt-in skill from optional-skills/ into an agent "
-            "home's skills/. Pollers (skills with pollers.json) "
+            "Install a core skill or selected plugin skill (<plugin>:<skill>, or --forge). "
+            "Pollers (skills with pollers.json) "
             "register on next `reload_pollers` or `mimir run` boot."
         ),
     )

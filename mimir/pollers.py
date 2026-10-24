@@ -1203,7 +1203,8 @@ def _is_selected_cultivate_default(manifest_path: Path, policy: PolicyRegistry) 
     if len(root_files) != 1:
         return False
     root = Path(dist.locate_file(root_files[0])).parent.resolve()
-    declared = {Path(directory) for directory in candidate.manifest.defaults.get("skills", ())}
+    declared = {Path(directory) for directory in (*candidate.manifest.defaults.get("skills", ()),
+                                                  *(path for path, _ in candidate.manifest.optional_skills))}
     for file in dist.files:
         if (file.name != "pollers.json"
                 or not file.parent.is_relative_to(root_files[0].parent)
@@ -1863,8 +1864,11 @@ def discover_pollers(
         root = Path(dist.locate_file(manifest_files[0])).parent.resolve()
         defaults = (candidate.manifest.defaults or {}) if candidate.name == "cultivate" else {}
         declared_skills = {
-            Path(directory) for directory in defaults.get("skills", ())
+            Path(directory) for directory in (*defaults.get("skills", ()),
+                                            *(path for path, _ in candidate.manifest.optional_skills))
         } if candidate.name == "cultivate" else set()
+        optional_skills = ({Path(path) for path, _ in candidate.manifest.optional_skills}
+                           if candidate.name == "cultivate" else set())
         for file in dist.files:
             if file.name != "pollers.json":
                 continue
@@ -1882,6 +1886,14 @@ def discover_pollers(
                     or not valid_skill
                     or not path.is_file()):
                 raise ValueError(f"plugin {candidate.name!r}: invalid skill poller resource {path}")
+            # Fresh homes do not opt in merely by selecting the distribution.
+            # Existing seeds retain the packaged fallback and manifest-only
+            # takeover used before defaults became optional. Whole-tree identity
+            # still governs the home copy's authority at dispatch time.
+            if skill in optional_skills:
+                installed = skills_dir / f"{candidate.name}-{skill.name}" / "pollers.json"
+                if installed not in manifests:
+                    continue
             if path in manifests:
                 raise ValueError(f"plugin poller resource collision: {path}")
             manifests[path] = candidate.name

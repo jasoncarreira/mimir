@@ -12,10 +12,14 @@ css = "frontend/cultivate.v1.css"
 [defaults]
 version = "0.9.10"
 skills = [
-  "defaults/skills/github-poller",
-  "defaults/skills/github-ci-watch",
   "defaults/skills/chainlink-orchestrator",
   "defaults/skills/worklink-tool-pins",
-  "defaults/skills/github",
-  "defaults/skills/review",
+]
+
+[optional]
+skills = [
+  { path = "defaults/skills/github-poller", forge = "github" },
+  { path = "defaults/skills/github-ci-watch", forge = "github" },
+  { path = "defaults/skills/github", forge = "github" },
+  { path = "defaults/skills/review", forge = "github" },
 ]

@@ -1233,6 +1233,8 @@ def build_app(config: Config) -> web.Application:
     seed_plugin_defaults(
         config.home, selected=config.plugin_manager.policy.selected_plugin_candidates,
     )
+    from .plugins.skills import log_optional_hint
+    log_optional_hint(config.home, config.plugin_manager.policy.selected_plugin_candidates, log)
     # Refresh reference docs on upgrade: rewrite docs still present in
     # <home>/docs/ to the shipped version, seed docs new in this release, and
     # leave operator-deleted ones deleted. No-ops unless the version changed

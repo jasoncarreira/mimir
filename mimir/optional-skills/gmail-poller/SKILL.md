@@ -34,10 +34,10 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
    add `--services gmail,calendar,...` if other skills use the same
    credentials.
 
-3. **Copy the skill into mimir's home:**
+3. **Install the skill into mimir's home:**
 
    ```
-   cp -r mimir/optional-skills/gmail-poller <home>/skills/
+   mimir skills install gmail-poller --home <home>
    ```
 
 4. **Configure accounts** — pick ONE of the two modes:

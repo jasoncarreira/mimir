@@ -145,6 +145,16 @@ def test_selected_installed_cultivate_seeded_pollers_reload(tmp_path, monkeypatc
         "github-ci-watch": "github-ci-watch",
         "worklink-ready-queue": "chainlink-orchestrator",
     }
+    # Optional GitHub pollers are not started from the package alone.
+    assert {p.name for p in installed} == {"worklink-ready-queue", "worklink-tool-pins"}
+    from mimir.plugins.skills import PluginSkill, install_skill
+    home.mkdir()
+    candidate = selected.selected_plugin_candidates[0]
+    for path, forge in candidate.manifest.optional_skills:
+        if Path(path).name in {"github-poller", "github-ci-watch"}:
+            install_skill(home, PluginSkill(candidate, Path(path).name, forge, False))
+    seed_plugin_defaults(home, selected=selected.selected_plugin_candidates)
+    installed = discover_pollers(home / "skills", policy=selected)
     assert set(shipped) <= {p.name for p in installed}
     for name in shipped:
         manifest = next(p.manifest_path for p in installed if p.name == name)
@@ -163,7 +173,8 @@ def test_selected_installed_cultivate_seeded_pollers_reload(tmp_path, monkeypatc
     package_files = [Path("mimir-plugin.toml")]
     for skill in shipped.values():
         relative = Path("defaults/skills") / skill / "pollers.json"
-        source = next(p.manifest_path for p in installed if p.skill_dir.name == skill)
+        source = next(p.manifest_path for p in installed
+                      if p.skill_dir.name in {skill, f"cultivate-{skill}"})
         target = package_root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source.read_bytes())
@@ -227,9 +238,7 @@ def test_selected_installed_cultivate_seeded_pollers_reload(tmp_path, monkeypatc
         seeded.write_bytes(original + b" ")
         invalid = []
         fallback = discover_pollers(home / "skills", policy=selected, invalid_entries=invalid)
-        assert next(p for p in fallback if p.name == name).manifest_path == (
-            next(p.manifest_path for p in installed if p.name == name)
-        )
+        assert next(p for p in fallback if p.name == name).manifest_path != seeded
         assert any(entry[0] == seeded and "reserved" in entry[2] for entry in invalid)
         seeded.write_bytes(original)
     assert set(shipped).isdisjoint(p.name for p in discover_pollers(
@@ -265,8 +274,15 @@ handler.emit = records.append
 logging.getLogger("mimir.pollers").addHandler(handler)
 if mode == "seed":
     from mimir.plugins.defaults import seed_plugin_defaults
+    from dataclasses import replace
     manager = load_plugins(enable="cultivate")
-    seed_plugin_defaults(home, selected=manager.policy.selected_plugin_candidates)
+    candidate, = manager.policy.selected_plugin_candidates
+    old = replace(candidate, manifest=replace(candidate.manifest, defaults={
+        **candidate.manifest.defaults,
+        "skills": [*candidate.manifest.defaults["skills"],
+                   *(path for path, _ in candidate.manifest.optional_skills)],
+    }, optional_skills=()))
+    seed_plugin_defaults(home, selected=(old,))
     for skill in seeded.values():
         assert (home / "skills" / skill / "pollers.json").is_file(), skill
     sys.exit(0)
