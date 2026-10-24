@@ -843,6 +843,132 @@ def test_executor_rejects_mismatched_launch_protocol_identity() -> None:
         worker_exec._handle_launch(object(), request, [-1, -1, -1])
 
 
+def test_leaf_git_environment_trusts_only_the_validated_checkout(tmp_path: Path) -> None:
+    checkout = tmp_path / "issued"
+    env = {"PATH": "/usr/bin:/bin"}
+    worker_exec._leaf_git_environment(env, checkout)
+    assert env == {
+        "PATH": "/usr/bin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": str(checkout),
+    }
+
+
+@pytest.mark.parametrize("name,value", [
+    ("GIT_CONFIG", "/tmp/hostile-config"),
+    ("GIT_CONFIG_COUNT", "2"),
+    ("GIT_CONFIG_KEY_1", "safe.directory"),
+    ("GIT_CONFIG_PARAMETERS", "'safe.directory=*'"),
+    ("GIT_CONFIG_GLOBAL", "/tmp/hostile-config"),
+])
+def test_leaf_git_environment_rejects_supplied_git_config(
+    tmp_path: Path, name: str, value: str,
+) -> None:
+    env = {name: value}
+    with pytest.raises(RuntimeError, match="assigned by the executor"):
+        worker_exec._leaf_git_environment(env, tmp_path / "issued")
+    assert env == {name: value}
+
+
+@pytest.mark.parametrize("operation,git_config", [
+    pytest.param("launch_factory", {}, id="factory-no-credentials"),
+    pytest.param("launch_factory", {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "!controller-credential-helper",
+    }, id="factory-controller-credentials"),
+    pytest.param("launch_path", {}, id="leaf-executor-config"),
+    *[
+        pytest.param("launch_path", {name: value}, id=f"leaf-refuses-{name}")
+        for name, value in [
+            ("GIT_CONFIG", "/caller/config"),
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_1", "safe.directory"),
+            ("GIT_CONFIG_VALUE_1", "*"),
+            ("GIT_CONFIG_PARAMETERS", "'safe.directory=*'"),
+            ("GIT_CONFIG_GLOBAL", "/caller/config"),
+            ("GIT_CONFIG_NOSYSTEM", "0"),
+        ]
+    ],
+])
+def test_path_launch_git_environment_at_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    operation: str, git_config: dict[str, str],
+) -> None:
+    """Exercise real launch wiring without root, Linux uid drops, or a child."""
+    checkout = tmp_path / "issued"
+    checkout.mkdir()
+    identifier = str(uuid.uuid4())
+    supplied = {"PATH": "/usr/bin:/bin", "CUSTOM": "preserved", **git_config}
+    request = {
+        "version": 1, "op": operation,
+        "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+        "id": identifier, "issue": 41, "attempt": 2,
+        "path": str(checkout), "run_uid": worker_exec.get_identities().worklink_uid,
+        "argv": ["worker"], "env": supplied.copy(), "projections": [],
+        "timeout_s": 5, "stdout_limit": 4096, "stderr_limit": 4096,
+    }
+    homes = tmp_path / "homes"
+    homes.mkdir()
+    monkeypatch.setattr(worker_exec, "HOME_ROOT", homes)
+    leaf_open = Mock(side_effect=lambda _request: os.open(checkout, os.O_RDONLY | os.O_DIRECTORY))
+    factory_open = Mock(side_effect=lambda _request, **_kw: os.open(checkout, os.O_RDONLY | os.O_DIRECTORY))
+    monkeypatch.setattr(worker_exec, "_open_path_checkout", leaf_open)
+    monkeypatch.setattr(worker_exec, "_open_factory_checkout", factory_open)
+    monkeypatch.setattr(worker_exec.os, "chown", lambda *args: None)
+    monkeypatch.setattr(worker_exec, "_execution_checkout_fd", lambda _cmd, fd, _home, **_kw: os.dup(fd))
+    # Only the supervisor transport is stubbed; _handle_launch and the Git
+    # environment helper remain real. No platform-specific socket is needed.
+    monkeypatch.setattr(worker_exec.socket, "socketpair", lambda *args: (
+        Mock(fileno=Mock(return_value=123)), Mock(fileno=Mock(return_value=124)),
+    ))
+    spawned = []
+
+    def spawn(_command, **kwargs):
+        spawned.append(kwargs["env"].copy())
+        return SimpleNamespace(pid=123, returncode=0)
+
+    def wait(proc, *args):
+        if isinstance(proc, worker_exec._FactoryProcess):
+            proc.done.set()
+        return 0, False, False
+
+    monkeypatch.setattr(worker_exec.subprocess, "Popen", spawn)
+    monkeypatch.setattr(worker_exec, "_wait_with_output_limits", wait)
+    refused = operation == "launch_path" and bool(git_config)
+    with (tmp_path / "stdout").open("w+b") as stdout, (tmp_path / "stderr").open("w+b") as stderr:
+        fds = [stdout.fileno(), stderr.fileno()]
+        try:
+            if refused:
+                with pytest.raises(RuntimeError, match="assigned by the executor"):
+                    worker_exec._handle_launch(Mock(), request, fds)
+                assert spawned == []
+            else:
+                worker_exec._handle_launch(Mock(), request, fds)
+                expected = {**supplied, "HOME": str(homes / identifier)}
+                if operation == "launch_path":
+                    expected.update({
+                        "GIT_CONFIG_NOSYSTEM": "1",
+                        "GIT_CONFIG_GLOBAL": os.devnull,
+                        "GIT_CONFIG_COUNT": "1",
+                        "GIT_CONFIG_KEY_0": "safe.directory",
+                        "GIT_CONFIG_VALUE_0": request["path"],
+                    })
+                assert spawned == [expected]
+        finally:
+            if len(fds) == 3:
+                os.close(fds[0])
+    (leaf_open if operation == "launch_path" else factory_open).assert_called_once()
+    (factory_open if operation == "launch_path" else leaf_open).assert_not_called()
+    assert request["env"] == supplied
+    assert identifier not in worker_exec._jobs
+    assert identifier not in worker_exec._launching
+    assert not (homes / identifier).exists()
+
+
 @pytest.mark.parametrize("operation,handler", [
     ("launch_path", "_handle_launch"),
     ("launch_factory", "_handle_launch_factory"),

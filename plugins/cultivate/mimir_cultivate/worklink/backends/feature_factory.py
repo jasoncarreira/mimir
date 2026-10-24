@@ -18,7 +18,7 @@ from ..compute import ComputeResult, WorkSpec
 from .base import Caps, CheckoutShape, RawResult, WorkOrder
 
 
-FACTORY_VERSION = "0.10.18"
+FACTORY_VERSION = "0.12.1"
 DEFAULT_FACTORY_ENTRYPOINT = "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
 FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("init", ("init",)),
@@ -267,6 +267,29 @@ _NEXT_ACTION_KINDS = frozenset({
     "terminal", "gate", "step", "observe-slice", "blocked-slice",
     "dispatch-slice", "seed-slices", "pr", "complete",
 })
+# Factory 0.12.1 adds `validator.override` (null, or an operator's decision to
+# publish a NO-GO). Records retained before 0.12.1 omit it, so it is optional.
+_STATUS_ROW_OPTIONAL = {"validator": frozenset({"override"})}
+_VALIDATOR_OVERRIDE_FIELDS = frozenset({"reviewed_head", "reason", "session", "at"})
+
+
+def _validator_override(value: object, validator: Mapping[str, Any]) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.keys() != _VALIDATOR_OVERRIDE_FIELDS:
+        raise FactoryContractError(
+            "factory status validator.override must be an object with reviewed_head, reason, session and at"
+        )
+    override = {
+        member: _bounded_text(value[member], f"validator.override.{member}", nullable=False)
+        for member in sorted(_VALIDATOR_OVERRIDE_FIELDS)
+    }
+    # The factory's schema allows an override only on a NO-GO, naming that verdict's head.
+    if validator["verdict"] != "NO-GO":
+        raise FactoryContractError("factory status validator.override requires a NO-GO verdict")
+    if override["reviewed_head"] != validator["reviewed_head"]:
+        raise FactoryContractError("factory status validator.override must name the verdict's reviewed_head")
+    return override
 
 
 def _status_row(value: object, name: str) -> dict[str, Any]:
@@ -286,9 +309,11 @@ def _status_row(value: object, name: str) -> dict[str, Any]:
             result[member] = _bounded_text(item, field_name, nullable=kind == "nullable")
     if name == "validator" and result["verdict"] not in _VALIDATOR_VERDICTS:
         raise FactoryContractError("factory status validator.verdict has an unknown verdict")
+    if name == "validator" and "override" in value:
+        result["override"] = _validator_override(value["override"], result)
     if name == "next_action" and result["kind"] not in _NEXT_ACTION_KINDS:
         raise FactoryContractError("factory status next_action.kind is unknown")
-    extra = value.keys() - _STATUS_ROW_FIELDS[name].keys()
+    extra = value.keys() - _STATUS_ROW_FIELDS[name].keys() - _STATUS_ROW_OPTIONAL.get(name, frozenset())
     if extra:
         raise FactoryContractError(f"factory status {name}.{sorted(extra)[0]} is unknown")
     # Keep the former per-row text budget as well as bounding each member.

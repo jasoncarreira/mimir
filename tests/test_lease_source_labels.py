@@ -1318,7 +1318,7 @@ def test_temporary_forge_guard_mutants_are_killed(tmp_path, monkeypatch, field, 
 
 @pytest.mark.parametrize("tool_name", ["ci_run", "ci_run_jobs", "ci_recent_runs"])
 @pytest.mark.usefixtures("selected_repository_policy")
-def test_plugin_ci_results_require_retained_receipt(monkeypatch, tool_name):
+def test_plugin_ci_results_do_not_reach_retained_receipt_guard(monkeypatch, tool_name):
     import inspect
 
     source = inspect.getsource(access_control_module.classify_protected_result)
@@ -1328,8 +1328,9 @@ def test_plugin_ci_results_require_retained_receipt(monkeypatch, tool_name):
     namespace = dict(vars(access_control_module))
     exec(compile(source, "<retained-receipt-mutant>", "exec"), namespace)
     monkeypatch.setitem(globals(), "classify_protected_result", namespace["classify_protected_result"])
-    with pytest.raises(AssertionError):
-        test_ci_classifier_refuses_nonretained_plugin_provenance(monkeypatch, tool_name, False, None)
+    # The removed CI-specific classifier cannot bypass the generic incomplete
+    # fallback even if the retained-receipt guard is disabled for these tools.
+    test_ci_classifier_refuses_nonretained_plugin_provenance(monkeypatch, tool_name, False, None)
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
