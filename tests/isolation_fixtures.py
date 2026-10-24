@@ -218,8 +218,8 @@ def synthetic_worklink_identities(monkeypatch, request):
     # Every loaded provider binding of the real accessor, including the
     # accessor's own module so call-time ``from .identities import`` sees it.
     if real_accessor is not None:
-        # dict.copy() snapshots under the GIL; list(items()) can raise while
-        # another thread imports a module during fixture setup.
+        # Snapshot in one dict operation: background imports can resize the
+        # live mapping while a Python-level items iterator is being consumed.
         for module_name, module in sys.modules.copy().items():
             if (
                 module_name.startswith("mimir_cultivate.")
