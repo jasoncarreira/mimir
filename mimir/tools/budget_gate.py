@@ -55,6 +55,7 @@ from typing import Annotated, Any, Awaitable, Callable, Union, get_args, get_ori
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import ToolException
+from langgraph.errors import GraphBubbleUp, NodeCancelledError, NodeTimeoutError
 from langgraph.types import Command
 import yaml
 
@@ -2669,6 +2670,7 @@ def _emit_tool_call_sync(
     denied: bool = False,
     arguments: dict[str, Any] | None = None,
     operator_shell_audit: Mapping[str, str] | None = None,
+    exception_class: str | None = None,
 ) -> None:
     payload = {"tool": tool_name, "ok": ok}
     argument_summary = (
@@ -2688,6 +2690,8 @@ def _emit_tool_call_sync(
         )
     if denied:
         payload["denied"] = True
+    if exception_class is not None:
+        payload["exception_class"] = exception_class
     _emit_event_sync("tool_call", **payload)
     if operator_shell_audit is not None and "declared_executable" in operator_shell_audit:
         _emit_event_sync(
@@ -2712,6 +2716,8 @@ def _emit_tool_call_sync(
             )
         if denied:
             error_payload["denied"] = True
+        if exception_class is not None:
+            error_payload["exception_class"] = exception_class
         # The companion ``tool_call(ok=false)`` event owns the dashboard's
         # error numerator. Mark this branch as paired so consumers that read
         # both event types don't double-count the same failed invocation.
@@ -3940,6 +3946,8 @@ def _finish_tool_result(
     call: _PreparedToolCall,
     capture: _ToolExecutionCapture,
     result: ToolMessage | Command,
+    *,
+    exception_class: str | None = None,
 ) -> ToolMessage | Command:
     is_error = _result_is_error(call.tool_name, result)
     if not is_error:
@@ -3966,8 +3974,27 @@ def _finish_tool_result(
         error=_result_error_text(result) if is_error else None,
         arguments=call.arguments,
         operator_shell_audit=call.operator_shell_audit,
+        exception_class=exception_class,
     )
     return result
+
+
+def _task_failure_result(call: _PreparedToolCall, exc: Exception) -> ToolMessage | None:
+    """Keep ordinary subagent failures inside the parent graph, without exposing content."""
+    if call.tool_name != "task" or isinstance(
+        exc, (TimeoutError, GraphBubbleUp, NodeCancelledError, NodeTimeoutError)
+    ):
+        return None
+    from ..quota_pause import is_quota_exhaustion
+
+    if is_quota_exhaustion(exc):
+        return None
+    return ToolMessage(
+        content="Subagent task failed. The parent may continue or try another approach.",
+        tool_call_id=_tool_call_id(call.request),
+        name="task",
+        status="error",
+    )
 
 
 class BudgetGateMiddleware(AgentMiddleware):
@@ -4030,6 +4057,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         if not isinstance(call, _PreparedToolCall):
             return call
         capture = _ToolExecutionCapture()
+        exception_class = None
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
@@ -4046,7 +4074,15 @@ class BudgetGateMiddleware(AgentMiddleware):
             if result is None:
                 result = _soft_live_execution_refusal(call)
             if result is None:
-                result = handler(call.execution_request)
+                try:
+                    result = handler(call.execution_request)
+                except ToolException:
+                    raise
+                except Exception as exc:
+                    result = _task_failure_result(call, exc)
+                    if result is None:
+                        raise
+                    exception_class = type(exc).__name__[:120]
         except ToolException as exc:
             refusal = _finish_tool_exception(call, capture, exc)
             if refusal is None:
@@ -4059,7 +4095,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             raise
         finally:
             _end_tool_execution(capture)
-        return _finish_tool_result(call, capture, result)
+        return _finish_tool_result(call, capture, result, exception_class=exception_class)
 
     async def awrap_tool_call(
         self,
@@ -4126,6 +4162,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             if privacy_refusal is not None:
                 return _tool_call_refusal(call, privacy_refusal, arguments=None)
         capture = _ToolExecutionCapture()
+        exception_class = None
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
@@ -4144,7 +4181,15 @@ class BudgetGateMiddleware(AgentMiddleware):
             if result is None:
                 result = _soft_live_execution_refusal(call)
             if result is None:
-                result = await handler(call.execution_request)
+                try:
+                    result = await handler(call.execution_request)
+                except ToolException:
+                    raise
+                except Exception as exc:
+                    result = _task_failure_result(call, exc)
+                    if result is None:
+                        raise
+                    exception_class = type(exc).__name__[:120]
         except ToolException as exc:
             refusal = _finish_tool_exception(call, capture, exc)
             if refusal is None:
@@ -4157,4 +4202,4 @@ class BudgetGateMiddleware(AgentMiddleware):
             raise
         finally:
             _end_tool_execution(capture)
-        return _finish_tool_result(call, capture, result)
+        return _finish_tool_result(call, capture, result, exception_class=exception_class)

@@ -1412,6 +1412,86 @@ async def test_submit_proposal_wipes_real_draft_only_on_success_before_turn_ends
     assert not draft.exists()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_after_failure", [False, True])
+async def test_failed_subagent_returns_to_parent_and_finishes_turn(tmp_path, cancel_after_failure):
+    """A real task dispatch must not unwind the parent graph on empty-stream failure."""
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+    from mimir.readonly_backend import WriteGuardBackend
+
+    seen_errors = []
+    second_subagent_started = asyncio.Event()
+
+    class ParentModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            errors = [m for m in messages if isinstance(m, ToolMessage) and m.name == "task"]
+            if errors:
+                seen_errors.extend(errors)
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    class BrokenSubagent(GenericFakeChatModel):
+        attempts: int = 0
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+            self.attempts += 1
+            if self.attempts > 1:
+                second_subagent_started.set()
+                await asyncio.Future()
+            raise ValueError("No generations found in stream. private prompt and output")
+
+    def delegate(call_id):
+        return AIMessage(content="", tool_calls=[{
+            "name": "task", "args": {"description": "private prompt and output",
+                                      "subagent_type": "stub"}, "id": call_id,
+        }])
+
+    parent_model = ParentModel(disable_streaming=True, messages=iter(
+        [delegate("task-failure"),
+         delegate("task-cancel") if cancel_after_failure else AIMessage(content="parent recovered")]
+    ))
+    backend = WriteGuardBackend(root_dir=tmp_path, writable_dirs=["state"])
+    graph = create_deep_agent(
+        model=parent_model, tools=[], backend=backend,
+        middleware=[BudgetGateMiddleware()],
+        subagents=[{"name": "stub", "description": "stub", "system_prompt": "stub",
+                    "model": BrokenSubagent(disable_streaming=True, messages=iter([])), "tools": []}],
+    )
+    agent = _build_agent(tmp_path, fake_agent=graph)
+    agent._identity_resolver = _resolver(agent._config.home, """people:
+  - canonical: operator
+    aliases: [discord-99]
+    access: {roles: [admin]}
+""")
+    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="delegate",
+                       author="discord-99", source="discord")
+    if cancel_after_failure:
+        running = asyncio.create_task(agent.run_turn(event))
+        await asyncio.wait_for(second_subagent_started.wait(), HANG_GUARD_SECONDS)
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(running, HANG_GUARD_SECONDS)
+    else:
+        record = await agent.run_turn(event)
+        assert record.error is None
+        assert "parent recovered" in record.output
+    assert len(seen_errors) == 1
+    assert seen_errors[0].status == "error"
+    assert seen_errors[0].tool_call_id == "task-failure"
+    assert "private prompt and output" not in str(seen_errors[0].content)
+    task_errors = [event for event in _read_events(tmp_path)
+                   if event.get("type") == "tool_error" and event.get("tool") == "task"]
+    assert len(task_errors) == 1
+    assert task_errors[0]["exception_class"] == "ValueError"
+
+
 @pytest.mark.parametrize("trigger", ["user_message", "saga_session_end"])
 async def test_turn_creates_scratch_before_model_and_advertises_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trigger: str,

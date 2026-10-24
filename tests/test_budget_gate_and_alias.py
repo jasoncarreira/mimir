@@ -37,6 +37,7 @@ import yaml
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import ToolException
+from langgraph.errors import GraphBubbleUp, NodeCancelledError, NodeTimeoutError
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
@@ -166,6 +167,118 @@ def _make_request(
         state=None,
         runtime=Runtime(context=auth_context),
     )
+
+
+@pytest.mark.asyncio
+async def test_task_model_failure_returns_content_free_error_and_counts_it(monkeypatch):
+    from mimir.tools import budget_gate
+
+    events = []
+    monkeypatch.setattr(
+        budget_gate, "_emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    secret = "subagent prompt and private output"
+
+    async def broken_subagent(request):
+        raise ValueError(f"No generations found in stream. {secret}")
+
+    result = await BudgetGateMiddleware().awrap_tool_call(
+        _make_request("task", "failed-subagent", _untainted_ifc_auth(),
+                      {"description": secret}),
+        broken_subagent,
+    )
+    assert isinstance(result, ToolMessage)
+    assert result.tool_call_id == "failed-subagent"
+    assert result.name == "task"
+    assert result.status == "error"
+    assert secret not in str(result.content)
+    assert "No generations" not in str(result.content)
+    assert len(str(result.content)) < 160
+    calls = [fields for kind, fields in events if kind == "tool_call" and fields["tool"] == "task"]
+    errors = [fields for kind, fields in events if kind == "tool_error" and fields["tool"] == "task"]
+    assert len(calls) == len(errors) == 1
+    assert calls[0]["ok"] is False
+    assert errors[0]["paired_tool_call"] is True
+    assert errors[0]["exception_class"] == "ValueError"
+    assert secret not in str(errors[0])
+
+
+@pytest.mark.asyncio
+async def test_task_cancellation_is_not_converted():
+    entered = asyncio.Event()
+
+    async def waiting_subagent(request):
+        entered.set()
+        await asyncio.Future()
+
+    parent = asyncio.create_task(BudgetGateMiddleware().awrap_tool_call(
+        _make_request("task", "cancel-subagent", _untainted_ifc_auth()), waiting_subagent,
+    ))
+    await asyncio.wait_for(entered.wait(), 5)
+    parent.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(parent, 5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [
+    TimeoutError("turn deadline"),
+    RuntimeError("quota exceeded"),
+    GraphBubbleUp("graph control flow"),
+    NodeCancelledError("node cancelled"),
+    NodeTimeoutError("subagent", 1.0, kind="run", run_timeout=1.0),
+])
+@pytest.mark.parametrize("sync", [False, True], ids=["async", "sync"])
+async def test_task_control_signals_propagate(error, sync):
+    def handler(request):
+        raise error
+
+    async def async_handler(request):
+        raise error
+
+    request = _make_request("task", "control-subagent", _untainted_ifc_auth())
+    middleware = BudgetGateMiddleware()
+    with pytest.raises(type(error)) as caught:
+        if sync:
+            middleware.wrap_tool_call(request, handler)
+        else:
+            await middleware.awrap_tool_call(request, async_handler)
+    assert caught.value is error
+
+
+@pytest.mark.asyncio
+async def test_non_task_handler_exception_propagates():
+    async def handler(request):
+        raise ValueError("ordinary tool failure")
+
+    with pytest.raises(ValueError, match="ordinary tool failure"):
+        await BudgetGateMiddleware().awrap_tool_call(
+            _make_request("read_file", "failed-built-in", _untainted_ifc_auth(),
+                          {"file_path": "test.txt"}),
+            handler,
+        )
+
+
+def test_sync_task_failure_returns_error_but_preserves_tool_refusals():
+    def broken(request):
+        raise ValueError("No generations found in stream. secret")
+
+    result = BudgetGateMiddleware().wrap_tool_call(
+        _make_request("task", auth_context=_untainted_ifc_auth()), broken,
+    )
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "secret" not in str(result.content)
+
+    def refused(request):
+        raise ToolException("original authorization refusal")
+
+    refusal = BudgetGateMiddleware().wrap_tool_call(
+        _make_request("task", auth_context=_untainted_ifc_auth()), refused,
+    )
+    assert refusal.status == "error"
+    assert "original authorization refusal" in str(refusal.content)
 
 
 def _service_turn(tmp_path: Path, channel_id: str | None) -> TurnContext:
