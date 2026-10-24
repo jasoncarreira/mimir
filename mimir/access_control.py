@@ -1062,6 +1062,7 @@ def _repo_pr_scope_resolution(
     author_is_trusted: object = None,
     pr_state: object = None,
     pr_author_is_trusted: object = None,
+    pr_author_trust_cause: object = None,
 ) -> RepoPRScopeResolution:
     """Validate a PR snapshot, preserving whether state or configuration refused it."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
@@ -1134,13 +1135,19 @@ def _repo_pr_scope_resolution(
             else "bot_not_allowlisted" if principal.endswith("[bot]")
             else "non_collaborator"
         )
+        from .pollers import bounded_github_author_cause
+        cause = (bounded_github_author_cause(pr_author_trust_cause or "verdict_missing")
+                 if pr_author_is_trusted is None else None)
         try:
-            log_event_sync(
-                "github_outsider_pr_refused", repo=repo, number=number,
+            fields = dict(
+                repo=repo, number=number,
                 author=principal if re.fullmatch(
                     r"[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?", principal, re.ASCII,
                 ) else "<invalid-login>", reason=reason,
             )
+            if cause is not None:
+                fields["cause"] = cause
+            log_event_sync("github_outsider_pr_refused", **fields)
             log_event_sync(
                 "github_content_withheld", tool="pr_scope", kind="pull_request",
                 count=1, reason=reason,
@@ -1354,6 +1361,7 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             actor=item.get("actor"),
             author_is_trusted=item.get("author_is_trusted"),
             pr_author_is_trusted=item.get("pr_author_is_trusted"),
+            pr_author_trust_cause=item.get("pr_author_trust_cause"),
             pr_state=item.get("pr_state"),
             number=item.get("number"),
             head_repo=item.get("head_repo"),
@@ -10679,9 +10687,21 @@ def log_pr_checkout_lease_attestation_refused(
     from .event_logger import log_event_sync
 
     try:
-        log_event_sync(
-            "pr_checkout_lease_attestation_refused", scope_id=scope_id, reason=reason,
-        )
+        fields = dict(scope_id=scope_id, reason=reason)
+        if reason == LeaseAttestationReason.NO_AUTHOR_TRUST:
+            from .pollers import bounded_github_author_cause
+
+            verdicts = getattr(ifc_state, "pr_checkout_author_trust", {})
+            if scope_id not in verdicts:
+                cause = "no_turn_verdict"
+            elif verdicts[scope_id] is False:
+                cause = "non_collaborator"
+            else:
+                cause = getattr(ifc_state, "pr_checkout_author_trust_cause", {}).get(
+                    scope_id, "verdict_missing",
+                )
+            fields["cause"] = bounded_github_author_cause(cause)
+        log_event_sync("pr_checkout_lease_attestation_refused", **fields)
     except RuntimeError:
         # Standalone policy callers may not initialize the process event logger.
         pass
