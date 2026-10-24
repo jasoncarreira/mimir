@@ -1258,14 +1258,9 @@ def _is_selected_cultivate_default(manifest_path: Path, policy: PolicyRegistry) 
         if manifest_path == source:
             return True
         if manifest_path.parent.name == f"cultivate-{source.parent.name}":
-            resources = [item for item in dist.files if item.parent == file.parent
-                         or file.parent in item.parents]
-            if resources and all(
-                not (dest := manifest_path.parent / item.relative_to(file.parent)).is_symlink()
-                and dest.is_file()
-                and dest.read_bytes() == Path(dist.locate_file(item)).read_bytes()
-                for item in resources
-            ):
+            from .plugins.skills import PluginSkill, skill_state
+
+            if skill_state(manifest_path.parents[2], PluginSkill(candidate, source.parent.name, None, True)) == "installed":
                 return True
     return False
 
@@ -1889,6 +1884,7 @@ def discover_pollers(
     validated_seeds: set[Path] = set()
     # Packaged manifest -> the byte-identical home seed that supersedes it.
     packaged_seeds: dict[Path, Path] = {}
+    upgrade_seeds: set[Path] = set()
     for candidate in plugin_candidates:
         if not candidate.enabled or candidate.manifest is None:
             continue
@@ -1938,12 +1934,27 @@ def discover_pollers(
             if path in manifests:
                 raise ValueError(f"plugin poller resource collision: {path}")
             manifests[path] = candidate.name
+            # Reserved home-seed takeover is currently Cultivate-only. Other
+            # plugins retain their existing manifest/ownership policy here;
+            # generic release inventories alone do not grant that authority.
             if candidate.name == "cultivate":
                 seeded = skills_dir / f"cultivate-{path.parent.name}" / "pollers.json"
+                if seeded in manifests:
+                    from .plugins.skills import PluginSkill, skill_state
+
+                    seeded_skill = PluginSkill(candidate, path.parent.name, None, True)
+                    if skill_state(skills_dir.parent, seeded_skill) == "upgrade available":
+                        # An old release has no authority to run. Let the
+                        # *current* packaged manifest run in its place.
+                        upgrade_seeds.add(seeded)
                 if seeded in manifests and not seeded.is_symlink() and seeded.is_file():
                     # A local copy cannot claim reserved provider identity after
                     # its manifest diverges from the inventoried distribution.
-                    if seeded.read_bytes() == path.read_bytes():
+                    try:
+                        identical_manifest = seeded.read_bytes() == path.read_bytes()
+                    except OSError:
+                        identical_manifest = False
+                    if identical_manifest:
                         manifests[seeded] = candidate.name
                         validated_seeds.add(seeded)
                         packaged_seeds[path] = seeded
@@ -1967,6 +1978,8 @@ def discover_pollers(
     for pollers_file, plugin_owner in sorted(
         manifests.items(), key=lambda item: (item[0] not in validated_seeds, item[0]),
     ):
+        if pollers_file in upgrade_seeds:
+            continue
         from ._paths import live_loader_path_allowed
         if not live_loader_path_allowed(pollers_file):
             continue

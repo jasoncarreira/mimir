@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from unittest.mock import Mock
+import pytest
 
 from github_poller_test_support import poller
 from mimir.pollers import _github_author_is_trusted
 
 
 _REAL_PR_AUTHOR_IS_TRUSTED = poller._pr_author_is_trusted
+_REAL_PR_AUTHOR_TRUST = poller._pr_author_trust
 _REAL_AUTHOR_IS_TRUSTED = poller._github_author_is_trusted
 
 
@@ -46,6 +48,7 @@ def _capture(monkeypatch):
 
 def _use_real_trust_filter(monkeypatch) -> None:
     monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_PR_AUTHOR_IS_TRUSTED)
+    monkeypatch.setattr(poller, "_pr_author_trust", _REAL_PR_AUTHOR_TRUST)
     monkeypatch.setattr(poller, "_github_author_is_trusted", _REAL_AUTHOR_IS_TRUSTED)
 
 
@@ -164,7 +167,8 @@ def test_trust_lookup_failure_is_retryable_and_not_cached(monkeypatch):
     )
 
     assert events == []
-    assert signals == []
+    assert signals == [{"signal": "github_pr_author_attestation_unavailable",
+                        "repo": "acme/widget", "number": 4, "cause": "author_unresolved"}]
     assert cache == {}
     assert budget.hard_truncated is True
 
@@ -215,7 +219,8 @@ def test_explicit_review_request_waits_for_author_trust(monkeypatch):
     )
 
     assert events == []
-    assert signals == []
+    assert signals == [{"signal": "github_pr_author_attestation_unavailable",
+                        "repo": "acme/widget", "number": 5, "cause": "author_unresolved"}]
 
 
 def test_trust_lookup_is_cached_per_author_per_poll_cycle(monkeypatch):
@@ -249,3 +254,154 @@ def test_trust_lookup_is_cached_per_author_per_poll_cycle(monkeypatch):
 
     assert content_calls == [1, 2]
     assert trust_calls == ["same-author"]
+
+
+@pytest.mark.parametrize("skip", ["no_token", "non_int", "bool"])
+def test_scope_missing_verdict_cannot_inherit_previous_pr_cause(monkeypatch, skip):
+    _use_real_trust_filter(monkeypatch)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
+
+    class NoBudget:
+        def call_timeout(self, **kwargs):
+            return None
+
+    first = poller._pr_scope_fields(_pr(1), "acme/widget", token="token", tick_budget=NoBudget())
+    assert first["pr_author_trust_cause"] == "budget_exhausted"
+    pr = _pr(2)
+    token = "token"
+    if skip == "no_token":
+        token = ""
+    else:
+        pr["number"] = "2" if skip == "non_int" else True
+    second = poller._pr_scope_fields(pr, "acme/widget", token=token)
+    assert second["pr_author_is_trusted"] is None
+    assert second["pr_author_trust_cause"] == "verdict_missing"
+
+
+def test_forwarded_author_is_sanitized(monkeypatch):
+    signals = []
+    monkeypatch.setattr(poller, "_emit_signal", lambda name, **fields: signals.append(fields))
+    poller._forward_author_diagnostic(
+        "github_author_attestation_unavailable", repository="acme/widget",
+        author="private response text\nsecret", request="collaborator", failure_class="timeout",
+    )
+    assert signals[0]["author"] == "<invalid-login>"
+
+
+@pytest.mark.parametrize("failure,expected", [
+    ("budget", "budget_exhausted"),
+    ("deadline", "deadline_exceeded"),
+    ("author", "author_unresolved"),
+    ("collaborator", "collaborator_timeout"),
+    ("membership", "membership_transport"),
+])
+def test_pr_scope_preserves_specific_retryable_cause(monkeypatch, request, failure, expected):
+    from contextlib import contextmanager
+    from mimir import pollers
+
+    _use_real_trust_filter(monkeypatch)
+    signals = []
+    monkeypatch.setattr(poller, "_emit_signal", lambda name, **fields: signals.append((name, fields)))
+    sink = pollers._github_author_diagnostic_sink.set(poller._forward_author_diagnostic)
+    request.addfinalizer(lambda: pollers._github_author_diagnostic_sink.reset(sink))
+    pr = _pr(42, author="owner")
+    if failure == "budget":
+        class NoBudget:
+            def call_timeout(self, **kwargs):
+                return None
+        budget = NoBudget()
+    else:
+        budget = None
+        if failure == "deadline":
+            @contextmanager
+            def expired(seconds):
+                raise poller._DeadlineExceeded
+                yield
+            monkeypatch.setattr(poller, "_wall_clock_deadline", expired)
+        elif failure == "author":
+            monkeypatch.setattr(poller, "_github_content_author", lambda *args: None)
+        else:
+            monkeypatch.setattr(poller, "_github_content_author", lambda *args: "owner")
+            def api(endpoint, token):
+                if failure == "membership" and endpoint.startswith("repos/"):
+                    return 404, None
+                pollers._github_attestation_failure.set(
+                    "timeout" if failure == "collaborator" else "transport"
+                )
+                return None
+            monkeypatch.setattr(pollers, "_github_api_attestation", api)
+
+    fields = poller._pr_scope_fields(pr, "acme/widget", token="token", tick_budget=budget)
+    assert fields["pr_author_is_trusted"] is None
+    assert fields["pr_author_trust_cause"] == expected
+    diagnostic = ("github_pr_author_attestation_unavailable", {
+        "repo": "acme/widget", "number": 42, "cause": expected,
+    })
+    if failure in {"collaborator", "membership"}:
+        assert signals == [("github_author_attestation_unavailable", {
+            "repository": "acme/widget", "author": "owner", "request": failure,
+            "failure_class": "timeout" if failure == "collaborator" else "transport",
+        }), diagnostic]
+    else:
+        assert signals == [diagnostic]
+
+
+@pytest.mark.parametrize("author,collaborator,membership,expected", [
+    ("owner", 204, None, True),
+    ("collaborator", 204, None, True),
+    ("outsider", 404, 404, False),
+])
+def test_real_author_verdict_distinguishes_owner_and_outsider(
+    monkeypatch, author, collaborator, membership, expected,
+):
+    from mimir import pollers
+
+    _use_real_trust_filter(monkeypatch)
+    monkeypatch.setattr(poller, "_github_content_author", lambda *args: author)
+    calls = []
+    def api(endpoint, token):
+        calls.append(endpoint)
+        return (membership if endpoint.startswith("orgs/") else collaborator), None
+    monkeypatch.setattr(pollers, "_github_api_attestation", api)
+    fields = poller._pr_scope_fields(_pr(42), "acme/widget", token="token")
+    assert fields["pr_author_is_trusted"] is expected
+    assert fields["pr_author_trust_cause"] is None
+    assert calls == [f"repos/acme/widget/collaborators/{author}"] + (
+        [f"orgs/acme/memberships/{author}"] if collaborator == 404 else []
+    )
+
+
+@pytest.mark.parametrize("failure,expected", [
+    ("budget", "budget_exhausted"), ("deadline", "deadline_exceeded"),
+])
+def test_second_stage_trust_allowance_fails_closed(monkeypatch, failure, expected):
+    from contextlib import contextmanager
+
+    _use_real_trust_filter(monkeypatch)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(poller, "_github_content_author", lambda *args: "owner")
+    trust = Mock(return_value=True)
+    monkeypatch.setattr(poller, "_github_author_is_trusted", trust)
+
+    class Budget:
+        calls = 0
+        def call_timeout(self, **kwargs):
+            self.calls += 1
+            return 10.0 if self.calls == 1 else (None if failure == "budget" else 10.0)
+
+    if failure == "deadline":
+        calls = []
+        @contextmanager
+        def deadline(seconds):
+            calls.append(seconds)
+            if len(calls) == 2:
+                raise poller._DeadlineExceeded
+            yield
+        monkeypatch.setattr(poller, "_wall_clock_deadline", deadline)
+    cache = {}
+    fields = poller._pr_scope_fields(_pr(42), "acme/widget", token="token",
+                                    tick_budget=Budget(), trust_cache=cache)
+    assert fields["pr_author_is_trusted"] is None
+    assert fields["pr_author_trust_cause"] == expected
+    assert cache == {("acme/widget", 42): "owner"}
+    trust.assert_not_called()

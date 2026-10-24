@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
+import json
 import os
 import shutil
+import stat
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,10 +33,36 @@ class PluginSkill:
         return f"{self.candidate.name}-{self.name}"
 
 
+_unreadable_reported: set[str] = set()
+_unreadable_report_lock = threading.Lock()
+
+
+def _report_unreadable(skill: PluginSkill) -> None:
+    from mimir.event_logger import log_event_sync
+
+    with _unreadable_report_lock:
+        if skill.label in _unreadable_reported:
+            return
+        try:
+            # No file names, exception messages or home bytes in diagnostics.
+            log_event_sync("plugin_skill_inventory_unreadable", skill=skill.label)
+        except RuntimeError:
+            # CLI/direct callers need not initialise the server's event logger.
+            # Leave it eligible for a later call after logger initialisation.
+            return
+        _unreadable_reported.add(skill.label)
+
+
 def selected_skills() -> list[PluginSkill]:
+    return skills_for_candidates(enabled_plugins())
+
+
+def skills_for_candidates(candidates) -> list[PluginSkill]:
     result = []
-    for candidate in enabled_plugins():
+    for candidate in candidates:
         manifest = candidate.manifest
+        if manifest is None:
+            continue
         for path in manifest.defaults.get("skills", ()):
             result.append(PluginSkill(candidate, Path(path).name, None, True))
         for path, forge in manifest.optional_skills:
@@ -44,25 +74,119 @@ def skill_files(skill: PluginSkill) -> dict[Path, str]:
     return plugin_default_files(skill.candidate, skill=skill.name)
 
 
+def skill_inventory(skill: PluginSkill) -> dict[str, str]:
+    """Current package's complete relative-path/sha256 inventory."""
+    prefix = Path("skills") / skill.dirname
+    return {rel.relative_to(prefix).as_posix(): hashlib.sha256(text.encode("utf-8")).hexdigest()
+            for rel, text in skill_files(skill).items()}
+
+
+def previous_skill_inventories(skill: PluginSkill) -> dict[str, dict[str, str]]:
+    """Read recorded release inventories, including the current packaged release.
+
+    Kept under the original API name for callers; skill_state checks the current
+    inventory first, so only a different recorded inventory enables an upgrade.
+    """
+    dist = skill.candidate.entry_point.dist
+    if dist is None or dist.files is None:
+        return {}
+    matches = [item for item in dist.files if item.as_posix().endswith("/defaults/skill_releases.json")]
+    if not matches:
+        return {}
+    if len(matches) != 1:
+        raise ValueError(f"{skill.label}: ambiguous release inventory")
+    path = Path(dist.locate_file(matches[0]))
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{skill.label}: invalid release inventory")
+    releases = json.loads(path.read_text(encoding="utf-8"))
+    return {version: files[skill.name] for version, files in releases.items()
+            if skill.name in files}
+
+
 def skill_state(home: Path, skill: PluginSkill) -> str:
     """Match the whole installed tree against the inventoried package files."""
     try:
-        root = safe_destination(home, Path("skills") / skill.dirname)
-    except ValueError:
-        return "modified"
-    if not root.exists():
-        return "not installed"
-    if not root.is_dir():
-        return "modified"
-    expected = {path.relative_to(Path("skills") / skill.dirname): text.encode("utf-8")
-                for path, text in skill_files(skill).items()}
-    actual: dict[Path, bytes] = {}
-    for path in root.rglob("*"):
-        if path.is_symlink():
+        try:
+            root = safe_destination(home, Path("skills") / skill.dirname)
+        except ValueError:
             return "modified"
-        if path.is_file():
-            actual[path.relative_to(root)] = path.read_bytes()
-    return "installed" if actual == expected else "modified"
+        try:
+            root_mode = root.stat().st_mode
+        except FileNotFoundError:
+            return "not installed"
+        if not stat.S_ISDIR(root_mode):
+            return "modified"
+        expected = skill_inventory(skill)
+        actual: dict[str, str] = {}
+
+        def walk_error(error: OSError) -> None:
+            raise error
+
+        # Path.rglob may suppress scandir errors. Never accept a partial tree.
+        for directory, dirs, files in os.walk(root, onerror=walk_error, followlinks=False):
+            base = Path(directory)
+            for name in (*dirs, *files):
+                if (base / name).is_symlink():
+                    return "modified"
+            # Match packaged cache exclusions. Seeded pollers currently execute
+            # their script as __main__ without sibling imports; revisit this trust
+            # assumption before adding imports that can load unchecked cache pycs.
+            dirs[:] = [name for name in dirs if name not in {"__pycache__", ".pytest_cache"}]
+            for name in files:
+                path = base / name
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    return "modified"
+                actual[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual == expected:
+            return "installed"
+        return ("upgrade available" if any(actual == previous for previous in previous_skill_inventories(skill).values())
+                else "modified")
+    except OSError:
+        _report_unreadable(skill)
+        return "modified"
+
+
+def pending_skill_upgrades(home: Path, selected: list[PluginSkill] | None = None) -> list[PluginSkill]:
+    return [skill for skill in (selected if selected is not None else selected_skills())
+            if skill_state(home, skill) == "upgrade available"]
+
+
+def upgrade_command(skill: PluginSkill) -> str:
+    return f"mimir skills install {skill.label} --restore"
+
+
+async def notify_skill_upgrades(home: Path, candidates, operator_channel: str, send) -> None:
+    """Emit one content-free event and one operator alert per skill/release."""
+    from mimir.event_logger import log_event
+
+    for skill in pending_skill_upgrades(home, skills_for_candidates(candidates)):
+        version = str(skill.candidate.manifest.defaults.get("version", skill.candidate.manifest.version))
+        inventory = skill_inventory(skill)
+        target = hashlib.sha256(json.dumps(inventory, sort_keys=True,
+                                           separators=(",", ":")).encode("utf-8")).hexdigest()
+        release = next((key for key, recorded in previous_skill_inventories(skill).items()
+                        if recorded == inventory), f"sha256:{target}")
+        marker = Path(".mimir/plugin-skill-upgrades") / skill.dirname / target
+        for kind in ("event", "alert"):
+            if kind == "alert" and not operator_channel:
+                continue
+            path = safe_destination(home, marker / kind)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "w"):
+                    pass
+            except FileExistsError:
+                continue
+            try:
+                if kind == "event":
+                    await log_event("plugin_skill_upgrade_available", skill=skill.label,
+                                    version=version, target_release=release)
+                else:
+                    await send(operator_channel, f"Plugin skill upgrade available: {skill.label}. "
+                               f"Run `{upgrade_command(skill)}` to apply it (backup kept).", final=True)
+            except Exception:
+                path.unlink(missing_ok=True)
+                raise
 
 
 def resolve_skill(name: str, core_names: set[str]) -> PluginSkill | None:
@@ -156,6 +280,8 @@ def log_optional_hint(home: Path, candidates, logger) -> None:
         logger.info("optional plugin skills available: %s; install with `mimir skills install <plugin>:<skill>` "
                     "or `mimir skills install --forge <name>`",
                     ", ".join(skill.label for skill in missing))
+    for skill in pending_skill_upgrades(home, skills_for_candidates(candidates)):
+        logger.info("plugin skill upgrade available: %s; run `%s`", skill.label, upgrade_command(skill))
 
 
 def uninstalled_optional(home: Path, selected: list[PluginSkill] | None = None) -> list[PluginSkill]:

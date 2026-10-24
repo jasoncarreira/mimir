@@ -174,6 +174,8 @@ def plugin_default_files(candidate: PluginCandidate, *, skill: str | None = None
     for directory in directories:
         source = root / directory
         for path in sorted(source.rglob("*")):
+            if {"__pycache__", ".pytest_cache"}.intersection(path.relative_to(source).parts):
+                continue
             if path.is_file():
                 rel = path.relative_to(source)
                 dest = Path("skills") / f"{candidate.name}-{source.name}" / rel

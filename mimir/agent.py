@@ -4405,6 +4405,11 @@ class Agent:
             # (wired via ``create_deep_agent(skills=...)``). build_system_prompt
             # no longer composes a skill_block — the middleware injects
             # ``## Skills System`` into the prompt at request time.
+            from .plugins.skills import pending_skill_upgrades, skills_for_candidates, upgrade_command
+
+            manager = getattr(self._config, "plugin_manager", None)
+            candidates = (manager.policy.selected_plugin_candidates if manager is not None else ())
+            pending = pending_skill_upgrades(self._config.home, skills_for_candidates(candidates))
             return build_system_prompt(
                 core_blocks=core_blocks,
                 memory_index_body=memory_index_body,
@@ -4412,6 +4417,9 @@ class Agent:
                     self._config, "operator_alert_channel", "",
                 ),
                 skill_block=None,
+                plugin_upgrade_notice=("Pending: " + "; ".join(
+                    f"{skill.label} (`{upgrade_command(skill)}`)" for skill in pending
+                ) + ". Tell the operator; do not apply upgrades yourself." if pending else None),
                 home_dir=str(self._config.home),
                 writable_dirs=self._config.writable_dirs,
                 access_control_enforced=self._config.access_control_enforced,

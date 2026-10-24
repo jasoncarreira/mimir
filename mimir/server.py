@@ -1708,6 +1708,15 @@ def build_app(config: Config) -> web.Application:
             )
             await log_event("pairing_alert_channel_missing", platforms=pairing_platforms)
         await channels.connect_all()
+        from .plugins.skills import notify_skill_upgrades
+
+        try:
+            await notify_skill_upgrades(
+                config.home, config.plugin_manager.policy.selected_plugin_candidates,
+                (config.operator_alert_channel or "").strip(), channels.send,
+            )
+        except Exception as exc:
+            log.warning("plugin skill upgrade notification failed: %s", exc)
 
         # MCP servers (opt-in via MIMIR_MCP_SERVERS_JSON / _PATH).
         # Bridged tools are appended to the agent's surface via the

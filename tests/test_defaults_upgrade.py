@@ -1086,6 +1086,39 @@ def test_plugin_defaults_upgrade_proposes_without_touching_live_home(
     _cleanup_upgrade_proposal(home)
 
 
+def test_plugin_skill_only_version_bump_never_opens_conflicting_proposal(home, tmp_path):
+    plugin = _plugin(tmp_path)
+    seed_plugin_defaults(home, selected=(plugin,))
+    _git("add", "-f", "skills/sample-helper/SKILL.md", "prompts/sample/heartbeat.md", cwd=home)
+    _git("commit", "-q", "-m", "plugin seed", cwd=home)
+    _git("push", "-q", cwd=home)
+    assert du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"].action == "baseline_initialized"
+    (tmp_path / "sample/skills/helper/SKILL.md").write_text("plugin skill v2\n")
+    plugin.manifest.defaults["version"] = "2.0"
+    result = du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"]
+    assert result.action == "no_changes" and result.proposal is None
+    assert (home / "skills/sample-helper/SKILL.md").read_text() == "plugin skill\n"
+
+
+def test_legacy_plugin_vendor_skill_is_not_merged_into_sparse_proposal(home, tmp_path):
+    plugin = _plugin(tmp_path)
+    seed_plugin_defaults(home, selected=(plugin,))
+    _git("add", "-f", "skills/sample-helper/SKILL.md", "prompts/sample/heartbeat.md", cwd=home)
+    _git("commit", "-q", "-m", "plugin seed", cwd=home)
+    _git("push", "-q", cwd=home)
+    baseline = du._ensure_vendor_branch(
+        home, branch="mimir-plugin-defaults-sample", version="1.0",
+        files=plugin_default_files(plugin),
+    )
+    assert baseline.error is None and baseline.changed
+    (home / ".mimir/upgrade-plugin-defaults").mkdir(parents=True, exist_ok=True)
+    (home / ".mimir/upgrade-plugin-defaults/sample").write_text("1.0\n")
+    plugin.manifest.defaults["version"] = "2.0"
+    result = du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"]
+    assert result.action == "vendor_updated_no_home_diff" and result.proposal is None
+    assert (home / "skills/sample-helper/SKILL.md").read_text() == "plugin skill\n"
+
+
 @pytest.mark.parametrize("edited", [False, True])
 def test_default_to_optional_upgrade_preserves_installed_skill(home, tmp_path, edited):
     plugin = _plugin(tmp_path)
@@ -1110,10 +1143,9 @@ def test_default_to_optional_upgrade_preserves_installed_skill(home, tmp_path, e
     assert result.action == "proposal_opened"
     assert result.proposal and result.proposal.worktree
     assert (home / rel).read_text() == expected
-    # The vendor ref, not the sparse proposal index, discriminates whether
-    # installed optionals were included. It contains package bytes, not edits.
-    assert _git("show", f"mimir-plugin-defaults-sample:{rel}", cwd=home).stdout == "plugin skill\n"
-    assert rel in _git("ls-tree", "-r", "--name-only", "mimir-plugin-defaults-sample", cwd=home).stdout.splitlines()
+    # The vendor branch carries prompts and jobs, never skill bytes.
+    assert _git("show", f"mimir-plugin-defaults-sample:{rel}", cwd=home, check=False).returncode != 0
+    assert rel not in _git("ls-tree", "-r", "--name-only", "mimir-plugin-defaults-sample", cwd=home).stdout.splitlines()
     assert _git("show", f":{rel}", cwd=result.proposal.worktree).stdout == expected
     assert rel not in _git("diff", "--cached", "--name-only", cwd=result.proposal.worktree).stdout.splitlines()
     _cleanup_upgrade_proposal(home)

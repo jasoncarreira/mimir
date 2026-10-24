@@ -29,10 +29,15 @@ log = logging.getLogger(__name__)
 
 
 def hidden_home_skill_dirs(home: Path, policy: "PolicyRegistry | None") -> frozenset[Path]:
-    """``<home>/skills/<dir>`` paths seeded by plugins that are not selected."""
+    """Withhold deselected and known-stale plugin seeds from every agent loader."""
     hidden = unselected_seeded_skills(home, selected_plugin_owners(policy))
     root = home_skills_dir(home)
-    return frozenset(root / name for name in hidden)
+    from .plugins.skills import pending_skill_upgrades, skills_for_candidates
+
+    selected = (skills_for_candidates(policy.selected_plugin_candidates)
+                if policy is not None else [])
+    return frozenset({*(root / name for name in hidden),
+                      *(root / skill.dirname for skill in pending_skill_upgrades(home, selected))})
 
 
 def visible_skill_names(home: Path, names: list[str], policy: "PolicyRegistry | None") -> list[str]:
@@ -63,6 +68,7 @@ class SeedFilteredSkillsMiddleware(SkillsMiddleware):
         super().__init__(backend=backend, sources=sources)
         self._home = Path(home)
         self._policy = policy
+        self._reported_hidden: set[PurePath] = set()
 
     @property
     def name(self) -> str:
@@ -89,10 +95,12 @@ class SeedFilteredSkillsMiddleware(SkillsMiddleware):
         for skill in skills:
             skill_dir = PurePath(str(skill.get("path", ""))).parent
             if skill_dir.name in names and skill_dir.parent.parts in operator_roots:
-                log.warning(
-                    "skill_plugin_seed_unselected: %s — seeded by a plugin that is "
-                    "not selected; skill withheld from the agent", skill_dir,
-                )
+                if skill_dir not in self._reported_hidden:
+                    log.warning(
+                        "skill_plugin_seed_hidden: %s — plugin seed is unavailable or awaiting "
+                        "CLI upgrade; skill withheld from the agent", skill_dir,
+                    )
+                    self._reported_hidden.add(skill_dir)
                 continue
             kept.append(skill)
         return kept

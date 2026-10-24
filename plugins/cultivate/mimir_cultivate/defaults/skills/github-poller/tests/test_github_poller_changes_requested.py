@@ -1414,6 +1414,7 @@ def test_untruncated_tick_still_advances_its_watermark(monkeypatch, tmp_path):
 #: replacing `_pr_author_is_trusted` with an instant lambda is precisely why the
 #: first wall-clock regression could not see the attestation transport.
 _REAL_TRUST_RESOLVER = poller._pr_author_is_trusted
+_REAL_PAIRED_TRUST_RESOLVER = poller._pr_author_trust
 
 
 def test_slow_trust_attestations_cannot_overrun_the_tick(monkeypatch, tmp_path):
@@ -1432,6 +1433,7 @@ def test_slow_trust_attestations_cannot_overrun_the_tick(monkeypatch, tmp_path):
     import time as _time
 
     monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
+    monkeypatch.setattr(poller, "_pr_author_trust", _REAL_PAIRED_TRUST_RESOLVER)
     monkeypatch.setattr(poller, "TRUST_ATTESTATION_TIMEOUT_SECONDS", 0.05)
     started: list[str] = []
 
@@ -1475,6 +1477,7 @@ def test_deadline_exceeded_trust_lookup_is_unresolved_not_untrusted(monkeypatch)
     )
     monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *a: True)
 
+    monkeypatch.setattr(poller, "_pr_author_trust", _REAL_PAIRED_TRUST_RESOLVER)
     cache: dict = {}
     verdict = _REAL_TRUST_RESOLVER(
         "o/r", 700, "https://github.com/o/r/pull/700", "tok", cache,
@@ -1495,6 +1498,7 @@ def test_unresolvable_trust_skips_the_pr_instead_of_marking_it_untrusted(
     of time. `None` means "unresolved": skip, hold the watermark, retry next tick.
     """
     monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
+    monkeypatch.setattr(poller, "_pr_author_trust", _REAL_PAIRED_TRUST_RESOLVER)
     surfaced: set[str] = set()
     calls: list[str] = []
 
@@ -1530,7 +1534,9 @@ def test_unresolvable_trust_skips_the_pr_instead_of_marking_it_untrusted(
     assert count == 0
     assert calls == [], "an attestation was made past the hard deadline"
     assert surfaced == set(), "unresolved trust was recorded as untrusted"
-    assert emitted == [], "unresolved trust emitted a verdict"
+    assert emitted == [{"repo": "o/r", "number": 700, "cause": "budget_exhausted"}], (
+        "unresolved trust should only emit a content-free diagnostic"
+    )
     assert spent.hard_truncated is True, "watermark not held for a skipped PR"
 
 
@@ -1543,6 +1549,7 @@ def test_unresolvable_trust_in_pushes_carries_the_prior_head_forward(monkeypatch
     it just as thoroughly. Only the prior head preserves the comparison.
     """
     monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
+    monkeypatch.setattr(poller, "_pr_author_trust", _REAL_PAIRED_TRUST_RESOLVER)
     attempted: list[str] = []
     monkeypatch.setattr(
         poller, "_github_content_author",
@@ -1585,6 +1592,7 @@ def test_pushes_trust_denial_does_not_freeze_the_watermark(monkeypatch):
     `created_at > since` and has nowhere else to defer to.
     """
     monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_TRUST_RESOLVER)
+    monkeypatch.setattr(poller, "_pr_author_trust", _REAL_PAIRED_TRUST_RESOLVER)
     monkeypatch.setattr(poller, "_emit", lambda *a, **k: None)
     monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
     pr = {
