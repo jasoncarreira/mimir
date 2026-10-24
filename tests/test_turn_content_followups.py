@@ -34,6 +34,31 @@ def test_narrow_search_from_repository_stays_clean(tmp_path, monkeypatch, tool):
     )
 
 
+@pytest.mark.parametrize("tool", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize(("command", "expected"), [
+    ('grep -rn "foo .', True),
+    ("rg 'unterminated", True),
+    ("ag 'unterminated", True),
+    ("egrep 'unterminated", True),
+    ("fgrep 'unterminated", True),
+    ('echo "x', False),
+])
+def test_malformed_search_quoting_fails_closed_outside_home(
+    tmp_path, monkeypatch, tool, command, expected,
+):
+    import shlex
+
+    home, checkout = tmp_path / "home", tmp_path / "checkout"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    # Prove the fixture reaches the malformed-input fallback; neither cwd nor
+    # a named content path can independently account for the positive verdict.
+    with pytest.raises(ValueError):
+        list(shlex.shlex(command, posix=True, punctuation_chars=";&|<>()\n"))
+    assert _shell_reads_home_content(
+        {"command": command, "cwd": str(checkout)}, tool_name=tool,
+    ) is expected
+
+
 def _install_research_manifest(home, name):
     manifest = home / "skills" / name / "pollers.json"
     manifest.parent.mkdir(parents=True, exist_ok=True)
@@ -406,7 +431,8 @@ def test_manifest_with_nonresearch_authority_preserves_drafts(tmp_path):
 
 
 @pytest.mark.parametrize("area", ["ci", "research"])
-def test_entry_refusal_does_not_skip_later_entries(tmp_path, monkeypatch, caplog, area):
+@pytest.mark.parametrize("error_type", [OSError, PermissionError, FileNotFoundError, NotADirectoryError])
+def test_entry_refusal_does_not_skip_later_entries(tmp_path, monkeypatch, caplog, area, error_type):
     from mimir import turn_stores
 
     _install_research_manifest(tmp_path, "papers")
@@ -428,7 +454,10 @@ def test_entry_refusal_does_not_skip_later_entries(tmp_path, monkeypatch, caplog
         if name in {first.name, second.name}:
             attempts.append(name)
         if name == first.name:
-            raise PermissionError("test-owned first entry refusal")
+            # Pin the full OSError boundary, not only PermissionError: an outer
+            # handler can otherwise hide a narrowed per-entry catch while the
+            # later draft remains unswept.
+            raise error_type("test-owned first entry refusal")
         return real_remove(fd, name)
 
     monkeypatch.setattr(turn_stores.os, "listdir", ordered)
