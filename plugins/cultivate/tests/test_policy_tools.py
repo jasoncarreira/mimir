@@ -13,7 +13,7 @@ import pytest
 
 from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
-from mimir.tool_descriptors import _PAYLOAD_EXTRACTOR_UNDECLARED, _TARGET_EXTRACTOR_UNDECLARED
+from mimir.tool_descriptors import ResultOriginKind, _PAYLOAD_EXTRACTOR_UNDECLARED, _TARGET_EXTRACTOR_UNDECLARED
 from mimir.tools.registry import all_mimir_tools
 from mimir_cultivate.policy import CODING_TOOLS
 from tests.test_plugin_policy_parity import (
@@ -64,6 +64,10 @@ def test_selected_cultivate_matches_frozen_pre_extraction_policy(monkeypatch, tm
             value = getattr(after.descriptor, field.name)
             if field.name == "result_origin":
                 value = int(value)
+                if name == "repo_push":
+                    # Provider correction: remote push diagnostics are external.
+                    assert value == before[field.name] | int(ResultOriginKind.EXTERNAL)
+                    continue
             elif field.name in {"sink_target_extractor", "sink_payload_extractor"}:
                 undeclared = (_TARGET_EXTRACTOR_UNDECLARED if field.name == "sink_target_extractor"
                               else _PAYLOAD_EXTRACTOR_UNDECLARED)
