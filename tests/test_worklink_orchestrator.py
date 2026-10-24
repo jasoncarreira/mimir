@@ -7773,6 +7773,149 @@ class _FactoryLifecycleClaims:
         return None
 
 
+@pytest.mark.parametrize("failure", [None, "transition", "milestone"])
+def test_factory_decision_park_archives_claim_before_resume(tmp_path: Path, monkeypatch, failure) -> None:
+    """A driver-reported needs-human decision receives the same credit as a budget park."""
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+    from mimir_cultivate.worklink.factory_state import save_factory_record
+
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "700"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "700"
+    snapshot.mkdir(parents=True)
+    claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
+    record = _factory_lifecycle_record(
+        sandbox, LaunchHandle("local_subprocess", "123", 456),
+    ).observed(
+        _factory_lifecycle_status(sandbox, status="needs-human", park_snapshot=str(snapshot)),
+        datetime.now(UTC).isoformat(),
+    )
+    record = replace(record, controller_phase="parked")
+    save_factory_record(tmp_path, record)
+
+    claims = _FactoryLifecycleClaims()
+    def fail(*args, **kwargs):
+        raise RuntimeError("transition publication failed")
+    if failure == "transition":
+        monkeypatch.setattr(claims, "transition_issue", fail)
+    elif failure == "milestone":
+        monkeypatch.setattr("mimir_cultivate.worklink.orchestrator._record_factory_milestone", fail)
+    finish = WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+        issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+        claim_record=claim, claims=claims, backend=object(),
+        compute=object(), factory_record=record, test_cmd="pytest -q",
+        runner=lambda args: cp(args), started_at=datetime.now(UTC),
+    )
+    if failure:
+        with pytest.raises(RuntimeError, match="transition publication failed"):
+            asyncio.run(finish)
+    else:
+        assert asyncio.run(finish).status == "needs-human"
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used([claim.to_comment()]) == 0
+    save_factory_record(tmp_path, replace(record, controller_phase="running"))
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used([claim.to_comment()]) == 0
+
+
+@pytest.mark.parametrize("error_type", [OSError, FactoryRecordError])
+def test_factory_park_archive_error_logs_and_finishes(tmp_path, monkeypatch, error_type):
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+    sandbox = tmp_path / "checkout/.factory-sandboxes/700"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory/.parked/700"
+    snapshot.mkdir(parents=True)
+    claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
+    record = replace(_factory_lifecycle_record(
+        sandbox, LaunchHandle("local_subprocess", "999999999", 1),
+    ).observed(
+        _factory_lifecycle_status(sandbox, status="needs-human", park_snapshot=str(snapshot)),
+        datetime.now(UTC).isoformat(),
+    ), controller_phase="parked")
+    save_factory_record(tmp_path, record)
+    events = []
+    def fail(*args):
+        raise error_type("archive unavailable")
+    monkeypatch.setattr(orchestrator, "record_clean_park", fail)
+    monkeypatch.setattr(orchestrator, "_log_event", lambda name, **kw: events.append((name, kw)))
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+        issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+        claim_record=claim, claims=_FactoryLifecycleClaims(), backend=object(), compute=object(),
+        factory_record=record, test_cmd="pytest -q", runner=lambda args: cp(args),
+        started_at=datetime.now(UTC),
+    ))
+    assert result.status == "needs-human"
+    assert ("worklink_clean_park_unverified", {
+        "issue_id": 700, "attempt": 1, "reason": "archive unavailable",
+    }) in events
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used([claim.to_comment()]) == 1
+
+
+@pytest.mark.parametrize("evidence", ["verified", "missing-time", "running", "too-old", "ambiguous", "missing-claim"])
+def test_factory_recovery_credits_only_prior_park_not_crashed_resumes(tmp_path, monkeypatch, evidence):
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+    _stub_factory_launch_identity(monkeypatch)
+    _configure_opencode_oauth(tmp_path, monkeypatch)
+    sandbox = tmp_path / "checkout/.factory-sandboxes/700"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory/.parked/700"
+    snapshot.mkdir(parents=True)
+    now = datetime.now(UTC)
+    prior = ClaimRecord(700, 1, "agent", now - timedelta(hours=2))
+    park_time = (now - timedelta(hours=1)).isoformat()
+    pre = _factory_lifecycle_status(sandbox, status="needs-human", park_snapshot=str(snapshot))
+    retained = _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "999999999", 1)).observed(pre, park_time)
+    if evidence == "missing-time":
+        retained = replace(retained, observed_at=None)
+    elif evidence == "running":
+        retained = retained.observed(_factory_lifecycle_status(sandbox, status="running"), park_time)
+    elif evidence == "too-old":
+        retained = replace(retained, observed_at=(prior.claimed_at - timedelta(seconds=1)).isoformat())
+    assert retained.controller_phase != "parked"
+    save_factory_record(tmp_path, retained)
+    history = [] if evidence == "missing-claim" else [prior.to_comment()]
+    if evidence == "ambiguous":
+        history.append(replace(prior, agent_id="other-agent").to_comment())
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path)
+    monkeypatch.setattr(claims, "_issue_comments", lambda issue_id, *, strict: list(history))
+    expected_credit = int(evidence == "verified")
+    class Backend(FeatureFactoryBackend):
+        def status(self, *args, **kwargs):
+            return pre
+        def resume(self, *args, **kwargs):
+            observed = load_factory_record(tmp_path, retained.run_id)
+            assert observed.observed_at == retained.observed_at
+            if expected_credit:
+                assert observed.controller_phase == "parked"
+                assert observed.status == pre
+            assert claims.attempts_used([prior.to_comment()]) == 1 - expected_credit
+            assert claims.attempts_used([claim.to_comment()]) == 1
+            raise RuntimeError("resume crashed before leaving needs-human")
+    monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kw: sandbox)
+    monkeypatch.setattr(orchestrator, "factory_process_is_alive", lambda rec: False)
+    monkeypatch.setattr(orchestrator, "factory_process_is_verified_dead", lambda rec: True)
+    for attempt in range(2, 6):
+        claim = ClaimRecord(700, attempt, "agent", now + timedelta(seconds=attempt))
+        history.append(claim.to_comment())
+        with pytest.raises(RuntimeError, match="resume crashed"):
+            asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                claim_record=claim, claims=claims, backend=Backend(entrypoint=retained.launcher),
+                compute=object(), retained=load_factory_record(tmp_path, retained.run_id),
+                launcher=Path(retained.launcher), repo_slug="owner/repo", base="main",
+                test_cmd="pytest -q", runner=lambda args: cp(args),
+                work_item_json=orchestrator.render_work_item(IssueContext(700, "epic", "build", {"worklink:epic"})),
+            ))
+        assert claims.attempts_used(history) == len(history) - expected_credit
+        assert not (tmp_path / f"state/worklink/clean-parks/700-{attempt}.json").exists()
+    archive = tmp_path / "state/worklink/clean-parks/700-1.json"
+    assert archive.exists() == bool(expected_credit)
+    if expected_credit:
+        payload = json.loads(archive.read_text())
+        assert payload["claim"]["claimed_at"] == prior.claimed_at.isoformat()
+        assert payload["record"]["observed_at"] == park_time
+
+
 @pytest.mark.parametrize(
     ("factory_status", "expected_status", "review_ready", "pr_url"),
     [
@@ -9693,6 +9836,9 @@ def test_factory_startup_deadline_reparks_only_a_verified_dead_unlocked_run(
     class Claims:
         def transition_issue(self, issue_id: int, **kw: Any) -> None:
             transitions.append(kw)
+
+        def _issue_comments(self, issue_id: int, *, strict: bool = False) -> list[str]:
+            return []
 
     owner = SimpleNamespace(record=lambda **kw: incidents.append(kw), release=lambda **kw: None)
     async def run() -> WorklinkRunResult:

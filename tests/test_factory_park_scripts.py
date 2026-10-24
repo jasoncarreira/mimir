@@ -125,9 +125,16 @@ def _park_stub(calls: list[list[str]], comments: list[str], *, release_rc: int =
     reads ownership and attempt forgiveness out of them rather than being told.
     """
 
+    held = True
+
     def run(cmd, **kwargs):
+        nonlocal held
         argv = list(cmd)
         calls.append(argv)
+        if argv[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"locks": {
+                "1783": {"issue_id": 1783, "agent_id": AGENT},
+            } if held else {}}), "")
         if argv[1:3] == ["issue", "comment"]:
             # A posted comment is visible to the next read, so the script's
             # postcondition sees the marker it just wrote.
@@ -138,6 +145,8 @@ def _park_stub(calls: list[list[str]], comments: list[str], *, release_rc: int =
                 argv, 0, json.dumps({"comments": list(comments)}), "",
             )
         if argv[1:3] == ["locks", "release"]:
+            if release_rc == 0:
+                held = False
             return subprocess.CompletedProcess(
                 argv, release_rc, "", "lock held by another agent" if release_rc else "",
             )
@@ -149,6 +158,10 @@ def _park_stub(calls: list[list[str]], comments: list[str], *, release_rc: int =
 def _home_with(record, tmp_path: Path) -> Path:
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
+    if record.status is not None and record.status.is_parked:
+        snapshot = tmp_path / ".factory" / ".parked" / record.run_id
+        snapshot.mkdir(parents=True, exist_ok=True)
+        record = replace(record, status=replace(record.status, park_snapshot=str(snapshot)))
     save_factory_record(home, record)
     _plane(Path(record.sandbox) / ".factory" / record.run_id)
     return home
@@ -163,7 +176,11 @@ def _park_main(record, home: Path, monkeypatch, run, tmp_path: Path, *, extra=()
     ])
     monkeypatch.setattr(park, "factory_status", lambda *a, **k: next(statuses))
     monkeypatch.setattr(park, "verify_controller", lambda pid, issue: "mimir worklink run-epic")
-    monkeypatch.setattr(park, "publish_snapshot", lambda *a, **k: tmp_path / "snap")
+    def publish(*args, **kwargs):
+        snapshot = tmp_path / ".factory" / ".parked" / record.run_id
+        snapshot.mkdir(parents=True, exist_ok=True)
+        return snapshot
+    monkeypatch.setattr(park, "publish_snapshot", publish)
     monkeypatch.setattr(park, "_run", run)
     return park.main([
         "--run-id", record.run_id, "--sandbox", record.sandbox,
@@ -331,7 +348,7 @@ def _record(
     sandbox = tmp_path / ".factory-sandboxes" / "chainlink-1783"
     sandbox.mkdir(parents=True, exist_ok=True)
     return FactoryRunRecord(
-        run_id="chainlink-1783", issue_id=1783, attempt=10,
+        run_id="chainlink-1783", issue_id=1783, attempt=1,
         repository="jasoncarreira/mimir", base_ref="base/chainlink-1783",
         branch="feature/chainlink-1783", launcher="/opt/factory/factory.js",
         sandbox=str(sandbox), session=session,
@@ -339,7 +356,7 @@ def _record(
         status=None if status is None else FactoryStatus(
             run_id="chainlink-1783", valid=True, sandbox_path=str(sandbox), status=status,
         ),
-        observed_at="2026-09-21T00:00:00+00:00", controller_phase=phase,
+        observed_at="2026-09-21T05:00:00+00:00", controller_phase=phase,
     )
 
 
@@ -356,6 +373,9 @@ def _status(
     a record must therefore pass ``sandbox_path``; the preflight never reads it,
     so its callers leave the default in place.
     """
+    if sandbox_path is not None and snapshot == "/c/.factory/.parked/x":
+        sandbox = Path(sandbox_path)
+        snapshot = str(sandbox.parent.parent / ".factory" / ".parked" / sandbox.name)
     return {
         "run_id": "chainlink-1783",
         "valid": True,
@@ -747,14 +767,10 @@ class TestParkToImmediateDispatch:
         assert ["chainlink", "locks", "release", "1783"] in calls
         assert ["chainlink", "issue", "unlabel", "1783", "worklink:in-progress"] in calls
 
-    def test_forgiveness_is_recorded_before_the_release(
+    def test_clean_park_is_recorded_before_the_release(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """Order matters, and it is the established shutdown path's order.
-
-        Recording forgiveness first means a failure between the two steps leaves
-        the claim held but already credited, rather than released and charged.
-        """
+        """Evidence must be durable before the lock can be released."""
         record = _record(tmp_path, phase="running", status="running")
         home = _home_with(record, tmp_path)
         calls: list[list[str]] = []
@@ -763,16 +779,13 @@ class TestParkToImmediateDispatch:
         monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
         monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
 
-        assert _park_main(
-            record, home, monkeypatch, _park_stub(calls, _claim_history(1)), tmp_path,
-        ) == 0
-
-        staged = [
-            "forgive" if argv[1:3] == ["issue", "comment"] else "release"
-            for argv in calls
-            if argv[1:3] in (["issue", "comment"], ["locks", "release"])
-        ]
-        assert staged == ["forgive", "release"]
+        run = _park_stub(calls, _claim_history(1))
+        def checked_run(cmd, **kwargs):
+            if list(cmd)[1:3] == ["locks", "release"]:
+                assert (home / "state/worklink/clean-parks/1783-1.json").is_file()
+            return run(cmd, **kwargs)
+        assert _park_main(record, home, monkeypatch, checked_run, tmp_path) == 0
+        assert ["chainlink", "locks", "release", "1783"] in calls
 
     def test_a_park_on_the_last_attempt_stays_resumable(
         self, tmp_path: Path, monkeypatch
@@ -800,8 +813,7 @@ class TestParkToImmediateDispatch:
             record, home, monkeypatch, _park_stub(calls, history), tmp_path,
         ) == 0
 
-        marker = next(argv[4] for argv in calls if argv[1:3] == ["issue", "comment"])
-        after = history + [marker]
+        after = history
 
         # Judged by the real admission gate, not by re-deriving the arithmetic.
         resumed = ChainlinkClaims(
@@ -810,7 +822,7 @@ class TestParkToImmediateDispatch:
             clock=lambda: datetime(2026, 9, 21, 5, 0, tzinfo=UTC),
             max_attempts=3,
         )
-        result = resumed.claim_issue(1783, after, home_path=tmp_path)
+        result = resumed.claim_issue(1783, after, home_path=home)
         assert result.attempts_exhausted is False
         assert result.claimed is True, result.reason
 
@@ -846,7 +858,7 @@ class TestParkToImmediateDispatch:
         run = _park_stub(calls, _claim_history(1, agent="someone-else"))
         with mock.patch.object(park, "_run", run):
             with pytest.raises(park.ParkError, match="held by 'someone-else'"):
-                park.release_claim_with_forgiveness("chainlink", 1783, AGENT, tmp_path)
+                park.release_parked_claim("chainlink", 1783, AGENT, tmp_path)
         assert not any(argv[1:3] == ["issue", "comment"] for argv in calls)
         assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
 
@@ -858,6 +870,8 @@ class TestParkToImmediateDispatch:
         exist. This is why the script reads through `_issue_comments` rather than
         stringifying whatever it is handed.
         """
+        record = _record(tmp_path)
+        home = _home_with(record, tmp_path)
         stored = [{"content": c} for c in _claim_history(1)]
         calls: list[list[str]] = []
 
@@ -875,24 +889,18 @@ class TestParkToImmediateDispatch:
             return subprocess.CompletedProcess(argv, 0, "{}", "")
 
         with mock.patch.object(park, "_run", run):
-            code, detail = park.release_claim_with_forgiveness(
-                "chainlink", 1783, AGENT, tmp_path,
+            code, detail = park.release_parked_claim(
+                "chainlink", 1783, AGENT, home,
             )
 
         assert code == 0
-        assert "forgiven" in detail
-        assert any(argv[1:3] == ["issue", "comment"] for argv in calls)
+        assert "cleanly parked" in detail
+        assert ["chainlink", "locks", "release", "1783"] in calls
 
-    def test_exhausted_forgiveness_refuses_before_anything_is_destroyed(
+    def test_exhausted_shutdown_forgiveness_does_not_block_clean_park(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        """The park must decide the claim outcome before it stops anything.
-
-        Forgiveness is bounded. If the budget is spent, the claim cannot be
-        credited back -- and discovering that *after* terminalizing leaves a
-        parked run whose claim is still held and charged, which is precisely the
-        unresumable state parking exists to avoid.
-        """
+        """Clean parks do not use the bounded shutdown-abort allowance."""
         record = _record(tmp_path, phase="running", status="running")
         home = _home_with(record, tmp_path)
         history = _exhausted_forgiveness_history()
@@ -903,15 +911,11 @@ class TestParkToImmediateDispatch:
         monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
         monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
 
-        with pytest.raises(park.ParkError, match="forgiveness marker would not discount"):
-            _park_main(record, home, monkeypatch, _park_stub(calls, history), tmp_path)
-
-        assert stopped == [], "the controller was stopped before the claim was decided"
-        assert not any("terminal" in argv for argv in calls), "the run was terminalized"
-        assert not any(argv[1:3] == ["issue", "comment"] for argv in calls)
-        assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
+        assert _park_main(record, home, monkeypatch, _park_stub(calls, history), tmp_path) == 0
+        assert stopped == ["controller"]
+        assert ["chainlink", "locks", "release", "1783"] in calls
         settled = load_factory_record(home, record.run_id)
-        assert settled is not None and settled.controller_phase == "running"
+        assert settled is not None and settled.controller_phase == "parked"
 
     def test_an_already_parked_run_completes_its_claim_reconciliation(
         self, tmp_path: Path, monkeypatch
@@ -940,10 +944,11 @@ class TestParkToImmediateDispatch:
 
         assert rc == 0
         assert ["chainlink", "locks", "release", "1783"] in calls
-        assert any(argv[1:3] == ["issue", "comment"] for argv in calls)
+        assert (home / "state/worklink/clean-parks/1783-1.json").is_file()
 
-    def test_an_already_parked_run_with_nothing_to_do_still_refuses(
-        self, tmp_path: Path, monkeypatch
+    @pytest.mark.parametrize("held", [False, True])
+    def test_an_already_parked_shutdown_forgiven_claim_reports_held_lock(
+        self, tmp_path: Path, monkeypatch, held: bool
     ) -> None:
         """The idempotent path must not re-forgive an already-reconciled claim.
 
@@ -966,8 +971,10 @@ class TestParkToImmediateDispatch:
             lambda *a, **k: _status(sandbox_path=record.sandbox),
         )
         monkeypatch.setattr(park, "_run", _park_stub(calls, history))
+        monkeypatch.setattr(ChainlinkClaims, "_lock_still_held_by", lambda self, claim: held)
 
-        with pytest.raises(park.ParkError, match="needs no reconciliation"):
+        message = "already discounted but its lock is still held" if held else "needs no reconciliation"
+        with pytest.raises(park.ParkError, match=message):
             park.main([
                 "--run-id", record.run_id, "--sandbox", record.sandbox,
                 "--home", str(home), "--launcher", record.launcher,
@@ -997,3 +1004,213 @@ class TestParkToImmediateDispatch:
         captured = capsys.readouterr()
         assert "THE CLAIM IS STILL HELD" in captured.err
         assert "locks release 1783" in captured.err
+
+
+@pytest.mark.parametrize("damage", ["layout", "snapshot", "attempt", "agent"])
+def test_park_eligibility_refuses_before_stop(tmp_path, monkeypatch, damage):
+    record = _record(tmp_path, phase="running", status="running")
+    if damage == "layout":
+        sandbox = tmp_path / "not-factory" / record.run_id
+        record = replace(record, sandbox=str(sandbox),
+                         status=replace(record.status, sandbox_path=str(sandbox)))
+    elif damage == "snapshot":
+        record = replace(record, status=replace(record.status, park_snapshot=str(tmp_path / "wrong")))
+    elif damage == "attempt":
+        record = replace(record, attempt=2)
+    home = _home_with(record, tmp_path)
+    stopped = []
+    calls = []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **k: stopped.append(a))
+    history = _claim_history(1, agent="other" if damage == "agent" else AGENT)
+    with pytest.raises(park.ParkError):
+        _park_main(record, home, monkeypatch, _park_stub(calls, history), tmp_path)
+    assert stopped == []
+    assert not any("terminal" in argv or argv[1:3] == ["locks", "release"] for argv in calls)
+    assert load_factory_record(home, record.run_id).controller_phase == "running"
+
+
+def test_retained_record_change_refuses_before_stop(tmp_path, monkeypatch):
+    record = _record(tmp_path, phase="running", status="running")
+    home = _home_with(record, tmp_path)
+    real_load = park.load_factory_record
+    reads = 0
+    def changed(home, run_id):
+        nonlocal reads
+        reads += 1
+        value = real_load(home, run_id)
+        return replace(value, session="changed") if reads > 1 else value
+    monkeypatch.setattr(park, "load_factory_record", changed)
+    stopped = []
+    calls = []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **k: stopped.append(a))
+    with pytest.raises(park.ParkError, match="changed during park preflight"):
+        _park_main(record, home, monkeypatch, _park_stub(calls, _claim_history(1)), tmp_path)
+    assert stopped == []
+
+
+@pytest.mark.parametrize("first_release_fails", [False, True])
+def test_clean_park_rerun_only_reconciles_held_claim(tmp_path, monkeypatch, first_release_fails):
+    record = _record(tmp_path, phase="running", status="running")
+    home = _home_with(record, tmp_path)
+    history = _claim_history(1)
+    calls = []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **k: None)
+    monkeypatch.setattr(park, "stop_residual_compute", lambda *a, **k: [])
+    monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
+    monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
+    run = _park_stub(calls, history, release_rc=int(first_release_fails))
+    assert _park_main(record, home, monkeypatch, run, tmp_path) == (3 if first_release_fails else 0)
+    assert (home / "state/worklink/clean-parks/1783-1.json").is_file()
+    monkeypatch.setattr(park, "factory_status", lambda *a, **k: _status(sandbox_path=record.sandbox))
+    if first_release_fails:
+        # The archive must suffice even if restore/pruning removes the live
+        # snapshot before the operator finishes releasing the claim.
+        (tmp_path / ".factory/.parked" / record.run_id).rmdir()
+        # Fresh invocation sees a held lock, but a now-successful release.
+        run = _park_stub(calls, history)
+    monkeypatch.setattr(park, "_run", run)
+    args = ["--run-id", record.run_id, "--sandbox", record.sandbox,
+            "--home", str(home), "--launcher", record.launcher,
+            "--reason", "budget", "--controller-pid", "none", "--agent-id", AGENT]
+    if first_release_fails:
+        assert park.main(args) == 0
+    before = list(calls)
+    with pytest.raises(park.ParkError, match="nothing to do"):
+        park.main(args)
+    assert not any(argv[1:3] in (["locks", "release"], ["issue", "unlabel"])
+                   for argv in calls[len(before):])
+
+
+def test_dry_run_prints_projected_attempt_budget_without_stopping(tmp_path, monkeypatch, capsys):
+    record = _record(tmp_path, phase="running", status="running")
+    home = _home_with(record, tmp_path)
+    calls, stopped = [], []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **kw: stopped.append(a))
+    assert _park_main(record, home, monkeypatch, _park_stub(calls, _claim_history(2)),
+                      tmp_path, extra=("--dry-run",)) == 0
+    assert "clean park would take attempts_used 2 -> 1" in capsys.readouterr().out
+    assert stopped == []
+    assert load_factory_record(home, record.run_id) == record
+    assert not any("terminal" in argv or argv[1:3] == ["locks", "release"] for argv in calls)
+
+
+def test_shutdown_forgiven_current_claim_refuses_before_stop(tmp_path, monkeypatch):
+    record = _record(tmp_path, phase="running", status="running")
+    home = _home_with(record, tmp_path)
+    history = _claim_history(2)
+    claim = ClaimRecord.from_payload(json.loads(history[-1].split(" ", 1)[1]))
+    history.append(ShutdownAbortRecord(
+        issue_id=claim.issue_id, attempt=claim.attempt, agent_id=claim.agent_id,
+        claimed_at=claim.claimed_at, aborted_at=claim.claimed_at + timedelta(hours=1),
+    ).to_comment())
+    assert ChainlinkClaims(agent_id=AGENT).attempts_used(history) == 1
+    stopped, calls = [], []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **k: stopped.append(a))
+    with pytest.raises(park.ParkError, match="already discounted"):
+        _park_main(record, home, monkeypatch, _park_stub(calls, history), tmp_path)
+    assert stopped == []
+    assert not any("terminal" in argv or argv[1:3] == ["locks", "release"] for argv in calls)
+    assert load_factory_record(home, record.run_id).controller_phase == "running"
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "file"])
+def test_unsafe_archive_directory_refuses_before_stop(tmp_path, monkeypatch, unsafe):
+    record = _record(tmp_path, phase="running", status="running")
+    home = _home_with(record, tmp_path)
+    directory = home / "state/worklink/clean-parks"
+    if unsafe == "symlink":
+        target = tmp_path / "archive-target"
+        target.mkdir()
+        directory.symlink_to(target, target_is_directory=True)
+    else:
+        directory.write_text("not a directory")
+    stopped, calls = [], []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **k: stopped.append(a))
+    with pytest.raises(park.ParkError, match="archive is unsafe"):
+        _park_main(record, home, monkeypatch, _park_stub(calls, _claim_history(1)), tmp_path)
+    assert stopped == []
+    assert not any("terminal" in argv or argv[1:3] == ["locks", "release"] for argv in calls)
+    assert load_factory_record(home, record.run_id).controller_phase == "running"
+
+
+@pytest.mark.parametrize("error", [OSError("disk full"), park.FactoryRecordError("unsafe directory")])
+def test_archive_publication_error_is_controlled_and_keeps_claim(tmp_path, monkeypatch, error):
+    record = _record(tmp_path, phase="running", status="running")
+    home = _home_with(record, tmp_path)
+    calls = []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **k: None)
+    monkeypatch.setattr(park, "stop_residual_compute", lambda *a, **k: [])
+    monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
+    monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
+    def fail_archive(*args):
+        raise error
+    monkeypatch.setattr(park, "record_clean_park", fail_archive)
+    with pytest.raises(park.ParkError, match="could not archive.*claim remains held"):
+        _park_main(record, home, monkeypatch, _park_stub(calls, _claim_history(1)), tmp_path)
+    assert load_factory_record(home, record.run_id).controller_phase == "parked"
+    assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
+
+
+@pytest.mark.parametrize("damage", ["snapshot", "missing_record", "lock_query"])
+def test_already_parked_reconciliation_propagates_real_errors(tmp_path, monkeypatch, damage):
+    record = _record(tmp_path, phase="parked", status="needs-human")
+    home = _home_with(record, tmp_path)
+    calls = []
+    history = _claim_history(1)
+    run = _park_stub(calls, history)
+    if damage == "snapshot":
+        retained = load_factory_record(home, record.run_id)
+        save_factory_record(home, replace(retained, status=replace(retained.status, park_snapshot=str(tmp_path / "wrong"))))
+    elif damage == "missing_record":
+        monkeypatch.setattr(park, "load_factory_record", lambda *args: None)
+    else:
+        retained = load_factory_record(home, record.run_id)
+        assert park.record_clean_park(home, latest := park.latest_claim(history, 1783), retained)
+        base_run = run
+        def fail_lock(cmd, **kwargs):
+            if list(cmd)[1:3] == ["locks", "list"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "lock query failed")
+            return base_run(cmd, **kwargs)
+        run = fail_lock
+    # Call the real reconciliation predicate so no earlier main() guard masks it.
+    monkeypatch.setattr(park, "_run", run)
+    with pytest.raises(park.ParkError, match={
+        "snapshot": "canonical path", "missing_record": "no matching retained",
+        "lock_query": "could not verify claim lock",
+    }[damage]):
+        park.claim_needs_reconciliation("chainlink", 1783, AGENT, home)
+    assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
+
+
+@pytest.mark.parametrize("damage", ["sandbox", "snapshot"])
+def test_main_binding_guards_refuse_before_stop(tmp_path, monkeypatch, damage):
+    record = _record(tmp_path, phase="running", status="running")
+    home = _home_with(record, tmp_path)
+    requested = record
+    if damage == "sandbox":
+        other = tmp_path / "other" / ".factory-sandboxes" / record.run_id
+        requested = replace(record, sandbox=str(other), status=replace(record.status, sandbox_path=str(other)))
+        _plane(other / ".factory" / record.run_id)
+    stopped = []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **k: stopped.append(a))
+    monkeypatch.setattr(park, "factory_status", lambda *a, **k: _status("running", sandbox_path=requested.sandbox, snapshot=str(tmp_path / "wrong") if damage == "snapshot" else None))
+    # Guard-specific reachability: neither planner nor controller lookup may mask it.
+    monkeypatch.setattr(park, "verify_controller", lambda *args: pytest.fail("binding guard bypassed"))
+    with pytest.raises(park.ParkError, match="retained sandbox" if damage == "sandbox" else "canonical path"):
+        park.main(["--run-id", requested.run_id, "--sandbox", requested.sandbox,
+                   "--home", str(home), "--launcher", record.launcher,
+                   "--reason", "budget", "--controller-pid", "4242", "--agent-id", AGENT])
+    assert stopped == []
+
+
+def test_clean_park_postcondition_refuses_release(tmp_path, monkeypatch):
+    record = _record(tmp_path, phase="parked", status="needs-human")
+    home = _home_with(record, tmp_path)
+    calls = []
+    monkeypatch.setattr(park, "_run", _park_stub(calls, _claim_history(1)))
+    # Publication claims success but has not produced a countable archive.
+    # Keep the real budget reader as the independent postcondition.
+    monkeypatch.setattr(park, "record_clean_park", lambda *args: True)
+    with pytest.raises(park.ParkError, match="did not discount"):
+        park.release_parked_claim("chainlink", 1783, AGENT, home)
+    assert not any(argv[1:3] == ["locks", "release"] for argv in calls)

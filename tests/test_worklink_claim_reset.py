@@ -52,7 +52,7 @@ def _reset(reason: str = "base repo fetch broken by reclaimed alternate") -> str
 
 
 def _claims() -> ChainlinkClaims:
-    return ChainlinkClaims.__new__(ChainlinkClaims)  # only next_attempt is exercised
+    return ChainlinkClaims(agent_id="mimir-worklink")
 
 
 def _completed(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
