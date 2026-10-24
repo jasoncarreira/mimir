@@ -44,6 +44,7 @@ from mimir.agent import (
     _REFLECTION_CHANNEL_ID,
     _filter_session_turns,
     _prompt_source_labels,
+    _turn_human_message,
 )
 from mimir.config import Config
 from mimir.feedback import FeedbackLog
@@ -137,6 +138,148 @@ def _domain_block(content: str, domain: str) -> PromptBlock:
             source_kind="protected_prompt",
         )),
     )
+
+
+def test_anthropic_turn_breakpoint_preserves_system_middleware_and_other_providers():
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    from langchain_core.messages import SystemMessage
+    from langchain_anthropic.middleware.prompt_caching import _tag_system_message
+
+    prompt = "## Channel context\n\nnotes\n\n## Current message\n\n| event"
+    stable = "## Channel context\n\nnotes\n\n"
+    anthropic = ChatAnthropic(model="claude-sonnet-4-5", api_key="test-key")
+    message = _turn_human_message(prompt, stable, anthropic)
+    assert len(message.content_blocks) == 2
+    first, second = message.content_blocks
+    assert first == {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}}
+    assert second == {"type": "text", "text": prompt[len(stable):]}
+    assert "".join(block["text"] for block in message.content_blocks) == prompt
+    # DeepAgents' existing middleware still owns the system-prompt breakpoint.
+    system = _tag_system_message(SystemMessage(content="system instructions"),
+                                 {"type": "ephemeral", "ttl": "5m"})
+    assert system.content_blocks[-1]["cache_control"]["type"] == "ephemeral"
+    for model in (FakeListChatModel(responses=["ok"]), None):
+        assert _turn_human_message(prompt, stable, model).content == prompt
+    assert _turn_human_message(prompt, "", anthropic).content == prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_turns_keep_same_prefix_after_recent_activity_and_scratch_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path)
+    channel_dir = tmp_path / "memory" / "channels" / "ch-cache"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "notes.md").write_text("persistent channel context")
+    monkeypatch.setattr(agent, "_assemble_session_summaries",
+                        lambda **_: asyncio.sleep(0, result=_block("completed session")))
+    pairs = []
+    for number in (1, 2):
+        event = AgentEvent(
+            trigger="user_message", channel_id="ch-cache", author="alice",
+            source="web", content=f"new event {number}",
+            extra={"event_ts_iso": f"2026-10-2{number}T12:00:00Z"},
+        )
+        ctx = _make_ctx(event)
+        ctx.turn_id = f"turn-{number}"
+        ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
+        prefix: list[str] = []
+        prompt, _ = await agent._build_turn_prompt(
+            ctx, event, saga_block=f"recall {number}",
+            stable_prefix_out=prefix,
+        )
+        pairs.append((prefix[0], prompt))
+        await agent._buffer.append(agent._buffer.make_message(
+            channel_id="ch-cache", kind="user_message", content=f"recent {number}",
+            author="alice", msg_id=f"msg-{number}", source="web",
+        ))
+    assert pairs[0][0] == pairs[1][0]
+    assert pairs[0][1].startswith(pairs[0][0])
+    assert pairs[1][1].startswith(pairs[1][0])
+    assert "persistent channel context" in pairs[0][0]
+    assert "completed session" in pairs[0][0]
+    assert "recent 1" not in pairs[1][0]
+    assert "recent 1" in pairs[1][1]
+    assert pairs[0][1][len(pairs[0][0]):] != pairs[1][1][len(pairs[1][0]):]
+
+
+@pytest.mark.asyncio
+async def test_reordering_preserves_mixed_turn_blocks_and_ifc_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import agent as agent_module
+    from mimir.models import IntegrityEffect
+
+    agent = _make_agent(tmp_path)
+    channel_dir = tmp_path / "memory" / "channels" / "ch-mixed"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "notes.md").write_text("stable channel facts")
+    recent = agent._buffer.make_message(
+        channel_id="ch-mixed", kind="user_message", content="untrusted recent",
+        author="alice", msg_id="prior", source="web", integrity=Integrity.UNTRUSTED,
+    )
+    await agent._buffer.append(recent)
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *_: _block("feedback"))
+    monkeypatch.setattr(agent, "_assemble_session_summaries",
+                        lambda **_: asyncio.sleep(0, result=_block("old summary")))
+    monkeypatch.setattr("mimir.skill_resolver.find_skill_for_channel",
+                        lambda *_: ("feed", "skill instructions"))
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-mixed", author="alice", source="web",
+        content="untrusted trigger", extra={"event_ts_iso": "2026-10-23T12:00:00Z"},
+    )
+    recall_labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="alice", domain="saga", resource_id="atom:one",
+        bridge_instance="saga", sensitivity="private",
+        authorized_principals=frozenset({"alice"}), source_kind="auto_recall",
+        integrity=Integrity.UNTRUSTED, integrity_effect=IntegrityEffect.INFORMATIONAL,
+    ))
+    auth = replace(_make_ctx(event).auth_context, roles=("admin",))
+    original_renderer = agent_module.build_turn_prompt
+
+    def legacy_order(*args, **kwargs):
+        rendered = original_renderer(*args, **kwargs)
+        blocks = re.findall(r"(?ms)^## .*?(?=^## |\Z)", rendered)
+        order = {name: index for index, name in enumerate((
+            "Current turn scratch", "Known identities", "Channel context",
+            "Trigger channel", "Delivery", "Autonomous trigger authority",
+            "Recent feedback signals", "Open change proposals", "Recent session summaries",
+            "Resource usage", "Upcoming", "Upcoming commitments", "Self-state",
+            "Recent activity", "Possibly relevant memories (from SAGA)",
+            "Skill: feed", "Today's date", "▶ Current message — respond to this",
+        ))}
+        return "\n\n".join(sorted((block.strip() for block in blocks),
+                                 key=lambda block: order[block.split("\n", 1)[0][3:]]))
+
+    async def assemble():
+        ctx = _make_ctx(event)
+        ctx.auth_context = auth
+        ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
+        text, _ = await agent._build_turn_prompt(
+            ctx, event, "untrusted recall", initial_auth_context=auth,
+            saga_labels=recall_labels,
+        )
+        return text, ctx.ifc_labels
+
+    stable_text, stable_labels = await assemble()
+    monkeypatch.setattr(agent_module, "build_turn_prompt", legacy_order)
+    legacy_text, legacy_labels = await assemble()
+    assert stable_text != legacy_text
+    assert stable_labels == legacy_labels
+    assert {source.integrity for source in stable_labels.sources} == {
+        Integrity.TRUSTED, Integrity.UNTRUSTED,
+    }
+    assert recall_labels.sources[0] in stable_labels.sources
+    def blocks(text):
+        return Counter(block.strip() for block in re.findall(r"(?ms)^## .*?(?=^## |\Z)", text))
+    assert blocks(stable_text) == blocks(legacy_text)
+    for heading in ("Channel context", "Recent session summaries", "Skill: feed",
+                    "Recent activity", "Possibly relevant memories (from SAGA)",
+                    "▶ Current message — respond to this", "Current turn scratch"):
+        assert f"## {heading}" in stable_text
+    assert "| untrusted trigger" in stable_text
+    assert "| untrusted recent" in stable_text
 
 
 @pytest.mark.asyncio

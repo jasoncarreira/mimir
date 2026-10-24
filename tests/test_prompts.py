@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from mimir.config import Config
-from mimir.prompts import build_system_prompt
+from mimir.prompts import build_system_prompt, build_turn_prompt
 
 
 @pytest.mark.parametrize("reader", ["core", "channel", "index"])
@@ -365,6 +365,69 @@ def test_turn_prompt_omits_attachments_section_when_empty():
     )
     prompt = build_turn_prompt(event)
     assert "Attachments:" not in prompt
+
+
+def test_stable_turn_prefix_across_consecutive_poller_events():
+    from mimir.models import AgentEvent
+
+    prefixes: list[str] = []
+    prompts = []
+    for number in (1, 2):
+        prefix: list[str] = []
+        prompts.append(build_turn_prompt(
+            AgentEvent(
+                trigger="poller", channel_id="poller:feed",
+                content=f"item {number}", source_id=f"item-{number}",
+                extra={"event_ts_iso": f"2026-10-2{number}T12:00:00Z"},
+            ),
+            channel_memory_block="stable channel facts",
+            session_summaries_block="older completed session",
+            auto_skill_block=("feed", "stable SKILL.md instructions"),
+            recent_messages=[],
+            feedback_block=f"feedback {number}",
+            core_proposals_block=f"proposal {number}",
+            usage_block=f"usage counter {number}",
+            upcoming_block=f"next tick {number}",
+            commitments_block=f"commitment {number}",
+            self_state_block=f"state {number}",
+            saga_block=f"recall {number}",
+            turn_scratch_path=f"/scratch/turn-{number}",
+            stable_prefix_out=prefix,
+        ))
+        prefixes.append(prefix[0])
+
+    assert prefixes[0] == prefixes[1]
+    assert prompts[0].startswith(prefixes[0]) and prompts[1].startswith(prefixes[1])
+    assert "## Channel context\n\nstable channel facts" in prefixes[0]
+    assert "## Recent session summaries\n\nolder completed session" in prefixes[0]
+    assert "## Skill: feed\n\nstable SKILL.md instructions" in prefixes[0]
+    assert prefixes[0].endswith("\n\n")
+    for volatile in ("Current turn scratch", "Recent activity", "Recent feedback signals",
+                     "Open change proposals", "Resource usage", "Upcoming", "Self-state",
+                     "Possibly relevant memories", "Today's date", "Current message"):
+        assert volatile not in prefixes[0]
+    assert prompts[0][len(prefixes[0]):] != prompts[1][len(prefixes[1]):]
+
+
+def test_stable_prefix_excludes_changing_recent_activity():
+    from mimir.history import Message
+    from mimir.models import AgentEvent
+
+    event = AgentEvent(trigger="user_message", channel_id="web-1", content="now")
+    prefixes = []
+    for number in (1, 2):
+        prefix: list[str] = []
+        rendered = build_turn_prompt(
+            event, channel_memory_block="same notes", stable_prefix_out=prefix,
+            recent_messages=[Message(
+                ts=f"2026-10-23T12:00:0{number}Z", msg_id=f"m{number}",
+                channel_id="web-1", author="alice", author_display="Alice",
+                kind="user_message", content=f"recent {number}", source="web",
+            )],
+        )
+        assert f"recent {number}" in rendered
+        prefixes.append(prefix[0])
+    assert prefixes[0] == prefixes[1] == "## Channel context\n\nsame notes\n\n"
 
 
 def test_turn_prompt_sanitizes_author_display_in_current_message_header():
