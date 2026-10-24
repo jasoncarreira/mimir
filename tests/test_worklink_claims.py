@@ -1631,13 +1631,37 @@ def test_repeated_verified_parks_do_not_use_attempt_budget(tmp_path: Path, caplo
             assert claims.attempts_used(history) == 0
             assert claims.next_attempt(history) == attempt + 1
     assert "clean_parks=8" in caplog.text
+    assert "issue_id=1985 generation=0" in caplog.text
+    # A restore, prune or interrupted re-park must never revoke archived credit.
+    snapshot.rmdir()
+    assert claims.attempts_used(history) == 0
+    target = tmp_path / "replacement"
+    target.mkdir()
+    snapshot.symlink_to(target, target_is_directory=True)
+    assert claims.attempts_used(history) == 0
+    # Admission and the operator-facing exhaustion record include parks even
+    # when the original snapshots are gone.
+    history.extend(ClaimRecord(1985, n, "agent", datetime(2026, 10, 2, tzinfo=UTC)
+                               + timedelta(minutes=n)).to_comment() for n in (9, 10))
+    calls = []
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    claims.runner = runner
+    result = claims.claim_issue(1985, history)
+    assert result.attempts_exhausted
+    exhausted = next(json.loads(argv[-1][len("WORKLINK_REAPER "):]) for argv in calls
+                     if argv[-1].startswith("WORKLINK_REAPER "))
+    assert exhausted["clean_parks"] == 8
+    assert exhausted["generation"] == 0
 
 
 @pytest.mark.parametrize("damage", [
-    "failed", "phase", "snapshot", "wrong_path", "invalid", "agent_id", "claimed_at",
-    "attempt", "observed_at", "symlink",
+    "failed", "phase", "wrong_path", "invalid", "agent_id", "claimed_at",
+    "attempt", "observed_at", "symlink", "owner", "hardlink", "extra_key",
+    "record_attempt", "record_issue",
 ])
-def test_only_matching_durable_clean_parks_are_free(tmp_path: Path, damage: str) -> None:
+def test_only_matching_durable_clean_parks_are_free(tmp_path: Path, damage: str, monkeypatch) -> None:
     sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "chainlink-1985"
     sandbox.mkdir(parents=True)
     snapshot = sandbox.parent.parent / ".factory" / ".parked" / "chainlink-1985"
@@ -1663,15 +1687,37 @@ def test_only_matching_durable_clean_parks_are_free(tmp_path: Path, damage: str)
             "2026-10-02T00:00:00+00:00" if damage == "claimed_at" else 2
         )
         marker.write_text(json.dumps(payload))
-    elif damage == "snapshot":
-        snapshot.rmdir()
+    elif damage == "owner":
+        from types import SimpleNamespace
+        from mimir_cultivate.worklink import claims as module
+        real_fstat = module.os.fstat
+        def wrong_owner(fd):
+            info = real_fstat(fd)
+            return SimpleNamespace(st_mode=info.st_mode, st_uid=info.st_uid + 1,
+                                   st_nlink=info.st_nlink, st_size=info.st_size)
+        monkeypatch.setattr(module.os, "fstat", wrong_owner)
+    elif damage == "hardlink":
+        import os
+        os.link(marker, marker.with_name("hardlink.json"))
     elif damage == "symlink":
         original = marker.with_name("copy.json")
         marker.rename(original)
         marker.symlink_to(original)
     else:
         payload = json.loads(marker.read_text())
-        if damage == "failed":
+        if damage == "extra_key":
+            payload["extra"] = True
+        elif damage == "record_attempt":
+            payload["record"]["attempt"] = 2
+        elif damage == "record_issue":
+            payload["record"]["issue_id"] = 1986
+            payload["record"]["run_id"] = "chainlink-1986"
+            payload["record"]["status"]["run_id"] = "chainlink-1986"
+            other_sandbox = str(sandbox.with_name("chainlink-1986"))
+            payload["record"]["sandbox"] = other_sandbox
+            payload["record"]["status"]["sandbox_path"] = other_sandbox
+            payload["record"]["status"]["park_snapshot"] = str(snapshot.with_name("chainlink-1986"))
+        elif damage == "failed":
             payload["record"]["status"]["status"] = "failed"
         elif damage == "invalid":
             payload["record"]["status"]["valid"] = False
@@ -1685,7 +1731,10 @@ def test_only_matching_durable_clean_parks_are_free(tmp_path: Path, damage: str)
     assert claims.attempts_used([claim.to_comment()]) == 1
 
 
-def test_park_credit_requires_retained_record_at_publication(tmp_path: Path) -> None:
+@pytest.mark.parametrize("damage", [
+    "missing_retained", "issue_id", "attempt", "layout", "observed_none", "snapshot_symlink",
+])
+def test_park_credit_requires_retained_record_at_publication(tmp_path: Path, damage: str) -> None:
     sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "chainlink-1985"
     sandbox.mkdir(parents=True)
     snapshot = sandbox.parent.parent / ".factory" / ".parked" / "chainlink-1985"
@@ -1700,7 +1749,26 @@ def test_park_credit_requires_retained_record_at_publication(tmp_path: Path) -> 
             status="needs-human", park_snapshot=str(snapshot),
         ), observed_at="2026-10-01T00:00:01+00:00", controller_phase="parked",
     )
+    if damage == "issue_id":
+        # Keep a fully valid retained record, mismatching only its claim.
+        claim = replace(claim, issue_id=1986)
+    elif damage == "attempt":
+        record = replace(record, attempt=2)
+    elif damage == "layout":
+        bad_sandbox = tmp_path / "checkout" / "other" / record.run_id
+        record = replace(record, sandbox=str(bad_sandbox),
+                         status=replace(record.status, sandbox_path=str(bad_sandbox)))
+    elif damage == "observed_none":
+        record = replace(record, observed_at=None)
+    elif damage == "snapshot_symlink":
+        snapshot.rmdir()
+        target = tmp_path / "target"
+        target.mkdir()
+        snapshot.symlink_to(target, target_is_directory=True)
+    if damage != "missing_retained":
+        save_factory_record(tmp_path, record)
     assert not record_clean_park(tmp_path, claim, record)
+    assert not (tmp_path / "state/worklink/clean-parks" / f"{claim.issue_id}-{claim.attempt}.json").exists()
     assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used(
         [claim.to_comment()]
     ) == 1
@@ -1729,6 +1797,41 @@ def test_stale_park_cannot_discount_a_later_crashed_claim(tmp_path: Path) -> Non
     assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used(
         [old.to_comment(), crashed.to_comment()]
     ) == 1
+
+
+@pytest.mark.parametrize("function, old, new, damage, write", [
+    ("_read_clean_park", "info.st_uid != os.geteuid()", "False", "owner", False),
+    ("_read_clean_park", "info.st_nlink != 1", "False", "hardlink", False),
+    ("_read_clean_park", 'set(payload) != {"claim", "record"}', "False", "extra_key", False),
+    ("_read_clean_park", "record.attempt <= claim.attempt", "True", "record_attempt", False),
+    ("_read_clean_park", "record.issue_id == claim.issue_id", "True", "record_issue", False),
+    ("record_clean_park", "record.issue_id != claim.issue_id", "False", "issue_id", True),
+    ("record_clean_park", "record.attempt > claim.attempt", "False", "attempt", True),
+    ("_archived_park", 'sandbox.parent.name != ".factory-sandboxes"', "False", "layout", True),
+    ("_observed_during_claim", "return False", "return True", "observed_none", True),
+    ("_published_park", "and not snapshot.is_symlink()", "", "snapshot_symlink", True),
+])
+def test_clean_park_guards_are_discriminating(tmp_path, monkeypatch, function, old, new, damage, write):
+    """Each reviewer-named guard must have a regression that kills its removal."""
+    import inspect
+    from mimir_cultivate.worklink import claims as module
+    source = inspect.getsource(getattr(module, function))
+    assert old in source
+    namespace = dict(vars(module))
+    exec(compile(source.replace(old, new, 1), "<clean-park-mutant>", "exec"), namespace)
+    monkeypatch.setattr(module, function, namespace[function])
+    # The writer's independent read-back also refuses mismatches; prove the
+    # write guard prevents publication itself, not just its return value.
+    if function == "record_clean_park":
+        reader = lambda *args: True
+        namespace["_read_clean_park"] = reader
+        monkeypatch.setattr(module, "_read_clean_park", reader)
+        monkeypatch.setitem(globals(), function, namespace[function])
+    with pytest.raises(AssertionError):
+        if write:
+            test_park_credit_requires_retained_record_at_publication(tmp_path, damage)
+        else:
+            test_only_matching_durable_clean_parks_are_free(tmp_path, damage, monkeypatch)
 
 
 @pytest.mark.parametrize("outcome", ["failed", "driver_killed", "startup_deadline", "unpublished"])

@@ -401,6 +401,7 @@ class ClaimPlan(NamedTuple):
 
 def plan_claim_release(
     chainlink_bin: str, issue_id: int, agent_id: str, home: Path,
+    *, expected_record=None,
 ) -> ClaimPlan:
     """Verify ownership before stopping the controller, writing nothing.
 
@@ -425,8 +426,31 @@ def plan_claim_release(
             "pass --agent-id if this run really was claimed under a different identity."
         )
 
+    record = load_factory_record(home, f"chainlink-{issue_id}")
+    if record is None or record.issue_id != issue_id:
+        raise ParkError("no matching retained record for the claim")
+    if expected_record is not None and record != expected_record:
+        raise ParkError("retained record changed during park preflight")
+    sandbox = Path(record.sandbox)
+    if sandbox.parent.name != ".factory-sandboxes":
+        raise ParkError("sandbox must be inside .factory-sandboxes")
+    expected_snapshot = sandbox.parent.parent / ".factory" / ".parked" / record.run_id
+    if (record.status is not None and record.status.park_snapshot is not None
+            and Path(record.status.park_snapshot) != expected_snapshot):
+        raise ParkError("park_snapshot differs from the expected canonical path")
+    if record.attempt > claim.attempt:
+        raise ParkError("retained attempt is newer than the claim")
+
+    credited = _read_clean_park(home, claim)
+    if credited:
+        try:
+            held = claims._lock_still_held_by(claim)
+        except RuntimeError as exc:
+            raise ParkError(f"could not verify claim lock: {exc}") from exc
+        if not held:
+            raise ParkError("this claim is already credited and released; nothing to reconcile")
     before = claims.attempts_used(comments, home_path=home)
-    if before == 0 and not _read_clean_park(home, claim):
+    if before == 0 and not credited:
         raise ParkError(
             "this claim is already discounted; nothing to reconcile"
         )
@@ -449,7 +473,7 @@ def release_parked_claim(
     plan = plan_claim_release(chainlink_bin, issue_id, agent_id, home)
     already_credited = _read_clean_park(home, plan.claim)
     record = load_factory_record(home, f"chainlink-{issue_id}")
-    if record is None or not record_clean_park(home, plan.claim, record):
+    if not already_credited and (record is None or not record_clean_park(home, plan.claim, record)):
         raise ParkError(
             "could not verify and archive the published park; claim remains charged and held"
         )
@@ -555,6 +579,11 @@ def main(argv: list[str] | None = None) -> int:
     record = load_factory_record(args.home, args.run_id)
     if record is None:
         raise ParkError(f"no retained record for {args.run_id} under {args.home}")
+    if Path(record.sandbox) != sandbox:
+        raise ParkError("retained sandbox differs from the requested sandbox")
+    expected_snapshot = parked_dir / args.run_id
+    if before.get("park_snapshot") is not None and Path(before["park_snapshot"]) != expected_snapshot:
+        raise ParkError("park_snapshot differs from the expected canonical path")
 
     # Identify the controller before anything is signalled, so a bad pid is a
     # refusal rather than a half-completed park.
@@ -578,7 +607,9 @@ def main(argv: list[str] | None = None) -> int:
     # Decide the claim outcome before stopping anything. Every refusal inside
     # plan_claim_release is unrecoverable once the run is terminalized, so it has
     # to happen while nothing has been changed yet.
-    plan = plan_claim_release(args.chainlink_bin, record.issue_id, args.agent_id, args.home)
+    plan = plan_claim_release(
+        args.chainlink_bin, record.issue_id, args.agent_id, args.home, expected_record=record,
+    )
     print(
         f"claim      : attempt {plan.claim.attempt} owned by {plan.claim.agent_id}; "
         f"clean park would take attempts_used {plan.before} -> {plan.before - 1}"
