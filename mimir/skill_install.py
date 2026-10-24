@@ -724,11 +724,13 @@ def cmd_install(args) -> int:
                     raise FileExistsError(f"modified plugin skills: {', '.join(conflicts)}; "
                                           "restore them individually with --restore")
                 for skill in matches:
-                    if skill_state(home, skill) == "not installed":
-                        dest, _ = install_skill(home, skill)
-                        print(f"installed skill {skill.label} into {dest}")
+                    state = skill_state(home, skill)
+                    if state in {"not installed", "upgrade available"}:
+                        dest, backup = install_skill(home, skill, restore=state == "upgrade available")
+                        print(f"{'upgraded' if backup else 'installed'} skill {skill.label} into {dest}" +
+                              (f" (backup: {backup})" if backup else ""))
                     else:
-                        print(f"{skill.label}: {skill_state(home, skill)} (skipped)")
+                        print(f"{skill.label}: {state} (skipped)")
                 return 0
             if not args.name:
                 raise ValueError("specify a skill name or --forge")
@@ -835,7 +837,7 @@ def cmd_list_optional(args) -> int:
         return 2
 
     skills = list_available()
-    from mimir.plugins.skills import selected_skills, skill_files, skill_state
+    from mimir.plugins.skills import selected_skills, skill_files, skill_state, upgrade_command
     plugin_skills = selected_skills()
     from mimir.plugins.discovery import discover_plugins, enabled_plugins
     selected_names = {candidate.name for candidate in enabled_plugins()}
@@ -856,10 +858,12 @@ def cmd_list_optional(args) -> int:
         for skill in plugin_skills:
             files = skill_files(skill)
             poller = any(path.name == "pollers.json" for path in files)
+            state = skill_state(_resolve_home(getattr(args, 'home', None)), skill)
             print(f"{skill.candidate.name}  {skill.name}  "
                   f"{'[poller]' if poller else '-'}  {skill.forge or '-'}  "
-                  f"{skill_state(_resolve_home(getattr(args, 'home', None)), skill)}  "
-                  f"{'default' if skill.default else 'optional'}")
+                  f"{state}  "
+                  f"{'default' if skill.default else 'optional'}" +
+                  (f"  {upgrade_command(skill)}" if state == "upgrade available" else ""))
     print(
         f"\ninstall: mimir skills install <name> [--home PATH]\n"
         f"source:  {resolved}\nplugin:  mimir skills install <plugin>:<skill> [--home PATH]"

@@ -150,6 +150,7 @@ def build_system_prompt(
     memory_index_body: str | None = None,
     operator_alert_channel: str = "",
     skill_block: str | None = None,
+    plugin_upgrade_notice: str | None = None,
     home_dir: str | None = None,
     writable_dirs: list[str] | None = None,
     access_control_enforced: bool = False,
@@ -240,6 +241,9 @@ def build_system_prompt(
             "## Operator config\n\n"
             f"Operator alert channel: {operator_alert_channel}"
         )
+
+    if plugin_upgrade_notice:
+        parts.append("## Plugin skill upgrades\n\n" + plugin_upgrade_notice)
 
     if skill_block:
         parts.append("## Skills\n\n" + skill_block.rstrip())

@@ -25,6 +25,7 @@ exclude = ["mimir_cultivate/defaults/skills/**", "mimir_cultivate/docker/**"]
 "brand/LICENSE" = "mimir_cultivate/brand/LICENSE"
 "mimir-plugin.toml" = "mimir_cultivate/mimir-plugin.toml"
 "mimir_cultivate/defaults/skills" = "mimir_cultivate/defaults/skills"
+"mimir_cultivate/defaults/skill_releases.json" = "mimir_cultivate/defaults/skill_releases.json"
 "mimir_cultivate/frontend/cultivate.v1.js" = "mimir_cultivate/frontend/cultivate.v1.js"
 "mimir_cultivate/frontend/cultivate.v1.css" = "mimir_cultivate/frontend/cultivate.v1.css"
 "mimir_cultivate/skins/squashmerge.json" = "mimir_cultivate/skins/squashmerge.json"

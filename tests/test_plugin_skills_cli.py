@@ -195,10 +195,29 @@ def _assert_previous_release_inventory(root: Path) -> dict[str, bytes]:
     return actual
 
 
-def test_packaged_pre_optional_skill_inventory_is_unchanged():
-    # Runs even without Cultivate installed, and needs no historical Git objects.
-    # Do not refresh hashes for a new release without a real seed migration.
-    _assert_previous_release_inventory(_PRE_OPTIONAL_ROOT)
+def test_packaged_pre_optional_skill_inventory_is_unchanged(monkeypatch):
+    import hashlib
+    import json
+
+    fixture = json.loads((Path(__file__).parent / "fixtures/plugin_skills_pre_optional.json").read_text())
+    releases = json.loads((_PRE_OPTIONAL_ROOT.parent / "skill_releases.json").read_text())
+    assert fixture["source_commit"] in releases
+    assert {f"{skill}/{rel}": digest for skill, files in releases[fixture["source_commit"]].items()
+            for rel, digest in files.items()} == fixture["files"]
+    # An edited shipped tree needs its *previous* complete inventory recorded.
+    # Once updated, this first entry is a known earlier version, not a freeze.
+    from mimir.plugins.skills import PluginSkill, skill_inventory, previous_skill_inventories
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    candidate, = [c for c in enabled_plugins() if c.name == "cultivate"]
+    for name in _PRE_OPTIONAL_SKILLS:
+        skill = PluginSkill(candidate, name, None, False)
+        current = skill_inventory(skill)
+        old = releases[fixture["source_commit"]][name]
+        latest = next(files[name] for files in reversed(list(releases.values())) if name in files)
+        assert current == latest, f"{name}: record the preceding inventory before changing packaged bytes"
+        if current != old:
+            assert old in previous_skill_inventories(skill).values()
 
 
 @pytest.mark.parametrize("path", [
@@ -211,7 +230,18 @@ def test_packaged_pre_optional_skill_inventory_is_unchanged():
 ])
 @pytest.mark.parametrize("drift", ["append", "add", "remove", "rename"])
 def test_previous_release_inventory_rejects_drift(tmp_path, path, drift):
-    released = _assert_previous_release_inventory(_PRE_OPTIONAL_ROOT)
+    import subprocess
+    import json
+
+    fixture = json.loads((Path(__file__).parent / "fixtures/plugin_skills_pre_optional.json").read_text())
+    released = {}
+    for name in fixture["files"]:
+        result = subprocess.run(["git", "-c", f"safe.directory={Path(__file__).parents[1]}",
+                                 "show", f"{fixture['source_commit']}:plugins/cultivate/mimir_cultivate/defaults/skills/{name}"],
+                                capture_output=True, cwd=Path(__file__).parents[1])
+        if result.returncode:
+            pytest.skip("historical Git objects not available in this checkout")
+        released[name] = result.stdout
     for name, data in released.items():
         target = tmp_path / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -233,22 +263,27 @@ def test_previous_release_inventory_rejects_drift(tmp_path, path, drift):
 
 @pytest.mark.parametrize("edit", ["none", "doc", "manifest"])
 def test_real_previous_release_poller_seeds_keep_running(tmp_path, monkeypatch, capsys, edit):
-    from dataclasses import replace
-
     pytest.importorskip("mimir_cultivate")
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setenv("GITHUB_REPOS", "o/r")
     manager = load_plugins(enable="cultivate")
     candidate, = manager.policy.selected_plugin_candidates
-    # Current package bytes are usable as released bytes only after every file
-    # in all four trees matches the independently supplied historical hashes.
-    released = _assert_previous_release_inventory(_PRE_OPTIONAL_ROOT)
-    old = replace(candidate, manifest=replace(candidate.manifest, defaults={
-        **candidate.manifest.defaults,
-        "skills": (*candidate.manifest.defaults["skills"],
-                   *(path for path, _ in candidate.manifest.optional_skills)),
-    }, optional_skills=()))
-    seed_plugin_defaults(tmp_path, selected=(old,))
+    import subprocess
+    import json
+
+    fixture = json.loads((Path(__file__).parent / "fixtures/plugin_skills_pre_optional.json").read_text())
+    released = {}
+    for name in fixture["files"]:
+        result = subprocess.run(["git", "-c", f"safe.directory={Path(__file__).parents[1]}",
+                                 "show", f"{fixture['source_commit']}:plugins/cultivate/mimir_cultivate/defaults/skills/{name}"],
+                                capture_output=True, cwd=Path(__file__).parents[1])
+        if result.returncode:
+            pytest.skip("historical Git objects not available in this checkout")
+        released[name] = result.stdout
+    for name, data in released.items():
+        dest = tmp_path / "skills" / f"cultivate-{name.split('/')[0]}" / Path(name).relative_to(name.split('/')[0])
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
     for name in _PRE_OPTIONAL_SKILLS:
         dest = tmp_path / "skills" / f"cultivate-{name}"
         expected = {path.removeprefix(name + "/"): data for path, data in released.items()
@@ -256,7 +291,7 @@ def test_real_previous_release_poller_seeds_keep_running(tmp_path, monkeypatch, 
         assert {p.relative_to(dest).as_posix(): p.read_bytes()
                 for p in dest.rglob("*") if p.is_file()} == expected
         skill = next(s for s in selected_skills() if s.name == name)
-        assert skill_state(tmp_path, skill) == "installed"
+        assert skill_state(tmp_path, skill) == ("upgrade available" if name == "github-poller" else "installed")
     for name in ("github-poller", "github-ci-watch"):
         dest = tmp_path / "skills" / f"cultivate-{name}"
         old_doc = released[f"{name}/SKILL.md"]
@@ -272,21 +307,127 @@ def test_real_previous_release_poller_seeds_keep_running(tmp_path, monkeypatch, 
         poller = pollers[name]
         assert poller.authority.canonical == f"poller:{name}"
         home_manifest = tmp_path / "skills" / f"cultivate-{skill_name}" / "pollers.json"
-        assert (poller.manifest_path == home_manifest) is (edit == "none")
+        assert (poller.manifest_path == home_manifest) is (edit == "none" and skill_name != "github-poller")
         skill = next(s for s in selected_skills() if s.name == skill_name)
-        assert skill_state(tmp_path, skill) == ("installed" if edit == "none" else "modified")
+        assert skill_state(tmp_path, skill) == (("upgrade available" if skill_name == "github-poller" else "installed")
+                                                   if edit == "none" else "modified")
     if edit == "none":
         assert not [entry for entry in invalid if entry[1] in {"github-activity", "github-ci-watch"}]
         assert cli("list-optional", "--home", str(tmp_path)) == 0
         listing = capsys.readouterr().out
-        assert "cultivate  github-poller  [poller]  github  installed" in listing
+        assert "cultivate  github-poller  [poller]  github  upgrade available" in listing
+        assert "mimir skills install cultivate:github-poller --restore" in listing
         assert "cultivate  github-ci-watch  [poller]  github  installed" in listing
         assert cli("install", "--forge", "github", "--home", str(tmp_path)) == 0
         output = capsys.readouterr().out
-        assert "cultivate:github-poller: installed (skipped)" in output
+        assert "upgraded skill cultivate:github-poller" in output
+        backup, = (tmp_path / ".mimir/plugin-skill-backups").glob("cultivate-github-poller-*")
+        assert (backup / "scripts/poller.py").read_bytes() == released["github-poller/scripts/poller.py"]
         assert "cultivate:github-ci-watch: installed (skipped)" in output
     assert {"github-activity", "github-ci-watch"}.isdisjoint(
         p.name for p in discover_pollers(tmp_path / "skills", policy=load_plugins(enable="").policy))
+
+
+@pytest.mark.asyncio
+async def test_prior_release_upgrade_notification_and_apply(tmp_path, monkeypatch, capsys, caplog):
+    import hashlib
+    import json
+    import logging
+    import subprocess
+    from types import SimpleNamespace
+    from mimir.agent import Agent
+    from mimir.plugins.skills import (log_optional_hint, notify_skill_upgrades,
+                                      pending_skill_upgrades, previous_skill_inventories)
+    from mimir.skill_visibility import hidden_home_skill_dirs
+
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    manager = load_plugins(enable="cultivate")
+    skill = next(s for s in selected_skills() if s.name == "github-poller")
+    version, inventory = next(iter(previous_skill_inventories(skill).items()))
+    dest = tmp_path / "skills" / skill.dirname
+    for rel, digest in inventory.items():
+        result = subprocess.run([
+            "git", "-c", f"safe.directory={Path(__file__).parents[1]}", "show",
+            f"{version}:plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/{rel}",
+        ], capture_output=True, cwd=Path(__file__).parents[1])
+        if result.returncode:
+            pytest.skip("historical Git objects not available")
+        assert hashlib.sha256(result.stdout).hexdigest() == digest
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(result.stdout)
+    assert skill_state(tmp_path, skill) == "upgrade available"
+    assert dest in hidden_home_skill_dirs(tmp_path, manager.policy)
+    invalid = []
+    with caplog.at_level(logging.WARNING):
+        pollers = discover_pollers(tmp_path / "skills", policy=manager.policy, invalid_entries=invalid)
+    activity = next(p for p in pollers if p.name == "github-activity")
+    assert activity.manifest_path != dest / "pollers.json"
+    assert activity.authority.github_activity
+    assert not [entry for entry in invalid if entry[1] == "github-activity"]
+    assert "poller_authority_rejected" not in caplog.text
+
+    agent = Agent.__new__(Agent)
+    agent._config = SimpleNamespace(home=tmp_path, plugin_manager=manager,
+                                     operator_alert_channel="alerts", writable_dirs=[],
+                                     access_control_enforced=False)
+    agent._indexes = None
+    command = "mimir skills install cultivate:github-poller --restore"
+    assert command in agent._build_system_prompt(emit_health_events=False)
+    logger = logging.getLogger("plugin-upgrade-boot-test")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        log_optional_hint(tmp_path, manager.policy.selected_plugin_candidates, logger)
+    assert command in caplog.text
+    assert cli("list-optional", "--home", str(tmp_path)) == 0
+    assert command in capsys.readouterr().out
+
+    events, sent = [], []
+    async def event(name, **fields):
+        events.append((name, fields))
+    async def send(channel, text, *, final):
+        sent.append((channel, text, final))
+    monkeypatch.setattr("mimir.event_logger.log_event", event)
+    for _ in range(3):
+        await notify_skill_upgrades(tmp_path, manager.policy.selected_plugin_candidates, "alerts", send)
+    assert events == [("plugin_skill_upgrade_available", {
+        "skill": skill.label, "version": skill.candidate.manifest.defaults["version"],
+    })]
+    assert sent == [("alerts", f"Plugin skill upgrade available: {skill.label}. "
+                     f"Run `{command}` to apply it (backup kept).", True)]
+    # A reload cannot repeat the alert, including after a send failure was retried.
+    await notify_skill_upgrades(tmp_path, manager.policy.selected_plugin_candidates, "alerts", send)
+    assert len(events) == len(sent) == 1
+
+    # A changed file or a missing file is not a previous whole-tree release.
+    original = (dest / "SKILL.md").read_bytes()
+    (dest / "SKILL.md").write_bytes(original + b"\noperator edit\n")
+    assert skill_state(tmp_path, skill) == "modified"
+    assert not pending_skill_upgrades(tmp_path, [skill])
+    assert cli("install", "--forge", "github", "--home", str(tmp_path)) == 3
+    assert (dest / "SKILL.md").read_bytes() != original
+    (dest / "SKILL.md").write_bytes(original)
+    (dest / "tests" / "operator-added.py").write_text("# local\n")
+    assert skill_state(tmp_path, skill) == "modified"
+    (dest / "tests" / "operator-added.py").unlink()
+    (dest / "scripts" / "hooks.py").unlink()
+    assert skill_state(tmp_path, skill) == "modified"
+    result = subprocess.run([
+        "git", "-c", f"safe.directory={Path(__file__).parents[1]}", "show",
+        f"{version}:plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/scripts/hooks.py",
+    ], capture_output=True, check=True, cwd=Path(__file__).parents[1])
+    (dest / "scripts" / "hooks.py").write_bytes(result.stdout)
+    assert skill_state(tmp_path, skill) == "upgrade available"
+    assert cli("install", "cultivate:github-poller", "--restore", "--home", str(tmp_path)) == 0
+    assert skill_state(tmp_path, skill) == "installed"
+    assert dest not in hidden_home_skill_dirs(tmp_path, manager.policy)
+    assert command not in agent._build_system_prompt(emit_health_events=False)
+    caplog.clear()
+    log_optional_hint(tmp_path, manager.policy.selected_plugin_candidates, logger)
+    assert command not in caplog.text
+    backup, = (tmp_path / ".mimir/plugin-skill-backups").glob("cultivate-github-poller-*")
+    assert (backup / "SKILL.md").read_bytes() == original
 
 
 @pytest.mark.parametrize("selected", [True, False])

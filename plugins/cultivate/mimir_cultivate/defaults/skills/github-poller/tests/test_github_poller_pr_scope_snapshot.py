@@ -296,6 +296,8 @@ def test_scope_verdict_survives_each_poller_emitter(
         return {"outsider": verdict, "collaborator": True}[author]
 
     monkeypatch.setattr(poller, "_pr_author_is_trusted", author_trust)
+    monkeypatch.setattr(poller, "_pr_author_trust",
+                        lambda *args, **kwargs: (author_trust(*args, **kwargs), None))
     monkeypatch.setattr(
         poller, "_github_author_is_trusted",
         lambda repo, login, token: login in {"collaborator", "reviewer", SELF},
@@ -352,6 +354,8 @@ def test_outsider_admission_withholds_before_scope_emission(
         return verdict
 
     monkeypatch.setattr(poller, "_pr_author_is_trusted", author_trust)
+    monkeypatch.setattr(poller, "_pr_author_trust",
+                        lambda *args, **kwargs: (author_trust(*args, **kwargs), None))
     monkeypatch.setattr(poller, "_emit_signal", lambda *args, **kwargs: None)
     _drive_trust_event(monkeypatch, pr, path)
     assert calls == [22]
