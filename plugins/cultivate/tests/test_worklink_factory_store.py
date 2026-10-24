@@ -251,13 +251,24 @@ def test_factory_runtime_cleanup_refuses_symlink(tmp_path: Path) -> None:
     assert (outside / "keep").read_text() == "evidence"
 
 
-def test_runtime_prune_refuses_unverified_matching_record(tmp_path: Path) -> None:
-    attempt = tmp_path / "1983-1"
-    (attempt / "checkout").mkdir(parents=True)
-    (attempt / ".factory-runtime").mkdir()
-    record, _ = _record(tmp_path / "elsewhere", LaunchHandle("local_subprocess", "invalid", None))
+@pytest.mark.parametrize("has_runtime", [False, True])
+def test_runtime_prune_refuses_unverified_matching_record(tmp_path, monkeypatch, has_runtime):
+    from mimir_cultivate.worklink import factory_store
+    record, db = _record(tmp_path, LaunchHandle("local_subprocess", "invalid", None))
+    attempt = Path(record.sandbox).parents[2]
+    if has_runtime:
+        db.write_bytes(b"retained")
+    else:
+        shutil.rmtree(attempt / ".factory-runtime")
+    assert record.children_reaped is True  # Isolate verified death from the other guard.
+    monkeypatch.setattr(factory_store, "clear_prunable_runtime",
+                        lambda path: pytest.fail("unverified driver dispatched cleanup"))
+    events = []
+    monkeypatch.setattr(autonomy, "log_event_sync", lambda name, **kw: events.append((name, kw)))
     assert not autonomy._prepare_factory_runtime_prune(attempt, [record])
-    assert (attempt / ".factory-runtime").is_dir()
+    assert events[-1][1]["reason"] == "driver death is not verified"
+    if has_runtime:
+        assert db.read_bytes() == b"retained"
 
 
 def test_factory_runtime_removed_with_prunable_checkout(tmp_path: Path, monkeypatch) -> None:
@@ -374,14 +385,127 @@ async def test_compute_reaping_ack_only_for_factory_worker_result(tmp_path, back
     assert not ComputeResult(0, "", "").children_reaped
 
 
-def test_ttl_unacknowledged_record_without_runtime_is_retained(tmp_path):
+def test_ttl_unacknowledged_record_without_runtime_is_prunable(tmp_path):
     record, db = _record(tmp_path, _dead_handle())
     record = replace(record, children_reaped=False)
     runtime = db.parents[2]
     shutil.rmtree(runtime)
     attempt = Path(record.sandbox).parents[2]
-    assert not autonomy._prepare_factory_runtime_prune(attempt, [record])
+    assert autonomy._prepare_factory_runtime_prune(attempt, [record])
     assert autonomy._prepare_factory_runtime_prune(attempt, [replace(record, children_reaped=True)])
+
+
+@pytest.mark.parametrize("case", ["ack", "unknown", "unverified", "cleanup"])
+def test_runtime_ttl_refusal_emits_reason_and_keeps_store(tmp_path, monkeypatch, case):
+    from mimir_cultivate.worklink import factory_store
+    record, db = _record(tmp_path, _dead_handle())
+    db.write_bytes(b"retained")
+    attempt = Path(record.sandbox).parents[2]
+    if case == "ack":
+        record = replace(record, children_reaped=False)
+    elif case == "unverified":
+        record = replace(record, handle=LaunchHandle("local_subprocess", "invalid", None))
+    calls = []
+    def clear(path):
+        calls.append(path)
+        raise PermissionError("worker-owned runtime")
+    monkeypatch.setattr(factory_store, "clear_prunable_runtime", clear)
+    events = []
+    monkeypatch.setattr(autonomy, "log_event_sync", lambda name, **kw: events.append((name, kw)))
+    assert not autonomy._prepare_factory_runtime_prune(attempt, [] if case == "unknown" else [record])
+    assert calls == ([attempt] if case == "cleanup" else [])
+    assert db.read_bytes() == b"retained"
+    assert len(events) == 1
+    assert events[0][0] == "worklink_factory_runtime_prune_refused"
+    assert events[0][1]["attempt_path"] == str(attempt)
+    assert {"ack": "specialist reaping", "unknown": "no authoritative", "unverified": "driver death",
+            "cleanup": "PermissionError"}[case] in events[0][1]["reason"]
+
+
+@pytest.mark.parametrize("case", ["success", "no-confirmation", "unverified", "unknown", "bad-records", "busy"])
+def test_operator_runtime_recovery_requires_confirmation_and_verified_record(tmp_path, monkeypatch, case):
+    from contextlib import contextmanager
+    from mimir_cultivate.worklink.factory_state import save_factory_record, load_factory_record
+    record, db = _record(tmp_path, _dead_handle())
+    record = replace(record, children_reaped=False)
+    if case == "unverified":
+        record = replace(record, handle=LaunchHandle("local_subprocess", "invalid", None))
+    home = tmp_path / "home"
+    save_factory_record(home, record)
+    db.write_bytes(b"legacy store")
+    attempt = Path(record.sandbox).parents[2]
+    if case in {"unknown", "bad-records"}:
+        monkeypatch.setattr(autonomy, "list_factory_records", lambda home: SimpleNamespace(
+            records=[] if case == "unknown" else [record], failures=["broken"] if case == "bad-records" else []))
+    if case == "busy":
+        @contextmanager
+        def busy(*args, **kwargs):
+            yield False
+        monkeypatch.setattr(autonomy, "factory_checkout_interlock", busy)
+    events = []
+    monkeypatch.setattr(autonomy, "log_event_sync", lambda name, **kw: events.append((name, kw)))
+    if case == "success":
+        autonomy.recover_factory_runtime(home, attempt, operator_confirmed_quiescent=True)
+        assert not (attempt / ".factory-runtime").exists()
+        assert autonomy._prepare_factory_runtime_prune(attempt, [record])
+        assert load_factory_record(home, record.run_id) == record  # No invented reap acknowledgement.
+        assert events[0][0] == "worklink_factory_runtime_operator_cleared"
+    else:
+        with pytest.raises(RuntimeError):
+            autonomy.recover_factory_runtime(home, attempt, operator_confirmed_quiescent=case != "no-confirmation")
+        assert db.read_bytes() == b"legacy store"
+        assert not events
+
+
+def test_operator_runtime_recovery_cli_requires_confirmation_and_dispatches(tmp_path, monkeypatch):
+    import argparse
+    from mimir_cultivate import commands
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    worklink_parser = commands.add_argparse(sub)
+    argv = ["worklink", "clear-factory-runtime", str(tmp_path / "1983-1"), "--home", str(tmp_path)]
+    with pytest.raises(SystemExit):
+        parser.parse_args(argv)
+    calls = []
+    monkeypatch.setattr(autonomy, "recover_factory_runtime", lambda *a, **kw: calls.append((a, kw)))
+    assert commands.dispatch(parser.parse_args(argv + ["--confirm-quiescent"]), worklink_parser) == 0
+    assert calls == [((tmp_path, tmp_path / "1983-1"), {"operator_confirmed_quiescent": True})]
+
+
+def test_base_verified_dead_ttl_regressions_execute_with_cultivate_selected(tmp_path):
+    """Do not let a core-only runner silently skip the unchanged base TTL matrix."""
+    root = Path(__file__).resolve().parents[3]
+    env = dict(os.environ, MIMIR_PLUGINS="cultivate", PYTEST_ADDOPTS="")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-rA", "-o", "addopts=",
+         "tests/test_worklink_autonomy.py",
+         "--basetemp", str(tmp_path / "base-ttl")],
+        cwd=root, env=env, text=True, capture_output=True, timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    executed = [line for line in result.stdout.splitlines()
+                if line.startswith("PASSED tests/test_worklink_autonomy.py::"
+                                   "test_prune_removes_old_attempt_with_verified_dead_unresumed_factory[")]
+    assert len(executed) == 24, result.stdout
+
+
+def test_executor_prune_uses_current_isolated_interpreter(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import worker_client
+    record, db = _record(tmp_path, _dead_handle())
+    db.write_bytes(b"worker-owned")
+    checkout = Path(record.sandbox).parent.parent
+    calls = []
+    monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: (checkout, 1983, 1))
+    metrics = {"bytes_before": 20, "bytes_after": 10, "rows_deleted": 1}
+    def control(path, argv, **kwargs):
+        assert path == checkout
+        assert argv == [sys.executable, "-I", str(Path(sys.modules[prune_factory_store.__module__].__file__).resolve()),
+                        "--prune", str(db)]
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(metrics).encode(), b"")
+    monkeypatch.setattr(worker_client, "run_factory_control", control)
+    assert prune_factory_store(record) == metrics
+    assert len(calls) == 1
 
 
 def test_ttl_cleanup_timeout_is_fail_closed(tmp_path, monkeypatch):

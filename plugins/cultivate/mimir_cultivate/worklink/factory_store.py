@@ -62,6 +62,9 @@ def _prune_db(path: Path) -> dict[str, int] | None:
     # event types: they may be needed by future OpenCode replay implementations.
     with sqlite3.connect(f"file:{quote(str(path))}?mode=rw", uri=True, timeout=1) as db:
         def checkpoint() -> None:
+            # Detects active WAL transactions, NOT idle outside connections.
+            # Quiescence relies on the executor acknowledgement (or explicit
+            # operator recovery); SQLite locking alone is not a liveness proof.
             if db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]:
                 raise RuntimeError("factory OpenCode store still has a reader or writer")
 
