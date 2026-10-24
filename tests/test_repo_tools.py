@@ -659,7 +659,11 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
         "pr_spec": "trusted",
         "repo_checkout": None if case != "collaborator" else "trusted",
     }, f"lease_refusals={refusal_reasons}; observed={observed_provenance}; events={events}"
-    assert set(observed.values()) == {"untrusted"}
+    assert observed == {
+        "pr_reviews": "untrusted", "pr_comments": "untrusted",
+        "pr_metadata": "untrusted", "pr_spec": "untrusted",
+        "repo_checkout": "trusted" if case == "collaborator" else "untrusted",
+    }
     assert auth.ifc_state.has_untrusted_active_ingest()
     if case in {"collaborator", "git_timeout"}:
         assert status_probes  # The positive/timeout controls reached the real proof boundary.
@@ -891,8 +895,11 @@ def test_resumed_local_commit_requires_clean_producing_turn(
                           repo_pr_action_scope=scope), result=checkout,
         provenance=checkout_provenance,
     )
-    assert checkout_labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_checkout>"
-    assert checkout_labels.sources[0].integrity == "untrusted"
+    assert checkout_labels.sources[0].resource_id == (
+        f"owner/repo#pull/7@{scope.observed_head_sha}" if trusted
+        else "<unresolved-resource:protected_tool:repo_checkout>"
+    )
+    assert checkout_labels.sources[0].integrity == ("trusted" if trusted else "untrusted")
     turn2.ifc_state.merge(checkout_labels)
     file_source = protected_result_source(
         turn2, principal="filesystem", domain="filesystem",
@@ -913,16 +920,20 @@ def test_resumed_local_commit_requires_clean_producing_turn(
             ToolAuthorization(tool_name=name, decision="resource_scoped", allowed=True,
                               repo_pr_action_scope=scope), result="ok", provenance=provenance,
         )
-        assert labels.sources[0].integrity == "untrusted"
-        assert labels.sources[0].resource_id == f"<unresolved-resource:protected_tool:{name}>"
+        assert labels.sources[0].integrity == ("trusted" if trusted else "untrusted")
+        assert labels.sources[0].resource_id == (
+            f"owner/repo#pull/7@{scope.observed_head_sha}" if trusted
+            else f"<unresolved-resource:protected_tool:{name}>"
+        )
         turn2.ifc_state.merge(labels)
     decision = SinkGate.check_sink_flow(
         "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
         turn2.ifc_state.current(InformationFlowLabels()), turn2,
         enforce=False, repo_pr_action_scope=scope,
     )
-    assert not decision.allowed
-    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    assert decision.allowed is trusted
+    if not trusted:
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
 
 
 def test_rebase_cannot_clean_up_tainted_local_commit(tmp_path: Path) -> None:
