@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,7 +61,11 @@ def skill_inventory(skill: PluginSkill) -> dict[str, str]:
 
 
 def previous_skill_inventories(skill: PluginSkill) -> dict[str, dict[str, str]]:
-    """Read the selected distribution's shipped previous-release inventories."""
+    """Read recorded release inventories, including the current packaged release.
+
+    Kept under the original API name for callers; skill_state checks the current
+    inventory first, so only a different recorded inventory enables an upgrade.
+    """
     dist = skill.candidate.entry_point.dist
     if dist is None or dist.files is None:
         return {}
@@ -80,24 +85,44 @@ def previous_skill_inventories(skill: PluginSkill) -> dict[str, dict[str, str]]:
 def skill_state(home: Path, skill: PluginSkill) -> str:
     """Match the whole installed tree against the inventoried package files."""
     try:
-        root = safe_destination(home, Path("skills") / skill.dirname)
-    except ValueError:
-        return "modified"
-    if not root.exists():
-        return "not installed"
-    if not root.is_dir():
-        return "modified"
-    expected = skill_inventory(skill)
-    actual: dict[str, str] = {}
-    for path in root.rglob("*"):
-        if path.is_symlink():
+        try:
+            root = safe_destination(home, Path("skills") / skill.dirname)
+        except ValueError:
             return "modified"
-        if path.is_file():
-            actual[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual == expected:
-        return "installed"
-    return ("upgrade available" if any(actual == previous for previous in previous_skill_inventories(skill).values())
-            else "modified")
+        try:
+            root_mode = root.stat().st_mode
+        except FileNotFoundError:
+            return "not installed"
+        if not stat.S_ISDIR(root_mode):
+            return "modified"
+        expected = skill_inventory(skill)
+        actual: dict[str, str] = {}
+
+        def walk_error(error: OSError) -> None:
+            raise error
+
+        # Path.rglob may suppress scandir errors. Never accept a partial tree.
+        for directory, dirs, files in os.walk(root, onerror=walk_error, followlinks=False):
+            base = Path(directory)
+            for name in (*dirs, *files):
+                if (base / name).is_symlink():
+                    return "modified"
+            dirs[:] = [name for name in dirs if name not in {"__pycache__", ".pytest_cache"}]
+            for name in files:
+                path = base / name
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    return "modified"
+                actual[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual == expected:
+            return "installed"
+        return ("upgrade available" if any(actual == previous for previous in previous_skill_inventories(skill).values())
+                else "modified")
+    except OSError:
+        from mimir.event_logger import log_event_sync
+
+        # No file names, exception messages or home bytes in diagnostics.
+        log_event_sync("plugin_skill_inventory_unreadable", skill=skill.label)
+        return "modified"
 
 
 def pending_skill_upgrades(home: Path, selected: list[PluginSkill] | None = None) -> list[PluginSkill]:
@@ -115,7 +140,9 @@ async def notify_skill_upgrades(home: Path, candidates, operator_channel: str, s
 
     for skill in pending_skill_upgrades(home, skills_for_candidates(candidates)):
         version = str(skill.candidate.manifest.defaults.get("version", skill.candidate.manifest.version))
-        marker = Path(".mimir/plugin-skill-upgrades") / skill.dirname / version
+        target = hashlib.sha256(json.dumps(skill_inventory(skill), sort_keys=True,
+                                           separators=(",", ":")).encode("utf-8")).hexdigest()
+        marker = Path(".mimir/plugin-skill-upgrades") / skill.dirname / target
         for kind in ("event", "alert"):
             if kind == "alert" and not operator_channel:
                 continue

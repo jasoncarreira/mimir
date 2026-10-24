@@ -34,6 +34,18 @@
     "review": {"SKILL.md": "4e6ee1e91213482fb2a2b91efd9f814b2a7d4b34e711d2bb6083e7287e60876f"}
   },
   "0.9.10-2001": {
+    "chainlink-orchestrator": {
+      "SKILL.md": "a328b7a5717a2843339c863ec4c5680ab4260d2f9af1c7161eb80a4d140c170b",
+      "pollers.json": "7771c3d953de5a4a299053d523a34695205888a5bb83e7e9f7fc250125ba407d",
+      "scripts/poller.py": "41336a6eb91fd41f0700d62a670c0edc416782319cd704b45bd0c3ecf00c3aec"
+    },
+    "worklink-tool-pins": {
+      "SKILL.md": "700af6e66123146b1b1ffd00f3cddce3090984ad71985aaba799a2a8d1ebbdfc",
+      "pollers.json": "0f1a6281e89ce354681add39dac58a9e95c12c5d4dfa6d3408c0fdf7bd897c4a",
+      "scripts/poller.py": "de83dba8293ac100a723de5398fcae560f083297fb862fd7e0c3438ff7dc972a",
+      "tests/conftest.py": "5df4b16fedf0d178373d2c2196d579d9571ecc0d7c5f1c394360b5b45a937c1a",
+      "tests/test_worklink_tool_pins_poller.py": "1ce74f66db36488f50afcb40ced0b7c45ff44c85a8ca7d5ad720145cd19a3603"
+    },
     "github-poller": {
       "SKILL.md": "fbdf96e35f4c4a14ed2ae00fc6f1c7e5e74271eec6a05a37a3371bbd16034de1",
       "pollers.json": "273c2d13e8f8fcf7f353d5d9107a729cbd522819ebd2897f0608492353e1d243",

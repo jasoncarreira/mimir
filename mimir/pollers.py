@@ -1934,6 +1934,9 @@ def discover_pollers(
             if path in manifests:
                 raise ValueError(f"plugin poller resource collision: {path}")
             manifests[path] = candidate.name
+            # Reserved home-seed takeover is currently Cultivate-only. Other
+            # plugins retain their existing manifest/ownership policy here;
+            # generic release inventories alone do not grant that authority.
             if candidate.name == "cultivate":
                 seeded = skills_dir / f"cultivate-{path.parent.name}" / "pollers.json"
                 if seeded in manifests:
@@ -1947,7 +1950,11 @@ def discover_pollers(
                 if seeded in manifests and not seeded.is_symlink() and seeded.is_file():
                     # A local copy cannot claim reserved provider identity after
                     # its manifest diverges from the inventoried distribution.
-                    if seeded.read_bytes() == path.read_bytes():
+                    try:
+                        identical_manifest = seeded.read_bytes() == path.read_bytes()
+                    except OSError:
+                        identical_manifest = False
+                    if identical_manifest:
                         manifests[seeded] = candidate.name
                         validated_seeds.add(seeded)
                         packaged_seeds[path] = seeded
