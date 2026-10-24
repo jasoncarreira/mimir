@@ -547,12 +547,48 @@ class MimirFilesystemMiddleware(FilesystemMiddleware):
             )
 
     def _process_large_message(self, message: ToolMessage, resolved_backend: Any) -> tuple[ToolMessage, bool]:
-        processed, evicted = super()._process_large_message(message, resolved_backend)
+        from .turn_stores import turn_store
+        from ._context import get_current_turn
+
+        prefix = turn_store("large_tool_results")
+        if prefix is None and get_current_turn() is not None:
+            return message, False
+        if prefix is None:
+            processed, evicted = super()._process_large_message(message, resolved_backend)
+        else:
+            content = deepagents_filesystem._extract_text_from_message(message)
+            processed = (
+                deepagents_filesystem._offload_tool_message_content(
+                    message, content, resolved_backend, prefix,
+                ) if self._tool_token_limit_before_evict
+                and len(content) > deepagents_filesystem.NUM_CHARS_PER_TOKEN * self._tool_token_limit_before_evict
+                else None
+            )
+            evicted = processed is not None
+            processed = processed or message
         self._record_eviction(message, evicted)
         return processed, evicted
 
     async def _aprocess_large_message(self, message: ToolMessage, resolved_backend: Any) -> tuple[ToolMessage, bool]:
-        processed, evicted = await super()._aprocess_large_message(message, resolved_backend)
+        from .turn_stores import turn_store
+        from ._context import get_current_turn
+
+        prefix = turn_store("large_tool_results")
+        if prefix is None and get_current_turn() is not None:
+            return message, False
+        if prefix is None:
+            processed, evicted = await super()._aprocess_large_message(message, resolved_backend)
+        else:
+            content = deepagents_filesystem._extract_text_from_message(message)
+            processed = (
+                await deepagents_filesystem._aoffload_tool_message_content(
+                    message, content, resolved_backend, prefix,
+                ) if self._tool_token_limit_before_evict
+                and len(content) > deepagents_filesystem.NUM_CHARS_PER_TOKEN * self._tool_token_limit_before_evict
+                else None
+            )
+            evicted = processed is not None
+            processed = processed or message
         self._record_eviction(message, evicted)
         return processed, evicted
 
@@ -1767,7 +1803,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
             # Reading back this turn's own offload is not a new IFC input.
             if (
                 turn is not None and artifact_root is not None
-                and resolved.parent == artifact_root
+                and resolved.parent == artifact_root / str(getattr(turn, "turn_id", ""))
                 and resolved.name in getattr(turn, "evicted_tool_result_ids", ())
             ):
                 continue
@@ -2349,10 +2385,11 @@ class WriteGuardBackend:
         canonical_path = self._canonicalize_path(file_path)
         if not canonical_path.startswith("/"):
             canonical_path = "/" + canonical_path
-        result = self._fs.write(
-            file_path=canonical_path,
-            content=content,
-        )
+        from .turn_stores import record_research_draft, research_draft_write_guard
+        with research_draft_write_guard(self._root, canonical_path):
+            result = self._fs.write(file_path=canonical_path, content=content)
+            if result.error is None:
+                record_research_draft(self._root, canonical_path)
         if result.error is _WRITE_COLLISION:
             return WriteResult(error=_collision_error(canonical_path))
         if isinstance(result.error, _WriteFailure):
@@ -2381,7 +2418,12 @@ class WriteGuardBackend:
         canonical_path = self._canonicalize_path(file_path)
         if not canonical_path.startswith("/"):
             canonical_path = "/" + canonical_path
-        return self._fs.replace(canonical_path, content, allow_shrink=allow_shrink)
+        from .turn_stores import record_research_draft, research_draft_write_guard
+        with research_draft_write_guard(self._root, canonical_path):
+            result = self._fs.replace(canonical_path, content, allow_shrink=allow_shrink)
+            if result.error is None:
+                record_research_draft(self._root, canonical_path)
+        return result
 
     async def areplace(self, file_path: str, content: str, allow_shrink: bool = False) -> WriteResult:
         return await asyncio.to_thread(self.replace, file_path, content, allow_shrink)
@@ -2413,12 +2455,16 @@ class WriteGuardBackend:
             self._record_denial("edit_identities_protected", file_path)
             return EditResult(error=self._IDENTITIES_DENY_REASON)
         # Idempotent with ``_resolve_target`` — see ``write`` above.
-        return self._fs.edit(
-            file_path=self._canonicalize_path(file_path),
-            old_string=old_string,
-            new_string=new_string,
-            replace_all=replace_all,
-        )
+        canonical_path = self._canonicalize_path(file_path)
+        from .turn_stores import record_research_draft, research_draft_write_guard
+        with research_draft_write_guard(self._root, canonical_path):
+            result = self._fs.edit(
+                file_path=canonical_path, old_string=old_string,
+                new_string=new_string, replace_all=replace_all,
+            )
+            if result.error is None:
+                record_research_draft(self._root, canonical_path)
+        return result
 
     async def aedit(
         self,

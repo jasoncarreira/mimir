@@ -127,6 +127,16 @@ async def test_bash_async_protected_operands_never_spawn(fake_registry, command,
 
 
 @pytest.mark.asyncio
+async def test_bash_async_uses_same_default_cwd_as_shell_exec(fake_registry, tmp_path, monkeypatch):
+    from mimir.tools import extra
+
+    remembered = tmp_path / "remembered"
+    monkeypatch.setattr(extra, "_effective_shell_cwd", lambda cwd=None, **kwargs: remembered)
+    await shell_async.bash_async.ainvoke({"command": "sleep 5"})
+    assert fake_registry._spawned_log[0]["cwd"] == str(remembered)
+
+
+@pytest.mark.asyncio
 async def test_bash_async_accepts_explicit_cwd(
     fake_registry: ShellJobRegistry, tmp_path: Path,
 ) -> None:
@@ -959,6 +969,7 @@ class _FakeTurnCtx:
 
     def __init__(self, channel_id: str) -> None:
         self.channel_id = channel_id
+        self.session_id = None
 
 
 @pytest.fixture

@@ -22,20 +22,22 @@ def _history_file(path: str) -> Path | None:
     if not home or requested.suffix != ".md":
         return None
     root = Path(home).resolve()
-    candidate = (
-        root / "conversation_history" / requested.name
-        if requested.parts[:2] == ("/", "conversation_history") and len(requested.parts) == 3
-        else requested
-    )
+    candidate = root / str(requested).lstrip("/") if requested.parts[:2] == ("/", "conversation_history") else requested
     try:
-        return candidate if candidate.parent == root / "conversation_history" and candidate.resolve(strict=True) == candidate else None
+        parent = root / "conversation_history"
+        return candidate if (candidate.parent == parent or candidate.parent.parent == parent) and candidate.resolve(strict=True) == candidate else None
     except (OSError, RuntimeError, ValueError):
         return None
 
 
 def _label_file(path: Path) -> Path:
     home = Path(os.environ["MIMIR_HOME"]).resolve()
-    return home / ".mimir" / "conversation_history_labels" / (hashlib.sha256(str(path).encode()).hexdigest() + ".json")
+    from .access_control import _valid_turn_scratch_id
+    turn_id = path.parent.name if path.parent.parent == home / "conversation_history" else None
+    parent = home / ".mimir" / "conversation_history_labels"
+    if turn_id is not None and _valid_turn_scratch_id(turn_id):
+        parent /= turn_id
+    return parent / (hashlib.sha256(str(path).encode()).hexdigest() + ".json")
 
 
 def read_offload_labels(path: str) -> tuple[Any, ...] | None:
@@ -328,6 +330,15 @@ def _wrap_sync_offload(original: Any, logger: Any) -> Any:
         # 4 were given" on every turn that offloads. The pin is ``>=0.7.1,<0.8``, so a
         # signature change inside that range is expected rather than exceptional.
         history = getattr(original, "__name__", "") == "_offload_to_backend"
+        from ._context import get_current_turn
+        from .turn_stores import turn_store
+        try:
+            turn = get_current_turn()
+        except Exception:
+            # Provenance bookkeeping is non-fatal; upstream may still offload.
+            turn = None
+        if history and hasattr(turn, "turn_scratch_path") and turn_store("conversation_history") is None:
+            return None
         session_id = kwargs.get("session_id", args[1] if len(args) > 1 else None)
         path, previous_hash, previous_sources, failed = (
             _prepare_offload(self, session_id, logger) if history else (None, None, None, False)
@@ -348,6 +359,14 @@ def _wrap_async_offload(original: Any, logger: Any) -> Any:
         # See _wrap_sync_offload: forward past ``backend`` without restating upstream's
         # signature.
         history = getattr(original, "__name__", "") == "_aoffload_to_backend"
+        from ._context import get_current_turn
+        from .turn_stores import turn_store
+        try:
+            turn = get_current_turn()
+        except Exception:
+            turn = None
+        if history and hasattr(turn, "turn_scratch_path") and turn_store("conversation_history") is None:
+            return None
         session_id = kwargs.get("session_id", args[1] if len(args) > 1 else None)
         path, previous_hash, previous_sources, failed = (
             await asyncio.to_thread(_prepare_offload, self, session_id, logger)
@@ -373,6 +392,18 @@ def install_offload_traceback_logging_patch() -> None:
         return
 
     middleware = summarization.SummarizationMiddleware
+    if not getattr(middleware._get_history_path, "_mimir_turn_scoped", False):
+        original_path = middleware._get_history_path
+
+        @wraps(original_path)
+        def turn_history_path(self: Any, session_id: str) -> str:
+            from .turn_stores import turn_store
+
+            prefix = turn_store("conversation_history")
+            return f"{prefix}/{session_id}.md" if prefix else original_path(self, session_id)
+
+        turn_history_path._mimir_turn_scoped = True
+        middleware._get_history_path = turn_history_path
     wrappers = {
         "_offload_inline_media": _wrap_sync_offload,
         "_aoffload_inline_media": _wrap_async_offload,

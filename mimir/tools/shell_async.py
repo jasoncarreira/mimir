@@ -331,6 +331,13 @@ async def bash_async(
     # audit "how many refused respawns happened" without reading turn
     # transcripts.  The tool return-string is the agent-visible signal;
     # the event is the operator/introspection-visible audit trail.
+    from .extra import _effective_shell_cwd
+    from ._shell_env import bound_direct_exec_argv
+
+    # Match shell_exec's default/session cwd; service argv never inherits it.
+    direct_execution = bound_direct_exec_argv() is not None or mimir_direct_argv is not None
+    effective_cwd = _effective_shell_cwd(cwd, allow_session_state=not direct_execution)
+    cwd = str(effective_cwd) if effective_cwd is not None else None
     effective_intent_cwd = _intent_cwd(command, cwd)
     if channel_id is not None:
         new_intent = _intent_prefix(command)

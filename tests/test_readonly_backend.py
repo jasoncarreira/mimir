@@ -1102,22 +1102,25 @@ class TestWriteGuardBackend:
         )
         content = "offloaded service result " * 10
 
-        token = set_current_turn(SimpleNamespace(turn_id="spill", auth_context=auth))
+        from mimir.access_control import ensure_turn_scratch
+        scratch = ensure_turn_scratch(home, "spill")
+        token = set_current_turn(SimpleNamespace(turn_id="spill", auth_context=auth,
+                                                 turn_scratch_path=scratch))
         try:
             processed, evicted = middleware._process_large_message(
                 ToolMessage(content=content, tool_call_id="service-call"), backend,
             )
-            result = backend.read(f"{middleware._large_tool_results_prefix}/service-call")
+            result = backend.read(f"{middleware._large_tool_results_prefix}/spill/service-call")
         finally:
             reset_current_turn(token)
 
         artifact_root = framework_large_tool_results_root(home)
         assert artifact_root is not None
         assert evicted is True
-        assert str(middleware._large_tool_results_prefix) in str(processed.content)
+        assert f"{middleware._large_tool_results_prefix}/spill" in str(processed.content)
         assert result.error is None
         assert result.file_data["content"] == content
-        assert (artifact_root / "service-call").read_text(encoding="utf-8") == content
+        assert (artifact_root / "spill" / "service-call").read_text(encoding="utf-8") == content
 
         sibling = artifact_root.parent / f"{artifact_root.name}-private" / "blocked.txt"
         denied = backend.write(str(sibling), "blocked")
