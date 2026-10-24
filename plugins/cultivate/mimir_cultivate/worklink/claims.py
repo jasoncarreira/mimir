@@ -14,8 +14,10 @@ from datetime import UTC, datetime, timedelta
 import fcntl
 import json
 import logging
+import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import time
 from typing import Any, Callable, Iterable, Sequence
@@ -23,6 +25,8 @@ from typing import Any, Callable, Iterable, Sequence
 from .checkout import _default_runner
 from .control import operator_stop_requested
 from .dispatch_failures import _find_latest_evidence_file_for_issue, record_leaf_transition_best_effort
+from .factory_state import FactoryRecordError, FactoryRunRecord, _require_safe_directory, load_factory_record
+from mimir._atomic import atomic_write_json
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
 WORKLINK_EPIC_LABEL = "worklink:epic"
@@ -56,6 +60,7 @@ QUOTA_HOLD_PREFIX = "WORKLINK_QUOTA_HOLD "
 MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
 REAPER_PREFIX = "WORKLINK_REAPER "
 REAPER_SKIP_SAMPLE_LIMIT = 20
+_CLEAN_PARK_MAX_BYTES = 2 * 1024 * 1024
 
 # Retrying remains useful even with Mimir's mutex: another Chainlink caller may
 # not participate in it. On mimirbot 2026-09-09, dispatch to successful claim
@@ -82,6 +87,13 @@ Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 EventLogger = Callable[..., None]
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AttemptBudget:
+    charged: int
+    clean_parks: int
+    generation: int
 
 
 class _ChainlinkContentionExhausted(RuntimeError):
@@ -302,6 +314,106 @@ def claim_records_from_comments(comments: Iterable[str]) -> list[ClaimRecord]:
     return _scan_claim_comments(comments)[0]
 
 
+def _clean_park_path(home: Path, claim: ClaimRecord) -> Path:
+    return home / "state" / "worklink" / "clean-parks" / f"{claim.issue_id}-{claim.attempt}.json"
+
+
+def _archived_park(record: FactoryRunRecord) -> bool:
+    """Validate archived facts without consulting mutable checkout state."""
+    status = record.status
+    sandbox = Path(record.sandbox)
+    if (
+        record.controller_phase != "parked"
+        or status is None or not status.valid or not status.is_parked
+        or status.park_snapshot is None
+        or sandbox.parent.name != ".factory-sandboxes"
+    ):
+        return False
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / record.run_id
+    return Path(status.park_snapshot) == snapshot
+
+
+def _published_park(record: FactoryRunRecord) -> bool:
+    """Check live snapshot safety once, before archiving the credit."""
+    if not _archived_park(record):
+        return False
+    snapshot = Path(record.status.park_snapshot)
+    try:
+        return snapshot.is_dir() and not snapshot.is_symlink()
+    except OSError:
+        return False
+
+
+def _observed_during_claim(record: FactoryRunRecord, claim: ClaimRecord) -> bool:
+    """A previous park of this same run cannot excuse a later crashed claim."""
+    if record.observed_at is None:
+        return False
+    try:
+        return _parse_dt(record.observed_at) >= claim.claimed_at
+    except ValueError:
+        return False
+
+
+def record_clean_park(home: Path, claim: ClaimRecord, record: FactoryRunRecord) -> bool:
+    """Archive the observed parked record before resume replaces its status.
+
+    The claim comment alone cannot certify a park. Missing or unsafe evidence is
+    a charged attempt; never publish evidence for a running or failed record.
+    """
+    if (
+        record.issue_id != claim.issue_id
+        or record.attempt > claim.attempt
+        or not _observed_during_claim(record, claim)
+        or not _published_park(record)
+    ):
+        return False
+    retained = load_factory_record(home, record.run_id)
+    if retained != record:
+        return False
+    path = _clean_park_path(home, claim)
+    _require_safe_directory(path.parent, create=True)
+    if path.exists() or path.is_symlink():
+        return _read_clean_park(home, claim)
+    payload = {"claim": json.loads(claim.to_comment()[len(CLAIM_PREFIX):]), "record": record.to_json()}
+    if len(json.dumps(payload).encode("utf-8")) > _CLEAN_PARK_MAX_BYTES:
+        return False
+    atomic_write_json(path, payload, mode=0o600)
+    return _read_clean_park(home, claim)
+
+
+def _read_clean_park(home: Path, claim: ClaimRecord) -> bool:
+    path = _clean_park_path(home, claim)
+    try:
+        if not _require_safe_directory(path.parent, create=False):
+            return False
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_nlink != 1 or info.st_size > _CLEAN_PARK_MAX_BYTES):
+                return False
+            raw = os.read(fd, _CLEAN_PARK_MAX_BYTES + 1)
+        finally:
+            os.close(fd)
+        if len(raw) > _CLEAN_PARK_MAX_BYTES:
+            return False
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or set(payload) != {"claim", "record"}:
+            return False
+        marker = ClaimRecord.from_payload(payload["claim"])
+        record = FactoryRunRecord.from_json(payload["record"])
+        return (
+            (marker.issue_id, marker.attempt, marker.agent_id, marker.claimed_at)
+            == (claim.issue_id, claim.attempt, claim.agent_id, claim.claimed_at)
+            and record.issue_id == claim.issue_id
+            and record.attempt <= claim.attempt
+            and _observed_during_claim(record, claim)
+            and _archived_park(record)
+        )
+    except (OSError, FactoryRecordError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
 def _claim_is_newer(candidate: ClaimRecord, current: ClaimRecord) -> bool:
     """True when ``candidate`` supersedes ``current`` for the same issue.
 
@@ -480,12 +592,15 @@ class ChainlinkClaims:
             # Judge exhaustion only after duplicate liveness, so a live final
             # attempt is refused as a duplicate instead of being blocked.
             attempt = self.next_attempt(comments)
-            attempts_used = self.attempts_used(comments)
+            budget = self.attempt_budget(comments, home_path=claim_home)
+            attempts_used = budget.charged
             if attempts_used >= self.max_attempts:
+                generation = budget.generation
                 self.release_issue(issue_id)
                 self._attempts_exhausted(
                     issue_id, attempts_used, issue_title=issue_title, home=claim_home,
-                    generation=_scan_claim_comments(comments)[1],
+                    generation=generation,
+                    clean_parks=budget.clean_parks,
                 )
                 return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
 
@@ -882,8 +997,16 @@ class ChainlinkClaims:
             return 1
         return max(attempts) + 1
 
-    def attempts_used(self, comments: Iterable[str]) -> int:
-        """Charged attempts in the active reset generation.
+    def attempt_budget(
+        self, comments: Iterable[str], *, home_path: Path | None = None,
+        projected_clean_park: ClaimRecord | None = None,
+    ) -> AttemptBudget:
+        """Compute one accounting view, optionally projecting a verified future park.
+
+        Projection is for pre-stop planning only; it never publishes credit.
+        All real admission and diagnostic counts use durable evidence.
+
+        Charged attempts in the active reset generation.
 
         The first bounded set of valid shutdown markers across the leaf's
         history forgive their matching claims. Attempt ordinals still advance,
@@ -911,7 +1034,29 @@ class ChainlinkClaims:
             for record in records
             if record.generation == generation
         }
-        return len(active_claims - forgiven)
+        home = home_path if home_path is not None else self.home_path
+        clean_parks = {
+            key for record in records
+            if record.generation == generation
+            and home is not None
+            and (key := (record.issue_id, record.attempt, record.agent_id, record.claimed_at)) not in forgiven
+            and _read_clean_park(home, record)
+        }
+        if projected_clean_park is not None:
+            key = (projected_clean_park.issue_id, projected_clean_park.attempt,
+                   projected_clean_park.agent_id, projected_clean_park.claimed_at)
+            if key in active_claims and key not in forgiven:
+                clean_parks.add(key)
+        budget = AttemptBudget(len(active_claims - forgiven - clean_parks), len(clean_parks), generation)
+        log.debug(
+            "Worklink attempt budget: issue_id=%s generation=%s charged=%s clean_parks=%s shutdown_or_other_forgiven=%s",
+            ",".join(str(value) for value in sorted({r.issue_id for r in records})), generation,
+            budget.charged, budget.clean_parks, len(active_claims & forgiven),
+        )
+        return budget
+
+    def attempts_used(self, comments: Iterable[str], *, home_path: Path | None = None) -> int:
+        return self.attempt_budget(comments, home_path=home_path).charged
 
     def reap_stale_claims(
         self,
@@ -1415,7 +1560,7 @@ class ChainlinkClaims:
 
     def _attempts_exhausted(
         self, issue_id: int, attempts: int, *, issue_title: str = "", home: Path | None = None,
-        generation: int = 0,
+        generation: int = 0, clean_parks: int = 0,
     ) -> None:
         self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
         self._run("issue", "unlabel", str(issue_id), "worklink:in-progress", check=False)
@@ -1431,13 +1576,17 @@ class ChainlinkClaims:
                     "attempts": attempts,
                     "transition": "blocked",
                     "reason": "attempts_exhausted",
+                    "generation": generation,
+                    "clean_parks": clean_parks,
                 },
                 sort_keys=True,
             ),
         )
         self._record_leaf_ending(
             "leaf_attempts_exhausted", issue_id, attempts,
-            reason=f"attempts exhausted: {attempts} of {self.max_attempts} allowed attempts used",
+            reason=(f"issue {issue_id}: attempts exhausted: "
+                    f"{attempts} of {self.max_attempts} allowed attempts used; "
+                    f"clean_parks={clean_parks} credited"),
             issue_title=issue_title, home=home,
             occurrence_id=f"claim-reset-generation:{generation}",
         )

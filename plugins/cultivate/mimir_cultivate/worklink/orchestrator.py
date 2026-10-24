@@ -48,7 +48,8 @@ from .compute import (
 )
 from .claims import (
     ChainlinkClaims, ClaimRecord, ShutdownAbortRecord, OPERATOR_STOP_PREFIX,
-    SHUTDOWN_ABORT_PREFIX, QUOTA_HOLD_PREFIX, WORKLINK_EPIC_LABEL,
+    SHUTDOWN_ABORT_PREFIX, QUOTA_HOLD_PREFIX, WORKLINK_EPIC_LABEL, record_clean_park,
+    claim_records_from_comments,
 )
 from .control import operator_stop_requested
 from .autonomy import chainlink_bin
@@ -92,6 +93,7 @@ from .backends.feature_factory import (
 from .backends.registry import factory_run_timeout_s
 from .backends.opencode import transcript_path, write_transcript
 from .factory_state import (
+    FactoryRecordError,
     FactoryRunRecord,
     factory_checkout_interlock,
     factory_issue_resource_lock,
@@ -3058,6 +3060,30 @@ class WorklinkRunner:
             work_item_json=_bind_work_item_run_id(work_item_json, retained.run_id),
             runner=runner,
         )
+        if pre.is_parked and pre.park_snapshot is not None:
+            # This park predates the dispatch claim. Never re-date it to now or
+            # credit the resume claim before resume has done any work. A durable
+            # parked observation may be missing only its controller phase/archive;
+            # without that original observation time we cannot certify a credit.
+            if (retained.status is not None and retained.status.is_parked
+                    and retained.status.park_snapshot == pre.park_snapshot
+                    and retained.observed_at is not None):
+                parked = replace(retained, controller_phase="parked")
+                history = claim_records_from_comments(
+                    claims._issue_comments(issue.issue_id, strict=True),
+                )
+                prior = {
+                    (entry.agent_id, entry.claimed_at, entry.generation): entry
+                    for entry in history
+                    if entry.issue_id == retained.issue_id
+                    and entry.attempt == retained.attempt
+                    and entry.claimed_at < claim_record.claimed_at
+                    and entry.attempt < claim_record.attempt
+                }
+                if len(prior) == 1:
+                    save_factory_record(self.home, parked)
+                    self._archive_factory_park(next(iter(prior.values())), parked)
+                    retained = parked
         session = retained.session
         if pre.lock == "stale" or pre.dead_lock:
             backend.lock(
@@ -3933,6 +3959,19 @@ class WorklinkRunner:
                 finally:
                     await compute.cleanup(handle)
 
+    def _archive_factory_park(self, claim: ClaimRecord, record: FactoryRunRecord) -> None:
+        """Persist credit before fallible transitions or resume replace the evidence."""
+        if record.status is None or record.status.park_snapshot is None:
+            return
+        try:
+            if record_clean_park(self.home, claim, record):
+                return
+            reason = "park evidence did not verify"
+        except (OSError, FactoryRecordError) as exc:
+            reason = str(exc)[:300]
+        _log_event("worklink_clean_park_unverified", issue_id=claim.issue_id,
+                   attempt=claim.attempt, reason=reason)
+
     async def _finish_factory_070(
         self,
         *,
@@ -3950,6 +3989,7 @@ class WorklinkRunner:
         if status is None:
             raise WorklinkError("factory terminal projection is missing")
         if status.is_parked:
+            self._archive_factory_park(claim_record, factory_record)
             diagnosis = factory_record.controller_error or "factory run is parked"
             park_report = (
                 f"{diagnosis}; control-plane snapshot: {status.park_snapshot}"
