@@ -3,14 +3,13 @@
 
 This script deliberately does **not** call ``factory resume``.
 
-mimir's recovery path does the whole transition as one operation: it refuses a
-status that is not ``running`` or ``needs-human``, requires the retained process
+mimir's recovery path does the whole transition as one operation: it accepts
+live ``running`` or published ``needs-human`` status and requires the retained process
 to be verifiably dead, steals or claims the session lock as needed, resumes,
 checks the returned status is owned and running, validates the recovery binding,
-launches a driver, saves the new handle and enters supervision. Unparking from
-outside spends the ``needs-human`` transition that path is gated on, and then the
-supported path refuses the run with ``factory resume requires current status
-needs-human``. That is not hypothetical: it is how an attempt was lost.
+launches a driver, saves the new handle and enters supervision. A live ``running``
+run with a verified-dead driver is parked before resume. Do not unpark manually:
+let the controller validate ownership and carry out the whole recovery sequence.
 
 Two details follow from reading that path rather than guessing at it:
 
@@ -43,7 +42,6 @@ from mimir_cultivate.worklink.factory_state import (  # noqa: E402
     factory_process_is_verified_dead,
     load_factory_record,
 )
-from mimir_cultivate.worklink.orchestrator import _RECOVERABLE_FACTORY_PHASES  # noqa: E402
 
 PARKED = "needs-human"
 
@@ -73,8 +71,8 @@ def preflight(record, status: dict, sandbox: Path) -> list[str]:
     """Return the recovery preconditions that do not hold, most specific first.
 
     Each check mirrors one in ``_verify_factory_recovery_target`` or the resume
-    block that follows it. ``_RECOVERABLE_FACTORY_PHASES`` is imported rather
-    than restated so this cannot drift from the gate it is reporting on.
+    block that follows it. Resumability follows the live status, not cached
+    controller lifecycle observations.
     """
     problems: list[str] = []
 
@@ -84,24 +82,11 @@ def preflight(record, status: dict, sandbox: Path) -> list[str]:
             f"factory status is {reported!r}; recovery resumes only 'running' or 'needs-human'"
         )
 
-    if record.controller_phase not in _RECOVERABLE_FACTORY_PHASES:
-        problems.append(
-            f"retained controller_phase is {record.controller_phase!r}; recoverable phases are "
-            f"{sorted(_RECOVERABLE_FACTORY_PHASES)}"
-        )
-
     if not record.session:
         problems.append("retained session is missing; recovery resumes with the recorded session")
 
-    if (
-        record.status is not None
-        and not record.status.is_terminal
-        and record.status.status != PARKED
-    ):
-        problems.append(
-            f"retained status is {record.status.status!r}; recovery requires 'needs-human'. "
-            "An out-of-band 'factory resume' is the usual cause."
-        )
+    if status.get("lock_session") not in {None, record.session}:
+        problems.append("factory recovery lock owner changed; refusing a foreign session")
 
     if factory_process_is_alive(record):
         problems.append("the retained factory process is still alive; recovery refuses a live run")

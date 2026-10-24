@@ -6597,8 +6597,10 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
 
 
 @pytest.mark.parametrize("release_confirmed", [False, True])
+@pytest.mark.parametrize("claim_confirmed", [False, True])
 def test_factory_identity_preflight_is_not_repeated_for_retained_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release_confirmed: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release_confirmed: bool,
+    claim_confirmed: bool,
 ) -> None:
     import mimir_cultivate.worklink.orchestrator as orchestrator
 
@@ -6661,8 +6663,15 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
         "defaults:\n  allow_autonomous_local_subprocess: true\n", encoding="utf-8"
     )
 
+    record_path = tmp_path / "state" / "worklink" / "factory-runs" / "700.json"
+    original_bytes = record_path.read_bytes()
+
     async def recover(self: object, **kwargs: object) -> object:
-        assert kwargs["retained"] == retained
+        assert claim_confirmed
+        refreshed = kwargs["retained"]
+        assert refreshed == replace(retained, status=live, observed_at=refreshed.observed_at)
+        assert record_path.read_bytes() == original_bytes
+        assert refreshed.status == live
         kwargs["claims"].transition_issue(700, status="completed", review_ready=True)
         return expected
 
@@ -6670,10 +6679,15 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
         raise AssertionError("new-run identity preflight reached during recovery")
 
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(retained.launcher))
+    live = _factory_lifecycle_status(
+        tmp_path / "sandbox", status="completed",
+    )
+    monkeypatch.setattr(FeatureFactoryBackend, "status", lambda self, *args, **kwargs: live)
 
     def claim_issue(self: object, *args: object, **kwargs: object) -> ClaimResult:
         kwargs["before_claim"]()
-        return ClaimResult(True, claim)
+        assert record_path.read_bytes() == original_bytes
+        return ClaimResult(True, claim) if claim_confirmed else ClaimResult(False, reason="locked")
 
     monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", claim_issue)
     monkeypatch.setattr(
@@ -6700,6 +6714,11 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
         )
     )
 
+    if not claim_confirmed:
+        assert result.reason == "locked"
+        assert record_path.read_bytes() == original_bytes
+        assert transitions == clears == signals == []
+        return
     assert result == (expected if release_confirmed else replace(
         expected, status="failed",
         reason="recovered completion; terminal recovery incomplete: Chainlink lock release failed",
@@ -6709,8 +6728,13 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
     assert signals == ([tmp_path] if release_confirmed else [])
 
 
+@pytest.mark.parametrize("refusal", [
+    "live_driver", "unverified_driver", "unreadable", "runtime_error", "os_error",
+    "foreign_fresh", "foreign_stale", "run_id", "sandbox_path", "branch", "snapshot",
+    "nonresumable_status", "probe_runtime_error", "probe_os_error",
+])
 def test_retained_running_factory_precondition_does_not_consume_attempt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: str,
 ) -> None:
     import mimir_cultivate.worklink.orchestrator as orchestrator
     from mimir_cultivate.worklink.dispatch_failures import (
@@ -6745,6 +6769,9 @@ def test_retained_running_factory_precondition_does_not_consume_attempt(
         if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
             return cp(args, stdout="git@github.com:owner/repo.git\n")
         if isinstance(args, list) and args[:3] == ["git", "-C", str(sandbox)]:
+            if refusal in {"probe_runtime_error", "probe_os_error"}:
+                error = RuntimeError if refusal == "probe_runtime_error" else OSError
+                raise error("checkout probe unavailable")
             operation = args[3:]
             if operation == ["rev-parse", "--show-toplevel"]:
                 return cp(args, stdout=f"{sandbox}\n")
@@ -6770,7 +6797,41 @@ def test_retained_running_factory_precondition_does_not_consume_attempt(
             ClaimRecord(700, allocations + 1, "agent", datetime.now(UTC)),
         )
 
+    retained = replace(retained, controller_error="retained diagnostic: do not erase")
+    save_factory_record(tmp_path, retained)
+    record_path = tmp_path / "state" / "worklink" / "factory-runs" / "700.json"
+    original_bytes = record_path.read_bytes()
+    saves = []
+    real_save = orchestrator.save_factory_record
+
+    def save_spy(*args):
+        saves.append(args)
+        return real_save(*args)
+
+    monkeypatch.setattr(orchestrator, "save_factory_record", save_spy)
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(retained.launcher))
+
+    def live_status(self: object, *args: object, **kwargs: object) -> Any:
+        errors = {"unreadable": FactoryContractError, "runtime_error": RuntimeError, "os_error": OSError}
+        if refusal in errors:
+            raise errors[refusal]("factory status unavailable")
+        live = _factory_lifecycle_status(
+            sandbox,
+            status=(
+                "failed" if refusal == "nonresumable_status" else
+                "running" if refusal in {"live_driver", "unverified_driver"} else "needs-human"
+            ),
+            park_snapshot=None if refusal == "snapshot" else str(sandbox / ".factory" / ".parked" / "700"),
+        )
+        if refusal.startswith("foreign_"):
+            live = replace(live, lock=refusal.split("_")[1], lock_session="session-foreign")
+        if refusal in {"run_id", "sandbox_path", "branch"}:
+            live = replace(live, **{refusal: "701" if refusal == "run_id" else str(sandbox / "other") if refusal == "sandbox_path" else "epic/other"})
+        return live
+
+    monkeypatch.setattr(FeatureFactoryBackend, "status", live_status)
+    monkeypatch.setattr(orchestrator, "factory_process_is_alive", lambda record: refusal == "live_driver")
+    monkeypatch.setattr(orchestrator, "factory_process_is_verified_dead", lambda record: refusal != "unverified_driver")
     monkeypatch.setattr(
         WorklinkConfig,
         "load",
@@ -6794,10 +6855,27 @@ def test_retained_running_factory_precondition_does_not_consume_attempt(
         for _ in range(3)
     ]
 
-    reason = "factory resume requires current status needs-human; found 'running'"
+    reason = {
+        "live_driver": "factory recovery refuses a live retained process",
+        "unverified_driver": "factory recovery cannot verify the retained process is dead",
+        "unreadable": "factory status is unavailable: factory status unavailable",
+        "runtime_error": "factory status is unavailable: factory status unavailable",
+        "os_error": "factory status is unavailable: factory status unavailable",
+        "foreign_fresh": "factory recovery lock owner changed",
+        "foreign_stale": "factory recovery lock owner changed",
+        "run_id": "factory status run id mismatch",
+        "sandbox_path": "factory status sandbox mismatch",
+        "branch": "factory status branch mismatch",
+        "snapshot": "factory recovery requires a published park snapshot",
+        "nonresumable_status": "factory recovery status is not resumable",
+        "probe_runtime_error": "checkout probe unavailable",
+        "probe_os_error": "checkout probe unavailable",
+    }[refusal]
     assert allocations == 0
     assert [result.status for result in results] == ["blocked"] * 3
     assert all(result.reason is not None and reason in result.reason for result in results)
+    if refusal.startswith("probe_"):
+        assert all("factory status is unavailable" not in result.reason for result in results)
     assert len(transitions) == 3
     assert all(reason in str(transition["reason"]) for transition in transitions)
     incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
@@ -6805,6 +6883,9 @@ def test_retained_running_factory_precondition_does_not_consume_attempt(
     assert incident["attempt_consumed"] is False
     assert reason in incident["terminal_error"]
     assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
+    assert saves == []
+    assert record_path.read_bytes() == original_bytes
+    assert load_factory_record(tmp_path, "700") == retained
 
 
 def test_post_work_factory_failure_consumes_attempt(tmp_path: Path) -> None:
@@ -6843,7 +6924,6 @@ def test_post_work_factory_failure_consumes_attempt(tmp_path: Path) -> None:
         "launcher",
         "base",
         "session",
-        "lifecycle",
         "checkout_root",
         "checkout_root_command",
         "checkout_root_unavailable",
@@ -6912,8 +6992,6 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
         retained = replace(retained, base_ref="develop")
     elif refusal == "session":
         retained = replace(retained, session=None)
-    elif refusal == "lifecycle":
-        retained = replace(retained, controller_phase="stopped")
     save_factory_record(tmp_path, retained)
     claim = ClaimRecord(700, 2, "agent", datetime.now(UTC), budget_attempt=2)
     lease = CheckoutLease(
@@ -7135,7 +7213,6 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
         "launcher": "retained factory launcher does not match recovery request",
         "base": "retained factory base does not match recovery request",
         "session": "retained factory session is missing",
-        "lifecycle": "retained factory lifecycle is not recoverable",
         "checkout_root": "factory checkout root mismatch",
         "checkout_root_command": "cannot inspect root",
         "checkout_root_unavailable": "factory checkout root is unavailable",
@@ -7209,14 +7286,6 @@ def test_factory_launch_preflight_refuses_existing_run_sandbox(tmp_path: Path) -
         orchestrator._create_factory_sandbox(record, lease)
 
     assert sandbox.is_dir()
-
-
-@pytest.mark.parametrize("phase", ["running", "parked", "failed", "terminal"])
-def test_factory_recovery_phases_are_explicit(phase: str) -> None:
-    import mimir_cultivate.worklink.orchestrator as orchestrator
-
-    assert phase in orchestrator._RECOVERABLE_FACTORY_PHASES
-    assert "stopped" not in orchestrator._RECOVERABLE_FACTORY_PHASES
 
 
 def test_autonomous_leaf_incident_fence_precedes_issue_reads_and_mutations(
@@ -7702,6 +7771,149 @@ def _factory_lifecycle_record(sandbox: Path, handle: LaunchHandle) -> FactoryRun
 class _FactoryLifecycleClaims:
     def transition_issue(self, *args: object, **kwargs: object) -> None:
         return None
+
+
+@pytest.mark.parametrize("failure", [None, "transition", "milestone"])
+def test_factory_decision_park_archives_claim_before_resume(tmp_path: Path, monkeypatch, failure) -> None:
+    """A driver-reported needs-human decision receives the same credit as a budget park."""
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+    from mimir_cultivate.worklink.factory_state import save_factory_record
+
+    sandbox = tmp_path / "checkout" / ".factory-sandboxes" / "700"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory" / ".parked" / "700"
+    snapshot.mkdir(parents=True)
+    claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
+    record = _factory_lifecycle_record(
+        sandbox, LaunchHandle("local_subprocess", "123", 456),
+    ).observed(
+        _factory_lifecycle_status(sandbox, status="needs-human", park_snapshot=str(snapshot)),
+        datetime.now(UTC).isoformat(),
+    )
+    record = replace(record, controller_phase="parked")
+    save_factory_record(tmp_path, record)
+
+    claims = _FactoryLifecycleClaims()
+    def fail(*args, **kwargs):
+        raise RuntimeError("transition publication failed")
+    if failure == "transition":
+        monkeypatch.setattr(claims, "transition_issue", fail)
+    elif failure == "milestone":
+        monkeypatch.setattr("mimir_cultivate.worklink.orchestrator._record_factory_milestone", fail)
+    finish = WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+        issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+        claim_record=claim, claims=claims, backend=object(),
+        compute=object(), factory_record=record, test_cmd="pytest -q",
+        runner=lambda args: cp(args), started_at=datetime.now(UTC),
+    )
+    if failure:
+        with pytest.raises(RuntimeError, match="transition publication failed"):
+            asyncio.run(finish)
+    else:
+        assert asyncio.run(finish).status == "needs-human"
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used([claim.to_comment()]) == 0
+    save_factory_record(tmp_path, replace(record, controller_phase="running"))
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used([claim.to_comment()]) == 0
+
+
+@pytest.mark.parametrize("error_type", [OSError, FactoryRecordError])
+def test_factory_park_archive_error_logs_and_finishes(tmp_path, monkeypatch, error_type):
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+    sandbox = tmp_path / "checkout/.factory-sandboxes/700"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory/.parked/700"
+    snapshot.mkdir(parents=True)
+    claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
+    record = replace(_factory_lifecycle_record(
+        sandbox, LaunchHandle("local_subprocess", "999999999", 1),
+    ).observed(
+        _factory_lifecycle_status(sandbox, status="needs-human", park_snapshot=str(snapshot)),
+        datetime.now(UTC).isoformat(),
+    ), controller_phase="parked")
+    save_factory_record(tmp_path, record)
+    events = []
+    def fail(*args):
+        raise error_type("archive unavailable")
+    monkeypatch.setattr(orchestrator, "record_clean_park", fail)
+    monkeypatch.setattr(orchestrator, "_log_event", lambda name, **kw: events.append((name, kw)))
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+        issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+        claim_record=claim, claims=_FactoryLifecycleClaims(), backend=object(), compute=object(),
+        factory_record=record, test_cmd="pytest -q", runner=lambda args: cp(args),
+        started_at=datetime.now(UTC),
+    ))
+    assert result.status == "needs-human"
+    assert ("worklink_clean_park_unverified", {
+        "issue_id": 700, "attempt": 1, "reason": "archive unavailable",
+    }) in events
+    assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used([claim.to_comment()]) == 1
+
+
+@pytest.mark.parametrize("evidence", ["verified", "missing-time", "running", "too-old", "ambiguous", "missing-claim"])
+def test_factory_recovery_credits_only_prior_park_not_crashed_resumes(tmp_path, monkeypatch, evidence):
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+    from mimir_cultivate.worklink.claims import ChainlinkClaims
+    _stub_factory_launch_identity(monkeypatch)
+    _configure_opencode_oauth(tmp_path, monkeypatch)
+    sandbox = tmp_path / "checkout/.factory-sandboxes/700"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory/.parked/700"
+    snapshot.mkdir(parents=True)
+    now = datetime.now(UTC)
+    prior = ClaimRecord(700, 1, "agent", now - timedelta(hours=2))
+    park_time = (now - timedelta(hours=1)).isoformat()
+    pre = _factory_lifecycle_status(sandbox, status="needs-human", park_snapshot=str(snapshot))
+    retained = _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "999999999", 1)).observed(pre, park_time)
+    if evidence == "missing-time":
+        retained = replace(retained, observed_at=None)
+    elif evidence == "running":
+        retained = retained.observed(_factory_lifecycle_status(sandbox, status="running"), park_time)
+    elif evidence == "too-old":
+        retained = replace(retained, observed_at=(prior.claimed_at - timedelta(seconds=1)).isoformat())
+    assert retained.controller_phase != "parked"
+    save_factory_record(tmp_path, retained)
+    history = [] if evidence == "missing-claim" else [prior.to_comment()]
+    if evidence == "ambiguous":
+        history.append(replace(prior, agent_id="other-agent").to_comment())
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path)
+    monkeypatch.setattr(claims, "_issue_comments", lambda issue_id, *, strict: list(history))
+    expected_credit = int(evidence == "verified")
+    class Backend(FeatureFactoryBackend):
+        def status(self, *args, **kwargs):
+            return pre
+        def resume(self, *args, **kwargs):
+            observed = load_factory_record(tmp_path, retained.run_id)
+            assert observed.observed_at == retained.observed_at
+            if expected_credit:
+                assert observed.controller_phase == "parked"
+                assert observed.status == pre
+            assert claims.attempts_used([prior.to_comment()]) == 1 - expected_credit
+            assert claims.attempts_used([claim.to_comment()]) == 1
+            raise RuntimeError("resume crashed before leaving needs-human")
+    monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kw: sandbox)
+    monkeypatch.setattr(orchestrator, "factory_process_is_alive", lambda rec: False)
+    monkeypatch.setattr(orchestrator, "factory_process_is_verified_dead", lambda rec: True)
+    for attempt in range(2, 6):
+        claim = ClaimRecord(700, attempt, "agent", now + timedelta(seconds=attempt))
+        history.append(claim.to_comment())
+        with pytest.raises(RuntimeError, match="resume crashed"):
+            asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                claim_record=claim, claims=claims, backend=Backend(entrypoint=retained.launcher),
+                compute=object(), retained=load_factory_record(tmp_path, retained.run_id),
+                launcher=Path(retained.launcher), repo_slug="owner/repo", base="main",
+                test_cmd="pytest -q", runner=lambda args: cp(args),
+                work_item_json=orchestrator.render_work_item(IssueContext(700, "epic", "build", {"worklink:epic"})),
+            ))
+        assert claims.attempts_used(history) == len(history) - expected_credit
+        assert not (tmp_path / f"state/worklink/clean-parks/700-{attempt}.json").exists()
+    archive = tmp_path / "state/worklink/clean-parks/700-1.json"
+    assert archive.exists() == bool(expected_credit)
+    if expected_credit:
+        payload = json.loads(archive.read_text())
+        assert payload["claim"]["claimed_at"] == prior.claimed_at.isoformat()
+        assert payload["record"]["observed_at"] == park_time
 
 
 @pytest.mark.parametrize(
@@ -9625,6 +9837,9 @@ def test_factory_startup_deadline_reparks_only_a_verified_dead_unlocked_run(
         def transition_issue(self, issue_id: int, **kw: Any) -> None:
             transitions.append(kw)
 
+        def _issue_comments(self, issue_id: int, *, strict: bool = False) -> list[str]:
+            return []
+
     owner = SimpleNamespace(record=lambda **kw: incidents.append(kw), release=lambda **kw: None)
     async def run() -> WorklinkRunResult:
         return await WorklinkRunner(home=tmp_path, repo=tmp_path, _incident_owner=owner)._supervise_factory_070(
@@ -10369,11 +10584,16 @@ def test_factory_needs_human_transitions_epic_to_parked_tracker_state(
 
 @pytest.mark.parametrize(
     ("lock", "dead_lock", "action"),
-    [("absent", False, "claim"), ("stale", True, "steal"), ("fresh", False, None)],
+    [
+        ("absent", False, "claim"), ("stale", False, "steal"),
+        # Keep synthetic parked/dead-lock coverage alongside realistic CLI status.
+        ("stale", True, "steal"), ("fresh", False, None),
+    ],
 )
 @pytest.mark.parametrize("local_compute", [False, True], ids=["fake", "local"])
 @pytest.mark.parametrize("retained_session", ["session-1", "session-2"])
 @pytest.mark.parametrize("idle_park", [False, True], ids=["operator-park", "idle-park"])
+@pytest.mark.parametrize("live_running", [False, True], ids=["live-parked", "dead-driver-running"])
 def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10383,6 +10603,7 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     local_compute: bool,
     retained_session: str,
     idle_park: bool,
+    live_running: bool,
 ) -> None:
     _stub_factory_launch_identity(monkeypatch)
     from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
@@ -10449,7 +10670,12 @@ print(json.dumps([str(path) for path in pruned]))
             payload["next"] = next_value
         return parse_factory_status(payload)
 
-    statuses = [status("needs-human", lock)]
+    live_parked = parse_factory_status({
+        **status("needs-human", lock).to_json(),
+        "park_snapshot": str(sandbox / ".factory" / ".parked" / "700"),
+    })
+    live_initial = status("running", lock, "implementation") if live_running else live_parked
+    statuses = [live_initial, live_initial]
     credential_settings = (("credential.https://github.com.helper", "!recovery-helper"),)
 
     def capture_credentials(trusted_repo):
@@ -10458,7 +10684,9 @@ print(json.dumps([str(path) for path in pruned]))
 
     monkeypatch.setattr("mimir_cultivate.worklink.orchestrator._git_credential_settings", capture_credentials)
     if action is not None:
-        statuses.append(status("needs-human", "fresh"))
+        statuses.append(status("running" if live_running else "needs-human", "fresh", "implementation"))
+    if live_running:
+        statuses.append(replace(live_parked, lock="fresh", dead_lock=False, lock_session=retained_session, next="implementation", next_present=True))
     statuses.extend([
         status("running", "fresh", "implementation"),
         status("running", "absent", "implementation"),
@@ -10476,6 +10704,9 @@ print(json.dumps([str(path) for path in pruned]))
 
         def lock(self, run_id: str, selected_action: str, **kwargs: Any) -> None:
             calls.append(("lock", run_id, selected_action, kwargs["session"], str(kwargs["sandbox"])))
+
+        def terminal(self, run_id: str, value: str, **kwargs: Any):
+            calls.append(("park", run_id, value, str(kwargs["sandbox"])))
 
         def resume(self, run_id: str, **kwargs: Any):
             calls.append(("resume", run_id, kwargs["session"], str(kwargs["sandbox"])))
@@ -10506,6 +10737,25 @@ print(json.dumps([str(path) for path in pruned]))
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             self.launches += 1
             assert spec.factory_credential_settings == credential_settings
+            # The full retained identity/diagnostics survive until launch publishes
+            # the replacement handle. Only observation fields may have changed.
+            saved = load_factory_record(tmp_path, "700")
+            assert saved is not None
+            assert saved.observed_at is not None
+            assert saved.observed_at != retained.observed_at
+            expected_status = (
+                replace(live_parked, lock="fresh", dead_lock=False,
+                        lock_session=retained_session, next="implementation", next_present=True)
+                if live_running else live_initial
+            )
+            expected_record = replace(
+                retained, status=expected_status, observed_at=saved.observed_at,
+                # The running path persists an observed park before resume;
+                # observed() clears the old driver diagnostic, not its identity.
+                controller_error=None if live_running else retained.controller_error,
+            )
+            if saved != expected_record:
+                pytest.fail(f"retained launch record {saved!r} differs from {expected_record!r}", pytrace=False)
             if local_compute:
                 self.process = subprocess.Popen(
                     [sys.executable, "-c", "import time; time.sleep(300)"],
@@ -10516,10 +10766,10 @@ print(json.dumps([str(path) for path in pruned]))
                 ticks = process_start_ticks(self.process.pid)
                 assert ticks is not None
                 self.handle = LaunchHandle("local_subprocess", str(self.process.pid), ticks)
-                # The durable record still names the dead worker while the
-                # replacement is launching, before save_factory_record.
-                assert load_factory_record(tmp_path, "700") == retained
-                assert prune_in_child() == []
+                # Pruning must still see the complete dead-worker record.
+                pruned = prune_in_child()
+                if pruned:
+                    pytest.fail(f"launch pruned retained checkout: {pruned}", pytrace=False)
                 assert self.process.poll() is None
                 assert sandbox.is_dir()
             assert spec.local_argv is not None
@@ -10588,9 +10838,13 @@ print(json.dumps([str(path) for path in pruned]))
         sandbox=str(sandbox),
         session=retained_session,
         handle=LaunchHandle("local_subprocess", "99999999", 456),
-        status=status("needs-human", lock),
+        status=status(
+            "running" if lock == "absent" else "failed" if lock == "stale" else "needs-human",
+            lock,
+        ),
         observed_at="2026-08-18T12:00:00+00:00",
-        controller_phase="parked",
+        transcript=str(tmp_path / "retained-driver.jsonl"),
+        controller_phase="stopped" if lock == "stale" else "parked",
         controller_error=(
             "factory driver idle: no progress since 2026-08-18T11:45:00+00:00"
             if idle_park else None
@@ -10606,6 +10860,12 @@ print(json.dumps([str(path) for path in pruned]))
         if local_compute:
             assert prune_in_child() == []
         kwargs["before_claim"]()
+        refreshed = load_factory_record(tmp_path, "700")
+        assert refreshed is not None
+        assert refreshed.status == live_initial
+        assert refreshed.session == retained.session
+        assert refreshed.observed_at != retained.observed_at
+        assert refreshed.controller_error == retained.controller_error
         return ClaimResult(True, claim)
 
     def release_issue(*args: object, **kwargs: object) -> bool:
@@ -10635,10 +10895,15 @@ print(json.dumps([str(path) for path in pruned]))
                 compute.process.kill()
             compute.process.wait(timeout=10)
     assert result.status == "needs-human", result.reason
-    expected = [("status", "700", str(sandbox), retained.launcher)]
+    expected = [("status", "700", str(sandbox), retained.launcher)] * 2
     if action is not None:
         expected.extend([
             ("lock", "700", action, retained_session, str(sandbox)),
+            ("status", "700", str(sandbox), retained.launcher),
+        ])
+    if live_running:
+        expected.extend([
+            ("park", "700", "needs-human", str(sandbox)),
             ("status", "700", str(sandbox), retained.launcher),
         ])
     expected.extend([
@@ -11309,7 +11574,6 @@ def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or
         "repository",
         "base",
         "launcher",
-        "lifecycle",
         "session",
         "claim_issue",
         "claim_owner",
@@ -11337,8 +11601,6 @@ def test_factory_recovery_binding_rejects_every_precontrol_mismatch(
         replacements["base_ref"] = "develop"
     elif case == "launcher":
         replacements["launcher"] = "/opt/other/factory.js"
-    elif case == "lifecycle":
-        replacements["controller_phase"] = "stopped"
     elif case == "session":
         replacements["session"] = None
     elif case == "sandbox":
