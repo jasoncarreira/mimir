@@ -84,7 +84,6 @@ from mimir.secret_scan import secret_matches
 from .safe_git import ControllerGitPublication, _git_credential_settings
 from .backends.feature_factory import (
     FACTORY_PUBLISHING_IDENTITY_ENV,
-    FactoryContractError,
     FactoryStatus,
     FactoryRunLockContended,
     FeatureFactoryBackend,
@@ -2559,9 +2558,12 @@ class WorklinkRunner:
                     base=base,
                     command_runner=runner,
                 )
-                live = selected.status(
-                    candidate.run_id, sandbox=sandbox, launcher=candidate.launcher,
-                )
+                try:
+                    live = selected.status(
+                        candidate.run_id, sandbox=sandbox, launcher=candidate.launcher,
+                    )
+                except (RuntimeError, OSError) as exc:
+                    raise WorklinkError(f"factory status is unavailable: {exc}") from exc
                 _require_factory_status(live, candidate)
                 if live.lock_session not in {None, candidate.session}:
                     raise WorklinkError("factory recovery lock owner changed")
@@ -2579,11 +2581,13 @@ class WorklinkRunner:
                 candidate = replace(
                     candidate, status=live, observed_at=datetime.now(UTC).isoformat(),
                 )
-                save_factory_record(self.home, candidate)
-            except WorklinkError as exc:
+                # Terminal observations remain in-memory until the claim succeeds.
+                # Otherwise a denied claim could make the autonomy sweep treat a
+                # still-running retained driver as terminal before finalization.
+                if not live.is_terminal:
+                    save_factory_record(self.home, candidate)
+            except (WorklinkError, RuntimeError, OSError) as exc:
                 raise FactoryRecoveryBlocked(candidate, str(exc)) from exc
-            except (FactoryContractError, RuntimeError, OSError) as exc:
-                raise FactoryRecoveryBlocked(candidate, f"factory status is unavailable: {exc}") from exc
             retained = candidate
 
         try:

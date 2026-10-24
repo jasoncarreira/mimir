@@ -387,6 +387,13 @@ class TestResumePreflight:
         record = _record(tmp_path)
         assert resume.preflight(record, _status(), Path(record.sandbox)) == []
 
+    @pytest.mark.parametrize("lock", ["fresh", "stale"])
+    def test_foreign_lock_owner_is_refused(self, tmp_path: Path, lock: str) -> None:
+        record = _record(tmp_path)
+        status = {**_status(), "lock": lock, "lock_session": "foreign-session"}
+        problems = resume.preflight(record, status, Path(record.sandbox))
+        assert any("lock owner changed" in problem for problem in problems)
+
     def test_running_with_verified_dead_driver_passes(self, tmp_path: Path, monkeypatch) -> None:
         record = _record(tmp_path, phase="running", status="running")
         monkeypatch.setattr(resume, "factory_process_is_alive", lambda record: False)

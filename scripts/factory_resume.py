@@ -85,6 +85,9 @@ def preflight(record, status: dict, sandbox: Path) -> list[str]:
     if not record.session:
         problems.append("retained session is missing; recovery resumes with the recorded session")
 
+    if status.get("lock_session") not in {None, record.session}:
+        problems.append("factory recovery lock owner changed; refusing a foreign session")
+
     if factory_process_is_alive(record):
         problems.append("the retained factory process is still alive; recovery refuses a live run")
     elif not factory_process_is_verified_dead(record):
