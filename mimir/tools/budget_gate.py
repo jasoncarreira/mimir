@@ -55,6 +55,7 @@ from typing import Annotated, Any, Awaitable, Callable, Union, get_args, get_ori
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import ToolException
+from langgraph.errors import GraphBubbleUp, NodeCancelledError, NodeTimeoutError
 from langgraph.types import Command
 import yaml
 
@@ -3980,7 +3981,9 @@ def _finish_tool_result(
 
 def _task_failure_result(call: _PreparedToolCall, exc: Exception) -> ToolMessage | None:
     """Keep ordinary subagent failures inside the parent graph, without exposing content."""
-    if call.tool_name != "task" or isinstance(exc, TimeoutError):
+    if call.tool_name != "task" or isinstance(
+        exc, (TimeoutError, GraphBubbleUp, NodeCancelledError, NodeTimeoutError)
+    ):
         return None
     from ..quota_pause import is_quota_exhaustion
 

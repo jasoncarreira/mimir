@@ -37,6 +37,7 @@ import yaml
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import ToolException
+from langgraph.errors import GraphBubbleUp, NodeCancelledError, NodeTimeoutError
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
@@ -221,15 +222,28 @@ async def test_task_cancellation_is_not_converted():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [TimeoutError("turn deadline"), RuntimeError("quota exceeded")])
-async def test_task_control_signals_propagate(error):
-    async def handler(request):
+@pytest.mark.parametrize("error", [
+    TimeoutError("turn deadline"),
+    RuntimeError("quota exceeded"),
+    GraphBubbleUp("graph control flow"),
+    NodeCancelledError("node cancelled"),
+    NodeTimeoutError("subagent", 1.0, kind="run", run_timeout=1.0),
+])
+@pytest.mark.parametrize("sync", [False, True], ids=["async", "sync"])
+async def test_task_control_signals_propagate(error, sync):
+    def handler(request):
         raise error
 
+    async def async_handler(request):
+        raise error
+
+    request = _make_request("task", "control-subagent", _untainted_ifc_auth())
+    middleware = BudgetGateMiddleware()
     with pytest.raises(type(error)) as caught:
-        await BudgetGateMiddleware().awrap_tool_call(
-            _make_request("task", "control-subagent", _untainted_ifc_auth()), handler,
-        )
+        if sync:
+            middleware.wrap_tool_call(request, handler)
+        else:
+            await middleware.awrap_tool_call(request, async_handler)
     assert caught.value is error
 
 
