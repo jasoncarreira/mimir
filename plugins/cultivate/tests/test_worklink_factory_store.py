@@ -202,6 +202,43 @@ def test_factory_runtime_cleanup_refuses_invalid_attempt(tmp_path: Path) -> None
     assert list((valid_name / ".factory-runtime").iterdir()) == []
 
 
+@pytest.mark.parametrize("reaped", [False, True])
+def test_ttl_partial_worker_layout_without_checkout(tmp_path, monkeypatch, reaped):
+    from mimir_cultivate.worklink import worker_client
+    record, db = _record(tmp_path, _dead_handle())
+    record = replace(record, children_reaped=reaped)
+    checkout = Path(record.sandbox).parent.parent
+    attempt = checkout.parent
+    db.write_bytes(b"retained partial store")
+    shutil.rmtree(checkout)
+    # Keep the real lexical worker binding: the old code attempted to reopen
+    # this nonexistent checkout through the executor and could never reclaim it.
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", attempt.parent.parent)
+    assert worker_client.factory_checkout_for_path(checkout) is not None
+    monkeypatch.setattr(worker_client, "run_factory_control",
+                        lambda *a, **kw: pytest.fail("missing checkout cannot be a worker cwd"))
+    assert autonomy._prepare_factory_runtime_prune(attempt, [record]) is reaped
+    if reaped:
+        assert list((attempt / ".factory-runtime").iterdir()) == []
+    else:
+        assert db.read_bytes() == b"retained partial store"
+
+
+def test_ttl_partial_layout_permission_failure_is_retained(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import factory_store, worker_client
+    record, db = _record(tmp_path, _dead_handle())
+    checkout = Path(record.sandbox).parent.parent
+    attempt = checkout.parent
+    db.write_bytes(b"worker-owned")
+    shutil.rmtree(checkout)
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", attempt.parent.parent)
+    def denied(path):
+        raise PermissionError("worker-owned runtime")
+    monkeypatch.setattr(factory_store, "_clear_runtime", denied)
+    assert not autonomy._prepare_factory_runtime_prune(attempt, [record])
+    assert db.read_bytes() == b"worker-owned"
+
+
 def test_factory_runtime_cleanup_refuses_symlink(tmp_path: Path) -> None:
     attempt = tmp_path / "1983-1"
     (attempt / "checkout").mkdir(parents=True)
@@ -423,11 +460,15 @@ async def test_cancellation_drains_store_thread_before_return(tmp_path, monkeypa
         assert release.wait(5)
         finished.set()
     monkeypatch.setattr(factory_store, "prune_factory_store", prune)
-    task = asyncio.create_task(orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
-        issue=orchestrator.IssueContext(1983, "Factory", "run", set()),
-        claim_record=object(), claims=object(), backend=object(), compute=object(),
-        factory_record=record, test_cmd="pytest", runner=object(), started_at=datetime.now(UTC),
-    ))
+    runner = orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path)
+    async def finish_under_production_locks(*args, **kwargs):
+        return await runner._finish_factory_070(
+            issue=orchestrator.IssueContext(1983, "Factory", "run", set()),
+            claim_record=object(), claims=object(), backend=object(), compute=object(),
+            factory_record=record, test_cmd="pytest", runner=object(), started_at=datetime.now(UTC),
+        )
+    monkeypatch.setattr(orchestrator.WorklinkRunner, "_run_factory_070_locked", finish_under_production_locks)
+    task = asyncio.create_task(runner.run_epic(1983))
     try:
         assert await asyncio.to_thread(entered.wait, 2)
         task.cancel()
@@ -435,11 +476,20 @@ async def test_cancellation_drains_store_thread_before_return(tmp_path, monkeypa
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done() and not finished.is_set()
+        from mimir_cultivate.worklink.factory_state import factory_issue_resource_lock, factory_checkout_interlock
+        with factory_issue_resource_lock(tmp_path, 1983) as acquired:
+            assert not acquired
+        with factory_checkout_interlock(tmp_path, pruning=True) as acquired:
+            assert not acquired
     finally:
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
     assert finished.is_set()
+    with factory_issue_resource_lock(tmp_path, 1983) as acquired:
+        assert acquired
+    with factory_checkout_interlock(tmp_path, pruning=True) as acquired:
+        assert acquired
 
 
 def test_opencode_task_id_resume_after_prune(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

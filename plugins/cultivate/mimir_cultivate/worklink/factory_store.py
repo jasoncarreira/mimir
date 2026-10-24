@@ -4,6 +4,14 @@ OpenCode resumes from its session/message/part tables. Its event journal also
 contains a full part snapshot on every streaming update; only those redundant
 ``message.part.updated`` (and the observed versioned ``.1``) snapshots are
 removed. Other event types are retained, including message/session updates.
+
+This is intentionally lossy journal compaction, not an event-replay-preserving
+archive: aggregate ``seq`` values and ``event_sequence`` references are not
+renumbered, so deleted updates leave gaps. Current OpenCode resumes from the
+materialized tables (covered by the pinned CLI child-task resume test). A future
+migration/sync that replays the journal may require disabling or revisiting this
+maintenance; retaining other event types does not guarantee future replay.
+Versioned event names other than the observed ``.1`` are left untouched.
 """
 
 from __future__ import annotations
@@ -90,7 +98,12 @@ def clear_prunable_runtime(attempt: Path) -> None:
     from .worker_client import factory_checkout_for_path, run_factory_control
 
     checkout = attempt / "checkout"
-    if factory_checkout_for_path(checkout) is None:
+    if not checkout.exists() and not checkout.is_symlink():
+        # Interrupted outer deletion may already have removed checkout/. There
+        # is then no safe worker cwd to reopen. Clear with existing controller
+        # permissions only; permission failures retain the attempt for recovery.
+        _clear_runtime(runtime)
+    elif factory_checkout_for_path(checkout) is None:
         _clear_runtime(runtime)
     else:
         result = run_factory_control(

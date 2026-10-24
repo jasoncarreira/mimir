@@ -138,8 +138,9 @@ def test_provider_runner_dry_run_uses_default_work_order(tmp_path: Path, capsys:
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(sys.platform != "linux", reason="factory executor requires Linux")
+@pytest.mark.parametrize("reaped", [False, True])
 async def test_provider_completion_uses_emitted_record_and_worker_gate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, short_socket_dir: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, short_socket_dir: Path, reaped: bool,
 ) -> None:
     root = tmp_path / "worklink"
     checkout = root / "repository" / "1949-1" / "checkout"
@@ -202,13 +203,30 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     cancels: list[LaunchHandle] = []
     cleanups: list[LaunchHandle] = []
 
+    supervision_order = []
+    real_prune = factory_store.prune_factory_store
+
+    def checked_prune(record):
+        # Exercise the production observe -> cancel -> drain -> persist -> prune
+        # wiring, not just a record with an acknowledgement injected in isolation.
+        assert supervision_order == ["cancel", "drained"]
+        assert record.children_reaped is reaped
+        persisted = load_factory_record(tmp_path, record.run_id)
+        assert persisted is not None and persisted.children_reaped is reaped
+        supervision_order.append("prune")
+        return real_prune(record)
+
+    monkeypatch.setattr(factory_store, "prune_factory_store", checked_prune)
+
     async def wait(self: object, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
         waits.append(handle)
         await cancelled.wait()
-        return ComputeResult(0, "", "", handle=handle)
+        supervision_order.append("drained")
+        return ComputeResult(0, "", "", handle=handle, children_reaped=reaped)
 
     async def cancel(self: object, handle: LaunchHandle) -> None:
         cancels.append(handle)
+        supervision_order.append("cancel")
         cancelled.set()
 
     async def cleanup(self: object, handle: LaunchHandle) -> None:
@@ -309,8 +327,9 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     assert payload["checkout"] == str(result.checkout)
     assert payload["tests"]["exit_code"] == 0
     assert "1949" in payload["tests"]["summary"]
+    assert supervision_order == ["cancel", "drained", "prune"]
     with sqlite3.connect(db_path) as db:
-        assert db.execute("SELECT count(*) FROM event").fetchone() == (0,)
+        assert db.execute("SELECT count(*) FROM event").fetchone() == (0 if reaped else 1,)
 
 
 @pytest.mark.asyncio
