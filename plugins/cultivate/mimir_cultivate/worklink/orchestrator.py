@@ -110,7 +110,6 @@ _PR_BODY_SECTION_FILE = ".worklink-pr-body.md"
 _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
 _FACTORY_CONTROLLER_ERROR_MAX_BYTES = 4000
-_RECOVERABLE_FACTORY_PHASES = {"running", "parked", "failed", "terminal"}
 _EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
 # GitHub's documented closing-keyword set:
 # https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue
@@ -2551,7 +2550,7 @@ class WorklinkRunner:
                 return
             candidate = candidates[0]
             try:
-                _verify_factory_recovery_target(
+                sandbox = _verify_factory_recovery_target(
                     runner=self,
                     issue=issue,
                     retained=candidate,
@@ -2560,7 +2559,35 @@ class WorklinkRunner:
                     base=base,
                     command_runner=runner,
                 )
-            except WorklinkError as exc:
+                try:
+                    live = selected.status(
+                        candidate.run_id, sandbox=sandbox, launcher=candidate.launcher,
+                    )
+                except (RuntimeError, OSError) as exc:
+                    raise WorklinkError(f"factory status is unavailable: {exc}") from exc
+                _require_factory_status(live, candidate)
+                if live.lock_session not in {None, candidate.session}:
+                    raise WorklinkError("factory recovery lock owner changed")
+                if not live.is_terminal:
+                    if live.status not in {"running", "needs-human"}:
+                        raise WorklinkError("factory recovery status is not resumable")
+                    if factory_process_is_alive(candidate):
+                        raise WorklinkError("factory recovery refuses a live retained process")
+                    if not factory_process_is_verified_dead(candidate):
+                        raise WorklinkError("factory recovery cannot verify the retained process is dead")
+                    if live.status == "needs-human" and live.park_snapshot is None:
+                        raise WorklinkError("factory recovery requires a published park snapshot")
+                # Do not adopt lock identity or clear controller diagnostics during
+                # the pre-claim refresh; subsequent recovery can still refuse.
+                candidate = replace(
+                    candidate, status=live, observed_at=datetime.now(UTC).isoformat(),
+                )
+                # Terminal observations remain in-memory until the claim succeeds.
+                # Otherwise a denied claim could make the autonomy sweep treat a
+                # still-running retained driver as terminal before finalization.
+                if not live.is_terminal:
+                    save_factory_record(self.home, candidate)
+            except (WorklinkError, RuntimeError, OSError) as exc:
                 raise FactoryRecoveryBlocked(candidate, str(exc)) from exc
             retained = candidate
 
@@ -4189,19 +4216,8 @@ def _verify_factory_recovery_target(
         raise WorklinkError("retained factory base does not match recovery request")
     if retained.launcher != str(launcher):
         raise WorklinkError("retained factory launcher does not match recovery request")
-    if retained.controller_phase not in _RECOVERABLE_FACTORY_PHASES:
-        raise WorklinkError("retained factory lifecycle is not recoverable")
     if not retained.session:
         raise WorklinkError("retained factory session is missing")
-    if (
-        retained.status is not None
-        and not retained.status.is_terminal
-        and retained.status.status != "needs-human"
-    ):
-        raise WorklinkError(
-            "factory resume requires current status needs-human; "
-            f"found {retained.status.status!r}"
-        )
     sandbox = Path(retained.sandbox)
     from .worker_client import WORKLINK_CHECKOUT_ROOT, factory_checkout_for_path
 

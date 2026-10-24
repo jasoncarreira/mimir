@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from types import MethodType
 from typing import Any
 from unittest.mock import patch
 
@@ -450,6 +451,41 @@ def bind_approval_turn(request: pytest.FixtureRequest) -> Callable[[AuthContext]
     return bind
 
 
+def _assert_tainted_write_veto(
+    auth: AuthContext, core_tools: tuple[str, ...], arguments: dict[str, Any],
+    *, enforce: bool, refused: bool,
+) -> None:
+    """Probe the tainted-turn write veto with tools governed in the active mode.
+
+    The core tools are registered in every mode. ``repo_push`` moved into
+    Cultivate on this branch, so a core-only policy sees it as an UNKNOWN tool;
+    it is probed only under the selected repository policy, where it is governed.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    def check(tool: str) -> None:
+        decision = ToolRegistry().authorize_tool(
+            tool, auth, enforce=enforce, arguments=arguments,
+        )
+        if refused:
+            assert not decision.allowed, (tool, decision)
+            assert decision.reason == "write_blocked_by_untrusted_ingest", (tool, decision)
+        else:
+            assert decision.reason != "write_blocked_by_untrusted_ingest", (tool, decision)
+
+    for tool in core_tools:
+        check(tool)
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        return
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        check("repo_push")
+
+
 def _auth(channel: str = "slack-C1", *, roles: tuple[str, ...] = ()) -> AuthContext:
     return AuthContext(
         principal="slack-U1",
@@ -464,6 +500,298 @@ def _auth(channel: str = "slack-C1", *, roles: tuple[str, ...] = ()) -> AuthCont
         resource_id=channel,
         bridge_instance="slack",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("author,tainted", [("slack-U1", False), ("outside", True)])
+@pytest.mark.parametrize("read_tool", ["read_file", "grep", "glob"])
+async def test_summarization_offload_read_back_preserves_ingress_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ingress_resolver: IdentityResolver,
+    author: str, tainted: bool, read_tool: str,
+) -> None:
+    """Real DeepAgents append, real backend provenance, fresh turn and write gate."""
+    from deepagents.middleware.summarization import SummarizationMiddleware
+    from langchain_core.messages import HumanMessage
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir._deepagents_summarization import install_offload_traceback_logging_patch
+    from mimir.config import Config
+    from mimir.readonly_backend import WriteGuardBackend
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_FOLDERS", raising=False)
+    install_offload_traceback_logging_patch()
+    backend = WriteGuardBackend(
+        root_dir=tmp_path, writable_dirs=Config.from_env().writable_dirs,
+        guard_outside_root=True,
+    )
+    middleware = object.__new__(SummarizationMiddleware)
+    middleware._get_history_path = MethodType(
+        lambda _self, _session=None: "/conversation_history/session-1994.md", middleware,
+    )
+    event = AgentEvent(
+        trigger="user_message", source="slack", channel_id="slack-C1",
+        author=author, content="needle: quoted outside content",
+    )
+    initial, _ = _runtime_operator_context(event, ingress_resolver)
+    token = set_current_turn(SimpleNamespace(turn_id="offload-1994", auth_context=initial))
+    try:
+        assert await middleware._aoffload_to_backend(
+            backend, [HumanMessage(content=event.content)], "session-1994",
+        ) == "/conversation_history/session-1994.md"
+    finally:
+        reset_current_turn(token)
+
+    path = tmp_path / "conversation_history" / "session-1994.md"
+    assert "needle: quoted outside content" in path.read_text()
+    from mimir._deepagents_summarization import read_offload_labels
+    assert read_offload_labels(str(path)) is not None
+
+    def read_in_turn(auth: AuthContext) -> InformationFlowLabels:
+        token = set_current_turn(SimpleNamespace(
+            turn_id="offload-1994" if auth is initial else "later-1994", auth_context=auth,
+        ))
+        capture = ac.begin_protected_result_capture()
+        try:
+            if read_tool == "read_file":
+                result = backend.read("/conversation_history/session-1994.md")
+                arguments = {"file_path": "/conversation_history/session-1994.md"}
+            elif read_tool == "grep":
+                result = backend.grep("needle", path="/conversation_history")
+                arguments = {"pattern": "needle", "path": "/conversation_history"}
+            else:
+                result = backend.glob("session-1994.md", path="/conversation_history")
+                arguments = {"pattern": "session-1994.md", "path": "/conversation_history"}
+            assert result.error is None
+            provenance = ac.end_protected_result_capture(capture)
+        finally:
+            reset_current_turn(token)
+        assert provenance is not None and provenance.sources
+        authorization = ToolRegistry().authorize_tool(
+            read_tool, auth, enforce=True, arguments=arguments,
+        )
+        assert authorization.allowed, authorization.reason
+        classified = classify_protected_result(
+            read_tool, arguments, auth, authorization, provenance=provenance,
+        )
+        assert classified is not None
+        assert any(source.domain == "filesystem" and source.resource_id == str(path)
+                   and source.integrity == "untrusted"
+                   for source in classified.sources)
+        assert any(source.domain == "channel" and source.resource_id == event.channel_id
+                   and source.integrity == ("untrusted" if tainted else "trusted")
+                   for source in classified.sources)
+        # Original source trust discriminates; the HOME path never declassifies.
+        assert classified.has_untrusted_active_ingest
+        return classified
+
+    # In-turn read, including a read of the offload the middleware just wrote.
+    read_in_turn(initial)
+    # New turn has trusted ingress only: no taint can be inherited accidentally.
+    later_event = replace(event, author="slack-U1", content="read that history")
+    later, later_labels = _runtime_operator_context(later_event, ingress_resolver)
+    assert not later_labels.has_untrusted_active_ingest
+    read_labels = read_in_turn(later)
+    write_tools = ("write_file", "edit_file", "replace_file", "memory_store")
+    args = {"file_path": str(tmp_path / "prompts" / "policy.md")}
+    # Discriminating pair: the clean turn is not vetoed before the read-back.
+    _assert_tainted_write_veto(later, write_tools, args, enforce=False, refused=False)
+    later.ifc_state.merge(read_labels, fallback=later.ifc_labels)
+    assert later.ifc_state.current(later.ifc_labels).has_untrusted_active_ingest
+    _assert_tainted_write_veto(later, write_tools, args, enforce=False, refused=True)
+
+    if not tainted:
+        # A clean old record must not attest bytes changed by another writer.
+        path.write_text(path.read_text() + "\nchanged outside offload\n")
+        from mimir._deepagents_summarization import read_offload_labels
+        assert read_offload_labels(str(path)) is None
+        token = set_current_turn(SimpleNamespace(turn_id="tampered-1994", auth_context=later))
+        capture = ac.begin_protected_result_capture()
+        try:
+            assert backend.read("/conversation_history/session-1994.md").error is None
+            provenance = ac.end_protected_result_capture(capture)
+        finally:
+            reset_current_turn(token)
+        assert provenance is not None and any(
+            source.has_untrusted_active_ingest for source in provenance.sources
+        )
+
+
+@pytest.mark.parametrize("drop_record", [False, True])
+def test_offload_append_keeps_earlier_untrusted_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ingress_resolver: IdentityResolver,
+    drop_record: bool,
+) -> None:
+    from deepagents.middleware.summarization import SummarizationMiddleware
+    from langchain_core.messages import HumanMessage
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir._deepagents_summarization import (
+        _label_file, install_offload_traceback_logging_patch, read_offload_labels,
+    )
+    from mimir.config import Config
+    from mimir.readonly_backend import WriteGuardBackend
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    install_offload_traceback_logging_patch()
+    backend = WriteGuardBackend(
+        root_dir=tmp_path, writable_dirs=Config.from_env().writable_dirs,
+        guard_outside_root=True,
+    )
+    middleware = object.__new__(SummarizationMiddleware)
+    middleware._get_history_path = MethodType(
+        lambda _self, _session=None: "/conversation_history/append.md", middleware,
+    )
+    path = tmp_path / "conversation_history" / "append.md"
+    for author in ("outside", "slack-U1"):
+        if author == "slack-U1" and drop_record:
+            _label_file(path).unlink()
+        event = AgentEvent(
+            trigger="user_message", channel_id="slack-C1", author=author,
+            content=f"message from {author}", source="slack",
+        )
+        auth, _ = _runtime_operator_context(event, ingress_resolver)
+        token = set_current_turn(SimpleNamespace(turn_id=f"append-{author}", auth_context=auth))
+        try:
+            assert middleware._offload_to_backend(
+                backend, [HumanMessage(content=event.content)], "append",
+            ) == "/conversation_history/append.md"
+        finally:
+            reset_current_turn(token)
+    assert path.read_text().count("## Summarized at ") == 2
+    sources = read_offload_labels(str(path))
+    assert sources is not None
+    assert {source.integrity for source in sources} == {"trusted", "untrusted"}
+    assert any(source.has_untrusted_active_ingest for source in sources)
+    later_event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="slack-U1",
+        content="read append", source="slack",
+    )
+    later, _ = _runtime_operator_context(later_event, ingress_resolver)
+    token = set_current_turn(SimpleNamespace(turn_id="append-later", auth_context=later))
+    capture = ac.begin_protected_result_capture()
+    try:
+        assert backend.read("/conversation_history/append.md").error is None
+        provenance = ac.end_protected_result_capture(capture)
+    finally:
+        reset_current_turn(token)
+    assert provenance is not None
+    assert any(source.domain == "filesystem" and source.resource_id == str(path)
+               and source.integrity == "untrusted" for source in provenance.sources)
+    assert any(source.has_untrusted_active_ingest for source in provenance.sources)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_taint", [False, True])
+@pytest.mark.parametrize("enforce", [False, True])
+async def test_real_summarization_middleware_captures_live_tool_sources(
+    tmp_path, monkeypatch, ingress_resolver, tool_taint, enforce,
+):
+    """Run awrap_model_call via a real graph, including media and session lookup."""
+    import base64
+    from deepagents.middleware.summarization import SummarizationMiddleware
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage, HumanMessage
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir._deepagents_summarization import install_offload_traceback_logging_patch, read_offload_labels
+    from mimir.config import Config
+    from mimir.readonly_backend import WriteGuardBackend
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1" if enforce else "0")
+    install_offload_traceback_logging_patch()
+    backend = WriteGuardBackend(root_dir=tmp_path, writable_dirs=Config.from_env().writable_dirs)
+    model = GenericFakeChatModel(messages=iter([AIMessage(content="summary")] * 10))
+    middleware = SummarizationMiddleware(
+        model=model, backend=backend, trigger=("messages", 4), keep=("messages", 2),
+    )
+    graph = create_agent(model, tools=[], middleware=[middleware])
+    event = AgentEvent(trigger="user_message", source="slack", channel_id="slack-C1",
+                       author="slack-U1", content="clean request")
+    auth, ingress = _runtime_operator_context(event, ingress_resolver)
+    assert not ingress.has_untrusted_active_ingest
+    web = SourceLabel(principal="web", domain="web", resource_id="https://example.test/input",
+                      bridge_instance="web", sensitivity="public",
+                      authorized_principals=frozenset({"web"}), source_kind="protected_tool",
+                      integrity="untrusted", integrity_effect="active_ingest")
+    if tool_taint:
+        auth.ifc_state.merge(InformationFlowLabels(sources=(web,)), fallback=auth.ifc_labels)
+    messages = [HumanMessage(content=[{"type": "image", "base64": base64.b64encode(b"image").decode(),
+                                        "mime_type": "image/png"}])]
+    for index in range(5):
+        messages.extend([AIMessage(content=f"answer {index}"), HumanMessage(content=f"question {index}")])
+    token = set_current_turn(SimpleNamespace(turn_id="real-offload", auth_context=auth))
+    try:
+        await graph.ainvoke({"messages": messages}, {"configurable": {"thread_id": "real-session"}})
+    finally:
+        reset_current_turn(token)
+    paths = list((tmp_path / "conversation_history").glob("*.md"))
+    assert len(paths) == 1
+    assert (tmp_path / "conversation_history" / "media").is_dir()
+    saved = read_offload_labels(str(paths[0]))
+    assert saved is not None
+    assert (web in saved) is tool_taint
+    assert any(s.domain == "channel" and s.integrity == "trusted" for s in saved)
+    # Fresh runtime-built ingress cannot account for the web source by itself.
+    later, _ = _runtime_operator_context(event, ingress_resolver)
+    token = set_current_turn(SimpleNamespace(turn_id="real-later", auth_context=later))
+    capture = ac.begin_protected_result_capture()
+    try:
+        assert backend.read(str(paths[0])).error is None
+        provenance = ac.end_protected_result_capture(capture)
+    finally:
+        reset_current_turn(token)
+    assert provenance is not None
+    assert (web in provenance.sources) is tool_taint
+    write_tools = ("write_file", "edit_file", "memory_store")
+    args = {"file_path": str(tmp_path / "state" / "x.md")}
+    # Discriminating pair: the clean turn is not vetoed before the read-back.
+    _assert_tainted_write_veto(later, write_tools, args, enforce=enforce, refused=False)
+    later.ifc_state.merge(InformationFlowLabels(sources=provenance.sources), fallback=later.ifc_labels)
+    _assert_tainted_write_veto(later, write_tools, args, enforce=enforce, refused=True)
+
+
+@pytest.mark.parametrize("fault", ["empty", "version", "malformed", "incomplete", "symlink", "parent", "digest"])
+def test_offload_record_fail_closed_guards(tmp_path, monkeypatch, fault):
+    import hashlib
+    import json
+    from mimir._deepagents_summarization import _label_file, _source_record, read_offload_labels
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    path = tmp_path / "conversation_history" / "guard.md"
+    path.parent.mkdir()
+    path.write_text("history")
+    source = _labels(integrity=Integrity.TRUSTED).sources[0]
+    record = {"version": 1, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+              "sources": [_source_record(source)]}
+    if fault == "empty":
+        record["sources"] = []
+    elif fault == "version":
+        record["version"] = 2
+    elif fault == "incomplete":
+        record["sources"][0]["principal"] = ""
+    elif fault == "digest":
+        record["sha256"] = "wrong"
+    elif fault == "symlink":
+        target = tmp_path / "target.md"
+        target.write_text("history")
+        path.unlink()
+        path.symlink_to(target)
+    elif fault == "parent":
+        path = tmp_path / "other" / "guard.md"
+        path.parent.mkdir()
+        path.write_text("history")
+    metadata = _label_file(path)
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    metadata.write_text("{" if fault == "malformed" else json.dumps(record))
+    saved = read_offload_labels(str(path))
+    if fault == "incomplete":
+        # Incomplete ACL evidence must not be restored as an authentic source.
+        assert saved is None
+    else:
+        assert saved is None
+    auth = _auth(roles=("admin",))
+    source = ac.protected_result_source(auth, principal="filesystem", domain="filesystem",
+                                        resource_id=str(path), bridge_instance="filesystem")
+    assert source.has_untrusted_active_ingest
 
 
 def _labels(

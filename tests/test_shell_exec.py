@@ -287,8 +287,9 @@ def test_shell_exec_timeout_reaps_spawned_child(
     wrappers = []
     script = tmp_path / "spawn.py"
     pidfile = tmp_path / "child.pid"
+    ready_read, ready_write = os.pipe()
     script.write_text(
-        "import signal, subprocess, sys, time\n"
+        "import os, signal, subprocess, sys, time\n"
         # Make child PID disappearance observable even in a container whose
         # PID 1 does not reap orphaned zombies.
         "signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n"
@@ -297,26 +298,33 @@ def test_shell_exec_timeout_reaps_spawned_child(
         "def stop(*_):\n"
         "    time.sleep(30)\n"
         "signal.signal(signal.SIGTERM, stop)\n"
-        "open(sys.argv[1], 'w').write(str(child.pid))\n"
+        "with open(sys.argv[1], 'w') as pidfile:\n"
+        "    pidfile.write(str(child.pid))\n"
+        "os.write(int(sys.argv[2]), b'R')\n"
         "time.sleep(30)\n",
     )
-    # Let the command itself wait for the child to start, rather than relying
-    # on a sleep in the test before the short timeout fires.
+    # Popen returns only after the script has written the pidfile. The real
+    # communicate(timeout=...) then starts its clock after child startup.
     monkeypatch.setitem(extra._SHELL_STATE, "timeout_s", 1.0)
-    command = f"{sys.executable} {script} {pidfile}"
+    command = f"{sys.executable} {script} {pidfile} {ready_write}"
     args = {"command": command}
     if direct:
-        args["mimir_direct_argv"] = [sys.executable, str(script), str(pidfile)]
-    if not isolated:
-        popen = subprocess.Popen
+        args["mimir_direct_argv"] = [sys.executable, str(script), str(pidfile), str(ready_write)]
+    popen = subprocess.Popen
 
-        def without_session(*args, **kwargs):
+    def after_child_starts(*args, **kwargs):
+        if not isolated:
             kwargs["start_new_session"] = False
+        kwargs["pass_fds"] = (ready_write,)
+        try:
             proc = popen(*args, **kwargs)
             wrappers.append(proc)
-            return proc
+        finally:
+            os.close(ready_write)
+        assert os.read(ready_read, 1) == b"R", "child did not report readiness"
+        return proc
 
-        monkeypatch.setattr(extra.subprocess, "Popen", without_session)
+    monkeypatch.setattr(extra.subprocess, "Popen", after_child_starts)
     if guard_regression:
         # Exercise the reviewer's exact mutation with the real timeout path.
         # The test-owned killpg interlock above remains independent of it.
@@ -356,6 +364,7 @@ def test_shell_exec_timeout_reaps_spawned_child(
             "or use bash_async for long jobs."
         )
     finally:
+        os.close(ready_read)
         # Also clean up when the interlock raises before shell_exec returns.
         for proc in wrappers:
             if proc.poll() is None:
