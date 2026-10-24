@@ -177,11 +177,7 @@ def test_confident_skip_is_audited_and_cursored(
     assert records == [
         {
             "message_id": "m1",
-            "url": "https://mail.google.com/mail/u/0/#inbox/thread-1",
-            "from": "Deals <deals@shop-example.com>",
-            "subject": "48-hour flash sale",
-            "answers": {"notify": {"type": "noul", "noul": 0.06}},
-            "model": "jev-1.13.0",
+            "notify_score": 0.06,
         }
     ]
     assert "dropped=1" in stderr
@@ -751,7 +747,7 @@ def test_shadow_would_drop_is_emitted_audited_and_cursored(
     ]
     assert len(records) == 1
     assert records[0]["shadow"] is True
-    assert records[0]["answers"]["notify"]["noul"] == 0.06
+    assert records[0]["notify_score"] == 0.06
     assert "dropped=0" in stderr
 
 
@@ -814,11 +810,7 @@ def test_decide_threshold_and_audit(
         records = [json.loads(line) for line in fresh_poller.TRIAGE_DROPPED_FILE.read_text().splitlines()]
         assert records == [{
             "message_id": "m1",
-            "url": "https://mail.google.com/mail/u/0/#inbox/thread-1",
-            "from": "Deals <deals@shop-example.com>",
-            "subject": "48-hour flash sale",
-            "answers": {"notify": {"type": "noul", "noul": noul}},
-            "model": "jev-1.13.0",
+            "notify_score": noul,
             "mode": "decide",
         }]
         assert "dropped=1" in stderr
@@ -888,7 +880,7 @@ def test_decide_shadow_emits_without_notify_line(
         assert len(records) == 1
         assert records[0]["shadow"] is True
         assert records[0]["mode"] == "decide"
-        assert records[0]["answers"]["notify"]["noul"] == noul
+        assert records[0]["notify_score"] == noul
     else:
         assert not fresh_poller.TRIAGE_DROPPED_FILE.exists()
 

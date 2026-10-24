@@ -1422,6 +1422,9 @@ def build_app(config: Config) -> web.Application:
     (config.home / "memory" / "shared").mkdir(parents=True, exist_ok=True)
     (config.home / "state").mkdir(parents=True, exist_ok=True)
     (config.home / "messages").mkdir(parents=True, exist_ok=True)
+    from .turn_stores import seed_home_ignore, sweep_turn_stores
+    seed_home_ignore(config.home)
+    sweep_turn_stores(config.home)
     (config.home / ".claude" / "agents").mkdir(parents=True, exist_ok=True)
     seeded = seed_subagent_defs(config.home)
     # One-shot migration: existing deployments with skills under

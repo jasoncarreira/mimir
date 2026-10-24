@@ -4801,6 +4801,65 @@ def test_operator_bounded_shell_result_remains_untrusted_informational() -> None
     assert labels.has_untrusted_active_ingest is False
 
 
+@pytest.mark.parametrize("tool", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize("command", [
+    "cat logs/turns.jsonl", "grep -r x logs/", "rg x",
+    "rg x /", "ag x", "cat state/pollers/worklink-ready-queue/run-1.log",
+    "cat messages/7.txt", "cat chat_history.jsonl", "cat events.jsonl",
+])
+@pytest.mark.parametrize("enforce", [False, True])
+def test_shell_name_match_taints_and_vetoes_following_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tool: str, command: str, enforce: bool,
+) -> None:
+    from mimir.tools.budget_gate import _authorize_tool_call
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    auth = replace(_auth(roles=("admin",)), enforcement_enabled=enforce)
+    labels = classify_protected_result(
+        tool, {"command": command}, auth,
+        ToolAuthorization(tool_name=tool, decision=OperationDecision.ADMIN_REQUIRED,
+                          allowed=True, flow_direction=ToolFlowDirection.BOTH),
+        result="shell output",
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+    auth.ifc_state.merge(labels, fallback=auth.ifc_labels)
+    denied, _ = _authorize_tool_call(
+        "edit_file", auth, arguments={"file_path": str(tmp_path / "code.py")},
+    )
+    assert denied.reason == "write_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.parametrize("command", ["ls", "git status", "uv run pytest", "rg x src"])
+def test_clean_shell_command_stays_informational(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    labels = classify_protected_result(
+        "shell_exec", {"command": command}, _auth(roles=("admin",)),
+        ToolAuthorization(tool_name="shell_exec", decision=OperationDecision.ADMIN_REQUIRED,
+                          allowed=True, flow_direction=ToolFlowDirection.BOTH),
+        result="ordinary shell output",
+    )
+    assert labels is not None and not labels.has_untrusted_active_ingest
+
+
+def test_shell_rg_uses_effective_home_cwd_without_explicit_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # shell_exec defaults to HOME even when the server process runs in the repo.
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    labels = classify_protected_result(
+        "shell_exec", {"command": "rg x"}, _auth(roles=("admin",)),
+        ToolAuthorization(tool_name="shell_exec", decision=OperationDecision.ADMIN_REQUIRED,
+                          allowed=True, flow_direction=ToolFlowDirection.BOTH),
+        result="search output",
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+
+
 def test_operator_bounded_shell_results_merge_monotonically() -> None:
     auth = _auth(roles=("user", "admin"))
     authorization = ToolAuthorization(
