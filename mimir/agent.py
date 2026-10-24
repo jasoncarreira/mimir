@@ -812,6 +812,29 @@ def _supports_responses_api() -> bool:
     return parsed_host == "api.openai.com"
 
 
+def _turn_human_message(
+    prompt: str, stable_prefix: str, model: BaseChatModel | None,
+) -> HumanMessage:
+    """Mark the stable turn run only for Anthropic's API message transport.
+
+    DeepAgents' own caching middleware still marks the system prompt and tools.
+    Claude Code manages caching in its CLI; other providers receive plain text.
+    """
+    if stable_prefix and prompt.startswith(stable_prefix) and model is not None:
+        try:
+            from langchain_anthropic import ChatAnthropic
+        except ImportError:  # Optional provider extra is absent.
+            pass
+        else:
+            if isinstance(model, ChatAnthropic):
+                return HumanMessage(content=[
+                    {"type": "text", "text": stable_prefix,
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": prompt[len(stable_prefix):]},
+                ])
+    return HumanMessage(content=prompt)
+
+
 def resolve_model_from_config(
     config: Any,
     *,
@@ -3076,12 +3099,14 @@ class Agent:
         # Session summaries, Resource usage, Upcoming, Upcoming
         # commitments, Self-state, etc. Synthesis turns
         # (saga_session_end) get a dedicated template instead.
+        stable_prefix_out: list[str] = []
         turn_prompt, recent = await self._build_turn_prompt(
             ctx, event,
             saga_block=memory_block,
             initial_auth_context=initial_auth_context,
             saga_labels=memory_labels,
             saga_query_task=saga_query_task,
+            stable_prefix_out=stable_prefix_out,
         )
 
         # Protected loaders merge their authoritative provenance into the turn
@@ -3170,7 +3195,10 @@ class Agent:
                 # when stream_mode is a list; the fallback keeps working if a
                 # backend ignores the list and yields bare snapshots.
                 async for item in agent.astream(
-                    {"messages": [HumanMessage(content=turn_prompt)]},
+                    {"messages": [_turn_human_message(
+                        turn_prompt, stable_prefix_out[0] if stable_prefix_out else "",
+                        self._agent_model,
+                    )]},
                     config=invoke_config,
                     context=ctx.auth_context,
                     stream_mode=["values", "messages"],
@@ -4743,6 +4771,7 @@ class Agent:
         saga_query_task: asyncio.Task[
             tuple[str | None, InformationFlowLabels]
         ] | None = None,
+        stable_prefix_out: list[str] | None = None,
     ) -> tuple[str, list]:
         """Assemble the per-turn user-side prompt + the recent-message
         list. Synthesis turns get a dedicated synthesis prompt; everything
@@ -5114,6 +5143,7 @@ class Agent:
                 str(ctx.turn_scratch_path)
                 if getattr(ctx, "turn_scratch_path", None) is not None else None
             ),
+            stable_prefix_out=stable_prefix_out,
         )
         ctx.ifc_labels = _merge_ifc_labels(
             ctx.ifc_labels, *(block.labels for block in source_blocks),
