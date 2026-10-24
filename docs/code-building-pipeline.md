@@ -12,6 +12,42 @@ Worklink is supplied by the optional Cultivate plugin, the in-repo
 before following these instructions; core Mimir alone does not supply Worklink
 or coding tools. See [upgrading a coding deployment](plugins.md#upgrading-a-coding-deployment).
 
+## Factory store maintenance and legacy recovery
+
+At a quiescent factory park/completion, Cultivate prunes redundant OpenCode
+streaming events and VACUUMs the store. Automatic runtime deletion at checkout
+TTL requires verified driver death and the executor's specialist-reaping
+acknowledgement. A verified-dead attempt **without** `.factory-runtime` follows
+the existing checkout TTL policy even when a legacy record lacks that acknowledgement.
+Existing runtimes with unknown records, unverified death, missing acknowledgement,
+or cleanup errors are retained with a `worklink_factory_runtime_prune_refused`
+event and a reason. Age alone never proves detached specialists have stopped.
+
+For legacy/interrupted runtimes whose acknowledgement cannot be recovered:
+
+1. Pause dispatch/recovery for the affected issue. On the execution host, verify
+   driver death and stop **all** remaining specialists and outside users of this
+   exact attempt's store, including idle SQLite clients. If quiescence cannot be
+   established, do not clear it. A successful WAL checkpoint detects active
+   transactions, not idle connections, and is not proof of quiescence.
+2. Preserve any required evidence first. This command is destructive: it deletes
+   the entire attempt-local runtime, not just redundant events, so OpenCode session
+   continuation from that store is lost. It does not archive factory records,
+   clear issue state, or make parked checkouts eligible for automatic deletion.
+3. Run as an authorized operator (not an autonomous task), with the Cultivate
+   plugin selected:
+   ```bash
+   mimir worklink clear-factory-runtime /exact/attempt/root/1983-1 \
+     --home /path/to/agent-home --confirm-quiescent
+   ```
+   The command holds the checkout-pruning interlock, reloads matching factory
+   records and still requires verified driver death. It uses existing controller/
+   executor cleanup permissions without widening privilege; unknown/broken records,
+   a busy interlock or permission failures refuse cleanup. It never synthesizes a
+   `children_reaped` acknowledgement. Successful cleanup removes the empty runtime
+   directory and emits `worklink_factory_runtime_operator_cleared`; other retention
+   and issue-recovery decisions remain separate.
+
 ## 1. Declare the repository
 
 Create `<MIMIR_HOME>/repositories.yaml`:

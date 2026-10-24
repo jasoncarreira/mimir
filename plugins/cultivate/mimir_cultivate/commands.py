@@ -51,6 +51,16 @@ def add_argparse(
     archive_p.add_argument("issue_id", type=int, help="Chainlink epic issue id to clear.")
     archive_p.add_argument("--home", type=Path, default=None, help="Agent home.")
 
+    recover_runtime_p = worklink_sub.add_parser(
+        "clear-factory-runtime", help="Operator-confirmed cleanup of a quiescent legacy factory store."
+    )
+    recover_runtime_p.add_argument("attempt", type=Path, help="Exact retained attempt directory.")
+    recover_runtime_p.add_argument("--home", type=Path, default=None, help="Agent home.")
+    recover_runtime_p.add_argument(
+        "--confirm-quiescent", action="store_true", required=True,
+        help="Confirm all driver, specialist and external store users are stopped. Destructive."
+    )
+
     emit_p = worklink_sub.add_parser(
         "emit-work-item",
         help="Emit one Chainlink issue as deterministic factory JSON.",
@@ -154,6 +164,22 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     if args.worklink_action == "archive-factory-run":
         return _archive_factory_run(args)
+
+    if args.worklink_action == "clear-factory-runtime":
+        from .worklink.autonomy import recover_factory_runtime
+        from mimir.event_logger import init_logger
+
+        home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+        init_logger(home / "logs" / "events.jsonl", session_id="worklink-runtime-recovery")
+        try:
+            recover_factory_runtime(
+                home, args.attempt, operator_confirmed_quiescent=args.confirm_quiescent,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"factory runtime recovery refused: {exc}", file=sys.stderr)
+            return 1
+        print(f"factory runtime cleared: {args.attempt}")
+        return 0
 
     if args.worklink_action == "emit-work-item":
         return _emit_work_item(args)

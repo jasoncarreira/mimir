@@ -391,12 +391,80 @@ def prune_stale_attempt_checkouts_for_home(
                 (record := records.get(child.resolve())) is None
                 or record.publication_outcome != "determined-unpublished"
             ),
+            prepare_prune=lambda child: _prepare_factory_runtime_prune(child, factory_records),
         )
         for child in pruned:
             record = records.get(child.resolve())
             if record is not None and record.publication_outcome == "undetermined":
                 _clear_pruned_orphan_block(home, record, run=run)
         return pruned
+
+
+def _prepare_factory_runtime_prune(child: Path, factory_records: Sequence[object]) -> bool:
+    """Empty worker-owned subdirectories before the controller removes the attempt."""
+    runtime = child / ".factory-runtime"
+    # The same interlock protects the record read and this operation. An unknown
+    # or unverified process is not authority to clear another run's store.
+    matching = [
+        record for record in factory_records
+        if Path(record.sandbox).parent.parent.parent.resolve() == child.resolve()
+    ]
+    def refuse(reason: str) -> bool:
+        try:
+            log_event_sync(
+                "worklink_factory_runtime_prune_refused",
+                attempt_path=str(child), reason=reason,
+            )
+        except Exception:
+            pass  # A telemetry failure must not turn refusal into deletion.
+        return False
+
+    if any(not factory_process_is_verified_dead(record) for record in matching):
+        return refuse("driver death is not verified")
+    # No worker store means there is no descendant-owned runtime to clear.
+    # Preserve the pre-existing verified-dead checkout TTL policy, including
+    # legacy records whose children_reaped field defaults to False.
+    if not runtime.exists() and not runtime.is_symlink():
+        return True
+    if not matching:
+        return refuse("runtime has no authoritative factory record")
+    if any(not getattr(record, "children_reaped", False) for record in matching):
+        return refuse("specialist reaping is not verified; operator quiescence recovery required")
+    try:
+        from .factory_store import clear_prunable_runtime
+
+        clear_prunable_runtime(child)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        return refuse(f"runtime cleanup failed: {type(exc).__name__}: {exc}")
+    return True
+
+
+def recover_factory_runtime(
+    home: Path, attempt: Path, *, operator_confirmed_quiescent: bool = False,
+) -> None:
+    """Operator-only store cleanup, never an automatic TTL override.
+
+    Confirmation means all driver/specialist and external store users have been
+    stopped. It is not inferred from age, PID death, or a WAL checkpoint. Do not
+    persist a synthetic children_reaped acknowledgement on the retained record.
+    """
+    if operator_confirmed_quiescent is not True:
+        raise RuntimeError("explicit operator quiescence confirmation is required")
+    with factory_checkout_interlock(home, pruning=True) as acquired, _claim_mutex(home):
+        if not acquired:
+            raise RuntimeError("factory checkout maintenance is busy")
+        listing = list_factory_records(home)
+        if listing.failures:
+            raise RuntimeError("factory records could not be verified")
+        matching = [record for record in listing.records
+                    if Path(record.sandbox).parent.parent.parent.resolve() == attempt.resolve()]
+        if not matching or any(not factory_process_is_verified_dead(record) for record in matching):
+            raise RuntimeError("factory runtime recovery requires matching records and verified driver death")
+        from .factory_store import clear_prunable_runtime
+
+        clear_prunable_runtime(attempt)
+        (attempt / ".factory-runtime").rmdir()
+        log_event_sync("worklink_factory_runtime_operator_cleared", attempt_path=str(attempt))
 
 
 def _clear_pruned_orphan_block(

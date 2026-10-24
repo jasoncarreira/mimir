@@ -271,9 +271,14 @@ class FactoryRunRecord:
     controller_phase: str
     controller_error: str | None = None
     transcript: str | None = None
+    # Set only after the executor's successful subreaper terminal acknowledgement.
+    # Driver PID death alone does not exclude detached specialists.
+    children_reaped: bool = False
     version: int = FACTORY_RECORD_VERSION
 
     def __post_init__(self) -> None:
+        if type(self.children_reaped) is not bool:
+            raise FactoryRecordError("factory record children_reaped is invalid")
         if self.version != FACTORY_RECORD_VERSION:
             raise FactoryRecordError("unsupported factory record version")
         if not _valid_record_run_id(self.run_id):
@@ -330,6 +335,7 @@ class FactoryRunRecord:
             "controller_phase": self.controller_phase,
             "controller_error": self.controller_error,
             "transcript": self.transcript,
+            "children_reaped": self.children_reaped,
         }
 
     @classmethod
@@ -354,6 +360,10 @@ class FactoryRunRecord:
             "controller_error",
             "transcript",
         }
+        data = dict(data)
+        children_reaped = data.pop("children_reaped", False)
+        if type(children_reaped) is not bool:
+            raise FactoryRecordError("factory record children_reaped is invalid")
         version = data.get("version")
         legacy = version == 1 and set(data) == expected - {"transcript"}
         if version not in {1, FACTORY_RECORD_VERSION}:
@@ -414,6 +424,7 @@ class FactoryRunRecord:
             controller_phase=str(data["controller_phase"]),
             controller_error=controller_error,
             transcript=transcript,
+            children_reaped=children_reaped,
         )
 
     def observed(self, status: FactoryStatus, observed_at: str) -> FactoryRunRecord:

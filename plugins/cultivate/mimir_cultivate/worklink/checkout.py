@@ -1354,6 +1354,7 @@ def prune_attempt_checkouts(
     runner: Runner = _default_runner,
     is_active: Callable[[Path], bool] | None = None,
     can_prune: Callable[[Path], bool] | None = None,
+    prepare_prune: Callable[[Path], bool] | None = None,
 ) -> list[Path]:
     """Prune retained attempt checkouts older than ``older_than``.
 
@@ -1384,6 +1385,8 @@ def prune_attempt_checkouts(
             if is_active is not None and is_active(child):
                 continue
             if can_prune is not None and not can_prune(child):
+                continue
+            if prepare_prune is not None and not prepare_prune(child):
                 continue
             if isolated:
                 try:

@@ -110,6 +110,7 @@ class ComputeResult:
     command: tuple[str, ...] = ()
     stdout_path: Path | None = None
     stderr_path: Path | None = None
+    children_reaped: bool = False
 
 
 class ComputeLaunchError(RuntimeError):
@@ -750,6 +751,9 @@ class LocalSubprocessComputeBackend:
                 command=command,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
+                # Only this factory worker path has the subreaper protocol;
+                # collect_contained raises on lost/refused terminal reports.
+                children_reaped=(_spec.backend == "feature_factory"),
             )
 
         proc = job

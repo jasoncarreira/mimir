@@ -11157,6 +11157,7 @@ def test_factory_recovery_launch_start(
         attempt=3,
         status=pre,
         controller_phase="parked",
+        children_reaped=True,  # The old run's acknowledgement cannot cover a relaunch.
     )
     handle = LaunchHandle("local_subprocess", "999999998", 2)
     state_dir = failures.dispatch_failure_state_dir(tmp_path)
@@ -11204,8 +11205,11 @@ def test_factory_recovery_launch_start(
     async def supervise(self: object, **kwargs: Any) -> str:
         events.append("supervise")
         assert kwargs["factory_record"].handle == handle
+        assert kwargs["factory_record"].children_reaped is False
         assert kwargs["autonomous"] is autonomous
-        assert load_factory_record(tmp_path, "700").handle == handle
+        persisted = load_factory_record(tmp_path, "700")
+        assert persisted.handle == handle
+        assert persisted.children_reaped is False
         transitions = failures.load_failure_state(state_dir).get("factory_transitions", {})
         assert transitions == (
             {key: expected} if (autonomous or existing_start) and write_failure != "transition" else {}
