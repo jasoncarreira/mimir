@@ -64,8 +64,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.10.18` through the lockstep
-`opencode-feature-factory@0.10.18` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.12.1` through the lockstep
+`opencode-feature-factory@0.12.1` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -126,7 +126,7 @@ executor together by rebuilding the executor image before enabling this layout.
   rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
   variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.10.18 verification and
+  Worklink admits the launcher only after package/adapter 0.12.1 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume uses the retained session, while
   heartbeat uses the newly claimed session after recovery; lock actions use
@@ -608,7 +608,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.10.18 controls. |
+| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.12.1 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than
@@ -1070,6 +1070,46 @@ after which it refuses the run with `factory resume requires current status
 needs-human` and the attempt is lost. So the script reports which recovery
 preconditions hold, refuses with the specific one that does not, and then hands
 off to `mimir worklink run-epic <issue> --autonomous`.
+
+### Finishing a run after a Gate 3 NO-GO (factory 0.12.1)
+
+A run can park at `needs-human` with every slice merged when Gate 3 (`pre_pr`)
+returns NO-GO and its remediations are spent: `factory remediate` refuses at the
+limit, and publication refuses the NO-GO. Epic #1949 ended this way and its PR
+(#2408) had to be opened by hand. Factory 0.12.1 adds two operator commands for it.
+Choose one:
+
+- **`factory grant-remediation <run> --reason TEXT --session ID`** adds one
+  remediation to the limit (2 plus the number of grants). Use it when the
+  validator's finding is real and the factory should fix it. A remediation can
+  still open only before Gate 3 opens.
+- **`factory override-validator <run> --reason TEXT --session ID`** keeps the
+  NO-GO on record and lets publication accept it. Use it only when you have judged
+  the finding and decided to publish anyway. The PR leads with "Published over
+  validator NO-GO by operator override", followed by the findings, the judged head
+  and your reason. A commit after the verdict, or a new verdict, voids the override.
+
+Both are operator decisions. The factory has no operator identity to check, so
+nothing but WORKFLOW.md stops a driver from running them. Run them yourself, only
+on a parked run, and always give a reason that names the finding.
+
+Both commands require the run parked at `needs-human` and a `--session` that holds
+a fresh lock. Use the same lock steal and release as a repark, as the `worklink` user:
+
+```bash
+docker exec -u worklink mimirbot env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/nonexistent sh -c '
+  cd <checkout>/.factory-sandboxes/<run-id> &&
+  F=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js &&
+  node $F status <run-id> --json &&                              # status needs-human, remediations {opened, limit, granted}
+  node $F lock <run-id> steal --session operator-<date> &&
+  node $F grant-remediation <run-id> --reason "<finding and why>" --session operator-<date> &&
+  node $F lock <run-id> release --session operator-<date>'
+```
+
+For an override, use `override-validator` in place of `grant-remediation`. Then
+resume the run through Worklink as in the section above
+(`scripts/factory_resume.py`, then `mimir worklink run-epic <issue> --autonomous`).
+Never resume it with `factory resume` directly.
 
 ### Leaf publication fence and manual reconciliation
 

@@ -10364,44 +10364,6 @@ class ToolRegistry:
                     sink_target = resource
                     requested_target = (arguments or {}).get("path")
                 return finish(hands_auth)
-            if tool_name in {"ci_run_jobs", "ci_run", "ci_recent_runs"}:
-                args = arguments or {}
-                repo, run_id = args.get("repository"), args.get("run_id")
-                run_scope = (
-                    isinstance(repo, str)
-                    and type(run_id) is int and run_id > 0
-                    and is_configured_github_repo(repo)
-                    and (repo.lower(), run_id) in getattr(
-                        auth_context, "ci_run_targets", frozenset(),
-                    )
-                )
-                branch, workflow_id = args.get("branch"), args.get("workflow_id")
-                branch_scope = (
-                    isinstance(repo, str) and is_configured_github_repo(repo)
-                    and isinstance(branch, str) and bool(branch)
-                    and (workflow_id is None or (type(workflow_id) is int and workflow_id > 0))
-                    and any(
-                        r == repo.lower() and b == branch
-                        and (workflow_id is None or workflow_id == w)
-                        for r, b, w in getattr(auth_context, "ci_branch_targets", frozenset())
-                    )
-                )
-                in_scope = (
-                    (branch_scope if tool_name == "ci_recent_runs" else run_scope)
-                    and service_principal is not None
-                    and service_principal.has_capability(tool_name)
-                )
-                return finish(ToolAuthorization(
-                    tool_name=tool_name,
-                    decision=OperationDecision.RESOURCE_SCOPED,
-                    allowed=in_scope or not enforce,
-                    reason=None if in_scope else "ci_run_scope_denied",
-                    required_tier=AccessTier.USER,
-                    enforcement_enabled=enforce,
-                    is_shadow_decision=not enforce and not in_scope,
-                    would_block=not in_scope,
-                    flow_direction=flow_direction,
-                ))
             if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
                 forge_auth = authorize_repo_pr_tool(
                     tool_name,
@@ -11826,45 +11788,6 @@ def classify_protected_result(
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels
     descriptor = get_tool_descriptor(tool_name)
-    if tool_name in {"ci_run_jobs", "ci_run", "ci_recent_runs"}:
-        repo, run_id = args.get("repository"), args.get("run_id")
-        branch, workflow_id = args.get("branch"), args.get("workflow_id")
-        valid_run = (
-            isinstance(repo, str) and type(run_id) is int
-            and (repo.lower(), run_id) in getattr(auth_context, "ci_run_targets", frozenset())
-        )
-        valid_branch = (
-            isinstance(repo, str) and isinstance(branch, str) and bool(branch)
-            and (workflow_id is None or type(workflow_id) is int)
-            and any(
-                r == repo.lower() and b == branch
-                and (workflow_id is None or workflow_id == w)
-                for r, b, w in getattr(auth_context, "ci_branch_targets", frozenset())
-            )
-        )
-        if not (valid_branch if tool_name == "ci_recent_runs" else valid_run):
-            return _incomplete_protected_result(
-                "repository", args, tool_name=tool_name, auth_context=auth_context,
-            )
-        principal = getattr(auth_context, "canonical_principal", None)
-        if getattr(auth_context, "is_service", False) and principal:
-            principal = f"service:{principal}"
-        source = protected_result_source(
-            auth_context,
-            principal=principal,
-            domain="repository",
-            resource_id=(
-                f"{repo.lower()}#actions/runs?branch={branch}"
-                + (f"&workflow={workflow_id}" if workflow_id is not None else "")
-                if tool_name == "ci_recent_runs" else
-                f"{repo.lower()}#actions/run/{run_id}"
-                + ("/jobs" if tool_name == "ci_run_jobs" else "")
-            ),
-            bridge_instance="forge",
-        )
-        labels = InformationFlowLabels().with_source(source)
-        channel = getattr(auth_context, "channel_id", None)
-        return labels.with_channel(channel) if channel else labels
     if descriptor and descriptor.result_origin & ResultOriginKind.REPOSITORY:
         if (
             tool_name.startswith("repo_")

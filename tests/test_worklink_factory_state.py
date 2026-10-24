@@ -293,6 +293,52 @@ def test_factory_record_round_trip_preserves_structured_status(tmp_path: Path) -
     assert persisted["next_action"] == status.next_action
 
 
+def test_factory_record_round_trip_preserves_0121_validator_override(tmp_path: Path) -> None:
+    # The validator row 0.12.1's `factory status --json` prints after an operator
+    # override; a retained record must save and reload it unchanged.
+    head = "7e23159fbf0b672e575144586918b4930d7d0210"
+    validator = {
+        "verdict": "NO-GO", "report": "reviews/implementation-validator.json",
+        "reviewed_head": head, "loops": 0,
+        "override": {
+            "reviewed_head": head, "reason": "AC4 finding judged non-blocking by operator",
+            "session": "operator-20261023", "at": "2026-10-23T14:00:00.000Z",
+        },
+    }
+    expected = record(tmp_path)
+    assert expected.status is not None
+    status = parse_factory_status({**expected.status.to_json(), "validator": validator})
+    expected = replace(expected, status=status)
+
+    path = save_factory_record(tmp_path, expected)
+
+    assert load_factory_record(tmp_path, expected.run_id) == expected
+    assert json.loads(path.read_text(encoding="utf-8"))["status"]["validator"] == validator
+
+
+@pytest.mark.parametrize("override, message", [
+    (None, None),
+    ({"reviewed_head": "abc", "reason": "r", "session": "s", "at": "t"}, None),
+    ({"reviewed_head": "other", "reason": "r", "session": "s", "at": "t"}, "reviewed_head"),
+    ({"reviewed_head": "abc", "reason": "r", "session": "s"}, "must be an object with"),
+    ("abc", "must be an object with"),
+])
+def test_fallback_status_row_parses_0121_validator_override(override: object, message: str | None) -> None:
+    # factory_state keeps its own parser for controllers without the executor installed.
+    from mimir_cultivate.worklink import factory_state
+
+    row = {"verdict": "NO-GO", "report": None, "reviewed_head": "abc", "loops": 1, "override": override}
+    if message is None:
+        assert factory_state._status_row(row, "validator") == row
+    else:
+        with pytest.raises(factory_state.FactoryContractError, match=message):
+            factory_state._status_row(row, "validator")
+    go = {"verdict": "GO", "report": None, "reviewed_head": "abc", "loops": 1}
+    assert factory_state._status_row(go, "validator") == go
+    with pytest.raises(factory_state.FactoryContractError, match="requires a NO-GO"):
+        factory_state._status_row({**go, "override": {"reviewed_head": "abc", "reason": "r", "session": "s", "at": "t"}}, "validator")
+
+
 def test_issue_lookup_reads_both_keys_without_legacy_shadowing_canonical(
     tmp_path: Path,
 ) -> None:

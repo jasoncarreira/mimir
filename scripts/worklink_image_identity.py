@@ -501,12 +501,10 @@ for name in ("pre-commit", "pre-push"):
     hook = hooks / name
     hook.write_text("#!/bin/sh\ntouch /tmp/worklink-publication-attack\nexit 91\n")
     hook.chmod(0o755)
-# The worker runs as ``worklink`` while the checkout is owned by ``mimir``, so bare
-# git refuses with "detected dubious ownership" and plants nothing. Name the checkout
-# explicitly and mark it safe: a hostile worker would do exactly this, and a proof that
-# cannot plant proves nothing.
+# The executor trusts this one issued checkout for the worker's Git subprocesses.
+# Planting and reading back the hostile metadata must work with plain Git.
 checkout = str(Path.cwd().resolve())
-git = ["git", "-c", f"safe.directory={checkout}", "-C", checkout]
+git = ["git", "-C", checkout]
 hostile_helper = "!f() { touch /tmp/worklink-publication-attack; echo username=worker; echo password=hostile; }; f"
 subprocess.run([*git, "config", "--local", "core.hooksPath", str(hooks.resolve())], check=True)
 subprocess.run([*git, "config", "--local", "credential.helper", hostile_helper], check=True)
