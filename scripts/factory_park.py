@@ -465,6 +465,15 @@ def plan_claim_release(
     before = claims.attempts_used(comments, home_path=home)
     after = claims.attempt_budget(comments, home_path=home, projected_clean_park=claim).charged
     if after >= before and not credited:
+        try:
+            held = claims._lock_still_held_by(claim)
+        except RuntimeError as exc:
+            raise ParkError(f"could not verify claim lock: {exc}") from exc
+        if held:
+            raise ParkError(
+                "this claim is already discounted but its lock is still held; "
+                "reconcile the interrupted shutdown release before resuming"
+            )
         raise ClaimAlreadyReconciled(
             "this claim is already discounted; nothing to reconcile"
         )

@@ -946,8 +946,9 @@ class TestParkToImmediateDispatch:
         assert ["chainlink", "locks", "release", "1783"] in calls
         assert (home / "state/worklink/clean-parks/1783-1.json").is_file()
 
-    def test_an_already_parked_run_with_nothing_to_do_still_refuses(
-        self, tmp_path: Path, monkeypatch
+    @pytest.mark.parametrize("held", [False, True])
+    def test_an_already_parked_shutdown_forgiven_claim_reports_held_lock(
+        self, tmp_path: Path, monkeypatch, held: bool
     ) -> None:
         """The idempotent path must not re-forgive an already-reconciled claim.
 
@@ -970,8 +971,10 @@ class TestParkToImmediateDispatch:
             lambda *a, **k: _status(sandbox_path=record.sandbox),
         )
         monkeypatch.setattr(park, "_run", _park_stub(calls, history))
+        monkeypatch.setattr(ChainlinkClaims, "_lock_still_held_by", lambda self, claim: held)
 
-        with pytest.raises(park.ParkError, match="needs no reconciliation"):
+        message = "already discounted but its lock is still held" if held else "needs no reconciliation"
+        with pytest.raises(park.ParkError, match=message):
             park.main([
                 "--run-id", record.run_id, "--sandbox", record.sandbox,
                 "--home", str(home), "--launcher", record.launcher,
@@ -1076,6 +1079,19 @@ def test_clean_park_rerun_only_reconciles_held_claim(tmp_path, monkeypatch, firs
         park.main(args)
     assert not any(argv[1:3] in (["locks", "release"], ["issue", "unlabel"])
                    for argv in calls[len(before):])
+
+
+def test_dry_run_prints_projected_attempt_budget_without_stopping(tmp_path, monkeypatch, capsys):
+    record = _record(tmp_path, phase="running", status="running")
+    home = _home_with(record, tmp_path)
+    calls, stopped = [], []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **kw: stopped.append(a))
+    assert _park_main(record, home, monkeypatch, _park_stub(calls, _claim_history(2)),
+                      tmp_path, extra=("--dry-run",)) == 0
+    assert "clean park would take attempts_used 2 -> 1" in capsys.readouterr().out
+    assert stopped == []
+    assert load_factory_record(home, record.run_id) == record
+    assert not any("terminal" in argv or argv[1:3] == ["locks", "release"] for argv in calls)
 
 
 def test_shutdown_forgiven_current_claim_refuses_before_stop(tmp_path, monkeypatch):

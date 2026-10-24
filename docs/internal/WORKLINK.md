@@ -1022,9 +1022,11 @@ canonical paths, archive-directory safety and the projected attempt budget.
 The projection must discount this claim, not an unrelated charged claim; an
 already shutdown-forgiven claim refuses before stop. Unpredictable publication
 IO failures are reported as controlled park errors with the claim still held.
-On an already-parked run, only an explicitly already-discounted claim or an
-archived-and-released claim is "nothing to do". Other preflight errors propagate;
-an archived-but-held claim can finish its interrupted release.
+On an already-parked run, only an explicitly already-discounted and released
+claim or an archived-and-released claim is "nothing to do". A shutdown-forgiven
+claim whose lock is still held reports the interrupted release rather than
+silently claiming reconciliation. Other preflight errors propagate; an
+archived-but-held claim can finish its interrupted release.
 
 `attempts_used` discounts matching verified archives by
 `(issue_id, attempt, agent_id, claimed_at)`. The parked record and canonical
@@ -1036,6 +1038,11 @@ crashes and unverified parks remain charged. Actual shutdown aborts still use
 The attempt *ordinal* still advances to avoid checkout/branch/evidence collisions.
 Budget diagnostics report only clean-park discounts not already covered by
 shutdown/other forgiveness, using the same accounting view as admission.
+Recovery may complete an absent archive only for the unique prior claim matching
+the retained attempt and an already-persisted parked observation, preserving its
+original observation time. Missing or ambiguous historical evidence stays
+charged. Observing an old park during recovery never credits the new resume
+claim; a resume that crashes before leaving needs-human consumes its budget.
 
 Without the release the next dispatch is refused, by a
 path worth stating because it is indirect: the chainlink CLI treats a same-agent
