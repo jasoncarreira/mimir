@@ -9,6 +9,7 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +31,26 @@ class PluginSkill:
     @property
     def dirname(self) -> str:
         return f"{self.candidate.name}-{self.name}"
+
+
+_unreadable_reported: set[str] = set()
+_unreadable_report_lock = threading.Lock()
+
+
+def _report_unreadable(skill: PluginSkill) -> None:
+    from mimir.event_logger import log_event_sync
+
+    with _unreadable_report_lock:
+        if skill.label in _unreadable_reported:
+            return
+        try:
+            # No file names, exception messages or home bytes in diagnostics.
+            log_event_sync("plugin_skill_inventory_unreadable", skill=skill.label)
+        except RuntimeError:
+            # CLI/direct callers need not initialise the server's event logger.
+            # Leave it eligible for a later call after logger initialisation.
+            return
+        _unreadable_reported.add(skill.label)
 
 
 def selected_skills() -> list[PluginSkill]:
@@ -107,6 +128,9 @@ def skill_state(home: Path, skill: PluginSkill) -> str:
             for name in (*dirs, *files):
                 if (base / name).is_symlink():
                     return "modified"
+            # Match packaged cache exclusions. Seeded pollers currently execute
+            # their script as __main__ without sibling imports; revisit this trust
+            # assumption before adding imports that can load unchecked cache pycs.
             dirs[:] = [name for name in dirs if name not in {"__pycache__", ".pytest_cache"}]
             for name in files:
                 path = base / name
@@ -118,10 +142,7 @@ def skill_state(home: Path, skill: PluginSkill) -> str:
         return ("upgrade available" if any(actual == previous for previous in previous_skill_inventories(skill).values())
                 else "modified")
     except OSError:
-        from mimir.event_logger import log_event_sync
-
-        # No file names, exception messages or home bytes in diagnostics.
-        log_event_sync("plugin_skill_inventory_unreadable", skill=skill.label)
+        _report_unreadable(skill)
         return "modified"
 
 
@@ -140,8 +161,11 @@ async def notify_skill_upgrades(home: Path, candidates, operator_channel: str, s
 
     for skill in pending_skill_upgrades(home, skills_for_candidates(candidates)):
         version = str(skill.candidate.manifest.defaults.get("version", skill.candidate.manifest.version))
-        target = hashlib.sha256(json.dumps(skill_inventory(skill), sort_keys=True,
+        inventory = skill_inventory(skill)
+        target = hashlib.sha256(json.dumps(inventory, sort_keys=True,
                                            separators=(",", ":")).encode("utf-8")).hexdigest()
+        release = next((key for key, recorded in previous_skill_inventories(skill).items()
+                        if recorded == inventory), f"sha256:{target}")
         marker = Path(".mimir/plugin-skill-upgrades") / skill.dirname / target
         for kind in ("event", "alert"):
             if kind == "alert" and not operator_channel:
@@ -155,7 +179,8 @@ async def notify_skill_upgrades(home: Path, candidates, operator_channel: str, s
                 continue
             try:
                 if kind == "event":
-                    await log_event("plugin_skill_upgrade_available", skill=skill.label, version=version)
+                    await log_event("plugin_skill_upgrade_available", skill=skill.label,
+                                    version=version, target_release=release)
                 else:
                     await send(operator_channel, f"Plugin skill upgrade available: {skill.label}. "
                                f"Run `{upgrade_command(skill)}` to apply it (backup kept).", final=True)

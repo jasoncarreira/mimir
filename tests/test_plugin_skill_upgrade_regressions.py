@@ -42,6 +42,7 @@ def test_unreadable_home_tree_fails_closed_without_breaking_consumers(
     full_prompt = agent._build_system_prompt(emit_health_events=False)
     assert "## Core memory" in full_prompt
     events = []
+    monkeypatch.setattr(skills, "_unreadable_reported", set())
     monkeypatch.setattr("mimir.event_logger.log_event_sync",
                         lambda name, **fields: events.append((name, fields)))
     unreadable = dest / ("pollers.json" if failure == "manifest" else "tests/conftest.py")
@@ -82,6 +83,118 @@ def test_unreadable_home_tree_fails_closed_without_breaking_consumers(
     assert events
     assert set(name for name, _ in events) == {"plugin_skill_inventory_unreadable"}
     assert all(fields == {"skill": skill.label} for _, fields in events)
+
+
+@pytest.mark.parametrize("consumer", ["state", "visibility", "pollers", "prompt"])
+def test_unreadable_tree_without_initialised_event_logger(tmp_path, monkeypatch, consumer):
+    from mimir import event_logger
+    from mimir.plugins.manager import load_plugins
+    from mimir.pollers import discover_pollers
+    from mimir.skill_visibility import hidden_home_skill_dirs
+
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    manager = load_plugins(enable="cultivate")
+    skill = next(s for s in skills.skills_for_candidates(manager.policy.selected_plugin_candidates)
+                 if s.name == "github-poller")
+    dest, _ = skills.install_skill(tmp_path, skill)
+    agent = _agent(tmp_path, manager)
+    full_prompt = agent._build_system_prompt(emit_health_events=False)
+    assert "## Core memory" in full_prompt
+    # Own the singleton state, but do not replace the failing production API.
+    monkeypatch.setattr(event_logger, "_logger", None)
+    monkeypatch.setattr(skills, "_unreadable_reported", set())
+    original = Path.read_bytes
+    def read_bytes(path):
+        if path == dest / "SKILL.md":
+            raise PermissionError("private filename and contents")
+        return original(path)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    for _ in range(2):
+        if consumer == "state":
+            assert skills.skill_state(tmp_path, skill) == "modified"
+        elif consumer == "visibility":
+            assert hidden_home_skill_dirs(tmp_path, manager.policy) == frozenset()
+        elif consumer == "pollers":
+            registered = {p.name: p for p in discover_pollers(tmp_path / "skills", policy=manager.policy)}
+            assert registered["github-activity"].authority.github_activity
+            assert registered["github-activity"].manifest_path != dest / "pollers.json"
+        else:
+            assert agent._build_system_prompt(emit_health_events=False) == full_prompt
+
+
+def test_unreadable_tree_cli_without_logger_and_late_logger_dedupe(tmp_path, monkeypatch, capsys):
+    from mimir import event_logger
+    from tests.test_defaults_upgrade import _plugin
+    from tests.test_plugin_skills_cli import cli
+
+    candidate = _plugin(tmp_path)
+    skill = skills.PluginSkill(candidate, "helper", "github", False)
+    home = tmp_path / "home"
+    dest, _ = skills.install_skill(home, skill)
+    monkeypatch.setattr(skills, "selected_skills", lambda: [skill])
+    monkeypatch.setattr(event_logger, "_logger", None)
+    monkeypatch.setattr(skills, "_unreadable_reported", set())
+    original = Path.read_bytes
+    def read_bytes(path):
+        if path == dest / "SKILL.md":
+            raise PermissionError("private filename and contents")
+        return original(path)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    assert cli("list-optional", "--home", str(home)) == 0
+    assert "modified" in capsys.readouterr().out
+    assert cli("install", "--forge", "github", "--home", str(home)) == 3
+    assert "--restore" in capsys.readouterr().out
+    # A failed telemetry attempt must not suppress the first event after init.
+    log_path = tmp_path / "events.jsonl"
+    monkeypatch.setattr(event_logger, "_logger", event_logger.EventLogger(log_path, "test"))
+    for _ in range(4):
+        assert skills.skill_state(home, skill) == "modified"
+    # Same label in another home is still once per process per skill.
+    other_home = tmp_path / "other-home"
+    other_dest, _ = skills.install_skill(other_home, skill)
+    def other_read_bytes(path):
+        if path == other_dest / "SKILL.md":
+            raise PermissionError("another private error")
+        return read_bytes(path)
+    monkeypatch.setattr(Path, "read_bytes", other_read_bytes)
+    assert skills.skill_state(other_home, skill) == "modified"
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["type"] == "plugin_skill_inventory_unreadable"
+    assert records[0]["skill"] == skill.label
+    assert "private" not in log_path.read_text()
+
+
+def test_non_regular_inventory_file_is_rejected_before_read(tmp_path, monkeypatch):
+    from tests.test_defaults_upgrade import _plugin
+
+    skill = skills.PluginSkill(_plugin(tmp_path), "helper", None, True)
+    home = tmp_path / "home"
+    dest, _ = skills.install_skill(home, skill)
+    fifo = dest / "pipe"
+    skills.os.mkfifo(fifo)
+    original = Path.read_bytes
+    def read_bytes(path):
+        # Test-owned interlock: removing S_ISREG fails instead of hanging.
+        assert path != fifo, "non-regular file must never be opened"
+        return original(path)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    assert skills.skill_state(home, skill) == "modified"
+
+
+def test_existing_non_directory_skill_root_is_modified_not_missing(tmp_path):
+    from tests.test_defaults_upgrade import _plugin
+
+    skill = skills.PluginSkill(_plugin(tmp_path), "helper", None, True)
+    home = tmp_path / "home"
+    root = home / "skills" / skill.dirname
+    assert skills.skill_state(home, skill) == "not installed"
+    root.parent.mkdir(parents=True)
+    root.write_text("operator-owned file")
+    assert skills.skill_state(home, skill) == "modified"
+    assert root.read_text() == "operator-owned file"
 
 
 def test_reserved_identity_rejects_previous_inventory_directly(tmp_path, monkeypatch):
@@ -176,7 +289,9 @@ async def test_successive_upgrades_same_defaults_version_each_notify_once(tmp_pa
         for _ in range(3):
             await skills.notify_skill_upgrades(home, (candidate,), "alerts", send)
         assert len(events) == len(sent) == index
-        assert events[-1] == ("plugin_skill_upgrade_available", {"skill": skill.label, "version": "1.0"})
+        assert events[-1] == ("plugin_skill_upgrade_available", {
+            "skill": skill.label, "version": "1.0", "target_release": f"release-{index}",
+        })
         assert sent[-1] == ("alerts", f"Plugin skill upgrade available: {skill.label}. "
                             f"Run `{skills.upgrade_command(skill)}` to apply it (backup kept).", True)
         skills.install_skill(home, skill, restore=True)

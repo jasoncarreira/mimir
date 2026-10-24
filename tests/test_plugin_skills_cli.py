@@ -409,8 +409,12 @@ async def test_prior_release_upgrade_notification_and_apply(tmp_path, monkeypatc
     monkeypatch.setattr("mimir.event_logger.log_event", event)
     for _ in range(3):
         await notify_skill_upgrades(tmp_path, manager.policy.selected_plugin_candidates, "alerts", send)
+    from mimir.plugins.skills import previous_skill_inventories, skill_inventory
+    target_release = next(key for key, inventory in previous_skill_inventories(skill).items()
+                          if inventory == skill_inventory(skill))
     assert events == [("plugin_skill_upgrade_available", {
         "skill": skill.label, "version": skill.candidate.manifest.defaults["version"],
+        "target_release": target_release,
     })]
     assert sent == [("alerts", f"Plugin skill upgrade available: {skill.label}. "
                      f"Run `{command}` to apply it (backup kept).", True)]
