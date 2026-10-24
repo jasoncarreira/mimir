@@ -520,6 +520,14 @@ def check_and_open_plugin_defaults_upgrade(
         safe_destination(home, VENDOR_WORKTREE_REL)
         safe_destination(home, Path("scratch") / "proposals" / "upgrade")
         files = plugin_default_files(candidate)
+        # Moving a default to optional must not delete its installed home copy.
+        # Only installed optional skills join the vendor tree: upgrades are not
+        # an implicit opt-in for optional skills absent from the home.
+        for directory, _forge in manifest.optional_skills:
+            rel = Path("skills") / f"{name}-{Path(directory).name}"
+            installed = safe_destination(home, rel)
+            if installed.is_dir():
+                files.update(plugin_default_files(candidate, skill=Path(directory).name))
         vendor = _ensure_vendor_branch(home, branch=branch, version=version, files=files)
         if vendor.error:
             results[name] = DefaultsUpgradeResult(False, "error", version, vendor.error)

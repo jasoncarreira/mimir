@@ -1886,15 +1886,14 @@ def discover_pollers(
                     or not valid_skill
                     or not path.is_file()):
                 raise ValueError(f"plugin {candidate.name!r}: invalid skill poller resource {path}")
-            # Optional resources are only runnable from an installed home copy.
-            # Merely shipping the distribution must not activate its pollers.
+            # Fresh homes do not opt in merely by selecting the distribution.
+            # Existing seeds retain the packaged fallback and manifest-only
+            # takeover used before defaults became optional. Whole-tree identity
+            # still governs the home copy's authority at dispatch time.
             if skill in optional_skills:
                 installed = skills_dir / f"{candidate.name}-{skill.name}" / "pollers.json"
-                if (installed in manifests and candidate.name == "cultivate"
-                        and _is_selected_cultivate_default(installed, policy)):
-                    manifests[installed] = candidate.name
-                    validated_seeds.add(installed)
-                continue
+                if installed not in manifests:
+                    continue
             if path in manifests:
                 raise ValueError(f"plugin poller resource collision: {path}")
             manifests[path] = candidate.name

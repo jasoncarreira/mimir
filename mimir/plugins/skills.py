@@ -76,7 +76,7 @@ def resolve_skill(name: str, core_names: set[str]) -> PluginSkill | None:
         _validate_skill_name(name)
         owner, local = None, name
     matches = [s for s in selected_skills() if s.name == local and (owner is None or s.candidate.name == owner)]
-    if owner is None and local in core_names and matches or len(matches) > 1:
+    if (owner is None and local in core_names and matches) or len(matches) > 1:
         raise ValueError(f"ambiguous skill {name!r}; use <plugin>:<skill>")
     if matches:
         return matches[0]
@@ -107,8 +107,6 @@ def install_skill(home: Path, skill: PluginSkill, *, restore: bool = False) -> t
     if restore and not dest.exists():
         raise ValueError(f"{dest} is not installed; omit --restore")
     files = skill_files(skill)
-    marker_rel = Path(".mimir") / "seed-plugin-defaults" / skill.candidate.name
-    marker = safe_destination(home, marker_rel)
     for rel in files:
         safe_destination(home, rel)
     root.mkdir(parents=True, exist_ok=True)
@@ -122,19 +120,15 @@ def install_skill(home: Path, skill: PluginSkill, *, restore: bool = False) -> t
             with os.fdopen(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644),
                            "w", encoding="utf-8") as stream:
                 stream.write(text)
-        if skill.candidate.manifest.defaults and not marker.exists():
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            safe_destination(home, marker_rel)
-            try:
-                with os.fdopen(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                       0o644), "w", encoding="utf-8") as stream:
-                    stream.write(str(skill.candidate.manifest.defaults["version"]) + "\n")
-            except FileExistsError:
-                pass
+        # Only defaults seeding may mark initial scheduler jobs as seeded.
+        stage.chmod(0o755)
         safe_destination(home, dest_rel)
         if restore:
             stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            backup = safe_destination(home, Path("skills") / f".{skill.dirname}.backup-{stamp}")
+            backup_rel = Path(".mimir/plugin-skill-backups") / f"{skill.dirname}-{stamp}"
+            backup = safe_destination(home, backup_rel)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            safe_destination(home, backup_rel)
             if backup.exists():
                 raise FileExistsError(f"backup already exists: {backup}")
             dest.rename(backup)
@@ -148,6 +142,19 @@ def install_skill(home: Path, skill: PluginSkill, *, restore: bool = False) -> t
         if stage.exists():
             shutil.rmtree(stage)
     return dest, backup
+
+
+def log_optional_hint(home: Path, candidates, logger) -> None:
+    """One boot hint for missing optionals, using the frozen selection only."""
+    missing = uninstalled_optional(home, [
+        PluginSkill(candidate, Path(path).name, forge, False)
+        for candidate in candidates
+        for path, forge in (candidate.manifest.optional_skills if candidate.manifest else ())
+    ])
+    if missing:
+        logger.info("optional plugin skills available: %s; install with `mimir skills install <plugin>:<skill>` "
+                    "or `mimir skills install --forge <name>`",
+                    ", ".join(skill.label for skill in missing))
 
 
 def uninstalled_optional(home: Path, selected: list[PluginSkill] | None = None) -> list[PluginSkill]:

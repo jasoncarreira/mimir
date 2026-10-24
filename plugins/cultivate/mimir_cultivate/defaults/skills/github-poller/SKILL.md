@@ -14,7 +14,7 @@ env:
       description: "GitHub login mimir authors as. Events from this login are filtered out."
       example: "mimir-carreira"
     - name: MIMIR_GITHUB_PRELOAD_REVIEW_SKILL
-      description: "Set to true to inline the selected Cultivate review skill from <home>/skills/cultivate-review/SKILL.md into PR-review prompts. No path override is needed after provider defaults seed the home."
+      description: "Set to true to inline the selected Cultivate review skill from <home>/skills/cultivate-review/SKILL.md into PR-review prompts. Install it with mimir skills install cultivate:review; no path override is needed."
       example: "true"
     - name: MIMIR_GITHUB_REVIEW_SKILL_PATH
       description: "Optional absolute-path override for the Cultivate review SKILL.md. Defaults to <home>/skills/cultivate-review/SKILL.md; only set this for a non-standard layout."
@@ -24,17 +24,18 @@ env:
 
 # Cultivate GitHub Poller — watch GitHub repos for activity
 
-This poller ships in `mimir-cultivate`, not core. When selected with
-`MIMIR_PLUGINS=cultivate`, provider defaults seed it under
-`<home>/skills/cultivate-github-poller/`. The companion review command is
-`/cultivate-review`, seeded at `<home>/skills/cultivate-review/`.
+This optional poller ships in `mimir-cultivate`, not core. Select
+`MIMIR_PLUGINS=cultivate` and run `mimir skills install cultivate:github-poller`
+to install `<home>/skills/cultivate-github-poller/`. The companion review command
+is `/cultivate-review`; install it with `mimir skills install cultivate:review`.
 
 ## Installation
 
-1. Install `mimir-cultivate` and select `MIMIR_PLUGINS=cultivate`. At startup,
-   provider defaults copy `plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/`
-   into `<home>/skills/cultivate-github-poller/`; configure it there rather
-   than installing it from core's optional-skill catalog.
+1. Install `mimir-cultivate` and select `MIMIR_PLUGINS=cultivate`. Run
+   `mimir skills install cultivate:github-poller` (or `mimir skills install --forge github`
+   for all GitHub skills). Existing modified copies can be backed up and replaced
+   with `mimir skills install cultivate:github-poller --restore`.
+   Backups live outside loader roots in `<home>/.mimir/plugin-skill-backups/`.
 
 2. Configure env vars:
 

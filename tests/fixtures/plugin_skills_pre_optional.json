@@ -1,0 +1,12 @@
+{
+  "source_commit": "e52e30daced64c5c5ad0ea266c27a5be07ef299e",
+  "note": "Verbatim changed documentation regions from the pre-optional base; unchanged env fields and trailing sections are retained from the package. Independent of Git history availability in shallow CI checkouts.",
+  "github-poller": {
+    "description": "Watch configured GitHub repositories for actionable issues, pull requests, comments and reviews. Install mimir-cultivate and select MIMIR_PLUGINS=cultivate to seed <home>/skills/cultivate-github-poller/, then configure GITHUB_REPOS and MIMIR_GITHUB_SELF_LOGIN.",
+    "body": "This poller ships in `mimir-cultivate`, not core. When selected with\n`MIMIR_PLUGINS=cultivate`, provider defaults seed it under\n`<home>/skills/cultivate-github-poller/`. The companion review command is\n`/cultivate-review`, seeded at `<home>/skills/cultivate-review/`.\n\n## Installation\n\n1. Install `mimir-cultivate` and select `MIMIR_PLUGINS=cultivate`. At startup,\n   provider defaults copy `plugins/cultivate/mimir_cultivate/defaults/skills/github-poller/`\n   into `<home>/skills/cultivate-github-poller/`; configure it there rather\n   than installing it from core's optional-skill catalog.\n\n"
+  },
+  "github-ci-watch": {
+    "description": "Watch GitHub Actions runs on the main branch of configured repositories; emit turns for new failures and remain silent while CI is green. Install mimir-cultivate and select MIMIR_PLUGINS=cultivate to seed <home>/skills/cultivate-github-ci-watch/, then set GITHUB_REPOS.",
+    "body": "A selected Cultivate poller skill. It is absent from core; installations\nselecting `mimir-cultivate` with `MIMIR_PLUGINS=cultivate` seed it under\n`<home>/skills/cultivate-github-ci-watch/`.\n\nIt watches the ``main`` branch of each ``GITHUB_REPOS`` entry, inspects\nthe last few GitHub Actions workflow runs, and emits one ``ci_failure``\nevent per newly-failed run (conclusion ``failure`` / ``timed_out`` /\n``startup_failure``). Green builds produce **zero output** — the\n\"silence as filter\" principle: this poller only speaks when CI breaks.\n\n## Installation\n\n1. Install `mimir-cultivate` and select `MIMIR_PLUGINS=cultivate`. On startup,\n   the provider seeds `<home>/skills/cultivate-github-ci-watch/`. In a source\n   checkout, the corresponding source is\n   `plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/`.\n\n"
+  }
+}

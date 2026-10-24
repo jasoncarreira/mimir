@@ -238,10 +238,7 @@ def test_selected_installed_cultivate_seeded_pollers_reload(tmp_path, monkeypatc
         seeded.write_bytes(original + b" ")
         invalid = []
         fallback = discover_pollers(home / "skills", policy=selected, invalid_entries=invalid)
-        if skill == "chainlink-orchestrator":
-            assert next(p for p in fallback if p.name == name).manifest_path != seeded
-        else:
-            assert name not in {p.name for p in fallback}  # optional has no packaged fallback
+        assert next(p for p in fallback if p.name == name).manifest_path != seeded
         assert any(entry[0] == seeded and "reserved" in entry[2] for entry in invalid)
         seeded.write_bytes(original)
     assert set(shipped).isdisjoint(p.name for p in discover_pollers(

@@ -997,7 +997,7 @@ def _plugin(tmp_path: Path, version: str = "1.0", *, name: str = "sample"):
         manifest=SimpleNamespace(defaults={
             "version": version, "skills": ("skills/helper",),
             "prompts": ("prompts/heartbeat.md",), "scheduler_jobs": ("jobs.yaml",),
-        }),
+        }, optional_skills=()),
     )
 
 
@@ -1083,6 +1083,55 @@ def test_plugin_defaults_upgrade_proposes_without_touching_live_home(
     assert "plugin v2" in (result.proposal.worktree / "prompts/sample/heartbeat.md").read_text()
     assert path.read_text() == "operator edit\n"
     assert (home / "memory/core/00-identity.md").read_text() == "identity v1\n"
+    _cleanup_upgrade_proposal(home)
+
+
+@pytest.mark.parametrize("edited", [False, True])
+def test_default_to_optional_upgrade_preserves_installed_skill(home, tmp_path, edited):
+    plugin = _plugin(tmp_path)
+    (home / "scheduler.yaml").write_text(_HEARTBEAT)
+    seed_plugin_defaults(home, selected=(plugin,))
+    rel = "skills/sample-helper/SKILL.md"
+    _git("add", "-f", rel, "prompts/sample/heartbeat.md", "scheduler.yaml", cwd=home)
+    _git("commit", "-q", "-m", "seed old plugin", cwd=home)
+    _git("push", "-q", cwd=home)
+    assert du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"].action == "baseline_initialized"
+    expected = "operator edit\n" if edited else "plugin skill\n"
+    if edited:
+        (home / rel).write_text(expected)
+        _git("add", "-f", rel, cwd=home)
+        _git("commit", "-q", "-m", "edit old seed", cwd=home)
+        _git("push", "-q", cwd=home)
+    plugin.manifest.defaults.update(version="2.0", skills=())
+    plugin.manifest.optional_skills = (("skills/helper", "github"),)
+    # Force a real proposal to check its resulting tree, not just vendor output.
+    (tmp_path / "sample/prompts/heartbeat.md").write_text("new prompt\n")
+    result = du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"]
+    assert result.action == "proposal_opened"
+    assert result.proposal and result.proposal.worktree
+    assert (home / rel).read_text() == expected
+    # The proposal is sparse; unchanged skills are verified in its Git index.
+    assert _git("show", f":{rel}", cwd=result.proposal.worktree).stdout == expected
+    assert rel not in _git("diff", "--cached", "--name-only", cwd=result.proposal.worktree).stdout.splitlines()
+    _cleanup_upgrade_proposal(home)
+
+
+def test_upgrade_does_not_install_absent_optional(home, tmp_path):
+    plugin = _plugin(tmp_path)
+    plugin.manifest.defaults["skills"] = ()
+    seed_plugin_defaults(home, selected=(plugin,))
+    _git("add", "-f", "prompts/sample/heartbeat.md", cwd=home)
+    _git("commit", "-q", "-m", "seed without optional", cwd=home)
+    _git("push", "-q", cwd=home)
+    assert du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"].action == "baseline_initialized"
+    plugin.manifest.defaults["version"] = "2.0"
+    plugin.manifest.optional_skills = (("skills/helper", "github"),)
+    (tmp_path / "sample/prompts/heartbeat.md").write_text("new prompt\n")
+    result = du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"]
+    assert result.action == "proposal_opened"
+    assert result.proposal and result.proposal.worktree
+    assert _git("show", ":skills/sample-helper/SKILL.md", cwd=result.proposal.worktree, check=False).returncode != 0
+    assert not (home / "skills/sample-helper").exists()
     _cleanup_upgrade_proposal(home)
 
 

@@ -14,9 +14,9 @@ env:
 
 # Cultivate GitHub CI Watch — react when CI breaks
 
-A selected Cultivate poller skill. It is absent from core; installations
-selecting `mimir-cultivate` with `MIMIR_PLUGINS=cultivate` seed it under
-`<home>/skills/cultivate-github-ci-watch/`.
+An optional Cultivate poller skill, absent from core. Select
+`MIMIR_PLUGINS=cultivate` and run `mimir skills install cultivate:github-ci-watch`
+to install it under `<home>/skills/cultivate-github-ci-watch/`.
 
 It watches the ``main`` branch of each ``GITHUB_REPOS`` entry, inspects
 the last few GitHub Actions workflow runs, and emits one ``ci_failure``
