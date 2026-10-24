@@ -767,7 +767,7 @@ def _validate_environment(value: object) -> dict[str, str]:
 
 def _leaf_git_environment(environment: dict[str, str], checkout: Path) -> None:
     """Trust only the executor-validated leaf checkout for this process's Git."""
-    if any(name.startswith("GIT_CONFIG_") for name in environment):
+    if any(name == "GIT_CONFIG" or name.startswith("GIT_CONFIG_") for name in environment):
         raise RuntimeError("leaf worker Git configuration must be assigned by the executor")
     environment.update({
         "GIT_CONFIG_NOSYSTEM": "1",
