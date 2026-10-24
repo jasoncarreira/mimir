@@ -387,11 +387,11 @@ class TestResumePreflight:
         record = _record(tmp_path)
         assert resume.preflight(record, _status(), Path(record.sandbox)) == []
 
-    def test_an_already_unparked_run_is_refused_naming_the_cause(self, tmp_path: Path) -> None:
-        """The exact failure that cost an attempt: status no longer needs-human."""
+    def test_running_with_verified_dead_driver_passes(self, tmp_path: Path, monkeypatch) -> None:
         record = _record(tmp_path, phase="running", status="running")
-        problems = resume.preflight(record, _status("running"), Path(record.sandbox))
-        assert any("recovery resumes only" in problem for problem in problems)
+        monkeypatch.setattr(resume, "factory_process_is_alive", lambda record: False)
+        monkeypatch.setattr(resume, "factory_process_is_verified_dead", lambda record: True)
+        assert resume.preflight(record, _status("running"), Path(record.sandbox)) == []
 
     @pytest.mark.skipif(
         sys.platform != "linux",

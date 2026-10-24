@@ -2563,17 +2563,27 @@ class WorklinkRunner:
                     candidate.run_id, sandbox=sandbox, launcher=candidate.launcher,
                 )
                 _require_factory_status(live, candidate)
-                candidate = candidate.observed(live, datetime.now(UTC).isoformat())
+                if live.lock_session not in {None, candidate.session}:
+                    raise WorklinkError("factory recovery lock owner changed")
+                if not live.is_terminal:
+                    if live.status not in {"running", "needs-human"}:
+                        raise WorklinkError("factory recovery status is not resumable")
+                    if factory_process_is_alive(candidate):
+                        raise WorklinkError("factory recovery refuses a live retained process")
+                    if not factory_process_is_verified_dead(candidate):
+                        raise WorklinkError("factory recovery cannot verify the retained process is dead")
+                    if live.status == "needs-human" and live.park_snapshot is None:
+                        raise WorklinkError("factory recovery requires a published park snapshot")
+                # Do not adopt lock identity or clear controller diagnostics during
+                # the pre-claim refresh; subsequent recovery can still refuse.
+                candidate = replace(
+                    candidate, status=live, observed_at=datetime.now(UTC).isoformat(),
+                )
                 save_factory_record(self.home, candidate)
-                if not live.is_terminal and live.status != "needs-human":
-                    raise WorklinkError(
-                        "factory resume requires current status needs-human; "
-                        f"found {live.status!r}"
-                    )
-            except FactoryContractError as exc:
-                raise FactoryRecoveryBlocked(candidate, f"factory status is unavailable: {exc}") from exc
             except WorklinkError as exc:
                 raise FactoryRecoveryBlocked(candidate, str(exc)) from exc
+            except (FactoryContractError, RuntimeError, OSError) as exc:
+                raise FactoryRecoveryBlocked(candidate, f"factory status is unavailable: {exc}") from exc
             retained = candidate
 
         try:

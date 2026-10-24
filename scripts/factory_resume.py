@@ -3,14 +3,13 @@
 
 This script deliberately does **not** call ``factory resume``.
 
-mimir's recovery path does the whole transition as one operation: it requires
-live ``needs-human`` status and the retained process
+mimir's recovery path does the whole transition as one operation: it accepts
+live ``running`` or published ``needs-human`` status and requires the retained process
 to be verifiably dead, steals or claims the session lock as needed, resumes,
 checks the returned status is owned and running, validates the recovery binding,
-launches a driver, saves the new handle and enters supervision. Unparking from
-outside spends the ``needs-human`` transition that path is gated on, and then the
-supported path refuses the run with ``factory resume requires current status
-needs-human``. That is not hypothetical: it is how an attempt was lost.
+launches a driver, saves the new handle and enters supervision. A live ``running``
+run with a verified-dead driver is parked before resume. Do not unpark manually:
+let the controller validate ownership and carry out the whole recovery sequence.
 
 Two details follow from reading that path rather than guessing at it:
 
@@ -78,9 +77,9 @@ def preflight(record, status: dict, sandbox: Path) -> list[str]:
     problems: list[str] = []
 
     reported = status.get("status")
-    if reported != PARKED:
+    if reported not in {"running", PARKED}:
         problems.append(
-            f"factory status is {reported!r}; recovery resumes only 'needs-human'"
+            f"factory status is {reported!r}; recovery resumes only 'running' or 'needs-human'"
         )
 
     if not record.session:
