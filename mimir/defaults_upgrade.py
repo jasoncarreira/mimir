@@ -520,9 +520,9 @@ def check_and_open_plugin_defaults_upgrade(
         safe_destination(home, VENDOR_WORKTREE_REL)
         safe_destination(home, Path("scratch") / "proposals" / "upgrade")
         files = plugin_default_files(candidate)
-        # Moving a default to optional must not delete its installed home copy.
-        # Only installed optional skills join the vendor tree: upgrades are not
-        # an implicit opt-in for optional skills absent from the home.
+        # Keep installed optionals represented in the package vendor baseline.
+        # This does not migrate skills: proposal worktrees currently cover only
+        # core memory and prompts. Absent optionals must not enter the baseline.
         for directory, _forge in manifest.optional_skills:
             rel = Path("skills") / f"{name}-{Path(directory).name}"
             installed = safe_destination(home, rel)

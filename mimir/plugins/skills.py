@@ -120,7 +120,8 @@ def install_skill(home: Path, skill: PluginSkill, *, restore: bool = False) -> t
             with os.fdopen(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644),
                            "w", encoding="utf-8") as stream:
                 stream.write(text)
-        # Only defaults seeding may mark initial scheduler jobs as seeded.
+        # Publish with the seeder's normal directory permissions, not mkdtemp's 0700.
+        # Do not write seed-plugin-defaults: only the seeder owns scheduler state.
         stage.chmod(0o755)
         safe_destination(home, dest_rel)
         if restore:

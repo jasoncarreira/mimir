@@ -96,7 +96,9 @@ def test_unselected_skills_and_symlink_restore_refused(tmp_path, monkeypatch, ca
     assert cli("install", "cultivate:github-poller", "--home", str(home)) == 2
     assert "MIMIR_PLUGINS" in capsys.readouterr().out
     assert cli("list-optional", "--home", str(home)) == 0
-    assert "cultivate  github-poller" not in capsys.readouterr().out
+    listing = capsys.readouterr().out
+    assert "cultivate  github-poller" not in listing
+    assert "Installed but unselected plugins: cultivate; select with MIMIR_PLUGINS." in listing
     assert cli("install", "--forge", "github", "--home", str(home)) == 2
     for name in ("github-poller", "cultivate:github-poller"):
         assert cli("install", name, "--home", str(home)) == 2
@@ -162,7 +164,7 @@ def test_install_before_seeding_preserves_initial_jobs_and_permissions(tmp_path)
 
 
 @pytest.mark.parametrize("edit", ["none", "doc", "manifest"])
-def test_real_previous_release_poller_seeds_keep_running(tmp_path, monkeypatch, edit):
+def test_real_previous_release_poller_seeds_keep_running(tmp_path, monkeypatch, capsys, edit):
     import json
     from dataclasses import replace
 
@@ -194,21 +196,65 @@ def test_real_previous_release_poller_seeds_keep_running(tmp_path, monkeypatch, 
         current = current.replace("Install it with mimir skills install cultivate:review; no path override is needed.",
                                   "No path override is needed after provider defaults seed the home.")
         old_doc = current.encode()
-        assert old_doc != (dest / "SKILL.md").read_bytes()
+        # Keep the released document bytes unchanged until a real migration
+        # exists; old unedited seeds must match, not merely get a fallback.
+        assert old_doc == (dest / "SKILL.md").read_bytes()
         (dest / "SKILL.md").write_bytes(old_doc)
         if edit == "doc":
             (dest / "SKILL.md").write_bytes(old_doc + b"\noperator note\n")
         elif edit == "manifest":
             manifest = dest / "pollers.json"
             manifest.write_bytes(manifest.read_bytes() + b" ")
-    pollers = {p.name: p for p in discover_pollers(tmp_path / "skills", policy=manager.policy)}
+    invalid = []
+    pollers = {p.name: p for p in discover_pollers(
+        tmp_path / "skills", policy=manager.policy, invalid_entries=invalid)}
     for name, skill_name in (("github-activity", "github-poller"), ("github-ci-watch", "github-ci-watch")):
         poller = pollers[name]
         assert poller.authority.canonical == f"poller:{name}"
-        # Modified copies cannot gain authority. The inventoried package runs.
-        assert poller.manifest_path != tmp_path / "skills" / f"cultivate-{skill_name}" / "pollers.json"
+        home_manifest = tmp_path / "skills" / f"cultivate-{skill_name}" / "pollers.json"
+        assert (poller.manifest_path == home_manifest) is (edit == "none")
+        skill = next(s for s in selected_skills() if s.name == skill_name)
+        assert skill_state(tmp_path, skill) == ("installed" if edit == "none" else "modified")
+    if edit == "none":
+        assert not [entry for entry in invalid if entry[1] in {"github-activity", "github-ci-watch"}]
+        assert cli("list-optional", "--home", str(tmp_path)) == 0
+        listing = capsys.readouterr().out
+        assert "cultivate  github-poller  [poller]  github  installed" in listing
+        assert "cultivate  github-ci-watch  [poller]  github  installed" in listing
+        assert cli("install", "--forge", "github", "--home", str(tmp_path)) == 0
+        output = capsys.readouterr().out
+        assert "cultivate:github-poller: installed (skipped)" in output
+        assert "cultivate:github-ci-watch: installed (skipped)" in output
     assert {"github-activity", "github-ci-watch"}.isdisjoint(
         p.name for p in discover_pollers(tmp_path / "skills", policy=load_plugins(enable="").policy))
+
+
+@pytest.mark.parametrize("selected", [True, False])
+def test_setup_home_populates_optional_report(tmp_path, monkeypatch, capsys, selected):
+    from mimir.commands.setup import setup_home, _print_setup_report
+
+    pytest.importorskip("mimir_cultivate")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if selected else "")
+    home = tmp_path / "agent"
+    status = setup_home(home)
+    expected = {f"cultivate:{name}" for name in (
+        "github-poller", "github-ci-watch", "github", "review",
+    )} if selected else set()
+    assert set(status["plugin_optional"]) == expected
+    _print_setup_report(status)
+    printed = capsys.readouterr().out
+    if selected:
+        assert all(label in printed for label in expected)
+        assert "mimir skills install <plugin>:<skill>" in printed
+        assert (home / "skills/cultivate-chainlink-orchestrator/SKILL.md").is_file()
+        assert not (home / "skills/cultivate-github-poller").exists()
+        # Exercise setup's re-run path after installing just one optional.
+        assert cli("install", "cultivate:github-poller", "--home", str(home)) == 0
+        rerun = setup_home(home)
+        assert set(rerun["plugin_optional"]) == expected - {"cultivate:github-poller"}
+    else:
+        assert "optional plugin skills:" not in printed
+        assert not (home / "skills/cultivate-chainlink-orchestrator").exists()
 
 
 def test_setup_report_and_boot_hint(tmp_path, monkeypatch, capsys, caplog):

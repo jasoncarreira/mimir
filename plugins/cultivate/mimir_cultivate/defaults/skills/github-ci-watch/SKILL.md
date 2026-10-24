@@ -1,6 +1,6 @@
 ---
 name: cultivate-github-ci-watch
-description: "Watch GitHub Actions runs on the main branch of configured repositories; emit turns for new failures and remain silent while CI is green. Select MIMIR_PLUGINS=cultivate and run mimir skills install cultivate:github-ci-watch, then set GITHUB_REPOS."
+description: "Watch GitHub Actions runs on the main branch of configured repositories; emit turns for new failures and remain silent while CI is green. Install mimir-cultivate and select MIMIR_PLUGINS=cultivate to seed <home>/skills/cultivate-github-ci-watch/, then set GITHUB_REPOS."
 env:
   required:
     - name: GITHUB_REPOS
@@ -14,9 +14,9 @@ env:
 
 # Cultivate GitHub CI Watch — react when CI breaks
 
-An optional Cultivate poller skill, absent from core. Select
-`MIMIR_PLUGINS=cultivate` and run `mimir skills install cultivate:github-ci-watch`
-to install it under `<home>/skills/cultivate-github-ci-watch/`.
+A selected Cultivate poller skill. It is absent from core; installations
+selecting `mimir-cultivate` with `MIMIR_PLUGINS=cultivate` seed it under
+`<home>/skills/cultivate-github-ci-watch/`.
 
 It watches the ``main`` branch of each ``GITHUB_REPOS`` entry, inspects
 the last few GitHub Actions workflow runs, and emits one ``ci_failure``
@@ -27,7 +27,7 @@ event per newly-failed run (conclusion ``failure`` / ``timed_out`` /
 ## Installation
 
 1. Install `mimir-cultivate` and select `MIMIR_PLUGINS=cultivate`. On startup,
-   run `mimir skills install cultivate:github-ci-watch` to install `<home>/skills/cultivate-github-ci-watch/`. In a source
+   the provider seeds `<home>/skills/cultivate-github-ci-watch/`. In a source
    checkout, the corresponding source is
    `plugins/cultivate/mimir_cultivate/defaults/skills/github-ci-watch/`.
 

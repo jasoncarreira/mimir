@@ -1110,7 +1110,10 @@ def test_default_to_optional_upgrade_preserves_installed_skill(home, tmp_path, e
     assert result.action == "proposal_opened"
     assert result.proposal and result.proposal.worktree
     assert (home / rel).read_text() == expected
-    # The proposal is sparse; unchanged skills are verified in its Git index.
+    # The vendor ref, not the sparse proposal index, discriminates whether
+    # installed optionals were included. It contains package bytes, not edits.
+    assert _git("show", f"mimir-plugin-defaults-sample:{rel}", cwd=home).stdout == "plugin skill\n"
+    assert rel in _git("ls-tree", "-r", "--name-only", "mimir-plugin-defaults-sample", cwd=home).stdout.splitlines()
     assert _git("show", f":{rel}", cwd=result.proposal.worktree).stdout == expected
     assert rel not in _git("diff", "--cached", "--name-only", cwd=result.proposal.worktree).stdout.splitlines()
     _cleanup_upgrade_proposal(home)
@@ -1132,6 +1135,9 @@ def test_upgrade_does_not_install_absent_optional(home, tmp_path):
     assert result.proposal and result.proposal.worktree
     assert _git("show", ":skills/sample-helper/SKILL.md", cwd=result.proposal.worktree, check=False).returncode != 0
     assert not (home / "skills/sample-helper").exists()
+    assert "skills/sample-helper/SKILL.md" not in _git(
+        "ls-tree", "-r", "--name-only", "mimir-plugin-defaults-sample", cwd=home,
+    ).stdout.splitlines()
     _cleanup_upgrade_proposal(home)
 
 

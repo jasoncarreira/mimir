@@ -837,7 +837,14 @@ def cmd_list_optional(args) -> int:
     skills = list_available()
     from mimir.plugins.skills import selected_skills, skill_files, skill_state
     plugin_skills = selected_skills()
+    from mimir.plugins.discovery import discover_plugins, enabled_plugins
+    selected_names = {candidate.name for candidate in enabled_plugins()}
+    unselected = sorted(candidate.name for candidate in discover_plugins(enable="")
+                        if candidate.manifest and candidate.name not in selected_names
+                        and (candidate.manifest.defaults.get("skills") or candidate.manifest.optional_skills))
     print("Plugin skills are shown only for selected plugins; select with MIMIR_PLUGINS.")
+    if unselected:
+        print(f"Installed but unselected plugins: {', '.join(unselected)}; select with MIMIR_PLUGINS.")
     if not skills and not plugin_skills:
         print(f"no optional skills found under {resolved}")
         return 0

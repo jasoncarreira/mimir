@@ -354,6 +354,15 @@ skill to a timestamped directory under `<home>/.mimir/plugin-skill-backups/`
 remain installed. An unselected plugin's skills are unavailable even if its
 distribution is installed or a prior seed remains in the home.
 
+The packaged GitHub poller `SKILL.md` files deliberately retain their
+pre-optional bytes so existing, unedited home seeds keep matching the selected
+inventory without a migration or new ownership path. Their legacy automatic
+seeding instructions are superseded by this section and
+[the agent development loop](agent-dev-loop.md): GitHub pollers and the companion
+`cultivate:review` skill now require explicit installation on fresh homes.
+Use `mimir skills install cultivate:github-ci-watch`,
+`mimir skills install cultivate:github-poller`, or `mimir skills install --forge github`.
+
 `plugin_config_rows(owner, manifests)` reads only declared keys of an enabled
 owner, with secret/security values redacted and `mutable: false`;
 `validate_plugin_config_write(owner, name, manifests)` rejects foreign, core,
