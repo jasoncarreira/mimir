@@ -10288,6 +10288,7 @@ def test_outsider_pr_scope_requires_exact_attestation(
         "repo": "o/r", "number": 42, "author": "outside-author",
         "reason": "attestation_unavailable" if verdict in (None, "missing")
         else "non_collaborator",
+        **({"cause": "verdict_missing"} if verdict in (None, "missing") else {}),
     })
     assert withheld[0] == "github_content_withheld"
     assert withheld[1]["count"] == 1
@@ -10301,6 +10302,38 @@ def test_poller_collaborator_scope_needs_forwarded_verdict(
     scope = _github_poller_auth(authority, item).repo_pr_action_scope
     assert scope is not None
     assert scope.pull_request_author == "collaborator"
+
+
+@pytest.mark.parametrize("cause", [
+    "budget_exhausted", "deadline_exceeded", "author_unresolved",
+    "collaborator_budget", "collaborator_timeout", "collaborator_transport",
+    "collaborator_malformed_payload", "collaborator_unexpected_status",
+    "membership_budget", "membership_timeout", "membership_transport",
+    "membership_malformed_payload", "membership_unexpected_status",
+])
+def test_unavailable_pr_cause_is_forwarded_and_refused(tmp_path, monkeypatch, cause):
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(event_type="pr_opened", author="owner", pr_author_is_trusted=None,
+                pr_author_trust_cause=cause)
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync",
+                        lambda name, **fields: events.append((name, fields)))
+    assert _github_poller_auth(authority, item).repo_pr_action_scope is None
+    assert events[0] == ("github_outsider_pr_refused", {
+        "repo": "o/r", "number": 42, "author": "owner",
+        "reason": "attestation_unavailable", "cause": cause,
+    })
+
+
+def test_untrusted_pr_cause_is_bounded(tmp_path, monkeypatch):
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(event_type="pr_opened", author="owner", pr_author_is_trusted=None,
+                pr_author_trust_cause="private GitHub response")
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync",
+                        lambda name, **fields: events.append((name, fields)))
+    assert _github_poller_auth(authority, item).repo_pr_action_scope is None
+    assert events[0][1]["cause"] == "author_unresolved"
 
 
 def test_fresh_changes_requested_review_mints_remediation_authority(

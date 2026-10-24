@@ -629,6 +629,9 @@ class InformationFlowState:
     pr_checkout_author_trust: dict[str, bool | None] = field(
         default_factory=dict, repr=False, compare=False, init=False,
     )
+    pr_checkout_author_trust_cause: dict[str, str] = field(
+        default_factory=dict, repr=False, compare=False, init=False,
+    )
     _own_push_lineage: dict[tuple[str, int], frozenset[str]] = field(
         default_factory=dict, repr=False, compare=False, init=False,
     )

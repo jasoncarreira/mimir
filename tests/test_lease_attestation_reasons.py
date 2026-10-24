@@ -362,7 +362,52 @@ def test_refusal_event_is_content_free_and_deduped_per_turn(attested, monkeypatc
         ac.protected_result_source(auth, principal="filesystem", domain="filesystem",
                                    resource_id=str(lease.path), bridge_instance="filesystem")
     assert events == [("pr_checkout_lease_attestation_refused", {
-        "scope_id": scope.scope_id, "reason": "no_author_trust",
+        "scope_id": scope.scope_id, "reason": "no_author_trust", "cause": "no_turn_verdict",
+    })]
+
+
+@pytest.mark.parametrize("verdict,expected", [
+    (False, "non_collaborator"), ("missing", "no_turn_verdict"),
+    (None, "verdict_missing"),
+])
+def test_lease_missing_and_false_verdicts_are_not_author_resolution_failures(
+    attested, monkeypatch, verdict, expected,
+):
+    auth, scope, lease = attested
+    auth.ifc_state.pr_checkout_author_trust.clear()
+    if verdict != "missing":
+        auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
+    # A stale cause must not override the actual missing/False verdict.
+    if verdict in (False, "missing"):
+        auth.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = "author_unresolved"
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync",
+                        lambda name, **fields: events.append((name, fields)))
+    result = ac.pr_checkout_lease_attestation(auth, scope, lease)
+    assert not result.ok and result.reason == "no_author_trust"
+    ac.log_pr_checkout_lease_attestation_refused(auth, scope, result.reason)
+    assert events[0][1]["cause"] == expected
+
+
+@pytest.mark.parametrize("cause,expected", [
+    ("collaborator_timeout", "collaborator_timeout"),
+    ("membership_budget", "membership_budget"),
+    ("untrusted response body", "author_unresolved"),
+])
+def test_no_author_trust_lease_diagnostic_carries_bounded_cause(
+    attested, monkeypatch, cause, expected,
+):
+    auth, scope, lease = attested
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
+    auth.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = cause
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync",
+                        lambda name, **fields: events.append((name, fields)))
+    result = ac.pr_checkout_lease_attestation(auth, scope, lease)
+    assert result.ok is False and result.reason == "no_author_trust"
+    ac.log_pr_checkout_lease_attestation_refused(auth, scope, result.reason)
+    assert events == [("pr_checkout_lease_attestation_refused", {
+        "scope_id": scope.scope_id, "reason": "no_author_trust", "cause": expected,
     })]
     assert "owner/repo" not in str(events) and str(lease.path) not in str(events)
     with pytest.raises(AssertionError, match="no_author_trust"):
