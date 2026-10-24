@@ -921,6 +921,7 @@ def _controlled_server_app(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     control: _ServerControl | None = None,
+    *, real_skill_setup: bool = False,
 ) -> tuple[web.Application, _ServerControl]:
     import mimir.background_tasks
     import mimir.doc_seed
@@ -1230,8 +1231,9 @@ def _controlled_server_app(
         lambda kind, **fields: control.event_payloads.append((kind, fields)),
     )
     monkeypatch.setattr("mimir.server.seed_subagent_defs", lambda home: {})
-    monkeypatch.setattr("mimir.server.migrate_legacy_skills_dir", lambda home: None)
-    monkeypatch.setattr("mimir.server.refresh_builtin_skills", lambda home: {})
+    if not real_skill_setup:
+        monkeypatch.setattr("mimir.server.migrate_legacy_skills_dir", lambda home: None)
+        monkeypatch.setattr("mimir.server.refresh_builtin_skills", lambda home: {})
     monkeypatch.setattr("mimir.server.seed_prompts", lambda home: None)
     monkeypatch.setattr("mimir.server.seed_scheduler", lambda home: None)
     monkeypatch.setattr("mimir.server.ensure_chainlink_initialized", lambda home: None)
@@ -1479,6 +1481,26 @@ async def test_build_app_skips_symlinked_ignore_and_still_sweeps_stores(
                        for record in caplog.records)
         finally:
             await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_startup_sweeps_research_drafts_after_legacy_skill_migration(tmp_path, monkeypatch):
+    from tests.test_turn_content_followups import _install_research_manifest
+
+    _install_research_manifest(tmp_path, "legacy-papers")
+    legacy = tmp_path / ".claude/skills"
+    legacy.parent.mkdir(parents=True)
+    (tmp_path / "skills").rename(legacy)
+    draft = tmp_path / "state/pollers/legacy-papers/drafts/paper.md"
+    draft.parent.mkdir(parents=True)
+    draft.write_text("crashed draft")
+    app, _ = _controlled_server_app(tmp_path, monkeypatch, real_skill_setup=True)
+    try:
+        assert (tmp_path / "skills/legacy-papers/pollers.json").is_file()
+        assert not draft.exists()
+        assert (tmp_path / ".mimir_builtin_skills").is_dir()
+    finally:
+        await _run_cleanup(app)
 
 
 def test_server_boot_installs_home_saga_config(tmp_path, monkeypatch):

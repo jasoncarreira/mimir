@@ -1424,7 +1424,6 @@ def build_app(config: Config) -> web.Application:
     (config.home / "messages").mkdir(parents=True, exist_ok=True)
     from .turn_stores import seed_home_ignore, sweep_turn_stores
     seed_home_ignore(config.home)
-    sweep_turn_stores(config.home)
     (config.home / ".claude" / "agents").mkdir(parents=True, exist_ok=True)
     seeded = seed_subagent_defs(config.home)
     # One-shot migration: existing deployments with skills under
@@ -1436,6 +1435,8 @@ def build_app(config: Config) -> web.Application:
     # Unconditional overwrite — the bundle is read-only by convention,
     # always matches mimir source.
     seeded_skills_map = refresh_builtin_skills(config.home)
+    # Discover research authority after legacy migration and bundled refresh.
+    sweep_turn_stores(config.home)
     # Seed default operator prompts (heartbeat.md, reflect.md) and the
     # default scheduler.yaml if missing. Idempotent — only writes when
     # the target is absent, so operator customizations persist. Existing-file

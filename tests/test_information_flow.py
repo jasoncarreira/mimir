@@ -4812,6 +4812,8 @@ def test_operator_bounded_shell_result_remains_untrusted_informational() -> None
     "rg foo 2>/dev/null", "rg -i foo --hidden", "rg foo ~", "rg foo $MIMIR_HOME",
     "grep -rn foo .", "grep -r foo .", "grep -rn foo",
     "grep -Rn 'foo' . | head", "grep -ri foo *", "rg foo src",
+    "grep -n -r foo .", "grep --color -r foo .", "grep --recursive foo .",
+    "grep -rn foo $MIMIR_HOME/*", "grep -rn foo $MIMIR_HOME/state",
 ])
 @pytest.mark.parametrize("enforce", [False, True])
 def test_shell_name_match_taints_and_vetoes_following_write(

@@ -74,13 +74,22 @@ For other persistent content (including turn logs and Worklink run logs),
 when raw command text names `turns.jsonl`, `events.jsonl`, `chat_history.jsonl`,
 `triage-dropped.jsonl`, `conversation_history`, `logs/` or `messages/` as a path
 component (including leading `/logs` and `/messages`), or `worklink-ready-queue`.
-Bare prose words `logs` and `messages` do not match. A recursive
-`rg`/`ag`/`grep -r`/`grep -R` from HOME or an ancestor also taints, even with narrow
-operands, pipelines, redirections or bundled grep flags. From a non-HOME cwd,
-explicit HOME/ancestor operands and `$MIMIR_HOME`, `${MIMIR_HOME}`, `$HOME`,
-`${HOME}` or `~` operands (including `cd` before a recursive search) also taint.
-Narrow literal descendants/sibling checkouts do not count as ancestor operands;
-non-recursive grep long options such as `--color` do not enable this rule.
+Bare prose words `logs` and `messages` do not match. Recursive searches use a
+small lexical pipeline-segment classifier, not a full shell parser. `rg`/`ag`
+are recursive; `grep`/`egrep`/`fgrep` recognize `-r`/`-R` (including bundled
+flags), `--recursive`, `-d recurse` and `--directories=recurse` anywhere among
+their arguments. Non-recursive long options such as `--color` do not enable
+this rule. Patterns and option values are not treated as path operands.
+
+A recursive search taints when an operand (or cwd for an implicit search) is
+HOME, an ancestor, or anywhere under HOME, except when all searched paths are
+inside the self-authored `memory/`, `docs/`, `skills/`, `prompts/` or
+`.mimir_builtin_skills/` roots. `state/` is deliberately not a recursive-search
+exception because it contains poller content. `$MIMIR_HOME`, `${MIMIR_HOME}`,
+`$HOME`, `${HOME}` and `~` expand to agent HOME for this check; dots and globs
+retain their searched-tree boundary. Simple `cd` chains update the lexical cwd.
+Unrelated `echo ~` segments no longer broaden a checkout-local search. External
+checkouts and sibling paths stay clean, while unknown HOME descendants taint.
 A cwd inside a named
 content store taints ordinary reads too. Both shell tools resolve omitted cwd
 through the shell default/session cwd helper for classification. The command

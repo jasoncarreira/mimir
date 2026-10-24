@@ -111,7 +111,7 @@ def test_absolute_home_operand_distinguishes_ancestors_and_descendants(tmp_path,
     home = tmp_path / "home"
     monkeypatch.setenv("MIMIR_HOME", str(home))
     path = str(tmp_path / target)
-    expected = target in {"home", ".", "..", "home/"}
+    expected = target in {"home", ".", "..", "home/", "home/src"}
     # Normalize only the fixture path, as a shell would do for literal paths.
     path = str(Path(path).resolve())
     assert _shell_reads_home_content({"command": f'rg foo "{path}"', "cwd": str(tmp_path / "checkout")}) is expected
@@ -316,3 +316,126 @@ def test_ci_log_delivery_skips_nonregular_files(tmp_path, kind):
     assert event.content == content
     assert keep.read_text() == "operator"
     assert not list((scratch / "ci-logs").iterdir())
+
+
+@pytest.mark.parametrize("tool", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize("command", [
+    "grep -n -r foo .", "grep -i -r foo .", "grep -E -r foo .",
+    "grep -e x -r .", "grep --include=*.md -r foo .",
+    "grep --color -r foo .", "grep foo -r $MIMIR_HOME",
+    "grep -n -r foo ~", "cd ~ && grep -n -r foo .",
+    "egrep -r foo .", "fgrep -r foo .", "grep -d recurse foo .",
+    "grep --directories=recurse foo .", "grep --directories recurse foo .",
+    "grep --recursive foo .", "grep -Rn 'foo bar' . | head",
+    "grep -rn foo . 2>/dev/null", "grep -rn foo .\necho done",
+])
+def test_recursive_grep_flags_anywhere_in_segment(tmp_path, monkeypatch, tool, command):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    assert _shell_reads_home_content({"command": command, "cwd": str(tmp_path)}, tool_name=tool)
+
+
+@pytest.mark.parametrize("tool", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize("operand", [
+    "$MIMIR_HOME/*", "~/*", "{home}/*", "$MIMIR_HOME/.", "{home}/.",
+    "$MIMIR_HOME/state", "$MIMIR_HOME/attachments", "~/attachments/fetch-cache",
+    "$MIMIR_HOME/large_tool_results", "${HOME}/state/pollers", '"${MIMIR_HOME}/state"',
+    "~/projects/x", "{home}/memory/../state",
+])
+def test_recursive_home_paths_use_self_authored_allowlist(tmp_path, monkeypatch, tool, operand):
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    command = "grep -rn foo " + operand.format(home=home) if "{home}" in operand else "grep -rn foo " + operand
+    assert _shell_reads_home_content({"command": command, "cwd": str(tmp_path / "checkout")}, tool_name=tool)
+
+
+@pytest.mark.parametrize("tool", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize("relative", ["state", "attachments", "attachments/fetch-cache", "projects"])
+def test_recursive_cwd_under_home_is_not_implicitly_trusted(tmp_path, monkeypatch, tool, relative):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    assert _shell_reads_home_content({"command": "grep -rn foo .", "cwd": str(tmp_path / relative)}, tool_name=tool)
+
+
+@pytest.mark.parametrize("root", ["memory", "docs", "skills", "prompts", ".mimir_builtin_skills"])
+@pytest.mark.parametrize("tool", ["shell_exec", "bash_async"])
+def test_recursive_search_all_operands_self_authored_stays_clean(tmp_path, monkeypatch, root, tool):
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    for cwd, command in [
+        (home, f"rg foo {root}/"),
+        (home / root, "grep -n -r foo ."),
+        (tmp_path / "checkout", f"grep --recursive foo $MIMIR_HOME/{root} ~/memory"),
+        (home, f"grep -e foo -r {root}/*"),
+        (home, f"rg --files {root}/"),
+    ]:
+        assert not _shell_reads_home_content({"command": command, "cwd": str(cwd)}, tool_name=tool)
+    assert _shell_reads_home_content({"command": f"rg foo ~/memory ~/state", "cwd": str(home)}, tool_name=tool)
+
+
+@pytest.mark.parametrize("command", [
+    "rg foo src && echo ~", "echo ~ | rg foo", "grep --color foo .",
+    "grep --line-number foo .", "echo grep -r ~", "rg foo /other/checkouts",
+])
+def test_search_segment_does_not_consume_unrelated_operands(tmp_path, monkeypatch, command):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    assert not _shell_reads_home_content({"command": command, "cwd": str(tmp_path / "checkout")})
+
+
+def test_manifest_with_nonresearch_authority_preserves_drafts(tmp_path):
+    from mimir.pollers import discover_pollers
+    from mimir.turn_stores import _research_poller_names
+
+    _install_research_manifest(tmp_path, "papers")
+    manifest = tmp_path / "skills/nonresearch/pollers.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"pollers": [{
+        "name": "nonresearch", "command": "python3 poller.py", "cron": "0 * * * *",
+        "authority": {"profile": "github", "tier": "code-execution",
+                      "capabilities": ["read_file"], "scoped_roots": ["state"]},
+    }]}))
+    paths = [tmp_path / f"state/pollers/{name}/drafts/notes.md" for name in ("papers", "nonresearch")]
+    for path in paths:
+        path.parent.mkdir(parents=True)
+        path.write_text("draft")
+    configs = discover_pollers(tmp_path / "skills", state_root=tmp_path / "state/pollers")
+    assert {config.name for config in configs} == {"papers", "nonresearch"}
+    assert all(config.authority is not None for config in configs)
+    assert _research_poller_names(tmp_path) == {"papers"}
+    sweep_turn_stores(tmp_path)
+    assert not paths[0].exists()
+    assert paths[1].read_text() == "draft"
+
+
+@pytest.mark.parametrize("area", ["ci", "research"])
+def test_entry_refusal_does_not_skip_later_entries(tmp_path, monkeypatch, caplog, area):
+    from mimir import turn_stores
+
+    _install_research_manifest(tmp_path, "papers")
+    root = tmp_path / ("state/pollers/github-ci-watch/logs" if area == "ci" else "state/pollers/papers")
+    root.mkdir(parents=True)
+    first, second = root / "first-draft.md", root / "second-draft.md"
+    first.write_text("refused")
+    second.write_text("remove")
+    real_listdir, real_remove = os.listdir, turn_stores._remove_entry
+    attempts = []
+
+    def ordered(fd):
+        entries = real_listdir(fd)
+        if set(entries) == {first.name, second.name}:
+            return [first.name, second.name]
+        return entries
+
+    def refuse_first(fd, name):
+        if name in {first.name, second.name}:
+            attempts.append(name)
+        if name == first.name:
+            raise PermissionError("test-owned first entry refusal")
+        return real_remove(fd, name)
+
+    monkeypatch.setattr(turn_stores.os, "listdir", ordered)
+    monkeypatch.setattr(turn_stores, "_remove_entry", refuse_first)
+    with caplog.at_level(logging.WARNING, logger="mimir.turn_stores"):
+        sweep_turn_stores(tmp_path)
+    assert attempts == [first.name, second.name]
+    assert first.read_text() == "refused"
+    assert not second.exists()
+    assert any(record.name == "mimir.turn_stores" for record in caplog.records)
