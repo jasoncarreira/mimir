@@ -882,7 +882,7 @@ def test_unattested_selected_repository_results_never_claim_an_exact_source(
     assert decision.forge_scope_mismatch["component"] == "resource_id"
 
 
-def test_selected_repo_status_raw_lease_evidence_is_exact_but_host_result_is_incomplete(
+def test_selected_repo_status_raw_lease_evidence_matches_host_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_repo_policy,
 ) -> None:
     from langgraph.runtime import Runtime
@@ -919,12 +919,9 @@ def test_selected_repo_status_raw_lease_evidence_is_exact_but_host_result_is_inc
             repo_pr_action_scope=scope, policy=selected_policy_registry(),
         ), result=result, provenance=provenance,
     )
-    assert labels is not None and labels.has_untrusted_active_ingest
-    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_status>"
-    assert not SinkGate.check_sink_flow(
-        "pr_comment", f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}:{scope.scope_id}",
-        labels, auth, enforce=True, repo_pr_action_scope=scope,
-    ).allowed
+    assert labels is not None and not labels.has_untrusted_active_ingest
+    assert labels.sources[0].resource_id == source.resource_id
+    assert labels.sources[0].integrity == "trusted"
 
 
 def test_mixed_repo_input_denies_bound_forge_sink(selected_repo_policy) -> None:

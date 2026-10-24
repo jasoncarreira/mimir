@@ -641,6 +641,9 @@ def validate_scoped_pr_action(action: RepoPRAction, scope: object, grant: object
     )
 
 
+# The Worklink factory's retained incident grants only these five operations;
+# PR checkout leases use the separately declared repo_actions membership and
+# per-tool result origin below. Do not broaden factory authority for PR results.
 _RETAINED = ("repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit")
 _BUILDS = ("worklink_run", "worklink_resume")
 _PUBLISH = ("repo_commit", "repo_merge", "repo_rebase", "repo_revert", "repo_push")
@@ -674,6 +677,8 @@ _FORGE = _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content
     pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments
     pr_review_requests pr_submit_review pr_inline_review_comment pr_comment
     pr_edit_body issue_comment pr_rerequest_review unsupported_operation""")
+# Provider declaration for PR-lease result classification (with the registered
+# result_origin); the host additionally verifies the exact live checkout lease.
 _REPO = _names("""repo_checkout repo_cleanup repo_fetch repo_status repo_test
     repo_diff repo_unmerged repo_stage repo_commit repo_merge repo_merge_abort
     repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push""")

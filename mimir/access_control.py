@@ -10764,12 +10764,17 @@ def _pr_checkout_lease_attestation(
     if not expected_head or not expected_branch or path is None:
         return verdict(False, LeaseAttestationReason.MISSING_EXPECTED_HEAD_OR_BRANCH)
 
-    registry = getattr(auth_context, "repo_pr_scope_registry", None)
-    review_state = (
-        registry.resolve_checkout_path(path)
-        if registry is not None
-        else getattr(auth_context, "repo_review_state", None)
-    )
+    # Use the same request-specific discovered state as repository admission;
+    # a reminted lease can supersede the original immutable event registry.
+    discovered = getattr(auth_context, "server_discovered_pr_states", None)
+    review_state = discovered.resolve_checkout_path(path) if discovered is not None else None
+    if review_state is None:
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        review_state = (
+            registry.resolve_checkout_path(path)
+            if registry is not None
+            else getattr(auth_context, "repo_review_state", None)
+        )
     attached = getattr(review_state, "checkout_lease", None)
     if (
         attached is not lease
@@ -11670,6 +11675,51 @@ def _log_retained_repository_failure(tool_name: str, result: Any, repository: st
         pass
 
 
+def _provider_pr_lease_result_is_bound(
+    tool_name: str, arguments: dict[str, Any], auth_context: "AuthContext | None",
+    authorization: ToolAuthorization, registered: Any,
+) -> bool:
+    """Admit provider results to the ordinary classifier, not confer result trust.
+
+    The retained factory scope remains a separate receipt-bound authority. This
+    check deliberately ignores success and payload shape: the existing repository
+    classifier validates published provenance for failures and successes alike.
+    """
+    scope = authorization.repo_pr_action_scope
+    if not (
+        "repo_actions" in registered.memberships
+        and registered.resource_scope == "repo_pr"
+        and scope is not None
+        and isinstance(getattr(scope, "canonical_repo", None), str)
+        and type(getattr(scope, "pr_number", None)) is int
+        and arguments.get("repository") == scope.canonical_repo
+        and arguments.get("pull_request") == scope.pr_number
+        and authorization.allowed and not authorization.would_block
+        and authorization.decision == OperationDecision.RESOURCE_SCOPED
+    ):
+        return False
+    state = getattr(auth_context, "repo_review_state", None)
+    if state is None or getattr(state, "action_scope", None) is not scope:
+        discovered = getattr(auth_context, "server_discovered_pr_states", None)
+        state = (
+            discovered.resolve_for_tool(tool_name, arguments.get("repository"),
+                                        arguments.get("pull_request"))
+            if discovered is not None and hasattr(discovered, "resolve_for_tool")
+            and isinstance(arguments.get("repository"), str)
+            and type(arguments.get("pull_request")) is int else None
+        )
+    if state is None or getattr(state, "action_scope", None) is not scope:
+        registry = getattr(auth_context, "repo_pr_scope_registry", None)
+        state = (
+            registry.resolve(arguments.get("repository"), arguments.get("pull_request"))
+            if registry is not None and hasattr(registry, "resolve") else None
+        )
+    return (
+        state is not None and getattr(state, "action_scope", None) is scope
+        and _attested_pr_checkout_lease(auth_context, scope, getattr(state, "checkout_lease", None))
+    )
+
+
 @scoped_policy_call(lambda bound: getattr(bound.arguments["authorization"], "policy", None))
 def classify_protected_result(
     tool_name: str,
@@ -11706,7 +11756,7 @@ def classify_protected_result(
     retained_verified = False
     if registered is not None and registered.owner != "core":
         scope = getattr(auth_context, "retained_factory_scope", None)
-        retained_verified = (
+        retained_candidate = (
             "retained_repo_tools" in registered.memberships
             and _is_registered_retained_scope(scope)
             and authorization.repo_pr_action_scope is scope
@@ -11719,10 +11769,20 @@ def classify_protected_result(
             and authorization.allowed
             and not failed
             and authorization.decision == OperationDecision.RESOURCE_SCOPED
+        )
+        retained_verified = (
+            retained_candidate
             and isinstance(retained_receipt, _RetainedResultReceipt)
             and retained_receipt.consume(tool_name, auth_context, scope, result, failed, selected)
         )
-        if not retained_verified:
+        # A PR checkout is a different authority from the retained Worklink
+        # factory scope. Only a provider-declared repository action bound to
+        # the selected review state can use the ordinary repository provenance
+        # classifier; the retained path still requires its one-shot receipt.
+        pr_lease_verified = _provider_pr_lease_result_is_bound(
+            tool_name, arguments or {}, auth_context, authorization, registered,
+        )
+        if not retained_verified and not pr_lease_verified:
             return _incomplete_protected_result(
                 registered.result_domain or "unknown", arguments or {},
                 tool_name=tool_name, auth_context=auth_context,
