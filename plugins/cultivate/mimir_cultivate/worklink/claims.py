@@ -89,6 +89,13 @@ EventLogger = Callable[..., None]
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class AttemptBudget:
+    charged: int
+    clean_parks: int
+    generation: int
+
+
 class _ChainlinkContentionExhausted(RuntimeError):
     pass
 
@@ -585,19 +592,15 @@ class ChainlinkClaims:
             # Judge exhaustion only after duplicate liveness, so a live final
             # attempt is refused as a duplicate instead of being blocked.
             attempt = self.next_attempt(comments)
-            attempts_used = self.attempts_used(comments, home_path=claim_home)
+            budget = self.attempt_budget(comments, home_path=claim_home)
+            attempts_used = budget.charged
             if attempts_used >= self.max_attempts:
-                generation = _scan_claim_comments(comments)[1]
+                generation = budget.generation
                 self.release_issue(issue_id)
                 self._attempts_exhausted(
                     issue_id, attempts_used, issue_title=issue_title, home=claim_home,
                     generation=generation,
-                    clean_parks=len({
-                        (r.issue_id, r.attempt, r.agent_id, r.claimed_at)
-                        for r in claim_records_from_comments(comments)
-                        if r.issue_id == issue_id and r.generation == generation
-                        and claim_home is not None and _read_clean_park(claim_home, r)
-                    }),
+                    clean_parks=budget.clean_parks,
                 )
                 return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
 
@@ -994,8 +997,16 @@ class ChainlinkClaims:
             return 1
         return max(attempts) + 1
 
-    def attempts_used(self, comments: Iterable[str], *, home_path: Path | None = None) -> int:
-        """Charged attempts in the active reset generation.
+    def attempt_budget(
+        self, comments: Iterable[str], *, home_path: Path | None = None,
+        projected_clean_park: ClaimRecord | None = None,
+    ) -> AttemptBudget:
+        """Compute one accounting view, optionally projecting a verified future park.
+
+        Projection is for pre-stop planning only; it never publishes credit.
+        All real admission and diagnostic counts use durable evidence.
+
+        Charged attempts in the active reset generation.
 
         The first bounded set of valid shutdown markers across the leaf's
         history forgive their matching claims. Attempt ordinals still advance,
@@ -1031,13 +1042,21 @@ class ChainlinkClaims:
             and (key := (record.issue_id, record.attempt, record.agent_id, record.claimed_at)) not in forgiven
             and _read_clean_park(home, record)
         }
-        log.info(
+        if projected_clean_park is not None:
+            key = (projected_clean_park.issue_id, projected_clean_park.attempt,
+                   projected_clean_park.agent_id, projected_clean_park.claimed_at)
+            if key in active_claims and key not in forgiven:
+                clean_parks.add(key)
+        budget = AttemptBudget(len(active_claims - forgiven - clean_parks), len(clean_parks), generation)
+        log.debug(
             "Worklink attempt budget: issue_id=%s generation=%s charged=%s clean_parks=%s shutdown_or_other_forgiven=%s",
             ",".join(str(value) for value in sorted({r.issue_id for r in records})), generation,
-            len(active_claims - forgiven - clean_parks), len(clean_parks),
-            len(active_claims & forgiven),
+            budget.charged, budget.clean_parks, len(active_claims & forgiven),
         )
-        return len(active_claims - forgiven - clean_parks)
+        return budget
+
+    def attempts_used(self, comments: Iterable[str], *, home_path: Path | None = None) -> int:
+        return self.attempt_budget(comments, home_path=home_path).charged
 
     def reap_stale_claims(
         self,

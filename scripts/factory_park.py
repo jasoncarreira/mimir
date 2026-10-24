@@ -77,6 +77,8 @@ from mimir_cultivate.worklink.claims import (  # noqa: E402
     record_clean_park,
 )
 from mimir_cultivate.worklink.factory_state import (  # noqa: E402
+    FactoryRecordError,
+    _require_safe_directory,
     factory_checkout_interlock,
     factory_issue_resource_lock,
     factory_process_is_alive,
@@ -89,7 +91,11 @@ TERMINAL_PARKED = "needs-human"
 
 
 class ParkError(RuntimeError):
-    """A park refused before it changed anything the operator cannot undo."""
+    """A controlled park refusal or incomplete reconciliation."""
+
+
+class ClaimAlreadyReconciled(ParkError):
+    """Only these explicit no-work outcomes may suppress reconciliation."""
 
 
 def _run(cmd: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
@@ -397,6 +403,7 @@ class ClaimPlan(NamedTuple):
     claim: object
     comments: list[str]
     before: int
+    after: int
 
 
 def plan_claim_release(
@@ -441,6 +448,12 @@ def plan_claim_release(
     if record.attempt > claim.attempt:
         raise ParkError("retained attempt is newer than the claim")
 
+    try:
+        # Missing directories are safe to create at publication; unsafe existing
+        # ancestors must refuse before the controller is stopped.
+        _require_safe_directory(home / "state/worklink/clean-parks", create=False)
+    except (FactoryRecordError, OSError) as exc:
+        raise ParkError(f"clean-park archive is unsafe or unavailable: {exc}") from exc
     credited = _read_clean_park(home, claim)
     if credited:
         try:
@@ -448,13 +461,14 @@ def plan_claim_release(
         except RuntimeError as exc:
             raise ParkError(f"could not verify claim lock: {exc}") from exc
         if not held:
-            raise ParkError("this claim is already credited and released; nothing to reconcile")
+            raise ClaimAlreadyReconciled("this claim is already credited and released; nothing to reconcile")
     before = claims.attempts_used(comments, home_path=home)
-    if before == 0 and not credited:
-        raise ParkError(
+    after = claims.attempt_budget(comments, home_path=home, projected_clean_park=claim).charged
+    if after >= before and not credited:
+        raise ClaimAlreadyReconciled(
             "this claim is already discounted; nothing to reconcile"
         )
-    return ClaimPlan(claim=claim, comments=comments, before=before)
+    return ClaimPlan(claim=claim, comments=comments, before=before, after=after)
 
 
 def release_parked_claim(
@@ -473,10 +487,13 @@ def release_parked_claim(
     plan = plan_claim_release(chainlink_bin, issue_id, agent_id, home)
     already_credited = _read_clean_park(home, plan.claim)
     record = load_factory_record(home, f"chainlink-{issue_id}")
-    if not already_credited and (record is None or not record_clean_park(home, plan.claim, record)):
-        raise ParkError(
-            "could not verify and archive the published park; claim remains charged and held"
-        )
+    try:
+        if not already_credited and (record is None or not record_clean_park(home, plan.claim, record)):
+            raise ParkError(
+                "could not verify and archive the published park; claim remains charged and held"
+            )
+    except (FactoryRecordError, OSError) as exc:
+        raise ParkError(f"could not archive the published park; claim remains held: {exc}") from exc
 
     # Re-read the durable evidence before releasing the lock.
     claims = claims_client(chainlink_bin, agent_id, home)
@@ -500,7 +517,7 @@ def claim_needs_reconciliation(
     """True when a parked run's claim is still charged."""
     try:
         plan_claim_release(chainlink_bin, issue_id, agent_id, home)
-    except ParkError:
+    except ClaimAlreadyReconciled:
         return False
     return True
 
@@ -612,7 +629,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"claim      : attempt {plan.claim.attempt} owned by {plan.claim.agent_id}; "
-        f"clean park would take attempts_used {plan.before} -> {plan.before - 1}"
+        f"clean park would take attempts_used {plan.before} -> {plan.after}"
     )
 
     if args.dry_run:

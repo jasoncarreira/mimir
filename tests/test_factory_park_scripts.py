@@ -1074,6 +1074,115 @@ def test_clean_park_rerun_only_reconciles_held_claim(tmp_path, monkeypatch, firs
                    for argv in calls[len(before):])
 
 
+def test_shutdown_forgiven_current_claim_refuses_before_stop(tmp_path, monkeypatch):
+    record = _record(tmp_path, phase="running", status="running")
+    home = _home_with(record, tmp_path)
+    history = _claim_history(2)
+    claim = ClaimRecord.from_payload(json.loads(history[-1].split(" ", 1)[1]))
+    history.append(ShutdownAbortRecord(
+        issue_id=claim.issue_id, attempt=claim.attempt, agent_id=claim.agent_id,
+        claimed_at=claim.claimed_at, aborted_at=claim.claimed_at + timedelta(hours=1),
+    ).to_comment())
+    assert ChainlinkClaims(agent_id=AGENT).attempts_used(history) == 1
+    stopped, calls = [], []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **k: stopped.append(a))
+    with pytest.raises(park.ParkError, match="already discounted"):
+        _park_main(record, home, monkeypatch, _park_stub(calls, history), tmp_path)
+    assert stopped == []
+    assert not any("terminal" in argv or argv[1:3] == ["locks", "release"] for argv in calls)
+    assert load_factory_record(home, record.run_id).controller_phase == "running"
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "file"])
+def test_unsafe_archive_directory_refuses_before_stop(tmp_path, monkeypatch, unsafe):
+    record = _record(tmp_path, phase="running", status="running")
+    home = _home_with(record, tmp_path)
+    directory = home / "state/worklink/clean-parks"
+    if unsafe == "symlink":
+        target = tmp_path / "archive-target"
+        target.mkdir()
+        directory.symlink_to(target, target_is_directory=True)
+    else:
+        directory.write_text("not a directory")
+    stopped, calls = [], []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **k: stopped.append(a))
+    with pytest.raises(park.ParkError, match="archive is unsafe"):
+        _park_main(record, home, monkeypatch, _park_stub(calls, _claim_history(1)), tmp_path)
+    assert stopped == []
+    assert not any("terminal" in argv or argv[1:3] == ["locks", "release"] for argv in calls)
+    assert load_factory_record(home, record.run_id).controller_phase == "running"
+
+
+@pytest.mark.parametrize("error", [OSError("disk full"), park.FactoryRecordError("unsafe directory")])
+def test_archive_publication_error_is_controlled_and_keeps_claim(tmp_path, monkeypatch, error):
+    record = _record(tmp_path, phase="running", status="running")
+    home = _home_with(record, tmp_path)
+    calls = []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **k: None)
+    monkeypatch.setattr(park, "stop_residual_compute", lambda *a, **k: [])
+    monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
+    monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
+    def fail_archive(*args):
+        raise error
+    monkeypatch.setattr(park, "record_clean_park", fail_archive)
+    with pytest.raises(park.ParkError, match="could not archive.*claim remains held"):
+        _park_main(record, home, monkeypatch, _park_stub(calls, _claim_history(1)), tmp_path)
+    assert load_factory_record(home, record.run_id).controller_phase == "parked"
+    assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
+
+
+@pytest.mark.parametrize("damage", ["snapshot", "missing_record", "lock_query"])
+def test_already_parked_reconciliation_propagates_real_errors(tmp_path, monkeypatch, damage):
+    record = _record(tmp_path, phase="parked", status="needs-human")
+    home = _home_with(record, tmp_path)
+    calls = []
+    history = _claim_history(1)
+    run = _park_stub(calls, history)
+    if damage == "snapshot":
+        retained = load_factory_record(home, record.run_id)
+        save_factory_record(home, replace(retained, status=replace(retained.status, park_snapshot=str(tmp_path / "wrong"))))
+    elif damage == "missing_record":
+        monkeypatch.setattr(park, "load_factory_record", lambda *args: None)
+    else:
+        retained = load_factory_record(home, record.run_id)
+        assert park.record_clean_park(home, latest := park.latest_claim(history, 1783), retained)
+        base_run = run
+        def fail_lock(cmd, **kwargs):
+            if list(cmd)[1:3] == ["locks", "list"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "lock query failed")
+            return base_run(cmd, **kwargs)
+        run = fail_lock
+    # Call the real reconciliation predicate so no earlier main() guard masks it.
+    monkeypatch.setattr(park, "_run", run)
+    with pytest.raises(park.ParkError, match={
+        "snapshot": "canonical path", "missing_record": "no matching retained",
+        "lock_query": "could not verify claim lock",
+    }[damage]):
+        park.claim_needs_reconciliation("chainlink", 1783, AGENT, home)
+    assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
+
+
+@pytest.mark.parametrize("damage", ["sandbox", "snapshot"])
+def test_main_binding_guards_refuse_before_stop(tmp_path, monkeypatch, damage):
+    record = _record(tmp_path, phase="running", status="running")
+    home = _home_with(record, tmp_path)
+    requested = record
+    if damage == "sandbox":
+        other = tmp_path / "other" / ".factory-sandboxes" / record.run_id
+        requested = replace(record, sandbox=str(other), status=replace(record.status, sandbox_path=str(other)))
+        _plane(other / ".factory" / record.run_id)
+    stopped = []
+    monkeypatch.setattr(park, "stop_pid", lambda *a, **k: stopped.append(a))
+    monkeypatch.setattr(park, "factory_status", lambda *a, **k: _status("running", sandbox_path=requested.sandbox, snapshot=str(tmp_path / "wrong") if damage == "snapshot" else None))
+    # Guard-specific reachability: neither planner nor controller lookup may mask it.
+    monkeypatch.setattr(park, "verify_controller", lambda *args: pytest.fail("binding guard bypassed"))
+    with pytest.raises(park.ParkError, match="retained sandbox" if damage == "sandbox" else "canonical path"):
+        park.main(["--run-id", requested.run_id, "--sandbox", requested.sandbox,
+                   "--home", str(home), "--launcher", record.launcher,
+                   "--reason", "budget", "--controller-pid", "4242", "--agent-id", AGENT])
+    assert stopped == []
+
+
 def test_clean_park_postcondition_refuses_release(tmp_path, monkeypatch):
     record = _record(tmp_path, phase="parked", status="needs-human")
     home = _home_with(record, tmp_path)

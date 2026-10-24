@@ -3032,6 +3032,12 @@ class WorklinkRunner:
             work_item_json=_bind_work_item_run_id(work_item_json, retained.run_id),
             runner=runner,
         )
+        if pre.is_parked and pre.park_snapshot is not None:
+            retained = replace(
+                retained.observed(pre, datetime.now(UTC).isoformat()), controller_phase="parked",
+            )
+            save_factory_record(self.home, retained)
+            self._archive_factory_park(claim_record, retained)
         session = retained.session
         if pre.lock == "stale" or pre.dead_lock:
             backend.lock(
@@ -3907,6 +3913,19 @@ class WorklinkRunner:
                 finally:
                     await compute.cleanup(handle)
 
+    def _archive_factory_park(self, claim: ClaimRecord, record: FactoryRunRecord) -> None:
+        """Persist credit before fallible transitions or resume replace the evidence."""
+        if record.status is None or record.status.park_snapshot is None:
+            return
+        try:
+            if record_clean_park(self.home, claim, record):
+                return
+            reason = "park evidence did not verify"
+        except (OSError, FactoryRecordError) as exc:
+            reason = str(exc)[:300]
+        _log_event("worklink_clean_park_unverified", issue_id=claim.issue_id,
+                   attempt=claim.attempt, reason=reason)
+
     async def _finish_factory_070(
         self,
         *,
@@ -3924,6 +3943,7 @@ class WorklinkRunner:
         if status is None:
             raise WorklinkError("factory terminal projection is missing")
         if status.is_parked:
+            self._archive_factory_park(claim_record, factory_record)
             diagnosis = factory_record.controller_error or "factory run is parked"
             park_report = (
                 f"{diagnosis}; control-plane snapshot: {status.park_snapshot}"
@@ -3965,16 +3985,6 @@ class WorklinkRunner:
                 run_id=factory_record.run_id, attempt=factory_record.attempt,
                 factory_record=factory_record,
             )
-            # Preserve this claim's observed park before the next resume replaces
-            # the retained status. Missing snapshots and failed phases stay charged.
-            if status.park_snapshot is not None:
-                try:
-                    if not record_clean_park(self.home, claim_record, factory_record):
-                        _log_event("worklink_clean_park_unverified", issue_id=issue.issue_id,
-                                   attempt=claim_record.attempt)
-                except (OSError, FactoryRecordError) as exc:
-                    _log_event("worklink_clean_park_unverified", issue_id=issue.issue_id,
-                               attempt=claim_record.attempt, reason=str(exc)[:300])
             return result
         if status.status in {"blocked", "partial"}:
             claims.transition_issue(

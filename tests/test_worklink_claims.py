@@ -1618,7 +1618,7 @@ def test_repeated_verified_parks_do_not_use_attempt_budget(tmp_path: Path, caplo
     ), controller_phase="parked")
     claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, max_attempts=2)
     history: list[str] = []
-    with caplog.at_level("INFO"):
+    with caplog.at_level("DEBUG"):
         for attempt in range(1, 9):
             claim = ClaimRecord(1985, attempt, "agent", datetime(2026, 10, 1, tzinfo=UTC)
                                 + timedelta(minutes=attempt))
@@ -1772,6 +1772,87 @@ def test_park_credit_requires_retained_record_at_publication(tmp_path: Path, dam
     assert ChainlinkClaims(agent_id="agent", home_path=tmp_path).attempts_used(
         [claim.to_comment()]
     ) == 1
+
+
+def test_shutdown_overlap_uses_one_budget_for_exhaustion(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import claims as module
+    first = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    history = [first.to_comment(), replace(first, attempt=2).to_comment()]
+    history.append(ShutdownAbortRecord(
+        first.issue_id, first.attempt, first.agent_id, first.claimed_at,
+        first.claimed_at + timedelta(seconds=1),
+    ).to_comment())
+    # Both archives are present, but shutdown forgiveness owns the first key.
+    monkeypatch.setattr(module, "_read_clean_park", lambda *args: True)
+    calls = []
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, max_attempts=1,
+                            runner=lambda argv, **kw: (calls.append(list(argv)) or
+                                subprocess.CompletedProcess(argv, 0, "{}", "")))
+    assert claims.attempt_budget(history).clean_parks == 1
+    assert claims.attempts_used(history) == 0
+    history.append(replace(first, attempt=3).to_comment())
+    monkeypatch.setattr(module, "_read_clean_park", lambda home, claim: claim.attempt < 3)
+    assert claims.claim_issue(1985, history).attempts_exhausted
+    exhausted = next(json.loads(argv[-1][len("WORKLINK_REAPER "):]) for argv in calls
+                     if argv[-1].startswith("WORKLINK_REAPER "))
+    assert exhausted["clean_parks"] == 1
+
+
+def test_archive_read_checks_safe_ancestors(tmp_path):
+    from mimir_cultivate.worklink import claims as module
+    sandbox = tmp_path / "checkout/.factory-sandboxes/chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory/.parked/chainlink-1985"
+    snapshot.mkdir(parents=True)
+    claim = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    record = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session", handle=None,
+        status=FactoryStatus(run_id="chainlink-1985", valid=True, sandbox_path=str(sandbox),
+                             status="needs-human", park_snapshot=str(snapshot)),
+        observed_at="2026-10-01T00:00:01+00:00", controller_phase="parked",
+    )
+    save_factory_record(tmp_path, record)
+    assert record_clean_park(tmp_path, claim, record)
+    directory = tmp_path / "state/worklink/clean-parks"
+    moved = directory.with_name("moved-parks")
+    directory.rename(moved)
+    directory.symlink_to(moved, target_is_directory=True)
+    # Final component is still a valid, controller-owned regular archive.
+    assert (directory / "1985-1.json").is_file()
+    assert not module._read_clean_park(tmp_path, claim)
+
+
+def test_archive_read_requires_regular_descriptor(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from mimir_cultivate.worklink import claims as module
+    import stat
+    # Feed otherwise-valid archive bytes through a non-regular descriptor. A
+    # fake fstat avoids opening a FIFO/device and cannot hang under mutation.
+    original = module.os.fstat
+    def nonregular(fd):
+        info = original(fd)
+        return SimpleNamespace(st_mode=stat.S_IFIFO | 0o600, st_uid=info.st_uid,
+                               st_nlink=1, st_size=info.st_size)
+    # Reuse the complete publisher fixture, altering only the read-side fstat.
+    sandbox = tmp_path / "checkout/.factory-sandboxes/chainlink-1985"
+    sandbox.mkdir(parents=True)
+    snapshot = sandbox.parent.parent / ".factory/.parked/chainlink-1985"
+    snapshot.mkdir(parents=True)
+    claim = ClaimRecord(1985, 1, "agent", datetime(2026, 10, 1, tzinfo=UTC))
+    record = FactoryRunRecord(
+        run_id="chainlink-1985", issue_id=1985, attempt=1,
+        repository="owner/repo", base_ref="main", branch="feature/1985",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session", handle=None,
+        status=FactoryStatus(run_id="chainlink-1985", valid=True, sandbox_path=str(sandbox),
+                             status="needs-human", park_snapshot=str(snapshot)),
+        observed_at="2026-10-01T00:00:01+00:00", controller_phase="parked",
+    )
+    save_factory_record(tmp_path, record)
+    assert record_clean_park(tmp_path, claim, record)
+    monkeypatch.setattr(module.os, "fstat", nonregular)
+    assert not module._read_clean_park(tmp_path, claim)
 
 
 def test_stale_park_cannot_discount_a_later_crashed_claim(tmp_path: Path) -> None:

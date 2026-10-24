@@ -1005,32 +1005,37 @@ Two constraints are not obvious and are enforced rather than documented alone:
   the factory never acknowledges, and `factory status` reports
   `park_snapshot: null`.
 
-A park also releases the Chainlink claim the stopped controller held, records a
-forgiveness marker for it, and clears `worklink:in-progress`. It mirrors
-`release_owned_claims_for_shutdown`, including that path's ordering — forgiveness
-first, then the release, then the label — so a partial failure leaves the claim
-held but already credited rather than released and charged. It deliberately does
-*not* add `worklink:ready` the way the shutdown path does: a park is resumed by
-an explicit dispatch, and arming the issue here would auto-dispatch a parked epic.
+A park archives the verified clean-park evidence under
+`<home>/state/worklink/clean-parks/<issue>-<attempt>.json`, releases the
+Chainlink claim the stopped controller held, and clears `worklink:in-progress`.
+The archive is written and read by the controller's effective uid: **run
+`factory_park.py` as that same uid**, not root or another operator account.
+A different owner fails the archive reader's uid check and receives no credit.
+This is not a shutdown-abort marker and does not spend the bounded shutdown
+allowance. Credit is archived first, then the lock is released, then the label
+is cleared, so a partial release leaves durable credit for reconciliation.
+It deliberately does *not* add `worklink:ready`: resume requires an explicit
+human dispatch, not automatic requeueing.
 
-Whether the claim can be released and forgiven is decided *before* the park stops
-anything, and re-running the script on an already-parked run completes a
-reconciliation a previous run left undone rather than refusing. Both exist for
-the same reason: every claim-side refusal is unrecoverable once the run is
-terminalized, because the run is then parked with its claim still held and still
-charged, and a flat "already parked" refusal would stop anyone finishing the job.
-A park that starts is a park that can finish.
+Before stopping anything, the script validates ownership, retained identity,
+canonical paths, archive-directory safety and the projected attempt budget.
+The projection must discount this claim, not an unrelated charged claim; an
+already shutdown-forgiven claim refuses before stop. Unpredictable publication
+IO failures are reported as controlled park errors with the claim still held.
+On an already-parked run, only an explicitly already-discounted claim or an
+archived-and-released claim is "nothing to do". Other preflight errors propagate;
+an archived-but-held claim can finish its interrupted release.
 
-The forgiveness marker is not bookkeeping. `claim_issue` charges an attempt for
-every successful claim and judges exhaustion from `attempts_used`, which
-discounts a claim only when a `ShutdownAbortRecord` matches it on
-`(issue_id, attempt, agent_id, claimed_at)`. Without one, park-then-resume spends
-two attempts on a single run, and a run parked on its **last** attempt comes back
-`attempts_exhausted` — parked and permanently unresumable. The attempt *ordinal*
-still advances, which is what keeps branch, checkout and evidence paths from
-colliding. Forgiveness is also bounded: `MAX_SHUTDOWN_ABORT_FORGIVENESS` is 2, so
-a run parked repeatedly eventually cannot be credited again, and the script
-refuses rather than publishing a park it knows resume will reject.
+`attempts_used` discounts matching verified archives by
+`(issue_id, attempt, agent_id, claimed_at)`. The parked record and canonical
+snapshot are checked at publication; later accounting reads only the durable
+archive, so deleting the checkout or snapshot cannot revoke credit. Clean parks
+(including controller idle/budget and decision parks) have no credit cap, but
+crashes and unverified parks remain charged. Actual shutdown aborts still use
+`ShutdownAbortRecord` with `MAX_SHUTDOWN_ABORT_FORGIVENESS = 2`, unchanged.
+The attempt *ordinal* still advances to avoid checkout/branch/evidence collisions.
+Budget diagnostics report only clean-park discounts not already covered by
+shutdown/other forgiveness, using the same accounting view as admission.
 
 Without the release the next dispatch is refused, by a
 path worth stating because it is indirect: the chainlink CLI treats a same-agent
