@@ -441,10 +441,11 @@ def build_turn_prompt(
     if core_proposals_block:
         _add_labeled("Open change proposals", core_proposals_block)
 
-    # Recent session summaries (v0.4 §3): older completed sessions stay
-    # unchanged until a new session boundary is added.
+    # Recent session summaries (v0.4 §3): completed content is historical,
+    # but its relative ages, channel-turn counts and stale-work suffixes are
+    # live. Keep the entire rendered block after the cache breakpoint.
     if session_summaries_block:
-        _add_labeled("Recent session summaries", session_summaries_block, stable=True)
+        _add_labeled("Recent session summaries", session_summaries_block)
 
     # Resource usage: cost / cache hit rate / context utilization across
     # rolling windows. Keep this live telemetry before the conversation.

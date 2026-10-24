@@ -381,7 +381,7 @@ def test_stable_turn_prefix_across_consecutive_poller_events():
                 extra={"event_ts_iso": f"2026-10-2{number}T12:00:00Z"},
             ),
             channel_memory_block="stable channel facts",
-            session_summaries_block="older completed session",
+            session_summaries_block=f"older completed session ({number} turns this channel)",
             auto_skill_block=("feed", "stable SKILL.md instructions"),
             recent_messages=[],
             feedback_block=f"feedback {number}",
@@ -399,7 +399,7 @@ def test_stable_turn_prefix_across_consecutive_poller_events():
     assert prefixes[0] == prefixes[1]
     assert prompts[0].startswith(prefixes[0]) and prompts[1].startswith(prefixes[1])
     assert "## Channel context\n\nstable channel facts" in prefixes[0]
-    assert "## Recent session summaries\n\nolder completed session" in prefixes[0]
+    assert "## Recent session summaries" not in prefixes[0]
     assert "## Skill: feed\n\nstable SKILL.md instructions" in prefixes[0]
     assert prefixes[0].endswith("\n\n")
     for volatile in ("Current turn scratch", "Recent activity", "Recent feedback signals",
@@ -407,6 +407,50 @@ def test_stable_turn_prefix_across_consecutive_poller_events():
                      "Possibly relevant memories", "Today's date", "Current message"):
         assert volatile not in prefixes[0]
     assert prompts[0][len(prefixes[0]):] != prompts[1][len(prefixes[1]):]
+
+
+def test_fully_populated_turn_has_exact_block_inventory(tmp_path):
+    from collections import Counter
+    import re
+    from mimir.history import Message
+    from mimir.identities import IdentityResolver
+    from mimir.models import AgentEvent
+
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "identities.yaml").write_text(
+        "people:\n  - canonical: alice\n    aliases: [web-alice]\n"
+    )
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    text = build_turn_prompt(
+        AgentEvent(trigger="poller", channel_id="poller:feed", author="web-alice",
+                   content="event"),
+        resolver=resolver,
+        recent_messages=[Message(
+            ts="2026-10-23T12:00:00Z", msg_id="prior", channel_id="poller:feed",
+            author="web-alice", author_display="Alice", kind="user_message",
+            content="recent", source="web",
+        )],
+        channel_memory_block="channel", deliver_channel="slack-ops",
+        trigger_authority_present=True, trigger_authority_profile="github",
+        trigger_capabilities=("pr_metadata",),
+        feedback_block="feedback", core_proposals_block="proposals",
+        session_summaries_block="sessions", usage_block="usage",
+        upcoming_block="upcoming", commitments_block="commitments",
+        self_state_block="state", saga_block="recall", auto_skill_block=("feed", "skill"),
+        turn_scratch_path="/scratch/turn",
+    )
+    # Literal inventory, not a re-sort of the renderer under test. Dropping any
+    # block (including Delivery or feedback) must fail this regression itself.
+    assert Counter(re.findall(r"(?m)^## (.+)$", text)) == Counter([
+        "Current turn scratch", "Known identities", "Channel context",
+        "Trigger channel", "Delivery", "Autonomous trigger authority",
+        "Recent feedback signals", "Open change proposals", "Recent session summaries",
+        "Resource usage", "Upcoming", "Upcoming commitments", "Self-state",
+        "Recent activity", "Possibly relevant memories (from SAGA)",
+        "Skill: feed", "Today's date", "▶ Current message — respond to this",
+    ])
+    assert text.rsplit("## ", 1)[1].startswith("▶ Current message — respond to this")
 
 
 def test_stable_prefix_excludes_changing_recent_activity():

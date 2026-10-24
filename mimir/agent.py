@@ -820,7 +820,7 @@ def _turn_human_message(
     DeepAgents' own caching middleware still marks the system prompt and tools.
     Claude Code manages caching in its CLI; other providers receive plain text.
     """
-    if stable_prefix and model is not None:
+    if stable_prefix and prompt.startswith(stable_prefix) and model is not None:
         try:
             from langchain_anthropic import ChatAnthropic
         except ImportError:  # Optional provider extra is absent.

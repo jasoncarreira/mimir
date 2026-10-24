@@ -162,26 +162,136 @@ def test_anthropic_turn_breakpoint_preserves_system_middleware_and_other_provide
     for model in (FakeListChatModel(responses=["ok"]), None):
         assert _turn_human_message(prompt, stable, model).content == prompt
     assert _turn_human_message(prompt, "", anthropic).content == prompt
+    # Wrapping/prepending must never silently drop bytes at an unrelated offset.
+    for wrapped in ("wrapper\n" + prompt, "different prompt"):
+        assert _turn_human_message(wrapped, stable, anthropic).content == wrapped
 
 
 @pytest.mark.asyncio
+async def test_anthropic_request_cache_marker_budget_with_tool_followup(monkeypatch):
+    from deepagents import create_deep_agent
+    from deepagents.backends import StateBackend
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.tools import tool
+
+    payloads = []
+
+    @tool
+    def cache_probe() -> str:
+        """Return a fixed observation for the follow-up request."""
+        return "observed"
+
+    async def capture(self, payload):
+        # Capture at the API boundary, after DeepAgents and LangChain rendering.
+        import copy
+        payloads.append(copy.deepcopy(payload))
+        first = len(payloads) == 1
+        response = {
+            "id": f"msg-{len(payloads)}", "type": "message", "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": ([{"type": "tool_use", "id": "probe-1",
+                         "name": "cache_probe", "input": {}}] if first
+                        else [{"type": "text", "text": "done"}]),
+            "stop_reason": "tool_use" if first else "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 10, "output_tokens": 1},
+        }
+        from anthropic.types import Message
+        return SimpleNamespace(parse=lambda: Message.model_validate(response))
+
+    monkeypatch.setattr(ChatAnthropic, "_acreate", capture)
+    model = ChatAnthropic(model="claude-sonnet-4-5", api_key="test-key")
+    graph = create_deep_agent(
+        model=model, tools=[cache_probe], system_prompt="stable system instructions",
+        backend=StateBackend(),
+    )
+    stable = "## Skill: cache\n\nStable instructions\n\n"
+    prompt = stable + "## Current message\n\nrun cache_probe"
+    await graph.ainvoke({"messages": [_turn_human_message(prompt, stable, model)]})
+    assert len(payloads) == 2
+
+    def markers(value):
+        if isinstance(value, dict):
+            return int("cache_control" in value) + sum(markers(v) for v in value.values())
+        if isinstance(value, list):
+            return sum(map(markers, value))
+        return 0
+
+    for payload in payloads:
+        assert 1 <= markers(payload) <= 4
+        assert payload["cache_control"]["type"] == "ephemeral"
+        assert markers(payload["system"]) == 1
+        assert markers(payload["tools"]) == 1
+        turn = payload["messages"][0]
+        assert turn["role"] == "user"
+        assert markers(turn) == 1
+        assert turn["content"][0]["text"] == stable
+        assert turn["content"][0]["cache_control"]["type"] == "ephemeral"
+        assert "cache_control" not in turn["content"][1]
+    assert payloads[1]["messages"][-1]["content"][0]["type"] == "tool_result"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["ch-cache", "poller:cache"])
 async def test_agent_turns_keep_same_prefix_after_recent_activity_and_scratch_change(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, channel: str,
 ) -> None:
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+
     agent = _make_agent(tmp_path)
-    channel_dir = tmp_path / "memory" / "channels" / "ch-cache"
+    agent._config.recent_boundaries = 3
+    agent._config.access_control_enforced = True
+    channel_dir = tmp_path / "memory" / "channels" / channel
     channel_dir.mkdir(parents=True)
     (channel_dir / "notes.md").write_text("persistent channel context")
-    monkeypatch.setattr(agent, "_assemble_session_summaries",
-                        lambda **_: asyncio.sleep(0, result=_block("completed session")))
+    # Exercise the real skill resolver and trusted delivery/authority derivation.
+    skill = tmp_path / "skills" / "cache"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: cache\n---\nstable skill instructions")
+    (skill / "pollers.json").write_text(json.dumps({"pollers": [{"name": "cache"}]}))
+    agent._channels = SimpleNamespace(find=lambda channel: object())
+    authority = replace(build_trigger_service_principal(
+        canonical="cache-poller", trigger="poller", profile="custom",
+        tier=CapabilityTier.SCOPE_CONTAINED, capabilities=("read_file",),
+        creation_path="test",
+    ), configured_delivery_channel="slack-ops")
+    # Use the actual SAGA reader, summary renderer and JSONL turn counter.
+    # A constant summary stub hid the per-turn count/age churn in the old test.
+    from datetime import timedelta
+
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.executescript(Path("mimir/saga/schema.sql").read_text())
+    boundary_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    _insert_session_boundary(
+        conn, session_id="cache-boundary", channel_id=channel,
+        summary="completed session", reflected_at=boundary_at.isoformat(),
+    )
+    conn.execute(
+        "INSERT INTO atoms "
+        "(id, content, content_hash, source_type, metadata, created_at, "
+        "owner_principal, visibility) VALUES "
+        "('cache-tip', 'stable learning', 'cache-tip-hash', 'skill_learning', ?, ?, "
+        "'service:cache-poller', 'public')",
+        (json.dumps({"skill": "cache", "kind": "tip"}), boundary_at.isoformat()),
+    )
+    conn.commit()
+    agent._saga = SagaStore(conn=conn, embedding_dim=4)
+    agent._saga_store = SimpleNamespace(run_locked_read=lambda fn: fn(conn))
     pairs = []
     for number in (1, 2):
         event = AgentEvent(
-            trigger="user_message", channel_id="ch-cache", author="alice",
+            trigger="poller" if channel.startswith("poller:") else "user_message",
+            channel_id=channel, author="alice",
             source="web", content=f"new event {number}",
             extra={"event_ts_iso": f"2026-10-2{number}T12:00:00Z"},
         )
         ctx = _make_ctx(event)
+        if event.trigger == "poller":
+            ctx.auth_context = replace(
+                ctx.auth_context, principal=authority.canonical,
+                canonical_principal=authority.canonical, is_service=True,
+                service_authority=authority, enforcement_enabled=True,
+            )
         ctx.turn_id = f"turn-{number}"
         ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
         prefix: list[str] = []
@@ -191,16 +301,37 @@ async def test_agent_turns_keep_same_prefix_after_recent_activity_and_scratch_ch
         )
         pairs.append((prefix[0], prompt))
         await agent._buffer.append(agent._buffer.make_message(
-            channel_id="ch-cache", kind="user_message", content=f"recent {number}",
+            channel_id=channel, kind="user_message", content=f"recent {number}",
             author="alice", msg_id=f"msg-{number}", source="web",
         ))
+        with agent._config.turns_log.open("a") as log:
+            log.write(json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "channel_id": channel, "turn_id": ctx.turn_id,
+            }) + "\n")
+        # Match the production writer's invalidation without sleeping for TTL.
+        agent._turns_snapshot.invalidate()
+    conn.close()
+    assert "0 turns this channel" in pairs[0][1]
+    assert "1 turn this channel" in pairs[1][1]
     assert pairs[0][0] == pairs[1][0]
     assert pairs[0][1].startswith(pairs[0][0])
     assert pairs[1][1].startswith(pairs[1][0])
-    assert "persistent channel context" in pairs[0][0]
-    assert "completed session" in pairs[0][0]
+    if channel.startswith("poller:"):
+        assert re.findall(r"(?m)^## (.+)$", pairs[0][0]) == [
+            "Trigger channel", "Delivery", "Autonomous trigger authority", "Skill: cache",
+            "Learnings from past runs",
+        ]
+        assert "stable skill instructions" in pairs[0][0]
+        assert "- [tip] stable learning" in pairs[0][0]
+        assert "slack-ops" in pairs[0][0]
+    else:
+        assert pairs[0][0] == "## Channel context\n\npersistent channel context\n\n"
+    assert "completed session" not in pairs[0][0]
+    assert "completed session" in pairs[0][1]
     assert "recent 1" not in pairs[1][0]
-    assert "recent 1" in pairs[1][1]
+    if not channel.startswith("poller:"):
+        assert "recent 1" in pairs[1][1]
     assert pairs[0][1][len(pairs[0][0]):] != pairs[1][1][len(pairs[1][0]):]
 
 
@@ -208,7 +339,6 @@ async def test_agent_turns_keep_same_prefix_after_recent_activity_and_scratch_ch
 async def test_reordering_preserves_mixed_turn_blocks_and_ifc_labels(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import agent as agent_module
     from mimir.models import IntegrityEffect
 
     agent = _make_agent(tmp_path)
@@ -236,44 +366,42 @@ async def test_reordering_preserves_mixed_turn_blocks_and_ifc_labels(
         integrity=Integrity.UNTRUSTED, integrity_effect=IntegrityEffect.INFORMATIONAL,
     ))
     auth = replace(_make_ctx(event).auth_context, roles=("admin",))
-    original_renderer = agent_module.build_turn_prompt
-
-    def legacy_order(*args, **kwargs):
-        rendered = original_renderer(*args, **kwargs)
-        blocks = re.findall(r"(?ms)^## .*?(?=^## |\Z)", rendered)
-        order = {name: index for index, name in enumerate((
-            "Current turn scratch", "Known identities", "Channel context",
-            "Trigger channel", "Delivery", "Autonomous trigger authority",
-            "Recent feedback signals", "Open change proposals", "Recent session summaries",
-            "Resource usage", "Upcoming", "Upcoming commitments", "Self-state",
-            "Recent activity", "Possibly relevant memories (from SAGA)",
-            "Skill: feed", "Today's date", "▶ Current message — respond to this",
-        ))}
-        return "\n\n".join(sorted((block.strip() for block in blocks),
-                                 key=lambda block: order[block.split("\n", 1)[0][3:]]))
-
-    async def assemble():
-        ctx = _make_ctx(event)
-        ctx.auth_context = auth
-        ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
-        text, _ = await agent._build_turn_prompt(
-            ctx, event, "untrusted recall", initial_auth_context=auth,
-            saga_labels=recall_labels,
-        )
-        return text, ctx.ifc_labels
-
-    stable_text, stable_labels = await assemble()
-    monkeypatch.setattr(agent_module, "build_turn_prompt", legacy_order)
-    legacy_text, legacy_labels = await assemble()
-    assert stable_text != legacy_text
-    assert stable_labels == legacy_labels
-    assert {source.integrity for source in stable_labels.sources} == {
-        Integrity.TRUSTED, Integrity.UNTRUSTED,
+    agent._config.feedback_limit_per_polarity = 1
+    # Eliminate ambient telemetry so the exact provenance expectation is fixed.
+    for assembler in ("_assemble_usage_block", "_assemble_upcoming_block",
+                      "_assemble_commitments_block", "_assemble_self_state_block"):
+        monkeypatch.setattr(agent, assembler, lambda *a, **kw: None)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda *a: (None, []))
+    monkeypatch.setattr("mimir.proposals.render_open_proposals_block", lambda *a: None)
+    ctx = _make_ctx(event)
+    ctx.auth_context = auth
+    ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
+    stable_text, _ = await agent._build_turn_prompt(
+        ctx, event, "untrusted recall", initial_auth_context=auth,
+        saga_labels=recall_labels,
+    )
+    stable_labels = ctx.ifc_labels
+    expected_sources = {
+        ctx_source for ctx_source in _make_ctx(event).ifc_labels.sources
+    } | {
+        _prompt_source_labels(
+            auth, domain="recent_activity", resource="message:prior",
+            channel_id="ch-mixed", principal="alice", bridge="web",
+            source_kind="recent_activity_user", self_authored=False,
+        ).sources[0],
+        _prompt_source_labels(
+            auth, domain="channel_memory", resource="memory/channels/ch-mixed",
+            channel_id="ch-mixed", bridge="web", self_authored=True,
+        ).sources[0],
+        _block("feedback").labels.sources[0],
+        recall_labels.sources[0],
+        _prompt_source_labels(
+            auth, domain="skills", resource="skill:feed", principal="alice",
+            self_authored=True,
+        ).sources[0],
     }
-    assert recall_labels.sources[0] in stable_labels.sources
-    def blocks(text):
-        return Counter(block.strip() for block in re.findall(r"(?ms)^## .*?(?=^## |\Z)", text))
-    assert blocks(stable_text) == blocks(legacy_text)
+    assert set(stable_labels.sources) == expected_sources
+    assert stable_labels.labels == frozenset({"private"})
     for heading in ("Channel context", "Recent session summaries", "Skill: feed",
                     "Recent activity", "Possibly relevant memories (from SAGA)",
                     "▶ Current message — respond to this", "Current turn scratch"):
