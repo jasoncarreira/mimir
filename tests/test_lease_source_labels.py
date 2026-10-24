@@ -1633,11 +1633,12 @@ def _git_commit(path: Path, target: Path, message: str, author: str, committer: 
 @pytest.mark.parametrize("extra_commit", [False, True])
 def test_unprotected_verified_base_merge_keeps_lease_reads_and_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login, extra_commit: bool,
+    selected_repository_policy,
 ) -> None:
     from mimir.git_bootstrap import DEFAULT_USER_NAME
-    from mimir import pr_checkout_lease
-    from mimir.pr_checkout_lease import PRCheckoutLease, _METADATA, _metadata
-    from mimir.tools import repo
+    from mimir.plugins.core import selected_policy_registry
+    from mimir_cultivate import repository as repo
+    from mimir_cultivate.repository import PRCheckoutLease, _METADATA, _metadata
 
     monkeypatch.setattr(access_control_module, "_lease_head_is_author_attested", _self_login)
     auth, original, lease, target, _ = _real_attested_lease(tmp_path)
@@ -1670,11 +1671,12 @@ def test_unprotected_verified_base_merge_keeps_lease_reads_and_writes(
         ["git", "-C", str(lease.path), "remote", "add", "origin", scope.canonical_origin],
         check=True,
     )
-    object.__setattr__(auth, "repo_pr_action_scope", scope)
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
     state = RepoReviewState(scope)
     state.attach_checkout_lease(lease)
-    object.__setattr__(auth, "repo_review_state", state)
+    # Plugin-owned auth fields are projected from a trusted slot on this
+    # branch; replace() re-projects them, object.__setattr__ would desync them.
+    auth = replace(auth, repo_pr_action_scope=scope, repo_review_state=state)
     monkeypatch.setattr(repo, "_state", lambda *_: state)
     token = begin_protected_result_capture()
     try:
@@ -1702,8 +1704,17 @@ def test_unprotected_verified_base_merge_keeps_lease_reads_and_writes(
                           repo_pr_action_scope=scope),
         result=result, provenance=provenance,
     )
-    assert merge_labels.sources[0].integrity == "trusted"
-    auth.ifc_state.merge(merge_labels)
+    # The merge itself publishes trusted, exactly-scoped lease evidence. On
+    # this branch the host deliberately labels a plugin repository result as
+    # incomplete (see test_protected_base_lineage_keeps_file_reads_trusted_but_
+    # plugin_results_incomplete), so the trusted evidence is asserted on the
+    # raw provenance and the host label is not merged into the turn below:
+    # what #2423 changes is the lineage-based trust of later lease reads/writes.
+    assert provenance is not None and provenance.sources
+    assert provenance.sources[0].integrity == "trusted"
+    assert provenance.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
+    assert merge_labels.sources[0].integrity == "untrusted"
+    assert merge_labels.sources[0].resource_id == "<unresolved-resource:protected_tool:repo_merge>"
 
     # Discriminating pair for the second verified-base disjunct: both the
     # recorded fetched base and its ancestry still match, only scope_base differs.
@@ -1728,7 +1739,10 @@ def test_unprotected_verified_base_merge_keeps_lease_reads_and_writes(
     assert (attestation.ok, attestation.reason) == (
         (False, "lineage_commit_mismatch") if extra_commit else (True, "ok")
     )
-    monkeypatch.setattr(pr_checkout_lease, "active_pr_checkout_lease_for_path", lambda _: lease)
+    selected = selected_policy_registry()
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks, active_checkout=lambda _: lease,
+    ))
     labels = classify_protected_result(
         "read_file", {"file_path": str(target)}, auth,
         ToolAuthorization(tool_name="read_file", decision="resource_scoped", allowed=True),
@@ -1753,7 +1767,7 @@ def test_unprotected_verified_base_merge_keeps_lease_reads_and_writes(
 
 
 def test_unprotected_merge_scope_base_guard_mutation_is_killed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login, selected_repository_policy,
 ) -> None:
     import inspect
 
@@ -1765,10 +1779,12 @@ def test_unprotected_merge_scope_base_guard_mutation_is_killed(
     with pytest.raises(AssertionError, match="scope-base mismatch must refuse"):
         test_unprotected_verified_base_merge_keeps_lease_reads_and_writes(
             tmp_path, monkeypatch, namespace["_lease_head_is_author_attested"], False,
+            selected_repository_policy,
         )
 
 
 @pytest.mark.parametrize("invalid_base", ["rewritten", "unreported"])
+@pytest.mark.usefixtures("selected_repository_policy")
 def test_unprotected_unverified_base_cannot_extend_lineage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login, invalid_base: str,
 ) -> None:
@@ -1802,12 +1818,11 @@ def test_unprotected_unverified_base_cannot_extend_lineage(
                verified_base_sha=other if invalid_base == "rewritten" else observed,
                lineage={merged: True})
     raw_path.write_text(json.dumps(raw))
-    object.__setattr__(auth, "repo_pr_action_scope", scope)
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
     state = RepoReviewState(scope)
     state.attach_checkout_lease(lease)
     state.record_git_head(scope.scope_id, merged)
-    object.__setattr__(auth, "repo_review_state", state)
+    auth = replace(auth, repo_pr_action_scope=scope, repo_review_state=state)
     attestation = access_control_module.pr_checkout_lease_attestation(auth, scope, lease)
     assert (attestation.ok, attestation.reason) == (
         False, "git_nonzero_exit" if invalid_base == "rewritten" else "lineage_commit_mismatch",
@@ -1819,9 +1834,12 @@ def test_unprotected_unverified_base_cannot_extend_lineage(
         inconsistent = SimpleNamespace(**{**vars(lease), "verified_base_sha": observed})
         assert not _self_login(lease.path, scope.head_ref, common, merged,
                                scope=scope, lease=inconsistent, ifc_state=auth.ifc_state)
-    from mimir import pr_checkout_lease
+    from mimir.plugins.core import selected_policy_registry
 
-    monkeypatch.setattr(pr_checkout_lease, "active_pr_checkout_lease_for_path", lambda _: lease)
+    selected = selected_policy_registry()
+    monkeypatch.setattr(selected, "_policy_consumer_hooks", replace(
+        selected.policy_consumer_hooks, active_checkout=lambda _: lease,
+    ))
     source = protected_result_source(auth, principal="filesystem", domain="filesystem",
                                      resource_id=str(target), bridge_instance="filesystem")
     assert (source.domain, source.integrity, source.integrity_effect) == (

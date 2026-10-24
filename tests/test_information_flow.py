@@ -451,6 +451,41 @@ def bind_approval_turn(request: pytest.FixtureRequest) -> Callable[[AuthContext]
     return bind
 
 
+def _assert_tainted_write_veto(
+    auth: AuthContext, core_tools: tuple[str, ...], arguments: dict[str, Any],
+    *, enforce: bool, refused: bool,
+) -> None:
+    """Probe the tainted-turn write veto with tools governed in the active mode.
+
+    The core tools are registered in every mode. ``repo_push`` moved into
+    Cultivate on this branch, so a core-only policy sees it as an UNKNOWN tool;
+    it is probed only under the selected repository policy, where it is governed.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    def check(tool: str) -> None:
+        decision = ToolRegistry().authorize_tool(
+            tool, auth, enforce=enforce, arguments=arguments,
+        )
+        if refused:
+            assert not decision.allowed, (tool, decision)
+            assert decision.reason == "write_blocked_by_untrusted_ingest", (tool, decision)
+        else:
+            assert decision.reason != "write_blocked_by_untrusted_ingest", (tool, decision)
+
+    for tool in core_tools:
+        check(tool)
+    try:
+        version("mimir-cultivate")
+    except PackageNotFoundError:
+        return
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    with policy_scope(load_plugins(enable="cultivate").policy):
+        check("repo_push")
+
+
 def _auth(channel: str = "slack-C1", *, roles: tuple[str, ...] = ()) -> AuthContext:
     return AuthContext(
         principal="slack-U1",
@@ -556,14 +591,13 @@ async def test_summarization_offload_read_back_preserves_ingress_labels(
     later, later_labels = _runtime_operator_context(later_event, ingress_resolver)
     assert not later_labels.has_untrusted_active_ingest
     read_labels = read_in_turn(later)
+    write_tools = ("write_file", "edit_file", "replace_file", "memory_store")
+    args = {"file_path": str(tmp_path / "prompts" / "policy.md")}
+    # Discriminating pair: the clean turn is not vetoed before the read-back.
+    _assert_tainted_write_veto(later, write_tools, args, enforce=False, refused=False)
     later.ifc_state.merge(read_labels, fallback=later.ifc_labels)
     assert later.ifc_state.current(later.ifc_labels).has_untrusted_active_ingest
-    for tool in ("write_file", "edit_file", "replace_file", "memory_store", "repo_push"):
-        args = {"file_path": str(tmp_path / "prompts" / "policy.md")}
-        decision = ToolRegistry().authorize_tool(
-            tool, later, enforce=False, arguments=args,
-        )
-        assert not decision.allowed and decision.reason == "write_blocked_by_untrusted_ingest", (tool, decision)
+    _assert_tainted_write_veto(later, write_tools, args, enforce=False, refused=True)
 
     if not tainted:
         # A clean old record must not attest bytes changed by another writer.
@@ -708,11 +742,12 @@ async def test_real_summarization_middleware_captures_live_tool_sources(
         reset_current_turn(token)
     assert provenance is not None
     assert (web in provenance.sources) is tool_taint
+    write_tools = ("write_file", "edit_file", "memory_store")
+    args = {"file_path": str(tmp_path / "state" / "x.md")}
+    # Discriminating pair: the clean turn is not vetoed before the read-back.
+    _assert_tainted_write_veto(later, write_tools, args, enforce=enforce, refused=False)
     later.ifc_state.merge(InformationFlowLabels(sources=provenance.sources), fallback=later.ifc_labels)
-    for tool in ("write_file", "edit_file", "memory_store", "repo_push"):
-        decision = ToolRegistry().authorize_tool(tool, later, enforce=enforce,
-                                                arguments={"file_path": str(tmp_path / "state" / "x.md")})
-        assert not decision.allowed and decision.reason == "write_blocked_by_untrusted_ingest"
+    _assert_tainted_write_veto(later, write_tools, args, enforce=enforce, refused=True)
 
 
 @pytest.mark.parametrize("fault", ["empty", "version", "malformed", "incomplete", "symlink", "parent", "digest"])
