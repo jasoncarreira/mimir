@@ -2911,6 +2911,50 @@ def test_github_public_read_permission_does_not_establish_collaborator_trust(
     ]
 
 
+@pytest.mark.parametrize("case", ["invalid", "trusted", "collaborator_reset", "membership_reset", "raising_sink", "unknown_failure"])
+def test_author_cause_context_resets_and_diagnostics_never_change_verdict(monkeypatch, case):
+    from mimir import pollers
+
+    cause_token = pollers._github_author_trust_cause.set("membership_timeout")
+    failure_token = pollers._github_attestation_failure.set("timeout")
+    sink_calls = []
+
+    def sink(name, **fields):
+        sink_calls.append((name, fields))
+        if case == "raising_sink":
+            raise RuntimeError("diagnostic sink unavailable")
+
+    sink_token = pollers._github_author_diagnostic_sink.set(sink)
+    try:
+        def api(endpoint, token):
+            assert pollers._github_attestation_failure.get() is None
+            if case == "trusted":
+                return 204, None
+            if case == "membership_reset" and endpoint.startswith("repos/"):
+                pollers._github_attestation_failure.set("timeout")
+                return 404, None
+            if case == "unknown_failure":
+                pollers._github_attestation_failure.set("unbounded server text")
+            return None
+
+        monkeypatch.setattr(pollers, "_github_api_attestation", api)
+        verdict = pollers._github_author_is_trusted(
+            None if case == "invalid" else "acme/widget", "owner", "token",
+        )
+        assert verdict is (False if case == "invalid" else True if case == "trusted" else None)
+        expected = None if case in {"invalid", "trusted"} else (
+            "membership_transport" if case == "membership_reset" else "collaborator_transport"
+        )
+        assert pollers.github_author_trust_cause() == expected
+        assert len(sink_calls) == (0 if expected is None else 1)
+        if sink_calls:
+            assert sink_calls[0][1]["failure_class"] == "transport"
+    finally:
+        pollers._github_author_diagnostic_sink.reset(sink_token)
+        pollers._github_attestation_failure.reset(failure_token)
+        pollers._github_author_trust_cause.reset(cause_token)
+
+
 def test_pr_opened_url_resolves_owner_despite_repository_case(monkeypatch):
     calls = []
     def api(endpoint, token):
@@ -2944,13 +2988,17 @@ async def test_poller_side_unavailable_author_diagnostic_reaches_server_log(
               / "github-poller" / "scripts" / "poller.py")
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", f'''
+import os
 import runpy
 from mimir import pollers
 p = runpy.run_path({str(script)!r})
+# Exercise production entry-point wiring, without running network polling.
+os.environ.pop("GITHUB_REPOS", None)
+p["main"]()
+assert pollers._github_author_diagnostic_sink.get() is p["_forward_author_diagnostic"]
 # The function's globals are the runpy namespace, not the returned copy.
 resolver = p["_pr_author_is_trusted"]
 resolver.__globals__["_github_content_author"] = lambda *args: "owner"
-pollers._github_author_diagnostic_sink.set(p["_forward_author_diagnostic"])
 def api(endpoint, token):
     pollers._github_attestation_failure.set("timeout")
     return None

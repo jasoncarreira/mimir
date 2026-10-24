@@ -1449,7 +1449,7 @@ def _repo_pr_scope_resolution(
             else "non_collaborator"
         )
         from .pollers import bounded_github_author_cause
-        cause = (bounded_github_author_cause(pr_author_trust_cause)
+        cause = (bounded_github_author_cause(pr_author_trust_cause or "verdict_missing")
                  if pr_author_is_trusted is None else None)
         try:
             fields = dict(repo=repo, number=number, author=sanitize_login(principal), reason=reason)
@@ -10775,7 +10775,15 @@ def log_pr_checkout_lease_attestation_refused(
         if reason == LeaseAttestationReason.NO_AUTHOR_TRUST:
             from .pollers import bounded_github_author_cause
 
-            cause = getattr(ifc_state, "pr_checkout_author_trust_cause", {}).get(scope_id)
+            verdicts = getattr(ifc_state, "pr_checkout_author_trust", {})
+            if scope_id not in verdicts:
+                cause = "no_turn_verdict"
+            elif verdicts[scope_id] is False:
+                cause = "non_collaborator"
+            else:
+                cause = getattr(ifc_state, "pr_checkout_author_trust_cause", {}).get(
+                    scope_id, "verdict_missing",
+                )
             fields["cause"] = bounded_github_author_cause(cause)
         log_event_sync("pr_checkout_lease_attestation_refused", **fields)
     except RuntimeError:

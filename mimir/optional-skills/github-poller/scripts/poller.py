@@ -1077,18 +1077,23 @@ def _forward_author_diagnostic(signal_type: str, **fields: object) -> None:
 #: timeout, not a total one, so it is enforced here with a real wall-clock
 #: deadline rather than trusted as a bound.
 TRUST_ATTESTATION_TIMEOUT_SECONDS = 10.0
-_PR_TRUST_CAUSE: str | None = None
 
 
-def _pr_trust_unavailable(cause: str, repo: str, number: int) -> None:
-    """Retain and report a retryable cause even when admission skips the PR."""
-    global _PR_TRUST_CAUSE
-    _PR_TRUST_CAUSE = cause
+def _pr_trust_unavailable(
+    cause: str, repo: str, number: int,
+) -> tuple[None, str]:
+    """Report a retryable cause and return it with this lookup's verdict."""
     _emit_signal("github_pr_author_attestation_unavailable", repo=repo, number=number,
                  cause=cause)
+    return None, cause
 
 
-def _pr_author_is_trusted(
+def _pr_author_is_trusted(*args, **kwargs) -> bool | None:
+    """Admission-only projection; scope emission keeps the paired cause."""
+    return _pr_author_trust(*args, **kwargs)[0]
+
+
+def _pr_author_trust(
     repo: str,
     number: int,
     url: str,
@@ -1096,8 +1101,8 @@ def _pr_author_is_trusted(
     trust_cache: dict[tuple[str, object], object],
     *,
     tick_budget: "TickBudget | None" = None,
-) -> bool | None:
-    """Resolve PR-author trust from GitHub and cache it for this poll cycle.
+) -> tuple[bool | None, str | None]:
+    """Resolve PR-author trust and its cause together; cache only real verdicts.
 
     Returns ``None`` when the tick has no budget left or a server attestation is
     unavailable. That is deliberately distinct from ``False``: an unresolved
@@ -1110,9 +1115,6 @@ def _pr_author_is_trusted(
     ``_gh_api``'s subprocess, so it needs its own budget plumbing — bounding only
     the `gh api` transport left this one free to overrun the tick.
     """
-    global _PR_TRUST_CAUSE
-    _PR_TRUST_CAUSE = None
-
     def _allowance() -> float | None:
         """Wall-clock seconds this lookup may take, or None to skip it."""
         if tick_budget is None:
@@ -1126,8 +1128,7 @@ def _pr_author_is_trusted(
     if author_key not in trust_cache:
         allowed = _allowance()
         if allowed is None:
-            _pr_trust_unavailable("budget_exhausted", repo, number)
-            return None
+            return _pr_trust_unavailable("budget_exhausted", repo, number)
         try:
             with _wall_clock_deadline(allowed):
                 resolved = _github_content_author(
@@ -1139,36 +1140,31 @@ def _pr_author_is_trusted(
             # Unresolved, not untrusted — see the tri-state note above. Do not
             # cache: the next tick should retry rather than inherit a verdict
             # produced by a timeout.
-            _pr_trust_unavailable("deadline_exceeded", repo, number)
-            return None
+            return _pr_trust_unavailable("deadline_exceeded", repo, number)
         if resolved is None:
             # Transport failure or malformed response is unresolved, not an
             # authoritative untrusted verdict. Do not cache it; retry next tick.
-            _pr_trust_unavailable("author_unresolved", repo, number)
-            return None
+            return _pr_trust_unavailable("author_unresolved", repo, number)
         trust_cache[author_key] = resolved
     author = trust_cache[author_key]
     trust_key = (repo, author if isinstance(author, str) else "")
     if trust_key not in trust_cache:
         allowed = _allowance()
         if allowed is None:
-            _pr_trust_unavailable("budget_exhausted", repo, number)
-            return None
+            return _pr_trust_unavailable("budget_exhausted", repo, number)
         try:
             with _wall_clock_deadline(allowed):
                 trusted = _github_author_is_trusted(repo, author, token)
         except _DeadlineExceeded:
-            _pr_trust_unavailable("deadline_exceeded", repo, number)
-            return None
+            return _pr_trust_unavailable("deadline_exceeded", repo, number)
         if trusted is None:
             # Preserve the transport's unavailable state separately from False.
             cause = bounded_github_author_cause(github_author_trust_cause())
             if cause == "author_unresolved":
                 cause = "collaborator_transport"
-            _pr_trust_unavailable(cause, repo, number)
-            return None
+            return _pr_trust_unavailable(cause, repo, number)
         trust_cache[trust_key] = trusted
-    return trust_cache[trust_key] is True
+    return trust_cache[trust_key] is True, None
 
 
 def _partition_activity(
@@ -1261,16 +1257,18 @@ def _pr_scope_fields(
     base = pr.get("base") or {}
     head_repo = ((head.get("repo") or {}).get("full_name") or "")
     author = (pr.get("user") or {}).get("login")
-    verdict = (
-        True if me and author == me else
-        _pr_author_is_trusted(repo, pr.get("number"), pr.get("html_url", ""),
-                              token, trust_cache if trust_cache is not None else {},
-                              tick_budget=tick_budget)
-        if token and type(pr.get("number")) is int else None
-    )
+    if me and author == me:
+        verdict, cause = True, None
+    elif token and type(pr.get("number")) is int:
+        verdict, cause = _pr_author_trust(
+            repo, pr["number"], pr.get("html_url", ""), token,
+            trust_cache if trust_cache is not None else {}, tick_budget=tick_budget,
+        )
+    else:
+        verdict, cause = None, "verdict_missing"
     return {
         "pr_author_is_trusted": verdict,
-        "pr_author_trust_cause": (_PR_TRUST_CAUSE or "author_unresolved") if verdict is None else None,
+        "pr_author_trust_cause": cause,
         "head_repo": head_repo or None,
         "head_remote": "origin" if head_repo.lower() == repo.lower() else "source",
         "head_ref": head.get("ref"),

@@ -8,6 +8,7 @@ from mimir.pollers import _github_author_is_trusted
 
 
 _REAL_PR_AUTHOR_IS_TRUSTED = poller._pr_author_is_trusted
+_REAL_PR_AUTHOR_TRUST = poller._pr_author_trust
 _REAL_AUTHOR_IS_TRUSTED = poller._github_author_is_trusted
 
 
@@ -47,6 +48,7 @@ def _capture(monkeypatch):
 
 def _use_real_trust_filter(monkeypatch) -> None:
     monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_PR_AUTHOR_IS_TRUSTED)
+    monkeypatch.setattr(poller, "_pr_author_trust", _REAL_PR_AUTHOR_TRUST)
     monkeypatch.setattr(poller, "_github_author_is_trusted", _REAL_AUTHOR_IS_TRUSTED)
 
 
@@ -252,6 +254,38 @@ def test_trust_lookup_is_cached_per_author_per_poll_cycle(monkeypatch):
 
     assert content_calls == [1, 2]
     assert trust_calls == ["same-author"]
+
+
+@pytest.mark.parametrize("skip", ["no_token", "non_int", "bool"])
+def test_scope_missing_verdict_cannot_inherit_previous_pr_cause(monkeypatch, skip):
+    _use_real_trust_filter(monkeypatch)
+    monkeypatch.setattr(poller, "_emit_signal", lambda *a, **k: None)
+
+    class NoBudget:
+        def call_timeout(self, **kwargs):
+            return None
+
+    first = poller._pr_scope_fields(_pr(1), "acme/widget", token="token", tick_budget=NoBudget())
+    assert first["pr_author_trust_cause"] == "budget_exhausted"
+    pr = _pr(2)
+    token = "token"
+    if skip == "no_token":
+        token = ""
+    else:
+        pr["number"] = "2" if skip == "non_int" else True
+    second = poller._pr_scope_fields(pr, "acme/widget", token=token)
+    assert second["pr_author_is_trusted"] is None
+    assert second["pr_author_trust_cause"] == "verdict_missing"
+
+
+def test_forwarded_author_is_sanitized(monkeypatch):
+    signals = []
+    monkeypatch.setattr(poller, "_emit_signal", lambda name, **fields: signals.append(fields))
+    poller._forward_author_diagnostic(
+        "github_author_attestation_unavailable", repository="acme/widget",
+        author="private response text\nsecret", request="collaborator", failure_class="timeout",
+    )
+    assert signals[0]["author"] == "<invalid-login>"
 
 
 @pytest.mark.parametrize("failure,expected", [

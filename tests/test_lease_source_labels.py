@@ -876,7 +876,7 @@ def test_failed_git_operation_keeps_only_attested_origin(
         assert events == [
             ("pr_checkout_lease_attestation_refused", {
                 "scope_id": scope.scope_id, "reason": "no_author_trust",
-                "cause": "author_unresolved",
+                "cause": "non_collaborator",
             }),
             ("repository_result_untrusted_default", {
                 "tool": operation, "scope_id": scope.scope_id,

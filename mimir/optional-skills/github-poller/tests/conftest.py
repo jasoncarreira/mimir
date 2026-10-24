@@ -13,6 +13,9 @@ def _trusted_pr_authors_by_default(monkeypatch: pytest.MonkeyPatch):
         poller, "_pr_author_is_trusted", lambda *args, **kwargs: True,
     )
     monkeypatch.setattr(
+        poller, "_pr_author_trust", lambda *args, **kwargs: (True, None),
+    )
+    monkeypatch.setattr(
         poller, "_github_author_is_trusted", lambda *args, **kwargs: True,
     )
 

@@ -484,6 +484,49 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
     )
 
 
+@pytest.mark.parametrize("case", ["unavailable", "missing_cause", "false", "true", "author_mismatch"])
+def test_checkout_records_fresh_turn_local_author_cause(tmp_path, monkeypatch, case):
+    from mimir import pollers
+    from mimir.tools import forge, repo
+
+    _, _, scope, state = _repo_scope_and_state(tmp_path, pull_request_author="owner")
+    auth = _lineage_turn(scope, state)
+    causes = auth.ifc_state.pr_checkout_author_trust_cause
+    causes[scope.scope_id] = "membership_timeout"
+    token = pollers._github_author_trust_cause.set("membership_timeout")
+    try:
+        monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+        monkeypatch.setattr(repo, "acquire_pr_checkout_lease", lambda *a, **k: (state.checkout_lease, []))
+        monkeypatch.setattr(forge, "_client", lambda _: SimpleNamespace(author_is_trusted=lambda *_: None))
+        monkeypatch.setattr(repo, "_publish_attested_lease_result", lambda *_: None)
+
+        def authors(*_):
+            assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is None
+            assert causes[scope.scope_id] == "author_unresolved"
+            return (("other",) if case == "author_mismatch" else ("owner",)), None
+
+        def verdict(*_):
+            assert pollers.github_author_trust_cause() is None
+            if case == "unavailable":
+                pollers._github_author_trust_cause.set("collaborator_timeout")
+            return {"false": False, "true": True}.get(case)
+
+        monkeypatch.setattr(forge, "_pr_content_authors", authors)
+        monkeypatch.setattr(forge, "_author_verdict", verdict)
+        repo.repo_checkout.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+        assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is {
+            "false": False, "true": True,
+        }.get(case)
+        if case in {"false", "true"}:
+            assert scope.scope_id not in causes
+        else:
+            assert causes[scope.scope_id] == (
+                "collaborator_timeout" if case == "unavailable" else "author_unresolved"
+            )
+    finally:
+        pollers._github_author_trust_cause.reset(token)
+
+
 def test_repo_scope_fixture_ignores_inherited_git_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -10288,7 +10288,7 @@ def test_outsider_pr_scope_requires_exact_attestation(
         "repo": "o/r", "number": 42, "author": "outside-author",
         "reason": "attestation_unavailable" if verdict in (None, "missing")
         else "non_collaborator",
-        **({"cause": "author_unresolved"} if verdict in (None, "missing") else {}),
+        **({"cause": "verdict_missing"} if verdict in (None, "missing") else {}),
     })
     assert withheld[0] == "github_content_withheld"
     assert withheld[1]["count"] == 1

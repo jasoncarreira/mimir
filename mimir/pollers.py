@@ -535,6 +535,7 @@ GITHUB_AUTHOR_FAILURE_CLASSES = frozenset({
 })
 GITHUB_AUTHOR_UNAVAILABLE_CAUSES = frozenset({
     "budget_exhausted", "deadline_exceeded", "author_unresolved",
+    "verdict_missing", "no_turn_verdict", "non_collaborator",
 }) | frozenset(
     f"{request}_{failure}" for request in ("collaborator", "membership")
     for failure in GITHUB_AUTHOR_FAILURE_CLASSES
