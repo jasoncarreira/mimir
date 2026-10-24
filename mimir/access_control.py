@@ -11620,8 +11620,9 @@ def _log_retained_repository_failure(tool_name: str, result: Any, repository: st
 
 
 _SHELL_CONTENT_NAME = re.compile(
-    r"(?<![\w.-])(?:turns\.jsonl|events\.jsonl|chat_history\.jsonl|worklink-ready-queue)(?![\w.-])"
-    r"|(?<![\w.-])(?:logs|messages)(?=/|\\|['\"]?(?:\s|$))"
+    r"(?<![\w.-])(?:turns\.jsonl|events\.jsonl|chat_history\.jsonl|triage-dropped\.jsonl|worklink-ready-queue|conversation_history)(?![\w.-])"
+    r"|(?<![\w.-])(?:logs|messages)(?=/|\\)"
+    r"|/(?:logs|messages)(?=['\"\s/\\]|$)"
 )
 _SHELL_RECURSIVE_SEARCH = re.compile(r"(?<![\w.-])(?:rg|ag|grep\s+-(?:\S*[rR]\S*))(?:\s|$)")
 
@@ -11633,8 +11634,6 @@ def _shell_reads_home_content(arguments: dict[str, Any], *, tool_name: str = "sh
         return False
     if _SHELL_CONTENT_NAME.search(command):
         return True
-    if not _SHELL_RECURSIVE_SEARCH.search(command):
-        return False
     home_raw = os.environ.get("MIMIR_HOME", "").strip()
     if not home_raw:
         return False
@@ -11642,29 +11641,35 @@ def _shell_reads_home_content(arguments: dict[str, Any], *, tool_name: str = "sh
     cwd_raw = arguments.get("cwd")
     if isinstance(cwd_raw, str) and cwd_raw:
         cwd = Path(cwd_raw).expanduser()
-    elif tool_name == "shell_exec":
+    else:
         from ._context import get_current_turn
         from .tools.extra import _effective_shell_cwd
         turn = get_current_turn()
         cwd = (_effective_shell_cwd() if turn is None or hasattr(turn, "session_id") else home) or home
-    else:
-        cwd = Path.cwd()
     broad_cwd = False
     try:
-        broad_cwd = home == cwd.resolve() or home.is_relative_to(cwd.resolve())
+        resolved = cwd.resolve()
+        broad_cwd = home == resolved or home.is_relative_to(resolved)
+        # Remembered shell cwd can itself be within a persistent content store.
+        if resolved.is_relative_to(home):
+            relative = resolved.relative_to(home)
+            if any(part in {"logs", "messages", "conversation_history", "large_tool_results"}
+                   for part in relative.parts) or relative.parts[:2] in {
+                       ("state", "pollers"), ("attachments", "fetch-cache"),
+                   }:
+                return True
     except (OSError, RuntimeError):
         pass
+    if not _SHELL_RECURSIVE_SEARCH.search(command):
+        return False
     # Literal absolute HOME/ancestor operands. Match raw command text, including
     # quoted paths; avoid treating a narrower descendant as a broad search.
     broad_path = any(
         re.search(r"(?<![\w/.-])" + re.escape(str(parent)) + r"(?=/|['\"\s]|$)", command)
         for parent in (home, *home.parents) if str(parent) != "/"
     ) or bool(re.search(r"(?:^|\s)['\"]?/(?:['\"\s]|$)", command))
-    # Unqualified searches in HOME are broad; an explicit narrower path is not.
-    unqualified = bool(re.search(
-        r"(?<![\w.-])(?:rg|ag|grep\s+-[rR])(?:\s+-\S+)*\s+\S+\s*$", command,
-    ))
-    return broad_path or broad_cwd and unqualified
+    # Deliberately over-taint narrow operands from HOME rather than parse shell.
+    return broad_path or broad_cwd
 
 
 def classify_protected_result(
@@ -12053,8 +12058,7 @@ def classify_protected_result(
             tool_name in {"shell_exec", "bash_job_output", "bash_jobs_list"}
             or (
                 tool_name == "bash_async"
-                and (getattr(auth_context, "repo_review_state", None) is not None
-                     or _shell_reads_home_content(args, tool_name=tool_name))
+                and getattr(auth_context, "repo_review_state", None) is not None
             )
         )
         and authorization.allowed
@@ -12090,10 +12094,7 @@ def classify_protected_result(
             ),
             source_kind="protected_tool",
             integrity="untrusted",
-            integrity_effect=(
-                "active_ingest" if tool_name in {"shell_exec", "bash_async"}
-                and _shell_reads_home_content(args, tool_name=tool_name) else "informational"
-            ),
+            integrity_effect="informational",
         ))
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels

@@ -115,8 +115,7 @@ def test_rollout_refuses_symlinked_store_root(tmp_path: Path) -> None:
     body = outside / "keep.txt"
     body.write_text("safe")
     (tmp_path / "large_tool_results").symlink_to(outside, target_is_directory=True)
-    with pytest.raises(OSError):
-        sweep_turn_stores(tmp_path)
+    sweep_turn_stores(tmp_path)
     assert body.read_text() == "safe"
 
 

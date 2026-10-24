@@ -1118,6 +1118,300 @@ def _build_agent(tmp_path: Path, *,
     return a
 
 
+def _seed_live_turn_stores(home: Path) -> list[Path]:
+    """Create test-owned bytes using the production live-turn path allocator."""
+    from mimir._context import get_current_turn
+    from mimir.turn_stores import turn_store
+
+    turn = get_current_turn()
+    assert turn is not None
+    paths = []
+    for name in (
+        "large_tool_results", "conversation_history", "attachments/fetch-cache",
+        ".mimir/conversation_history_labels",
+    ):
+        virtual = turn_store(name)
+        assert virtual == f"/{name}/{turn.turn_id}"
+        path = home / virtual.lstrip("/") / "owned.txt"
+        path.write_text(f"untrusted bytes for {turn.turn_id}", encoding="utf-8")
+        paths.append(path)
+    return paths
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "exception", "cancellation"])
+async def test_run_turn_wipes_only_finished_turn_stores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    """The real finally must clean A while a concurrently running B retains bytes."""
+    from mimir._context import get_current_turn
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    ids = ("store-finishing", "store-still-running")
+    entered = {turn_id: asyncio.Event() for turn_id in ids}
+    release = {turn_id: asyncio.Event() for turn_id in ids}
+    written: dict[str, list[Path]] = {}
+
+    class StoreModel(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            turn_id = get_current_turn().turn_id
+            written[turn_id] = _seed_live_turn_stores(home)
+            entered[turn_id].set()
+            await release[turn_id].wait()
+            if turn_id == ids[0] and outcome == "exception":
+                raise RuntimeError("turn store model failed")
+            async for chunk in super().astream(
+                state, config=config, context=context, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    agent = _build_agent(tmp_path, fake_agent=StoreModel([AIMessage(content="done")]))
+    tasks = [asyncio.create_task(agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id=f"channel:{turn_id}", content="hello",
+    ), turn_id=turn_id)) for turn_id in ids]
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(signal.wait() for signal in entered.values())),
+            HANG_GUARD_SECONDS,
+        )
+        assert all(path.is_file() for paths in written.values() for path in paths)
+        assert not any(task.done() for task in tasks)
+        if outcome == "cancellation":
+            tasks[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(tasks[0], HANG_GUARD_SECONDS)
+        else:
+            release[ids[0]].set()
+            record = await asyncio.wait_for(tasks[0], HANG_GUARD_SECONDS)
+            if outcome == "exception":
+                assert record.error == "RuntimeError: turn store model failed"
+            else:
+                assert record.error is None
+        # Check the directory, not merely the file: no empty per-turn stores
+        # should remain. B is demonstrably still inside its own model stream.
+        assert all(not path.parent.exists() for path in written[ids[0]])
+        assert not tasks[1].done()
+        assert all(path.read_text() == f"untrusted bytes for {ids[1]}"
+                   for path in written[ids[1]])
+        release[ids[1]].set()
+        record = await asyncio.wait_for(tasks[1], HANG_GUARD_SECONDS)
+        assert record.error is None
+        assert all(not path.parent.exists() for path in written[ids[1]])
+    finally:
+        for signal in release.values():
+            signal.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_moves_ci_log_before_model_and_wipes_delivered_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir._context import get_current_turn
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    source = home / "state/pollers/github-ci-watch/logs/42-101.log"
+    source.parent.mkdir(parents=True)
+    source.write_text("untrusted bounded CI tail", encoding="utf-8")
+    unrelated = source.with_name("43-102.log")
+    unrelated.write_text("another pending event", encoding="utf-8")
+    authority = build_trigger_service_principal(
+        canonical="poller:github-ci-watch", trigger="poller", profile="github",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE, capabilities=("read_file",),
+        roots=(source.parent.parent,), creation_path="test",
+    )
+    event = AgentEvent(
+        trigger="poller", channel_id=authority.canonical, source="poller",
+        source_id="ci:42:101", service_principal=authority.canonical,
+        service_authority=authority,
+        content=f"Read the bounded log tail using read_file: {source}",
+    )
+    moved = home / "scratch/turns/ci-log-consumer/ci-logs/42-101.log"
+    observed = []
+
+    class CIModel(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            assert get_current_turn().ci_log_paths == (moved,)
+            assert not source.exists()
+            assert moved.read_text() == "untrusted bounded CI tail"
+            assert str(moved) in event.content
+            assert str(source) not in event.content
+            prompt = str(state["messages"][0].content)
+            assert str(moved) in prompt
+            assert str(source) not in prompt
+            observed.append(moved)
+            async for chunk in super().astream(
+                state, config=config, context=context, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    model = CIModel([AIMessage(content="checked")])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    record = await agent.run_turn(event, turn_id="ci-log-consumer")
+    assert record.error is None
+    assert observed == [moved]
+    assert len(model.invocations) == 1
+    assert not source.exists()
+    assert not moved.exists()
+    assert unrelated.read_text() == "another pending event"
+
+
+def _research_draft_event(home: Path) -> AgentEvent:
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+
+    authority = build_trigger_service_principal(
+        canonical="poller:papers", trigger="poller", profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("open_proposal", "submit_proposal", "abandon_proposal",
+                      "read_file", "write_file", "replace_file", "edit_file"),
+        roots=(home / "state/pollers/papers",), creation_path="test",
+    )
+    return AgentEvent(
+        trigger="poller", channel_id=authority.canonical, source="poller",
+        source_id="paper:42", content="Research this paper.",
+        service_principal=authority.canonical, service_authority=authority,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "exception", "cancellation"])
+async def test_run_turn_wipes_research_drafts_written_by_real_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    from mimir.readonly_backend import WriteGuardBackend
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    backend = WriteGuardBackend(home, ["state"])
+    persist = home / "state/pollers/papers"
+    persist.mkdir(parents=True)
+    cursor = persist / "cursor.json"
+    cursor.write_text('{"last_id": 42}', encoding="utf-8")
+    unowned = persist / "unowned-draft.md"
+    unowned.write_text("not written by this turn", encoding="utf-8")
+    drafts = (persist / "paper-draft.md", persist / "drafts/paper.md")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class DraftModel(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            for draft in drafts:
+                virtual = "/" + draft.relative_to(home).as_posix()
+                assert (await backend.awrite(virtual, "first draft")).error is None
+                assert (await backend.areplace(virtual, "revised draft")).error is None
+                assert (await backend.aedit(virtual, "revised", "final")).error is None
+                assert draft.read_text() == "final draft"
+            entered.set()
+            await release.wait()
+            if outcome == "exception":
+                raise RuntimeError("research model failed")
+            async for chunk in super().astream(
+                state, config=config, context=context, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    agent = _build_agent(tmp_path, fake_agent=DraftModel([AIMessage(content="done")]))
+    task = asyncio.create_task(agent.run_turn(
+        _research_draft_event(home), turn_id="research-draft-writer",
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
+        assert all(draft.is_file() for draft in drafts)
+        if outcome == "cancellation":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, HANG_GUARD_SECONDS)
+        else:
+            release.set()
+            record = await asyncio.wait_for(task, HANG_GUARD_SECONDS)
+            assert record.error == (
+                "RuntimeError: research model failed" if outcome == "exception" else None
+            )
+        assert all(not draft.exists() for draft in drafts)
+        assert cursor.read_text() == '{"last_id": 42}'
+        assert unowned.read_text() == "not written by this turn"
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submitted", [True, False], ids=["success", "failure"])
+async def test_submit_proposal_wipes_real_draft_only_on_success_before_turn_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, submitted: bool,
+) -> None:
+    from mimir.proposals import ProposalResult
+    from mimir.readonly_backend import WriteGuardBackend
+    from mimir.tools import proposals
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    backend = WriteGuardBackend(home, ["state"])
+    draft = home / "state/pollers/papers/drafts/paper.md"
+    url = "https://github.com/test-owned/research/pull/42"
+    calls = []
+    observed = []
+
+    def finalize(context, proposal_home, operation, **kwargs):
+        # Stub only the publication boundary: no git, network, or real PR.
+        assert proposal_home == home
+        assert operation == "submit_proposal"
+        assert context.canonical_principal == "poller:papers"
+        assert kwargs == {"title": "Paper", "rationale": "Findings"}
+        assert draft.read_text() == "paper notes"
+        calls.append(operation)
+        return ProposalResult(
+            ok=submitted, branch="poller/test-owned", pushed=submitted,
+            pr_url=url if submitted else None, reason=None if submitted else "no_open",
+        )
+
+    monkeypatch.setattr(proposals, "_run_poller", finalize)
+
+    class SubmitModel(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            assert (await backend.awrite(
+                "/state/pollers/papers/drafts/paper.md", "paper notes",
+            )).error is None
+            runtime = ToolRuntime(
+                state={}, context=context, config=config, stream_writer=lambda _: None,
+                tool_call_id="test-submit-draft", store=None,
+            )
+            if submitted:
+                output = await proposals.submit_proposal.coroutine(
+                    title="Paper", rationale="Findings", runtime=runtime,
+                )
+                assert url in output
+                # This assertion happens INSIDE the model, so run_turn's final
+                # cleanup cannot hide removal of submit_proposal's own wipe.
+                assert not draft.exists()
+            else:
+                with pytest.raises(proposals.ProposalSubmissionError) as raised:
+                    await proposals.submit_proposal.coroutine(
+                        title="Paper", rationale="Findings", runtime=runtime,
+                    )
+                assert raised.value.reason == "no_open"
+                assert draft.read_text() == "paper notes"
+            observed.append(submitted)
+            async for chunk in super().astream(
+                state, config=config, context=context, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    agent = _build_agent(tmp_path, fake_agent=SubmitModel([AIMessage(content="done")]))
+    record = await agent.run_turn(_research_draft_event(home), turn_id="draft-submitter")
+    assert record.error is None
+    assert calls == ["submit_proposal"]
+    assert observed == [submitted]
+    assert not draft.exists()
+
+
 @pytest.mark.parametrize("trigger", ["user_message", "saga_session_end"])
 async def test_turn_creates_scratch_before_model_and_advertises_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trigger: str,

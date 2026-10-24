@@ -53,16 +53,29 @@ record never raises path trust even then.
 
 Offloads, evicted large results and fetched bodies live beneath their existing
 labeled roots in turn-id directories. Each directory is wiped on turn completion,
-failure or cancellation, and crashed-turn leftovers are swept at startup. The
-first startup after upgrade purges pre-existing shared bytes whose source turn
-cannot be established. A HOME `.ignore` keeps `rg` from unqualified searches of
-these roots, `logs/`, `messages/` and `state/pollers/`.
+failure or cancellation, and crashed-turn leftovers are swept at startup. DeepAgents'
+HumanMessage eviction and inline-media offloads still use shared `conversation_history/`
+paths; the shell name-match backstop covers these too, and startup sweeps them.
+The first startup after upgrade purges pre-existing shared bytes whose source turn
+cannot be established. Gmail's operator-owned `triage-dropped.jsonl` is preserved
+unchanged. A HOME `.ignore` keeps `rg` from unqualified searches of these roots,
+`logs/`, `messages/` and `state/pollers/`. This also affects the admin file-tool
+`grep` path that uses `rg`; the non-admin Python fallback does not consult `.ignore`.
+Unsafe symlinked stores or `.ignore` are skipped with a warning, not followed or
+allowed to prevent startup. Late tool threads cannot allocate a turn store after
+final cleanup has closed that context; this is not process isolation for already
+open descriptors.
 
 For other persistent content (including turn logs and Worklink run logs),
 `shell_exec` and `bash_async` classify output as untrusted **active_ingest**
 when raw command text names `turns.jsonl`, `events.jsonl`, `chat_history.jsonl`,
-`logs` or `messages` as a path component, or `worklink-ready-queue`. A recursive
-`rg`/`ag`/`grep -r`/`grep -R` over HOME or an ancestor also taints. The command
+`triage-dropped.jsonl`, `conversation_history`, `logs/` or `messages/` as a path
+component (including leading `/logs` and `/messages`), or `worklink-ready-queue`.
+Bare prose words `logs` and `messages` do not match. A recursive
+`rg`/`ag`/`grep -r`/`grep -R` from HOME or an ancestor also taints, even with narrow
+operands, pipelines, redirections or bundled grep flags. A cwd inside a named
+content store taints ordinary reads too. Both shell tools resolve omitted cwd
+through the shell default/session cwd helper for classification. The command
 still runs; the existing tainted-turn write veto then applies. Ordinary shell
 results remain informational. This is protection against accidental reads by
 a clean-turn model, not a security boundary against a deliberate bypass: there

@@ -718,9 +718,11 @@ def _audit_drop(
     """Persist a drop record; return False so audit failures fail open."""
     record = {
         "message_id": event["message_id"],
-        # Persist only an id and a bounded numeric decision, never mail headers
-        # or arbitrary provider response text across turns.
-        "notify_score": triage_result["answers"]["notify"]["noul"],
+        "url": event["url"],
+        "from": event["from"],
+        "subject": event["subject"],
+        "answers": triage_result["answers"],
+        "model": triage_result["model"],
     }
     if shadow:
         record["shadow"] = True

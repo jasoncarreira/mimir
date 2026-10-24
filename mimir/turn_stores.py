@@ -20,6 +20,13 @@ _IGNORE_ENTRIES = ("logs/", "messages/", "large_tool_results/", "conversation_hi
 log = logging.getLogger(__name__)
 _draft_owners: dict[Path, str] = {}
 _draft_lock = RLock()
+_store_lock = RLock()
+
+
+def close_turn_stores(ctx: object) -> None:
+    """Revoke allocation for retained tool-thread contexts before final cleanup."""
+    with _store_lock:
+        ctx.turn_stores_closed = True
 
 
 def research_draft_write_guard(home: Path, raw_path: str):
@@ -86,7 +93,14 @@ def wipe_research_drafts(home: Path, turn_id: str) -> None:
 
 
 def seed_home_ignore(home: Path) -> None:
-    """Add the default rg exclusions on both new and existing homes."""
+    """Best-effort seed: an unsafe .ignore must not prevent server startup."""
+    try:
+        _seed_home_ignore(home)
+    except OSError:
+        log.warning("home_ignore_seed_failed")
+
+
+def _seed_home_ignore(home: Path) -> None:
     fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         target = os.open(".ignore", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=fd)
@@ -163,12 +177,15 @@ def turn_store(name: str) -> str | None:
     turn_id = getattr(ctx, "turn_id", None)
     if not home or current_turn_scratch_root() is None or not isinstance(turn_id, str):
         return None
-    try:
-        fd = _open_directory(Path(home), (*name.split("/"), turn_id), create=True)
-        os.close(fd)
-    except OSError:
-        return None
-    return f"/{name}/{turn_id}"
+    with _store_lock:
+        if getattr(ctx, "turn_stores_closed", False):
+            return None
+        try:
+            fd = _open_directory(Path(home), (*name.split("/"), turn_id), create=True)
+            os.close(fd)
+        except OSError:
+            return None
+        return f"/{name}/{turn_id}"
 
 
 def wipe_turn_stores(home: Path, turn_id: str) -> None:
@@ -235,6 +252,19 @@ def wipe_ci_logs(paths: tuple[Path, ...]) -> None:
             log.warning("ci_log_wipe_failed")
 
 
+def _sweep_drafts(fd: int) -> None:
+    """Walk research subdirectories without following links or deleting metadata."""
+    for entry in os.listdir(fd):
+        if entry == "drafts" or entry.endswith("draft.md"):
+            _remove_entry(fd, entry)
+        elif stat.S_ISDIR(os.stat(entry, dir_fd=fd, follow_symlinks=False).st_mode):
+            child = os.open(entry, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                _sweep_drafts(child)
+            finally:
+                os.close(child)
+
+
 def sweep_turn_stores(home: Path) -> None:
     """On upgrade purge unattributed legacy bytes; on restart sweep crashed turns."""
     home = home.resolve()
@@ -248,9 +278,14 @@ def sweep_turn_stores(home: Path) -> None:
         except FileNotFoundError:
             counts[name] = 0
             continue
+        except OSError:
+            log.warning("turn_store_sweep_failed store=%s", name)
+            continue
         try:
             for entry in os.listdir(fd):
                 count += _remove_entry(fd, entry)
+        except OSError:
+            log.warning("turn_store_sweep_failed store=%s", name)
         finally:
             os.close(fd)
         counts[name] = count
@@ -279,28 +314,13 @@ def sweep_turn_stores(home: Path) -> None:
                 except OSError:
                     continue
                 try:
-                    for entry in os.listdir(fd):
-                        if entry == "drafts" or entry.endswith("draft.md"):
-                            _remove_entry(fd, entry)
+                    _sweep_drafts(fd)
                 finally:
                     os.close(fd)
         finally:
             os.close(pollers_fd)
     if first_start:
-        # Older Gmail triage audits included raw subject/sender/provider text.
-        try:
-            fd = _open_directory(home, ("state", "pollers", "gmail-poller"), create=False)
-        except FileNotFoundError:
-            pass
-        else:
-            try:
-                counts["state/pollers/gmail-poller/triage-dropped.jsonl"] = _remove_entry(
-                    fd, "triage-dropped.jsonl",
-                )
-            except FileNotFoundError:
-                counts["state/pollers/gmail-poller/triage-dropped.jsonl"] = 0
-            finally:
-                os.close(fd)
+        # Operator-owned Gmail audit records are intentionally not purged.
         fd = _open_directory(home, (".mimir",), create=True)
         try:
             marker_fd = os.open(marker.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,

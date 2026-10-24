@@ -4806,6 +4806,12 @@ def test_operator_bounded_shell_result_remains_untrusted_informational() -> None
     "cat logs/turns.jsonl", "grep -r x logs/", "rg x",
     "rg x /", "ag x", "cat state/pollers/worklink-ready-queue/run-1.log",
     "cat messages/7.txt", "cat chat_history.jsonl", "cat events.jsonl",
+    "cat turns.jsonl", "cat conversation_history/evicted.md",
+    "cat conversation_history/media/image.png", "cat triage-dropped.jsonl",
+    "rg foo .", "rg foo ./", "rg 'foo bar'", "rg foo | head -20",
+    "rg foo 2>/dev/null", "rg -i foo --hidden", "rg foo ~", "rg foo $MIMIR_HOME",
+    "grep -rn foo .", "grep -r foo .", "grep -rn foo",
+    "grep -Rn 'foo' . | head", "grep -ri foo *", "rg foo src",
 ])
 @pytest.mark.parametrize("enforce", [False, True])
 def test_shell_name_match_taints_and_vetoes_following_write(
@@ -4831,7 +4837,11 @@ def test_shell_name_match_taints_and_vetoes_following_write(
     assert denied.reason == "write_blocked_by_untrusted_ingest"
 
 
-@pytest.mark.parametrize("command", ["ls", "git status", "uv run pytest", "rg x src"])
+@pytest.mark.parametrize("command", [
+    "ls", "git status", "uv run pytest",
+    "git commit -m 'Improve error messages'", 'git commit -m "reduce logs noise"',
+    "gh pr create --title 'Fix messages'", "echo no logs here", "docker logs mimirbot",
+])
 def test_clean_shell_command_stays_informational(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str,
 ) -> None:
@@ -4846,14 +4856,15 @@ def test_clean_shell_command_stays_informational(
     assert labels is not None and not labels.has_untrusted_active_ingest
 
 
+@pytest.mark.parametrize("tool", ["shell_exec", "bash_async"])
 def test_shell_rg_uses_effective_home_cwd_without_explicit_cwd(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool: str,
 ) -> None:
-    # shell_exec defaults to HOME even when the server process runs in the repo.
+    # Both tools default to HOME even when the server process runs in the repo.
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     labels = classify_protected_result(
-        "shell_exec", {"command": "rg x"}, _auth(roles=("admin",)),
-        ToolAuthorization(tool_name="shell_exec", decision=OperationDecision.ADMIN_REQUIRED,
+        tool, {"command": "rg x"}, _auth(roles=("admin",)),
+        ToolAuthorization(tool_name=tool, decision=OperationDecision.ADMIN_REQUIRED,
                           allowed=True, flow_direction=ToolFlowDirection.BOTH),
         result="search output",
     )

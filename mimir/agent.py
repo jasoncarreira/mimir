@@ -2521,8 +2521,9 @@ class Agent:
             if ctx_token is not None:
                 reset_current_turn(ctx_token)
             if ctx is not None:
-                from .turn_stores import wipe_ci_logs, wipe_research_drafts, wipe_turn_stores
+                from .turn_stores import close_turn_stores, wipe_ci_logs, wipe_research_drafts, wipe_turn_stores
                 try:
+                    await asyncio.to_thread(close_turn_stores, ctx)
                     await asyncio.to_thread(wipe_turn_stores, self._config.home, ctx.turn_id)
                     await asyncio.to_thread(wipe_ci_logs, getattr(ctx, "ci_log_paths", ()))
                     await asyncio.to_thread(wipe_research_drafts, self._config.home, ctx.turn_id)
