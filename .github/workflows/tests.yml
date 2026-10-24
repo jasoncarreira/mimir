@@ -438,10 +438,15 @@ jobs:
         # Keep tracebacks short; upload raw evidence files on failure instead of huge logs.
         run: env -u MIMIR_PLUGINS uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
 
+      - name: Install pinned OpenCode for required child-session resume coverage
+        if: matrix.python-version == '3.12'
+        run: npm install --global opencode-ai@1.18.21
+
       - name: Run selected Cultivate suite (shadow, Python 3.12)
         if: matrix.python-version == '3.12'
         env:
           MIMIR_PLUGINS: cultivate
+          MIMIR_REQUIRE_OPENCODE_RESUME: "1"
         run: env -u MIMIR_ACCESS_CONTROL_ENFORCED uv run --locked --all-packages --extra dev --extra bench pytest -q --tb=short tests plugins/cultivate/tests --basetemp "$PYTEST_EVIDENCE_ROOT/cultivate-shadow"
 
       - name: Run optional-skills tests (per-skill, isolated)
@@ -905,10 +910,14 @@ jobs:
           MIMIR_ACCESS_CONTROL_ENFORCED: "1"
         run: env -u MIMIR_PLUGINS uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
 
+      - name: Install pinned OpenCode for required child-session resume coverage
+        run: npm install --global opencode-ai@1.18.21
+
       - name: Run selected Cultivate suite (enforcement on)
         env:
           MIMIR_PLUGINS: cultivate
           MIMIR_ACCESS_CONTROL_ENFORCED: "1"
+          MIMIR_REQUIRE_OPENCODE_RESUME: "1"
         run: uv run --locked --all-packages --extra dev --extra bench pytest -q --tb=short tests plugins/cultivate/tests --basetemp "$PYTEST_EVIDENCE_ROOT/cultivate-enforced"
 
       - *stage-pytest-evidence

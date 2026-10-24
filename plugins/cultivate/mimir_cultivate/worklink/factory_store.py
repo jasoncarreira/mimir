@@ -13,6 +13,8 @@ from pathlib import Path
 import shutil
 import sqlite3
 import stat
+import sys
+import re
 from urllib.parse import quote
 
 from typing import TYPE_CHECKING
@@ -83,7 +85,7 @@ def _clear_runtime(path: Path) -> None:
 def clear_prunable_runtime(attempt: Path) -> None:
     """Delete worker-owned contents at TTL, leaving the outer attempt to the reaper."""
     runtime = attempt / ".factory-runtime"
-    if attempt.name.count("-") != 1 or not (attempt / "checkout").is_dir():
+    if re.fullmatch(r"[1-9][0-9]*-[1-9][0-9]*", attempt.name) is None:
         raise RuntimeError("factory runtime is outside a checkout attempt")
     from .worker_client import factory_checkout_for_path, run_factory_control
 
@@ -92,7 +94,7 @@ def clear_prunable_runtime(attempt: Path) -> None:
         _clear_runtime(runtime)
     else:
         result = run_factory_control(
-            checkout, ["python3", "-I", str(Path(__file__).resolve()),
+            checkout, [sys.executable, "-I", str(Path(__file__).resolve()),
                        "--clear-runtime", str(runtime)], env={}, timeout=3600, output_limit=4096,
         )
         if result.returncode:
@@ -115,12 +117,14 @@ def prune_factory_store(record: FactoryRunRecord) -> dict[str, int] | None:
         return None
     if factory_process_is_alive(record) or not factory_process_is_verified_dead(record):
         raise RuntimeError("factory OpenCode prune refused: driver death is not verified")
+    if not record.children_reaped:
+        raise RuntimeError("factory OpenCode prune refused: specialist reaping is not verified")
     from .worker_client import factory_checkout_for_path, run_factory_control
 
     checkout = Path(record.sandbox).parent.parent
     if factory_checkout_for_path(checkout) is not None:
         result = run_factory_control(
-            checkout, ["python3", "-I", str(Path(__file__).resolve()),
+            checkout, [sys.executable, "-I", str(Path(__file__).resolve()),
                        "--prune", str(path)], env={}, timeout=3600, output_limit=4096,
         )
         if result.returncode:

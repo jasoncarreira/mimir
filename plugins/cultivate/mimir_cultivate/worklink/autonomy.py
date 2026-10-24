@@ -403,18 +403,27 @@ def prune_stale_attempt_checkouts_for_home(
 def _prepare_factory_runtime_prune(child: Path, factory_records: Sequence[object]) -> bool:
     """Empty worker-owned subdirectories before the controller removes the attempt."""
     runtime = child / ".factory-runtime"
-    if not runtime.exists() and not runtime.is_symlink():
-        return True
     # The same interlock protects the record read and this operation. An unknown
     # or unverified process is not authority to clear another run's store.
-    for record in factory_records:
-        if f"{getattr(record, 'issue_id', None)}-{getattr(record, 'attempt', None)}" == child.name and not factory_process_is_verified_dead(record):
-            return False
+    matching = [
+        record for record in factory_records
+        if Path(record.sandbox).parent.parent.parent.resolve() == child.resolve()
+    ]
+    if matching and any(
+        not factory_process_is_verified_dead(record)
+        or not getattr(record, "children_reaped", False)
+        for record in matching
+    ):
+        return False
+    if not runtime.exists() and not runtime.is_symlink():
+        return True
+    if not matching:
+        return False  # Runtime with no authoritative record is not proof of quiescence.
     try:
         from .factory_store import clear_prunable_runtime
 
         clear_prunable_runtime(child)
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         return False
     return True
 

@@ -3187,6 +3187,7 @@ class WorklinkRunner:
             handle=handle,
             controller_phase="running",
             transcript=None,
+            children_reaped=False,
         )
         try:
             save_factory_record(self.home, relaunched)
@@ -3312,7 +3313,10 @@ class WorklinkRunner:
                 stdout_path=None if result is None else result.stdout_path,
                 stderr_path=None if result is None else result.stderr_path,
             )
-            factory_record = replace(factory_record, transcript=str(path))
+            factory_record = replace(
+                factory_record, transcript=str(path),
+                children_reaped=(result is not None and result.children_reaped),
+            )
             save_factory_record(self.home, factory_record)
 
         async def cancel_once() -> None:
@@ -3926,7 +3930,32 @@ class WorklinkRunner:
             raise WorklinkError("factory OpenCode prune requires a parked or terminal status")
         from .factory_store import prune_factory_store
 
-        await asyncio.to_thread(prune_factory_store, factory_record)
+        # Cancellation cannot release the issue/interlock while the worker thread
+        # is still mutating the store. Shield and drain even repeated cancels.
+        maintenance = asyncio.create_task(asyncio.to_thread(prune_factory_store, factory_record))
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(maintenance)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if maintenance.done():
+                    break
+            except Exception as exc:  # housekeeping must not fail a park/completion
+                try:
+                    _log_event(
+                        "worklink_factory_opencode_prune_failed",
+                        issue_id=issue.issue_id, attempt=factory_record.attempt,
+                        run_id=factory_record.run_id, reason=_factory_controller_error(exc),
+                    )
+                except Exception:
+                    pass  # Telemetry failure cannot make housekeeping fatal either.
+                break
+        if cancelled:
+            # Retrieve any exception to avoid an unobserved task error.
+            await asyncio.gather(maintenance, return_exceptions=True)
+            raise asyncio.CancelledError
         if status.is_parked:
             diagnosis = factory_record.controller_error or "factory run is parked"
             park_report = (

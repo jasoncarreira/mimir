@@ -12,6 +12,8 @@ import shutil
 import sqlite3
 import subprocess
 import threading
+import sys
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -37,6 +39,7 @@ def _record(tmp_path: Path, handle: LaunchHandle) -> tuple[FactoryRunRecord, Pat
         sandbox=str(sandbox), session="factory-session", handle=handle,
         status=FactoryStatus("chainlink-1983", True, str(sandbox), status="needs-human"),
         observed_at=datetime.now(UTC).isoformat(), controller_phase="parked",
+        children_reaped=True,
     )
     return record, db
 
@@ -47,6 +50,7 @@ def _dead_handle() -> LaunchHandle:
     return LaunchHandle("local_subprocess", str(process.pid), 1, process.pid)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="birth ticks require procfs")
 def test_factory_store_refuses_live_driver(tmp_path: Path) -> None:
     process = subprocess.Popen(["sleep", "30"])
     try:
@@ -194,9 +198,8 @@ def test_factory_runtime_cleanup_refuses_invalid_attempt(tmp_path: Path) -> None
     (attempt / "checkout").rmdir()
     valid_name = attempt.with_name("1983-1")
     attempt.rename(valid_name)
-    with pytest.raises(RuntimeError, match="outside a checkout attempt"):
-        clear_prunable_runtime(valid_name)
-    assert (valid_name / ".factory-runtime" / "keep").read_text() == "evidence"
+    clear_prunable_runtime(valid_name)
+    assert list((valid_name / ".factory-runtime").iterdir()) == []
 
 
 def test_factory_runtime_cleanup_refuses_symlink(tmp_path: Path) -> None:
@@ -220,7 +223,7 @@ def test_runtime_prune_refuses_unverified_matching_record(tmp_path: Path) -> Non
     assert (attempt / ".factory-runtime").is_dir()
 
 
-def test_factory_runtime_removed_with_prunable_checkout(tmp_path: Path) -> None:
+def test_factory_runtime_removed_with_prunable_checkout(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     home.mkdir()
     (home / "worklink.yaml").write_text("defaults:\n  reaper_ttl_s: 3600\n  factory_resumable_retention_s: 3600\n")
@@ -234,6 +237,20 @@ def test_factory_runtime_removed_with_prunable_checkout(tmp_path: Path) -> None:
     (runtime / "opencode.db").write_bytes(b"old store")
     old = datetime.now(UTC) - timedelta(days=2)
     os.utime(attempt, (old.timestamp(), old.timestamp()))
+    record, _ = _record(tmp_path / "record", _dead_handle())
+    sandbox = checkout / ".factory-sandboxes" / record.run_id
+    record = replace(record, sandbox=str(sandbox), status=None)
+    autonomy_prepare = autonomy._prepare_factory_runtime_prune
+    monkeypatch.setattr(autonomy, "_prepare_factory_runtime_prune",
+                        lambda child, records: autonomy_prepare(child, [record]))
+    # Inspect immediately before the enclosing rmtree, not after it.
+    from mimir_cultivate.worklink import checkout as checkout_module
+    real_rmtree = checkout_module.shutil.rmtree
+    def checked_rmtree(path, *args, **kwargs):
+        if Path(path) == attempt:
+            assert list((attempt / ".factory-runtime").iterdir()) == []
+        return real_rmtree(path, *args, **kwargs)
+    monkeypatch.setattr(checkout_module.shutil, "rmtree", checked_rmtree)
     assert autonomy.prune_stale_attempt_checkouts_for_home(home, repo=repo) == [attempt]
     assert not attempt.exists()
 
@@ -250,32 +267,218 @@ def test_attempt_pruner_requires_runtime_preparation(tmp_path: Path) -> None:
     assert attempt.is_dir()
 
 
+def test_event_filter_and_vacuum_are_exact(tmp_path):
+    _, db = _record(tmp_path, _dead_handle())
+    retained = ["message.updated", "session.updated", "worklink", "message.part.updated.2"]
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE event (type TEXT, data BLOB)")
+        conn.executemany("INSERT INTO event VALUES (?, ?)",
+                         [(name, b"keep") for name in retained] +
+                         [(name, b"x" * 8192) for name in
+                          ["message.part.updated", "message.part.updated.1"] for _ in range(100)])
+    metrics = _prune_db(db)
+    assert metrics["rows_deleted"] == 200
+    assert metrics["bytes_after"] < metrics["bytes_before"]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT type, data FROM event").fetchall() == [(name, b"keep") for name in retained]
+
+
+def test_unacknowledged_specialists_refuse_prune_and_ttl(tmp_path):
+    record, db = _record(tmp_path, _dead_handle())
+    record = replace(record, children_reaped=False)
+    db.write_bytes(b"untouched")
+    with pytest.raises(RuntimeError, match="specialist reaping"):
+        prune_factory_store(record)
+    attempt = Path(record.sandbox).parents[2]
+    assert not autonomy._prepare_factory_runtime_prune(attempt, [record])
+    assert not autonomy._prepare_factory_runtime_prune(attempt, [])
+    assert db.read_bytes() == b"untouched"
+
+
+def test_ttl_matches_exact_attempt_path_not_name(tmp_path):
+    from mimir_cultivate.worklink.factory_state import FactoryRunRecord
+    record, db = _record(tmp_path, _dead_handle())
+    db.write_bytes(b"old store")
+    attempt = Path(record.sandbox).parents[2]
+    other, _ = _record(tmp_path / "other", _dead_handle())
+    other = replace(other, children_reaped=False)
+    assert autonomy._prepare_factory_runtime_prune(attempt, [other, record])
+    assert list((attempt / ".factory-runtime").iterdir()) == []
+    # Old records load conservatively and invalid acknowledgement types refuse.
+    payload = record.to_json()
+    payload.pop("children_reaped")
+    assert not FactoryRunRecord.from_json(payload).children_reaped
+    payload["children_reaped"] = "yes"
+    with pytest.raises(RuntimeError, match="children_reaped"):
+        FactoryRunRecord.from_json(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend,ack", [("feature_factory", True), ("opencode", False)])
+async def test_compute_reaping_ack_only_for_factory_worker_result(tmp_path, backend, ack):
+    from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend, WorkSpec
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+    handle = _dead_handle()
+    compute = LocalSubprocessComputeBackend()
+    compute._handles[handle.identifier] = handle
+    spec = SimpleNamespace(backend=backend)
+    async def collected():
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+    task = asyncio.create_task(collected())
+    compute._jobs[handle.identifier] = (task, spec, ())
+    result = await compute.wait(handle, timeout_s=2)
+    assert result.children_reaped is ack
+    async def refused():
+        raise RuntimeError("worklink_factory_reap_refused")
+    compute._jobs[handle.identifier] = (asyncio.create_task(refused()), spec, ())
+    with pytest.raises(RuntimeError, match="reap_refused"):
+        await compute.wait(handle, timeout_s=2)
+    from mimir_cultivate.worklink.compute import ComputeResult
+    assert not ComputeResult(0, "", "").children_reaped
+
+
+def test_ttl_unacknowledged_record_without_runtime_is_retained(tmp_path):
+    record, db = _record(tmp_path, _dead_handle())
+    record = replace(record, children_reaped=False)
+    runtime = db.parents[2]
+    shutil.rmtree(runtime)
+    attempt = Path(record.sandbox).parents[2]
+    assert not autonomy._prepare_factory_runtime_prune(attempt, [record])
+    assert autonomy._prepare_factory_runtime_prune(attempt, [replace(record, children_reaped=True)])
+
+
+def test_ttl_cleanup_timeout_is_fail_closed(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import factory_store
+    record, db = _record(tmp_path, _dead_handle())
+    db.write_bytes(b"retained")
+    def timeout(attempt):
+        raise subprocess.TimeoutExpired("worker", 1)
+    monkeypatch.setattr(factory_store, "clear_prunable_runtime", timeout)
+    assert not autonomy._prepare_factory_runtime_prune(Path(record.sandbox).parents[2], [record])
+    assert db.read_bytes() == b"retained"
+
+
+def test_legacy_store_layout_has_no_sibling_runtime(tmp_path):
+    record, _ = _record(tmp_path, _dead_handle())
+    sandbox = tmp_path / "legacy" / record.run_id
+    record = replace(record, sandbox=str(sandbox), status=None)
+    assert prune_factory_store(record) is None
+
+
+def test_executor_runtime_cleanup_uses_current_interpreter_and_precedes_rmtree(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import worker_client
+    record, db = _record(tmp_path, _dead_handle())
+    db.write_bytes(b"worker-owned")
+    checkout = Path(record.sandbox).parent.parent
+    attempt = checkout.parent
+    calls = []
+    monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: (checkout, 1983, 1))
+    def control(path, argv, **kwargs):
+        assert path == checkout and db.exists()
+        assert argv == [sys.executable, "-I", str(Path(sys.modules[prune_factory_store.__module__].__file__).resolve()),
+                        "--clear-runtime", str(attempt / ".factory-runtime")]
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+    monkeypatch.setattr(worker_client, "run_factory_control", control)
+    assert autonomy._prepare_factory_runtime_prune(attempt, [record])
+    assert len(calls) == 1  # A no-op clear_prunable_runtime mutation must fail.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["needs-human", "completed"])
+@pytest.mark.parametrize("error", [RuntimeError("busy WAL"), sqlite3.OperationalError("disk full"), subprocess.TimeoutExpired("worker", 1)])
+async def test_housekeeping_failure_preserves_run_outcome(tmp_path, monkeypatch, state, error):
+    from mimir_cultivate.worklink import factory_store
+    record, _ = _record(tmp_path, _dead_handle())
+    record = replace(record, status=replace(record.status, status=state))
+    def refuse(record):
+        raise error
+    monkeypatch.setattr(factory_store, "prune_factory_store", refuse)
+    monkeypatch.setattr(orchestrator, "_record_factory_milestone", lambda *a, **kw: None)
+    events = []
+    monkeypatch.setattr(orchestrator, "_log_event", lambda name, **kw: events.append((name, kw)))
+    async def verified(**kw):
+        return tmp_path / "evidence", "https://github.com/owner/repo/pull/1"
+    monkeypatch.setattr(orchestrator, "_verify_factory_completion", verified)
+    transitions = []
+    result = await orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+        issue=orchestrator.IssueContext(1983, "Factory", "run", set()),
+        claim_record=SimpleNamespace(attempt=1, budget_attempt=None),
+        claims=SimpleNamespace(transition_issue=lambda issue, **kw: transitions.append(kw["status"])),
+        backend=object(), compute=object(), factory_record=record,
+        test_cmd="pytest", runner=object(), started_at=datetime.now(UTC),
+    )
+    assert result.status == ("needs-human" if state == "needs-human" else "review_ready")
+    assert transitions == (["blocked"] if state == "needs-human" else ["review"])
+    assert any(name == "worklink_factory_opencode_prune_failed" and fields["reason"] for name, fields in events)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_drains_store_thread_before_return(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import factory_store
+    record, _ = _record(tmp_path, _dead_handle())
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    def prune(record):
+        entered.set()
+        assert release.wait(5)
+        finished.set()
+    monkeypatch.setattr(factory_store, "prune_factory_store", prune)
+    task = asyncio.create_task(orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+        issue=orchestrator.IssueContext(1983, "Factory", "run", set()),
+        claim_record=object(), claims=object(), backend=object(), compute=object(),
+        factory_record=record, test_cmd="pytest", runner=object(), started_at=datetime.now(UTC),
+    ))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and not finished.is_set()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert finished.is_set()
+
+
 def test_opencode_task_id_resume_after_prune(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Use the real OpenCode CLI/schema and a local deterministic model endpoint."""
     binary = shutil.which("opencode")
     if binary is None:
+        if os.environ.get("MIMIR_REQUIRE_OPENCODE_RESUME") == "1":
+            pytest.fail("required OpenCode resume prerequisite is unavailable")
         pytest.skip("OpenCode executable is unavailable")
     requests: list[dict] = []
     events: list[tuple[str, dict]] = []
     monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda name, **fields: events.append((name, fields)))
-    tool_issued = False
+    tool_step = 0
+    child_id = None
 
     class Model(BaseHTTPRequestHandler):
         def log_message(self, *args: object) -> None:
             pass
 
         def do_POST(self) -> None:
-            nonlocal tool_issued
+            nonlocal tool_step
             length = int(self.headers["Content-Length"])
             request = json.loads(self.rfile.read(length))
             requests.append(request)
-            if request.get("tools") and not tool_issued:
-                tool_issued = True
+            if request.get("tools") and tool_step < 2:
+                step = tool_step
+                tool_step += 1
+                function = (
+                    {"name": "task", "arguments": json.dumps({
+                        "description": "Child continuity fixture", "subagent_type": "general",
+                        "prompt": "Use bash to print the current directory",
+                        **({"task_id": child_id} if child_id else {}),
+                    })}
+                    if step == 0 else
+                    {"name": "bash", "arguments": json.dumps({"command": "pwd; printf 'child-resume-second-turn'" if child_id else "pwd", "description": "Print working directory"})}
+                )
                 chunks = [
                     {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [
-                        {"index": 0, "id": "call_fixture", "type": "function", "function": {
-                            "name": "bash", "arguments": json.dumps({"command": "pwd", "description": "Print working directory"}),
-                        }},
+                        {"index": 0, "id": f"call_fixture_{step}", "type": "function", "function": function},
                     ]}}]},
                     {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
                 ]
@@ -320,7 +523,11 @@ def test_opencode_task_id_resume_after_prune(tmp_path: Path, monkeypatch: pytest
                         if line.startswith("{") and "sessionID" in json.loads(line)]
             assert task_ids and db.exists() and len(requests) >= 2
             with sqlite3.connect(db) as conn:
-                assert conn.execute("SELECT count(*) FROM part WHERE json_extract(data, '$.type') = 'tool'").fetchone()[0] >= 1
+                children = conn.execute("SELECT id FROM session WHERE parent_id = ?", (task_ids[0],)).fetchall()
+                assert len(children) == 1
+                child_id = children[0][0]
+                child_messages_before = conn.execute("SELECT count(*) FROM message WHERE session_id = ?", (child_id,)).fetchone()[0]
+                assert conn.execute("SELECT count(*) FROM part WHERE json_extract(data, '$.type') = 'tool'").fetchone()[0] >= 2
                 before = conn.execute("SELECT count(*) FROM event WHERE type IN ('message.part.updated', 'message.part.updated.1')").fetchone()[0]
                 retained = conn.execute("SELECT count(*) FROM event WHERE type NOT IN ('message.part.updated', 'message.part.updated.1')").fetchone()[0]
                 assert before > 0
@@ -334,11 +541,24 @@ def test_opencode_task_id_resume_after_prune(tmp_path: Path, monkeypatch: pytest
                 assert conn.execute("SELECT count(*) FROM event").fetchone() == (retained,)
                 assert conn.execute("SELECT count(*) FROM session WHERE id = ?", (task_ids[0],)).fetchone() == (1,)
             request_count = len(requests)
+            tool_step = 0  # Call task again using the retained child task_id.
             run("run", "Recall the tool output", "--session", task_ids[0], "--format", "json")
             history = json.dumps([message for request in requests[request_count:]
                                   for message in request.get("messages", [])])
             assert "Use bash to print the current directory" in history
             assert str(checkout) in history and '"role": "tool"' in history
+            assert child_id in history
+            with sqlite3.connect(db) as conn:
+                assert conn.execute("SELECT id FROM session WHERE parent_id = ?", (task_ids[0],)).fetchall() == [(child_id,)]
+                assert conn.execute("SELECT count(*) FROM message WHERE session_id = ?", (child_id,)).fetchone()[0] > child_messages_before
+                child_tools = [json.loads(row[0]) for row in conn.execute(
+                    "SELECT data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'tool'", (child_id,))]
+                assert any(part.get("state", {}).get("status") == "completed" and
+                           "child-resume-second-turn" in part.get("state", {}).get("output", "")
+                           for part in child_tools)
+                assert any("child-resume-second-turn" in str(message.get("content", ""))
+                           for request in requests[request_count:] for message in request.get("messages", [])
+                           if message.get("role") == "tool")
         finally:
             server.shutdown()
             thread.join(timeout=5)

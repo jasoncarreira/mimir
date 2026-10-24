@@ -55,6 +55,7 @@ class ComputeResult:
     command: tuple[str, ...] = ()
     stdout_path: Path | None = None
     stderr_path: Path | None = None
+    children_reaped: bool = False
 
 
 class ComputeLaunchError(RuntimeError):
