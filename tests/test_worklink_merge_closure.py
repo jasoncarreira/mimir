@@ -1363,7 +1363,9 @@ with policy_scope(load_plugins(enable="cultivate").policy):
         )
         for _ in range(2)
     ]
-    outputs = [process.communicate(timeout=20) for process in processes]
+    # Child imports can be slow under a fully parallel suite; the journal
+    # assertions below, rather than this hang guard, prove serialization.
+    outputs = [process.communicate(timeout=90) for process in processes]
     assert [(process.returncode, stderr) for process, (_, stderr) in zip(processes, outputs)] == [
         (0, ""), (0, ""),
     ]
