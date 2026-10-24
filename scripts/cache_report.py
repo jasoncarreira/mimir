@@ -19,8 +19,9 @@ class Bucket:
     reads: int = 0
     writes: int = 0
     uncached: int = 0
+    inconsistent: int = 0
 
-    def add(self, usage: object) -> None:
+    def add(self, usage: object, semantics: str = "inclusive") -> None:
         self.turns += 1
         if not isinstance(usage, dict):
             return
@@ -29,10 +30,15 @@ class Bucket:
         # Unknown cache fields cannot be safely interpreted as zero cache use.
         if any(type(value) is not int or value < 0 for value in values):
             return
+        prompt, reads, writes = values
+        uncached = prompt - reads - writes if semantics == "inclusive" else prompt
+        if uncached < 0:
+            self.inconsistent += 1
+            return
         self.measured += 1
-        self.uncached += values[0]
-        self.reads += values[1]
-        self.writes += values[2]
+        self.uncached += uncached
+        self.reads += reads
+        self.writes += writes
 
 
 def session_kind(session_id: object) -> str:
@@ -64,8 +70,10 @@ def _row(label: str, bucket: Bucket) -> str:
             f"uncached={part(bucket.uncached)}")
 
 
-def report(home: Path, start: date, end: date) -> str:
-    """Stream retained turns, aggregating only complete nonnegative token usage."""
+def report(home: Path, start: date, end: date, *, input_semantics: str = "inclusive") -> str:
+    """Stream retained turns with an explicit, window-wide input convention."""
+    if input_semantics not in {"inclusive", "exclusive"}:
+        raise ValueError("input semantics must be inclusive or exclusive")
     log = home / "logs" / "turns.jsonl"
     if not home.is_dir():
         raise ValueError(f"home is not a directory: {home}")
@@ -98,23 +106,27 @@ def report(home: Path, start: date, end: date) -> str:
                 continue
             if start <= day <= end:
                 usage = turn.get("usage")
-                total.add(usage)
-                by_day[day.isoformat()].add(usage)
+                total.add(usage, input_semantics)
+                by_day[day.isoformat()].add(usage, input_semantics)
                 trigger = turn.get("trigger")
-                by_trigger[trigger if isinstance(trigger, str) and trigger else "unknown"].add(usage)
-                by_kind[session_kind(turn.get("session_id"))].add(usage)
+                by_trigger[trigger if isinstance(trigger, str) and trigger else "unknown"].add(usage, input_semantics)
+                by_kind[session_kind(turn.get("session_id"))].add(usage, input_semantics)
 
     rows = [f"Cache-hit report (UTC {start} through {end})",
             f"Configured agent model (current home/.env): {model}",
             "Per-turn model attribution unavailable in turns.jsonl.",
+            f"Input token semantics: {input_semantics} (selected for the entire window).",
             "Shares use read + write + uncached input tokens from measured turns only.",
             _row("Total", total)]
     for title, buckets in (("Day", by_day), ("Trigger", by_trigger), ("Session kind", by_kind)):
         rows.append(f"{title}:")
         rows.extend(_row(f"  {key}", buckets[key]) for key in sorted(buckets))
     rows.append(f"Skipped malformed/undated lines: {skipped}")
-    if total.measured != total.turns:
-        rows.append(f"Turns without complete cache usage: {total.turns - total.measured}")
+    unmeasured = total.turns - total.measured - total.inconsistent
+    if unmeasured:
+        rows.append(f"Turns without complete cache usage: {unmeasured}")
+    if total.inconsistent:
+        rows.append(f"Turns excluded because cache details exceed total input: {total.inconsistent}")
     return "\n".join(rows) + "\n"
 
 
@@ -124,11 +136,17 @@ def main() -> None:
     today = datetime.now(timezone.utc).date()
     parser.add_argument("--from-date", type=_date, default=today - timedelta(days=6))
     parser.add_argument("--to-date", type=_date, default=today)
+    parser.add_argument(
+        "--input-semantics", choices=("inclusive", "exclusive"), default="inclusive",
+        help="inclusive LangChain totals (default), or known Anthropic-raw exclusive counts; "
+             "applies to the entire window, never inferred from the current model",
+    )
     args = parser.parse_args()
     if args.from_date > args.to_date:
         parser.error("--from-date must not be after --to-date")
     try:
-        print(report(args.home, args.from_date, args.to_date), end="")
+        print(report(args.home, args.from_date, args.to_date,
+                     input_semantics=args.input_semantics), end="")
     except (ValueError, OSError, UnicodeError) as exc:
         parser.exit(1, f"cache report: {exc}\n")
 
