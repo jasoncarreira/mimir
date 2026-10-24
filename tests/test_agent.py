@@ -1486,6 +1486,11 @@ async def test_failed_subagent_returns_to_parent_and_finishes_turn(tmp_path, can
     assert seen_errors[0].status == "error"
     assert seen_errors[0].tool_call_id == "task-failure"
     assert "private prompt and output" not in str(seen_errors[0].content)
+    # The gate logs through emit_event_background; after cancellation that write
+    # task may still be in flight. Drain it before asserting on the file.
+    from mimir import event_logger
+
+    await asyncio.gather(*tuple(event_logger._background_event_tasks))
     task_errors = [event for event in _read_events(tmp_path)
                    if event.get("type") == "tool_error" and event.get("tool") == "task"]
     assert len(task_errors) == 1
