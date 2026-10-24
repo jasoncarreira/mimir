@@ -3437,13 +3437,13 @@ def test_pr_opened_url_from_another_repository_cannot_resolve_author(monkeypatch
     api.assert_not_called()
 
 
-@pytest.mark.skip(reason="deferred to chainlink #2001: frozen pre-optional poller bytes")
 @pytest.mark.asyncio
 async def test_poller_side_unavailable_author_diagnostic_reaches_server_log(
     tmp_path: Path, home: Path,
 ) -> None:
     """Execute the skill's real trust resolver in a child, then read server events."""
-    script = (Path(__file__).resolve().parents[1] / "mimir" / "optional-skills"
+    script = (Path(__file__).resolve().parents[1] / "plugins" / "cultivate"
+              / "mimir_cultivate" / "defaults" / "skills"
               / "github-poller" / "scripts" / "poller.py")
     skill_dir = tmp_path / "skill"
     _install_script(skill_dir, "poller.py", f'''

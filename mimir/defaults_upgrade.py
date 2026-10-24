@@ -407,10 +407,7 @@ def _apply_defaults_three_way(
 
         try:
             for rel in paths:
-                if rel.parts[:2] == ("prompts", plugin) or (
-                    len(rel.parts) >= 2 and rel.parts[0] == "skills"
-                    and rel.parts[1].startswith(f"{plugin}-")
-                ):
+                if rel.parts[:2] == ("prompts", plugin):
                     safe_destination(worktree, rel)
             safe_destination(worktree, Path("scheduler.yaml"))
         except ValueError as exc:
@@ -418,7 +415,6 @@ def _apply_defaults_three_way(
     for rel in sorted(paths, key=lambda p: p.as_posix()):
         is_surface = (rel.parts[:2] == ("memory", "core") or rel.parts[:1] == ("prompts",)) if plugin is None else (
             rel.parts[:2] == ("prompts", plugin)
-            or len(rel.parts) >= 2 and rel.parts[0] == "skills" and rel.parts[1].startswith(f"{plugin}-")
         )
         if not is_surface:
             continue
@@ -519,15 +515,10 @@ def check_and_open_plugin_defaults_upgrade(
         pending = f"refs/mimir/plugin-defaults/{name}/previous"
         safe_destination(home, VENDOR_WORKTREE_REL)
         safe_destination(home, Path("scratch") / "proposals" / "upgrade")
-        files = plugin_default_files(candidate)
-        # Keep installed optionals represented in the package vendor baseline.
-        # This does not migrate skills: proposal worktrees currently cover only
-        # core memory and prompts. Absent optionals must not enter the baseline.
-        for directory, _forge in manifest.optional_skills:
-            rel = Path("skills") / f"{name}-{Path(directory).name}"
-            installed = safe_destination(home, rel)
-            if installed.is_dir():
-                files.update(plugin_default_files(candidate, skill=Path(directory).name))
+        # Skills are delivered only by the explicit skills CLI. Existing vendor
+        # refs may still contain them; the merge surface below ignores them.
+        files = {rel: text for rel, text in plugin_default_files(candidate).items()
+                 if rel.parts[0] != "skills"}
         vendor = _ensure_vendor_branch(home, branch=branch, version=version, files=files)
         if vendor.error:
             results[name] = DefaultsUpgradeResult(False, "error", version, vendor.error)
