@@ -191,7 +191,9 @@ def _core_auth() -> AuthContext:
     )
 
 
-def _real_attested_lease(tmp_path: Path, *, author: str = "collaborator"):
+def _real_attested_lease(
+    tmp_path: Path, *, author: str = "collaborator", repository: str = "owner/repo",
+):
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
 
     checkout = tmp_path / "checkout"
@@ -210,7 +212,7 @@ def _real_attested_lease(tmp_path: Path, *, author: str = "collaborator"):
         ["git", "-C", str(checkout), "rev-parse", "HEAD"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
-    scope = _scope(observed_head_sha=head, author=author)
+    scope = _scope(repository, observed_head_sha=head, author=author)
     lease = SimpleNamespace(
         path=checkout, lease_root=tmp_path, scope_id=scope.scope_id, canonical_repo=scope.canonical_repo,
         pr_number=scope.pr_number, head_sha=head, owner=scope.principal,
@@ -287,6 +289,95 @@ def test_attested_lease_head_accepts_only_server_identity_descendants(
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     state.record_git_head(scope.scope_id, foreign_head)
+    assert not access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+
+
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_reminted_advanced_lease_attestation_uses_discovered_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login,
+) -> None:
+    """The original event registry cannot attest a reminted, advanced lease."""
+    import inspect
+    from mimir_cultivate.policy import RepoPRScopeRegistry, ServerDiscoveredPRStates
+    from mimir_cultivate.repository import _publish_attested_lease_result
+
+    monkeypatch.setattr(access_control_module, "_lease_head_is_author_attested", _self_login)
+    auth, scope, lease, target, identity = _real_attested_lease(tmp_path)
+    scope = replace(scope, event_type="pr_changes_requested_stale")
+    lease.scope_id = scope.scope_id
+    _record_clean_head(lease, scope.observed_head_sha)
+    state = RepoReviewState(scope)
+    state.attach_checkout_lease(lease)
+    original = RepoReviewState(replace(scope, observed_head_sha="b" * 40))
+    discovered = ServerDiscoveredPRStates()
+    assert discovered.begin_remint(original.repo, original.pr_number)
+    assert discovered.remember_remint(original, state) is state
+    auth = replace(
+        auth, repo_pr_action_scope=scope, repo_review_state=original,
+        repo_pr_scope_registry=RepoPRScopeRegistry((original,)),
+        server_discovered_pr_states=discovered,
+    )
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+
+    target.write_text("server remediation after remint\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(lease.path), "-c", f"user.name={identity[0]}",
+        "-c", f"user.email={identity[1]}", "commit", "-qm", "reminted remediation",
+    ], check=True)
+    remediation_head = subprocess.run(
+        ["git", "-C", str(lease.path), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    _record_clean_head(lease, remediation_head)
+    state.record_git_head(scope.scope_id, remediation_head)
+    assert lease.head_sha != scope.observed_head_sha
+    assert auth.repo_pr_scope_registry.resolve_checkout_path(lease.path) is None
+    assert discovered.resolve_checkout_path(lease.path) is state
+    assert_lease_attested(auth, scope, lease)
+
+    # Exercise the real producer and provider classifier, not just the helper.
+    token = begin_protected_result_capture()
+    try:
+        _publish_attested_lease_result(SimpleNamespace(context=auth), state)
+    finally:
+        provenance = end_protected_result_capture(token)
+    labels = classify_protected_result(
+        "repo_commit", {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        auth, ToolAuthorization(tool_name="repo_commit", decision="resource_scoped", allowed=True,
+                                repo_pr_action_scope=scope),
+        result={"ok": True}, provenance=provenance,
+    )
+    assert labels.sources[0].integrity == "trusted"
+
+    # Reverting only discovered-state lookup loses the advanced lease; fallback
+    # to the immutable registry must not silently suffice at the observed head.
+    helper = access_control_module._pr_checkout_lease_attestation
+    source = inspect.getsource(helper)
+    lookup = "review_state = discovered.resolve_checkout_path(path) if discovered is not None else None"
+    assert source.count(lookup) == 1
+    namespace = dict(vars(access_control_module))
+    exec(compile(source.replace(lookup, "review_state = None"), helper.__code__.co_filename, "exec"), namespace)
+    with monkeypatch.context() as patch:
+        patch.setattr(access_control_module, helper.__name__, namespace[helper.__name__])
+        verdict = access_control_module._pr_checkout_lease_attestation(auth, scope, lease)
+        assert (verdict.ok, verdict.reason) == (False, "review_state_mismatch")
+    assert_lease_attested(auth, scope, lease)
+
+    # Discovery is not a new trust grant: author trust, liveness, and actual
+    # checkout HEAD still bind the otherwise valid discovered state.
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
+    assert not access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    lease.is_active = False
+    assert not access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    lease.is_active = True
+    target.write_text("foreign commit\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(lease.path), "-c", "user.name=foreign",
+        "-c", "user.email=foreign@example.test", "commit", "-qm", "foreign commit",
+    ], check=True)
     assert not access_control_module._attested_pr_checkout_lease(auth, scope, lease)
 
 
@@ -532,6 +623,11 @@ def test_selected_push_porcelain_uses_attested_origin(tmp_path: Path, attested, 
     ("membership", '"repo_actions" in registered.memberships'),
     ("resource_scope", 'registered.resource_scope == "repo_pr"'),
     ("action_scope", 'getattr(state, "action_scope", None) is scope'),
+    ("authorization_denied", "authorization.allowed"),
+    ("authorization_open", "authorization.decision == OperationDecision.RESOURCE_SCOPED"),
+    ("authorization_admin_required", "authorization.decision == OperationDecision.RESOURCE_SCOPED"),
+    ("authorization_unknown", "authorization.decision == OperationDecision.RESOURCE_SCOPED"),
+    ("repository_argument", 'arguments.get("repository") == scope.canonical_repo'),
 ])
 def test_selected_pr_result_binding_guards_are_discriminating(
     tmp_path, monkeypatch, boundary, guard,
@@ -540,10 +636,13 @@ def test_selected_pr_result_binding_guards_are_discriminating(
     from mimir.plugins.core import selected_policy_registry
     from mimir_cultivate.repository import _publish_attested_lease_result
 
-    auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
+    # N3: the valid lease and published result belong to a different repo
+    # with the same PR number; only the request's repository will be changed.
+    repository = "other/repo" if boundary == "repository_argument" else "owner/repo"
+    auth, scope, lease, _, _ = _real_attested_lease(tmp_path, repository=repository)
     policy = selected_policy_registry()
     registered = policy.tools["repo_merge"]
-    args = {"repository": "owner/repo", "pull_request": 7}
+    args = {"repository": repository, "pull_request": 7}
     authz = ToolAuthorization(tool_name="repo_merge", decision="resource_scoped", allowed=True,
                               repo_pr_action_scope=scope, policy=policy)
     capture = begin_protected_result_capture()
@@ -568,6 +667,14 @@ def test_selected_pr_result_binding_guards_are_discriminating(
         ))
     elif boundary == "resource_scope":
         monkeypatch.setitem(policy._tools, "repo_merge", replace(registered, resource_scope="forge_pr"))
+    elif boundary == "authorization_denied":
+        authz = replace(authz, allowed=False)
+    elif boundary.startswith("authorization_"):
+        authz = replace(authz, decision=OperationDecision(boundary.removeprefix("authorization_")))
+    elif boundary == "repository_argument":
+        args["repository"] = "owner/repo"
+        assert scope.canonical_repo == "other/repo" and scope.pr_number == args["pull_request"]
+        assert provenance.sources[0].resource_id.startswith("other/repo#pull/7@")
     else:
         from mimir_cultivate.policy import RepoPRScopeRegistry
         object.__setattr__(auth.repo_review_state, "action_scope", replace(scope))
