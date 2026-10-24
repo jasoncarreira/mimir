@@ -272,19 +272,22 @@ def build_turn_prompt(
     trigger_authority_present: bool = False,
     trigger_shell_commands: Iterable[str] | None = None,
     turn_scratch_path: str | None = None,
+    stable_prefix_out: list[str] | None = None,
 ) -> str:
-    """Assemble the turn prompt: known identities, recent activity, SAGA
-    atom hits, event header + body.
+    """Assemble stable channel/session context before live context and event.
 
     ``recent_message_chars`` (>0) caps each Recent-activity message's
     rendered content with ``…[truncated]``; protects against single huge
     inbounds blowing the context (SPEC §5.4).
 
     ``resolver`` (FUTURE_WORK §6.1) — when present, identity records for
-    any author in the recent window or the inbound event are surfaced as
-    a 'Known identities' preamble at the top of the prompt, and the
-    Recent activity render uses the canonical's display_name. None
-    falls back to the no-identity-reconciliation rendering."""
+    authors in the recent window or inbound event appear in the live
+    'Known identities' section, and Recent activity uses canonical display
+    names. None falls back to the no-identity-reconciliation rendering.
+
+    ``stable_prefix_out`` receives the exact byte prefix ending after the
+    reusable sections (including the separator before live sections)."""
+    stable_sections: list[str] = []
     sections: list[str] = []
     # Per-section size tracking (chars). Surfaced as a ~token breakdown
     # at the bottom of the resource-usage block so the agent can see
@@ -296,10 +299,10 @@ def build_turn_prompt(
     # that grow between ticks.
     section_sizes: dict[str, int] = {}
 
-    def _add_labeled(label: str, body: str) -> None:
+    def _add_labeled(label: str, body: str, *, stable: bool = False) -> None:
         """Append a `## Label\n\nbody` section + record its size."""
         rendered = f"## {label}\n\n{body.rstrip()}"
-        sections.append(rendered)
+        (stable_sections if stable else sections).append(rendered)
         section_sizes[label] = len(rendered)
 
     def _add_plugins(section: str) -> None:
@@ -328,14 +331,11 @@ def build_turn_prompt(
 
     # Channel context (chainlink #187): per-channel operator facts injected
     # inline so the agent has context (operator name, preferences, channel-
-    # specific patterns) without a tool call. Placement at the top of the
-    # turn prompt (after optional identity reconciliation, before algedonic
-    # feedback) mirrors how the system prompt presents core memory: the agent
-    # reads WHO it's talking to before it reads WHAT just happened.
+    # specific patterns) without a tool call. Keep it ahead of the live blocks.
     # Only fires for real channels; synthetic channels (scheduler:*, poller:*)
     # return None from load_channel_memory and this section is suppressed.
     if channel_memory_block:
-        _add_labeled("Channel context", channel_memory_block)
+        _add_labeled("Channel context", channel_memory_block, stable=True)
     _add_plugins("channel_memory")
 
     if event.channel_id.lower().startswith(("poller:", "scheduler:")):
@@ -356,6 +356,7 @@ def build_turn_prompt(
             "deliverable via send_message or react. Ending the turn silently "
             "without calling send_message is normal when there is nothing to report. "
             + notification_hint,
+            stable=True,
         )
 
     # chainlink #508: optional deliver channel for poller / scheduled-tick
@@ -374,6 +375,7 @@ def build_turn_prompt(
             f'`send_message(channel_id="{deliver_channel}", text=…)`. '
             f"If there's nothing worth sending, send nothing — don't post "
             f"filler or empty status updates.",
+            stable=True,
         )
 
     capabilities = tuple(sorted(set(trigger_capabilities or ())))
@@ -415,11 +417,10 @@ def build_turn_prompt(
                 "call ``operator_alert(text=...)``. Its destination is fixed by the "
                 "operator; do not use shell or file writes as a notification path."
             )
-        _add_labeled("Autonomous trigger authority", "\n".join(lines))
+        _add_labeled("Autonomous trigger authority", "\n".join(lines), stable=True)
 
-    # Algedonic channel (v0.4 §2): self-feedback signals between identities
-    # and recent activity, so the agent reads its own pain/pleasure data
-    # before it reads the conversation it's about to act on.
+    # Algedonic channel (v0.4 §2): live self-feedback before recent activity,
+    # so the agent reads its own signals before the conversation.
     if feedback_block:
         _add_labeled("Recent feedback signals", feedback_block)
     _add_plugins("feedback")
@@ -432,17 +433,15 @@ def build_turn_prompt(
         _add_labeled("Open change proposals", core_proposals_block)
     _add_plugins("core_proposals")
 
-    # Recent session summaries (v0.4 §3): one rung wider than the message-
-    # level recent activity. Placed before Recent activity so the agent
-    # reads the session-level context first.
+    # Recent session summaries (v0.4 §3): completed content is historical,
+    # but its relative ages, channel-turn counts and stale-work suffixes are
+    # live. Keep the entire rendered block after the cache breakpoint.
     if session_summaries_block:
         _add_labeled("Recent session summaries", session_summaries_block)
     _add_plugins("session_summaries")
 
     # Resource usage: cost / cache hit rate / context utilization across
-    # rolling windows. Same priority as the algedonic feedback channel —
-    # it's data about the agent's own state — placed near the top so the
-    # agent reads it before the conversation it's about to act on.
+    # rolling windows. Keep this live telemetry before the conversation.
     # The per-section size breakdown (assembled below from
     # ``section_sizes``) is appended to this block at the end of
     # assembly, so the resource-usage entry's tracked size doesn't
@@ -489,14 +488,9 @@ def build_turn_prompt(
     if saga_block:
         _add_labeled("Possibly relevant memories (from SAGA)", saga_block)
 
-    # Auto-surfaced skill block — when the turn lands on a
-    # ``poller:<name>`` channel and the named poller's parent skill
-    # has a SKILL.md, the resolver returns ``(skill_name, body)`` and
-    # we render it as a labeled section here. Placement is intentional:
-    # right above ``Today's date`` and the event header, so it's the
-    # last context the agent reads before the inbound event. The
-    # skill name is in the label so future readers can tell at a
-    # glance which skill auto-loaded.
+    # Auto-surfaced skill block — the named poller's SKILL.md and any
+    # accumulated learnings change only when the skill/learning changes.
+    # Keep the skill name in the label to identify its provenance.
     #
     # The full SKILL.md body lands inline; for skills with large
     # SKILL.md files this is a sizeable prompt addition (~10-15 KB
@@ -505,7 +499,7 @@ def build_turn_prompt(
     # reflect, react_received, saga_session_end, etc.) are unaffected.
     if auto_skill_block:
         skill_name, skill_body = auto_skill_block
-        _add_labeled(f"Skill: {skill_name}", skill_body)
+        _add_labeled(f"Skill: {skill_name}", skill_body, stable=True)
 
     # Prompt-header timestamp: defaults to now (the agent's view of "today")
     # but can be overridden by the inbound event via ``extra.event_ts_iso``.
@@ -624,7 +618,14 @@ def build_turn_prompt(
                     sections[i] = body + "\n\n" + breakdown
                     break
 
-    return "\n\n".join(sections)
+    # The separator belongs to the stable prefix: Anthropic can mark its end
+    # on a text block; prefix-only caches see the same bytes without a marker.
+    stable_prefix = "\n\n".join(stable_sections)
+    if stable_prefix:
+        stable_prefix += "\n\n"
+    if stable_prefix_out is not None:
+        stable_prefix_out.append(stable_prefix)
+    return stable_prefix + "\n\n".join(sections)
 
 
 def _format_section_sizes(sizes: dict[str, int]) -> str:

@@ -5141,6 +5141,7 @@ def repo_checkout(
     # Record only turn-local authority, never trust in checkout-controlled metadata.
     # Clear an earlier verdict before fetching metadata, so failures stay closed.
     context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
+    context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = "author_unresolved"
     client = _client(scope)
     from .forge import _BOT_LOGIN, _author_verdict
 
@@ -5149,8 +5150,19 @@ def repo_checkout(
     ):
         authors, _ = _call(lambda: _pr_content_authors(client, scope))
         if authors == (scope.pull_request_author,) and scope.pull_request_author:
+            from mimir.pollers import _github_author_trust_cause
+
+            _github_author_trust_cause.set(None)
             verdict = _author_verdict(context, scope, scope.pull_request_author, client)
             context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
+            if verdict is None:
+                from mimir.pollers import github_author_trust_cause
+
+                context.ifc_state.pr_checkout_author_trust_cause[scope.scope_id] = (
+                    github_author_trust_cause() or "author_unresolved"
+                )
+            else:
+                context.ifc_state.pr_checkout_author_trust_cause.pop(scope.scope_id, None)
     _publish_attested_lease_result(runtime, state)
     return {
         "status": "resumed" if candidates else "checked_out",
