@@ -349,7 +349,8 @@ Optional skills are installed only on request. `mimir skills list-optional`
 shows selected plugins' defaults and optional skills with their forge and install
 state. Use `mimir skills install <plugin>:<skill>` or
 `mimir skills install --forge github`; `--restore` backs up a modified plugin
-skill to a timestamped sibling before replacing it. Previously seeded skills
+skill to a timestamped directory under `<home>/.mimir/plugin-skill-backups/`
+(outside skill-loader roots) before replacing it. Previously seeded skills
 remain installed. An unselected plugin's skills are unavailable even if its
 distribution is installed or a prior seed remains in the home.
 
