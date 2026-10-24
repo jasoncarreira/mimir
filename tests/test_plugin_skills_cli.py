@@ -163,9 +163,76 @@ def test_install_before_seeding_preserves_initial_jobs_and_permissions(tmp_path)
         p.relative_to(seeded_dir): p.read_bytes() for p in seeded_dir.rglob("*") if p.is_file()}
 
 
+_PRE_OPTIONAL_SKILLS = ("github-poller", "github-ci-watch", "github", "review")
+_PRE_OPTIONAL_ROOT = (Path(__file__).parents[1] /
+                      "plugins/cultivate/mimir_cultivate/defaults/skills")
+
+
+def _assert_previous_release_inventory(root: Path) -> dict[str, bytes]:
+    import hashlib
+    import json
+
+    fixture = json.loads((Path(__file__).parent / "fixtures/plugin_skills_pre_optional.json").read_text())
+    assert fixture["source_commit"] == "e52e30daced64c5c5ad0ea266c27a5be07ef299e"
+    expected = fixture["files"]
+    assert len(expected) == 28
+    assert {Path(path).parts[0] for path in expected} == set(_PRE_OPTIONAL_SKILLS)
+    actual = {}
+    for name in _PRE_OPTIONAL_SKILLS:
+        tree = root / name
+        assert tree.is_dir() and not tree.is_symlink(), name
+        for path in tree.rglob("*"):
+            # Runtime caches are not shipped skill resources. Everything else,
+            # including newly added files, must match the historical inventory.
+            if {"__pycache__", ".pytest_cache"}.intersection(path.relative_to(tree).parts):
+                continue
+            assert not path.is_symlink(), path
+            if path.is_file():
+                actual[path.relative_to(root).as_posix()] = path.read_bytes()
+    assert set(actual) == set(expected), "historical skill file-set drift"
+    for path, data in actual.items():
+        assert hashlib.sha256(data).hexdigest() == expected[path], f"historical skill byte drift: {path}"
+    return actual
+
+
+def test_packaged_pre_optional_skill_inventory_is_unchanged():
+    # Runs even without Cultivate installed, and needs no historical Git objects.
+    # Do not refresh hashes for a new release without a real seed migration.
+    _assert_previous_release_inventory(_PRE_OPTIONAL_ROOT)
+
+
+@pytest.mark.parametrize("path", [
+    "github-poller/SKILL.md", "github-ci-watch/SKILL.md",
+    "github-poller/pollers.json", "github-ci-watch/pollers.json",
+    "github-poller/scripts/poller.py", "github-poller/scripts/hooks.py",
+    "github-ci-watch/scripts/ci_logs.py", "github-ci-watch/scripts/poller.py",
+    "github-poller/tests/test_github_poller_windows.py",
+    "github-ci-watch/tests/test_ci_state.py", "github/SKILL.md", "review/SKILL.md",
+])
+@pytest.mark.parametrize("drift", ["append", "add", "remove", "rename"])
+def test_previous_release_inventory_rejects_drift(tmp_path, path, drift):
+    released = _assert_previous_release_inventory(_PRE_OPTIONAL_ROOT)
+    for name, data in released.items():
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    # Positive control on the same copy and helper used by each negative case.
+    assert _assert_previous_release_inventory(tmp_path) == released
+    target = tmp_path / path
+    if drift == "append":
+        target.write_bytes(target.read_bytes() + b"\ntrailing drift\n")
+    elif drift == "add":
+        target.with_name(target.name + ".new").write_bytes(b"new file\n")
+    elif drift == "remove":
+        target.unlink()
+    else:
+        target.rename(target.with_name(target.name + ".renamed"))
+    with pytest.raises(AssertionError, match="historical skill (byte|file-set) drift"):
+        _assert_previous_release_inventory(tmp_path)
+
+
 @pytest.mark.parametrize("edit", ["none", "doc", "manifest"])
 def test_real_previous_release_poller_seeds_keep_running(tmp_path, monkeypatch, capsys, edit):
-    import json
     from dataclasses import replace
 
     pytest.importorskip("mimir_cultivate")
@@ -173,33 +240,26 @@ def test_real_previous_release_poller_seeds_keep_running(tmp_path, monkeypatch, 
     monkeypatch.setenv("GITHUB_REPOS", "o/r")
     manager = load_plugins(enable="cultivate")
     candidate, = manager.policy.selected_plugin_candidates
-    # Immutable pre-change base, not the current package dressed as an old manifest.
-    fixture = json.loads((Path(__file__).parent / "fixtures/plugin_skills_pre_optional.json").read_text())
-    assert fixture["source_commit"] == "e52e30daced64c5c5ad0ea266c27a5be07ef299e"
+    # Current package bytes are usable as released bytes only after every file
+    # in all four trees matches the independently supplied historical hashes.
+    released = _assert_previous_release_inventory(_PRE_OPTIONAL_ROOT)
     old = replace(candidate, manifest=replace(candidate.manifest, defaults={
         **candidate.manifest.defaults,
         "skills": (*candidate.manifest.defaults["skills"],
                    *(path for path, _ in candidate.manifest.optional_skills)),
     }, optional_skills=()))
     seed_plugin_defaults(tmp_path, selected=(old,))
+    for name in _PRE_OPTIONAL_SKILLS:
+        dest = tmp_path / "skills" / f"cultivate-{name}"
+        expected = {path.removeprefix(name + "/"): data for path, data in released.items()
+                    if path.startswith(name + "/")}
+        assert {p.relative_to(dest).as_posix(): p.read_bytes()
+                for p in dest.rglob("*") if p.is_file()} == expected
+        skill = next(s for s in selected_skills() if s.name == name)
+        assert skill_state(tmp_path, skill) == "installed"
     for name in ("github-poller", "github-ci-watch"):
         dest = tmp_path / "skills" / f"cultivate-{name}"
-        # Reinsert captured old-release regions, without requiring Git objects
-        # in wheel/contained/shallow-CI environments.
-        current = (dest / "SKILL.md").read_text()
-        lines = current.splitlines(keepends=True)
-        lines[2] = f'description: "{fixture[name]["description"]}"\n'
-        current = "".join(lines)
-        heading_end = current.index("\n\n", current.index("# Cultivate")) + 2
-        configure_start = current.index("2. ", heading_end)
-        current = current[:heading_end] + fixture[name]["body"] + current[configure_start:]
-        current = current.replace("Install it with mimir skills install cultivate:review; no path override is needed.",
-                                  "No path override is needed after provider defaults seed the home.")
-        old_doc = current.encode()
-        # Keep the released document bytes unchanged until a real migration
-        # exists; old unedited seeds must match, not merely get a fallback.
-        assert old_doc == (dest / "SKILL.md").read_bytes()
-        (dest / "SKILL.md").write_bytes(old_doc)
+        old_doc = released[f"{name}/SKILL.md"]
         if edit == "doc":
             (dest / "SKILL.md").write_bytes(old_doc + b"\noperator note\n")
         elif edit == "manifest":
