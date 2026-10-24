@@ -3335,12 +3335,36 @@ class WorklinkRunner:
             cancel_attempted = True
             await compute.cancel(handle)
 
-        async def park_for_reason(current: FactoryStatus, reason: str) -> WorklinkRunResult:
+        async def park_for_reason(
+            current: FactoryStatus, reason: str, *, startup_failure: bool = False,
+        ) -> WorklinkRunResult:
             nonlocal factory_record, failed, wait_result
             await cancel_once()
             wait_result = await _finish_factory_wait_task(wait_task)
             if compute.job_alive(handle):
                 raise WorklinkError("factory driver survived cancellation before park")
+            if startup_failure:
+                if not factory_process_is_verified_dead(factory_record):
+                    raise WorklinkError(reason)
+                # Re-read after cancellation: an observation from before the deadline
+                # cannot authorize terminalizing a run now owned by another driver.
+                current = await asyncio.to_thread(
+                    backend.status, factory_record.run_id,
+                    sandbox=Path(factory_record.sandbox), launcher=factory_record.launcher,
+                )
+                if not current.valid:
+                    raise WorklinkError(reason)
+                _require_factory_status(current, factory_record)
+                if current.status != "running" or (current.lock == "fresh" and not current.dead_lock):
+                    raise WorklinkError("factory startup deadline: run has a live lock or is not running")
+                if not (factory_record.session or current.lock_session):
+                    # An initial launch whose driver died before taking the lock has
+                    # no session anywhere, and recovery admits only a retained one.
+                    # Record a controller-owned session; recovery claims the absent
+                    # lock under it through the factory CLI before resuming.
+                    factory_record = replace(
+                        factory_record, session=f"worklink-repark-{os.urandom(8).hex()}",
+                    )
             retain_result(wait_result, "needs-human")
             await asyncio.to_thread(
                 backend.terminal,
@@ -3352,8 +3376,9 @@ class WorklinkRunner:
             )
 
             snapshot_failure = "factory status reports park_snapshot null"
+            verification_deadline = max(deadline, loop.time() + startup_timeout) if startup_failure else deadline
             while True:
-                remaining = deadline - loop.time()
+                remaining = verification_deadline - loop.time()
                 if remaining <= 0:
                     break
                 try:
@@ -3387,7 +3412,7 @@ class WorklinkRunner:
                     break
                 delay = min(
                     max(0.01, float(backend.poll_interval_s)),
-                    max(0, deadline - loop.time()),
+                    max(0, verification_deadline - loop.time()),
                 )
                 if delay <= 0:
                     break
@@ -3417,6 +3442,27 @@ class WorklinkRunner:
                 runner=runner,
                 started_at=started_at,
             )
+
+        async def repark_startup_failure(reason: str) -> WorklinkRunResult:
+            # The park helper cancels and drains the driver, verifies its birth
+            # marker, then reads run state again before invoking the factory CLI.
+            # With no manifest even then, the original failure remains the diagnosis,
+            # raised to the generic handler, which records the incident as before.
+            result = await park_for_reason(
+                last_status or FactoryStatus(
+                    factory_record.run_id, False, factory_record.sandbox,
+                ),
+                reason, startup_failure=True,
+            )
+            # A completed repark is a park, not an incident: an active
+            # operator_required incident would fence the next autonomous dispatch.
+            _log_event(
+                "worklink_factory_supervision_error",
+                issue_id=issue.issue_id, run_id=factory_record.run_id,
+                attempt=factory_record.attempt, error_class="WorklinkError",
+                message=reason,
+            )
+            return result
 
         def end_stale_episode(reason: str) -> None:
             nonlocal stale_started, stale_failure
@@ -3517,7 +3563,9 @@ class WorklinkRunner:
                         last_status, reason
                     )
                 if recovery_session is not None and loop.time() >= startup_deadline:
-                    raise WorklinkError("factory driver did not acquire the run lock before startup deadline")
+                    return await repark_startup_failure(
+                        "factory driver did not acquire the run lock before startup deadline"
+                    )
                 observed = True
                 if status is None:
                     remaining = (
@@ -3527,7 +3575,7 @@ class WorklinkRunner:
                     )
                     if remaining <= 0:
                         if last_status is None:
-                            raise WorklinkError("factory never initialised before startup deadline")
+                            return await repark_startup_failure("factory never initialised before startup deadline")
                         return await park_for_reason(
                             last_status, _factory_budget_park_reason(last_status, factory_record)
                         )
@@ -3541,11 +3589,11 @@ class WorklinkRunner:
                             ),
                             timeout=remaining,
                         )
-                    except TimeoutError as exc:
+                    except TimeoutError:
                         if last_status is None:
-                            raise WorklinkError(
+                            return await repark_startup_failure(
                                 "factory never initialised before startup deadline"
-                            ) from exc
+                            )
                         return await park_for_reason(
                             last_status, _factory_budget_park_reason(last_status, factory_record)
                         )
@@ -3584,7 +3632,7 @@ class WorklinkRunner:
                 )
                 if pre_manifest:
                     if loop.time() >= startup_deadline:
-                        raise WorklinkError("factory never initialised before startup deadline")
+                        return await repark_startup_failure("factory never initialised before startup deadline")
                 else:
                     try:
                         _require_factory_status(status, factory_record)
@@ -3595,7 +3643,9 @@ class WorklinkRunner:
                     if recovery_session is not None:
                         if status.lock == "absent" and status.lock_session is None:
                             if loop.time() >= startup_deadline:
-                                raise WorklinkError("factory driver did not acquire the run lock before startup deadline")
+                                return await repark_startup_failure(
+                                    "factory driver did not acquire the run lock before startup deadline"
+                                )
                         elif (
                             status.lock == "fresh"
                             and not status.dead_lock

@@ -38,6 +38,7 @@ from mimir_cultivate.worklink.detached_dispatch import FactoryRecoveryIdentity
 from mimir_cultivate.worklink.backends.feature_factory import (
     _FACTORY_PERMISSION,
     FactoryContractError,
+    FactoryStatus,
     FeatureFactoryBackend,
     parse_factory_status,
 )
@@ -9418,7 +9419,7 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
     import mimir_cultivate.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
-    handle = LaunchHandle("local_subprocess", "123", 456)
+    handle = LaunchHandle("local_subprocess", "999999999", 1)
     stopped = asyncio.Event()
     lifecycle: list[str] = []
     status_calls = 0
@@ -9429,7 +9430,7 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
             return ComputeResult(-15, "", "cancelled", handle=selected)
 
         def job_alive(self, selected: LaunchHandle) -> bool:
-            assert factory_clock.now < 30.0, "startup continued past its deadline"
+            assert factory_clock.now <= 30.0, "startup continued past its deadline"
             return not stopped.is_set()
 
         async def cancel(self, selected: LaunchHandle) -> None:
@@ -9444,9 +9445,10 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
 
         def status(self, *args: object, **kwargs: object) -> Any:
             nonlocal status_calls
-            assert factory_clock.now < 30.0, "status requested after startup deadline"
+            assert factory_clock.now <= 30.0, "status requested after startup deadline"
             status_calls += 1
-            factory_clock.now += 10.0
+            if factory_clock.now < 30.0:
+                factory_clock.now += 10.0
             return parse_factory_status(
                 {
                     "run_id": "700",
@@ -9492,7 +9494,7 @@ def test_factory_recovery_absent_lock_is_bounded_by_startup_deadline(
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
-    handle = LaunchHandle("local_subprocess", "123", 456)
+    handle = LaunchHandle("local_subprocess", "123", None)
     stopped = asyncio.Event()
     released = _factory_lifecycle_status(
         sandbox, status="running", lock="absent", session=None,
@@ -9550,6 +9552,172 @@ def test_factory_recovery_absent_lock_is_bounded_by_startup_deadline(
     assert status_calls >= 2
     assert lifecycle == ["cancel", "cleanup"]
     assert load_factory_record(tmp_path, "700").session == "session-1"
+
+
+@pytest.mark.parametrize("record_session", ["session-1", None], ids=["recovery", "initial-launch"])
+@pytest.mark.parametrize("pre_manifest", [False, True])
+@pytest.mark.parametrize("guard", ["dead", "live_driver", "live_lock", "unverified", "not_running"])
+def test_factory_startup_deadline_reparks_only_a_verified_dead_unlocked_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory_clock: SimpleNamespace,
+    pre_manifest: bool, guard: str, record_session: str | None,
+) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle(
+        "local_subprocess", "999999999", None if guard == "unverified" else 1,
+    )
+    stopped = asyncio.Event()
+    events: list[str] = []
+    incidents: list[dict[str, Any]] = []
+    transitions: list[dict[str, Any]] = []
+    snapshot = str(sandbox / ".factory" / ".parked" / "700")
+    state = {"parked": False, "reads": 0}
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return guard == "live_driver" or not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            events.append("cancel")
+            stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            events.append("cleanup")
+
+    class Backend:
+        poll_interval_s = 1
+
+        def status(self, *args: object, **kwargs: object) -> FactoryStatus:
+            state["reads"] += 1
+            if pre_manifest and factory_clock.now < 3:
+                return FactoryStatus("700", False, str(sandbox))
+            return _factory_lifecycle_status(
+                sandbox, status="needs-human" if state["parked"] or (
+                    guard == "not_running" and factory_clock.now >= 3
+                ) else "running",
+                lock="fresh" if guard == "live_lock" and factory_clock.now >= 3 else "absent",
+                session="other" if guard == "live_lock" and factory_clock.now >= 3 else None,
+                park_snapshot=snapshot if state["parked"] else None,
+            )
+
+        def terminal(self, run_id: str, status: str, *, reason: str, **kwargs: object) -> None:
+            assert orchestrator.factory_process_is_verified_dead(record)
+            assert stopped.is_set()
+            assert (run_id, status) == ("700", "needs-human")
+            assert "startup deadline" in reason
+            events.append("terminal")
+            state["parked"] = True
+
+    # An initial launch has no session until its driver takes the lock.
+    record = replace(_factory_lifecycle_record(sandbox, handle), session=record_session)
+    # The nonexistent PID is verifiably dead only when its birth marker was
+    # recorded. The unverified case exercises the real fail-closed guard.
+    monkeypatch.setattr(orchestrator, "_log_event", lambda name, **kw: events.append(name))
+    monkeypatch.setenv("MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S", "3")
+    async def advance(delay: float) -> None:
+        factory_clock.now += delay
+        await asyncio.sleep(0)
+    monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
+
+    class Claims:
+        def transition_issue(self, issue_id: int, **kw: Any) -> None:
+            transitions.append(kw)
+
+    owner = SimpleNamespace(record=lambda **kw: incidents.append(kw), release=lambda **kw: None)
+    async def run() -> WorklinkRunResult:
+        return await WorklinkRunner(home=tmp_path, repo=tmp_path, _incident_owner=owner)._supervise_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=Claims(), backend=Backend(), compute=Compute(), factory_record=record,
+            test_cmd="pytest -q", runner=lambda args: cp(args), started_at=datetime.now(UTC),
+            initial_status=None if pre_manifest else _factory_lifecycle_status(
+                sandbox, status="running", lock="absent", session=None,
+            ),
+            recovery_session=None if pre_manifest else "session-1",
+        )
+
+    if guard != "dead":
+        with pytest.raises(WorklinkError):
+            asyncio.run(run())
+        assert "terminal" not in events
+        assert not state["parked"]
+        return
+
+    result = asyncio.run(run())
+    assert result.status == "needs-human"
+    assert "startup deadline" in result.reason
+    assert events.index("cancel") < events.index("terminal") < events.index("cleanup")
+    assert "worklink_factory_supervision_error" in events
+    # A completed repark records no operator incident: an active one would fence
+    # the next autonomous dispatch, which is what the repark exists to allow.
+    assert incidents == []
+    assert transitions[0]["status"] == "blocked"
+    retained = load_factory_record(tmp_path, "700")
+    assert retained.controller_phase == "parked"
+    assert retained.status.park_snapshot == snapshot
+    # Recovery admits only a retained session, so a session-less launch gets a
+    # controller-owned one; an existing session is kept unchanged.
+    if record_session is None:
+        assert retained.session and retained.session.startswith("worklink-repark-")
+    else:
+        assert retained.session == record_session
+
+    _stub_factory_launch_identity(monkeypatch)
+    _configure_opencode_oauth(tmp_path, monkeypatch)
+    recovery_events: list[str] = []
+    recovery_lock = {"value": "absent"}
+
+    class RecoveryBackend(FeatureFactoryBackend):
+        def status(self, *args: object, **kwargs: object) -> FactoryStatus:
+            return _factory_lifecycle_status(
+                sandbox, status="running" if "resume" in recovery_events else "needs-human",
+                lock=recovery_lock["value"],
+                session=retained.session if recovery_lock["value"] == "fresh" else None,
+                park_snapshot=snapshot,
+            )
+
+        def lock(self, run_id: str, action: str, **kwargs: object) -> None:
+            assert kwargs["session"] == retained.session
+            recovery_events.append(action)
+            recovery_lock["value"] = "fresh" if action == "claim" else "absent"
+
+        def resume(self, run_id: str, **kwargs: object) -> FactoryStatus:
+            assert load_factory_record(tmp_path, "700").status.park_snapshot == snapshot
+            recovery_events.append("resume")
+            return self.status(run_id, **kwargs)
+
+    class RecoveryCompute:
+        async def launch(self, spec: WorkSpec) -> LaunchHandle:
+            recovery_events.append("launch")
+            return LaunchHandle("local_subprocess", "999999998", 2)
+
+    async def supervise(self: WorklinkRunner, **kw: Any) -> WorklinkRunResult:
+        assert kw["factory_record"].controller_phase == "running"
+        assert kw["initial_status"].status == "running"
+        recovery_events.append("supervise")
+        return WorklinkRunResult(700, 1, "needs-human")
+
+    monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kw: sandbox)
+    monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *args, **kw: "https://github.com/owner/repo.git")
+    monkeypatch.setattr(orchestrator, "_factory_checkout_repository", lambda *args: "owner/repo")
+    monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
+    recovered = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+        issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+        claim_record=ClaimRecord(700, 2, "agent", datetime.now(UTC)),
+        claims=Claims(), backend=RecoveryBackend(entrypoint=retained.launcher),
+        compute=RecoveryCompute(), retained=retained, launcher=Path(retained.launcher),
+        repo_slug="owner/repo", base="main", test_cmd="pytest -q",
+        runner=lambda args: cp(args),
+        work_item_json=orchestrator.render_work_item(IssueContext(700, "epic", "build", {"worklink:epic"})),
+    ))
+    assert recovered.status == "needs-human"
+    assert recovery_events == ["claim", "resume", "release", "launch", "supervise"]
 
 
 @pytest.mark.parametrize("after_valid", [False, True])
