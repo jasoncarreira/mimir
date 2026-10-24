@@ -10823,7 +10823,7 @@ def _lease_has_clean_lineage(
     _METADATA, _recorded_lineage, _recorded_verified_base = (
         hooks.lease_metadata, hooks.lineage, hooks.verified_base,
     )
-    _PROTECTED_BRANCH_REFS, hardened_git_command = hooks.protected_refs, hooks.git_command
+    hardened_git_command = hooks.git_command
 
     try:
         raw = json.loads((path / _METADATA).read_text(encoding="utf-8"))
@@ -10841,11 +10841,9 @@ def _lease_has_clean_lineage(
             return _lease_refuse(LeaseAttestationReason.LINEAGE_RECORD_MISSING)
         base = getattr(lease, "base_sha", "").lower()
         verified_base = _recorded_verified_base(raw)
-        protected = (
-            _scope_has_protected_base(scope, _PROTECTED_BRANCH_REFS)
-            and (base == verified_base or base == getattr(scope, "observed_base_sha", "").lower())
-        )
-        if protected and base != getattr(scope, "observed_base_sha", "").lower():
+        observed_base = getattr(scope, "observed_base_sha", "").lower()
+        verified = base == observed_base or base == verified_base
+        if verified and base != observed_base:
             ancestor = hardened_git_command(
                 path, ("merge-base", "--is-ancestor", scope.observed_base_sha, base),
                 timeout=_LEASE_GIT_TIMEOUT_S,
@@ -10854,7 +10852,7 @@ def _lease_has_clean_lineage(
                 return False
         result = hardened_git_command(
             path, ("rev-list", "--max-count=501", current_head, "--not", expected_head,
-                   *((base,) if protected else ()), "--"), timeout=_LEASE_GIT_TIMEOUT_S,
+                   *((base,) if verified else ()), "--"), timeout=_LEASE_GIT_TIMEOUT_S,
         )
         if not _lease_git_ok(result):
             return False
@@ -10868,13 +10866,6 @@ def _lease_has_clean_lineage(
         return _lease_refuse(_lease_exception_reason(error))
     except (ValueError, TypeError):
         return _lease_refuse(LeaseAttestationReason.LINEAGE_READ_ERROR)
-
-
-def _scope_has_protected_base(scope: Any, protected_refs: frozenset[str]) -> bool:
-    return (
-        getattr(scope, "destination_ref", None) in protected_refs
-        or f"refs/heads/{getattr(scope, 'base_ref', '')}" in protected_refs
-    )
 
 
 def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
@@ -10925,16 +10916,14 @@ def _lease_head_is_author_attested(
     lease: Any = None,
     ifc_state: Any = None,
 ) -> bool:
-    """Verify HEAD against the attested head and the observed protected base."""
+    """Verify HEAD against the attested head and the forge-observed base."""
     from collections import Counter
 
     from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
     hooks = selected_policy_registry().policy_consumer_hooks
     if hooks is None:
         return False
-    _BASE_CONFIG, _DEFAULT_GIT, _PROTECTED_BRANCH_REFS = (
-        hooks.git_config, hooks.git_binary, hooks.protected_refs,
-    )
+    _BASE_CONFIG, _DEFAULT_GIT = hooks.git_config, hooks.git_binary
     _sanitized_git_env, hardened_git_command = hooks.git_env, hooks.git_command
 
     def run(*arguments: str):
@@ -10973,9 +10962,8 @@ def _lease_head_is_author_attested(
         if current_head.lower() == expected_head.lower():
             return True
         base = getattr(scope, "observed_base_sha", "").lower()
-        protected_base = (
-            _scope_has_protected_base(scope, _PROTECTED_BRANCH_REFS)
-            and len(base) == 40 and all(c in "0123456789abcdef" for c in base)
+        verified_base = (
+            len(base) == 40 and all(c in "0123456789abcdef" for c in base)
             and (
                 base == getattr(lease, "base_sha", "").lower()
                 or (
@@ -10985,10 +10973,10 @@ def _lease_head_is_author_attested(
                 )
             )
         )
-        if protected_base:
+        if verified_base:
             base = lease.base_sha.lower()
         head_ancestor = _lease_ancestor_ok(run("merge-base", "--is-ancestor", expected_head, current_head))
-        base_ancestor = protected_base and _lease_ancestor_ok(run(
+        base_ancestor = verified_base and _lease_ancestor_ok(run(
             "merge-base", "--is-ancestor", base, current_head,
         ))
         if not head_ancestor and not base_ancestor:
@@ -11015,7 +11003,7 @@ def _lease_head_is_author_attested(
             if [committer, committer_email] != [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
                 return _lease_refuse(LeaseAttestationReason.COMMIT_IDENTITY_MISMATCH)
             if len(parents.split()) > 1:
-                # Only a server-authored merge of the exact protected base may
+                # Only a server-authored merge of the exact verified base may
                 # introduce another ancestry. Never accept arbitrary side merges.
                 if not base_ancestor or [author, email] != [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
                     return _lease_refuse(LeaseAttestationReason.MERGE_IDENTITY_MISMATCH)
@@ -11217,6 +11205,8 @@ def protected_result_source(
             retained_checkout=retained_checkout,
         )
         integrity, integrity_effect = anchor.integrity
+        # Offload provenance may add original source ACLs at the backend, but
+        # never raises a conversation_history path above its HOME anchor.
         if anchor is FilesystemReadTrust.AUTHOR_ATTESTATION:
             principal = requester
             domain = "repository"
