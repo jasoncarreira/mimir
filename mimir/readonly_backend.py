@@ -684,6 +684,11 @@ class MimirFilesystemMiddleware(FilesystemMiddleware):
                 message = stock_tool.func(pattern=pattern, runtime=runtime, path=path)
             finally:
                 _read_withheld_notices.reset(token)
+            # The upstream executor can time out before the backend returns.
+            # Attest only its exact fixed error, never an arbitrary glob failure.
+            if (message.status == "error"
+                    and message.content == deepagents_filesystem._glob_timeout_message()):
+                _publish_content_free_error(message.content)
             return self._append_withheld_notices(message, notices)
 
         async def async_glob(
@@ -699,6 +704,9 @@ class MimirFilesystemMiddleware(FilesystemMiddleware):
                 )
             finally:
                 _read_withheld_notices.reset(token)
+            if (message.status == "error"
+                    and message.content == deepagents_filesystem._glob_timeout_message()):
+                _publish_content_free_error(message.content)
             return self._append_withheld_notices(message, notices)
 
         for wrapper in (sync_glob, async_glob):
@@ -1495,15 +1503,14 @@ class _BoundedFilesystemBackend(FilesystemBackend):
             truncated=truncated is not None,
             reason=truncated,
         )
-        return GlobResult(
-            error=(
+        if truncated and truncated.startswith("ran longer than"):
+            error = (
                 f"glob timed out after {timeout_seconds:g}s; results are incomplete; "
                 "narrow the path or pattern"
-                if truncated and truncated.startswith("ran longer than") else None
-            ),
-            matches=results,
-            truncated=truncated is not None,
-        )
+            )
+            _publish_content_free_error(error)
+            return GlobResult(error=error, matches=[], truncated=True)
+        return GlobResult(matches=results, truncated=truncated is not None)
 
     def ls(self, path: str) -> LsResult:
         """List direct children, omitting excluded traversal roots by default."""
