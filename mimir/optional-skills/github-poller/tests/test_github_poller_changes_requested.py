@@ -1530,7 +1530,9 @@ def test_unresolvable_trust_skips_the_pr_instead_of_marking_it_untrusted(
     assert count == 0
     assert calls == [], "an attestation was made past the hard deadline"
     assert surfaced == set(), "unresolved trust was recorded as untrusted"
-    assert emitted == [], "unresolved trust emitted a verdict"
+    assert emitted == [{"repo": "o/r", "number": 700, "cause": "budget_exhausted"}], (
+        "unresolved trust should only emit a content-free diagnostic"
+    )
     assert spent.hard_truncated is True, "watermark not held for a skipped PR"
 
 

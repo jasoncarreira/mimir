@@ -524,6 +524,32 @@ _github_fire_attestation: contextvars.ContextVar[_GithubFireAttestation | None] 
 _github_attestation_failure: contextvars.ContextVar[str | None] = (
     contextvars.ContextVar("github_attestation_failure", default=None)
 )
+_github_author_trust_cause: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar("github_author_trust_cause", default=None)
+)
+_github_author_diagnostic_sink: contextvars.ContextVar[Any] = (
+    contextvars.ContextVar("github_author_diagnostic_sink", default=None)
+)
+GITHUB_AUTHOR_FAILURE_CLASSES = frozenset({
+    "budget", "timeout", "transport", "malformed_payload", "unexpected_status",
+})
+GITHUB_AUTHOR_UNAVAILABLE_CAUSES = frozenset({
+    "budget_exhausted", "deadline_exceeded", "author_unresolved",
+}) | frozenset(
+    f"{request}_{failure}" for request in ("collaborator", "membership")
+    for failure in GITHUB_AUTHOR_FAILURE_CLASSES
+)
+
+
+def bounded_github_author_cause(cause: object) -> str:
+    """Never serialize free-form GitHub failures as durable refusal causes."""
+    return (cause if isinstance(cause, str) and cause in GITHUB_AUTHOR_UNAVAILABLE_CAUSES
+            else "author_unresolved")
+
+
+def github_author_trust_cause() -> str | None:
+    """Bounded cause of the last unavailable author verdict in this context."""
+    return _github_author_trust_cause.get()
 
 
 def _github_api_attestation(
@@ -584,6 +610,7 @@ def _github_author_is_trusted(
     two attestation requests this makes; see ``_github_content_author`` for why
     callers on a budget must pass it.
     """
+    _github_author_trust_cause.set(None)
     if not isinstance(repo, str) or not isinstance(author, str):
         return False
     parts = repo.split("/")
@@ -598,6 +625,18 @@ def _github_author_is_trusted(
         return False
 
     def unavailable(request: str, failure_class: str) -> None:
+        failure_class = (failure_class if failure_class in GITHUB_AUTHOR_FAILURE_CLASSES
+                         else "transport")
+        _github_author_trust_cause.set(f"{request}_{failure_class}")
+        sink = _github_author_diagnostic_sink.get()
+        if sink is not None:
+            try:
+                sink(
+                    "github_author_attestation_unavailable", repository=repo,
+                    author=author, request=request, failure_class=failure_class,
+                )
+            except Exception:
+                pass  # Diagnostics must never change a trust verdict.
         try:
             get_logger().log_sync(
                 "github_author_attestation_unavailable",
@@ -668,7 +707,8 @@ def _github_content_author(
     path = [urllib.parse.unquote(value) for value in parsed.path.split("/") if value]
     if len(parts) != 2 or parsed.hostname not in {"github.com", "www.github.com"}:
         return None
-    if len(path) < 4 or path[:2] != parts or path[2] not in {"issues", "pull"}:
+    if (len(path) < 4 or [value.casefold() for value in path[:2]]
+        != [value.casefold() for value in parts] or path[2] not in {"issues", "pull"}):
         return None
     number = path[3]
     if not number.isdigit():

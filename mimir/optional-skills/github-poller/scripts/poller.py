@@ -146,7 +146,10 @@ _ensure_mimir_import_path()
 # what makes the collaborator-only review filter work; if they cannot be imported
 # the poller must fail rather than run without the filter, because "no filter"
 # means auto-reviewing every author's PR — the exact behaviour #1022 removed.
-from mimir.pollers import _github_author_is_trusted, _github_content_author
+from mimir.pollers import (
+    _github_author_is_trusted, _github_content_author, github_author_trust_cause,
+    bounded_github_author_cause, _github_author_diagnostic_sink,
+)
 from mimir.ci_logs import capture_job_log, clean_log_tail
 from mimir.ci_attention import classify_cancelled_run
 from mimir.github_withhold import partition, sanitize_login, sanitize_url
@@ -1061,11 +1064,28 @@ def _emit_signal(signal_type: str, **extras: object) -> None:
     )
 
 
+def _forward_author_diagnostic(signal_type: str, **fields: object) -> None:
+    _emit_signal(
+        signal_type, repository=fields["repository"],
+        author=sanitize_login(fields["author"]), request=fields["request"],
+        failure_class=fields["failure_class"],
+    )
+
+
 #: Ceiling for one trust lookup, matching `_github_api_attestation`'s own
 #: `timeout` default in `mimir.pollers`. That default is a socket-operation
 #: timeout, not a total one, so it is enforced here with a real wall-clock
 #: deadline rather than trusted as a bound.
 TRUST_ATTESTATION_TIMEOUT_SECONDS = 10.0
+_PR_TRUST_CAUSE: str | None = None
+
+
+def _pr_trust_unavailable(cause: str, repo: str, number: int) -> None:
+    """Retain and report a retryable cause even when admission skips the PR."""
+    global _PR_TRUST_CAUSE
+    _PR_TRUST_CAUSE = cause
+    _emit_signal("github_pr_author_attestation_unavailable", repo=repo, number=number,
+                 cause=cause)
 
 
 def _pr_author_is_trusted(
@@ -1090,6 +1110,9 @@ def _pr_author_is_trusted(
     ``_gh_api``'s subprocess, so it needs its own budget plumbing — bounding only
     the `gh api` transport left this one free to overrun the tick.
     """
+    global _PR_TRUST_CAUSE
+    _PR_TRUST_CAUSE = None
+
     def _allowance() -> float | None:
         """Wall-clock seconds this lookup may take, or None to skip it."""
         if tick_budget is None:
@@ -1103,6 +1126,7 @@ def _pr_author_is_trusted(
     if author_key not in trust_cache:
         allowed = _allowance()
         if allowed is None:
+            _pr_trust_unavailable("budget_exhausted", repo, number)
             return None
         try:
             with _wall_clock_deadline(allowed):
@@ -1115,10 +1139,12 @@ def _pr_author_is_trusted(
             # Unresolved, not untrusted — see the tri-state note above. Do not
             # cache: the next tick should retry rather than inherit a verdict
             # produced by a timeout.
+            _pr_trust_unavailable("deadline_exceeded", repo, number)
             return None
         if resolved is None:
             # Transport failure or malformed response is unresolved, not an
             # authoritative untrusted verdict. Do not cache it; retry next tick.
+            _pr_trust_unavailable("author_unresolved", repo, number)
             return None
         trust_cache[author_key] = resolved
     author = trust_cache[author_key]
@@ -1126,14 +1152,20 @@ def _pr_author_is_trusted(
     if trust_key not in trust_cache:
         allowed = _allowance()
         if allowed is None:
+            _pr_trust_unavailable("budget_exhausted", repo, number)
             return None
         try:
             with _wall_clock_deadline(allowed):
                 trusted = _github_author_is_trusted(repo, author, token)
         except _DeadlineExceeded:
+            _pr_trust_unavailable("deadline_exceeded", repo, number)
             return None
         if trusted is None:
             # Preserve the transport's unavailable state separately from False.
+            cause = bounded_github_author_cause(github_author_trust_cause())
+            if cause == "author_unresolved":
+                cause = "collaborator_transport"
+            _pr_trust_unavailable(cause, repo, number)
             return None
         trust_cache[trust_key] = trusted
     return trust_cache[trust_key] is True
@@ -1238,6 +1270,7 @@ def _pr_scope_fields(
     )
     return {
         "pr_author_is_trusted": verdict,
+        "pr_author_trust_cause": (_PR_TRUST_CAUSE or "author_unresolved") if verdict is None else None,
         "head_repo": head_repo or None,
         "head_remote": "origin" if head_repo.lower() == repo.lower() else "source",
         "head_ref": head.get("ref"),
@@ -3537,6 +3570,7 @@ def _seed_state_gitignore() -> None:
 
 
 def main() -> None:
+    _github_author_diagnostic_sink.set(_forward_author_diagnostic)
     _seed_state_gitignore()
     repos_str = os.environ.get("GITHUB_REPOS", "").strip()
     if not repos_str:

@@ -2911,6 +2911,79 @@ def test_github_public_read_permission_does_not_establish_collaborator_trust(
     ]
 
 
+def test_pr_opened_url_resolves_owner_despite_repository_case(monkeypatch):
+    calls = []
+    def api(endpoint, token):
+        calls.append(endpoint)
+        return 200, {"user": {"login": "jasoncarreira"}}
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", api)
+    assert _github_content_author(
+        "JasonCarreira/feature-factory", {
+            "event_type": "pr_opened",
+            "url": "https://github.com/jasoncarreira/FEATURE-FACTORY/pull/404",
+        }, "token",
+    ) == "jasoncarreira"
+    assert calls == ["repos/JasonCarreira/feature-factory/issues/404"]
+
+
+def test_pr_opened_url_from_another_repository_cannot_resolve_author(monkeypatch):
+    api = Mock(side_effect=AssertionError("foreign URL must not reach GitHub"))
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", api)
+    assert _github_content_author("acme/widget", {
+        "event_type": "pr_opened", "url": "https://github.com/acme/other/pull/404",
+    }, "token") is None
+    api.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_poller_side_unavailable_author_diagnostic_reaches_server_log(
+    tmp_path: Path, home: Path,
+) -> None:
+    """Execute the skill's real trust resolver in a child, then read server events."""
+    script = (Path(__file__).resolve().parents[1] / "mimir" / "optional-skills"
+              / "github-poller" / "scripts" / "poller.py")
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f'''
+import runpy
+from mimir import pollers
+p = runpy.run_path({str(script)!r})
+# The function's globals are the runpy namespace, not the returned copy.
+resolver = p["_pr_author_is_trusted"]
+resolver.__globals__["_github_content_author"] = lambda *args: "owner"
+pollers._github_author_diagnostic_sink.set(p["_forward_author_diagnostic"])
+def api(endpoint, token):
+    pollers._github_attestation_failure.set("timeout")
+    return None
+pollers._github_api_attestation = api
+assert resolver("acme/widget", 42, "https://github.com/acme/widget/pull/42", "token", {{}}) is None
+def membership_api(endpoint, token):
+    if endpoint.startswith("repos/"):
+        return 404, None
+    pollers._github_attestation_failure.set("transport")
+    return None
+pollers._github_api_attestation = membership_api
+assert pollers._github_author_is_trusted("acme/widget", "owner", "token") is None
+''')
+    cfg = PollerConfig(
+        name="github-activity", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=tmp_path / "persist" / "github-activity",
+    )
+    assert await run_poller(cfg, enqueue=_CapturingEnqueue(), home=home) == 0
+    events = [event for event in _read_events(home)
+              if event["type"] == "github_author_attestation_unavailable"]
+    assert [{key: event[key] for key in ("poller", "repository", "author", "request", "failure_class")}
+            for event in events] == [{
+                "poller": "github-activity", "repository": "acme/widget", "author": "owner",
+                "request": request, "failure_class": failure,
+            } for request, failure in (("collaborator", "timeout"), ("membership", "transport"))]
+    [pr_failure] = [event for event in _read_events(home)
+                    if event["type"] == "github_pr_author_attestation_unavailable"]
+    assert (pr_failure["repo"], pr_failure["number"], pr_failure["cause"]) == (
+        "acme/widget", 42, "collaborator_timeout",
+    )
+
+
 @pytest.mark.asyncio
 async def test_github_poller_mixing_uses_least_server_attested_trust(
     tmp_path: Path,
