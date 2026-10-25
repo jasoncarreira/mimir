@@ -342,6 +342,7 @@ def main() -> None:
             # The worker exists only in a Cultivate image; select the in-repo
             # plugin so this proof exercises it from the same commit.
             "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate",
+            "--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build",
             "--tag", IMAGE, ".",
         ], timeout=1200)
         run([

@@ -7,7 +7,8 @@
 # PyPI.
 #
 # Cultivate (the coding provider) is not published to an index. Select it with
-# ``--build-arg MIMIR_PLUGIN_SELECTION=cultivate``: the image then installs core
+# ``--build-arg MIMIR_PLUGIN_SELECTION=cultivate`` together with
+# ``--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build``: the image installs core
 # AND the in-repo ``plugins/cultivate`` workspace member from the verified
 # MIMIR_CONTROLLER_COMMIT, into both the controller venv and the root worker
 # venv, so the plugin always runs with the core of its own commit. Without the
@@ -37,6 +38,9 @@
 # ECR Public mirrors the same Docker Official Image; switch back with
 # --build-arg BASE_IMAGE=python:3.11-slim if needed.
 ARG BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim
+# BuildKit resolves stage dependencies before RUN shell conditions. Keep the
+# Rust builder unreachable unless the caller explicitly selects its artifact.
+ARG CHAINLINK_ARTIFACT_STAGE=chainlink-none
 FROM ${BASE_IMAGE} AS provenance-validation
 
 # Every canonical image must identify one remote ref and the exact commit it is
@@ -83,6 +87,13 @@ RUN set -eu; \
     CARGO_BUILD_JOBS=1 cargo install --locked \
         --git https://github.com/dollspace-gay/chainlink.git \
         --rev "$CHAINLINK_COMMIT" --root /usr/local chainlink-tracker
+
+# A bind-mount source must exist even when core skips installing the artifact.
+# The empty placeholder is rejected if Cultivate is selected without its builder.
+FROM provenance-validation AS chainlink-none
+RUN touch /usr/local/bin/chainlink
+
+FROM ${CHAINLINK_ARTIFACT_STAGE} AS chainlink-artifact
 
 FROM provenance-validation AS base
 COPY plugins/cultivate/mimir_cultivate/docker/ /opt/cultivate-docker/
@@ -172,10 +183,13 @@ RUN set -eu; \
         fi; \
     done; IFS="$old_ifs"; \
     printf '%s\n' "$selected" > /opt/cultivate-docker/selected
-# BuildKit binds the artifact without adding it (or its toolchain) to a core-only
-# image layer. World-executable mode lets both mimir and worklink invoke it.
-RUN --mount=type=bind,from=chainlink-build,source=/usr/local/bin/chainlink,target=/tmp/chainlink,ro \
+# Core binds only the placeholder, so BuildKit never schedules chainlink-build.
+# World-executable mode lets both mimir and worklink invoke the selected binary.
+RUN --mount=type=bind,from=chainlink-artifact,source=/usr/local/bin/chainlink,target=/tmp/chainlink,ro \
     if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        if ! test -s /tmp/chainlink; then \
+            echo >&2 "Cultivate requires --build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build"; exit 2; \
+        fi; \
         install -m 0755 /tmp/chainlink /usr/local/bin/chainlink; \
     fi
 # Core-only images create just the controller user; the worklink identity and

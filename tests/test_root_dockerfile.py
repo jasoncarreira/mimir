@@ -270,7 +270,7 @@ def test_cultivate_chainlink_is_pinned_and_kept_out_of_core_runtime() -> None:
     assert "CARGO_BUILD_JOBS=1" in builder
     assert "COPY --from=chainlink-build" not in runtime
     assert "cargo install" not in runtime and "rustup" not in runtime
-    assert "--mount=type=bind,from=chainlink-build,source=/usr/local/bin/chainlink" in runtime
+    assert "--mount=type=bind,from=chainlink-artifact,source=/usr/local/bin/chainlink" in runtime
 
 
 @pytest.mark.parametrize("commit,toolchain,exit_code", [
@@ -289,10 +289,65 @@ def test_chainlink_builder_rejects_floating_build_args(commit, toolchain, exit_c
     assert result.returncode == exit_code, result.stderr
 
 
-@pytest.mark.parametrize("selected", ["0", "1"])
-def test_chainlink_install_and_version_check_follow_cultivate_selection(tmp_path, selected) -> None:
+def _runtime_stage_dependencies(text: str, **build_args: str) -> set[str]:
+    """Walk FROM, COPY and bind-mount edges, not conditional shell branches."""
+    global_args = dict(re.findall(r"(?m)^ARG (\w+)=(.*)$", text.split("\nFROM ", 1)[0]))
+    global_args.update(build_args)
+    graph: dict[str, set[str]] = {}
+    current = None
+    for line in text.splitlines():
+        stage = re.fullmatch(r"FROM (\S+) AS (\S+)", line)
+        if stage:
+            parent, current = stage.groups()
+            parent = re.sub(r"\$\{(\w+)\}", lambda m: global_args[m[1]], parent)
+            graph[current] = {parent}
+        elif current is not None:
+            graph[current].update(re.findall(r"(?:--from=|\bfrom=)([\w-]+)", line))
+    assert current is not None
+    pending, seen = [current], set()
+    while pending:
+        stage = pending.pop()
+        if stage not in seen:
+            seen.add(stage)
+            pending.extend(graph.get(stage, ()))
+    return seen
+
+
+def _assert_core_skips_chainlink_builder(text: str) -> None:
+    reachable = _runtime_stage_dependencies(text)
+    assert "chainlink-none" in reachable
+    assert "chainlink-build" not in reachable, "core build schedules the Rust builder"
+
+
+def test_chainlink_builder_is_only_reachable_when_explicitly_selected() -> None:
+    text = DOCKERFILE.read_text()
+    _assert_core_skips_chainlink_builder(text)
+    reachable = _runtime_stage_dependencies(text, CHAINLINK_ARTIFACT_STAGE="chainlink-build")
+    assert "chainlink-build" in reachable
+    assert "chainlink-none" not in reachable
+    # Pin the live Docker proof's selection as well as the documented invocation.
+    proof = (ROOT / "scripts/worklink_image_identity.py").read_text()
+    assert '"--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate"' in proof
+    assert '"--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build"' in proof
+
+
+@pytest.mark.parametrize("old,new", [
+    ("from=chainlink-artifact,", "from=chainlink-build,"),
+    ("ARG CHAINLINK_ARTIFACT_STAGE=chainlink-none", "ARG CHAINLINK_ARTIFACT_STAGE=chainlink-build"),
+    ("FROM ${CHAINLINK_ARTIFACT_STAGE} AS chainlink-artifact", "FROM chainlink-build AS chainlink-artifact"),
+])
+def test_core_dependency_guard_detects_unconditional_builder_edges(old, new) -> None:
+    text = DOCKERFILE.read_text()
+    assert old in text
+    with pytest.raises(AssertionError):
+        _assert_core_skips_chainlink_builder(text.replace(old, new))
+
+
+@pytest.mark.parametrize("selected,artifact", [("0", "binary"), ("1", "binary"),
+                                                ("0", "placeholder"), ("1", "placeholder")])
+def test_chainlink_install_and_version_check_follow_cultivate_selection(tmp_path, selected, artifact) -> None:
     programs = _run_instructions(DOCKERFILE.read_text())
-    install_program, = (p for p in programs if p.startswith("--mount=type=bind,from=chainlink-build,"))
+    install_program, = (p for p in programs if p.startswith("--mount=type=bind,from=chainlink-artifact,"))
     version_program, = (p for p in programs if "chainlink --version" in p)
     assert "install -m 0755 /tmp/chainlink /usr/local/bin/chainlink" in install_program
     assert "chainlink --version" in version_program
@@ -300,8 +355,14 @@ def test_chainlink_install_and_version_check_follow_cultivate_selection(tmp_path
     marker = tmp_path / "selected"
     marker.write_text(selected + "\n")
     source = tmp_path / "built-chainlink"
-    source.write_text('#!/bin/sh\n[ "$1" = --version ] && printf "%s\\n" "chainlink 1.6.0"\n')
-    source.chmod(0o755)
+    if artifact == "placeholder":
+        placeholder, = (p for p in programs if p == "touch /usr/local/bin/chainlink")
+        subprocess.run(["/bin/sh", "-ceu", placeholder.replace("/usr/local/bin/chainlink", str(source))],
+                       check=True)
+        assert source.stat().st_size == 0
+    else:
+        source.write_text('#!/bin/sh\n[ "$1" = --version ] && printf "%s\\n" "chainlink 1.6.0"\n')
+        source.chmod(0o755)
     binary = tmp_path / "bin/chainlink"
     binary.parent.mkdir()
     install_program = install_program.split("\n", 1)[1].replace(
@@ -310,6 +371,11 @@ def test_chainlink_install_and_version_check_follow_cultivate_selection(tmp_path
     version_program = version_program.replace("/opt/cultivate-docker/selected", str(marker))
     env = {**os.environ, "PATH": f"{binary.parent}:/usr/bin:/bin"}
     result = subprocess.run(["/bin/sh", "-ceu", install_program], env=env, capture_output=True, text=True)
+    if selected == "1" and artifact == "placeholder":
+        assert result.returncode == 2
+        assert "Cultivate requires --build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build" in result.stderr
+        assert not binary.exists()
+        return
     assert result.returncode == 0, result.stderr
     assert binary.exists() is (selected == "1")
     if selected == "1":
@@ -407,8 +473,10 @@ def test_runtime_preloads_jemalloc_via_arch_independent_symlink() -> None:
     assert "-linux-gnu/libjemalloc" not in text, "LD_PRELOAD must not hardcode an arch path"
 
 
-def _assert_provenance_stage_ancestry(text: str) -> None:
+def _assert_provenance_stage_ancestry(text: str, **build_args: str) -> None:
     """Every build target must inherit the validation RUN, not merely copy it."""
+    global_args = dict(re.findall(r"(?m)^ARG (\w+)=(.*)$", text.split("\nFROM ", 1)[0]))
+    global_args.update(build_args)
     # Join Docker continuation lines before reading instructions. FROM supports
     # an optional platform flag and optional alias; unnamed stages still have
     # numeric indexes that later FROM instructions may inherit.
@@ -433,6 +501,7 @@ def _assert_provenance_stage_ancestry(text: str) -> None:
     aliases: set[str] = set()
     for index, (parent, alias) in enumerate(stages):
         if index:
+            parent = re.sub(r"\$\{(\w+)\}", lambda m: global_args.get(m[1], m[0]), parent)
             assert parent.lower() in validated, (
                 f"stage {alias or index} bypasses provenance-validation: FROM {parent}"
             )
@@ -447,7 +516,15 @@ def _assert_provenance_stage_ancestry(text: str) -> None:
 
 
 def test_every_image_stage_inherits_provenance_validation() -> None:
-    _assert_provenance_stage_ancestry(_text())
+    for artifact in ("chainlink-none", "chainlink-build"):
+        _assert_provenance_stage_ancestry(_text(), CHAINLINK_ARTIFACT_STAGE=artifact)
+
+
+def test_provenance_stage_ancestry_rejects_external_artifact_default() -> None:
+    text = _text().replace("ARG CHAINLINK_ARTIFACT_STAGE=chainlink-none",
+                           "ARG CHAINLINK_ARTIFACT_STAGE=python:3.11-slim")
+    with pytest.raises(AssertionError, match="bypasses provenance-validation"):
+        _assert_provenance_stage_ancestry(text)
 
 
 def test_provenance_stage_ancestry_accepts_transitive_and_numeric_parents() -> None:
