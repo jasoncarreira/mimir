@@ -10,8 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from .saga.paths import resolve_saga_config, resolve_saga_db_path
-
 if TYPE_CHECKING:
     from .agent import Agent
     from .bridges.base import SendResult
@@ -181,6 +179,20 @@ class AgentRuntimeBundle:
                 name="agent-runtime-close",
             )
         await asyncio.shield(self._close_task)
+
+
+def resolve_saga_config(home: Path) -> tuple[Path | None, str]:
+    """Compatibility wrapper; importing runtime must not initialize Saga."""
+    from .saga.paths import resolve_saga_config as resolve
+
+    return resolve(home)
+
+
+def resolve_saga_db_path(home: Path, *, db_path: str | Path | None = None) -> Path:
+    """Resolve storage lazily through the shared, non-creating helper."""
+    from .saga.paths import resolve_saga_db_path as resolve
+
+    return resolve(home, db_path=db_path)
 
 
 def create_core_services(config: Config) -> CoreServices:

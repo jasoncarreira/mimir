@@ -604,6 +604,25 @@ def test_runtime_public_two_phase_api() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_runtime_import_does_not_load_saga() -> None:
+    """Observe the import graph in a fresh process, not pytest's shared cache."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import mimir.runtime; "
+            "assert not any(name == 'mimir.saga' or name.startswith('mimir.saga.') "
+            "for name in sys.modules), 'runtime eagerly imported Saga'",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_core_phase_contains_only_adapter_prerequisites(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -742,6 +761,31 @@ def test_core_preserves_saga_config_and_db_path_behavior(
     expected = Path(db_name or "saga.db")
     assert core.saga_db_path == tmp_path / ".mimir" / expected
     assert "SAGA_CONFIG" not in os.environ
+
+
+def test_resolve_saga_config_lazy_wrapper_preserves_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    assert runtime.resolve_saga_config(tmp_path) == (None, "defaults")
+    home_config = tmp_path / "saga.toml"
+    home_config.write_text('[storage]\ndb_path = "home.db"\n')
+    assert runtime.resolve_saga_config(tmp_path) == (home_config, "home")
+    operator_config = tmp_path / "operator.toml"
+    monkeypatch.setenv("SAGA_CONFIG", str(operator_config))
+    assert runtime.resolve_saga_config(tmp_path) == (operator_config, "env")
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_resolve_saga_db_path_lazy_wrapper_forwards_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, absolute: bool,
+) -> None:
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    db_path = tmp_path / "explicit.db" if absolute else Path("nested/explicit.db")
+    expected = db_path if absolute else tmp_path / ".mimir" / db_path
+    assert runtime.resolve_saga_db_path(tmp_path, db_path=db_path) == expected
+    assert not expected.exists()
+    assert not (tmp_path / ".mimir").exists()
 
 
 @pytest.mark.parametrize("reverse", [False, True])
