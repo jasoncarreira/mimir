@@ -397,8 +397,12 @@ class GitHubForgeClient:
         items: list[Mapping[str, Any]] = []
         separator = "&" if "?" in endpoint else "?"
         offset = 0
+        page_size = 50
         for _ in range(_MAX_PAGES):
-            page_size = min(50, max(limit - len(items), 1)) if limit is not None else 50
+            # Filtering may reject every row, so retain scan depth independently
+            # of the output limit. Keep any size reduction across later pages.
+            if limit is not None and not merged_only and predicate is None:
+                page_size = min(page_size, max(limit - len(items), 1))
             while True:
                 # GitHub's page number is relative to per_page. Recompute it
                 # after each shrink and discard any overlap with prior pages.
@@ -585,7 +589,8 @@ class GitHubForgeClient:
 
         rows = self._paginate(
             f"/repos/{repository}/pulls?{urlencode(query)}",
-            limit=limit, merged_only=state == "merged", predicate=matches,
+            limit=limit, merged_only=state == "merged",
+            predicate=matches if any(value is not None for value in (head, author, merged_since)) else None,
         )
         return tuple(
             PullRequestSummary(

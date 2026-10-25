@@ -318,7 +318,7 @@ def test_pr_list_qualifies_bare_head_and_drops_wrong_branch_before_limit():
 def test_pr_list_applies_filters_before_limit_across_pages(selector):
     from datetime import datetime, timezone
 
-    excluded = [_pr_row(0, merged=True)]
+    excluded = [_pr_row(n, merged=True) for n in range(50)]
     for item in excluded:
         item["user"]["login"] = "other"
         item["merged_at"] = "2026-09-01T00:00:00Z"
@@ -376,7 +376,7 @@ def test_pr_list_uses_fixed_endpoint_query_and_filters_merged_before_limit():
     assert len(result[0].title) == 1024
     assert session.calls[0][0:2] == (
         "GET", "https://api.github.com/repos/owner/repo/pulls?"
-        "state=closed&sort=updated&direction=desc&base=main&head=fork%3Atopic&per_page=1&page=1",
+        "state=closed&sort=updated&direction=desc&base=main&head=fork%3Atopic&per_page=50&page=1",
     )
 
 
@@ -408,18 +408,44 @@ def test_pr_list_limit_one_avoids_oversized_fifty_item_page():
     assert _page_params(session) == [(1, 1)]
 
 
-def test_pr_list_merged_only_walks_past_full_small_unmatched_page():
-    session = PagingSession([
-        _pr_row(0), _pr_row(1), _pr_row(2, merged=True),
-    ])
+@pytest.mark.parametrize("selector", ["merged", "author", "head", "merged_since"])
+def test_pr_list_filtered_limit_one_preserves_scan_depth(selector):
+    from datetime import datetime, timezone
+
+    rows = [_pr_row(n) for n in range(21)]
+    kwargs = {"state": "all"}
+    if selector == "merged":
+        kwargs["state"] = "merged"
+        rows[-1] = _pr_row(20, merged=True)
+    elif selector == "author":
+        kwargs["author"] = "wanted"
+        rows[-1]["user"]["login"] = "wanted"
+    elif selector == "head":
+        kwargs["head"] = "wanted"
+        rows[-1]["head"]["ref"] = "wanted"
+    else:
+        kwargs["merged_since"] = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        rows[-1] = _pr_row(20, merged=True)
+    session = PagingSession(rows)
     result = GitHubForgeClient(session=session).list_pull_requests(
-        "owner/repo", state="merged", limit=2,
+        "owner/repo", limit=1, **kwargs,
     )
-    assert [row.number for row in result] == [2]
-    assert _page_params(session) == [(2, 1), (2, 2)]
+    assert [row.number for row in result] == [20]
+    assert _page_params(session) == [(50, 1)]
 
 
-def test_pr_list_remainder_page_size_keeps_its_place_after_filtering():
+def test_pr_list_merged_only_walks_past_full_small_unmatched_page():
+    rows = [{**_pr_row(n), "body": "x" * 20_000} for n in range(40)]
+    rows[25]["merged_at"] = "2026-10-02T00:00:00Z"
+    session = PagingSession(rows)
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="merged", limit=1,
+    )
+    assert [row.number for row in result] == [25]
+    assert _page_params(session) == [(50, 1), (25, 1), (25, 2)]
+
+
+def test_pr_list_filtered_page_size_is_not_capped_by_remaining_matches():
     rows = [_pr_row(n) for n in range(5)]
     for row in rows[1:3]:
         row["user"]["login"] = "other"
@@ -428,17 +454,21 @@ def test_pr_list_remainder_page_size_keeps_its_place_after_filtering():
         "owner/repo", state="all", author="author", limit=3,
     )
     assert [row.number for row in result] == [0, 3, 4]
-    assert _page_params(session) == [(3, 1), (2, 2), (1, 5)]
+    assert _page_params(session) == [(50, 1)]
 
 
-def test_pr_list_shrinks_oversized_page_without_skipping_rows():
-    rows = [{**_pr_row(n), "body": "x" * 20_000} for n in range(50)]
+@pytest.mark.parametrize("limit", [50, 51])
+def test_pr_list_shrinks_oversized_page_without_skipping_rows(limit):
+    rows = [{**_pr_row(n), "body": "x" * 20_000} for n in range(75)]
     session = PagingSession(rows)
     result = GitHubForgeClient(session=session).list_pull_requests(
-        "owner/repo", state="all", limit=50,
+        "owner/repo", state="all", limit=limit,
     )
-    assert [row.number for row in result] == list(range(50))
-    assert _page_params(session) == [(50, 1), (25, 1), (25, 2)]
+    assert [row.number for row in result] == list(range(limit))
+    expected = [(50, 1), (25, 1), (25, 2)]
+    if limit == 51:
+        expected.append((1, 51))
+    assert _page_params(session) == expected
 
 
 def test_pr_list_refuses_single_oversized_item_after_shrinking():
@@ -454,7 +484,21 @@ def test_review_list_shrinks_oversized_unlimited_pages():
     session = PagingSession([{"id": n, "body": "x" * 30_000} for n in range(1, 51)])
     result = GitHubForgeClient(session=session).list_reviews(_scope())
     assert [review.id for review in result] == [str(n) for n in range(1, 51)]
-    assert _page_params(session) == [(50, 1), (25, 1), (50, 1), (25, 2), (50, 2)]
+    assert _page_params(session) == [(50, 1), (25, 1), (25, 2), (25, 3)]
+
+
+def test_review_list_later_shrink_discards_overlap_without_losing_rows():
+    rows = [
+        {"id": n + 1, "body": "small" if n < 50 else "x" * 50_000}
+        for n in range(100)
+    ]
+    session = PagingSession(rows)
+    result = GitHubForgeClient(session=session).list_reviews(_scope())
+    assert [review.id for review in result] == [str(n) for n in range(1, 101)]
+    assert _page_params(session) == [
+        (50, 1), (50, 2), (25, 3), (12, 5),
+        (12, 6), (12, 7), (12, 8), (12, 9),
+    ]
 
 
 def _search_row(number, *, merged=False):
