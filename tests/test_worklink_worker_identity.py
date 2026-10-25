@@ -130,6 +130,64 @@ def test_image_proof_passes_the_github_remote_ref(monkeypatch) -> None:
     assert 'f"MIMIR_GIT_REF={git_ref}"' in (ROOT / "scripts/worklink_image_identity.py").read_text()
 
 
+@pytest.mark.parametrize("mutation", [None, "uid", "home", "user", "logname", "legacy"])
+def test_image_proof_checks_shipped_controller_identity_before_build(
+    monkeypatch, tmp_path, mutation
+) -> None:
+    """Exercise main's real preflight, stopping only at the Docker build boundary."""
+    import subprocess
+
+    namespace = runpy.run_path(ROOT / "scripts/worklink_image_identity.py")
+    service = (ROOT / "deploy/s6-overlay/s6-rc.d/mimir/run").read_text()
+    replacements = {
+        "uid": ("s6-setuidgid mimir", "s6-setuidgid root"),
+        "home": ("HOME=/home/mimir", "HOME=/root"),
+        "user": ("USER=mimir", "USER=root"),
+        "logname": ("LOGNAME=mimir", "LOGNAME=root"),
+        "legacy": ("env HOME=/home/mimir USER=mimir LOGNAME=mimir", ""),
+    }
+    if mutation is not None:
+        old, new = replacements[mutation]
+        assert old in service
+        service = service.replace(old, new)
+    target = tmp_path / "deploy/s6-overlay/s6-rc.d/mimir/run"
+    target.parent.mkdir(parents=True)
+    target.write_text(service)
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/proof")
+    monkeypatch.setenv("MIMIR_GIT_REF", "refs/heads/proof")
+    globals_ = namespace["main"].__globals__
+    monkeypatch.setitem(globals_, "ROOT", tmp_path)
+
+    class BuildReached(Exception):
+        pass
+
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["docker", "build"]:
+            raise BuildReached
+        assert args in (
+            ["docker", "info"],
+            ["git", "rev-parse", "HEAD"],
+            ["git", "status", "--porcelain=v1"],
+        )
+        stdout = "a" * 40 if args == ["git", "rev-parse", "HEAD"] else ""
+        return subprocess.CompletedProcess(args, 0, stdout=stdout)
+
+    monkeypatch.setitem(globals_, "run", run)
+    # main cleans up in finally; this unit regression must never call real Docker.
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: None)
+    if mutation is None:
+        with pytest.raises(BuildReached):
+            namespace["main"]()
+        assert any(args[:2] == ["docker", "build"] for args in calls)
+    else:
+        with pytest.raises(RuntimeError, match="controller s6 service no longer drops"):
+            namespace["main"]()
+        assert not any(args[:2] == ["docker", "build"] for args in calls)
+
+
 def _worker_uid_job() -> dict:
     """Return the parsed ``pytest-worker-uid`` job.
 
