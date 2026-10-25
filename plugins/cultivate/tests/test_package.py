@@ -47,6 +47,10 @@ def test_workspace_metadata_and_manifest() -> None:
     assert manifest["requires_mimir"] == f"=={version}"
     assert set(manifest) == {
         "name", "version", "license", "requires_mimir", "defaults", "optional", "frontend", "themes",
+        "cli",
+    }
+    assert manifest["cli"] == {
+        "cultivate": True, "worklink": False, "opencode-bootstrap": False,
     }
     assert manifest["defaults"]["version"] == version
     assert set(manifest["defaults"]["skills"]) == {
