@@ -90,6 +90,31 @@ def test_repair_bounded_batches_live_provenance_and_rerun(db, provider):
     assert snapshot(db) == after
 
 
+def test_force_reembeds_matching_dimensions_when_model_changes(db, provider):
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE embeddings SET dim=3, vec=?", (struct.pack("<3f", 0, 0, 0),))
+        conn.execute("UPDATE sessions SET embedding_dim=3, embedding=?", (struct.pack("<3f", 0, 0, 0),))
+    assert reembed(db)["atoms_stale"] == 0
+    provider.batch_embed.assert_not_called()
+    report = reembed(db, force=True, batch_size=2)
+    assert report["atoms_updated"] == 4
+    assert report["sessions_updated"] == 5
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM embeddings WHERE provider='live-provider'").fetchone() == (4,)
+        assert conn.execute("SELECT count(*) FROM sessions WHERE embedding=?", (struct.pack("<3f", 1, 2, 3),)).fetchone() == (5,)
+
+
+def test_reembed_repairs_triples_before_provider_switch(db, provider):
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO triples (id, subject, predicate, object, embedding, embedding_dim, created_at) "
+                     "VALUES ('triple-1', 'agent', 'works_at', 'office', ?, 2, 'old')", (struct.pack('<2f', 0, 0),))
+    report = reembed(db)
+    assert report["triples_updated"] == 1
+    assert [call.args[0] for call in provider.batch_embed.call_args_list][-1] == ["agent works at office"]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT embedding_dim FROM triples WHERE id='triple-1'").fetchone() == (3,)
+
+
 def test_dry_run_is_read_only(db, provider):
     before = snapshot(db)
     bytes_before = db.read_bytes()

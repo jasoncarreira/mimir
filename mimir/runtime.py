@@ -182,38 +182,17 @@ class AgentRuntimeBundle:
 
 
 def resolve_saga_config(home: Path) -> tuple[Path | None, str]:
-    """Choose this home's SAGA config without changing process state."""
-    env_config = os.environ.get("SAGA_CONFIG")
-    if env_config:
-        return Path(env_config), "env"
-    home_config = home / "saga.toml"
-    if home_config.exists():
-        return home_config, "home"
-    return None, "defaults"
+    """Compatibility wrapper; importing runtime must not initialize Saga."""
+    from .saga.paths import resolve_saga_config as resolve
+
+    return resolve(home)
 
 
-def resolve_saga_db_path(home: Path) -> Path:
-    """Resolve storage without pinning a home's config in process-global state."""
-    import tomllib
+def resolve_saga_db_path(home: Path, *, db_path: str | Path | None = None) -> Path:
+    """Resolve storage lazily through the shared, non-creating helper."""
+    from .saga.paths import resolve_saga_db_path as resolve
 
-    from .saga._config_io import _DEFAULTS
-
-    config_path, _ = resolve_saga_config(home)
-    if config_path is not None and config_path.is_file():
-        # Read locally: neither the environment nor SAGA's config singleton
-        # may retain this home's settings for another caller (including threads).
-        try:
-            with config_path.open("rb") as stream:
-                config = tomllib.load(stream)
-        except (OSError, ValueError) as exc:
-            logging.getLogger("saga.config").warning(
-                "Failed to load %s: %s. Using defaults.", config_path, exc
-            )
-            config = {}
-        db_path = Path(config.get("storage", {}).get("db_path", "saga.db"))
-    else:
-        db_path = Path(_DEFAULTS["storage"]["db_path"])
-    return db_path if db_path.is_absolute() else home / ".mimir" / db_path
+    return resolve(home, db_path=db_path)
 
 
 def create_core_services(config: Config) -> CoreServices:

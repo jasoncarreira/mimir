@@ -10,6 +10,41 @@ from tests.timing import HANG_GUARD_SECONDS
 from mimir.saga import _llm
 
 
+def test_openai_key_never_reaches_non_openai_endpoint(monkeypatch, caplog):
+    from mimir.saga import _config_io
+    import requests
+
+    values = {"url": "https://integrate.api.nvidia.com/v1/chat/completions?fixture=saga-key-2011",
+              "api_key_env": "OPENAI_API_KEY", "provider": "openai_compat"}
+    monkeypatch.setattr(_config_io, "get_config", lambda: lambda section, key, default=None:
+                        values.get(key, default) if section == "llm" else default)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-sensitive-key")
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: pytest.fail("key sent to untrusted host"))
+    for _ in range(2):
+        llm = _config_io.resolve_llm_config("annotation")
+        assert llm["api_key"] == ""
+        assert _llm._call_openai_compat(llm, prompt="hello", max_tokens=10, temperature=0, system=None) == ""
+    assert caplog.text.count("Refusing OPENAI_API_KEY") == 1
+    values["url"] = "https://api.openai.com/v1/chat/completions"
+    assert _config_io.resolve_llm_config("annotation")["api_key"] == "test-sensitive-key"
+    assert "test-sensitive-key" not in caplog.text
+
+
+def test_explicit_nvidia_saga_config_keeps_host_specific_key(monkeypatch):
+    from mimir.saga import _config_io
+
+    values = {"url": "https://integrate.api.nvidia.com/v1/chat/completions",
+              "api_key_env": "NVIDIA_NIM_API_KEY", "model": "mistral-test"}
+    monkeypatch.setattr(_config_io, "get_config", lambda: lambda section, key, default=None:
+                        values.get(key, default) if section == "llm" else default)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-test-key")
+    monkeypatch.setenv("NVIDIA_NIM_API_KEY", "nvidia-test-key")
+    effective = _config_io.resolve_llm_config("annotation")
+    assert effective["url"] == values["url"]
+    assert effective["model"] == values["model"]
+    assert effective["api_key"] == "nvidia-test-key"
+
+
 @pytest.fixture
 def claude(monkeypatch):
     state = SimpleNamespace(stage=None, entered=asyncio.Event(), clients=[])

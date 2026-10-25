@@ -18,6 +18,9 @@ import logging
 import os
 import threading
 import time
+import sqlite3
+from pathlib import Path
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import Optional
 
@@ -395,6 +398,75 @@ def reset_provider_cache() -> None:
         cached_embed_query.cache_clear()
 
 
+_dimension_check = threading.local()
+
+
+@contextmanager
+def offline_reembedding():
+    """Allow only the offline repair path to read a mismatched database."""
+    previous = getattr(_dimension_check, "offline", False)
+    _dimension_check.offline = True
+    try:
+        yield
+    finally:
+        _dimension_check.offline = previous
+
+
+def _check_existing_dimensions(dim: int) -> None:
+    """Require the unique plurality dimension, allowing minority legacy drift."""
+    if getattr(_dimension_check, "offline", False):
+        return
+    from contextlib import closing
+    from .paths import resolve_saga_db_path
+
+    dimension_counts: dict[int, int] = {}
+    try:
+        # Match Config.from_env's home rule without loading dotenv/plugins or
+        # calling get_data_dir(), which creates ~/.saga even on read-only homes.
+        home = Path(os.environ.get("MIMIR_HOME") or Path.cwd()).resolve()
+        db = resolve_saga_db_path(home, db_path=_cfg('storage', 'db_path', 'saga.db'))
+        if not db.is_file():
+            return
+        # A sqlite connection's context manager does not close the descriptor.
+        with closing(sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+            for table, column in (("embeddings", "dim"), ("sessions", "embedding_dim"),
+                                  ("triples", "embedding_dim")):
+                if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                    continue
+                counts = conn.execute(
+                    f"SELECT {column}, count(*) FROM {table} "
+                    f"WHERE {column} IS NOT NULL GROUP BY {column}",
+                )
+                for stored_dim, count in counts:
+                    dimension_counts[stored_dim] = dimension_counts.get(stored_dim, 0) + count
+    except (OSError, sqlite3.Error):
+        # This read-only preflight must not make an unavailable database a
+        # provider-init failure. The store remains responsible for its own IO.
+        return
+    if not dimension_counts:
+        return
+    largest_count = max(dimension_counts.values())
+    dominant_dimensions = [stored_dim for stored_dim, count in dimension_counts.items()
+                           if count == largest_count]
+    if len(dominant_dimensions) != 1:
+        raise RuntimeError("Saga database has ambiguous dominant embedding dimensions; "
+                           "run mimir saga-reembed offline before using an embedding provider")
+    dominant_dim = dominant_dimensions[0]
+    if dim != dominant_dim:
+        raise RuntimeError(
+            f"Embedding provider dimension {dim} differs from saga.db's dominant "
+            f"dimension {dominant_dim}; run mimir saga-reembed offline before switching providers"
+        )
+    mismatched = sum(dimension_counts.values()) - dimension_counts[dim]
+    if mismatched:
+        logging.getLogger("saga.embeddings").warning(
+            "Saga database contains %d rows with mismatched embedding dimensions "
+            "(provider dimension %d); continuing with the dominant dimension. "
+            "Run mimir saga-reembed offline to repair legacy rows.",
+            mismatched, dim,
+        )
+
+
 def get_provider() -> EmbeddingProvider:
     """Get the configured embedding provider (singleton).
 
@@ -442,7 +514,8 @@ def get_provider() -> EmbeddingProvider:
                 _DEFAULT_KEY_ENVS[provider_name],
             )
             if api_key_env and not os.environ.get(api_key_env):
-                logging.getLogger("saga.embeddings").info(
+                _check_existing_dimensions(384)
+                logging.getLogger("saga.embeddings").warning(
                     "[embedding] provider=%s but %s is unset — falling back "
                     "to onnx (fastembed, BAAI/bge-small-en-v1.5). Set %s in "
                     "your environment to use %s.",
@@ -459,12 +532,16 @@ def get_provider() -> EmbeddingProvider:
                 f"Available: {', '.join(_PROVIDERS.keys())}"
             )
         if _onnx_model_override is not None and provider_cls is ONNXProvider:
-            _provider_instance = provider_cls(
+            instance = provider_cls(
                 model_name=_onnx_model_override,
                 dimensions=_onnx_dimensions_override,
             )
         else:
-            _provider_instance = provider_cls()
+            instance = provider_cls()
+        # The keyless fallback already checked its fixed dimension above.
+        if isinstance(instance, EmbeddingProvider) and _onnx_dimensions_override is None:
+            _check_existing_dimensions(instance.dimensions())
+        _provider_instance = instance
     return _provider_instance
 
 

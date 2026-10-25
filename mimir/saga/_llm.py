@@ -79,11 +79,8 @@ def _call_anthropic(
         # where anthropic isn't installed (e.g., older bench infra).
         from anthropic import Anthropic
     except ImportError:
-        log.warning("anthropic SDK not installed; falling back to openai_compat")
-        return _call_openai_compat(
-            llm, prompt=prompt, max_tokens=max_tokens,
-            temperature=temperature, system=system,
-        )
+        log.warning("anthropic SDK not installed; install the anthropic extra for saga")
+        return ""
 
     cache_key = (api_key, llm.get("timeout", 30))
     client = _ANTHROPIC_CLIENTS.get(cache_key)
@@ -182,6 +179,10 @@ def _call_openai_compat(
 
     api_key = llm.get("api_key") or ""
     url = llm.get("url") or ""
+    if not api_key:
+        if not llm.get("blocked_key"):
+            log.warning("saga openai_compat key unavailable; configure [llm] api_key_env for this endpoint")
+        return ""
     messages: list[dict[str, str]] = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -398,12 +399,8 @@ async def _call_claude_code_async(
             ClaudeSDKClient,
         )
     except ImportError:
-        log.warning("claude-agent-sdk not installed; falling back to openai_compat")
-        return await asyncio.to_thread(
-            _call_openai_compat, llm,
-            prompt=prompt, max_tokens=max_tokens,
-            temperature=temperature, system=system,
-        )
+        log.warning("claude-agent-sdk not installed; configure saga [llm] for an installed provider")
+        return ""
 
     pool = _get_async_claude_pool()
     timeout = float(llm.get("timeout", 30))

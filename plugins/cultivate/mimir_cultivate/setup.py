@@ -22,6 +22,7 @@ import socket
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 
@@ -34,6 +35,11 @@ from .repository import valid_repository_slug
 DEFAULT_SOURCE_REPO = "jasoncarreira/mimir"
 DEFAULT_NEXTEST_VERSION = "0.9.148"
 DEFAULT_UV_VERSION = "0.11.0"
+DEFAULT_SAGA_MODELS = {"openai": "gpt-5.4-nano", "anthropic": "claude-haiku-5-5"}
+LOCAL_MODEL = "BAAI/bge-small-en-v1.5"
+EMBEDDING_MODELS = {"local": ("onnx", LOCAL_MODEL, 384, None),
+                    "openai": ("openai", "text-embedding-3-small", 1536, "OPENAI_API_KEY"),
+                    "voyage": ("voyage", "voyage-4-lite", 1024, "VOYAGE_API_KEY")}
 
 PAT_HELP = (
     "Create a fine-grained PAT at https://github.com/settings/personal-access-tokens/new: "
@@ -117,8 +123,10 @@ def validate(name: str, value: str) -> str:
         ok = bool(_EMAIL.fullmatch(value))
     elif name == "branch":
         ok = bool(_BRANCH.fullmatch(value)) and ".." not in value and "//" not in value and not value.endswith("/")
-    elif name == "model_spec":
+    elif name in {"model_spec", "saga_model_spec"}:
         ok = bool(re.fullmatch(r"(openai|anthropic):[A-Za-z0-9_.-]+", value))
+    elif name == "embedding":
+        ok = value == "local" or bool(re.fullmatch(r"(openai|voyage):[A-Za-z0-9_.-]+", value))
     elif name == "test_command":
         ok = bool(value) and "\n" not in value and "\r" not in value
     elif name == "port":
@@ -370,6 +378,92 @@ def _env(deploy: Path, updates: dict[str, str]) -> str:
     return current.get("MIMIR_API_KEY") or updates["MIMIR_API_KEY"]
 
 
+def _saga_settings(spec: str, embedding: str) -> dict[str, dict[str, object]]:
+    provider, model = spec.split(":", 1)
+    kind, _, dim, key_env = EMBEDDING_MODELS[embedding.split(":", 1)[0]]
+    embed_model = LOCAL_MODEL if embedding == "local" else embedding.split(":", 1)[1]
+    llm: dict[str, object] = {"provider": "anthropic" if provider == "anthropic" else "openai_compat",
+                              "model": model, "api_key_env": provider.upper() + "_API_KEY"}
+    if provider == "openai":
+        llm["url"] = "https://api.openai.com/v1/chat/completions"
+    emb: dict[str, object] = {"provider": kind, "model": embed_model, "dimensions": dim}
+    if key_env:
+        emb["api_key_env"] = key_env
+        emb["url"] = f"https://api.{'voyageai' if kind == 'voyage' else 'openai'}.com/v1/embeddings"
+    if kind == "voyage":
+        emb["send_input_type"] = True
+    return {"llm": llm, "embedding": emb}
+
+
+def _provision_saga(home: Path, spec: str, embedding: str, reembed: bool = False,
+                    *, prefetch=None, repair=None) -> bool:
+    """Reconcile only installer-owned sections; leave all other TOML bytes intact."""
+    from mimir.saga._config_io import install_saga_config
+    from mimir.saga.embeddings import ONNXProvider
+    from mimir.saga.reembed import reembed as saga_reembed
+
+    settings = _saga_settings(spec, embedding)
+    path = home / "saga.toml"
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise RuntimeError("saga.toml must be a regular file; reconcile it manually")
+    original = path.read_text() if path.exists() else ""
+    existing = tomllib.loads(original)
+    # Only the byte-for-byte core scaffold is known to be unedited. Its
+    # claude_code default is unusable in Cultivate's SDK-disabled image.
+    from mimir.commands.setup import _default_saga_toml
+    core_scaffold = bool(original) and original == _default_saga_toml(home)
+    marker = "# Cultivate-managed saga models\n"
+    embedding_signature = re.search(r"(?m)^# Cultivate embedding sha256:([0-9a-f]{64})$", original)
+    signed_embedding = (embedding_signature is not None and
+                        embedding_signature.group(1) == hashlib.sha256(
+                            json.dumps(existing.get("embedding", {}), sort_keys=True).encode()).hexdigest())
+    db = home / ".mimir" / "saga.db"
+    for section, fields in settings.items():
+        old = existing.get(section, {})
+        if old and (not isinstance(old, dict) or any(k in old and old[k] != v for k, v in fields.items())):
+            if section == "embedding" and (signed_embedding or core_scaffold and db.exists()) and not reembed:
+                raise RuntimeError("Changing embedding provider requires --reembed (stop the agent first), or run mimir saga-reembed offline")
+            if not core_scaffold and (section != "embedding" or not reembed or not signed_embedding):
+                raise RuntimeError(f"existing saga.toml [{section}] conflicts; reconcile the operator setting manually")
+    old_embedding = existing.get("embedding", {})
+    changed_embedding = bool(old_embedding and any(old_embedding.get(k) != v for k, v in settings["embedding"].items()))
+    if db.exists() and changed_embedding and not reembed:
+        raise RuntimeError("Changing embedding provider requires --reembed (stop the agent first), or run mimir saga-reembed after reconciling saga.toml")
+    if db.exists() and not old_embedding and not reembed:
+        raise RuntimeError("Existing saga.db requires --reembed before selecting an embedding provider")
+
+    text = original
+    for section, fields in settings.items():
+        if existing.get(section) == fields or (existing.get(section) and not (core_scaffold or section == "embedding" and changed_embedding)):
+            continue
+        if existing.get(section) and (core_scaffold or section == "embedding" and changed_embedding):
+            # Only a previously Cultivate-managed section can be replaced.
+            text = re.sub(r"(?ms)^\[" + section + r"\]\n.*?(?=^\[|\Z)", "", text)
+            if section == "embedding":
+                text = re.sub(r"(?m)^# Cultivate embedding sha256:[0-9a-f]{64}\n", "", text)
+        if section == "embedding":
+            text += "# Cultivate embedding sha256:" + hashlib.sha256(
+                json.dumps(fields, sort_keys=True).encode()).hexdigest() + "\n"
+        text += ("\n" if text and not text.endswith("\n\n") else "") + f"[{section}]\n"
+        for key, value in fields.items():
+            text += f"{key} = {json.dumps(value)}\n"
+    if (not original or core_scaffold) and text:
+        text = marker + text
+    # Download to the shared persistent cache before publishing a local config.
+    if embedding == "local":
+        if prefetch is None:
+            prefetch = lambda: ONNXProvider(model_name=LOCAL_MODEL, dimensions=384)._load()
+        prefetch()
+    if text != original:
+        path.write_text(text)
+    if reembed and db.exists():
+        install_saga_config(path)
+        report = (repair or saga_reembed)(db, force=changed_embedding or not old_embedding, progress=lambda _: None)
+        if any(value for name, value in report.items() if name.endswith("_unrepaired")):
+            raise RuntimeError("Saga re-embed incomplete; restore missing summaries and run mimir saga-reembed before starting the agent")
+    return text != original
+
+
 def _port() -> int:
     for port in range(8090, 65536):
         with socket.socket() as sock:
@@ -458,6 +552,8 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("display-name", "Owner's human-readable name."),
         ("owner-email", "Owner's email identity."),
         ("model-spec", "provider:model (openai:... or anthropic:...)."),
+        ("saga-model-spec", "Fast/cheap memory model (openai:... or anthropic:...)."),
+        ("embedding", "local, openai:model, or voyage:model (default: local)."),
         ("deploy", "Absolute deployment directory (default: ./cultivate-agent)."),
         ("port", "Free loopback port (default: next free from 8090)."),
         ("test-command", "Verification command for target repo; default detected from repo."),
@@ -465,11 +561,12 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("source-repo", "Mimir source owner/name (default: " + DEFAULT_SOURCE_REPO + ")."),
     ):
         setup.add_argument("--" + name, help=help_text)
-    for name in ("github-token", "model-key"):
+    for name in ("github-token", "model-key", "saga-model-key", "embedding-key"):
         setup.add_argument("--" + name + "-file", help="Read secret from a mode-600 file (never from argv).")
         setup.add_argument("--" + name + "-stdin", action="store_true", help="Read one secret line from stdin.")
     setup.add_argument("--accept-license", action="store_true", help="Explicitly accept the shipped Cultivate BSL 1.1 license for unattended setup.")
     setup.add_argument("--rotate-web-key", action="store_true", help="Replace the owner's existing web key intentionally.")
+    setup.add_argument("--reembed", action="store_true", help="Re-embed existing Saga vectors offline when changing embeddings.")
     return parser
 
 
@@ -508,6 +605,23 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     provider = spec.split(":", 1)[0]
     key_name = provider.upper() + "_API_KEY"
     model_key = _secret(args, "model_key", f"Model key: obtain it in your {provider} API console; input is hidden.", previous=prior.get(key_name))
+    saga_spec = _field(args, "saga_model_spec",
+                       "Saga makes frequent, short, latency-sensitive memory calls; a faster, cheaper model is recommended. "
+                       f"Your agent's {spec} is also available if you prefer it.",
+                       default=provider + ":" + DEFAULT_SAGA_MODELS[provider])
+    saga_provider = saga_spec.split(":", 1)[0]
+    saga_key_env = saga_provider.upper() + "_API_KEY"
+    extra_keys = {}
+    if saga_key_env != key_name:
+        extra_keys[saga_key_env] = _secret(args, "saga_model_key", "Saga model API key (input hidden).", previous=prior.get(saga_key_env))
+    embedding = _field(args, "embedding", "Embedding model: local runs on CPU in the container without a key; "
+                       "API providers can give better retrieval quality.", default="local")
+    embedding_key_env = EMBEDDING_MODELS[embedding.split(":", 1)[0]][3]
+    if embedding_key_env == key_name:
+        print(f"Reusing {key_name} for embeddings.")
+    elif embedding_key_env and embedding_key_env not in extra_keys:
+        extra_keys[embedding_key_env] = _secret(args, "embedding_key", "Embedding API key (input hidden).",
+                                                 previous=prior.get(embedding_key_env))
     source_ref = _field(args, "source_ref", "Mimir source ref: a pushed branch or tag on the canonical GitHub repository.", default="refs/heads/feature/plugins")
     source_repo = _field(args, "source_repo", "Mimir source owner/name: canonical repo or a trusted fork.", default=DEFAULT_SOURCE_REPO)
     source_url = "https://github.com/" + source_repo + ".git"
@@ -546,7 +660,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   "--build-arg MIMIR_PLUGIN_SELECTION=cultivate",
                   "--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build",
                   "--build-arg MIMIR_ENABLE_OPENCODE=1",
-                  "--build-arg MIMIR_EXTRAS=" + provider + ",mcp"]
+                  "--build-arg MIMIR_EXTRAS=" + ",".join(sorted({provider, saga_provider, "mcp"}))]
     _write(deploy / "build.sh", "#!/bin/sh\nset -eu\n"
            + "docker build -t " + tag + " " + " ".join(build_args) + " " + source_url + "#" + sha + "\n"
            + "docker build -t " + layer_tag + " -f Dockerfile.toolchain .\n", mode=0o755)
@@ -565,24 +679,27 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         "MIMIR_API_KEY": secrets.token_urlsafe(32), "GITHUB_TOKEN": token, "GH_TOKEN": token,
         "GH_USER_NAME": bot, "GH_USER_EMAIL": bot_email, "MIMIR_GITHUB_SELF_LOGIN": bot,
         "GITHUB_REPOS": repo, "MIMIR_MODEL_SPEC": spec, key_name: model_key,
-        "MIMIR_WEB_HOST": "0.0.0.0",
+         "MIMIR_WEB_HOST": "0.0.0.0", **extra_keys,
     })
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
     manifest = {"slug": repo.lower(), "branch": branch, "owner": owner, "display": display,
-                "email": owner_email, "test": test, "rotate": bool(args.rotate_web_key)}
+                 "email": owner_email, "test": test, "rotate": bool(args.rotate_web_key),
+                 "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed)}
     _write(deploy / "manifest.json", json.dumps(manifest, indent=2) + "\n", replace=True)
     _write(deploy / "provision.py", _PROVISION)
     # The provision script and manifest are mounted read-only for a one-shot
     # non-root container, never into the long-running agent.
     _write(deploy / "compose.provision.yml", "services:\n  agent:\n    volumes:\n      - ./provision.py:/opt/cultivate-provision.py:ro\n      - ./manifest.json:/opt/cultivate-manifest.json:ro\n")
     was_running = bool(run(["docker", "compose", "ps", "-q", "agent"], cwd=deploy))
+    if args.reembed and was_running:
+        run(["docker", "compose", "stop", "agent"], cwd=deploy)
     print(f"Building pushed Mimir commit {sha} ({source_ref})")
     run(["docker", "build", "-t", tag, "--build-arg", "MIMIR_GIT_REF=" + source_ref,
          "--build-arg", "MIMIR_CONTROLLER_COMMIT=" + sha, "--build-arg", "MIMIR_EXECUTOR_COMMIT=" + sha,
          "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate",
          "--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build", "--build-arg", "MIMIR_ENABLE_OPENCODE=1",
-         "--build-arg", "MIMIR_EXTRAS=" + provider + ",mcp", source_url + "#" + sha], cwd=deploy)
+         "--build-arg", "MIMIR_EXTRAS=" + ",".join(sorted({provider, saga_provider, "mcp"})), source_url + "#" + sha], cwd=deploy)
     run(["docker", "build", "-t", layer_tag, "-f", "Dockerfile.toolchain", "."], cwd=deploy)
     run(["docker", "compose", "run", "--rm", "init"], cwd=deploy)
     provisioned = run(["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",
@@ -621,10 +738,14 @@ import yaml
 from mimir.identities_populator import add_identity_alias, issue_web_key
 from mimir.identities import hash_web_key
 from mimir.plugins.skills import resolve_skill, install_skill
+from mimir_cultivate.setup import _provision_saga
 
 m = json.loads(Path('/opt/cultivate-manifest.json').read_text())
 changed = False
 home = Path('/home/mimir/agent')
+os.environ['HOME'] = '/home/mimir'
+os.environ['XDG_CACHE_HOME'] = '/home/mimir/.cache'
+changed = _provision_saga(home, m['saga_model_spec'], m['embedding'], m['reembed'])
 repo = Path('/workspace') / m['slug'].split('/')[1]
 origin = 'https://github.com/' + m['slug'] + '.git'
 # Persist only the helper program, never the token. Git runs it for future

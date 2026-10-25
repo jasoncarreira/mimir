@@ -8,6 +8,7 @@ from contextlib import redirect_stdout
 import io
 import json
 import logging
+import tomllib
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -94,7 +95,8 @@ def test_license_uses_installed_resource_not_cwd(tmp_path, monkeypatch):
 def test_validation_and_github_permissions():
     for name, value in (("repo", "../escape"), ("repo", "o/."),
                         ("branch", "../main"), ("bot_email", "bad\nname@example.com"),
-                        ("model_spec", "codex-plus:model"), ("port", "65536")):
+                        ("model_spec", "codex-plus:model"), ("saga_model_spec", "voyage:m"),
+                        ("embedding", "local;bad"), ("port", "65536")):
         with pytest.raises(installer.SetupError):
             installer.validate(name, value)
 
@@ -162,8 +164,14 @@ def test_detects_repo_pins_and_pinned_path(files, expected):
         assert "/usr/local/bin/uv" in layer
 
 
-def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypatch, capsys, caplog):
+@pytest.mark.parametrize("embedding,saga_spec", [
+    ("local", None), ("openai:text-embedding-3-small", None),
+    ("voyage:voyage-4-lite", "anthropic:claude-haiku-5-5"),
+])
+def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypatch, capsys, caplog, embedding, saga_spec):
     compile(installer._PROVISION, "provision.py", "exec")
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "")
     parser = argparse.ArgumentParser()
     installer.add_argparse(parser.add_subparsers(dest="command"))
     deploy = tmp_path / "deploy"
@@ -175,6 +183,14 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     model_file.write_text(model_secret)
     token_file.chmod(0o600)
     model_file.chmod(0o600)
+    other_file = tmp_path / "other"
+    other_file.write_text("other-secret-test-2008")
+    other_file.chmod(0o600)
+    extra = ["--embedding", embedding]
+    if embedding.startswith("voyage:"):
+        extra += ["--embedding-key-file", str(other_file)]
+    if saga_spec:
+        extra += ["--saga-model-spec", saga_spec, "--saga-model-key-file", str(other_file)]
     args = parser.parse_args([
         "cultivate", "setup", "--accept-license", "--source-repo", "neworg/mimir",
         "--repo", "org/repo", "--branch", "main", "--bot-login", "bot",
@@ -182,7 +198,7 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
         "--owner-email", "owner@example.com", "--model-spec", "openai:gpt-test",
         "--github-token-file", str(token_file), "--model-key-file", str(model_file),
         "--deploy", str(deploy), "--port", "8123",
-    ])
+    ] + extra)
 
     def request(url, token):
         assert token == github_secret
@@ -225,39 +241,53 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
         installer.setup(args, request=request, run=run,
                         verify=lambda *a: verified.append(a))
     stdout, stderr = capsys.readouterr()
+    if saga_spec is None:
+        assert "faster, cheaper" in stdout and "openai:gpt-test" in stdout
     assert len(verified) == 2
-    for secret in (github_secret, model_secret, "owner-key-test-2008"):
+    for secret in (github_secret, model_secret, "other-secret-test-2008", "owner-key-test-2008"):
         assert secret not in stdout + stderr + caplog.text
         for argv in calls:
             assert secret not in " ".join(argv)
     assert (deploy / "compose.env").stat().st_mode & 0o777 == 0o600
     assert (deploy / "owner-web-key").stat().st_mode & 0o777 == 0o600
     assert github_secret in (deploy / "compose.env").read_text()
+    env_text = (deploy / "compose.env").read_text()
+    assert ("VOYAGE_API_KEY=other-secret-test-2008" in env_text) == embedding.startswith("voyage:")
+    assert ("ANTHROPIC_API_KEY=other-secret-test-2008" in env_text) == bool(saga_spec)
+    saga = json.loads((deploy / "manifest.json").read_text())
+    assert saga["saga_model_spec"] == (saga_spec or "openai:" + installer.DEFAULT_SAGA_MODELS["openai"])
+    assert saga["embedding"] == embedding
+    assert saga["saga_model_spec"] != "openai:gpt-test"
     assert (deploy / "build.sh").stat().st_mode & 0o777 == 0o755
     assert "https://github.com/neworg/mimir.git#" + SHA in (deploy / "build.sh").read_text()
     assert any("https://github.com/neworg/mimir.git#" + SHA in argv for argv in calls)
-    # Check both the actual installer invocation and its saved rebuild script.
+    # Check both providers and mcp independently, in the live and saved builds.
+    expected_extras = {"openai", "mcp"}
+    if saga_spec:
+        expected_extras.add(saga_spec.split(":", 1)[0])
+    extras_arg = "MIMIR_EXTRAS=" + ",".join(sorted(expected_extras))
     root_builds = [argv for argv in calls if argv[:2] == ["docker", "build"]
                    and "MIMIR_PLUGIN_SELECTION=cultivate" in argv]
     assert len(root_builds) == 2
     for argv in root_builds:
         index = argv.index("CHAINLINK_ARTIFACT_STAGE=chainlink-build")
         assert argv[index - 1] == "--build-arg"
-        assert argv[argv.index("MIMIR_EXTRAS=openai,mcp") - 1] == "--build-arg"
+        assert argv[argv.index(extras_arg) - 1] == "--build-arg"
     import shlex
     build_lines = (deploy / "build.sh").read_text().splitlines()
     saved_build, = [shlex.split(line) for line in build_lines
                    if "MIMIR_PLUGIN_SELECTION=cultivate" in line]
     index = saved_build.index("CHAINLINK_ARTIFACT_STAGE=chainlink-build")
     assert saved_build[index - 1] == "--build-arg"
-    assert saved_build[saved_build.index("MIMIR_EXTRAS=openai,mcp") - 1] == "--build-arg"
+    assert saved_build[saved_build.index(extras_arg) - 1] == "--build-arg"
     assert json.loads((deploy / "manifest.json").read_text())["test"] == "./tools/verify"
     assert (deploy / ".dockerignore").read_text() == "*\n!Dockerfile.toolchain\n"
     for name in ("compose.yml", "Dockerfile.toolchain", "manifest.json", "provision.py"):
         text = (deploy / name).read_text()
-        assert github_secret not in text and model_secret not in text
+        assert github_secret not in text and model_secret not in text and "other-secret-test-2008" not in text
     compose = yaml.safe_load((deploy / "compose.yml").read_text())
     assert compose["services"]["agent"]["environment"]["MIMIR_PLUGINS"] == "cultivate"
+    assert compose["services"]["agent"]["environment"]["MIMIR_ENABLE_CLAUDE_CODE"] == "0"
     assert "WORKLINK_REPO" not in compose["services"]["agent"]["environment"]
     assert compose["services"]["agent"]["environment"]["MIMIR_ACP_ENABLED"] == "1"
     assert compose["services"]["agent"]["environment"]["MIMIR_PR_CHECKOUT_LEASE_ROOT"] == "/workspace/pr-leases"
@@ -405,6 +435,8 @@ def test_existing_env_never_overwrites_operator_secrets(tmp_path):
 
 
 def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monkeypatch, capsys, caplog):
+    monkeypatch.setenv("HOME", "/home/mimir")
+    monkeypatch.setenv("XDG_CACHE_HOME", "/home/mimir/.cache")
     home = tmp_path / "home"
     repo = tmp_path / "repo"
     state = home / "state"
@@ -413,8 +445,9 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     (state / "identities.yaml").write_text(yaml.safe_dump(existing))
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"slug": "org/repo", "branch": "main", "owner": "owner",
-                                    "display": "Owner", "email": "owner@example.com",
-                                    "test": "npm run verify", "rotate": False}))
+                                     "display": "Owner", "email": "owner@example.com",
+                                     "test": "npm run verify", "rotate": False,
+                                     "saga_model_spec": "openai:gpt-5.4-nano", "embedding": "local", "reembed": False}))
     script = (installer._PROVISION
               .replace("/opt/cultivate-manifest.json", str(manifest))
               .replace("/home/mimir/agent", str(home))
@@ -438,6 +471,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
         return subprocess.CompletedProcess(argv, 0, stdout="https://github.com/org/repo.git\n")
 
     monkeypatch.setattr(subprocess, "run", git)
+    monkeypatch.setattr(installer, "_provision_saga", lambda *a, **kw: False)
     caplog.set_level(logging.DEBUG)
     for _ in range(2):
         exec(compile(script, "provision.py", "exec"), {"__name__": "__main__"})
@@ -506,6 +540,110 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
         exec(compile(script, "provision.py", "exec"), {"__name__": "__main__"})
 
 
+@pytest.mark.parametrize("spec,embedding,llm,provider,dim,key", [
+    ("openai:gpt-5.4-nano", "local", "openai_compat", "onnx", 384, None),
+    ("anthropic:claude-haiku-5-5", "openai:text-embedding-3-small", "anthropic", "openai", 1536, "OPENAI_API_KEY"),
+    ("openai:gpt-5.4-nano", "voyage:voyage-4-lite", "openai_compat", "voyage", 1024, "VOYAGE_API_KEY"),
+])
+def test_saga_provisioning(tmp_path, spec, embedding, llm, provider, dim, key):
+    fetched = []
+    assert installer._provision_saga(tmp_path, spec, embedding, prefetch=lambda: fetched.append(True))
+    text = (tmp_path / "saga.toml").read_text()
+    parsed = tomllib.loads(text)
+    assert parsed["llm"]["provider"] == llm
+    assert parsed["llm"]["api_key_env"] == spec.split(":")[0].upper() + "_API_KEY"
+    assert parsed["embedding"]["provider"] == provider
+    assert parsed["embedding"]["dimensions"] == dim
+    assert parsed["embedding"].get("api_key_env") == key
+    assert parsed["embedding"].get("send_input_type") == (True if provider == "voyage" else None)
+    assert fetched == ([True] if embedding == "local" else [])
+    before = (tmp_path / "saga.toml").read_bytes()
+    assert not installer._provision_saga(tmp_path, spec, embedding, prefetch=lambda: None)
+    assert (tmp_path / "saga.toml").read_bytes() == before
+    (tmp_path / "saga.toml").write_text(text.replace(parsed["llm"]["model"], "operator-model"))
+    with pytest.raises(RuntimeError, match=r"\[llm\] conflicts"):
+        installer._provision_saga(tmp_path, spec, embedding, prefetch=lambda: None)
+    assert "operator-model" in (tmp_path / "saga.toml").read_text()
+
+
+def test_existing_vectors_require_explicit_reembed(tmp_path):
+    installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "local", prefetch=lambda: None)
+    with pytest.raises(RuntimeError, match="--reembed"):
+        installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "voyage:voyage-4-lite")
+    (tmp_path / ".mimir").mkdir()
+    (tmp_path / ".mimir/saga.db").touch()
+    with pytest.raises(RuntimeError, match="--reembed"):
+        installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "voyage:voyage-4-lite")
+    assert tomllib.loads((tmp_path / "saga.toml").read_text())["embedding"]["provider"] == "onnx"
+    updated = []
+    assert installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "voyage:voyage-4-lite",
+                                    reembed=True, repair=lambda path, **kw: updated.append((path, kw)) or {},
+                                    prefetch=lambda: None)
+    assert updated[0][1]["force"] is True
+    assert tomllib.loads((tmp_path / "saga.toml").read_text())["embedding"]["provider"] == "voyage"
+
+
+def test_operator_embedding_edit_is_never_replaced_even_with_reembed(tmp_path):
+    installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "local", prefetch=lambda: None)
+    path = tmp_path / "saga.toml"
+    path.write_text(path.read_text().replace("dimensions = 384", "dimensions = 768"))
+    original = path.read_bytes()
+    with pytest.raises(RuntimeError, match="conflicts"):
+        installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "voyage:voyage-4-lite",
+                                reembed=True)
+    assert path.read_bytes() == original
+
+
+def test_existing_database_without_embedding_config_requires_reembed(tmp_path):
+    (tmp_path / ".mimir").mkdir()
+    (tmp_path / ".mimir/saga.db").touch()
+    with pytest.raises(RuntimeError, match="--reembed"):
+        installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "local", prefetch=lambda: None)
+    assert not (tmp_path / "saga.toml").exists()
+
+
+def test_incomplete_reembed_prevents_provisioning_success(tmp_path):
+    installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "local", prefetch=lambda: None)
+    (tmp_path / ".mimir").mkdir()
+    (tmp_path / ".mimir/saga.db").touch()
+    with pytest.raises(RuntimeError, match="Saga re-embed incomplete"):
+        installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "voyage:voyage-4-lite",
+                                reembed=True, repair=lambda *a, **kw: {"sessions_unrepaired": 1})
+
+
+def test_core_scaffold_is_only_unmarked_config_replaced(tmp_path):
+    from mimir.commands.setup import _default_saga_toml
+    path = tmp_path / "saga.toml"
+    scaffold = _default_saga_toml(tmp_path)
+    path.write_text(scaffold + "\n# operator note\n")
+    with pytest.raises(RuntimeError, match="conflicts"):
+        installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "local", prefetch=lambda: None)
+    assert path.read_text() == scaffold + "\n# operator note\n"
+    path.write_text(scaffold)
+    assert installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "local", prefetch=lambda: None)
+    result = tomllib.loads(path.read_text())
+    assert result["llm"]["provider"] == "openai_compat"
+    assert result["embedding"]["provider"] == "onnx"
+
+
+def test_prompts_recommend_fast_model_and_reuse_embedding_key(monkeypatch, capsys):
+    args = argparse.Namespace(model_spec="openai:flagship", saga_model_spec=None, embedding=None)
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    assert installer._field(args, "saga_model_spec", "Frequent short calls: faster, cheaper; agent openai:flagship is an alternative",
+                            default="openai:" + installer.DEFAULT_SAGA_MODELS["openai"]) == "openai:" + installer.DEFAULT_SAGA_MODELS["openai"]
+    assert "faster, cheaper" in capsys.readouterr().out
+
+
+def test_default_saga_anthropic_model():
+    assert installer.DEFAULT_SAGA_MODELS["anthropic"] == "claude-haiku-5-5"
+
+
+def test_embedding_key_distinction():
+    assert installer.EMBEDDING_MODELS["openai"][3] == "OPENAI_API_KEY"
+    assert installer.EMBEDDING_MODELS["voyage"][3] != "OPENAI_API_KEY"
+
+
 @pytest.mark.parametrize(("push_ok", "probe_stderr", "expected_marker"), [
     pytest.param(True, b"", None, id="success"),
     pytest.param(False, b"The requested URL returned error: 403", installer._PUSH_PROBE_FAILED, id="403"),
@@ -522,6 +660,11 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
 @pytest.mark.parametrize("existing_checkout", [False, True], ids=["fresh", "rerun"])
 def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok, probe_stderr, expected_marker, existing_checkout):
     """Exercise setup's run boundary and the actual provision program, offline."""
+    from mimir.saga.embeddings import ONNXProvider
+
+    monkeypatch.setattr(ONNXProvider, "_load", lambda self: None)
+    monkeypatch.setenv("HOME", "/home/mimir")
+    monkeypatch.setenv("XDG_CACHE_HOME", "/home/mimir/.cache")
     monkeypatch.setattr(installer, "_installed_license", lambda: (b"license", "1.0"))
     parser = argparse.ArgumentParser()
     installer.add_argparse(parser.add_subparsers(dest="command"))
@@ -532,6 +675,7 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok,
         "cultivate", "setup", "--accept-license", "--repo", "org/repo", "--bot-login", "bot",
         "--bot-email", "bot@example.com", "--owner", "owner", "--display-name", "Owner",
         "--owner-email", "owner@example.com", "--model-spec", "openai:gpt-test",
+        "--saga-model-spec", "openai:gpt-5.4-nano", "--embedding", "local",
         "--deploy", str(deploy), "--port", "8123",
     ])
 

@@ -17,6 +17,7 @@ def reembed(
     batch_size: int = 50,
     batch_delay: float = 0.0,
     dry_run: bool = False,
+    force: bool = False,
     progress: Callable[[str], None] = print,
 ) -> dict[str, int]:
     """Repair existing stale/NULL-dimension vectors; leave matching rows alone.
@@ -31,7 +32,7 @@ def reembed(
         raise ValueError("batch_delay must be finite and nonnegative")
 
     from ._config_io import get_config
-    from .embeddings import get_provider
+    from .embeddings import get_provider, offline_reembedding
 
     max_chars = get_config()("embedding", "max_input_chars", 2000)
     if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
@@ -40,7 +41,8 @@ def reembed(
     mode = "ro" if dry_run else "rw"
     conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode={mode}", uri=True)
     try:
-        provider = get_provider()
+        with offline_reembedding():
+            provider = get_provider()
         dim = provider.dimensions()
         if not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0:
             raise ValueError("provider dimensions must be a positive integer")
@@ -48,20 +50,29 @@ def reembed(
             f"{'DRY RUN' if dry_run else 'APPLY'}: {db_path} "
             f"provider={provider.provider_name} model={provider.model_id} dim={dim}"
         )
+        stale_atoms = "a.tombstoned = 0" if force else "a.tombstoned = 0 AND e.dim IS NOT ?"
+        stale_sessions = "embedding IS NOT NULL" if force else "embedding IS NOT NULL AND embedding_dim IS NOT ?"
         sources = {
             "atoms": (
                 "embeddings e JOIN atoms a ON a.id = e.atom_id",
-                "a.id", "a.content", "a.tombstoned = 0 AND e.dim IS NOT ?",
+                "a.id", "a.content", stale_atoms,
             ),
             "sessions": (
                 "sessions", "id", "summary",
-                "embedding IS NOT NULL AND embedding_dim IS NOT ?",
+                stale_sessions,
             ),
         }
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='triples'").fetchone() and conn.execute(
+            "SELECT 1 FROM triples WHERE embedding IS NOT NULL LIMIT 1"
+        ).fetchone():
+            sources["triples"] = (
+                "triples", "id", "subject || ' ' || replace(predicate, '_', ' ') || ' ' || object",
+                "embedding IS NOT NULL" if force else "embedding IS NOT NULL AND embedding_dim IS NOT ?",
+            )
         report = {}
         for name, (source, key, text, predicate) in sources.items():
             total = conn.execute(
-                f"SELECT count(*) FROM {source} WHERE {predicate}", (dim,),
+                f"SELECT count(*) FROM {source} WHERE {predicate}", () if force else (dim,),
             ).fetchone()[0]
             report[f"{name}_stale"] = total
             report[f"{name}_updated"] = 0
@@ -70,7 +81,7 @@ def reembed(
         report["atoms_unrepaired"] = 0
         report["sessions_unrepaired"] = conn.execute(
             f"SELECT count(*) FROM sessions WHERE {sources['sessions'][3]} "
-            f"AND NOT ({usable_summary})", (dim,),
+            f"AND NOT ({usable_summary})", () if force else (dim,),
         ).fetchone()[0]
         progress(
             f"sessions: {report['sessions_unrepaired']} unrepaired "
@@ -87,7 +98,8 @@ def reembed(
             while True:
                 # Keyset pagination bounds memory and avoids rescanning repaired rows.
                 after = f" AND {key} > ?" if last_id is not None else ""
-                params = (dim, last_id, batch_size) if after else (dim, batch_size)
+                params = ((last_id, batch_size) if after else (batch_size,)) if force else (
+                    (dim, last_id, batch_size) if after else (dim, batch_size))
                 rows = conn.execute(
                     f"SELECT {key}, {text} FROM {source} WHERE {predicate}"
                     f"{after} ORDER BY {key} LIMIT ?", params,
@@ -116,15 +128,21 @@ def reembed(
                         now = datetime.now(timezone.utc).isoformat()
                         conn.executemany(
                             "UPDATE embeddings SET vec=?, dim=?, provider=?, model=?, "
-                            "embedded_at=? WHERE atom_id=? AND dim IS NOT ?",
+                            "embedded_at=? WHERE atom_id=?" + ("" if force else " AND dim IS NOT ?"),
                             [(blob, dim, provider.provider_name, provider.model_id,
-                              now, row[0], dim) for row, blob in zip(rows, blobs)],
+                              now, row[0]) + (() if force else (dim,)) for row, blob in zip(rows, blobs)],
+                        )
+                    elif name == "sessions":
+                        conn.executemany(
+                            "UPDATE sessions SET embedding=?, embedding_dim=? "
+                            "WHERE id=?" + ("" if force else " AND embedding_dim IS NOT ?"),
+                            [(blob, dim, row[0]) + (() if force else (dim,)) for row, blob in zip(rows, blobs)],
                         )
                     else:
                         conn.executemany(
-                            "UPDATE sessions SET embedding=?, embedding_dim=? "
-                            "WHERE id=? AND embedding_dim IS NOT ?",
-                            [(blob, dim, row[0], dim) for row, blob in zip(rows, blobs)],
+                            "UPDATE triples SET embedding=?, embedding_dim=? WHERE id=?" +
+                            ("" if force else " AND embedding_dim IS NOT ?"),
+                            [(blob, dim, row[0]) + (() if force else (dim,)) for row, blob in zip(rows, blobs)],
                         )
                 last_id = rows[-1][0]
                 report[f"{name}_updated"] += len(rows)
@@ -133,9 +151,12 @@ def reembed(
                     f"{report[f'{name}_stale']}"
                 )
         for name, (source, _, _, predicate) in sources.items():
-            report[f"{name}_unrepaired"] = conn.execute(
-                f"SELECT count(*) FROM {source} WHERE {predicate}", (dim,),
-            ).fetchone()[0]
+            if force:
+                report[f"{name}_unrepaired"] = report.get(f"{name}_unrepaired", 0)
+            else:
+                report[f"{name}_unrepaired"] = conn.execute(
+                    f"SELECT count(*) FROM {source} WHERE {predicate}", (dim,),
+                ).fetchone()[0]
             progress(f"{name}: {report[f'{name}_unrepaired']} unrepaired stale rows remain")
         if report["atoms_unrepaired"] or report["sessions_unrepaired"]:
             progress("Incomplete. Restore missing original summaries and rerun; no text was invented.")

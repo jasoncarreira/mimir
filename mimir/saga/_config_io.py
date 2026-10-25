@@ -34,8 +34,10 @@ Usage:
 from __future__ import annotations
 
 import os
+import logging
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 # Python 3.11+ has tomllib in stdlib
 try:
@@ -262,9 +264,9 @@ _DEFAULTS = {
     # subsystem-specific keys are not set. To configure all five at once,
     # set [llm] and skip the per-subsystem llm_url/llm_model/api_key_env.
     "llm": {
-        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "model": "mistralai/mistral-large-3-675b-instruct-2512",
-        "api_key_env": "NVIDIA_NIM_API_KEY",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "model": "gpt-5.4-nano",
+        "api_key_env": "OPENAI_API_KEY",
         "timeout_seconds": 30,
         "reasoning_effort": "",
     },
@@ -856,10 +858,8 @@ def resolve_llm_config(subsystem: str) -> dict:
         2. ``[llm]`` top-level fallback
         3. Built-in default
 
-    For the API key, ``api_key_env`` from the same resolution chain
-    selects which environment variable to read. If that variable isn't
-    set (or no api_key_env was specified), we fall through a final chain:
-    ``OPENAI_API_KEY`` → ``NVIDIA_NIM_API_KEY`` → ``NVIDIA_API_KEY``.
+    The configured ``api_key_env`` alone selects the credential. A key
+    for another host must never be used as an implicit fallback.
     Empty string is returned if no key is found anywhere; subsystems are
     expected to handle that gracefully.
 
@@ -894,8 +894,8 @@ def resolve_llm_config(subsystem: str) -> dict:
             return v
         return default
 
-    url = _resolve('url', 'url', 'https://integrate.api.nvidia.com/v1/chat/completions')
-    model = _resolve('model', 'model', 'mistralai/mistral-large-3-675b-instruct-2512')
+    url = _resolve('url', 'url', 'https://api.openai.com/v1/chat/completions')
+    model = _resolve('model', 'model', 'gpt-5.4-nano')
     timeout = (
         cfg(subsystem, 'timeout_seconds', None)
         or cfg('llm', 'timeout_seconds', None)
@@ -907,15 +907,14 @@ def resolve_llm_config(subsystem: str) -> dict:
         cfg(subsystem, 'api_key_env', None)
         or cfg('llm', 'api_key_env', None)
     )
-    api_key = ''
-    if api_key_env:
-        api_key = os.environ.get(api_key_env, '') or ''
-    if not api_key:
-        # Final fallback chain — common deployment patterns.
-        for var in ('OPENAI_API_KEY', 'NVIDIA_NIM_API_KEY', 'NVIDIA_API_KEY'):
-            api_key = os.environ.get(var, '') or ''
-            if api_key:
-                break
+    api_key = os.environ.get(api_key_env, '') if api_key_env else ''
+    blocked_key = False
+    if api_key and api_key_env == 'OPENAI_API_KEY' and urlsplit(url).hostname != 'api.openai.com' and (
+        cfg(subsystem, 'provider', None) or cfg('llm', 'provider', None) or 'openai_compat'
+    ) == 'openai_compat':
+        _warn_wrong_openai_host(url)
+        api_key = ''
+        blocked_key = True
 
     # v0.5 §7: provider knob. "anthropic" routes via anthropic.Anthropic;
     # "openai_compat" keeps the legacy requests.post path (default for
@@ -941,10 +940,23 @@ def resolve_llm_config(subsystem: str) -> dict:
         "url": url,
         "model": model,
         "api_key": api_key,
+        **({"blocked_key": True} if blocked_key else {}),
         "timeout": int(timeout),
         "provider": str(provider),
         "reasoning_effort": str(reasoning_effort) if reasoning_effort else None,
     }
+
+
+_warned_hosts: set[str] = set()
+
+
+def _warn_wrong_openai_host(url: str) -> None:
+    if url not in _warned_hosts:
+        _warned_hosts.add(url)
+        logging.getLogger('saga.config').warning(
+            'Refusing OPENAI_API_KEY for non-OpenAI saga LLM endpoint. '
+            'Set [llm] url to https://api.openai.com/v1/chat/completions or configure the host-specific api_key_env.'
+        )
 
 
 # ─── Convenience: direct attribute access ────────────────────────
