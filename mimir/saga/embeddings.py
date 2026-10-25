@@ -8,13 +8,14 @@ Supports:
   - local: sentence-transformers (no API key needed, runs on CPU/GPU)
 
 When the configured provider is API-keyed (voyage/openai) and its API
-key env var is unset, ``get_provider()`` auto-falls back to ``onnx`` so
-a keyless install still works.
+key env var is unset, ``get_provider()`` falls back to compatible local
+Voyage 4 embeddings where possible, otherwise to ``onnx``.
 
 Provider is configured via saga.toml [embedding] section.
 """
 
 import logging
+import math
 import os
 import threading
 import time
@@ -33,6 +34,13 @@ os.environ.setdefault("MKL_NUM_THREADS", str(os.cpu_count() or 1))
 log = logging.getLogger(__name__)
 
 _cfg = get_config()
+
+# Only these reviewed model repositories may execute Hugging Face remote code.
+REMOTE_CODE_REVISIONS = {
+    "voyageai/voyage-4-nano": "5fb34e870f49f19e79c94d5e118f5ee730133279",
+}
+VOYAGE_NANO_DIMENSIONS = (2048, 1024, 512, 256)
+VOYAGE_4_MODELS = frozenset(("voyage-4", "voyage-4-lite", "voyage-4-large"))
 
 
 def _retry_with_backoff(fn, max_retries=3, base_delay=1.0):
@@ -159,8 +167,18 @@ class LocalProvider(EmbeddingProvider):
 
     provider_name = "local"
 
-    def __init__(self):
-        self.model_name = _cfg('embedding', 'model', 'all-MiniLM-L6-v2')
+    def __init__(self, model_name: Optional[str] = None, dimensions: Optional[int] = None):
+        self.model_name = model_name or _cfg('embedding', 'model', 'voyageai/voyage-4-nano')
+        self._dimensions = dimensions if dimensions is not None else _cfg('embedding', 'dimensions', None)
+        if self.model_name == 'voyageai/voyage-4-nano':
+            if self._dimensions is None:
+                self._dimensions = 2048
+            if type(self._dimensions) is not int or self._dimensions not in VOYAGE_NANO_DIMENSIONS:
+                raise ValueError(
+                    'voyageai/voyage-4-nano supports [embedding] dimensions '
+                    '2048, 1024, 512 or 256'
+                )
+        self.device = _cfg('embedding', 'device', 'cpu')
         self.max_chars = _cfg('embedding', 'max_input_chars', 2000)
         self._model = None
         self._load_lock = threading.Lock()
@@ -173,22 +191,33 @@ class LocalProvider(EmbeddingProvider):
                 return self._model
             try:
                 from sentence_transformers import SentenceTransformer
-                self._model = SentenceTransformer(self.model_name)
-            except ImportError:
+            except ImportError as exc:
                 raise RuntimeError(
-                    "sentence-transformers not installed. "
-                    "Run: pip install sentence-transformers"
-                )
+                    "sentence-transformers not installed. Install mimir-agent[local-embeddings]."
+                ) from exc
+            options = {'device': self.device}
+            if self.model_name in REMOTE_CODE_REVISIONS:
+                options['trust_remote_code'] = True
+                options['revision'] = _cfg('embedding', 'revision', None) or REMOTE_CODE_REVISIONS[self.model_name]
+            self._model = SentenceTransformer(self.model_name, **options)
         return self._model
 
     def embed(self, text: str, input_type: str = "passage") -> list[float]:
         model = self._load_model()
-        embedding = model.encode(text[:self.max_chars])
-        return embedding.tolist()
+        options = {'truncate_dim': self._dimensions} if self._dimensions is not None else {}
+        method = (getattr(model, 'encode_query', None) if input_type == 'query'
+                  else getattr(model, 'encode_document', None))
+        if not getattr(model, 'prompts', None) or not callable(method):
+            method = model.encode
+        vector = method(text[:self.max_chars], **options)
+        values = vector.tolist() if hasattr(vector, 'tolist') else list(vector)
+        norm = math.sqrt(sum(value * value for value in values))
+        return [value / norm for value in values] if norm else values
 
     def dimensions(self) -> int:
-        model = self._load_model()
-        return model.get_sentence_embedding_dimension()
+        if self._dimensions is not None:
+            return self._dimensions
+        return self._load_model().get_sentence_embedding_dimension()
 
 
 class ONNXProvider(EmbeddingProvider):
@@ -470,13 +499,8 @@ def _check_existing_dimensions(dim: int) -> None:
 def get_provider() -> EmbeddingProvider:
     """Get the configured embedding provider (singleton).
 
-    Auto-fallback: if the configured provider is API-keyed (``voyage``,
-    ``openai``) and the required API key env var isn't set,
-    transparently fall through to the ``onnx`` (fastembed) provider
-    instead of raising on the first ``embed()`` call. Lets fresh
-    ``mimir setup``-only installs work out of the box without a
-    Voyage key, while paid-tier users keep the better embeddings as
-    long as their key is in the environment.
+    Keyless Voyage 4 configurations use compatible local nano embeddings
+    when available; other keyless API providers use ONNX.
     """
     global _provider_instance
     # Double-checked locking: avoid acquiring on every call once the
@@ -490,11 +514,7 @@ def get_provider() -> EmbeddingProvider:
         import os
         provider_name = _cfg('embedding', 'provider', 'voyage')
 
-        # API-keyed providers — auto-fall-back to onnx when the
-        # required env var isn't set. Voyage is the default
-        # (``mimir setup --embedding voyage``); a fresh install
-        # without VOYAGE_API_KEY should fall back to local fastembed
-        # rather than raising on first embed.
+        # API-keyed providers fall back when their required key is unset.
         _API_KEYED_PROVIDERS = ("openai", "voyage")
         _DEFAULT_KEY_ENVS = {
             "openai": "OPENAI_API_KEY",
@@ -508,22 +528,39 @@ def get_provider() -> EmbeddingProvider:
         # callers pack vectors at the reported dim.
         _onnx_model_override: Optional[str] = None
         _onnx_dimensions_override: Optional[int] = None
+        _local_fallback: Optional[LocalProvider] = None
         if provider_name in _API_KEYED_PROVIDERS:
             api_key_env = _cfg(
                 'embedding', 'api_key_env',
                 _DEFAULT_KEY_ENVS[provider_name],
             )
             if api_key_env and not os.environ.get(api_key_env):
-                _check_existing_dimensions(384)
-                logging.getLogger("saga.embeddings").warning(
-                    "[embedding] provider=%s but %s is unset — falling back "
-                    "to onnx (fastembed, BAAI/bge-small-en-v1.5). Set %s in "
-                    "your environment to use %s.",
-                    provider_name, api_key_env, api_key_env, provider_name,
+                configured_model = _cfg(
+                    'embedding', 'model',
+                    'voyage-4-lite' if provider_name == 'voyage' else 'text-embedding-3-small',
                 )
-                provider_name = "onnx"
-                _onnx_model_override = "BAAI/bge-small-en-v1.5"
-                _onnx_dimensions_override = 384
+                configured_dim = _cfg('embedding', 'dimensions', 1024)
+                if (provider_name == 'voyage' and configured_model in VOYAGE_4_MODELS
+                        and type(configured_dim) is int and configured_dim in VOYAGE_NANO_DIMENSIONS):
+                    from importlib.util import find_spec
+                    if find_spec('sentence_transformers') is not None:
+                        _local_fallback = LocalProvider(model_name='voyageai/voyage-4-nano', dimensions=configured_dim)
+                if _local_fallback is not None:
+                    provider_name = 'local'
+                    fallback_name = _local_fallback.model_name
+                    compatibility = 'vectors stay compatible with Voyage 4'
+                else:
+                    provider_name = 'onnx'
+                    _onnx_model_override = 'BAAI/bge-small-en-v1.5'
+                    _onnx_dimensions_override = 384
+                    _check_existing_dimensions(384)
+                    fallback_name = _onnx_model_override
+                    compatibility = 'vectors are not compatible with Voyage 4'
+                logging.getLogger("saga.embeddings").warning(
+                    "[embedding] %s is unset — falling back to %s (%s); %s. "
+                    "Set %s to use the configured provider.",
+                    api_key_env, provider_name, fallback_name, compatibility, api_key_env,
+                )
 
         provider_cls = _PROVIDERS.get(provider_name)
         if provider_cls is None:
@@ -531,7 +568,9 @@ def get_provider() -> EmbeddingProvider:
                 f"Unknown embedding provider: {provider_name}. "
                 f"Available: {', '.join(_PROVIDERS.keys())}"
             )
-        if _onnx_model_override is not None and provider_cls is ONNXProvider:
+        if _local_fallback is not None:
+            instance = _local_fallback
+        elif _onnx_model_override is not None and provider_cls is ONNXProvider:
             instance = provider_cls(
                 model_name=_onnx_model_override,
                 dimensions=_onnx_dimensions_override,

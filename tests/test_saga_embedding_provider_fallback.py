@@ -25,6 +25,8 @@ def _reset_provider_singleton() -> None:
 
 @pytest.fixture
 def fake_cfg(monkeypatch: pytest.MonkeyPatch):
+    # Keep availability independent of the worker's installed optional extras.
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
     def _install(embedding: dict) -> None:
         def accessor(section, key, default=None):
             if section == "embedding" and key in embedding:
@@ -147,6 +149,64 @@ def test_fallback_uses_onnx_default_when_model_inherited(
     provider = get_provider()
     assert isinstance(provider, ONNXProvider)
     assert provider.model_name == "BAAI/bge-small-en-v1.5"
+
+
+@pytest.mark.parametrize("model", ["voyage-4", "voyage-4-lite", "voyage-4-large"])
+@pytest.mark.parametrize("dim", [2048, 1024, 512, 256])
+def test_voyage_4_keyless_falls_back_in_shared_space(monkeypatch, fake_cfg, caplog, model, dim):
+    from mimir.saga import embeddings as emb
+
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object() if name == "sentence_transformers" else None)
+    fake_cfg({"provider": "voyage", "model": model, "dimensions": dim})
+    with caplog.at_level("WARNING", logger="saga.embeddings"):
+        provider = emb.get_provider()
+    assert isinstance(provider, emb.LocalProvider)
+    assert provider.model_id == "voyageai/voyage-4-nano"
+    assert provider.dimensions() == dim
+    assert "voyageai/voyage-4-nano" in caplog.text
+    assert "vectors stay compatible" in caplog.text
+
+
+def test_keyless_nano_keeps_existing_1024_dimension_database(tmp_path, monkeypatch, fake_cfg):
+    from mimir.saga import embeddings as emb
+
+    db = tmp_path / "saga.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE embeddings (dim INTEGER)")
+        conn.execute("INSERT INTO embeddings VALUES (1024)")
+    fake_cfg({"provider": "voyage", "model": "voyage-4-lite", "dimensions": 1024})
+    previous_cfg = emb._cfg
+    monkeypatch.setattr(emb, "_cfg", lambda section, key, default=None:
+                        str(db) if (section, key) == ("storage", "db_path")
+                        else previous_cfg(section, key, default))
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+
+    provider = emb.get_provider()
+    assert isinstance(provider, emb.LocalProvider)
+    assert provider.dimensions() == 1024
+    assert provider._model is None
+
+
+@pytest.mark.parametrize("provider,model,dim", [
+    ("voyage", "voyage-3-lite", 1024),
+    ("voyage", "voyage-4-lite", 384),
+    ("openai", "text-embedding-3-small", 1024),
+])
+def test_incompatible_keyless_fallback_remains_onnx(monkeypatch, fake_cfg, caplog, provider, model, dim):
+    from mimir.saga import embeddings as emb
+
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+    fake_cfg({"provider": provider, "model": model, "dimensions": dim})
+    with caplog.at_level("WARNING", logger="saga.embeddings"):
+        instance = emb.get_provider()
+    assert isinstance(instance, emb.ONNXProvider)
+    assert instance.dimensions() == 384
+    assert "BAAI/bge-small-en-v1.5" in caplog.text
+    assert "not compatible" in caplog.text
 
 
 def test_keyless_fallback_warns_once_and_refuses_mixed_dimensions(tmp_path, monkeypatch, fake_cfg, caplog):

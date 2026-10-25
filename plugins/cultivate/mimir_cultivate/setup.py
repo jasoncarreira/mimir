@@ -36,8 +36,8 @@ DEFAULT_SOURCE_REPO = "jasoncarreira/mimir"
 DEFAULT_NEXTEST_VERSION = "0.9.148"
 DEFAULT_UV_VERSION = "0.11.0"
 DEFAULT_SAGA_MODELS = {"openai": "gpt-5.4-nano", "anthropic": "claude-haiku-5-5"}
-LOCAL_MODEL = "BAAI/bge-small-en-v1.5"
-EMBEDDING_MODELS = {"local": ("onnx", LOCAL_MODEL, 384, None),
+LOCAL_MODEL = "voyageai/voyage-4-nano"
+EMBEDDING_MODELS = {"local": ("local", LOCAL_MODEL, 1024, None),
                     "openai": ("openai", "text-embedding-3-small", 1536, "OPENAI_API_KEY"),
                     "voyage": ("voyage", "voyage-4-lite", 1024, "VOYAGE_API_KEY")}
 
@@ -328,7 +328,8 @@ def render_compose(template: str, layer_tag: str, kind: str) -> str:
         passthrough = "UV_PYTHON_INSTALL_DIR" if kind == "python" else "RUSTUP_HOME,CARGO_HOME" if kind == "rust" else ""
         environment.update({"MIMIR_ACP_ENABLED": "1", "MIMIR_PR_CHECKOUT_LEASE_ROOT": "/workspace/pr-leases",
                             "MIMIR_SHELL_PASS_ENV": passthrough, "MIMIR_ENABLE_CLAUDE_CODE": "0",
-                            "MIMIR_HOME": "/home/mimir/agent", "MIMIR_PLUGINS": "cultivate"})
+                            "MIMIR_HOME": "/home/mimir/agent", "MIMIR_PLUGINS": "cultivate",
+                            "XDG_CACHE_HOME": "/home/mimir/.cache"})
         # Worklink requires its own dedicated base, not the live working checkout.
         environment.pop("WORKLINK_REPO", None)
         volumes = ["home:/home/mimir/agent", "cache:/home/mimir/.cache", "workspace:/workspace",
@@ -399,7 +400,7 @@ def _provision_saga(home: Path, spec: str, embedding: str, reembed: bool = False
                     *, prefetch=None, repair=None) -> bool:
     """Reconcile only installer-owned sections; leave all other TOML bytes intact."""
     from mimir.saga._config_io import install_saga_config
-    from mimir.saga.embeddings import ONNXProvider
+    from mimir.saga.embeddings import LocalProvider
     from mimir.saga.reembed import reembed as saga_reembed
 
     settings = _saga_settings(spec, embedding)
@@ -452,7 +453,7 @@ def _provision_saga(home: Path, spec: str, embedding: str, reembed: bool = False
     # Download to the shared persistent cache before publishing a local config.
     if embedding == "local":
         if prefetch is None:
-            prefetch = lambda: ONNXProvider(model_name=LOCAL_MODEL, dimensions=384)._load()
+            prefetch = lambda: LocalProvider(model_name=LOCAL_MODEL, dimensions=1024)._load_model()
         prefetch()
     if text != original:
         path.write_text(text)
@@ -614,8 +615,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     extra_keys = {}
     if saga_key_env != key_name:
         extra_keys[saga_key_env] = _secret(args, "saga_model_key", "Saga model API key (input hidden).", previous=prior.get(saga_key_env))
-    embedding = _field(args, "embedding", "Embedding model: local runs on CPU in the container without a key; "
-                       "API providers can give better retrieval quality.", default="local")
+    embedding = _field(args, "embedding", "Embedding model: local voyage-4-nano runs on CPU without a key "
+                       "and shares Voyage 4's embedding space; API providers are also available.", default="local")
     embedding_key_env = EMBEDDING_MODELS[embedding.split(":", 1)[0]][3]
     if embedding_key_env == key_name:
         print(f"Reusing {key_name} for embeddings.")
@@ -660,7 +661,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   "--build-arg MIMIR_PLUGIN_SELECTION=cultivate",
                   "--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build",
                   "--build-arg MIMIR_ENABLE_OPENCODE=1",
-                  "--build-arg MIMIR_EXTRAS=" + ",".join(sorted({provider, saga_provider, "mcp"}))]
+                  "--build-arg MIMIR_EXTRAS=" + ",".join(sorted({provider, saga_provider, "mcp", "local-embeddings"}))]
     _write(deploy / "build.sh", "#!/bin/sh\nset -eu\n"
            + "docker build -t " + tag + " " + " ".join(build_args) + " " + source_url + "#" + sha + "\n"
            + "docker build -t " + layer_tag + " -f Dockerfile.toolchain .\n", mode=0o755)
@@ -699,7 +700,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
          "--build-arg", "MIMIR_CONTROLLER_COMMIT=" + sha, "--build-arg", "MIMIR_EXECUTOR_COMMIT=" + sha,
          "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate",
          "--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build", "--build-arg", "MIMIR_ENABLE_OPENCODE=1",
-         "--build-arg", "MIMIR_EXTRAS=" + ",".join(sorted({provider, saga_provider, "mcp"})), source_url + "#" + sha], cwd=deploy)
+         "--build-arg", "MIMIR_EXTRAS=" + ",".join(sorted({provider, saga_provider, "mcp", "local-embeddings"})), source_url + "#" + sha], cwd=deploy)
     run(["docker", "build", "-t", layer_tag, "-f", "Dockerfile.toolchain", "."], cwd=deploy)
     run(["docker", "compose", "run", "--rm", "init"], cwd=deploy)
     provisioned = run(["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",

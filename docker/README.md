@@ -45,7 +45,10 @@ but `worker_exec._handle_launch` replaces it before spawning jobs). The disposab
 build HOME is removed even when a probe fails. The static version floor is 2.102.0
 (the advisory-patched release); the capability checks remain required.
 Core-only images do not download or install gh. `mimir cultivate setup` passes
-`MIMIR_EXTRAS=<provider>,mcp` to the root build, including its saved `build.sh`.
+`MIMIR_EXTRAS=<provider>,mcp,local-embeddings` to the root build, including its
+saved `build.sh`. The extra installs CPU-only torch wheels from the PyTorch CPU
+index in the controller and executor environments; the provision container
+prefetches voyage-4-nano to the shared persistent Hugging Face cache.
 
 The Cultivate image also ships `/usr/local/bin/chainlink` for Worklink claims,
 continuation, and the ready-queue poller. It is built from

@@ -87,6 +87,11 @@ codex-plus = [
 mcp = [
     "mcp>=2.3,<3",
 ]
+local-embeddings = [
+    "sentence-transformers>=5.1",
+    "transformers>=4.56,<5",
+    "torch>=2.2",
+]
 acp = []
 # LongMemEval bench harness — pulls the workspace ``saga`` package
 # (the bench shell, not the runtime memory backend). Only meaningful
@@ -295,6 +300,12 @@ members = ["benchmarks/saga", "plugins/cultivate"]
 # saga.core / saga.benchmarks are importable from anywhere in the workspace.
 [tool.uv.sources]
 saga = { workspace = true }
+torch = { index = "pytorch-cpu", marker = "sys_platform == 'linux'" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [dependency-groups]
 # uv-native dependency group (PEP 735). Mirrors

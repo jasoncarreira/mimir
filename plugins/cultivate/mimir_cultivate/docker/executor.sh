@@ -13,6 +13,9 @@ printf '%s\n' "$MIMIR_EXECUTOR_COMMIT" > /opt/mimir-worklink/executor-source-com
 rm -rf /opt/mimir-worklink/source/.git
 python3 -m venv /opt/mimir-worklink/venv
 /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --upgrade pip
+case ",${MIMIR_EXTRAS:-}," in
+    *,local-embeddings,*) /opt/mimir-worklink/venv/bin/pip install --no-cache-dir 'torch==2.14.1+cpu' --extra-index-url https://download.pytorch.org/whl/cpu ;;
+esac
 /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 /opt/mimir-worklink/venv/bin/pip install --no-cache-dir 'pypdf>=6.16'
 /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source

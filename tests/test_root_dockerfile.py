@@ -144,6 +144,15 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
         actual_steps = steps((source / name).read_text())
         if name == "executor.sh":
             # Intentional post-extraction changes, each pinned exactly:
+            # 0. The optional local embedding extra needs the locked CPU
+            #    torch wheel before pip resolves the rest of the extra.
+            extra_install = "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir mimir-agent[${MIMIR_EXTRAS}]"
+            expected_steps[expected_steps.index(extra_install):expected_steps.index(extra_install)] = [
+                "case ,${MIMIR_EXTRAS:-}, in",
+                "*,local-embeddings,*) /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "
+                "torch==2.14.1+cpu --extra-index-url https://download.pytorch.org/whl/cpu",
+                "esac",
+            ]
             # 1. Cultivate is overlaid from the same verified tree as core, with
             #    --no-deps so its exact mimir-agent pin cannot replace the overlay.
             overlay = "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source"
