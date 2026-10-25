@@ -28,6 +28,53 @@ by name. Disabled provider modules are not imported.
 
 ### Cultivate (optional coding provider)
 
+#### Set up a Cultivate agent
+
+Run `mimir cultivate setup` from a source checkout with Cultivate installed and
+selected (`MIMIR_PLUGINS=cultivate uv run --all-packages mimir cultivate setup`).
+Before any other prompt or provisioning, setup displays the full shipped
+Cultivate **Business Source License 1.1**, distinct from core Mimir's MIT
+license, and requires `yes` or `accept`. Decline or EOF writes nothing.
+Acceptance is saved once per user at
+`${XDG_CONFIG_HOME:-~/.config}/mimir/cultivate-license-accepted.json` with the
+license SHA-256, installed version and UTC timestamp; a changed license
+requires acceptance again. Unattended first runs require `--accept-license`.
+
+The installer asks for a GitHub repository and base branch, a bot login and
+commit email, an owner name and email, a model spec and API key, and a local
+deployment directory and loopback port. It shows the required fine-grained PAT
+permissions and verifies the bot's identity, Write invitation, PR read and
+Actions read before building. The source is fetched from a pushed ref and its
+full SHA is pinned into both the controller and executor image build.
+Use `--source-repo owner/name` (`MIMIR_CULTIVATE_SOURCE_REPO`) to build from
+a trusted fork or relocated source repo; the default is `jasoncarreira/mimir`.
+Setup prefers executable `tools/verify` or `scripts/verify` (including `.sh`
+variants) over language-default test commands. Rust nextest uses a versioned
+prebuilt binary, taking a `cargo-nextest@X.Y.Z` workflow pin when present
+(default `0.9.148`); Python uv is explicitly pinned (default `0.11.0`).
+The target checkout is `/workspace/<repo-name>`. `WORKLINK_REPO` is intentionally
+unset: configure a dedicated Worklink base separately, never the live checkout.
+
+For unattended runs, use `--help` to see the corresponding flags or set
+`MIMIR_CULTIVATE_REPO`, `MIMIR_CULTIVATE_BRANCH`, `MIMIR_CULTIVATE_BOT_LOGIN`,
+`MIMIR_CULTIVATE_BOT_EMAIL`, `MIMIR_CULTIVATE_OWNER`,
+`MIMIR_CULTIVATE_DISPLAY_NAME`, `MIMIR_CULTIVATE_OWNER_EMAIL`,
+`MIMIR_CULTIVATE_MODEL_SPEC`, `MIMIR_CULTIVATE_DEPLOY`, and
+`MIMIR_CULTIVATE_PORT`. Pass secrets via `--github-token-file` and
+`--model-key-file` (private mode-600 files), their `-stdin` counterparts, or
+`MIMIR_CULTIVATE_GITHUB_TOKEN` / `MIMIR_CULTIVATE_MODEL_KEY`. Never put a key
+in a command-line argument. The installer writes `compose.env` and the owner's
+web key as separate mode-600 files and does not print either key.
+
+The generated Compose binds only to `127.0.0.1`, has an init service to own
+the named volumes, and selects Cultivate in the **process environment**. Setup
+also writes a provenance-pinned `build.sh` for reproducible rebuilds. Setup
+provisions the checkout, the repository inventory, the optional GitHub pollers,
+and the owner key before starting the agent. It then checks health, plugin
+selection, repository binding, poller scheduling, and a web-chat reply. Re-run
+the same command to repair missing provisioning without replacing operator
+secrets. Use `--rotate-web-key` only when intentionally revoking the old key.
+
 Coding is supplied by the separately packaged `mimir-cultivate` distribution
 (`BUSL-1.1`), not by an extra on the MIT `mimir-agent` distribution. It is
 **not published to a package index**: it is installed from the in-repo
