@@ -18,6 +18,9 @@ import logging
 import os
 import threading
 import time
+import sqlite3
+from pathlib import Path
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import Optional
 
@@ -395,6 +398,40 @@ def reset_provider_cache() -> None:
         cached_embed_query.cache_clear()
 
 
+_dimension_check = threading.local()
+
+
+@contextmanager
+def offline_reembedding():
+    """Allow only the offline repair path to read a mismatched database."""
+    previous = getattr(_dimension_check, "offline", False)
+    _dimension_check.offline = True
+    try:
+        yield
+    finally:
+        _dimension_check.offline = previous
+
+
+def _check_existing_dimensions(dim: int) -> None:
+    """Never add vectors of a new dimension to an existing Saga database."""
+    if getattr(_dimension_check, "offline", False):
+        return
+    from ._config_io import get_data_dir
+    db = Path(_cfg('storage', 'db_path', 'saga.db'))
+    if not db.is_absolute():
+        db = get_data_dir() / db
+    if not db.is_file():
+        return
+    with sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True) as conn:
+        for table, column in (("embeddings", "dim"), ("sessions", "embedding_dim"),
+                              ("triples", "embedding_dim")):
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                continue
+            if conn.execute(f"SELECT 1 FROM {table} WHERE {column} IS NOT NULL AND {column} != ? LIMIT 1", (dim,)).fetchone():
+                raise RuntimeError("Embedding provider would mix vector dimensions in saga.db; "
+                                   "run mimir saga-reembed offline before switching providers")
+
+
 def get_provider() -> EmbeddingProvider:
     """Get the configured embedding provider (singleton).
 
@@ -442,7 +479,8 @@ def get_provider() -> EmbeddingProvider:
                 _DEFAULT_KEY_ENVS[provider_name],
             )
             if api_key_env and not os.environ.get(api_key_env):
-                logging.getLogger("saga.embeddings").info(
+                _check_existing_dimensions(384)
+                logging.getLogger("saga.embeddings").warning(
                     "[embedding] provider=%s but %s is unset — falling back "
                     "to onnx (fastembed, BAAI/bge-small-en-v1.5). Set %s in "
                     "your environment to use %s.",
@@ -459,12 +497,15 @@ def get_provider() -> EmbeddingProvider:
                 f"Available: {', '.join(_PROVIDERS.keys())}"
             )
         if _onnx_model_override is not None and provider_cls is ONNXProvider:
-            _provider_instance = provider_cls(
+            instance = provider_cls(
                 model_name=_onnx_model_override,
                 dimensions=_onnx_dimensions_override,
             )
         else:
-            _provider_instance = provider_cls()
+            instance = provider_cls()
+        if isinstance(instance, EmbeddingProvider):
+            _check_existing_dimensions(instance.dimensions())
+        _provider_instance = instance
     return _provider_instance
 
 

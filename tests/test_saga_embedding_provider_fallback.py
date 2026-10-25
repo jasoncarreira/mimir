@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import sqlite3
 
 
 @pytest.fixture(autouse=True)
@@ -47,6 +48,43 @@ def test_fallback_uses_onnx_default_when_model_inherited(
     provider = get_provider()
     assert isinstance(provider, ONNXProvider)
     assert provider.model_name == "BAAI/bge-small-en-v1.5"
+
+
+def test_keyless_fallback_warns_once_and_refuses_mixed_dimensions(tmp_path, monkeypatch, fake_cfg, caplog):
+    import mimir.saga.embeddings as emb
+    db = tmp_path / "saga.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE embeddings (dim INTEGER)")
+        conn.execute("INSERT INTO embeddings VALUES (1024)")
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    fake_cfg({"provider": "voyage", "api_key_env": "VOYAGE_API_KEY"})
+    original = emb._cfg
+    monkeypatch.setattr(emb, "_cfg", lambda section, key, default=None:
+                        str(db) if (section, key) == ("storage", "db_path") else original(section, key, default))
+    with pytest.raises(RuntimeError, match="mimir saga-reembed"):
+        emb.get_provider()
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM embeddings")
+    with caplog.at_level("WARNING"):
+        assert emb.get_provider().provider_name == "onnx"
+        emb.get_provider()
+    assert caplog.text.count("VOYAGE_API_KEY is unset") == 1
+
+
+def test_explicit_provider_cannot_mix_dimensions_but_offline_reembed_can(tmp_path, monkeypatch, fake_cfg):
+    import mimir.saga.embeddings as emb
+    db = tmp_path / "saga.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE embeddings (dim INTEGER)")
+        conn.execute("INSERT INTO embeddings VALUES (1024)")
+    fake_cfg({"provider": "onnx", "model": "BAAI/bge-small-en-v1.5", "dimensions": 384})
+    original = emb._cfg
+    monkeypatch.setattr(emb, "_cfg", lambda section, key, default=None:
+                        str(db) if (section, key) == ("storage", "db_path") else original(section, key, default))
+    with pytest.raises(RuntimeError, match="mimir saga-reembed"):
+        emb.get_provider()
+    with emb.offline_reembedding():
+        assert emb.get_provider().dimensions() == 384
 
 
 def test_fallback_uses_onnx_default_when_model_explicitly_voyage(

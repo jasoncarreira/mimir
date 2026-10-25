@@ -627,11 +627,11 @@ def test_opencode_task_id_resume_after_prune(tmp_path: Path, monkeypatch: pytest
                 function = (
                     {"name": "task", "arguments": json.dumps({
                         "description": "Child continuity fixture", "subagent_type": "general",
-                        "prompt": "Use bash to print the current directory",
+                        "prompt": "Read the continuity fixture",
                         **({"task_id": child_id} if child_id else {}),
                     })}
                     if step == 0 else
-                    {"name": "bash", "arguments": json.dumps({"command": "pwd; printf 'child-resume-second-turn'" if child_id else "pwd", "description": "Print working directory"})}
+                    {"name": "read", "arguments": json.dumps({"filePath": str(resume_path if child_id else first_path)})}
                 )
                 chunks = [
                     {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [
@@ -658,6 +658,10 @@ def test_opencode_task_id_resume_after_prune(tmp_path: Path, monkeypatch: pytest
         try:
             record, db = _record(tmp_path, _dead_handle())
             checkout = Path(record.sandbox).parent.parent
+            first_path = checkout / "continuity-first.txt"
+            resume_path = checkout / "continuity-resume.txt"
+            first_path.write_text(str(checkout))
+            resume_path.write_text("child-resume-second-turn")
             config = {
                 "model": "fixture/fixture", "provider": {"fixture": {
                     "npm": "@ai-sdk/openai-compatible", "name": "Fixture",
@@ -675,7 +679,7 @@ def test_opencode_task_id_resume_after_prune(tmp_path: Path, monkeypatch: pytest
                 assert result.returncode == 0, (result.stdout, result.stderr)
                 return result
 
-            first = run("run", "Use bash to print the current directory", "--format", "json")
+            first = run("run", "Read the continuity fixture", "--format", "json")
             task_ids = [json.loads(line)["sessionID"] for line in first.stdout.splitlines()
                         if line.startswith("{") and "sessionID" in json.loads(line)]
             assert task_ids and db.exists() and len(requests) >= 2
@@ -702,7 +706,7 @@ def test_opencode_task_id_resume_after_prune(tmp_path: Path, monkeypatch: pytest
             run("run", "Recall the tool output", "--session", task_ids[0], "--format", "json")
             history = json.dumps([message for request in requests[request_count:]
                                   for message in request.get("messages", [])])
-            assert "Use bash to print the current directory" in history
+            assert "Read the continuity fixture" in history
             assert str(checkout) in history and '"role": "tool"' in history
             assert child_id in history
             with sqlite3.connect(db) as conn:
@@ -712,7 +716,7 @@ def test_opencode_task_id_resume_after_prune(tmp_path: Path, monkeypatch: pytest
                     "SELECT data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'tool'", (child_id,))]
                 assert any(part.get("state", {}).get("status") == "completed" and
                            "child-resume-second-turn" in part.get("state", {}).get("output", "")
-                           for part in child_tools)
+                               for part in child_tools)
                 assert any("child-resume-second-turn" in str(message.get("content", ""))
                            for request in requests[request_count:] for message in request.get("messages", [])
                            if message.get("role") == "tool")
