@@ -125,7 +125,8 @@ exists — turn it on here first:
 
 Coding is an optional installed provider, not a feature flag: install the
 in-repo `plugins/cultivate` workspace member (`uv sync --all-packages`, or an
-image built with `MIMIR_PLUGIN_SELECTION=cultivate`) and select `cultivate` in
+image built with `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` and
+`--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build`) and select `cultivate` in
 `MIMIR_PLUGINS`. The retired `MIMIR_CODING_ENABLED` flag has no effect and logs a
 warning at boot. See [coding prerequisites](#coding-prerequisites) and
 [upgrading a coding deployment](plugins.md#upgrading-a-coding-deployment).
@@ -897,7 +898,8 @@ Coding stays disabled by default. Install Cultivate from the in-repo
 (`uv sync --all-packages`; it is not published to an index) and set
 `MIMIR_PLUGINS=cultivate` in the supervisor process environment; an unselected
 or absent provider supplies no coding tools. For image builds, select Cultivate
-at build time with `MIMIR_PLUGIN_SELECTION=cultivate` as described in
+at build time with `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` and
+`--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` as described in
 [plugins](plugins.md#docker-image-assembly-and-services).
 `MIMIR_ENABLE_OPENCODE` is a build argument for the pinned CLI/bootstrap, not
 a runtime coding switch. Compose reads its project `.env` for build argument

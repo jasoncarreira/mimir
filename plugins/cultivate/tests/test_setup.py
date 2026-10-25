@@ -221,6 +221,19 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert (deploy / "build.sh").stat().st_mode & 0o777 == 0o755
     assert "https://github.com/neworg/mimir.git#" + SHA in (deploy / "build.sh").read_text()
     assert any("https://github.com/neworg/mimir.git#" + SHA in argv for argv in calls)
+    # Check both the actual installer invocation and its saved rebuild script.
+    root_builds = [argv for argv in calls if argv[:2] == ["docker", "build"]
+                   and "MIMIR_PLUGIN_SELECTION=cultivate" in argv]
+    assert len(root_builds) == 2
+    for argv in root_builds:
+        index = argv.index("CHAINLINK_ARTIFACT_STAGE=chainlink-build")
+        assert argv[index - 1] == "--build-arg"
+    import shlex
+    build_lines = (deploy / "build.sh").read_text().splitlines()
+    saved_build, = [shlex.split(line) for line in build_lines
+                   if "MIMIR_PLUGIN_SELECTION=cultivate" in line]
+    index = saved_build.index("CHAINLINK_ARTIFACT_STAGE=chainlink-build")
+    assert saved_build[index - 1] == "--build-arg"
     assert json.loads((deploy / "manifest.json").read_text())["test"] == "./tools/verify"
     assert (deploy / ".dockerignore").read_text() == "*\n!Dockerfile.toolchain\n"
     for name in ("compose.yml", "Dockerfile.toolchain", "manifest.json", "provision.py"):

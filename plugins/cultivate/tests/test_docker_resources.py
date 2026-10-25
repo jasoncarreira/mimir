@@ -161,6 +161,7 @@ def test_actual_selected_cli_bootstraps_and_missing_provider_fails(tmp_path: Pat
     assert "MIMIR_PLUGINS: missing plugin(s): cultivate" in missing.stderr
     assert "`uv sync --all-packages`" in missing.stderr
     assert "--build-arg MIMIR_PLUGIN_SELECTION=cultivate" in missing.stderr
+    assert "--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build" in missing.stderr
 
 
 @pytest.mark.parametrize("mode", ["root", "workspace", "pypi"])

@@ -81,7 +81,8 @@ Coding is supplied by the separately packaged `mimir-cultivate` distribution
 `plugins/cultivate` workspace member at the same commit as core. From a source
 checkout, `uv sync --all-packages` (plus your usual `--extra` flags) installs
 both; a plain `uv sync` or `uv sync --extra …` removes it again. Images build it
-from the pinned source commit when `MIMIR_PLUGIN_SELECTION=cultivate` (see
+from the pinned source commit with `--build-arg MIMIR_PLUGIN_SELECTION=cultivate`
+and `--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` (see
 [Docker image assembly](#docker-image-assembly-and-services)). Then set
 `MIMIR_PLUGINS=cultivate` in the operator-owned process environment and restart.
 Installing without selecting does not activate or import the provider.

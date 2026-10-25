@@ -8,7 +8,8 @@ agent home selected by `MIMIR_HOME`.
 Worklink is supplied by the optional Cultivate plugin, the in-repo
 `plugins/cultivate` workspace member. Install it from the same checkout as core
 (`uv sync --all-packages`, or an image built with
-`MIMIR_PLUGIN_SELECTION=cultivate`) and select `cultivate` in `MIMIR_PLUGINS`
+`--build-arg MIMIR_PLUGIN_SELECTION=cultivate` and
+`--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build`) and select `cultivate` in `MIMIR_PLUGINS`
 before following these instructions; core Mimir alone does not supply Worklink
 or coding tools. See [upgrading a coding deployment](plugins.md#upgrading-a-coding-deployment).
 
