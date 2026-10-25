@@ -513,10 +513,6 @@ def _validate_qualification(
         return "association_changed"
     if pr.slug != repository.slug or pr.base_slug != repository.slug:
         return "repository_identity_mismatch"
-    if pr.base_ref != repository.base_branch:
-        return "completion_base_mismatch"
-    if any(base_ref != repository.base_branch for base_ref in association.active_base_refs):
-        return "completion_base_mismatch"
     if not pr.merged:
         return "pr_open" if pr.state == "open" else "pr_closed_unmerged"
     completion = parse_completion_reference(pr.body, expected_issue_id=issue.issue_id)
@@ -914,7 +910,7 @@ def reconcile_merged_leaves(
                     raise ClosureReadError(reason)
                 assert pr.merged_at is not None and pr.merge_commit_sha is not None
                 key = _intent_key(issue_id, repository, pr)
-                audit = _audit_text(key, issue_id, pr, repository.base_branch)
+                audit = _audit_text(key, issue_id, pr, pr.base_ref)
                 if dry_run:
                     outcomes.append(
                         ClosureOutcome(issue_id, pr.url, pr.merged_at, pr.merge_commit_sha)
