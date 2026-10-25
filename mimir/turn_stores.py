@@ -291,7 +291,10 @@ def _research_poller_names(home: Path, *, policy: PolicyRegistry) -> set[str]:
 
 
 def sweep_turn_stores(home: Path, *, policy: PolicyRegistry) -> None:
-    """Sweep crashed turns using the server's explicit active plugin policy."""
+    """On upgrade purge unattributed legacy bytes; on restart sweep crashed turns.
+
+    Research-poller discovery uses the caller's explicit active plugin policy.
+    """
     if policy is None:
         raise ValueError("turn-store sweep requires an explicit plugin policy")
     home = home.resolve()
