@@ -29,7 +29,6 @@ from .dispatch_failures import (
     resolve_failure_if_current,
     resolve_merge_reconciliation_notices,
 )
-from .planning import target_branch_from_description
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
@@ -71,7 +70,6 @@ class IssueSnapshot:
     labels: frozenset[str]
     comments: tuple[str, ...]
     parent_id: int | None
-    description: str = ""
 
     @property
     def is_open(self) -> bool:
@@ -259,13 +257,7 @@ def parse_issue_snapshot(payload: object, *, expected_issue_id: int) -> IssueSna
     parent_id = None if parent_raw is None else _positive_int(parent_raw, "parent_id")
     if parent_id == expected_issue_id:
         raise ClosureReadError("issue cannot be its own parent")
-    description = payload.get("description")
-    if not isinstance(description, str):
-        raise ClosureReadError("issue snapshot requires a description")
-    return IssueSnapshot(
-        expected_issue_id, normalized_status, frozenset(labels), tuple(comments), parent_id,
-        description,
-    )
+    return IssueSnapshot(expected_issue_id, normalized_status, frozenset(labels), tuple(comments), parent_id)
 
 
 def parse_completion_reference(body: str, *, expected_issue_id: int) -> CompletionDecision:
@@ -516,20 +508,6 @@ def _validate_qualification(
         return "repository_identity_mismatch"
     if not pr.merged:
         return "pr_open" if pr.state == "open" else "pr_closed_unmerged"
-    try:
-        target = target_branch_from_description(issue.description)
-    except ValueError:
-        return "completion_target_not_allowed"
-    if target is not None and target not in (repository.base_branch, *repository.integration_branches):
-        # Preserve the legacy base refusal when no integration bases are enabled.
-        if repository.integration_branches:
-            return "completion_target_not_allowed"
-        return "completion_base_mismatch"
-    completion_base = target or repository.base_branch
-    if pr.base_ref != completion_base:
-        return "completion_base_mismatch"
-    if any(base_ref != completion_base for base_ref in association.active_base_refs):
-        return "completion_base_mismatch"
     completion = parse_completion_reference(pr.body, expected_issue_id=issue.issue_id)
     return None if completion.qualifies else completion.reason
 

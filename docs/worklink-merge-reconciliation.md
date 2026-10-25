@@ -19,16 +19,10 @@ The home must declare `repositories.yaml`, select that repository from
 `worklink.yaml`, grant it `rw` mode, and set `WORKLINK_REPO` (or its supported
 alias) to the exact configured Git root. The local Git top-level and origin,
 the PR URL and API identity, and the PR base repository must all match that
-inventory. An optional `integration_branches` list in the repository's
-`repositories.yaml` entry approves additional completion bases (empty by
-default). A leaf's `Worklink notes` Target branch must be `base_branch` or a
-listed integration branch; without a target, completion uses `base_branch`.
-The merged PR and active evidence must both name that leaf-specific base.
-Other targets and intermediate stack bases remain for human reconciliation.
-With no integration branches configured, an unapproved target retains the
-legacy `completion_base_mismatch` refusal; otherwise it reports
-`completion_target_not_allowed`.
-Open PRs raise no base or target notices, even if their current base differs;
+inventory. A qualifying merged PR into any branch of the declared repository
+completes its leaf. No branch allowlist or comparison with the inventory's
+`base_branch`, the leaf's stated target, or the evidence's base is required.
+Open PRs raise no base notices, regardless of their current base;
 closed-unmerged PRs retain their existing handling.
 
 Only an open `worklink:review` ordinary leaf qualifies. `worklink:epic` and

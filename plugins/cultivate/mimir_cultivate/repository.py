@@ -34,7 +34,6 @@ class RepositoryConfig:
     base_branch: str
     test_command: str | None = None
     test_suites: tuple[RepositoryTestSuite, ...] = ()
-    integration_branches: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -222,8 +221,6 @@ def _parse_test_suites(
 
 
 def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
-    from .worklink.planning import _plausible_branch_name
-
     if not isinstance(value, list | tuple):
         raise ValueError("repository inventory repositories must be a list")
     repositories: list[RepositoryConfig] = []
@@ -255,21 +252,15 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
                 f"{label}.origin names {origin_slug}, which disagrees with slug {slug}"
             )
         base_branch = item["base_branch"]
-        if not isinstance(base_branch, str) or not _plausible_branch_name(base_branch):
-            raise ValueError(f"{label}.base_branch must be a valid branch name")
-        integration_branches = item.get("integration_branches", [])
-        if not isinstance(integration_branches, list) or any(
-            not isinstance(branch, str) or not _plausible_branch_name(branch)
-            for branch in integration_branches
-        ):
-            raise ValueError(f"{label}.integration_branches must be a list of valid branch names")
+        if not isinstance(base_branch, str) or not base_branch.strip():
+            raise ValueError(f"{label}.base_branch must be a non-empty string")
         test_command = item.get("test_command")
         if test_command is not None and not isinstance(test_command, str):
             raise ValueError(f"{label}.test_command must be a string or null")
         test_suites = _parse_test_suites(
             item.get("test_suites", []), f"{label}.test_suites", test_command,
         )
-        if set(item) - {"slug", "root", "mode", "origin", "base_branch", "integration_branches", "test_command", "test_suites"}:
+        if set(item) - {"slug", "root", "mode", "origin", "base_branch", "test_command", "test_suites"}:
             raise ValueError(f"{label} contains unknown fields")
         if slug in slugs:
             raise ValueError(f"duplicate repository slug: {slug}")
@@ -286,7 +277,6 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
                 base_branch=base_branch.strip(),
                 test_command=test_command,
                 test_suites=test_suites,
-                integration_branches=tuple(integration_branches),
             )
         )
     return tuple(repositories)

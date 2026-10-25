@@ -41,10 +41,7 @@ def cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.Co
     return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
 
-def configured_home(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *,
-    integration_branches: tuple[str, ...] | None = None,
-) -> tuple[Path, Path]:
+def configured_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     home = tmp_path / "home"
     repo = tmp_path / "repo"
     home.mkdir(parents=True)
@@ -56,9 +53,7 @@ def configured_home(
         f"    root: {repo}\n"
         "    mode: rw\n"
         "    origin: https://github.com/example/project.git\n"
-        "    base_branch: main\n"
-        + (f"    integration_branches: {json.dumps(list(integration_branches))}\n"
-           if integration_branches is not None else ""),
+        "    base_branch: main\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
@@ -166,30 +161,26 @@ def evidence(home: Path, issue_id: int, *, url: str = PR_URL, attempt: int = 1,
     return path
 
 
-def target_description(branch: str) -> str:
-    return f"Worklink notes:\n- Target branch: {branch}\n"
-
-
 def unresolved_reasons(home: Path) -> list[str]:
     notices = load_failure_state(dispatch_failure_state_dir(home))["merge_reconciliations"]["notices"]
     return [entry["reason"] for entry in notices.values() if not entry["resolved"]]
 
 
-def test_approved_integration_merge_closes_with_actual_base_and_tombstone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("base", ["main", "feature/plugins", "release/next"])
+def test_any_branch_merge_closes_with_actual_base_and_tombstone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base: str,
 ) -> None:
-    home, repo = configured_home(tmp_path, monkeypatch, integration_branches=("feature/plugins",))
-    evidence(home, 2014, base_ref="feature/plugins")
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 2014, base_ref=base)
     tracker = Tracker(2014)
-    tracker.description = target_description("feature/plugins")
 
     outcomes = closure.reconcile_merged_leaves(
-        home, chainlink_runner=tracker, gh_runner=forge(2014, base="feature/plugins"),
+        home, chainlink_runner=tracker, gh_runner=forge(2014, base=base),
         git_runner=git_runner(repo),
     )
 
     assert [outcome.issue_id for outcome in outcomes] == [2014]
-    assert "completion base feature/plugins." in tracker.comments[-1]
+    assert f"completion base {base}." in tracker.comments[-1]
     assert [call[2] for call in tracker.calls if call[1:3] in (
         ["issue", "comment"], ["issue", "close"], ["issue", "unlabel"],
     )] == ["comment", "close", "unlabel"]
@@ -199,112 +190,69 @@ def test_approved_integration_merge_closes_with_actual_base_and_tombstone(
     assert intent["audit_text"] == tracker.comments[-1]
 
 
-@pytest.mark.parametrize(("target", "pr_base", "evidence_base", "branches", "reason"), [
-    ("feature/plugins", "feature/plugins", "feature/plugins", None, "completion_base_mismatch"),
-    ("feature/other", "feature/other", "feature/other", ("feature/plugins",), "completion_target_not_allowed"),
-    ("feature/plugins", "main", "main", ("feature/plugins",), "completion_base_mismatch"),
-    ("feature/plugins", "main", "feature/plugins", ("feature/plugins",), "completion_base_mismatch"),
-    ("feature/plugins", "feature/plugins", "main", ("feature/plugins",), "completion_base_mismatch"),
-    ("feature/plugins", "feature/plugins", "feature/plugins", (), "completion_base_mismatch"),
-    ("feature/plugins", "main", "main", None, "completion_base_mismatch"),
-    ("main", "feature/plugins", "feature/plugins", ("feature/plugins",), "completion_base_mismatch"),
+@pytest.mark.parametrize(("target", "pr_base", "evidence_base"), [
+    ("feature/plugins", "main", "feature/plugins"),
+    ("main", "feature/plugins", "main"),
+    ("../invalid", "release/next", "feature/plugins"),
 ])
-def test_merged_leaf_requires_approved_own_target_and_matching_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str, pr_base: str,
-    evidence_base: str, branches: tuple[str, ...] | None, reason: str,
+def test_merge_does_not_compare_target_or_evidence_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str,
+    pr_base: str, evidence_base: str,
 ) -> None:
-    home, repo = configured_home(tmp_path, monkeypatch, integration_branches=branches)
+    home, repo = configured_home(tmp_path, monkeypatch)
     evidence(home, 2000, base_ref=evidence_base)
     tracker = Tracker(2000)
-    tracker.description = target_description(target)
-    assert closure.reconcile_merged_leaves(
+    tracker.description = f"Worklink notes:\n- Target branch: {target}\n"
+    assert [item.issue_id for item in closure.reconcile_merged_leaves(
         home, chainlink_runner=tracker, gh_runner=forge(2000, base=pr_base),
         git_runner=git_runner(repo),
-    ) == []
-    assert tracker.status == "open"
-    assert unresolved_reasons(home) == [reason]
-    assert not [call for call in tracker.calls if call[1:3] in (
-        ["issue", "comment"], ["issue", "close"], ["issue", "unlabel"],
-    )]
+    )] == [2000]
+    assert tracker.status == "closed"
+    assert unresolved_reasons(home) == []
+    assert f"completion base {pr_base}." in tracker.comments[-1]
 
 
-@pytest.mark.parametrize(("target", "base", "branches"), [
-    ("feature/plugins", "feature/plugins", ("feature/plugins",)),
-    ("feature/other", "feature/other", ("feature/plugins",)),
-    ("feature/plugins", "main", ("feature/plugins",)),
-    ("", "feature/plugins", None),
-])
-def test_open_pr_has_no_base_or_target_notice(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str,
-    base: str, branches: tuple[str, ...] | None,
+@pytest.mark.parametrize("base", ["main", "feature/plugins", "release/next"])
+def test_open_pr_has_no_base_notice_or_tracker_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base: str,
 ) -> None:
-    home, repo = configured_home(tmp_path, monkeypatch, integration_branches=branches)
-    evidence(home, 2449, base_ref=base)
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 2449, base_ref="different/evidence")
     tracker = Tracker(2449)
-    tracker.description = target_description(target) if target else ""
     assert closure.reconcile_merged_leaves(
         home, chainlink_runner=tracker,
         gh_runner=forge(2449, state="open", merged=False, base=base),
         git_runner=git_runner(repo),
     ) == []
     assert unresolved_reasons(home) == []
+    assert tracker.status == "open"
+    assert not [call for call in tracker.calls if call[1:3] in (
+        ["issue", "comment"], ["issue", "close"], ["issue", "unlabel"],
+    )]
 
 
-def test_closed_unmerged_wrong_target_archives_without_base_notice(
+def test_closed_unmerged_nondefault_base_archives_without_notice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home, repo = configured_home(tmp_path, monkeypatch)
     path = evidence(home, 2012, base_ref="feature/plugins")
     tracker = Tracker(2012)
-    tracker.description = target_description("feature/plugins")
     assert closure.reconcile_merged_leaves(
         home, chainlink_runner=tracker,
         gh_runner=forge(2012, state="closed", merged=False, base="feature/plugins"),
         git_runner=git_runner(repo),
     ) == []
     assert unresolved_reasons(home) == []
+    assert tracker.status == "open"
     assert path.with_suffix(".json.closed-unmerged").exists()
 
 
-@pytest.mark.parametrize(("base", "expected"), [
-    ("main", True), ("feature/plugins", False),
-])
-def test_no_target_uses_main_even_with_approved_integration_branch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base: str, expected: bool,
-) -> None:
-    home, repo = configured_home(tmp_path, monkeypatch, integration_branches=("feature/plugins",))
-    evidence(home, 2011, base_ref=base)
-    tracker = Tracker(2011)
-    outcomes = closure.reconcile_merged_leaves(
-        home, chainlink_runner=tracker, gh_runner=forge(2011, base=base),
-        git_runner=git_runner(repo),
-    )
-    assert bool(outcomes) is expected
-    assert unresolved_reasons(home) == ([] if expected else ["completion_base_mismatch"])
-    if expected:
-        assert "completion base main." in tracker.comments[-1]
-
-
-def test_malformed_target_refuses_merged_leaf(
+def test_pending_intent_revalidates_nondefault_branch_merge_before_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    home, repo = configured_home(tmp_path, monkeypatch, integration_branches=("feature/plugins",))
-    evidence(home, 2010, base_ref="main")
-    tracker = Tracker(2010)
-    tracker.description = target_description("../invalid")
-    assert closure.reconcile_merged_leaves(
-        home, chainlink_runner=tracker, gh_runner=forge(2010), git_runner=git_runner(repo),
-    ) == []
-    assert unresolved_reasons(home) == ["completion_target_not_allowed"]
-
-
-def test_pending_intent_revalidates_leaf_target_before_close(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    home, repo = configured_home(tmp_path, monkeypatch, integration_branches=("feature/plugins",))
+    home, repo = configured_home(tmp_path, monkeypatch)
     path = evidence(home, 2006, base_ref="feature/plugins")
     tracker = Tracker(2006)
-    tracker.description = target_description("feature/plugins")
     _, audit = _seed_intent(
         home, 2006, path, stage="audit_confirmed", base_ref="feature/plugins",
     )
@@ -318,24 +266,24 @@ def test_pending_intent_revalidates_leaf_target_before_close(
     )] == ["close", "unlabel"]
 
 
-def test_pending_intent_refuses_target_changed_before_close(
+def test_pending_intent_does_not_compare_target_or_evidence_base(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    home, repo = configured_home(tmp_path, monkeypatch, integration_branches=("feature/plugins",))
-    path = evidence(home, 2007, base_ref="feature/plugins")
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 2007, base_ref="main")
     tracker = Tracker(2007)
-    tracker.description = target_description("main")
+    tracker.description = "Worklink notes:\n- Target branch: main\n"
     _, audit = _seed_intent(
         home, 2007, path, stage="audit_confirmed", base_ref="feature/plugins",
     )
     tracker.comments.append(audit)
-    assert closure.reconcile_merged_leaves(
+    assert [item.issue_id for item in closure.reconcile_merged_leaves(
         home, chainlink_runner=tracker, gh_runner=forge(2007, base="feature/plugins"),
         git_runner=git_runner(repo),
-    ) == []
-    assert tracker.status == "open"
-    assert unresolved_reasons(home) == ["intent_revalidation_failed"]
-    assert not [call for call in tracker.calls if call[1:3] == ["issue", "close"]]
+    )] == [2007]
+    assert tracker.status == "closed"
+    assert unresolved_reasons(home) == []
+    assert tracker.comments == [audit]
 
 
 @pytest.mark.parametrize("issue_id", HISTORICAL_IDS)
@@ -765,21 +713,19 @@ def test_merged_pr_requires_closed_state_and_complete_identity(defect: str) -> N
         )
 
 
-def test_completion_base_not_evidence_base_and_repository_binding(
+def test_repository_binding_still_refuses_before_tracker_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home, repo = configured_home(tmp_path, monkeypatch)
     evidence(home, 15, base_ref="release")
     tracker = Tracker(15)
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path / "other"))
     assert closure.reconcile_merged_leaves(
         home, chainlink_runner=tracker, gh_runner=forge(15, base="release"),
         git_runner=git_runner(repo),
     ) == []
     assert tracker.status == "open"
-    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path / "other"))
-    assert closure.reconcile_merged_leaves(
-        home, chainlink_runner=tracker, gh_runner=forge(15), git_runner=git_runner(repo),
-    ) == []
+    assert tracker.calls == []
 
 
 @pytest.mark.parametrize("foreign_identity", ["pr_repository", "base_repository"])
@@ -961,16 +907,14 @@ def test_strict_tracker_snapshots() -> None:
     base = {
         "id": 22, "status": "open", "closed": False,
         "labels": ["worklink:review"], "comments": [], "parent_id": None,
-        "description": "",
     }
     assert closure.parse_issue_snapshot(base, expected_issue_id=22).issue_id == 22
-    for field in ("status", "labels", "comments", "parent_id", "description"):
+    assert closure.parse_issue_snapshot({**base, "description": None}, expected_issue_id=22).issue_id == 22
+    for field in ("status", "labels", "comments", "parent_id"):
         malformed = dict(base)
         malformed.pop(field)
         with pytest.raises(closure.ClosureReadError):
             closure.parse_issue_snapshot(malformed, expected_issue_id=22)
-    with pytest.raises(closure.ClosureReadError, match="description"):
-        closure.parse_issue_snapshot({**base, "description": None}, expected_issue_id=22)
 
 
 def _seed_intent(

@@ -391,7 +391,7 @@ def test_merge_reconciliation_audits_before_closing_once(
             return result({
                 "id": 1949, "number": 1949, "status": status, "closed": status == "closed",
                 "labels": sorted(labels),
-                "comments": comments, "parent_id": None, "description": "",
+                "comments": comments, "parent_id": None,
             })
         if command[:2] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"]):
             calls.append(command[1])
