@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -327,3 +328,38 @@ def test_opencode_build_arg_installs_pinned_runtime() -> None:
 def test_worklink_service_run_script_is_made_executable() -> None:
     text = _text()
     assert "/etc/s6-overlay/s6-rc.d/worklink-execd/run" in text
+
+
+def test_s6_privilege_drops_set_matching_user_environment() -> None:
+    """Every service that changes uid must replace /init's root identity env."""
+    homes = {}
+    for line in _text().splitlines():
+        if not line.lstrip().startswith("&& useradd "):
+            continue
+        args = shlex.split(line.rstrip(" \\"))
+        user = args[-1]
+        if "--home-dir" in args:
+            homes[user] = args[args.index("--home-dir") + 1]
+        elif "--create-home" in args:
+            homes[user] = f"/home/{user}"
+
+    scripts = sorted((ROOT / "deploy/s6-overlay/s6-rc.d").rglob("run"))
+    assert scripts, "no s6 run scripts discovered"
+    drops = 0
+    for script in scripts:
+        # Join shell continuations before tokenizing, so comments and quoted
+        # arguments cannot masquerade as executable environment assignments.
+        for line in script.read_text(encoding="utf-8").replace("\\\n", " ").splitlines():
+            tokens = shlex.split(line, comments=True)
+            for index, token in enumerate(tokens):
+                if token != "s6-setuidgid":
+                    continue
+                drops += 1
+                assert len(tokens) > index + 2, f"{script}: missing uid or command"
+                user = tokens[index + 1]
+                assert user in homes, f"{script}: unknown home for {user}"
+                assert tokens[index + 2] == "env", f"{script}: {user} needs env after uid drop"
+                expected = {f"HOME={homes[user]}", f"USER={user}", f"LOGNAME={user}"}
+                actual = set(tokens[index + 3:index + 6])
+                assert actual == expected, f"{script}: {user} needs {sorted(expected)}, got {sorted(actual)}"
+    assert drops, "no s6-setuidgid commands discovered"
