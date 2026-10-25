@@ -14,6 +14,7 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import ensure_turn_scratch
 from mimir._deepagents_summarization import install_offload_traceback_logging_patch
+from mimir.plugins.core import core_policy_registry
 from mimir.readonly_backend import MimirFilesystemMiddleware, WriteGuardBackend
 from mimir.turn_stores import (
     move_ci_logs_to_turn, seed_home_ignore, sweep_turn_stores, wipe_ci_logs,
@@ -95,13 +96,13 @@ def test_rollout_purge_is_one_time_and_restart_sweeps_crashed_turns(
     (external / "body").write_text("untouched")
     (tmp_path / "conversation_history" / "linked-dir").symlink_to(external, target_is_directory=True)
     with caplog.at_level(logging.INFO):
-        sweep_turn_stores(tmp_path)
+        sweep_turn_stores(tmp_path, policy=core_policy_registry())
         assert all(not (tmp_path / store / "legacy.md").exists() for store in stores)
         assert outside.read_text() == "safe"
         assert (external / "body").read_text() == "untouched"
         (tmp_path / "large_tool_results" / "crashed").mkdir()
         (tmp_path / "large_tool_results" / "crashed" / "body").write_text("stale")
-        sweep_turn_stores(tmp_path)
+        sweep_turn_stores(tmp_path, policy=core_policy_registry())
     assert not (tmp_path / "large_tool_results" / "crashed").exists()
     events = [entry for entry in caplog.records if "turn_store_rollout_purge" in entry.message]
     assert len(events) == 1
@@ -115,7 +116,7 @@ def test_rollout_refuses_symlinked_store_root(tmp_path: Path) -> None:
     body = outside / "keep.txt"
     body.write_text("safe")
     (tmp_path / "large_tool_results").symlink_to(outside, target_is_directory=True)
-    sweep_turn_stores(tmp_path)
+    sweep_turn_stores(tmp_path, policy=core_policy_registry())
     assert body.read_text() == "safe"
 
 

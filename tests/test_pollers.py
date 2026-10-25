@@ -345,6 +345,74 @@ def test_seeded_cultivate_pollers_do_not_run_when_cultivate_is_deselected(tmp_pa
     run("selected")
 
 
+@pytest.mark.parametrize("selected", [True, False], ids=["cultivate-selected", "core-only"])
+def test_sweep_and_admin_discover_scheduler_pollers_with_selected_policy(
+    tmp_path, monkeypatch, caplog, selected,
+):
+    pytest.importorskip("mimir_cultivate")
+    from dataclasses import dataclass
+    from mimir import access_control
+    from mimir.admin_config import build_admin_config_payload
+    from mimir.plugins.defaults import seed_plugin_defaults
+    from mimir.plugins.manager import load_plugins
+    from mimir.scheduler import Scheduler
+    from mimir.turn_stores import _research_poller_names, sweep_turn_stores
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if selected else "")
+    monkeypatch.setenv("WORKLINK_REPO", "o/r")
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    home = tmp_path / "home"
+    home.mkdir()
+    cultivate = load_plugins(enable="cultivate")
+    seed_plugin_defaults(home, selected=cultivate.policy.selected_plugin_candidates)
+    manager = cultivate if selected else load_plugins(enable="")
+    scheduler = Scheduler(home / "scheduler.yaml", lambda event: None,
+                          home=home, policy=manager.policy)
+    scheduler._pollers_dir = home / "skills"
+
+    # Treat every discovered poller as research-eligible here so the sweep's
+    # name set exercises discovery, rather than just the research profile filter.
+    monkeypatch.setattr(access_control, "_is_research_proposal_poller", lambda authority: authority is not None)
+
+    @dataclass
+    class AdminConfigFixture:
+        home: Path
+        plugin_manager: object
+        model_spec: str = ""
+
+    with caplog.at_level("WARNING", logger="mimir.pollers"):
+        sweep_turn_stores(home, policy=manager.policy)
+        research_names = _research_poller_names(home, policy=manager.policy)
+        admin_names = {row["name"] for row in build_admin_config_payload(
+            config=AdminConfigFixture(home, manager), home=home,
+        )["pollers"]}
+        scheduled, _, invalid = scheduler._discover_pollers_io()
+
+    scheduled_names = {config.name for config in scheduled}
+    assert research_names == admin_names == scheduled_names
+    seeded_names = {"worklink-ready-queue", "worklink-tool-pins"}
+    if selected:
+        assert seeded_names <= scheduled_names
+        assert invalid == []
+        assert "poller_plugin_seed_unselected" not in caplog.text
+    else:
+        assert seeded_names.isdisjoint(scheduled_names)
+        assert any("seeded by plugin 'cultivate'" in reason for _, _, reason in invalid)
+        assert "poller_plugin_seed_unselected" in caplog.text
+
+    # Omission must fail at the helper boundary, not silently choose core policy
+    # and recreate the false warning. Explicit None is not a policy either.
+    caplog.clear()
+    for helper in (sweep_turn_stores, _research_poller_names):
+        with pytest.raises(TypeError, match="required keyword-only argument: 'policy'"):
+            helper(home)
+        with pytest.raises(ValueError, match="explicit plugin policy"):
+            helper(home, policy=None)
+    assert "poller_plugin_seed_unselected" not in caplog.text
+    with pytest.raises(ValueError, match="explicit plugin policy"):
+        discover_pollers(home / "skills")
+
+
 def test_plugin_poller_authority_rejects_foreign_profile(tmp_path):
     from mimir.plugins.registry import PolicyRegistry
 

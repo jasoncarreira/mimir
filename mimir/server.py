@@ -1225,7 +1225,7 @@ def build_app(config: Config) -> web.Application:
     # always matches mimir source.
     seeded_skills_map = refresh_builtin_skills(config.home)
     # Discover research authority after legacy migration and bundled refresh.
-    sweep_turn_stores(config.home)
+    sweep_turn_stores(config.home, policy=config.plugin_manager.policy)
     # Seed default operator prompts (heartbeat.md, reflect.md) and the
     # default scheduler.yaml if missing. Idempotent — only writes when
     # the target is absent, so operator customizations persist. Existing-file

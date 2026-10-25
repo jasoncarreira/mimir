@@ -9,8 +9,12 @@ import stat
 from contextlib import nullcontext
 from pathlib import Path
 from threading import RLock
+from typing import TYPE_CHECKING
 
 from ._rmtree import rmtree_missing_ok
+
+if TYPE_CHECKING:
+    from .plugins.registry import PolicyRegistry
 
 _STORES = ("large_tool_results", "conversation_history", "attachments/fetch-cache",
            ".mimir/conversation_history_labels")
@@ -268,15 +272,17 @@ def _sweep_drafts(fd: int) -> None:
             log.warning("research_draft_sweep_failed")
 
 
-def _research_poller_names(home: Path) -> set[str]:
+def _research_poller_names(home: Path, *, policy: PolicyRegistry) -> set[str]:
     """Only sweep pollers whose installed manifest grants research proposals."""
     from .access_control import _is_research_proposal_poller
     from .pollers import discover_pollers
 
+    if policy is None:
+        raise ValueError("research poller discovery requires an explicit plugin policy")
     names: set[str] = set()
     for root in (home / "skills", home / ".mimir_builtin_skills"):
         try:
-            configs = discover_pollers(root, state_root=home / "state/pollers")
+            configs = discover_pollers(root, state_root=home / "state/pollers", policy=policy)
             names.update(config.name for config in configs
                          if _is_research_proposal_poller(config.authority))
         except OSError:
@@ -284,8 +290,13 @@ def _research_poller_names(home: Path) -> set[str]:
     return names
 
 
-def sweep_turn_stores(home: Path) -> None:
-    """On upgrade purge unattributed legacy bytes; on restart sweep crashed turns."""
+def sweep_turn_stores(home: Path, *, policy: PolicyRegistry) -> None:
+    """On upgrade purge unattributed legacy bytes; on restart sweep crashed turns.
+
+    Research-poller discovery uses the caller's explicit active plugin policy.
+    """
+    if policy is None:
+        raise ValueError("turn-store sweep requires an explicit plugin policy")
     home = home.resolve()
     marker = home / _MARKER
     first_start = not marker.exists()
@@ -325,7 +336,7 @@ def sweep_turn_stores(home: Path) -> None:
         log.warning("ci_log_sweep_failed")
     # A process crash has no turn-finally. Restrict draft deletion to installed
     # research proposal pollers, never an arbitrary poller's drafts directory.
-    for poller in sorted(_research_poller_names(home)):
+    for poller in sorted(_research_poller_names(home, policy=policy)):
         try:
             fd = _open_directory(home, ("state", "pollers", poller), create=False)
             try:

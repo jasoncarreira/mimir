@@ -1817,6 +1817,9 @@ def _apply_poller_overrides(
     return dataclasses.replace(poller, **updates)
 
 
+_UNSPECIFIED_PLUGIN_POLICY = object()
+
+
 def discover_pollers(
     skills_dir: Path,
     *,
@@ -1824,7 +1827,7 @@ def discover_pollers(
     invalid_manifests: list[tuple[Path, str]] | None = None,
     invalid_entries: list[tuple[Path, str, str]] | None = None,
     overrides_path: Path | None = None,
-    policy: PolicyRegistry | None = None,
+    policy: PolicyRegistry | None | object = _UNSPECIFIED_PLUGIN_POLICY,
     plugin_candidates: tuple[object, ...] | None = None,
 ) -> list[PollerConfig]:
     """Walk ``skills_dir/**/pollers.json`` and parse out poller configs.
@@ -1859,7 +1862,14 @@ def discover_pollers(
     ``invalid_entries`` collects rejected entries and rejected optional fields
     as ``(source_path, poller_name, reason)`` tuples. The scheduler emits them
     after discovery returns, keeping this parser safe in synchronous contexts.
+    Callers discovering plugin-seeded skills must pass the active frozen policy;
+    omitting it raises rather than misreporting selected seeds as unselected.
     """
+    # Keep legacy core-only callers working, but never let a new caller
+    # silently classify a seeded provider manifest without a selected policy.
+    policy_omitted = policy is _UNSPECIFIED_PLUGIN_POLICY
+    if policy_omitted:
+        policy = None
     _validate_non_secret_forwarded_env_keys()
     pollers: list[PollerConfig] = []
     if plugin_candidates is None:
@@ -2009,6 +2019,8 @@ def discover_pollers(
             namespaces.skill_owner(_rel_dirs[0])
             if plugin_owner is None and _rel_dirs else None
         )
+        if seed_owner is not None and policy_omitted:
+            raise ValueError("discover_pollers requires an explicit plugin policy for seeded skills")
         if seed_owner is not None and seed_owner not in selected_owners:
             reason = (
                 f"skill seeded by plugin {seed_owner!r}, which is not selected; "
