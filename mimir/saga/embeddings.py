@@ -413,7 +413,7 @@ def offline_reembedding():
 
 
 def _check_existing_dimensions(dim: int) -> None:
-    """Refuse a new dimension, but allow repairable drift in legacy databases."""
+    """Require the unique plurality dimension, allowing minority legacy drift."""
     if getattr(_dimension_check, "offline", False):
         return
     from ._config_io import get_data_dir
@@ -422,26 +422,37 @@ def _check_existing_dimensions(dim: int) -> None:
         db = get_data_dir() / db
     if not db.is_file():
         return
-    matching = mismatched = 0
+    dimension_counts: dict[int, int] = {}
     with sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True) as conn:
         for table, column in (("embeddings", "dim"), ("sessions", "embedding_dim"),
                               ("triples", "embedding_dim")):
             if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
                 continue
             counts = conn.execute(
-                f"SELECT count(CASE WHEN {column} = ? THEN 1 END), "
-                f"count(CASE WHEN {column} != ? THEN 1 END) FROM {table}",
-                (dim, dim),
-            ).fetchone()
-            matching += counts[0]
-            mismatched += counts[1]
-    if mismatched and not matching:
-        raise RuntimeError("Embedding provider would mix vector dimensions in saga.db; "
-                           "run mimir saga-reembed offline before switching providers")
+                f"SELECT {column}, count(*) FROM {table} "
+                f"WHERE {column} IS NOT NULL GROUP BY {column}",
+            )
+            for stored_dim, count in counts:
+                dimension_counts[stored_dim] = dimension_counts.get(stored_dim, 0) + count
+    if not dimension_counts:
+        return
+    largest_count = max(dimension_counts.values())
+    dominant_dimensions = [stored_dim for stored_dim, count in dimension_counts.items()
+                           if count == largest_count]
+    if len(dominant_dimensions) != 1:
+        raise RuntimeError("Saga database has ambiguous dominant embedding dimensions; "
+                           "run mimir saga-reembed offline before using an embedding provider")
+    dominant_dim = dominant_dimensions[0]
+    if dim != dominant_dim:
+        raise RuntimeError(
+            f"Embedding provider dimension {dim} differs from saga.db's dominant "
+            f"dimension {dominant_dim}; run mimir saga-reembed offline before switching providers"
+        )
+    mismatched = sum(dimension_counts.values()) - dimension_counts[dim]
     if mismatched:
         logging.getLogger("saga.embeddings").warning(
             "Saga database contains %d rows with mismatched embedding dimensions "
-            "(provider dimension %d); continuing with existing matching vectors. "
+            "(provider dimension %d); continuing with the dominant dimension. "
             "Run mimir saga-reembed offline to repair legacy rows.",
             mismatched, dim,
         )

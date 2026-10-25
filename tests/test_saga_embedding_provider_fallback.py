@@ -91,7 +91,7 @@ def test_explicit_provider_cannot_mix_dimensions_but_offline_reembed_can(tmp_pat
 def test_existing_mixed_dimensions_keep_provider_and_warn_once(
     tmp_path, monkeypatch, fake_cfg, caplog, matching_table,
 ):
-    """Legacy drift must not disable a provider with matching stored vectors."""
+    """Legacy drift must not disable the unique plurality provider dimension."""
     import mimir.saga.embeddings as emb
 
     db = tmp_path / "saga.db"
@@ -99,7 +99,9 @@ def test_existing_mixed_dimensions_keep_provider_and_warn_once(
         for table, column in (("embeddings", "dim"), ("sessions", "embedding_dim"),
                               ("triples", "embedding_dim")):
             conn.execute(f"CREATE TABLE {table} ({column} INTEGER)")
-            dims = [384, 1024, 1536] if table == matching_table else [384, 1536]
+            # Four 1024 rows beat three rows at each stale dimension across
+            # all tables (a plurality, not necessarily an absolute majority).
+            dims = [384, *([1024] * 4), 1536] if table == matching_table else [384, 1536]
             conn.executemany(f"INSERT INTO {table} VALUES (?)", [(dim,) for dim in dims])
     fake_cfg({"provider": "voyage", "dimensions": 1024})
     monkeypatch.setenv("VOYAGE_API_KEY", "fixture-key")
@@ -142,7 +144,7 @@ def test_keyless_fallback_mixed_dimensions_warns_only_once(tmp_path, monkeypatch
     db = tmp_path / "saga.db"
     with sqlite3.connect(db) as conn:
         conn.execute("CREATE TABLE embeddings (dim INTEGER)")
-        conn.executemany("INSERT INTO embeddings VALUES (?)", [(384,), (1024,), (1536,)])
+        conn.executemany("INSERT INTO embeddings VALUES (?)", [(384,), (384,), (1024,), (1536,)])
     fake_cfg({"provider": "voyage"})
     monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
     original = emb._cfg
@@ -153,6 +155,87 @@ def test_keyless_fallback_mixed_dimensions_warns_only_once(tmp_path, monkeypatch
         emb.get_provider()
     assert caplog.text.count("mismatched embedding dimensions") == 1
     assert caplog.text.count("VOYAGE_API_KEY is unset") == 1
+
+
+@pytest.fixture
+def dimension_database(tmp_path, monkeypatch, fake_cfg):
+    """A test-owned database using the real provider initialization path."""
+    import mimir.saga.embeddings as emb
+
+    db = tmp_path / "saga.db"
+
+    def install(rows, provider_dim):
+        with sqlite3.connect(db) as conn:
+            for (table, column), dims in zip(
+                (("embeddings", "dim"), ("sessions", "embedding_dim"),
+                 ("triples", "embedding_dim")), rows, strict=True,
+            ):
+                conn.execute(f"CREATE TABLE {table} ({column} INTEGER)")
+                conn.executemany(f"INSERT INTO {table} VALUES (?)", [(d,) for d in dims])
+        fake_cfg({"provider": "voyage", "dimensions": provider_dim})
+        monkeypatch.setenv("VOYAGE_API_KEY", "fixture-key")
+        original = emb._cfg
+        monkeypatch.setattr(emb, "_cfg", lambda section, key, default=None:
+                            str(db) if (section, key) == ("storage", "db_path")
+                            else original(section, key, default))
+        return emb
+
+    return install
+
+
+@pytest.mark.parametrize("provider_dim", [1024, 384, 1536, 3072])
+def test_legacy_minority_rows_do_not_permit_provider_switch(dimension_database, caplog, provider_dim):
+    """Muninn-shaped drift: minority matching rows are not switch authority."""
+    emb = dimension_database(
+        ([1024] * 3549 + [384] * 167 + [1536] * 27,
+         [1024] * 100 + [None] * 10, [1024] * 100),
+        provider_dim,
+    )
+    with caplog.at_level("WARNING", logger="saga.embeddings"):
+        if provider_dim == 1024:
+            provider = emb.get_provider()
+            assert emb.get_provider() is provider
+            warnings = [r.message for r in caplog.records if "mismatched embedding dimensions" in r.message]
+            assert len(warnings) == 1
+            assert "194 rows" in warnings[0]
+            assert "mimir saga-reembed" in warnings[0]
+        else:
+            with pytest.raises(RuntimeError, match="mimir saga-reembed"):
+                emb.get_provider()
+            assert emb._provider_instance is None
+            assert not caplog.records
+
+
+@pytest.mark.parametrize("provider_dim", [384, 1024])
+def test_dominant_dimension_is_summed_across_tables(dimension_database, provider_dim):
+    # Embeddings alone favor 384; session and triple counts make 1024 win.
+    emb = dimension_database(([384] * 5, [1024] * 3, [1024] * 3), provider_dim)
+    if provider_dim == 1024:
+        assert emb.get_provider().dimensions() == 1024
+    else:
+        with pytest.raises(RuntimeError, match="mimir saga-reembed"):
+            emb.get_provider()
+        assert emb._provider_instance is None
+
+
+@pytest.mark.parametrize("rows", [
+    ([384, 384], [1024], [1024, None]),
+    ([384], [1024], [1536]),
+])
+@pytest.mark.parametrize("provider_dim", [384, 1024, 1536, 3072])
+def test_tied_dimensions_refuse_every_provider(dimension_database, rows, provider_dim):
+    emb = dimension_database(rows, provider_dim)
+    with pytest.raises(RuntimeError, match="ambiguous.*mimir saga-reembed"):
+        emb.get_provider()
+    assert emb._provider_instance is None
+
+
+@pytest.mark.parametrize("rows", [([], [], []), ([None], [None, None], [None])])
+def test_empty_or_null_dimensions_allow_provider(dimension_database, caplog, rows):
+    emb = dimension_database(rows, 1024)
+    with caplog.at_level("WARNING", logger="saga.embeddings"):
+        assert emb.get_provider().dimensions() == 1024
+    assert not caplog.records
 
 
 def test_fallback_uses_onnx_default_when_model_explicitly_voyage(
