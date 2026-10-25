@@ -338,7 +338,7 @@ def _schedules(home: Path | None) -> list[dict[str, Any]]:
     return rows
 
 
-def _pollers(scheduler: Any, home: Path | None) -> list[dict[str, Any]]:
+def _pollers(scheduler: Any, home: Path | None, *, policy: Any) -> list[dict[str, Any]]:
     if scheduler is not None and hasattr(scheduler, "registered_poller_details"):
         try:
             return [
@@ -365,6 +365,7 @@ def _pollers(scheduler: Any, home: Path | None) -> list[dict[str, Any]]:
                 home / "skills",
                 state_root=home / "state" / "pollers",
                 overrides_path=home / "pollers-overrides.yaml",
+                policy=policy,
             )
         ]
     except Exception:
@@ -390,6 +391,9 @@ def build_admin_config_payload(
     manifests = {loaded.candidate.name: loaded.candidate.manifest for loaded in manager.plugins} if manager else {}
     plugin_rows = [row for owner in sorted(manifests) for row in plugin_config_rows(owner, manifests)]
 
+    from .plugins.core import core_policy_registry
+
+    policy = manager.policy if manager is not None else core_policy_registry()
     return {
         "generated_at": _now_iso(),
         "model": {
@@ -409,7 +413,7 @@ def build_admin_config_payload(
         },
         "schema_sections": _schema_sections(),
         "schedules": _schedules(effective_home),
-        "pollers": _pollers(scheduler, effective_home),
+        "pollers": _pollers(scheduler, effective_home, policy=policy),
         "env": _env_rows() + plugin_rows,
         "raw_config": _redacted_config(config) if config is not None else {},
         "mutation_policy": {

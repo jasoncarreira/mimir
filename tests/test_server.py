@@ -1610,7 +1610,7 @@ def _selected_server_manager() -> Any:
     from mimir.plugins.registry import PolicyRegistry
 
     policy = PolicyRegistry()
-    candidate = SimpleNamespace(name="example", manifest=None)
+    candidate = SimpleNamespace(name="example", enabled=True, manifest=None)
     policy.select_plugin_candidates((candidate,))
     registrar = policy.registrar("example")
 
