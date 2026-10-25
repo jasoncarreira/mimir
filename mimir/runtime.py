@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from .saga.paths import resolve_saga_config, resolve_saga_db_path
+
 if TYPE_CHECKING:
     from .agent import Agent
     from .bridges.base import SendResult
@@ -179,41 +181,6 @@ class AgentRuntimeBundle:
                 name="agent-runtime-close",
             )
         await asyncio.shield(self._close_task)
-
-
-def resolve_saga_config(home: Path) -> tuple[Path | None, str]:
-    """Choose this home's SAGA config without changing process state."""
-    env_config = os.environ.get("SAGA_CONFIG")
-    if env_config:
-        return Path(env_config), "env"
-    home_config = home / "saga.toml"
-    if home_config.exists():
-        return home_config, "home"
-    return None, "defaults"
-
-
-def resolve_saga_db_path(home: Path) -> Path:
-    """Resolve storage without pinning a home's config in process-global state."""
-    import tomllib
-
-    from .saga._config_io import _DEFAULTS
-
-    config_path, _ = resolve_saga_config(home)
-    if config_path is not None and config_path.is_file():
-        # Read locally: neither the environment nor SAGA's config singleton
-        # may retain this home's settings for another caller (including threads).
-        try:
-            with config_path.open("rb") as stream:
-                config = tomllib.load(stream)
-        except (OSError, ValueError) as exc:
-            logging.getLogger("saga.config").warning(
-                "Failed to load %s: %s. Using defaults.", config_path, exc
-            )
-            config = {}
-        db_path = Path(config.get("storage", {}).get("db_path", "saga.db"))
-    else:
-        db_path = Path(_DEFAULTS["storage"]["db_path"])
-    return db_path if db_path.is_absolute() else home / ".mimir" / db_path
 
 
 def create_core_services(config: Config) -> CoreServices:

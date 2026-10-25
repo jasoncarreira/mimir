@@ -7,6 +7,15 @@ import sqlite3
 
 
 @pytest.fixture(autouse=True)
+def _isolated_saga_home(tmp_path, monkeypatch):
+    """Provider tests must never probe a deployment or the worker's real HOME."""
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "agent-home"))
+    monkeypatch.setenv("HOME", str(tmp_path / "user-home"))
+    monkeypatch.setenv("SAGA_DATA_DIR", str(tmp_path / "legacy-saga"))
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _reset_provider_singleton() -> None:
     import mimir.saga.embeddings as emb
     emb._provider_instance = None
@@ -30,6 +39,96 @@ def fake_cfg(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(cfg_io, "was_set_in_toml", lambda s, k: False)
 
     return _install
+
+
+@pytest.mark.parametrize("relative_path", ["saga.db", "nested/memory.db"])
+def test_relative_database_guard_matches_runtime_path(tmp_path, monkeypatch, relative_path):
+    from mimir import runtime
+    from mimir.saga import _config_io, embeddings as emb
+
+    home = tmp_path / "agent-home"
+    home.mkdir()
+    config = home / "saga.toml"
+    config.write_text(
+        f'[storage]\ndb_path = "{relative_path}"\n'
+        '[embedding]\nprovider = "voyage"\ndimensions = 1024\n'
+    )
+    # Install real config, not a stub of the path resolver or embedding accessor.
+    with monkeypatch.context() as patch:
+        patch.setattr(_config_io, "_config", {})
+        patch.setattr(_config_io, "_explicit_keys", {})
+        patch.setattr(_config_io, "_config_loaded", False)
+        patch.setattr(_config_io, "_install_generation", _config_io._install_generation)
+        _config_io.install_saga_config(config)
+        monkeypatch.setenv("VOYAGE_API_KEY", "fixture-key")
+        db = runtime.resolve_saga_db_path(home)
+        assert db == home / ".mimir" / relative_path
+        db.parent.mkdir(parents=True)
+        with sqlite3.connect(db) as conn:
+            conn.execute("CREATE TABLE embeddings (dim INTEGER)")
+            conn.execute("INSERT INTO embeddings VALUES (384)")
+        with pytest.raises(RuntimeError, match="dominant.*384.*mimir saga-reembed"):
+            emb.get_provider()
+        assert emb._provider_instance is None
+
+
+def test_provider_without_database_never_creates_directories(tmp_path, monkeypatch, fake_cfg):
+    from pathlib import Path
+    from mimir.saga import embeddings as emb
+
+    home = tmp_path / "unwritable-home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("MIMIR_HOME", str(home / "agent"))
+    monkeypatch.delenv("SAGA_DATA_DIR", raising=False)
+    fake_cfg({"provider": "voyage", "dimensions": 1024})
+    monkeypatch.setenv("VOYAGE_API_KEY", "fixture-key")
+
+    mkdir_attempts = []
+
+    def deny_mkdir(path, *args, **kwargs):
+        mkdir_attempts.append(path)
+        raise PermissionError(f"provider initialization tried mkdir: {path}")
+
+    # Deterministic under both root and worker uid, unlike chmod-only fixtures.
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "mkdir", deny_mkdir)
+        assert emb.get_provider().dimensions() == 1024
+    assert not mkdir_attempts
+    assert not home.exists()
+
+
+@pytest.mark.parametrize("failure_stage", ["stat", "connect"])
+def test_unreadable_database_does_not_break_provider(
+    tmp_path, monkeypatch, fake_cfg, failure_stage,
+):
+    from pathlib import Path
+    from mimir.saga import embeddings as emb
+
+    db = tmp_path / "saga.db"
+    db.touch()
+    fake_cfg({"provider": "voyage", "dimensions": 1024})
+    monkeypatch.setenv("VOYAGE_API_KEY", "fixture-key")
+    original_cfg = emb._cfg
+    monkeypatch.setattr(emb, "_cfg", lambda section, key, default=None:
+                        str(db) if (section, key) == ("storage", "db_path")
+                        else original_cfg(section, key, default))
+    if failure_stage == "stat":
+        original_is_file = Path.is_file
+
+        def is_file(path):
+            if path == db:
+                raise PermissionError("unreadable database")
+            return original_is_file(path)
+
+        monkeypatch.setattr(Path, "is_file", is_file)
+    else:
+        def connect(database, **kwargs):
+            assert kwargs == {"uri": True}
+            assert database.endswith("?mode=ro")
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(emb.sqlite3, "connect", connect)
+    assert emb.get_provider().dimensions() == 1024
 
 
 def test_fallback_uses_onnx_default_when_model_inherited(

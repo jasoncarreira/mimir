@@ -416,24 +416,33 @@ def _check_existing_dimensions(dim: int) -> None:
     """Require the unique plurality dimension, allowing minority legacy drift."""
     if getattr(_dimension_check, "offline", False):
         return
-    from ._config_io import get_data_dir
-    db = Path(_cfg('storage', 'db_path', 'saga.db'))
-    if not db.is_absolute():
-        db = get_data_dir() / db
-    if not db.is_file():
-        return
+    from contextlib import closing
+    from .paths import resolve_saga_db_path
+
     dimension_counts: dict[int, int] = {}
-    with sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True) as conn:
-        for table, column in (("embeddings", "dim"), ("sessions", "embedding_dim"),
-                              ("triples", "embedding_dim")):
-            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
-                continue
-            counts = conn.execute(
-                f"SELECT {column}, count(*) FROM {table} "
-                f"WHERE {column} IS NOT NULL GROUP BY {column}",
-            )
-            for stored_dim, count in counts:
-                dimension_counts[stored_dim] = dimension_counts.get(stored_dim, 0) + count
+    try:
+        # Match Config.from_env's home rule without loading dotenv/plugins or
+        # calling get_data_dir(), which creates ~/.saga even on read-only homes.
+        home = Path(os.environ.get("MIMIR_HOME") or Path.cwd()).resolve()
+        db = resolve_saga_db_path(home, db_path=_cfg('storage', 'db_path', 'saga.db'))
+        if not db.is_file():
+            return
+        # A sqlite connection's context manager does not close the descriptor.
+        with closing(sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+            for table, column in (("embeddings", "dim"), ("sessions", "embedding_dim"),
+                                  ("triples", "embedding_dim")):
+                if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                    continue
+                counts = conn.execute(
+                    f"SELECT {column}, count(*) FROM {table} "
+                    f"WHERE {column} IS NOT NULL GROUP BY {column}",
+                )
+                for stored_dim, count in counts:
+                    dimension_counts[stored_dim] = dimension_counts.get(stored_dim, 0) + count
+    except (OSError, sqlite3.Error):
+        # This read-only preflight must not make an unavailable database a
+        # provider-init failure. The store remains responsible for its own IO.
+        return
     if not dimension_counts:
         return
     largest_count = max(dimension_counts.values())
