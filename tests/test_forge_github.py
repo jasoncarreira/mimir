@@ -101,6 +101,31 @@ class Session:
         return self.responses.pop(0)
 
 
+class PagingSession(Session):
+    """Serve slices using GitHub's page/per_page offsets and real JSON bytes."""
+
+    def __init__(self, rows, *, collection_key=None):
+        super().__init__([])
+        self.rows = rows
+        self.collection_key = collection_key
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        params = parse_qs(urlsplit(url).query)
+        size = int(params["per_page"][0])
+        page = int(params["page"][0])
+        rows = self.rows[(page - 1) * size:page * size]
+        return Response({self.collection_key: rows} if self.collection_key else rows)
+
+
+def _page_params(session):
+    return [
+        (int(params["per_page"][0]), int(params["page"][0]))
+        for _, url, _ in session.calls
+        for params in [parse_qs(urlsplit(url).query)]
+    ]
+
+
 def test_ci_run_projects_only_bounded_metadata():
     run = {
         "id": 42, "name": "C" * 300, "display_title": "D" * 300,
@@ -132,8 +157,7 @@ def test_ci_run_projects_only_bounded_metadata():
 ])
 def test_ci_recent_runs_paginates_encoded_bound_branch(workflow_id, limit, endpoint):
     run = {"id": 42, "name": "CI", "html_url": "private"}
-    session = Session([Response({"workflow_runs": [run] * 50}),
-                       Response({"workflow_runs": [run] * 50})])
+    session = PagingSession([run] * 50, collection_key="workflow_runs")
     result = GitHubForgeClient(token="secret", session=session).list_runs(
         "owner/repo", "release/hot fix", workflow_id, limit,
     )
@@ -142,7 +166,7 @@ def test_ci_recent_runs_paginates_encoded_bound_branch(workflow_id, limit, endpo
     assert len(session.calls) == 1
     assert session.calls[0][1] == (
         f"https://api.github.com/repos/owner/repo/actions/{endpoint}"
-        "?branch=release%2Fhot%20fix&per_page=50&page=1"
+        f"?branch=release%2Fhot%20fix&per_page={limit}&page=1"
     )
 
 
@@ -282,7 +306,7 @@ def _pr_row(number, *, merged=False):
 def test_pr_list_qualifies_bare_head_and_drops_wrong_branch_before_limit():
     wrong = _pr_row(1)
     wrong["head"]["ref"] = "unrelated"
-    session = Session([Response([wrong, _pr_row(2)])])
+    session = PagingSession([wrong, _pr_row(2)])
     result = GitHubForgeClient(session=session).list_pull_requests(
         "owner/repo", state="all", head="topic", limit=1,
     )
@@ -294,13 +318,12 @@ def test_pr_list_qualifies_bare_head_and_drops_wrong_branch_before_limit():
 def test_pr_list_applies_filters_before_limit_across_pages(selector):
     from datetime import datetime, timezone
 
-    excluded = [_pr_row(n, merged=True) for n in range(50)]
+    excluded = [_pr_row(0, merged=True)]
     for item in excluded:
         item["user"]["login"] = "other"
         item["merged_at"] = "2026-09-01T00:00:00Z"
-    # Matching rows must be discovered after a full page of rejected rows,
-    # not merely beyond limit within an already-fetched page.
-    session = Session([Response(excluded), Response([_pr_row(51, merged=True), _pr_row(52, merged=True)])])
+    # Matching rows must be discovered after a full page of rejected rows.
+    session = PagingSession([*excluded, _pr_row(51, merged=True), _pr_row(52, merged=True)])
     kwargs = {}
     if selector in {"author", "both"}:
         kwargs["author"] = "AUTHOR"
@@ -322,7 +345,7 @@ def test_pr_list_merged_since_drops_unmerged_rows_before_limit(state, merged_at)
     unmerged["merged_at"] = merged_at
     if state == "closed":
         unmerged["state"] = "closed"
-    session = Session([Response([unmerged, _pr_row(2, merged=True)])])
+    session = PagingSession([unmerged, _pr_row(2, merged=True)])
     result = GitHubForgeClient(session=session).list_pull_requests(
         "owner/repo", state=state, limit=1,
         merged_since=datetime(2026, 10, 1, tzinfo=timezone.utc),
@@ -344,7 +367,7 @@ def test_paginate_limited_collection_returns_partial_at_page_cap():
 
 
 def test_pr_list_uses_fixed_endpoint_query_and_filters_merged_before_limit():
-    session = Session([Response([_pr_row(1), _pr_row(2, merged=True), _pr_row(3, merged=True)])])
+    session = PagingSession([_pr_row(1), _pr_row(2, merged=True), _pr_row(3, merged=True)])
     result = GitHubForgeClient(session=session).list_pull_requests(
         "owner/repo", state="merged", base="main", head="fork:topic", limit=1,
     )
@@ -353,16 +376,16 @@ def test_pr_list_uses_fixed_endpoint_query_and_filters_merged_before_limit():
     assert len(result[0].title) == 1024
     assert session.calls[0][0:2] == (
         "GET", "https://api.github.com/repos/owner/repo/pulls?"
-        "state=closed&sort=updated&direction=desc&base=main&head=fork%3Atopic&per_page=50&page=1",
+        "state=closed&sort=updated&direction=desc&base=main&head=fork%3Atopic&per_page=1&page=1",
     )
 
 
 def test_pr_list_paginates_to_limit_and_stops_at_ten_pages():
-    session = Session([Response([_pr_row(page * 50 + n, merged=True) for n in range(50)])
-                       for page in range(20)])
+    session = PagingSession([_pr_row(n, merged=True) for n in range(100)])
     client = GitHubForgeClient(session=session)
     assert len(client.list_pull_requests("owner/repo", state="all", limit=51)) == 51
     assert len(session.calls) == 2
+    assert _page_params(session) == [(50, 1), (1, 51)]
     session = Session([Response([_pr_row(page * 50 + n) for n in range(50)])
                        for page in range(20)])
     result = GitHubForgeClient(session=session).list_pull_requests(
@@ -370,6 +393,68 @@ def test_pr_list_paginates_to_limit_and_stops_at_ten_pages():
     )
     assert result == ()
     assert len(session.calls) == 10
+
+
+def test_pr_list_limit_one_avoids_oversized_fifty_item_page():
+    rows = [{**_pr_row(n), "body": "x" * 30_000} for n in range(50)]
+    assert len(Response(rows).content) > github_module._MAX_RESPONSE_BYTES
+    session = PagingSession(rows)
+
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", limit=1,
+    )
+
+    assert [row.number for row in result] == [0]
+    assert _page_params(session) == [(1, 1)]
+
+
+def test_pr_list_merged_only_walks_past_full_small_unmatched_page():
+    session = PagingSession([
+        _pr_row(0), _pr_row(1), _pr_row(2, merged=True),
+    ])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="merged", limit=2,
+    )
+    assert [row.number for row in result] == [2]
+    assert _page_params(session) == [(2, 1), (2, 2)]
+
+
+def test_pr_list_remainder_page_size_keeps_its_place_after_filtering():
+    rows = [_pr_row(n) for n in range(5)]
+    for row in rows[1:3]:
+        row["user"]["login"] = "other"
+    session = PagingSession(rows)
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", author="author", limit=3,
+    )
+    assert [row.number for row in result] == [0, 3, 4]
+    assert _page_params(session) == [(3, 1), (2, 2), (1, 5)]
+
+
+def test_pr_list_shrinks_oversized_page_without_skipping_rows():
+    rows = [{**_pr_row(n), "body": "x" * 20_000} for n in range(50)]
+    session = PagingSession(rows)
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", limit=50,
+    )
+    assert [row.number for row in result] == list(range(50))
+    assert _page_params(session) == [(50, 1), (25, 1), (25, 2)]
+
+
+def test_pr_list_refuses_single_oversized_item_after_shrinking():
+    session = PagingSession([{**_pr_row(1), "body": "x" * github_module._MAX_RESPONSE_BYTES}])
+    with pytest.raises(ForgeResponseTooLarge, match="forge response exceeded size limit"):
+        GitHubForgeClient(session=session).list_pull_requests(
+            "owner/repo", state="all", limit=50,
+        )
+    assert _page_params(session) == [(50, 1), (25, 1), (12, 1), (6, 1), (3, 1), (1, 1)]
+
+
+def test_review_list_shrinks_oversized_unlimited_pages():
+    session = PagingSession([{"id": n, "body": "x" * 30_000} for n in range(1, 51)])
+    result = GitHubForgeClient(session=session).list_reviews(_scope())
+    assert [review.id for review in result] == [str(n) for n in range(1, 51)]
+    assert _page_params(session) == [(50, 1), (25, 1), (50, 1), (25, 2), (50, 2)]
 
 
 def _search_row(number, *, merged=False):
@@ -394,17 +479,17 @@ def _search_params(session):
 
 
 def test_pr_search_projects_items_and_paginates_on_fixed_host():
-    session = Session([
-        Response({"items": [_search_row(n) for n in range(50)]}),
-        Response({"items": [_search_row(50, merged=True)]}),
-    ])
+    session = PagingSession(
+        [_search_row(n) for n in range(50)] + [_search_row(50, merged=True)],
+        collection_key="items",
+    )
     result = GitHubForgeClient(session=session).search_pull_requests(
         "owner/repo", query="1445", state="all", limit=51,
     )
     assert len(result) == 51
     assert len(session.calls) == 2
     assert all(urlsplit(call[1]).path == "/search/issues" for call in session.calls)
-    assert [parse_qs(urlsplit(call[1]).query)["page"] for call in session.calls] == [["1"], ["2"]]
+    assert _page_params(session) == [(50, 1), (1, 51)]
     params = _search_params(session)
     assert params["q"] == ["1445 is:pr repo:owner/repo"]
     assert params["sort"] == ["updated"] and params["order"] == ["desc"]
