@@ -88,6 +88,7 @@ class Tracker:
         self.comments = comments or []
         self.comment_visible = comment_visible
         self.close_visible = close_visible
+        self.description = ""
         self.calls: list[list[str]] = []
 
     def snapshot(self) -> dict[str, object]:
@@ -99,6 +100,7 @@ class Tracker:
             "labels": sorted(self.labels),
             "comments": list(self.comments),
             "parent_id": None,
+            "description": self.description,
         }
 
     def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -157,6 +159,131 @@ def evidence(home: Path, issue_id: int, *, url: str = PR_URL, attempt: int = 1,
         "base_ref": base_ref,
     }), encoding="utf-8")
     return path
+
+
+def unresolved_reasons(home: Path) -> list[str]:
+    notices = load_failure_state(dispatch_failure_state_dir(home))["merge_reconciliations"]["notices"]
+    return [entry["reason"] for entry in notices.values() if not entry["resolved"]]
+
+
+@pytest.mark.parametrize("base", ["main", "feature/plugins", "release/next"])
+def test_any_branch_merge_closes_with_actual_base_and_tombstone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base: str,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 2014, base_ref=base)
+    tracker = Tracker(2014)
+
+    outcomes = closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(2014, base=base),
+        git_runner=git_runner(repo),
+    )
+
+    assert [outcome.issue_id for outcome in outcomes] == [2014]
+    assert f"completion base {base}." in tracker.comments[-1]
+    assert [call[2] for call in tracker.calls if call[1:3] in (
+        ["issue", "comment"], ["issue", "close"], ["issue", "unlabel"],
+    )] == ["comment", "close", "unlabel"]
+    intent = next(iter(load_failure_state(dispatch_failure_state_dir(home))[
+        "merge_reconciliations"]["intents"].values()))
+    assert intent["result_finalized"] is True
+    assert intent["audit_text"] == tracker.comments[-1]
+
+
+@pytest.mark.parametrize(("target", "pr_base", "evidence_base"), [
+    ("feature/plugins", "main", "feature/plugins"),
+    ("main", "feature/plugins", "main"),
+    ("../invalid", "release/next", "feature/plugins"),
+])
+def test_merge_does_not_compare_target_or_evidence_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str,
+    pr_base: str, evidence_base: str,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 2000, base_ref=evidence_base)
+    tracker = Tracker(2000)
+    tracker.description = f"Worklink notes:\n- Target branch: {target}\n"
+    assert [item.issue_id for item in closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(2000, base=pr_base),
+        git_runner=git_runner(repo),
+    )] == [2000]
+    assert tracker.status == "closed"
+    assert unresolved_reasons(home) == []
+    assert f"completion base {pr_base}." in tracker.comments[-1]
+
+
+@pytest.mark.parametrize("base", ["main", "feature/plugins", "release/next"])
+def test_open_pr_has_no_base_notice_or_tracker_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base: str,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 2449, base_ref="different/evidence")
+    tracker = Tracker(2449)
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker,
+        gh_runner=forge(2449, state="open", merged=False, base=base),
+        git_runner=git_runner(repo),
+    ) == []
+    assert unresolved_reasons(home) == []
+    assert tracker.status == "open"
+    assert not [call for call in tracker.calls if call[1:3] in (
+        ["issue", "comment"], ["issue", "close"], ["issue", "unlabel"],
+    )]
+
+
+def test_closed_unmerged_nondefault_base_archives_without_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 2012, base_ref="feature/plugins")
+    tracker = Tracker(2012)
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker,
+        gh_runner=forge(2012, state="closed", merged=False, base="feature/plugins"),
+        git_runner=git_runner(repo),
+    ) == []
+    assert unresolved_reasons(home) == []
+    assert tracker.status == "open"
+    assert path.with_suffix(".json.closed-unmerged").exists()
+
+
+def test_pending_intent_revalidates_nondefault_branch_merge_before_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 2006, base_ref="feature/plugins")
+    tracker = Tracker(2006)
+    _, audit = _seed_intent(
+        home, 2006, path, stage="audit_confirmed", base_ref="feature/plugins",
+    )
+    tracker.comments.append(audit)
+    assert [item.issue_id for item in closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(2006, base="feature/plugins"),
+        git_runner=git_runner(repo),
+    )] == [2006]
+    assert [call[2] for call in tracker.calls if call[1:3] in (
+        ["issue", "comment"], ["issue", "close"], ["issue", "unlabel"],
+    )] == ["close", "unlabel"]
+
+
+def test_pending_intent_does_not_compare_target_or_evidence_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 2007, base_ref="main")
+    tracker = Tracker(2007)
+    tracker.description = "Worklink notes:\n- Target branch: main\n"
+    _, audit = _seed_intent(
+        home, 2007, path, stage="audit_confirmed", base_ref="feature/plugins",
+    )
+    tracker.comments.append(audit)
+    assert [item.issue_id for item in closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(2007, base="feature/plugins"),
+        git_runner=git_runner(repo),
+    )] == [2007]
+    assert tracker.status == "closed"
+    assert unresolved_reasons(home) == []
+    assert tracker.comments == [audit]
 
 
 @pytest.mark.parametrize("issue_id", HISTORICAL_IDS)
@@ -586,21 +713,19 @@ def test_merged_pr_requires_closed_state_and_complete_identity(defect: str) -> N
         )
 
 
-def test_completion_base_not_evidence_base_and_repository_binding(
+def test_repository_binding_still_refuses_before_tracker_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home, repo = configured_home(tmp_path, monkeypatch)
     evidence(home, 15, base_ref="release")
     tracker = Tracker(15)
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path / "other"))
     assert closure.reconcile_merged_leaves(
         home, chainlink_runner=tracker, gh_runner=forge(15, base="release"),
         git_runner=git_runner(repo),
     ) == []
     assert tracker.status == "open"
-    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path / "other"))
-    assert closure.reconcile_merged_leaves(
-        home, chainlink_runner=tracker, gh_runner=forge(15), git_runner=git_runner(repo),
-    ) == []
+    assert tracker.calls == []
 
 
 @pytest.mark.parametrize("foreign_identity", ["pr_repository", "base_repository"])
@@ -784,6 +909,7 @@ def test_strict_tracker_snapshots() -> None:
         "labels": ["worklink:review"], "comments": [], "parent_id": None,
     }
     assert closure.parse_issue_snapshot(base, expected_issue_id=22).issue_id == 22
+    assert closure.parse_issue_snapshot({**base, "description": None}, expected_issue_id=22).issue_id == 22
     for field in ("status", "labels", "comments", "parent_id"):
         malformed = dict(base)
         malformed.pop(field)
@@ -799,6 +925,7 @@ def _seed_intent(
     stage: str,
     uncertainty: str | None = None,
     finalized: bool = False,
+    base_ref: str = "main",
 ) -> tuple[str, str]:
     source_digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
     identity = json.dumps([1, issue_id, "example/project", 42], separators=(",", ":"))
@@ -806,7 +933,7 @@ def _seed_intent(
     audit = (
         f"WORKLINK_CLOSED v1 {key}\n"
         f"Chainlink #{issue_id} complete via PR {PR_URL}.\n"
-        f"Merged at {MERGED_AT}; merge commit {MERGE_SHA}; completion base main."
+        f"Merged at {MERGED_AT}; merge commit {MERGE_SHA}; completion base {base_ref}."
     )
     entry = {
         "intent_key": key,
@@ -814,7 +941,7 @@ def _seed_intent(
         "repository": "example/project",
         "pr_number": 42,
         "pr_url": PR_URL,
-        "base_ref": "main",
+        "base_ref": base_ref,
         "merge_commit_sha": MERGE_SHA,
         "merged_at": MERGED_AT,
         "audit_text": audit,
