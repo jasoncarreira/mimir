@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import redirect_stdout
+import io
 import json
 import logging
 import tomllib
@@ -115,7 +117,7 @@ def test_validation_and_github_permissions():
             body = {"permissions": {"push": False}}
         return status, body
 
-    with pytest.raises(installer.SetupError, match="push permission"):
+    with pytest.raises(installer.SetupError, match="invite the bot as a Write collaborator"):
         installer.validate_token("secret", "bot", "org/repo", no_push)
 
     def no_actions(url, token):
@@ -125,6 +127,19 @@ def test_validation_and_github_permissions():
 
     with pytest.raises(installer.SetupError, match="Actions"):
         installer.validate_token("secret", "bot", "org/repo", no_actions)
+
+
+def test_pat_help_describes_owner_permissions_and_approval():
+    help_text = installer.PAT_HELP
+    assert "resource owner = the owner of the target repository" in help_text
+    assert "organization for an org repo" in help_text
+    assert "Settings, Personal access tokens" in help_text
+    assert "repository access = only the target repository" in help_text
+    assert "Contents, Pull requests, Issues: Read and write" in help_text
+    assert "Actions, Commit statuses, Metadata: Read-only" in help_text
+    assert "optional Workflows: Read and write" in help_text
+    assert ".github/workflows/" in help_text
+    assert "Checks" not in help_text
 
 
 @pytest.mark.parametrize(("files", "expected"), [
@@ -151,7 +166,7 @@ def test_detects_repo_pins_and_pinned_path(files, expected):
 
 @pytest.mark.parametrize("embedding,saga_spec", [
     ("local", None), ("openai:text-embedding-3-small", None),
-    ("voyage:voyage-4-lite", "anthropic:claude-haiku-4-5"),
+    ("voyage:voyage-4-lite", "anthropic:claude-haiku-5-5"),
 ])
 def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypatch, capsys, caplog, embedding, saga_spec):
     compile(installer._PROVISION, "provision.py", "exec")
@@ -246,19 +261,25 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert (deploy / "build.sh").stat().st_mode & 0o777 == 0o755
     assert "https://github.com/neworg/mimir.git#" + SHA in (deploy / "build.sh").read_text()
     assert any("https://github.com/neworg/mimir.git#" + SHA in argv for argv in calls)
-    # Check both the actual installer invocation and its saved rebuild script.
+    # Check both providers and mcp independently, in the live and saved builds.
+    expected_extras = {"openai", "mcp"}
+    if saga_spec:
+        expected_extras.add(saga_spec.split(":", 1)[0])
+    extras_arg = "MIMIR_EXTRAS=" + ",".join(sorted(expected_extras))
     root_builds = [argv for argv in calls if argv[:2] == ["docker", "build"]
                    and "MIMIR_PLUGIN_SELECTION=cultivate" in argv]
     assert len(root_builds) == 2
     for argv in root_builds:
         index = argv.index("CHAINLINK_ARTIFACT_STAGE=chainlink-build")
         assert argv[index - 1] == "--build-arg"
+        assert argv[argv.index(extras_arg) - 1] == "--build-arg"
     import shlex
     build_lines = (deploy / "build.sh").read_text().splitlines()
     saved_build, = [shlex.split(line) for line in build_lines
                    if "MIMIR_PLUGIN_SELECTION=cultivate" in line]
     index = saved_build.index("CHAINLINK_ARTIFACT_STAGE=chainlink-build")
     assert saved_build[index - 1] == "--build-arg"
+    assert saved_build[saved_build.index(extras_arg) - 1] == "--build-arg"
     assert json.loads((deploy / "manifest.json").read_text())["test"] == "./tools/verify"
     assert (deploy / ".dockerignore").read_text() == "*\n!Dockerfile.toolchain\n"
     for name in ("compose.yml", "Dockerfile.toolchain", "manifest.json", "provision.py"):
@@ -475,6 +496,13 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     clone = next(argv for argv in calls if "clone" in argv)
     assert clone[-1] == str(tmp_path / "repo")
     assert "password=$GITHUB_TOKEN" in " ".join(clone)
+    pushes = [argv for argv in calls if "push" in argv]
+    assert len(pushes) == 2
+    assert all(argv[:4] == ["git", "-C", str(repo), "push"] and
+               argv[4:6] == ["--dry-run", "origin"] and
+               argv[6].startswith("HEAD:refs/heads/cultivate-setup-probe-") for argv in pushes)
+    assert pushes[0][6] != pushes[1][6]
+    assert all("secret" not in " ".join(argv) for argv in pushes)
     prior_inventory = (home / "repositories.yaml").read_bytes()
     prior_key = (home / "owner-web-key").read_bytes()
     (repo / ".git").rmdir()
@@ -514,7 +542,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
 
 @pytest.mark.parametrize("spec,embedding,llm,provider,dim,key", [
     ("openai:gpt-5.4-nano", "local", "openai_compat", "onnx", 384, None),
-    ("anthropic:claude-haiku-4-5", "openai:text-embedding-3-small", "anthropic", "openai", 1536, "OPENAI_API_KEY"),
+    ("anthropic:claude-haiku-5-5", "openai:text-embedding-3-small", "anthropic", "openai", 1536, "OPENAI_API_KEY"),
     ("openai:gpt-5.4-nano", "voyage:voyage-4-lite", "openai_compat", "voyage", 1024, "VOYAGE_API_KEY"),
 ])
 def test_saga_provisioning(tmp_path, spec, embedding, llm, provider, dim, key):
@@ -607,6 +635,135 @@ def test_prompts_recommend_fast_model_and_reuse_embedding_key(monkeypatch, capsy
     assert "faster, cheaper" in capsys.readouterr().out
 
 
+def test_default_saga_anthropic_model():
+    assert installer.DEFAULT_SAGA_MODELS["anthropic"] == "claude-haiku-5-5"
+
+
 def test_embedding_key_distinction():
     assert installer.EMBEDDING_MODELS["openai"][3] == "OPENAI_API_KEY"
     assert installer.EMBEDDING_MODELS["voyage"][3] != "OPENAI_API_KEY"
+
+
+@pytest.mark.parametrize(("push_ok", "probe_stderr", "expected_marker"), [
+    pytest.param(True, b"", None, id="success"),
+    pytest.param(False, b"The requested URL returned error: 403", installer._PUSH_PROBE_FAILED, id="403"),
+    pytest.param(False, b"The requested URL returned error: 401", installer._PUSH_PROBE_FAILED, id="401"),
+    pytest.param(False, b"Authentication failed", installer._PUSH_PROBE_FAILED, id="authentication"),
+    pytest.param(False, b"Permission to org/repo.git denied to bot.", installer._PUSH_PROBE_FAILED, id="permission"),
+    pytest.param(False, b"could not read Username for 'https://github.com'", installer._PUSH_PROBE_FAILED, id="username"),
+    pytest.param(False, b"Could not resolve host: github.com", installer._PUSH_PROBE_UNREACHABLE, id="dns"),
+    pytest.param(False, b"Recv failure: Connection reset by peer", installer._PUSH_PROBE_UNREACHABLE, id="reset"),
+    pytest.param(False, b"Could not resolve proxy: proxy.example", installer._PUSH_PROBE_UNREACHABLE, id="proxy"),
+    pytest.param(False, b"The requested URL returned error: 503", installer._PUSH_PROBE_UNREACHABLE, id="github-503"),
+    pytest.param(False, b"unknown failure \\xff", installer._PUSH_PROBE_UNREACHABLE, id="unknown"),
+])
+@pytest.mark.parametrize("existing_checkout", [False, True], ids=["fresh", "rerun"])
+def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok, probe_stderr, expected_marker, existing_checkout):
+    """Exercise setup's run boundary and the actual provision program, offline."""
+    from mimir.saga.embeddings import ONNXProvider
+
+    monkeypatch.setattr(ONNXProvider, "_load", lambda self: None)
+    monkeypatch.setenv("HOME", "/home/mimir")
+    monkeypatch.setenv("XDG_CACHE_HOME", "/home/mimir/.cache")
+    monkeypatch.setattr(installer, "_installed_license", lambda: (b"license", "1.0"))
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers(dest="command"))
+    deploy = tmp_path / "deploy"
+    monkeypatch.setenv("MIMIR_CULTIVATE_GITHUB_TOKEN", "fixture-token")
+    monkeypatch.setenv("MIMIR_CULTIVATE_MODEL_KEY", "fixture-model-key")
+    args = parser.parse_args([
+        "cultivate", "setup", "--accept-license", "--repo", "org/repo", "--bot-login", "bot",
+        "--bot-email", "bot@example.com", "--owner", "owner", "--display-name", "Owner",
+        "--owner-email", "owner@example.com", "--model-spec", "openai:gpt-test",
+        "--saga-model-spec", "openai:gpt-5.4-nano", "--embedding", "local",
+        "--deploy", str(deploy), "--port", "8123",
+    ])
+
+    def request(url, token):
+        assert token == "fixture-token"
+        if url.endswith("/user"):
+            return 200, {"login": "bot"}
+        if url.endswith("/repos/org/repo"):
+            return 200, {"permissions": {"push": True}}  # collaborator role, not PAT write access
+        if "/git/ref/" in url:
+            return 200, {"object": {"sha": SHA}}
+        if "package.json" in url:
+            return 200, {"encoding": "base64", "content": base64.b64encode(
+                b'{"engines":{"node":"22.16.0"}}').decode()}
+        if "/contents/" in url:
+            return 404, {}
+        if "/git/trees/" in url:
+            return 200, {"tree": []}
+        return 200, {}
+
+    import mimir.plugins.skills as skills
+    monkeypatch.setattr(skills, "resolve_skill", lambda name, core_names: SimpleNamespace(dirname=name.split(":")[1]))
+    monkeypatch.setattr(skills, "install_skill", lambda home, skill: ((home / "skills" / skill.dirname).mkdir(parents=True), None))
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    if existing_checkout:
+        (repo / ".git").mkdir(parents=True)
+    git_calls = []
+    docker_calls = []
+
+    def subprocess_run(argv, **kwargs):
+        if argv[0] == "git":
+            git_calls.append(argv)
+            if "clone" in argv:
+                (repo / ".git").mkdir(parents=True)
+            if "push" in argv:
+                return subprocess.CompletedProcess(argv, 0 if push_ok else 128,
+                                                   stdout=b"secret remote output fixture-token",
+                                                   stderr=probe_stderr + b" remote secret fixture-token")
+            return subprocess.CompletedProcess(argv, 0, stdout="https://github.com/org/repo.git\n")
+        if argv[:2] == ["docker", "exec"]:
+            kwargs["stdout"].write(b"owner-key\n")
+            return subprocess.CompletedProcess(argv, 0)
+        docker_calls.append(argv)
+        if "compose.provision.yml" in argv:
+            home.mkdir(exist_ok=True)
+            manifest = deploy / "manifest.json"
+            script = ((deploy / "provision.py").read_text()
+                      .replace("/opt/cultivate-manifest.json", str(manifest))
+                      .replace("/home/mimir/agent", str(home))
+                      .replace("Path('/workspace')", "Path(" + repr(str(tmp_path)) + ")"))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                try:
+                    exec(compile(script, "provision.py", "exec"), {"__name__": "__main__"})
+                except SystemExit as exc:
+                    assert exc.code == 1
+                    assert output.getvalue().splitlines() == [expected_marker]
+                    return subprocess.CompletedProcess(argv, exc.code, stdout=output.getvalue(), stderr="remote secret fixture-token")
+            return subprocess.CompletedProcess(argv, 0, stdout=output.getvalue(), stderr="")
+        if argv[-3:] == ["ps", "-q", "agent"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="b" * 64, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(installer.subprocess, "run", subprocess_run)
+    verified = []
+    if push_ok:
+        installer.setup(args, request=request, verify=lambda *a: verified.append(a))
+        assert verified and any(argv[-3:] == ["up", "-d", "agent"] for argv in docker_calls)
+    else:
+        with pytest.raises(installer.SetupError) as caught:
+            installer.setup(args, request=request, verify=lambda *a: verified.append(a))
+        message = str(caught.value)
+        if expected_marker == installer._PUSH_PROBE_FAILED:
+            assert message == installer._PUSH_PROBE_HELP
+            assert "resource owner = the repository owner" in message
+            assert "organization" in message and "Contents: Read and write" in message
+            assert "approval" in message
+        else:
+            assert message == "Push probe could not reach the remote (network or GitHub error); retry setup."
+            assert "Token" not in message and "PAT" not in message
+        assert probe_stderr.decode("utf-8", errors="replace") not in message
+        assert "fixture-token" not in message and "remote secret" not in message
+        assert not verified and not any(argv[-3:] == ["up", "-d", "agent"] for argv in docker_calls)
+        assert not (home / "repositories.yaml").exists()
+    assert len([argv for argv in git_calls if "push" in argv]) == 1
+    assert len([argv for argv in git_calls if "clone" in argv]) == (0 if existing_checkout else 1)
+    assert all("fixture-token" not in " ".join(argv) for argv in git_calls + docker_calls)
+    captured = capsys.readouterr()
+    assert "fixture-token" not in captured.out + captured.err
+    assert "secret remote output" not in captured.out + captured.err

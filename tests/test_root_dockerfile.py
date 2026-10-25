@@ -192,10 +192,15 @@ def _run_instructions(text: str) -> list[str]:
     ("cultivate", "mimir-cultivate==0.9.10", None, False),
     ("", "Mimir_Cultivate==0.9.10", None, False),
 ])
+@pytest.mark.parametrize("unrelated_words", ["", "github high ghcr"])
 def test_root_cultivate_selection_executes_verified_build_branches(
-    tmp_path, selection, packages, selected, success,
+    tmp_path, selection, packages, selected, success, unrelated_words,
 ) -> None:
     root = DOCKERFILE.read_text()
+    # Unrelated gh substrings must not remove an actual gated branch.
+    users = "sh /opt/cultivate-docker/users.sh;"
+    assert users in root
+    root = root.replace(users, users + f" : {unrelated_words};", 1)
     marker_dir = tmp_path / "cultivate-docker"
     marker_dir.mkdir()
     s6 = tmp_path / "s6-rc.d"
@@ -220,7 +225,7 @@ def test_root_cultivate_selection_executes_verified_build_branches(
                               env={**env, "PATH": path})
 
     programs = _run_instructions(root)
-    selector, = (p for p in programs if "/opt/cultivate-docker/selected" in p and "printf" in p)
+    selector, = (p for p in programs if "printf '%s\\n' \"$selected\" > /opt/cultivate-docker/selected" in p)
     result = run(selector, stubbed=False)
     assert (result.returncode == 0) is success, result.stderr
     if not success:
@@ -229,7 +234,8 @@ def test_root_cultivate_selection_executes_verified_build_branches(
     assert (marker_dir / "selected").read_text() == selected + "\n"
 
     gated = [p for p in programs if "cat /opt/cultivate-docker/selected" in p
-             and "chainlink" not in p]
+             and "chainlink" not in p and "/usr/local/bin/gh" not in p
+             and "gh --version" not in p]
     # users, executor, controller, bootstrap, worker-service removal, assembler pin.
     assert len(gated) == 6
     for program in gated:
@@ -384,6 +390,166 @@ def test_chainlink_install_and_version_check_follow_cultivate_selection(tmp_path
     result = subprocess.run(["/bin/sh", "-ceu", version_program], env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == ("chainlink 1.6.0" if selected == "1" else "")
+
+
+def _assert_cultivate_gh_install(root: str) -> None:
+    pin = re.search(r"(?m)^ARG GH_VERSION=(\d+\.\d+\.\d+)$", root)
+    assert pin is not None and tuple(map(int, pin[1].split("."))) >= (2, 102, 0), "gh must include the advisory fixes"
+    for arch in ("AMD64", "ARM64"):
+        assert re.search(rf"(?m)^ARG GH_{arch}_SHA256=[0-9a-f]{{64}}$", root)
+    programs = _run_instructions(root)
+    installs = [p for p in programs if "install -m 0755" in p and "/usr/local/bin/gh" in p]
+    assert len(installs) == 1, "Cultivate must install the pinned gh binary"
+    install, = installs
+    assert 'if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then' in install
+    assert "amd64) arch=amd64; digest=\"$GH_AMD64_SHA256\"" in install
+    assert "arm64) arch=arm64; digest=\"$GH_ARM64_SHA256\"" in install
+    assert 'https://github.com/cli/cli/releases/download/v${GH_VERSION}/${archive}' in install
+    assert "sha256sum -c -" in install
+    assert install.index("sha256sum -c -") < install.index("tar -xzf") < install.index("install -m 0755")
+    assert 'printf \'%s  %s\\n\' "$digest" /tmp/gh.tar.gz | sha256sum -c -' in install
+    assert "gh_${GH_VERSION}_linux_${arch}/bin/gh" in install
+    assert "Unsupported architecture for gh" in install
+    assert 'case "$GH_VERSION" in *[!0-9.]*|.*|*..*|*.)' in install
+    controller_check = next(p for p in programs if "gh --version" in p and "s6-setuidgid" not in p)
+    assert 'gh --version;' in controller_check
+    assert controller_check.startswith("set -eu;"), "gh probe must fail closed"
+    assert 'gh api --help | grep -q -- --allow-escape-sequences;' in controller_check, "gh capability probe missing"
+    assert 'export HOME=/home/mimir XDG_CONFIG_HOME=/home/mimir/.config GH_CONFIG_DIR=/home/mimir/.config/gh;' in controller_check
+    worker_check = next(p for p in programs if "s6-setuidgid" in p and "gh --version" in p)
+    assert worker_check.startswith("set -eu;"), "worker gh probe must fail closed"
+    assert 'mktemp -d /var/lib/mimir-worklink/homes/gh-build-XXXXXX' in worker_check
+    assert 'chown worklink:worklink "$home";' in worker_check
+    assert 'chmod 0700 "$home";' in worker_check
+    assert 'trap \'rm -rf "$home"\' EXIT;' in worker_check
+    prefix = '/command/s6-setuidgid worklink env HOME="$home" XDG_CONFIG_HOME="$home/.config" GH_CONFIG_DIR="$home/.config/gh" '
+    assert prefix + 'gh --version;' in worker_check
+    assert prefix + 'gh api --help | grep -q -- --allow-escape-sequences;' in worker_check, "worker gh capability probe missing"
+    # A core build selects 0; only the selected branch may fetch or install gh.
+    assert root.count("/usr/local/bin/gh") == 1
+    assert "gh" not in (ROOT / "plugins/cultivate/mimir_cultivate/docker/base.sh").read_text().split("apt-get install", 1)[1].split("curl -fsSL", 1)[0].split()
+
+
+def test_cultivate_gh_is_pinned_verified_and_core_does_not_install_it() -> None:
+    _assert_cultivate_gh_install(DOCKERFILE.read_text())
+
+
+def test_core_gh_install_branch_does_not_fetch_or_install(tmp_path) -> None:
+    install, = (p for p in _run_instructions(DOCKERFILE.read_text())
+                if "install -m 0755" in p and "/usr/local/bin/gh" in p)
+    selected = tmp_path / "selected"
+    selected.write_text("0\n")
+    install = install.replace("/opt/cultivate-docker/selected", str(selected))
+    result = subprocess.run(["/bin/sh", "-ceu", install], capture_output=True, text=True,
+                            env={**os.environ, "PATH": "/usr/bin:/bin", "GH_VERSION": "2.103.2"})
+    assert result.returncode == 0, result.stderr
+    assert not result.stdout
+
+
+def test_cultivate_gh_static_guard_rejects_missing_install() -> None:
+    root = DOCKERFILE.read_text()
+    old = 'install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" /usr/local/bin/gh;'
+    assert old in root
+    with pytest.raises(AssertionError, match="install the pinned gh"):
+        _assert_cultivate_gh_install(root.replace(old, "true;"))
+
+
+@pytest.mark.parametrize("old,new", [
+    ("sha256sum -c -", "true"),
+    ('if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then', "if true; then"),
+])
+def test_cultivate_gh_static_guard_rejects_integrity_or_selection_bypass(old, new) -> None:
+    root = DOCKERFILE.read_text()
+    install = next(p for p in _run_instructions(root) if "/usr/local/bin/gh" in p)
+    assert old in install
+    with pytest.raises(AssertionError):
+        _assert_cultivate_gh_install(root.replace(install, install.replace(old, new), 1))
+
+
+@pytest.mark.parametrize("old,new,message", [
+    ("gh api --help | grep -q -- --allow-escape-sequences;", "true;", "capability probe"),
+    ("ARG GH_VERSION=2.103.2", "ARG GH_VERSION=2.83.1", "advisory fixes"),
+])
+def test_cultivate_gh_guard_rejects_missing_capability_or_old_pin(old, new, message) -> None:
+    root = DOCKERFILE.read_text()
+    assert old in root
+    with pytest.raises(AssertionError, match=message):
+        _assert_cultivate_gh_install(root.replace(old, new))
+
+
+@pytest.mark.parametrize("identity", ["mimir", "worklink"])
+@pytest.mark.parametrize("selected,version_exit,supports_flag,expected", [
+    ("0", 1, False, 0),
+    ("1", 0, True, 0),
+    ("1", 0, False, 1),
+    ("1", 1, True, 1),
+])
+def test_cultivate_gh_build_probe_requires_working_binary_and_flag(
+    tmp_path, identity, selected, version_exit, supports_flag, expected,
+) -> None:
+    result, calls = _run_gh_probe(tmp_path, identity, selected, version_exit, supports_flag)
+    assert result.returncode == expected, result.stderr
+    assert calls == ([] if selected == "0" else ["--version"] if version_exit else ["--version", "api --help"])
+
+
+def _run_gh_probe(tmp_path, identity, selected="1", version_exit=0, supports_flag=True,
+                  *, inherit_home=False):
+    probe, = (p for p in _run_instructions(DOCKERFILE.read_text())
+              if "gh --version" in p and ("s6-setuidgid" in p) == (identity == "worklink"))
+    marker = tmp_path / "selected"
+    marker.write_text(selected + "\n")
+    homes = tmp_path / "homes"
+    homes.mkdir()
+    controller_home = tmp_path / "controller"
+    controller_home.mkdir()
+    log = tmp_path / "calls"
+    binary = tmp_path / "gh"
+    # Model gh's config lookup, not just its output: inherited root config must
+    # fail even for --version. Both calls must see the identity-specific HOME.
+    binary.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$*" >> "$GH_TEST_LOG"\n'
+        'case "$GH_TEST_IDENTITY" in\n'
+        'mimir) [ "$HOME" = "$GH_TEST_CONTROLLER_HOME" ] || exit 41 ;;\n'
+        'worklink) case "$HOME" in "$GH_TEST_HOMES"/gh-build-*) ;; *) exit 41 ;; esac; '
+        '[ -d "$HOME" ] && [ "$(stat -c %a "$HOME" 2>/dev/null || stat -f %Lp "$HOME")" = 700 ] || exit 41 ;;\n'
+        'esac\n'
+        '[ "$XDG_CONFIG_HOME" = "$HOME/.config" ] || exit 41\n'
+        '[ "$GH_CONFIG_DIR" = "$HOME/.config/gh" ] || exit 41\n'
+        'if [ "$1" = --version ]; then exit "$GH_TEST_VERSION_EXIT"; fi\n'
+        'if [ "$GH_TEST_FLAG" = 1 ]; then echo --allow-escape-sequences; else echo usage; fi\n'
+    )
+    binary.chmod(0o755)
+    # Portable unit execution doesn't impersonate host accounts; ownership is
+    # asserted statically above and the real uid boundary is the image CI gate.
+    for name, body in (("s6-setuidgid", 'shift; exec "$@"'), ("chown", ":")):
+        stub = tmp_path / name
+        stub.write_text("#!/bin/sh\n" + body + "\n")
+        stub.chmod(0o755)
+    probe = probe.replace("/opt/cultivate-docker/selected", str(marker)).replace(
+        "/var/lib/mimir-worklink/homes", str(homes)).replace(
+        "/home/mimir", str(controller_home)).replace(
+        "/command/s6-setuidgid", str(tmp_path / "s6-setuidgid"))
+    if inherit_home:
+        if identity == "mimir":
+            probe = re.sub(r"export HOME=.*?;", "true;", probe)
+        else:
+            probe = probe.replace('env HOME="$home" XDG_CONFIG_HOME="$home/.config" GH_CONFIG_DIR="$home/.config/gh" ', "")
+    result = subprocess.run(["/bin/sh", "-c", probe], capture_output=True, text=True, env={
+        **os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin", "GH_TEST_LOG": str(log),
+        "HOME": "/root", "XDG_CONFIG_HOME": "/root/.config", "GH_CONFIG_DIR": "/root/.config/gh",
+        "GH_TEST_IDENTITY": identity, "GH_TEST_CONTROLLER_HOME": str(controller_home),
+        "GH_TEST_HOMES": str(homes), "GH_TEST_VERSION_EXIT": str(version_exit),
+        "GH_TEST_FLAG": str(int(supports_flag)),
+    })
+    assert list(homes.iterdir()) == [], "disposable worker HOME must be removed on success and failure"
+    return result, log.read_text().splitlines() if log.exists() else []
+
+
+@pytest.mark.parametrize("identity", ["mimir", "worklink"])
+def test_cultivate_gh_probe_rejects_inherited_root_environment(tmp_path, identity):
+    result, calls = _run_gh_probe(tmp_path, identity, inherit_home=True)
+    assert result.returncode == 41, result.stderr
+    assert calls == ["--version"]
 
 
 def test_root_assembler_pins_selected_cultivate_to_the_built_version(tmp_path) -> None:

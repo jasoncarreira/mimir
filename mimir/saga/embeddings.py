@@ -413,7 +413,7 @@ def offline_reembedding():
 
 
 def _check_existing_dimensions(dim: int) -> None:
-    """Never add vectors of a new dimension to an existing Saga database."""
+    """Refuse a new dimension, but allow repairable drift in legacy databases."""
     if getattr(_dimension_check, "offline", False):
         return
     from ._config_io import get_data_dir
@@ -422,14 +422,29 @@ def _check_existing_dimensions(dim: int) -> None:
         db = get_data_dir() / db
     if not db.is_file():
         return
+    matching = mismatched = 0
     with sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True) as conn:
         for table, column in (("embeddings", "dim"), ("sessions", "embedding_dim"),
                               ("triples", "embedding_dim")):
             if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
                 continue
-            if conn.execute(f"SELECT 1 FROM {table} WHERE {column} IS NOT NULL AND {column} != ? LIMIT 1", (dim,)).fetchone():
-                raise RuntimeError("Embedding provider would mix vector dimensions in saga.db; "
-                                   "run mimir saga-reembed offline before switching providers")
+            counts = conn.execute(
+                f"SELECT count(CASE WHEN {column} = ? THEN 1 END), "
+                f"count(CASE WHEN {column} != ? THEN 1 END) FROM {table}",
+                (dim, dim),
+            ).fetchone()
+            matching += counts[0]
+            mismatched += counts[1]
+    if mismatched and not matching:
+        raise RuntimeError("Embedding provider would mix vector dimensions in saga.db; "
+                           "run mimir saga-reembed offline before switching providers")
+    if mismatched:
+        logging.getLogger("saga.embeddings").warning(
+            "Saga database contains %d rows with mismatched embedding dimensions "
+            "(provider dimension %d); continuing with existing matching vectors. "
+            "Run mimir saga-reembed offline to repair legacy rows.",
+            mismatched, dim,
+        )
 
 
 def get_provider() -> EmbeddingProvider:
@@ -503,7 +518,8 @@ def get_provider() -> EmbeddingProvider:
             )
         else:
             instance = provider_cls()
-        if isinstance(instance, EmbeddingProvider):
+        # The keyless fallback already checked its fixed dimension above.
+        if isinstance(instance, EmbeddingProvider) and _onnx_dimensions_override is None:
             _check_existing_dimensions(instance.dimensions())
         _provider_instance = instance
     return _provider_instance
