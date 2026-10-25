@@ -93,6 +93,17 @@ def test_manifest_validates_required_fields_and_reserved_keys():
         parse_manifest(_toml(), entry_name="Bad_Name")
 
 
+def test_manifest_declares_inert_cli_operator_flags():
+    assert parse_manifest(_toml(), entry_name="alpha").cli_commands is None
+    assert dict(parse_manifest(_toml() + b"[cli]\n", entry_name="alpha").cli_commands) == {}
+    manifest = parse_manifest(_toml() + b"[cli]\nalpha-setup = true\nalpha-work = false\n",
+                              entry_name="alpha")
+    assert dict(manifest.cli_commands) == {"alpha-setup": True, "alpha-work": False}
+    for payload in (b"[cli]\nBad_Name = true\n", b"[cli]\nalpha = 'true'\n"):
+        with pytest.raises(PluginManifestError, match="cli:"):
+            parse_manifest(_toml() + payload, entry_name="alpha")
+
+
 def test_optional_skill_schema_and_name_collisions():
     default = b'[defaults]\nversion = "1"\nskills = ["skills/github"]\n'
     optional = b'[optional]\nskills = [{path = "skills/gitlab", forge = "gitlab"}]\n'

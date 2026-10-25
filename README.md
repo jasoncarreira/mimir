@@ -130,6 +130,12 @@ uv run mimir setup --home ~/mimir-home
 uv run mimir run --home ~/mimir-home
 ```
 
+To install the optional Cultivate coding agent from a source checkout, run
+`uv sync --all-packages` and then `uv run --all-packages mimir cultivate setup`.
+The installer works on the operator workstation without `MIMIR_PLUGINS` set;
+it configures the generated deployment to select Cultivate for the agent.
+See [the Cultivate setup guide](./docs/plugins.md#set-up-a-cultivate-agent).
+
 `mimir setup` activates four recurring tasks out of the box: hourly
 heartbeat, weekly reflection, daily saga consolidation (default `MIMIR_SAGA_CONSOLIDATE_CRON=0 4 * * *`), weekly
 behavioral introspection report. All gated by the homeostat so a

@@ -115,7 +115,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     words = list(argv) if argv is not None else sys.argv[1:]
     parser = argparse.ArgumentParser(
         prog="mimir",
-        description="Memory-centric agent harness on the Claude Agent SDK.",
+        description="Memory-centric agent harness on the Claude Agent SDK. "
+                    "See `mimir plugins list` for installed providers and their commands; "
+                    "operator commands work without selecting the provider.",
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -875,11 +877,55 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     # Inspection paths use installed-distribution metadata only, even if the
     # operator has selected plugins. In particular, list never imports a provider.
-    if words[:2] not in (["plugins", "list"], ["plugins", "dockerfile"]) and os.environ.get("MIMIR_PLUGINS", "").strip():
+    inspecting = words[:2] in (["plugins", "list"], ["plugins", "dockerfile"])
+    selection = os.environ.get("MIMIR_PLUGINS", "").strip()
+    if not inspecting and selection:
         from .plugins.manager import load_plugins
 
-        manager = load_plugins(enable=os.environ["MIMIR_PLUGINS"])
+        manager = load_plugins(enable=selection)
         commands.add_selected(manager.policy.cli_commands, sub)
+
+    # Inspect manifests only for a command word not already registered. Never
+    # load an unselected provider while building a core parser (especially run).
+    if words and words[0] not in sub.choices and not words[0].startswith("-"):
+        from .plugins.discovery import discover_plugins
+        from .plugins.registry import PolicyRegistrationError
+
+        candidates = discover_plugins(enable=selection)
+        owners = [candidate for candidate in candidates
+                  if candidate.diagnostic is None and candidate.manifest is not None
+                  and words[0] in (candidate.manifest.cli_commands or {})]
+        if len(owners) > 1:
+            parser.error(f"CLI command {words[0]!r} is claimed by multiple installed plugins")
+        if owners:
+            candidate = owners[0]
+            if not candidate.manifest.cli_commands[words[0]]:
+                parser.error(f"{words[0]!r} belongs to plugin {candidate.name!r}; "
+                             f"select it with MIMIR_PLUGINS={candidate.name}")
+            from .plugins.manager import load_plugins
+
+            # This is an operator-only CLI process; the server path above has
+            # no route through this branch. Verify the live registration agrees
+            # with the inert manifest before exposing the parser or dispatch.
+            operator = load_plugins(enable=candidate.name).policy.cli_commands.get(words[0])
+            if operator is None or operator.owner != candidate.name or operator.operator is not True:
+                raise PolicyRegistrationError(
+                    f"{candidate.name}: operator command {words[0]!r} does not match its manifest"
+                )
+            commands.add_selected({words[0]: operator}, sub)
+        else:
+            # Older manifests lack command metadata. Provide an actionable
+            # selection hint without loading any disabled provider, even on a
+            # misspelled word. Never guess which provider owns the word.
+            unselected = [candidate.name for candidate in candidates
+                          if not candidate.enabled and candidate.diagnostic is None
+                          and candidate.manifest is not None
+                          and candidate.manifest.cli_commands is None]
+            if unselected:
+                hints = ", ".join(f"MIMIR_PLUGINS={name}" for name in unselected)
+                parser.error(f"unknown command {words[0]!r}; installed unselected plugins: "
+                             f"{', '.join(unselected)}. To use their commands, select {hints}; "
+                             "see `mimir plugins list` for advertised commands")
 
     args = parser.parse_args(words)
     if args.command is None:

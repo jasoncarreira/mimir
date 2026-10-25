@@ -18,7 +18,7 @@ from packaging.version import InvalidVersion, Version
 
 PLUGIN_NAME = re.compile(r"[a-z][a-z0-9-]*\Z")
 _FIELDS = frozenset({"name", "version", "license", "requires_mimir"})
-_RESERVED = frozenset({"dockerfile", "themes", "frontend", "defaults", "optional", "config"})
+_RESERVED = frozenset({"dockerfile", "themes", "frontend", "defaults", "optional", "config", "cli"})
 _SKIN_TOKENS = frozenset("--mimir-" + token for token in (
     "color-text color-text-muted color-background color-chrome-background color-chrome-border "
     "color-chrome-accent color-chrome-accent-text color-panel-background color-panel-background-muted "
@@ -57,6 +57,8 @@ class PluginManifest:
     defaults: Mapping[str, Any] = field(default_factory=dict)
     config: Mapping[str, Any] = field(default_factory=dict)
     optional_skills: tuple[tuple[str, str | None], ...] = ()
+    # None means legacy metadata; an empty table explicitly advertises no commands.
+    cli_commands: Mapping[str, bool] | None = None
 
 
 def _resource(value: str, *, key: str, root: Path | None, files: frozenset[Path] | None,
@@ -317,6 +319,11 @@ def parse_manifest(data: bytes, *, entry_name: str, resource_root: Path | None =
                 or not _choice(definition.get("type"), {"string", "integer", "boolean"}) \
                 or any(type(definition.get(flag, False)) is not bool for flag in ("secret", "security")):
             raise PluginManifestError(f"config: invalid schema for {key}")
+    cli = _table(raw, "cli", set(raw.get("cli", {})) if isinstance(raw.get("cli", {}), dict) else set())
+    if any(not PLUGIN_NAME.fullmatch(name) or type(operator) is not bool
+           for name, operator in cli.items()):
+        raise PluginManifestError("cli: expected command names with boolean operator flags")
     return PluginManifest(*(raw[key] for key in ("name", "version", "license", "requires_mimir")),
-                          MappingProxyType(docker), themes, tuple(skin_defaults), MappingProxyType(frontend),
-                           MappingProxyType(defaults), MappingProxyType(config), tuple(optional_skills))
+                           MappingProxyType(docker), themes, tuple(skin_defaults), MappingProxyType(frontend),
+                            MappingProxyType(defaults), MappingProxyType(config), tuple(optional_skills),
+                            MappingProxyType(cli) if "cli" in raw else None)

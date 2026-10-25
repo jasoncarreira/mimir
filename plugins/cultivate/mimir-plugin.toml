@@ -4,6 +4,11 @@ license = "BUSL-1.1"
 requires_mimir = "==0.9.10"
 themes = ["skins/squashmerge.json"]
 
+[cli]
+cultivate = true
+worklink = false
+opencode-bootstrap = false
+
 [frontend]
 api_major = 1
 module = "frontend/cultivate.v1.js"

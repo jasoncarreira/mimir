@@ -123,6 +123,7 @@ class CliCommand:
     name: str
     configure: Callable[..., Any]
     dispatch: Callable[..., Any]
+    operator: bool = False
 
 
 @dataclass(frozen=True)
@@ -560,14 +561,16 @@ class PolicyRegistry:
             raise PolicyRegistrationError(f"{owner}: scheduler job {name} requires a callable")
         self._scheduler_jobs[name] = SchedulerJob(owner, name, job_id, callback)
 
-    def register_cli_command(self, name: str, configure: Callable[..., Any], dispatch: Callable[..., Any], *, owner: str = "core") -> None:
+    def register_cli_command(self, name: str, configure: Callable[..., Any], dispatch: Callable[..., Any], *, operator: bool = False, owner: str = "core") -> None:
         self._writable()
         name = _name(name, "CLI command")
         if not re.fullmatch(r"[a-z][a-z0-9-]*", name) or name in self._cli_commands:
             raise PolicyRegistrationError(f"{owner}: invalid or duplicate CLI command: {name}")
         if not callable(configure) or not callable(dispatch):
             raise PolicyRegistrationError(f"{owner}: CLI command {name} requires parser and handler")
-        self._cli_commands[name] = CliCommand(owner, name, configure, dispatch)
+        if type(operator) is not bool:
+            raise PolicyRegistrationError(f"{owner}: CLI command {name} has invalid operator flag")
+        self._cli_commands[name] = CliCommand(owner, name, configure, dispatch, operator)
 
     def register_route(self, method: str, path: str, handler: Callable[..., Any], *, role: str = "user", owner: str = "core") -> None:
         self._writable()
@@ -1183,8 +1186,8 @@ class PolicyRegistrar:
     def register_scheduler_job(self, name: str, job_id: str, callback: Callable[..., Any]) -> None:
         self._registry.register_scheduler_job(name, job_id, callback, owner=self.plugin)
 
-    def register_cli_command(self, name: str, configure: Callable[..., Any], dispatch: Callable[..., Any]) -> None:
-        self._registry.register_cli_command(name, configure, dispatch, owner=self.plugin)
+    def register_cli_command(self, name: str, configure: Callable[..., Any], dispatch: Callable[..., Any], *, operator: bool = False) -> None:
+        self._registry.register_cli_command(name, configure, dispatch, operator=operator, owner=self.plugin)
 
     def register_route(self, method: str, path: str, handler: Callable[..., Any], *, role: str = "user") -> None:
         self._registry.register_route(method, path, handler, role=role, owner=self.plugin)
