@@ -517,14 +517,34 @@ class GitHubForgeClient:
         """
         items: list[Mapping[str, Any]] = []
         separator = "&" if "?" in endpoint else "?"
-        for page in range(1, _MAX_PAGES + 1):
-            payload = self._request("GET", f"{endpoint}{separator}per_page=50&page={page}")
+        offset = 0
+        page_size = 50
+        for _ in range(_MAX_PAGES):
+            # Filtering may reject every row, so retain scan depth independently
+            # of the output limit. Keep any size reduction across later pages.
+            if limit is not None and not merged_only and predicate is None:
+                page_size = min(page_size, max(limit - len(items), 1))
+            while True:
+                # GitHub's page number is relative to per_page. Recompute it
+                # after each shrink and discard any overlap with prior pages.
+                page = offset // page_size + 1
+                try:
+                    payload = self._request(
+                        "GET", f"{endpoint}{separator}per_page={page_size}&page={page}",
+                    )
+                    break
+                except ForgeResponseTooLarge:
+                    if page_size == 1:
+                        raise
+                    page_size = max(page_size // 2, 1)
             if collection_key is not None:
                 payload = payload.get(collection_key) if isinstance(payload, Mapping) else None
             if not isinstance(payload, list):
                 raise ForgeError("forge returned an invalid collection")
+            page_rows = payload[offset % page_size:]
+            offset += len(page_rows)
             page_items = [
-                item for item in payload
+                item for item in page_rows
                 if isinstance(item, Mapping)
                 and (not merged_only or item.get("merged_at") is not None)
                 and (predicate is None or predicate(item))
@@ -534,7 +554,7 @@ class GitHubForgeClient:
                 return items[:limit]
             if len(items) > _MAX_ITEMS:
                 raise ForgeResponseTooLarge("forge collection exceeded item limit")
-            if len(payload) < 50:
+            if len(payload) < page_size:
                 return items
         if limit is not None:
             return items
@@ -690,7 +710,8 @@ class GitHubForgeClient:
 
         rows = self._paginate(
             f"/repos/{repository}/pulls?{urlencode(query)}",
-            limit=limit, merged_only=state == "merged", predicate=matches,
+            limit=limit, merged_only=state == "merged",
+            predicate=matches if any(value is not None for value in (head, author, merged_since)) else None,
         )
         return tuple(
             PullRequestSummary(
