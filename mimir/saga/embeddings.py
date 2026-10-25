@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import threading
+import tempfile
 import time
 import sqlite3
 from pathlib import Path
@@ -199,7 +200,14 @@ class LocalProvider(EmbeddingProvider):
             if self.model_name in REMOTE_CODE_REVISIONS:
                 options['trust_remote_code'] = True
                 options['revision'] = _cfg('embedding', 'revision', None) or REMOTE_CODE_REVISIONS[self.model_name]
-            self._model = SentenceTransformer(self.model_name, **options)
+            try:
+                # A cached pinned snapshot must load without probing the Hub.
+                # In particular, transformers' processor probe does not always
+                # fall back correctly when the network is unavailable.
+                self._model = SentenceTransformer(self.model_name, local_files_only=True, **options)
+            except Exception:
+                # A cold or incomplete cache still needs the normal Hub load.
+                self._model = SentenceTransformer(self.model_name, **options)
         return self._model
 
     def embed(self, text: str, input_type: str = "passage") -> list[float]:
@@ -225,9 +233,10 @@ class ONNXProvider(EmbeddingProvider):
 
     Default model: BAAI/bge-small-en-v1.5 (33MB ONNX, 384 dimensions).
     fastembed handles model fetch, ONNX runtime, tokenizer config, and
-    pooling — same library mimir's file_search uses, so we share one
-    on-disk cache (``~/.cache/fastembed/``) instead of paying for the
-    model twice.
+    pooling. On first load, cache in ``FASTEMBED_CACHE_PATH`` if set,
+    otherwise ``$XDG_CACHE_HOME/fastembed`` or ``~/.cache/fastembed``.
+    If that directory is unwritable, use fastembed's temporary cache
+    (``<tempdir>/fastembed_cache``) and warn once.
 
     Pre-fastembed implementation downloaded model.onnx + tokenizer.json
     by hand and ran ``onnxruntime.InferenceSession`` directly with a
@@ -267,7 +276,22 @@ class ONNXProvider(EmbeddingProvider):
                     "this only fires in standalone-saga deployments that "
                     "skipped the optional embedding deps)."
                 )
-            self._model = TextEmbedding(model_name=self.model_name)
+            override = os.environ.get("FASTEMBED_CACHE_PATH")
+            if override:
+                cache = Path(override).expanduser()
+            else:
+                root = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+                cache = Path(root).expanduser() / "fastembed"
+            try:
+                cache.mkdir(parents=True, exist_ok=True)
+                # mkdir(exist_ok=True) also succeeds for an existing read-only
+                # directory; probe with the effective uid, not os.access().
+                with tempfile.TemporaryFile(dir=cache):
+                    pass
+            except OSError:
+                log.warning("fastembed cache %s is unwritable; using temporary cache", cache)
+                cache = Path(tempfile.gettempdir()) / "fastembed_cache"
+            self._model = TextEmbedding(model_name=self.model_name, cache_dir=str(cache))
         return self._model
 
     def embed(self, text: str, input_type: str = "passage") -> list[float]:

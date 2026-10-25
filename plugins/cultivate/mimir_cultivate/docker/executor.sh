@@ -13,9 +13,9 @@ printf '%s\n' "$MIMIR_EXECUTOR_COMMIT" > /opt/mimir-worklink/executor-source-com
 rm -rf /opt/mimir-worklink/source/.git
 python3 -m venv /opt/mimir-worklink/venv
 /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --upgrade pip
-case ",${MIMIR_EXTRAS:-}," in
-    *,local-embeddings,*) /opt/mimir-worklink/venv/bin/pip install --no-cache-dir 'torch==2.14.1+cpu' --extra-index-url https://download.pytorch.org/whl/cpu ;;
-esac
+# worker_exec never embeds: keep the controller's local model stack out of
+# this separate executor venv while retaining all other requested extras.
+MIMIR_EXTRAS="$(python3 -c 'print(",".join(extra for extra in __import__("os").environ.get("MIMIR_EXTRAS", "").split(",") if extra and extra != "local-embeddings"))')"
 /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 /opt/mimir-worklink/venv/bin/pip install --no-cache-dir 'pypdf>=6.16'
 /opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source

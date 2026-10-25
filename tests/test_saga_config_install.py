@@ -116,14 +116,14 @@ def test_installed_llm_keys_resolve_without_unknown_key_warning(tmp_path, monkey
         '[llm]\nprovider = "codex_plus"\n'
         'url = "https://example.invalid/v1/chat/completions"\n'
         'model = "home-model"\napi_key_env = "SAGA_INSTALL_TEST_KEY"\n'
-        'timeout_seconds = 47\nreasoning_effort = "low"\n',
+        'timeout_seconds = 47\nreasoning_effort = "low"\nsampling = "default"\n',
         encoding="utf-8",
     )
     _config_io.install_saga_config(path)
     assert _config_io.resolve_llm_config("reflection") == {
         "provider": "codex_plus", "model": "home-model",
         "url": "https://example.invalid/v1/chat/completions",
-        "api_key": "test-only", "timeout": 47, "reasoning_effort": "low",
+        "api_key": "test-only", "timeout": 47, "reasoning_effort": "low", "sampling": "default",
     }
     assert "Unknown config key [llm]" not in caplog.text
 

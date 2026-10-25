@@ -7,8 +7,9 @@ import os
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -41,7 +42,7 @@ def test_local_nano_lazy_pinned_prompt_routing_and_normalization(local_stub):
     model.encode.assert_not_called()
     constructor.assert_called_once_with(
         "voyageai/voyage-4-nano", device="cpu", trust_remote_code=True,
-        revision="5fb34e870f49f19e79c94d5e118f5ee730133279",
+        revision="5fb34e870f49f19e79c94d5e118f5ee730133279", local_files_only=True,
     )
     settings["revision"] = "a" * 40
     embeddings.LocalProvider().embed("override")
@@ -73,7 +74,32 @@ def test_non_allowlisted_model_cannot_load_remote_code_or_override_revision(loca
     assert provider.dimensions() == 384
     assert provider.embed("ordinary", input_type="query") == [1.0, 0.0]
     model.encode.assert_called_once_with("ordinary", truncate_dim=384)
-    constructor.assert_called_once_with("example/other", device="cuda")
+    constructor.assert_called_once_with("example/other", device="cuda", local_files_only=True)
+
+
+def test_local_load_tries_cache_before_network_and_reuses_success(local_stub):
+    _, model, constructor = local_stub
+    constructor.side_effect = [ValueError("snapshot not cached"), model]
+    provider = embeddings.LocalProvider()
+    assert provider._load_model() is model
+    assert provider._load_model() is model
+    options = dict(device="cpu", trust_remote_code=True,
+                   revision="5fb34e870f49f19e79c94d5e118f5ee730133279")
+    assert constructor.call_args_list == [
+        call("voyageai/voyage-4-nano", local_files_only=True, **options),
+        call("voyageai/voyage-4-nano", **options),
+    ]
+
+
+def test_local_load_propagates_network_failure_without_caching(local_stub):
+    _, model, constructor = local_stub
+    constructor.side_effect = [OSError("cache miss"), OSError("network down"), model]
+    provider = embeddings.LocalProvider()
+    with pytest.raises(OSError, match="network down"):
+        provider._load_model()
+    assert provider._model is None
+    assert provider._load_model() is model
+    assert [c.kwargs.get("local_files_only", False) for c in constructor.call_args_list] == [True, False, True]
 
 
 def test_missing_local_extra_names_install_command(monkeypatch):
@@ -82,6 +108,78 @@ def test_missing_local_extra_names_install_command(monkeypatch):
     provider = embeddings.LocalProvider()
     with pytest.raises(RuntimeError, match=r"mimir-agent\[local-embeddings\]"):
         provider.embed("hello")
+
+
+@pytest.fixture
+def recorded_onnx(monkeypatch):
+    calls = []
+
+    def text_embedding(**kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(TextEmbedding=text_embedding))
+    return calls
+
+
+@pytest.mark.parametrize("fastembed,xdg,expected", [
+    ("custom/onnx", "xdg", "custom/onnx"),
+    (None, "xdg", "xdg/fastembed"),
+    (None, None, "home/.cache/fastembed"),
+])
+def test_onnx_cache_resolution_is_lazy(tmp_path, monkeypatch, recorded_onnx,
+                                       fastembed, xdg, expected):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for key, value in (("FASTEMBED_CACHE_PATH", fastembed), ("XDG_CACHE_HOME", xdg)):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, str(tmp_path / value))
+    cache = tmp_path / expected
+    provider = embeddings.ONNXProvider(model_name="BAAI/bge-small-en-v1.5")
+    assert not cache.exists()
+    assert not recorded_onnx
+
+    provider._load()
+    assert cache.is_dir()
+    assert recorded_onnx == [{"model_name": "BAAI/bge-small-en-v1.5",
+                              "cache_dir": str(cache)}]
+    assert provider._load() is provider._model
+    assert len(recorded_onnx) == 1
+
+
+@pytest.mark.parametrize("failure", ["mkdir", "write"])
+def test_onnx_unwritable_cache_warns_once_and_uses_temp(tmp_path, monkeypatch,
+                                                         recorded_onnx, caplog, failure):
+    cache = tmp_path / "persistent" / "fastembed"
+    monkeypatch.setenv("FASTEMBED_CACHE_PATH", str(cache))
+    monkeypatch.setattr(embeddings.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+    if failure == "mkdir":
+        original_mkdir = Path.mkdir
+
+        def mkdir(path, *args, **kwargs):
+            if path == cache:
+                raise PermissionError("read-only volume")
+            return original_mkdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", mkdir)
+    else:
+        original_probe = embeddings.tempfile.TemporaryFile
+
+        def probe(*args, **kwargs):
+            if kwargs.get("dir") == cache:
+                raise PermissionError("read-only existing cache")
+            return original_probe(*args, **kwargs)
+
+        monkeypatch.setattr(embeddings.tempfile, "TemporaryFile", probe)
+
+    provider = embeddings.ONNXProvider()
+    with caplog.at_level("WARNING", logger=embeddings.__name__):
+        provider._load()
+        provider._load()
+    assert recorded_onnx == [{"model_name": provider.model_name,
+                              "cache_dir": str(tmp_path / "tmp" / "fastembed_cache")}]
+    assert len([record for record in caplog.records if "unwritable" in record.message]) == 1
 
 
 @pytest.fixture(params=["onnx", "local"])

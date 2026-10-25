@@ -144,15 +144,10 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
         actual_steps = steps((source / name).read_text())
         if name == "executor.sh":
             # Intentional post-extraction changes, each pinned exactly:
-            # 0. The optional local embedding extra needs the locked CPU
-            #    torch wheel before pip resolves the rest of the extra.
+            # 0. The executor never embeds; filter the controller-only extra.
             extra_install = "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir mimir-agent[${MIMIR_EXTRAS}]"
-            expected_steps[expected_steps.index(extra_install):expected_steps.index(extra_install)] = [
-                "case ,${MIMIR_EXTRAS:-}, in",
-                "*,local-embeddings,*) /opt/mimir-worklink/venv/bin/pip install --no-cache-dir "
-                "torch==2.14.1+cpu --extra-index-url https://download.pytorch.org/whl/cpu",
-                "esac",
-            ]
+            expected_steps.insert(expected_steps.index(extra_install),
+                'MIMIR_EXTRAS=$(python3 -c print(,.join(extra for extra in __import__(os).environ.get(MIMIR_EXTRAS, ).split(,) if extra and extra != local-embeddings)))')
             # 1. Cultivate is overlaid from the same verified tree as core, with
             #    --no-deps so its exact mimir-agent pin cannot replace the overlay.
             overlay = "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir --no-deps /opt/mimir-worklink/source"
@@ -173,6 +168,29 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
                 "chmod +x /etc/s6-overlay/s6-rc.d/watchdog/run",
             ]
         assert actual_steps == expected_steps, name
+
+
+@pytest.mark.parametrize("extras,expected", [
+    ("openai,mcp,local-embeddings", "mimir-agent[openai,mcp]"),
+    ("local-embeddings,openai,local-embeddings,mcp", "mimir-agent[openai,mcp]"),
+    ("openai,mcp", "mimir-agent[openai,mcp]"),
+    ("local-embeddings", "mimir-agent[]"),
+    ("", "mimir-agent[]"),
+])
+def test_executor_install_excludes_local_embeddings(extras, expected):
+    script = (ROOT / "plugins/cultivate/mimir_cultivate/docker/executor.sh").read_text()
+    assert "torch" not in script
+    # Execute the real filter and install command, replacing only pip with an
+    # argv recorder. No Git, venv creation, package install or cleanup runs.
+    program = script.split('MIMIR_EXTRAS="$(', 1)[1]
+    program = 'MIMIR_EXTRAS="$(' + program.split(
+        "/opt/mimir-worklink/venv/bin/pip install --no-cache-dir 'pypdf", 1)[0]
+    program = program.replace("/opt/mimir-worklink/venv/bin/pip", "record_install")
+    program = 'record_install() { printf "%s\\n" "$@"; }\n' + program
+    result = subprocess.run(["/bin/sh", "-eu", "-c", program], capture_output=True, text=True,
+                            env={**os.environ, "MIMIR_EXTRAS": extras})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["install", "--no-cache-dir", expected]
 
 
 def _run_instructions(text: str) -> list[str]:

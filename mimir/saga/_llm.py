@@ -65,6 +65,21 @@ log = logging.getLogger(__name__)
 _ANTHROPIC_CLIENTS: dict[tuple[str, Any], Any] = {}
 
 
+def _sampling(llm: dict[str, Any]) -> str:
+    sampling = llm.get('sampling')
+    if sampling is None:
+        sampling = 'default' if llm.get('reasoning_effort') else 'custom'
+    if sampling not in ('default', 'custom'):
+        raise ValueError(f"Invalid saga [llm] sampling {sampling!r}; choose 'default' or 'custom'")
+    return sampling
+
+
+def _sampling_hint(error: str) -> str:
+    if '400' in error and ('temperature' in error.lower() or 'sampling' in error.lower()):
+        return ' Set [llm] sampling = "default" to omit unsupported sampling parameters.'
+    return ''
+
+
 def _call_anthropic(
     llm: dict[str, Any], *,
     prompt: str, max_tokens: int, temperature: float,
@@ -82,21 +97,29 @@ def _call_anthropic(
         log.warning("anthropic SDK not installed; install the anthropic extra for saga")
         return ""
 
+    effort = validate_effort('anthropic', llm.get('reasoning_effort'))
+    sampling = _sampling(llm)
     cache_key = (api_key, llm.get("timeout", 30))
     client = _ANTHROPIC_CLIENTS.get(cache_key)
     if client is None:
         client = Anthropic(api_key=api_key, timeout=llm.get("timeout", 30))
         _ANTHROPIC_CLIENTS[cache_key] = client
     try:
-        msg = client.messages.create(
-            model=llm.get("model") or "claude-haiku-4-5",
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system or "",
-            messages=[{"role": "user", "content": prompt}],
-        )
+        kwargs: dict[str, Any] = {
+            "model": llm.get("model") or "claude-haiku-5-5",
+            "max_tokens": max_tokens,
+        }
+        if sampling == 'custom':
+            kwargs['temperature'] = temperature
+        kwargs['system'] = system or ''
+        kwargs['messages'] = [{"role": "user", "content": prompt}]
+        if effort:
+            kwargs['output_config'] = {'effort': effort}
+        msg = client.messages.create(**kwargs)
     except Exception as exc:  # noqa: BLE001 — saga's existing sites swallow.
-        log.warning("anthropic call failed: %s", exc)
+        error = str(exc)
+        log.warning("anthropic call failed: %s%s", exc,
+                    _sampling_hint(f"{getattr(exc, 'status_code', '')} {error}"))
         return ""
 
     # Anthropic returns a list of content blocks (text + optional tool_use,
@@ -190,9 +213,13 @@ def _call_openai_compat(
     body: dict[str, Any] = {
         "model": llm.get("model") or "",
         "messages": messages,
-        "temperature": temperature,
-        "max_completion_tokens": max_tokens,
     }
+    if _sampling(llm) == 'custom':
+        body['temperature'] = temperature
+    body['max_completion_tokens'] = max_tokens
+    effort = validate_effort('openai', llm.get('reasoning_effort'))
+    if effort:
+        body['reasoning_effort'] = effort
     try:
         r = requests.post(
             url,
@@ -215,8 +242,9 @@ def _call_openai_compat(
             # (e.g., "Unsupported parameter: 'max_tokens'...").
             body_preview = (getattr(r, "text", "") or "")[:300]
             log.warning(
-                "openai_compat call failed: %s — body=%s",
+                "openai_compat call failed: %s — body=%s%s",
                 http_exc, body_preview,
+                _sampling_hint(f"{getattr(r, 'status_code', '')} {http_exc} {body_preview}"),
             )
             return ""
         msg = r.json()["choices"][0]["message"]

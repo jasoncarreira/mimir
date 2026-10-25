@@ -265,10 +265,10 @@ _DEFAULTS = {
     # set [llm] and skip the per-subsystem llm_url/llm_model/api_key_env.
     "llm": {
         "url": "https://api.openai.com/v1/chat/completions",
-        "model": "gpt-5.4-nano",
+        "model": "gpt-6-luna",
         "api_key_env": "OPENAI_API_KEY",
         "timeout_seconds": 30,
-        "reasoning_effort": "",
+        "reasoning_effort": "low",
     },
     "annotation": {
         # Per-subsystem overrides; if absent, [llm] is used.
@@ -655,11 +655,11 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
         # [llm] when these are absent). Used by HyDE / contextual rewrite
         # to point at a faster/cheaper model than the bench's main LLM.
         "llm_url", "llm_model", "api_key_env", "timeout_seconds",
-        "reasoning_effort",
+        "reasoning_effort", "sampling",
     },
     "consolidation": {
         "enabled", "enable_llm", "llm_url", "llm_model",
-        "timeout_seconds", "api_key_env", "reasoning_effort",
+        "timeout_seconds", "api_key_env", "reasoning_effort", "sampling",
     },
     "embedding": {
         "max_chars", "dimensions",
@@ -671,15 +671,15 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
     },
     "triples": {
         "enable_extraction", "llm_url", "llm_model", "api_key_env",
-        "timeout_seconds", "reasoning_effort",
+        "timeout_seconds", "reasoning_effort", "sampling",
     },
     "annotation": {
-        "use_llm", "llm_url", "llm_model", "api_key_env", "reasoning_effort",
+        "use_llm", "llm_url", "llm_model", "api_key_env", "reasoning_effort", "sampling",
     },
-    "llm": {"provider"},  # resolve_llm_config supplies its runtime default.
+    "llm": {"provider", "sampling"},  # resolve_llm_config supplies runtime defaults.
     "compression": {
         "api_key_env", "llm_url", "llm_model", "timeout_seconds",
-        "reasoning_effort",
+        "reasoning_effort", "sampling",
     },
     "decay": {
         "enabled",
@@ -869,7 +869,7 @@ def resolve_llm_config(subsystem: str) -> dict:
 
     Returns:
         Resolved endpoint, model, authentication, timeout, provider, and
-        reasoning-effort values.
+        reasoning-effort and sampling values.
     """
     cfg = get_config()
 
@@ -895,7 +895,7 @@ def resolve_llm_config(subsystem: str) -> dict:
         return default
 
     url = _resolve('url', 'url', 'https://api.openai.com/v1/chat/completions')
-    model = _resolve('model', 'model', 'gpt-5.4-nano')
+    model = _resolve('model', 'model', 'gpt-6-luna')
     timeout = (
         cfg(subsystem, 'timeout_seconds', None)
         or cfg('llm', 'timeout_seconds', None)
@@ -930,11 +930,32 @@ def resolve_llm_config(subsystem: str) -> dict:
     if provider == 'anthropic' and not api_key:
         api_key = os.environ.get('ANTHROPIC_API_KEY', '') or api_key
 
-    reasoning_effort = (
-        cfg(subsystem, 'reasoning_effort', None)
-        or cfg('llm', 'reasoning_effort', None)
-        or ''
+    # The built-in low effort belongs to the built-in model only. A pre-existing
+    # operator config that chooses a provider/model/endpoint without specifying
+    # effort must retain its previous request body (including temperature).
+    operator_llm = any(
+        was_set_in_toml(section, key)
+        for section, keys in (
+            ('llm', ('provider', 'model', 'url', 'api_key_env', 'timeout_seconds')),
+            (subsystem, ('provider', 'llm_model', 'llm_url', 'rerank_model',
+                         'synthesis_model', 'api_key_env', 'timeout_seconds')),
+        )
+        for key in keys
     )
+    subsystem_effort = cfg(subsystem, 'reasoning_effort', None)
+    if subsystem_effort is not None:
+        reasoning_effort = subsystem_effort
+    elif was_set_in_toml('llm', 'reasoning_effort'):
+        reasoning_effort = cfg('llm', 'reasoning_effort', None)
+    else:
+        reasoning_effort = None if operator_llm else cfg('llm', 'reasoning_effort', None)
+    sampling = cfg(subsystem, 'sampling', None)
+    if sampling is None:
+        sampling = cfg('llm', 'sampling', None)
+    if sampling is None:
+        sampling = 'default' if reasoning_effort else 'custom'
+    if sampling not in ('default', 'custom'):
+        raise ValueError(f"Invalid saga [llm] sampling {sampling!r}; choose 'default' or 'custom'")
 
     return {
         "url": url,
@@ -944,6 +965,7 @@ def resolve_llm_config(subsystem: str) -> dict:
         "timeout": int(timeout),
         "provider": str(provider),
         "reasoning_effort": str(reasoning_effort) if reasoning_effort else None,
+        "sampling": sampling,
     }
 
 

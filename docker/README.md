@@ -47,8 +47,10 @@ build HOME is removed even when a probe fails. The static version floor is 2.102
 Core-only images do not download or install gh. `mimir cultivate setup` passes
 `MIMIR_EXTRAS=<provider>,mcp,local-embeddings` to the root build, including its
 saved `build.sh`. The extra installs CPU-only torch wheels from the PyTorch CPU
-index in the controller and executor environments; the provision container
-prefetches voyage-4-nano to the shared persistent Hugging Face cache.
+index in the controller environment; the provision container prefetches
+voyage-4-nano to the shared persistent Hugging Face cache. The separate
+Worklink executor venv strips `local-embeddings` from its extras: it runs
+`worker_exec`, not the embedding provider, and does not install torch.
 
 The Cultivate image also ships `/usr/local/bin/chainlink` for Worklink claims,
 continuation, and the ready-queue poller. It is built from
