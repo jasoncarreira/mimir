@@ -894,7 +894,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         candidates = discover_plugins(enable=selection)
         owners = [candidate for candidate in candidates
                   if candidate.diagnostic is None and candidate.manifest is not None
-                  and words[0] in candidate.manifest.cli_commands]
+                  and words[0] in (candidate.manifest.cli_commands or {})]
         if len(owners) > 1:
             parser.error(f"CLI command {words[0]!r} is claimed by multiple installed plugins")
         if owners:
@@ -918,7 +918,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             # selection hint without loading any disabled provider, even on a
             # misspelled word. Never guess which provider owns the word.
             unselected = [candidate.name for candidate in candidates
-                          if not candidate.enabled and candidate.diagnostic is None]
+                          if not candidate.enabled and candidate.diagnostic is None
+                          and candidate.manifest is not None
+                          and candidate.manifest.cli_commands is None]
             if unselected:
                 hints = ", ".join(f"MIMIR_PLUGINS={name}" for name in unselected)
                 parser.error(f"unknown command {words[0]!r}; installed unselected plugins: "

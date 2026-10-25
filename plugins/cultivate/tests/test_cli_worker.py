@@ -15,6 +15,61 @@ from mimir.plugins.manager import load_plugins
 from mimir_cultivate import commands
 
 
+def test_installed_cli_manifest_matches_live_cultivate_registration() -> None:
+    from mimir.plugins.discovery import discover_plugins
+
+    candidate, = (item for item in discover_plugins(enable="") if item.name == "cultivate")
+    assert candidate.diagnostic is None
+    assert candidate.manifest is not None
+    assert candidate.manifest.cli_commands is not None
+    policy = load_plugins(enable="cultivate").policy
+    registered = {name: command.operator for name, command in policy.cli_commands.items()
+                  if command.owner == "cultivate"}
+    assert dict(candidate.manifest.cli_commands) == registered
+
+
+def test_unselected_cultivate_setup_cli_child_process() -> None:
+    # This suite requires the installed workspace provider. Core-only CI must
+    # not depend on it, but selected CI executes this real discovery/dispatch path.
+    env = dict(os.environ)
+    env.pop("MIMIR_PLUGINS", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "mimir.cli", "cultivate", "setup", "--help"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--accept-license" in result.stdout
+    script = """
+import mimir.cli
+import mimir_cultivate.setup as installer
+installer.setup = lambda args: print('SETUP_DISPATCHED:' + args.repo)
+mimir.cli.main(['cultivate', 'setup', '--repo', 'owner/project'])
+"""
+    result = subprocess.run([sys.executable, "-c", script], env=env,
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "SETUP_DISPATCHED:owner/project"
+
+
+def test_unselected_non_operator_command_explains_selection(monkeypatch, capsys) -> None:
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "--help"])
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "plugin 'cultivate'" in error
+    assert "MIMIR_PLUGINS=cultivate" in error
+    assert "invalid choice" not in error
+
+
+def test_plugins_list_shows_installed_commands_without_selection(monkeypatch, capsys) -> None:
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    main(["plugins", "list"])
+    output = capsys.readouterr().out
+    assert "mimir cultivate — operator" in output
+    assert "mimir worklink — requires MIMIR_PLUGINS=cultivate" in output
+
+
 def test_selected_cli_registers_both_commands() -> None:
     policy = load_plugins(enable="cultivate").policy
     assert set(policy.cli_commands) >= {"worklink", "opencode-bootstrap"}

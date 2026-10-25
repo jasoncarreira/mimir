@@ -94,6 +94,8 @@ def test_manifest_validates_required_fields_and_reserved_keys():
 
 
 def test_manifest_declares_inert_cli_operator_flags():
+    assert parse_manifest(_toml(), entry_name="alpha").cli_commands is None
+    assert dict(parse_manifest(_toml() + b"[cli]\n", entry_name="alpha").cli_commands) == {}
     manifest = parse_manifest(_toml() + b"[cli]\nalpha-setup = true\nalpha-work = false\n",
                               entry_name="alpha")
     assert dict(manifest.cli_commands) == {"alpha-setup": True, "alpha-work": False}

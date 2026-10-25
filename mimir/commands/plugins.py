@@ -64,6 +64,6 @@ def dispatch(args: argparse.Namespace, plugins_p: argparse.ArgumentParser) -> in
             if row["diagnostic"]:
                 print(f"  diagnostic: {row['diagnostic']}")
             manifest = getattr(candidate, "manifest", None)
-            for command, operator in getattr(manifest, "cli_commands", {}).items():
+            for command, operator in (getattr(manifest, "cli_commands", None) or {}).items():
                 print(f"  mimir {command} — {'operator' if operator else 'requires MIMIR_PLUGINS=' + candidate.name}")
     return 0

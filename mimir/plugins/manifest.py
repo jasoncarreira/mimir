@@ -57,7 +57,8 @@ class PluginManifest:
     defaults: Mapping[str, Any] = field(default_factory=dict)
     config: Mapping[str, Any] = field(default_factory=dict)
     optional_skills: tuple[tuple[str, str | None], ...] = ()
-    cli_commands: Mapping[str, bool] = field(default_factory=dict)
+    # None means legacy metadata; an empty table explicitly advertises no commands.
+    cli_commands: Mapping[str, bool] | None = None
 
 
 def _resource(value: str, *, key: str, root: Path | None, files: frozenset[Path] | None,
@@ -325,4 +326,4 @@ def parse_manifest(data: bytes, *, entry_name: str, resource_root: Path | None =
     return PluginManifest(*(raw[key] for key in ("name", "version", "license", "requires_mimir")),
                            MappingProxyType(docker), themes, tuple(skin_defaults), MappingProxyType(frontend),
                             MappingProxyType(defaults), MappingProxyType(config), tuple(optional_skills),
-                            MappingProxyType(cli))
+                            MappingProxyType(cli) if "cli" in raw else None)

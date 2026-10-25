@@ -120,48 +120,21 @@ assert 'poison_provider' not in sys.modules
     assert result.returncode == 0, result.stderr
 
 
-def test_unselected_cultivate_setup_cli_child_process():
-    # Exercise the installed distribution and entry point, not an in-process
-    # monkeypatch whose ambient selection could hide the regression.
-    env = dict(os.environ)
-    env.pop("MIMIR_PLUGINS", None)
-    result = subprocess.run(
-        [sys.executable, "-m", "mimir.cli", "cultivate", "setup", "--help"],
-        env=env, capture_output=True, text=True, check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "--accept-license" in result.stdout
-    # Follow the normal CLI dispatch with an injected external-effect boundary;
-    # installer integration (license, build, verification) is covered in test_setup.
-    script = """
-import mimir.cli
-import mimir_cultivate.setup as installer
-installer.setup = lambda args: print('SETUP_DISPATCHED:' + args.repo)
-mimir.cli.main(['cultivate', 'setup', '--repo', 'owner/project'])
-"""
-    result = subprocess.run([sys.executable, "-c", script], env=env,
-                            capture_output=True, text=True, check=False)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "SETUP_DISPATCHED:owner/project"
-
-
 def test_unselected_non_operator_command_explains_selection(monkeypatch, capsys):
+    from mimir.plugins import discovery
+
     monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.setattr(discovery, "discover_plugins", lambda *, enable: (
+        SimpleNamespace(name="alpha", diagnostic=None,
+                        manifest=SimpleNamespace(cli_commands={"alpha-work": False})),
+    ))
     with pytest.raises(SystemExit) as exc:
-        cli.main(["worklink", "--help"])
+        cli.main(["alpha-work", "--help"])
     assert exc.value.code == 2
     error = capsys.readouterr().err
-    assert "plugin 'cultivate'" in error
-    assert "MIMIR_PLUGINS=cultivate" in error
+    assert "plugin 'alpha'" in error
+    assert "MIMIR_PLUGINS=alpha" in error
     assert "invalid choice" not in error
-
-
-def test_plugins_list_shows_installed_commands_without_selection(monkeypatch, capsys):
-    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
-    cli.main(["plugins", "list"])
-    output = capsys.readouterr().out
-    assert "mimir cultivate — operator" in output
-    assert "mimir worklink — requires MIMIR_PLUGINS=cultivate" in output
 
 
 def test_help_points_to_installed_plugin_inventory(monkeypatch, capsys):
@@ -212,7 +185,7 @@ def test_legacy_unselected_command_explains_selection(monkeypatch, capsys):
     monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
     monkeypatch.setattr(discovery, "discover_plugins", lambda *, enable: (
         SimpleNamespace(name="legacy", enabled=False, diagnostic=None,
-                        manifest=SimpleNamespace(cli_commands={})),
+                        manifest=SimpleNamespace(cli_commands=None)),
     ))
     with pytest.raises(SystemExit) as exc:
         cli.main(["legacy-hello", "--help"])
@@ -220,6 +193,40 @@ def test_legacy_unselected_command_explains_selection(monkeypatch, capsys):
     error = capsys.readouterr().err
     assert "MIMIR_PLUGINS=legacy" in error
     assert "invalid choice" not in error
+
+
+@pytest.mark.parametrize("declared", [{}, {"alpha-work": False}])
+def test_declared_cli_unknown_command_does_not_suggest_selection(monkeypatch, capsys, declared):
+    from mimir.plugins import discovery, manager
+
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.setattr(discovery, "discover_plugins", lambda *, enable: (
+        SimpleNamespace(name="alpha", enabled=False, diagnostic=None,
+                        manifest=SimpleNamespace(cli_commands=declared)),
+    ))
+    monkeypatch.setattr(manager, "load_plugins", lambda **kwargs: pytest.fail("provider loaded"))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["bogus"])
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "invalid choice" in error
+    assert "MIMIR_PLUGINS=alpha" not in error
+
+
+def test_plugins_list_shows_declared_commands_without_loading_provider(monkeypatch, capsys):
+    from mimir.commands import plugins
+
+    candidate = _candidate("alpha")
+    candidate.manifest = SimpleNamespace(cli_commands={"alpha-setup": True, "alpha-work": False})
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.setattr(plugins, "discover_plugins", lambda *, enable: (candidate,))
+    cli.main(["plugins", "list"])
+    output = capsys.readouterr().out
+    assert "mimir alpha-setup — operator" in output
+    assert "mimir alpha-work — requires MIMIR_PLUGINS=alpha" in output
+    candidate.manifest.cli_commands = None
+    cli.main(["plugins", "list"])
+    assert "mimir alpha" not in capsys.readouterr().out
 
 
 def test_unselected_run_help_never_imports_provider():
