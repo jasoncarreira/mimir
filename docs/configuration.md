@@ -258,10 +258,12 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `SAGA_QUIET_CONFIG` | bool (`1`) | off | Suppress the "no `saga.toml` found, using defaults" startup log. |
 | `SAGA_PERSISTENT_CLAUDE_POOL_SIZE` | int (≥1) | SAGA default | Size of SAGA's persistent Claude-Code client pool (only relevant when SAGA's LLM `provider = "claude_code"`). |
 | `SAGA_PERSISTENT_CLAUDE_RECYCLE` | int (≥1) | SAGA default | Recycle a pooled SAGA Claude-Code client after this many calls. |
+| `FASTEMBED_CACHE_PATH` | path | unset | Explicit directory for Saga's local ONNX/fastembed model cache. Takes precedence over `XDG_CACHE_HOME`; created on first model load. |
+| `XDG_CACHE_HOME` | path | unset | When no `FASTEMBED_CACHE_PATH` is set, Saga caches the local model under `$XDG_CACHE_HOME/fastembed` (otherwise `~/.cache/fastembed`). Unwritable cache directories fall back to the temporary fastembed cache with a warning. |
 
 > SAGA's substantive dials (retrieval, consolidation, embeddings, LLM provider)
-> live in `<MIMIR_HOME>/saga.toml`. The variables above only locate that file and
-> tune the (opt-in) persistent Claude-Code pool.
+> live in `<MIMIR_HOME>/saga.toml`. These variables locate that file, set the
+> local model cache path, and tune the (opt-in) persistent Claude-Code pool.
 
 ## Web server & auth
 

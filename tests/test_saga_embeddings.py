@@ -7,12 +7,85 @@ import os
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from mimir.saga import embeddings
+
+
+@pytest.fixture
+def recorded_onnx(monkeypatch):
+    calls = []
+
+    def text_embedding(**kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(TextEmbedding=text_embedding))
+    return calls
+
+
+@pytest.mark.parametrize("fastembed,xdg,expected", [
+    ("custom/onnx", "xdg", "custom/onnx"),
+    (None, "xdg", "xdg/fastembed"),
+    (None, None, "home/.cache/fastembed"),
+])
+def test_onnx_cache_resolution_is_lazy(tmp_path, monkeypatch, recorded_onnx,
+                                       fastembed, xdg, expected):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for key, value in (("FASTEMBED_CACHE_PATH", fastembed), ("XDG_CACHE_HOME", xdg)):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, str(tmp_path / value))
+    cache = tmp_path / expected
+    provider = embeddings.ONNXProvider(model_name="BAAI/bge-small-en-v1.5")
+    assert not cache.exists()
+    assert not recorded_onnx
+
+    provider._load()
+    assert cache.is_dir()
+    assert recorded_onnx == [{"model_name": "BAAI/bge-small-en-v1.5",
+                              "cache_dir": str(cache)}]
+    assert provider._load() is provider._model
+    assert len(recorded_onnx) == 1
+
+
+@pytest.mark.parametrize("failure", ["mkdir", "write"])
+def test_onnx_unwritable_cache_warns_once_and_uses_temp(tmp_path, monkeypatch,
+                                                         recorded_onnx, caplog, failure):
+    cache = tmp_path / "persistent" / "fastembed"
+    monkeypatch.setenv("FASTEMBED_CACHE_PATH", str(cache))
+    monkeypatch.setattr(embeddings.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+    if failure == "mkdir":
+        original_mkdir = Path.mkdir
+
+        def mkdir(path, *args, **kwargs):
+            if path == cache:
+                raise PermissionError("read-only volume")
+            return original_mkdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", mkdir)
+    else:
+        original_probe = embeddings.tempfile.TemporaryFile
+
+        def probe(*args, **kwargs):
+            if kwargs.get("dir") == cache:
+                raise PermissionError("read-only existing cache")
+            return original_probe(*args, **kwargs)
+
+        monkeypatch.setattr(embeddings.tempfile, "TemporaryFile", probe)
+
+    provider = embeddings.ONNXProvider()
+    with caplog.at_level("WARNING", logger=embeddings.__name__):
+        provider._load()
+        provider._load()
+    assert recorded_onnx == [{"model_name": provider.model_name,
+                              "cache_dir": str(tmp_path / "tmp" / "fastembed_cache")}]
+    assert len([record for record in caplog.records if "unwritable" in record.message]) == 1
 
 
 @pytest.fixture(params=["onnx", "local"])
