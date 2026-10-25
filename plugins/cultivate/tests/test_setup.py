@@ -597,12 +597,31 @@ def test_local_prefetch_and_agent_share_persistent_cache(tmp_path, monkeypatch):
     manifest.write_text(json.dumps({"saga_model_spec": "openai:gpt-5.4-nano",
                                     "embedding": "local", "reembed": False}))
     prefetches = []
+    resolutions = []
+
+    class LocalEntryNotFoundError(Exception):
+        pass
+
+    def snapshot_download(model_name, *, revision, local_files_only):
+        cache = Path(os.environ["XDG_CACHE_HOME"]) / "huggingface"
+        snapshot = cache / "hub" / ("models--" + model_name.replace("/", "--")) / "snapshots" / revision
+        resolutions.append((model_name, revision, local_files_only, cache))
+        if not snapshot.is_dir():
+            raise LocalEntryNotFoundError("cold cache")
+        return str(snapshot)
+
     def load(model_name, **kwargs):
         cache = Path(os.environ["XDG_CACHE_HOME"]) / "huggingface"
-        cache.mkdir(parents=True, exist_ok=True)
+        if model_name == installer.LOCAL_MODEL:
+            snapshot = cache / "hub" / ("models--" + model_name.replace("/", "--")) / "snapshots" / kwargs["revision"]
+            snapshot.mkdir(parents=True, exist_ok=True)
+        else:
+            assert Path(model_name).is_dir()
         prefetches.append((model_name, kwargs, cache))
         return object()
 
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=snapshot_download))
+    monkeypatch.setitem(sys.modules, "huggingface_hub.errors", SimpleNamespace(LocalEntryNotFoundError=LocalEntryNotFoundError))
     monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=load))
     monkeypatch.delenv("FASTEMBED_CACHE_PATH", raising=False)
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
@@ -616,7 +635,7 @@ def test_local_prefetch_and_agent_share_persistent_cache(tmp_path, monkeypatch):
     assert cache.is_dir()
     expected = (installer.LOCAL_MODEL,
                 {"device": "cpu", "trust_remote_code": True,
-                 "revision": REMOTE_CODE_REVISIONS[installer.LOCAL_MODEL], "local_files_only": True},
+                 "revision": REMOTE_CODE_REVISIONS[installer.LOCAL_MODEL]},
                 cache)
     assert prefetches == [expected]
     # Match the agent's generated environment as well as the provision preamble.
@@ -624,7 +643,10 @@ def test_local_prefetch_and_agent_share_persistent_cache(tmp_path, monkeypatch):
         "/home/mimir", str(container_home)))
     runtime = LocalProvider(model_name=installer.LOCAL_MODEL, dimensions=1024)
     runtime._load_model()
-    assert prefetches == [expected] * 2
+    revision = REMOTE_CODE_REVISIONS[installer.LOCAL_MODEL]
+    snapshot = cache / "hub" / "models--voyageai--voyage-4-nano" / "snapshots" / revision
+    assert prefetches == [expected, (str(snapshot), {"device": "cpu", "trust_remote_code": True}, cache)]
+    assert resolutions == [(installer.LOCAL_MODEL, revision, True, cache)] * 2
 
 
 def test_existing_vectors_require_explicit_reembed(tmp_path):

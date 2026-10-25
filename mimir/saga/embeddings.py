@@ -197,17 +197,24 @@ class LocalProvider(EmbeddingProvider):
                     "sentence-transformers not installed. Install mimir-agent[local-embeddings]."
                 ) from exc
             options = {'device': self.device}
+            model_path = self.model_name
             if self.model_name in REMOTE_CODE_REVISIONS:
+                from huggingface_hub import snapshot_download
+                from huggingface_hub.errors import LocalEntryNotFoundError
+
                 options['trust_remote_code'] = True
-                options['revision'] = _cfg('embedding', 'revision', None) or REMOTE_CODE_REVISIONS[self.model_name]
-            try:
-                # A cached pinned snapshot must load without probing the Hub.
-                # In particular, transformers' processor probe does not always
-                # fall back correctly when the network is unavailable.
-                self._model = SentenceTransformer(self.model_name, local_files_only=True, **options)
-            except Exception:
-                # A cold or incomplete cache still needs the normal Hub load.
-                self._model = SentenceTransformer(self.model_name, **options)
+                revision = _cfg('embedding', 'revision', None) or REMOTE_CODE_REVISIONS[self.model_name]
+                try:
+                    # Resolve the exact cached commit to a local path: the
+                    # processor probe can still consult the Hub for repo IDs.
+                    model_path = snapshot_download(
+                        self.model_name, revision=revision, local_files_only=True,
+                    )
+                except LocalEntryNotFoundError:
+                    # Only a missing snapshot permits a network load. Real
+                    # resolution and model-loading errors must propagate.
+                    options['revision'] = revision
+            self._model = SentenceTransformer(model_path, **options)
         return self._model
 
     def embed(self, text: str, input_type: str = "passage") -> list[float]:

@@ -17,7 +17,21 @@ from mimir.saga import embeddings
 
 
 @pytest.fixture
-def local_stub(monkeypatch):
+def hub_stub(monkeypatch):
+    class LocalEntryNotFoundError(Exception):
+        pass
+
+    hub = SimpleNamespace(
+        snapshot_download=Mock(return_value="/cached/snapshots/5fb34e870f49f19e79c94d5e118f5ee730133279"),
+        LocalEntryNotFoundError=LocalEntryNotFoundError,
+    )
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    monkeypatch.setitem(sys.modules, "huggingface_hub.errors", hub)
+    return hub
+
+
+@pytest.fixture
+def local_stub(monkeypatch, hub_stub):
     settings = {"model": "voyageai/voyage-4-nano", "dimensions": 1024}
     monkeypatch.setattr(embeddings, "_cfg", lambda section, key, default=None: settings.get(key, default))
     model = SimpleNamespace(prompts={"query": "q", "document": "d"},
@@ -29,7 +43,7 @@ def local_stub(monkeypatch):
     return settings, model, constructor
 
 
-def test_local_nano_lazy_pinned_prompt_routing_and_normalization(local_stub):
+def test_local_nano_lazy_pinned_prompt_routing_and_normalization(local_stub, hub_stub):
     settings, model, constructor = local_stub
     provider = embeddings.LocalProvider()
     assert provider.dimensions() == 1024
@@ -40,13 +54,18 @@ def test_local_nano_lazy_pinned_prompt_routing_and_normalization(local_stub):
     model.encode_document.assert_called_once_with("a document", truncate_dim=1024)
     assert provider.embed("other", input_type="anything") == [0.0, 1.0]
     model.encode.assert_not_called()
-    constructor.assert_called_once_with(
-        "voyageai/voyage-4-nano", device="cpu", trust_remote_code=True,
+    hub_stub.snapshot_download.assert_called_once_with(
+        "voyageai/voyage-4-nano",
         revision="5fb34e870f49f19e79c94d5e118f5ee730133279", local_files_only=True,
     )
+    constructor.assert_called_once_with(
+        hub_stub.snapshot_download.return_value, device="cpu", trust_remote_code=True,
+    )
     settings["revision"] = "a" * 40
+    hub_stub.snapshot_download.return_value = "/cached/snapshots/" + "a" * 40
     embeddings.LocalProvider().embed("override")
-    assert constructor.call_args.kwargs["revision"] == "a" * 40
+    assert hub_stub.snapshot_download.call_args.kwargs["revision"] == "a" * 40
+    assert constructor.call_args.args == ("/cached/snapshots/" + "a" * 40,)
 
 
 @pytest.mark.parametrize("dim", [2048, 1024, 512, 256])
@@ -66,7 +85,7 @@ def test_nano_rejects_unsupported_dimensions_at_construction(local_stub, dim):
     constructor.assert_not_called()
 
 
-def test_non_allowlisted_model_cannot_load_remote_code_or_override_revision(local_stub):
+def test_non_allowlisted_model_cannot_load_remote_code_or_override_revision(local_stub, hub_stub):
     settings, model, constructor = local_stub
     settings.update(model="example/other", revision="a" * 40, dimensions=384, device="cuda")
     model.prompts = {}
@@ -74,32 +93,73 @@ def test_non_allowlisted_model_cannot_load_remote_code_or_override_revision(loca
     assert provider.dimensions() == 384
     assert provider.embed("ordinary", input_type="query") == [1.0, 0.0]
     model.encode.assert_called_once_with("ordinary", truncate_dim=384)
-    constructor.assert_called_once_with("example/other", device="cuda", local_files_only=True)
+    constructor.assert_called_once_with("example/other", device="cuda")
+    hub_stub.snapshot_download.assert_not_called()
 
 
-def test_local_load_tries_cache_before_network_and_reuses_success(local_stub):
+def test_local_load_uses_snapshot_path_and_reuses_success(local_stub, hub_stub):
     _, model, constructor = local_stub
-    constructor.side_effect = [ValueError("snapshot not cached"), model]
     provider = embeddings.LocalProvider()
     assert provider._load_model() is model
     assert provider._load_model() is model
-    options = dict(device="cpu", trust_remote_code=True,
-                   revision="5fb34e870f49f19e79c94d5e118f5ee730133279")
-    assert constructor.call_args_list == [
-        call("voyageai/voyage-4-nano", local_files_only=True, **options),
-        call("voyageai/voyage-4-nano", **options),
-    ]
+    hub_stub.snapshot_download.assert_called_once_with(
+        provider.model_name, revision=embeddings.REMOTE_CODE_REVISIONS[provider.model_name],
+        local_files_only=True,
+    )
+    constructor.assert_called_once_with(
+        hub_stub.snapshot_download.return_value, device="cpu", trust_remote_code=True,
+    )
 
 
-def test_local_load_propagates_network_failure_without_caching(local_stub):
+@pytest.mark.parametrize("override", [None, "a" * 40])
+def test_local_cache_miss_loads_hub_with_exact_revision(local_stub, hub_stub, override):
+    settings, model, constructor = local_stub
+    settings["revision"] = override
+    hub_stub.snapshot_download.side_effect = hub_stub.LocalEntryNotFoundError("not cached")
+    provider = embeddings.LocalProvider()
+    assert provider._load_model() is model
+    revision = override or embeddings.REMOTE_CODE_REVISIONS[provider.model_name]
+    hub_stub.snapshot_download.assert_called_once_with(
+        provider.model_name, revision=revision, local_files_only=True,
+    )
+    constructor.assert_called_once_with(
+        provider.model_name, device="cpu", trust_remote_code=True, revision=revision,
+    )
+
+
+@pytest.mark.parametrize("stage", ["snapshot", "model"])
+def test_local_real_load_errors_propagate_without_network_retry(local_stub, hub_stub, stage):
+    _, _, constructor = local_stub
+    failure = ValueError("real load failure")
+    target = hub_stub.snapshot_download if stage == "snapshot" else constructor
+    target.side_effect = failure
+    provider = embeddings.LocalProvider()
+    with pytest.raises(ValueError, match="real load failure") as caught:
+        provider._load_model()
+    assert caught.value is failure
+    assert provider._model is None
+    hub_stub.snapshot_download.assert_called_once()
+    if stage == "snapshot":
+        constructor.assert_not_called()
+    else:
+        constructor.assert_called_once_with(
+            hub_stub.snapshot_download.return_value, device="cpu", trust_remote_code=True,
+        )
+
+
+def test_local_load_propagates_network_failure_without_caching(local_stub, hub_stub):
     _, model, constructor = local_stub
-    constructor.side_effect = [OSError("cache miss"), OSError("network down"), model]
+    hub_stub.snapshot_download.side_effect = hub_stub.LocalEntryNotFoundError("not cached")
+    constructor.side_effect = [OSError("network down"), model]
     provider = embeddings.LocalProvider()
     with pytest.raises(OSError, match="network down"):
         provider._load_model()
     assert provider._model is None
     assert provider._load_model() is model
-    assert [c.kwargs.get("local_files_only", False) for c in constructor.call_args_list] == [True, False, True]
+    assert constructor.call_args_list == [
+        call(provider.model_name, device="cpu", trust_remote_code=True,
+             revision=embeddings.REMOTE_CODE_REVISIONS[provider.model_name]),
+    ] * 2
 
 
 def test_missing_local_extra_names_install_command(monkeypatch):
@@ -183,7 +243,7 @@ def test_onnx_unwritable_cache_warns_once_and_uses_temp(tmp_path, monkeypatch,
 
 
 @pytest.fixture(params=["onnx", "local"])
-def provider_and_constructor(request, monkeypatch):
+def provider_and_constructor(request, monkeypatch, hub_stub):
     monkeypatch.setattr(embeddings, "_cfg", lambda section, key, default=None: default)
     vector = SimpleNamespace(tolist=lambda: [0.6, 0.8])
     model = SimpleNamespace(
