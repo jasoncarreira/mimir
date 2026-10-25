@@ -28,6 +28,8 @@ import urllib.request
 
 import yaml
 
+from mimir._reasoning_effort import validate_effort
+
 from .repository import valid_repository_slug
 
 
@@ -35,7 +37,8 @@ from .repository import valid_repository_slug
 DEFAULT_SOURCE_REPO = "jasoncarreira/mimir"
 DEFAULT_NEXTEST_VERSION = "0.9.148"
 DEFAULT_UV_VERSION = "0.11.0"
-DEFAULT_SAGA_MODELS = {"openai": "gpt-5.4-nano", "anthropic": "claude-haiku-5-5"}
+DEFAULT_SAGA_MODELS = {"openai": "gpt-6-luna", "anthropic": "claude-haiku-5-5"}
+DEFAULT_SAGA_EFFORT = "low"
 LOCAL_MODEL = "BAAI/bge-small-en-v1.5"
 EMBEDDING_MODELS = {"local": ("onnx", LOCAL_MODEL, 384, None),
                     "openai": ("openai", "text-embedding-3-small", 1536, "OPENAI_API_KEY"),
@@ -123,8 +126,16 @@ def validate(name: str, value: str) -> str:
         ok = bool(_EMAIL.fullmatch(value))
     elif name == "branch":
         ok = bool(_BRANCH.fullmatch(value)) and ".." not in value and "//" not in value and not value.endswith("/")
-    elif name in {"model_spec", "saga_model_spec"}:
+    elif name == "model_spec":
         ok = bool(re.fullmatch(r"(openai|anthropic):[A-Za-z0-9_.-]+", value))
+    elif name == "saga_model_spec":
+        ok = bool(re.fullmatch(r"(openai|anthropic):[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?", value))
+        if ok and value.count(":") == 2:
+            provider, _, effort = value.split(":")
+            try:
+                validate_effort(provider, effort)
+            except ValueError as exc:
+                raise SetupError(f"Invalid saga model spec: {exc}") from None
     elif name == "embedding":
         ok = value == "local" or bool(re.fullmatch(r"(openai|voyage):[A-Za-z0-9_.-]+", value))
     elif name == "test_command":
@@ -379,11 +390,15 @@ def _env(deploy: Path, updates: dict[str, str]) -> str:
 
 
 def _saga_settings(spec: str, embedding: str) -> dict[str, dict[str, object]]:
-    provider, model = spec.split(":", 1)
+    provider, model, *suffix = validate("saga_model_spec", spec).split(":")
+    effort = suffix[0] if suffix else (DEFAULT_SAGA_EFFORT if model == DEFAULT_SAGA_MODELS[provider] else None)
     kind, _, dim, key_env = EMBEDDING_MODELS[embedding.split(":", 1)[0]]
     embed_model = LOCAL_MODEL if embedding == "local" else embedding.split(":", 1)[1]
     llm: dict[str, object] = {"provider": "anthropic" if provider == "anthropic" else "openai_compat",
                               "model": model, "api_key_env": provider.upper() + "_API_KEY"}
+    if effort:
+        llm["reasoning_effort"] = effort
+        llm["sampling"] = "default"
     if provider == "openai":
         llm["url"] = "https://api.openai.com/v1/chat/completions"
     emb: dict[str, object] = {"provider": kind, "model": embed_model, "dimensions": dim}
@@ -552,7 +567,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("display-name", "Owner's human-readable name."),
         ("owner-email", "Owner's email identity."),
         ("model-spec", "provider:model (openai:... or anthropic:...)."),
-        ("saga-model-spec", "Fast/cheap memory model (openai:... or anthropic:...)."),
+        ("saga-model-spec", "Fast/cheap memory model (openai:model[:effort] or anthropic:model[:effort])."),
         ("embedding", "local, openai:model, or voyage:model (default: local)."),
         ("deploy", "Absolute deployment directory (default: ./cultivate-agent)."),
         ("port", "Free loopback port (default: next free from 8090)."),
@@ -606,9 +621,10 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     key_name = provider.upper() + "_API_KEY"
     model_key = _secret(args, "model_key", f"Model key: obtain it in your {provider} API console; input is hidden.", previous=prior.get(key_name))
     saga_spec = _field(args, "saga_model_spec",
-                       "Saga makes frequent, short, latency-sensitive memory calls; a faster, cheaper model is recommended. "
-                       f"Your agent's {spec} is also available if you prefer it.",
-                       default=provider + ":" + DEFAULT_SAGA_MODELS[provider])
+                        "Saga makes frequent, short, latency-sensitive memory calls; a faster, cheaper model is recommended. "
+                        f"Recommended: {provider}:{DEFAULT_SAGA_MODELS[provider]}:{DEFAULT_SAGA_EFFORT}. "
+                        f"Your agent's {spec} is also available if you prefer it.",
+                        default=provider + ":" + DEFAULT_SAGA_MODELS[provider] + ":" + DEFAULT_SAGA_EFFORT)
     saga_provider = saga_spec.split(":", 1)[0]
     saga_key_env = saga_provider.upper() + "_API_KEY"
     extra_keys = {}

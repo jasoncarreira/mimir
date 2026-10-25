@@ -243,6 +243,7 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     stdout, stderr = capsys.readouterr()
     if saga_spec is None:
         assert "faster, cheaper" in stdout and "openai:gpt-test" in stdout
+        assert "openai:gpt-6-luna:low" in stdout
     assert len(verified) == 2
     for secret in (github_secret, model_secret, "other-secret-test-2008", "owner-key-test-2008"):
         assert secret not in stdout + stderr + caplog.text
@@ -255,7 +256,7 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert ("VOYAGE_API_KEY=other-secret-test-2008" in env_text) == embedding.startswith("voyage:")
     assert ("ANTHROPIC_API_KEY=other-secret-test-2008" in env_text) == bool(saga_spec)
     saga = json.loads((deploy / "manifest.json").read_text())
-    assert saga["saga_model_spec"] == (saga_spec or "openai:" + installer.DEFAULT_SAGA_MODELS["openai"])
+    assert saga["saga_model_spec"] == (saga_spec or "openai:" + installer.DEFAULT_SAGA_MODELS["openai"] + ":low")
     assert saga["embedding"] == embedding
     assert saga["saga_model_spec"] != "openai:gpt-test"
     assert (deploy / "build.sh").stat().st_mode & 0o777 == 0o755
@@ -552,6 +553,11 @@ def test_saga_provisioning(tmp_path, spec, embedding, llm, provider, dim, key):
     parsed = tomllib.loads(text)
     assert parsed["llm"]["provider"] == llm
     assert parsed["llm"]["api_key_env"] == spec.split(":")[0].upper() + "_API_KEY"
+    if parsed["llm"]["model"] == installer.DEFAULT_SAGA_MODELS[spec.split(":")[0]]:
+        assert parsed["llm"]["reasoning_effort"] == "low"
+        assert parsed["llm"]["sampling"] == "default"
+    else:
+        assert "reasoning_effort" not in parsed["llm"]
     assert parsed["embedding"]["provider"] == provider
     assert parsed["embedding"]["dimensions"] == dim
     assert parsed["embedding"].get("api_key_env") == key
@@ -631,12 +637,62 @@ def test_prompts_recommend_fast_model_and_reuse_embedding_key(monkeypatch, capsy
     monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _: "")
     assert installer._field(args, "saga_model_spec", "Frequent short calls: faster, cheaper; agent openai:flagship is an alternative",
-                            default="openai:" + installer.DEFAULT_SAGA_MODELS["openai"]) == "openai:" + installer.DEFAULT_SAGA_MODELS["openai"]
+                             default="openai:" + installer.DEFAULT_SAGA_MODELS["openai"] + ":low") == "openai:gpt-6-luna:low"
     assert "faster, cheaper" in capsys.readouterr().out
 
 
 def test_default_saga_anthropic_model():
+    assert installer.DEFAULT_SAGA_MODELS["openai"] == "gpt-6-luna"
     assert installer.DEFAULT_SAGA_MODELS["anthropic"] == "claude-haiku-5-5"
+
+
+@pytest.mark.parametrize("provider,model", list(installer.DEFAULT_SAGA_MODELS.items()))
+def test_recommended_saga_spec_writes_effort_and_sampling(tmp_path, provider, model):
+    for spec in (f"{provider}:{model}", f"{provider}:{model}:low"):
+        home = tmp_path / ("suffix" if spec.endswith(":low") else "bare")
+        home.mkdir()
+        installer._provision_saga(home, spec, "local", prefetch=lambda: None)
+        llm = tomllib.loads((home / "saga.toml").read_text())["llm"]
+        assert llm["model"] == model
+        assert llm["reasoning_effort"] == "low"
+        assert llm["sampling"] == "default"
+
+
+@pytest.mark.parametrize("spec,effort", [
+    ("openai:other", None), ("openai:other:high", "high"),
+    ("anthropic:other", None), ("anthropic:other:xhigh", "xhigh"),
+])
+def test_saga_spec_optional_effort(spec, effort):
+    assert installer.validate("saga_model_spec", spec) == spec
+    llm = installer._saga_settings(spec, "local")["llm"]
+    assert llm.get("reasoning_effort") == effort
+    assert llm.get("sampling") == ("default" if effort else None)
+
+
+@pytest.mark.parametrize("spec", ["openai:gpt-6-luna:none", "anthropic:claude-haiku-5-5:minimal", "openai:m:", "openai:m:low:high"])
+def test_invalid_saga_effort_rejected_before_provision(spec, monkeypatch):
+    with pytest.raises(installer.SetupError, match="saga model spec"):
+        installer.validate("saga_model_spec", spec)
+
+
+def test_invalid_saga_effort_stops_setup_before_build(tmp_path, monkeypatch):
+    monkeypatch.setattr(installer, "_license_gate", lambda args: None)
+    monkeypatch.setattr(installer, "validate_token", lambda *a, **kw: None)
+    monkeypatch.setenv("MIMIR_CULTIVATE_GITHUB_TOKEN", "test-only")
+    monkeypatch.setenv("MIMIR_CULTIVATE_MODEL_KEY", "test-only")
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers(dest="command"))
+    deploy = tmp_path / "deploy"
+    args = parser.parse_args([
+        "cultivate", "setup", "--repo", "org/repo", "--bot-login", "bot",
+        "--bot-email", "bot@example.com", "--owner", "owner", "--display-name", "Owner",
+        "--owner-email", "owner@example.com", "--model-spec", "openai:agent",
+        "--saga-model-spec", "openai:gpt-6-luna:none", "--deploy", str(deploy),
+    ])
+    with pytest.raises(installer.SetupError, match="not valid for provider 'openai'"):
+        installer.setup(args, request=lambda *a: pytest.fail("requested remote before spec validation"),
+                        run=lambda *a, **kw: pytest.fail("built before spec validation"))
+    assert not deploy.exists()
 
 
 def test_embedding_key_distinction():
