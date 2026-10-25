@@ -60,9 +60,12 @@ same origin and base branch into the persistent Worklink volume at
 `/workspace/worklink/base/<repo-name>` and sets `WORKLINK_REPO` to that dedicated
 base. An existing base must be clean, on the declared branch and have the
 declared origin; reconcile a mismatch manually before retrying. The repository
-inventory keeps `/workspace/<repo-name>` as the working checkout; Worklink's
-repository selection and PR-completion checks recognize only its declared
-`worklink` volume's `base/<repo-name>` clone as the alternate base.
+inventory keeps `/workspace/<repo-name>` as the working checkout and explicitly
+sets `worklink_base: /workspace/worklink/base/<repo-name>` on that repository's
+`repositories.yaml` entry. Worklink's repository selection and PR-completion
+checks recognize only that exact alternate path, and only beneath a declared
+`rw` allowed root. Omitting `worklink_base` preserves working-checkout-only
+selection; directory names alone never confer trust.
 
 For unattended runs, use `--help` to see the corresponding flags or set
 `MIMIR_CULTIVATE_REPO`, `MIMIR_CULTIVATE_BRANCH`, `MIMIR_CULTIVATE_BOT_LOGIN`,
@@ -89,7 +92,7 @@ docker compose exec -w /home/mimir/agent agent chainlink issue label <issue-id> 
 ```
 
 Setup writes `<home>/worklink.yaml` from the repository inventory, selecting
-OpenCode and enabling autonomous local-subprocess dispatch. Reruns preserve an
+OpenCode, a 5400-second run timeout, and autonomous local-subprocess dispatch. Reruns preserve an
 operator-edited config; use `--force` to replace it intentionally. It then checks health, plugin
 selection, repository binding, poller scheduling, and a web-chat reply. Re-run
 the same command to repair missing provisioning without replacing operator

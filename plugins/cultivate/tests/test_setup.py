@@ -501,6 +501,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert (home / "owner-web-key").stat().st_mode & 0o777 == 0o600
     inventory = yaml.safe_load((home / "repositories.yaml").read_text())
     assert inventory["repositories"][0]["root"] == str(repo)
+    assert inventory["repositories"][0]["worklink_base"] == str(tmp_path / 'worklink/base/repo')
     assert inventory["repositories"][0]["origin"] == "https://github.com/org/repo.git"
     assert len(inventory["repositories"]) == 1
     assert {r["root"] for r in inventory["allowed_roots"]} == {"/workspace/pr-leases", "/workspace/worklink"}
@@ -532,6 +533,19 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     prior_inventory = (home / "repositories.yaml").read_bytes()
     prior_worklink = (home / 'worklink.yaml').read_bytes()
     prior_key = (home / "owner-web-key").read_bytes()
+    legacy = yaml.safe_load(prior_inventory)
+    del legacy['repositories'][0]['worklink_base']
+    (home / 'repositories.yaml').write_text(yaml.safe_dump(legacy, sort_keys=False))
+    exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+    assert (home / 'repositories.yaml').read_bytes() == prior_inventory
+    assert (home / 'worklink.yaml').read_bytes() == prior_worklink
+    explicit = yaml.safe_load(prior_inventory)
+    explicit['repositories'][0]['worklink_base'] = str(tmp_path / 'operator-base')
+    (home / 'repositories.yaml').write_text(yaml.safe_dump(explicit, sort_keys=False))
+    with pytest.raises(RuntimeError, match='existing repository declaration differs'):
+        exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+    assert yaml.safe_load((home / 'repositories.yaml').read_text()) == explicit
+    (home / 'repositories.yaml').write_bytes(prior_inventory)
     (repo / ".git").rmdir()
     with pytest.raises(subprocess.CalledProcessError):
         def fail_clone(argv, **kwargs):
@@ -606,6 +620,7 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch)
     assert config.defaults.base_branch == entry['base_branch']
     assert config.defaults.test_command == entry['test_command']
     assert config.defaults.backend == 'opencode'
+    assert config.defaults.timeout_s == 5400
     assert config.defaults.allow_autonomous_local_subprocess
     assert original_run(['git', '-C', str(base), 'status', '--porcelain'], capture_output=True,
                         text=True, check=True).stdout == ''
@@ -663,6 +678,26 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch)
         installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
 
 
+@pytest.mark.parametrize('relation', ['equal', 'nested', 'contains', 'lease'])
+def test_worklink_overlap_refused_before_side_effects(tmp_path, monkeypatch, relation):
+    checkout = tmp_path / 'checkout'
+    base = {'equal': checkout, 'nested': checkout / 'base',
+            'contains': tmp_path, 'lease': Path('/workspace/pr-leases/base')}[relation]
+    home = tmp_path / 'home'
+    home.mkdir()
+    before = tuple(tmp_path.iterdir())
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('overlapping base reached subprocess execution')
+
+    monkeypatch.setattr(subprocess, 'run', unexpected)
+    entry = {'origin': 'https://github.com/org/repo.git', 'base_branch': 'main'}
+    with pytest.raises(RuntimeError, match='overlaps the live checkout or lease root'):
+        installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=[])
+    assert tuple(tmp_path.iterdir()) == before
+    assert not list(home.iterdir())
+
+
 def test_dedicated_base_selection_requires_declared_persistent_root(tmp_path, monkeypatch):
     from mimir.plugins.manager import load_plugins
     from mimir_cultivate.repository import RepositoryInventory, dedicated_worklink_base
@@ -671,13 +706,18 @@ def test_dedicated_base_selection_requires_declared_persistent_root(tmp_path, mo
     home = tmp_path / 'home'
     home.mkdir()
     checkout = tmp_path / 'repo'
-    base = tmp_path / 'worklink/base/repo'
+    # Deliberately not the conventional worklink/base/<name> path: trust
+    # follows the explicit field, not a directory-naming convention.
+    base = tmp_path / 'worklink/declared-base'
+    conventional = tmp_path / 'worklink/base/repo'
+    monkeypatch.delenv('MIMIR_WORKLINK_REPO', raising=False)
     (home / 'worklink.yaml').write_text('repository: org/repo\n')
     inventory = home / 'repositories.yaml'
-    inventory.write_text(yaml.safe_dump({'repositories': [{
-        'slug': 'org/repo', 'root': str(checkout), 'mode': 'rw',
-        'origin': 'https://github.com/org/repo.git', 'base_branch': 'main',
-    }], 'allowed_roots': [{'root': str(tmp_path / 'worklink'), 'mode': 'rw'}]}))
+    entry = {'slug': 'org/repo', 'root': str(checkout), 'mode': 'rw',
+             'origin': 'https://github.com/org/repo.git', 'base_branch': 'main',
+             'worklink_base': str(base)}
+    inventory.write_text(yaml.safe_dump({'repositories': [entry],
+        'allowed_roots': [{'root': str(tmp_path / 'worklink'), 'mode': 'rw'}]}))
     declaration = RepositoryInventory.load(inventory)
     assert dedicated_worklink_base(declaration, declaration.repository('org/repo')) == base
     selection = load_plugins(enable='cultivate').policy.policy_consumer_hooks.repository_selection
@@ -700,21 +740,45 @@ def test_dedicated_base_selection_requires_declared_persistent_root(tmp_path, mo
     monkeypatch.setenv('WORKLINK_REPO', str(tmp_path / 'other'))
     with pytest.raises(RuntimeError, match='disagrees'):
         selection(home, declaration)
-    inventory.write_text(yaml.safe_dump({'repositories': [{
-        'slug': 'org/repo', 'root': str(checkout), 'mode': 'rw',
-        'origin': 'https://github.com/org/repo.git', 'base_branch': 'main',
-    }]}))
-    undeclared = RepositoryInventory.load(inventory)
-    monkeypatch.setenv('WORKLINK_REPO', str(base))
-    assert dedicated_worklink_base(undeclared, undeclared.repository('org/repo')) is None
+    monkeypatch.setenv('WORKLINK_REPO', str(conventional))
     with pytest.raises(RuntimeError, match='disagrees'):
-        selection(home, undeclared)
+        selection(home, declaration)
+    for roots in ([], [{'root': str(tmp_path / 'worklink'), 'mode': 'ro'}],
+                  [{'root': str(tmp_path / 'elsewhere'), 'mode': 'rw'}]):
+        inventory.write_text(yaml.safe_dump({'repositories': [entry], 'allowed_roots': roots}))
+        refused = RepositoryInventory.load(inventory)
+        monkeypatch.setenv('WORKLINK_REPO', str(base))
+        assert dedicated_worklink_base(refused, refused.repository('org/repo')) is None
+        with pytest.raises(RuntimeError, match='disagrees'):
+            selection(home, refused)
+        with pytest.raises(ClosureReadError, match='declared root'):
+            resolve_completion_repository(home, runner=git)
+    # No field preserves legacy selection, even if the conventional rw root exists.
+    entry.pop('worklink_base')
+    inventory.write_text(yaml.safe_dump({'repositories': [entry], 'allowed_roots': [
+        {'root': str(tmp_path / 'worklink'), 'mode': 'rw'}]}))
+    legacy = RepositoryInventory.load(inventory)
+    assert legacy.repository('org/repo').worklink_base is None
+    assert dedicated_worklink_base(legacy, legacy.repository('org/repo')) is None
+    for target in (base, conventional):
+        monkeypatch.setenv('WORKLINK_REPO', str(target))
+        with pytest.raises(RuntimeError, match='disagrees'):
+            selection(home, legacy)
+    monkeypatch.setenv('WORKLINK_REPO', str(checkout))
+    selection(home, legacy)
+
+
+@pytest.mark.parametrize('value', [None, 123, '', 'relative/base', '/base/../other', '~/base'])
+def test_worklink_base_field_requires_absolute_path(tmp_path, value):
+    from mimir_cultivate.repository import RepositoryInventory
+    inventory = tmp_path / 'repositories.yaml'
     inventory.write_text(yaml.safe_dump({'repositories': [{
-        'slug': 'org/repo', 'root': str(checkout), 'mode': 'rw',
+        'slug': 'org/repo', 'root': str(tmp_path / 'repo'), 'mode': 'rw',
         'origin': 'https://github.com/org/repo.git', 'base_branch': 'main',
-    }], 'allowed_roots': [{'root': str(tmp_path / 'worklink'), 'mode': 'ro'}]}))
-    read_only = RepositoryInventory.load(inventory)
-    assert dedicated_worklink_base(read_only, read_only.repository('org/repo')) is None
+        'worklink_base': value,
+    }]}))
+    with pytest.raises(ValueError, match='worklink_base'):
+        RepositoryInventory.load(inventory)
 
 
 @pytest.mark.parametrize("spec,embedding,llm,provider,dim,key", [
@@ -755,7 +819,7 @@ def test_local_prefetch_and_agent_share_persistent_cache(tmp_path, monkeypatch):
 
     compose = installer.render_compose(
         render_compose_yml(service_name="agent", web_port=8123, mode="pypi"),
-        "image:sha", "python",
+        "image:sha", "python", "repo",
     )
     agent = yaml.safe_load(compose)["services"]["agent"]
     assert "cache:/home/mimir/.cache" in agent["volumes"]

@@ -421,7 +421,7 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         'backend': 'opencode', 'compute_backend': 'local_subprocess',
         'allow_autonomous_local_subprocess': True,
         'base_branch': branch, 'test_command': entry['test_command'],
-        'max_concurrent': 2, 'timeout_s': 1800, 'reaper_ttl_s': 86400,
+        'max_concurrent': 2, 'timeout_s': 5400, 'reaper_ttl_s': 86400,
     }}
     try:
         allowlist = list(_derive_bash_allowlist(entry['test_command']))
@@ -881,10 +881,16 @@ if probe.returncode:
 inventory = home / 'repositories.yaml'
 config = yaml.safe_load(inventory.read_text()) if inventory.exists() else {}
 config = config or {}
+base = Path('/workspace/worklink/base') / repo.name
 entry = {'slug': m['slug'], 'root': str(repo), 'mode': 'rw', 'origin': origin,
-         'base_branch': m['branch'], 'test_command': m['test']}
+         'base_branch': m['branch'], 'test_command': m['test'], 'worklink_base': str(base)}
 rows = config.setdefault('repositories', [])
 old = next((r for r in rows if r.get('slug') == m['slug']), None)
+# Upgrade only an otherwise identical pre-Worklink declaration; never replace
+# an operator's explicitly selected alternate base.
+if old is not None and old == {k: v for k, v in entry.items() if k != 'worklink_base'}:
+    old['worklink_base'] = str(base)
+    changed = True
 if old is not None and old != entry:
     raise RuntimeError('existing repository declaration differs; reconcile manually')
 if old is None:
@@ -899,7 +905,7 @@ text = yaml.safe_dump(config, sort_keys=False)
 if not inventory.exists() or inventory.read_text() != text:
     inventory.write_text(text)
     changed = True
-changed = _provision_worklink(home, entry, base=Path('/workspace/worklink/base') / repo.name,
+changed = _provision_worklink(home, entry, base=base,
                             checkout=repo, git_auth=git_auth, force=m.get('force', False)) or changed
 for name in ('github-poller', 'github-ci-watch', 'github', 'review'):
     skill = resolve_skill('cultivate:' + name, set())
