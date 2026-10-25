@@ -227,7 +227,8 @@ def test_root_cultivate_selection_executes_verified_build_branches(
         return
     assert (marker_dir / "selected").read_text() == selected + "\n"
 
-    gated = [p for p in programs if "cat /opt/cultivate-docker/selected" in p]
+    gated = [p for p in programs if "cat /opt/cultivate-docker/selected" in p
+             and "chainlink" not in p]
     # users, executor, controller, bootstrap, worker-service removal, assembler pin.
     assert len(gated) == 6
     for program in gated:
@@ -246,6 +247,76 @@ def test_root_cultivate_selection_executes_verified_build_branches(
         assert not any("worklink" in line for line in calls)
     assert (s6 / "worklink-execd").exists() is (selected == "1")
     assert bundle.exists() is (selected == "1")
+
+
+def test_cultivate_chainlink_is_pinned_and_kept_out_of_core_runtime() -> None:
+    root = DOCKERFILE.read_text()
+    builder = root.split("FROM provenance-validation AS chainlink-build\n", 1)[1].split(
+        "FROM provenance-validation AS base\n", 1)[0]
+    runtime = root.split("FROM provenance-validation AS base\n", 1)[1]
+    assert root.startswith("# syntax=docker/dockerfile:1\n")
+    assert "ARG CHAINLINK_RUST_TOOLCHAIN=1.96.0" in builder
+    pin = re.search(r"(?m)^ARG CHAINLINK_COMMIT=([0-9a-f]{40})$", builder)
+    assert pin is not None, "Chainlink source must be pinned to a full SHA"
+    assert "if ! printf '%s\\n' \"$CHAINLINK_COMMIT\" | grep -Eq '^[0-9a-f]{40}$'" in builder
+    assert "if ! printf '%s\\n' \"$CHAINLINK_RUST_TOOLCHAIN\" | grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+$'" in builder
+    assert "--default-toolchain \"$CHAINLINK_RUST_TOOLCHAIN\"" in builder
+    assert re.search(
+        r"cargo install --locked\s*\\\s*\n\s*--git "
+        r"https://github.com/dollspace-gay/chainlink\.git\s*\\\s*\n"
+        r"\s*--rev \"\$CHAINLINK_COMMIT\" --root /usr/local chainlink-tracker",
+        builder,
+    ), "the pinned Chainlink revision must be installed in the isolated builder"
+    assert "CARGO_BUILD_JOBS=1" in builder
+    assert "COPY --from=chainlink-build" not in runtime
+    assert "cargo install" not in runtime and "rustup" not in runtime
+    assert "--mount=type=bind,from=chainlink-build,source=/usr/local/bin/chainlink" in runtime
+
+
+@pytest.mark.parametrize("commit,toolchain,exit_code", [
+    ("a" * 40, "1.96.0", 0),
+    ("main", "1.96.0", 2),
+    ("a" * 39, "1.96.0", 2),
+    ("a" * 40, "stable", 2),
+])
+def test_chainlink_builder_rejects_floating_build_args(commit, toolchain, exit_code) -> None:
+    builder = DOCKERFILE.read_text().split("FROM provenance-validation AS chainlink-build\n", 1)[1].split(
+        "FROM provenance-validation AS base\n", 1)[0]
+    validation = builder.split("RUN set -eu; \\\n", 1)[1].split("    curl --proto", 1)[0]
+    result = subprocess.run(["/bin/sh", "-c", "set -eu; " + validation], capture_output=True, text=True,
+                            env={**os.environ, "CHAINLINK_COMMIT": commit,
+                                 "CHAINLINK_RUST_TOOLCHAIN": toolchain})
+    assert result.returncode == exit_code, result.stderr
+
+
+@pytest.mark.parametrize("selected", ["0", "1"])
+def test_chainlink_install_and_version_check_follow_cultivate_selection(tmp_path, selected) -> None:
+    programs = _run_instructions(DOCKERFILE.read_text())
+    install_program, = (p for p in programs if p.startswith("--mount=type=bind,from=chainlink-build,"))
+    version_program, = (p for p in programs if "chainlink --version" in p)
+    assert "install -m 0755 /tmp/chainlink /usr/local/bin/chainlink" in install_program
+    assert "chainlink --version" in version_program
+
+    marker = tmp_path / "selected"
+    marker.write_text(selected + "\n")
+    source = tmp_path / "built-chainlink"
+    source.write_text('#!/bin/sh\n[ "$1" = --version ] && printf "%s\\n" "chainlink 1.6.0"\n')
+    source.chmod(0o755)
+    binary = tmp_path / "bin/chainlink"
+    binary.parent.mkdir()
+    install_program = install_program.split("\n", 1)[1].replace(
+        "/opt/cultivate-docker/selected", str(marker)).replace(
+        "/tmp/chainlink", str(source)).replace("/usr/local/bin/chainlink", str(binary))
+    version_program = version_program.replace("/opt/cultivate-docker/selected", str(marker))
+    env = {**os.environ, "PATH": f"{binary.parent}:/usr/bin:/bin"}
+    result = subprocess.run(["/bin/sh", "-ceu", install_program], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert binary.exists() is (selected == "1")
+    if selected == "1":
+        assert binary.stat().st_mode & 0o777 == 0o755
+    result = subprocess.run(["/bin/sh", "-ceu", version_program], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == ("chainlink 1.6.0" if selected == "1" else "")
 
 
 def test_root_assembler_pins_selected_cultivate_to_the_built_version(tmp_path) -> None:
@@ -421,7 +492,7 @@ def _run_provenance_validation(**build_args: str) -> subprocess.CompletedProcess
     remains the end-to-end Docker integration proof.
     """
     stage = _text().split("FROM ${BASE_IMAGE} AS provenance-validation\n", 1)[1]
-    stage = stage.split("FROM provenance-validation AS base\n", 1)[0]
+    stage = re.split(r"(?m)^FROM ", stage, maxsplit=1)[0]
     names = ("MIMIR_GIT_REF", "MIMIR_CONTROLLER_COMMIT", "MIMIR_EXECUTOR_COMMIT")
     for name in names:
         assert f"ARG {name}\n" in stage

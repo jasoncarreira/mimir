@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # mimir agent deployment image — installs ``mimir-agent`` from PyPI.
 #
 # Source-build path (workspace ``uv sync`` + local saga copy) is gone.
@@ -58,6 +59,30 @@ RUN set -eu; \
     if ! test "$MIMIR_EXECUTOR_COMMIT" = "$MIMIR_CONTROLLER_COMMIT"; then \
         echo >&2 "MIMIR_EXECUTOR_COMMIT must equal MIMIR_CONTROLLER_COMMIT"; exit 2; \
     fi
+
+# Build the Worklink CLI away from the runtime filesystem. The bind mount below
+# exposes only the finished binary to the selected image; no Rust or Cargo layer
+# is inherited by either runtime variant.
+FROM provenance-validation AS chainlink-build
+ARG CHAINLINK_RUST_TOOLCHAIN=1.96.0
+ARG CHAINLINK_COMMIT=9909d7e0d5c95251f3555e0dd9d71f894cfc4883
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN set -eu; \
+    if ! printf '%s\n' "$CHAINLINK_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then \
+        echo >&2 "CHAINLINK_COMMIT must be a full lowercase Git SHA"; exit 2; \
+    fi; \
+    if ! printf '%s\n' "$CHAINLINK_RUST_TOOLCHAIN" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then \
+        echo >&2 "CHAINLINK_RUST_TOOLCHAIN must be a pinned Rust release"; exit 2; \
+    fi; \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh; \
+    sh /tmp/rustup.sh -y --profile minimal --default-toolchain "$CHAINLINK_RUST_TOOLCHAIN"; \
+    rm /tmp/rustup.sh; \
+    CARGO_BUILD_JOBS=1 cargo install --locked \
+        --git https://github.com/dollspace-gay/chainlink.git \
+        --rev "$CHAINLINK_COMMIT" --root /usr/local chainlink-tracker
 
 FROM provenance-validation AS base
 COPY plugins/cultivate/mimir_cultivate/docker/ /opt/cultivate-docker/
@@ -147,6 +172,12 @@ RUN set -eu; \
         fi; \
     done; IFS="$old_ifs"; \
     printf '%s\n' "$selected" > /opt/cultivate-docker/selected
+# BuildKit binds the artifact without adding it (or its toolchain) to a core-only
+# image layer. World-executable mode lets both mimir and worklink invoke it.
+RUN --mount=type=bind,from=chainlink-build,source=/usr/local/bin/chainlink,target=/tmp/chainlink,ro \
+    if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        install -m 0755 /tmp/chainlink /usr/local/bin/chainlink; \
+    fi
 # Core-only images create just the controller user; the worklink identity and
 # its state directories belong to the selected Cultivate worker.
 RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
@@ -257,6 +288,10 @@ RUN mkdir -p /home/mimir/agent && mimir setup --home /home/mimir/agent || true
 RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
         MIMIR_PLUGINS=cultivate MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" \
         sh /opt/cultivate-docker/bootstrap.sh; \
+    fi
+# Check the installed runtime binary as the non-root controller user.
+RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        chainlink --version; \
     fi
 
 # Auto-update behavior on this image:

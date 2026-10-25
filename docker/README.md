@@ -26,6 +26,17 @@ container with `MIMIR_PLUGINS=cultivate` in its environment. Without the build
 argument the image is core-only and has no Worklink executor. See
 [upgrading a coding deployment](../docs/plugins.md#upgrading-a-coding-deployment).
 
+The Cultivate image also ships `/usr/local/bin/chainlink` for Worklink claims,
+continuation, and the ready-queue poller. It is built from
+`CHAINLINK_COMMIT=9909d7e0d5c95251f3555e0dd9d71f894cfc4883` with
+`CHAINLINK_RUST_TOOLCHAIN=1.96.0` (both Docker build args). To bump it, resolve
+the intended Chainlink release to a full 40-character Git commit SHA, set
+`--build-arg CHAINLINK_COMMIT=<full-sha>` and, if needed, set
+`--build-arg CHAINLINK_RUST_TOOLCHAIN=<version>`. Update the Dockerfile defaults
+and rebuild the Cultivate image; its build runs `chainlink --version` in the
+runtime stage. The builder's Rust toolchain and Cargo cache are not copied into
+the image. Core-only images do not include the binary.
+
 With Cultivate selected, and only then, the image also creates the `worklink`
 user and group (UID/GID 1002), the `/var/lib/mimir-worklink` checkout roots and
 the `worklink-execd` service. A core-only image has none of them. The root-owned
