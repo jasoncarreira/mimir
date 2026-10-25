@@ -82,6 +82,14 @@ class RepositoryInventory:
         return next((repo for repo in self.repositories if repo.root == resolved), None)
 
 
+def dedicated_worklink_base(inventory: RepositoryInventory, repository: RepositoryConfig) -> Path | None:
+    """Recognize the installer-owned base only when its persistent root is declared rw."""
+    root = repository.root.parent / "worklink"
+    if not any(item.root == root and item.mode == "rw" for item in inventory.allowed_roots):
+        return None
+    return root / "base" / repository.root.name
+
+
 _REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _TEST_SUITE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _GITHUB_ORIGIN = re.compile(

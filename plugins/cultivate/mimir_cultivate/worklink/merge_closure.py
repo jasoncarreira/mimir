@@ -179,12 +179,18 @@ def resolve_completion_repository(home: Path, *, runner: Runner) -> RepositoryCo
         raise ClosureReadError(
             f"repository trust unavailable: configured repository path cannot be resolved: {exc}"
         ) from exc
-    if not configured_paths or any(path != repository.root for path in configured_paths):
+    from mimir_cultivate.repository import dedicated_worklink_base
+    dedicated = dedicated_worklink_base(inventory, repository)
+    if not configured_paths or any(
+        path not in ({repository.root, dedicated} if dedicated is not None else {repository.root})
+        for path in configured_paths
+    ) or len(set(configured_paths)) != 1:
         raise ClosureReadError(
             "repository trust unavailable: WORKLINK_REPO/MIMIR_WORKLINK_REPO must select the declared root"
         )
+    selected_root = configured_paths[0]
     top = _invoke(
-        runner, ["git", "-C", str(repository.root), "rev-parse", "--show-toplevel"],
+        runner, ["git", "-C", str(selected_root), "rev-parse", "--show-toplevel"],
         "git top-level read",
     )
     if top.returncode != 0:
@@ -193,17 +199,18 @@ def resolve_completion_repository(home: Path, *, runner: Runner) -> RepositoryCo
         actual_root = Path(top.stdout.strip()).resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise ClosureReadError("repository trust unavailable: invalid git top-level") from exc
-    if actual_root != repository.root:
+    if actual_root != selected_root:
         raise ClosureReadError("repository trust unavailable: git top-level differs from inventory")
     origin = _invoke(
-        runner, ["git", "-C", str(repository.root), "remote", "get-url", "origin"],
+        runner, ["git", "-C", str(selected_root), "remote", "get-url", "origin"],
         "git origin read",
     )
     if origin.returncode != 0 or origin.stdout.strip() != repository.origin:
         raise ClosureReadError("repository trust unavailable: local origin differs from inventory")
     if _origin_slug(repository.origin) != repository.slug:
         raise ClosureReadError("repository trust unavailable: origin identity differs from inventory")
-    return repository
+    from dataclasses import replace
+    return replace(repository, root=selected_root)
 
 
 def parse_issue_snapshot(payload: object, *, expected_issue_id: int) -> IssueSnapshot:

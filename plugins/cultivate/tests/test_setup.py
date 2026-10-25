@@ -288,7 +288,9 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     compose = yaml.safe_load((deploy / "compose.yml").read_text())
     assert compose["services"]["agent"]["environment"]["MIMIR_PLUGINS"] == "cultivate"
     assert compose["services"]["agent"]["environment"]["MIMIR_ENABLE_CLAUDE_CODE"] == "0"
-    assert "WORKLINK_REPO" not in compose["services"]["agent"]["environment"]
+    assert compose["services"]["agent"]["environment"]["MIMIR_WORKLINK_AGENT_ID"] == "cultivate-worklink"
+    assert compose["services"]["agent"]["environment"]["WORKLINK_REPO"] == "/workspace/worklink/base/repo"
+    assert compose["services"]["agent"]["environment"]["WORKLINK_REPO"] != "/workspace/repo"
     assert compose["services"]["agent"]["environment"]["MIMIR_ACP_ENABLED"] == "1"
     assert compose["services"]["agent"]["environment"]["MIMIR_PR_CHECKOUT_LEASE_ROOT"] == "/workspace/pr-leases"
     assert compose["services"]["agent"]["depends_on"]["init"]["condition"] == "service_completed_successfully"
@@ -296,6 +298,8 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert any("MIMIR_CONTROLLER_COMMIT=" + SHA in part for argv in calls for part in argv)
     assert sum("docker" == argv[0] and "exec" in argv for argv in calls) == 0
     assert sum("-f" in argv and "compose.provision.yml" in argv for argv in calls) == 2
+    assert all(argv[argv.index('--user') + 1] == '1001:1001' for argv in calls
+               if 'compose.provision.yml' in argv)
     assert sum(argv[-2:] == ["restart", "agent"] for argv in calls) == 1
 
     def unpushed(url, token):
@@ -343,7 +347,7 @@ def test_compose_structural_changes_survive_format_drift_and_refuse_invalid_shap
     # Different ordering, indentation and missing old lines cannot silently
     # omit required settings when the installer modifies a parsed mapping.
     drifted = yaml.safe_dump(doc, sort_keys=True, indent=4)
-    result = yaml.safe_load(installer.render_compose(drifted, "image:sha", "rust"))
+    result = yaml.safe_load(installer.render_compose(drifted, "image:sha", "rust", "repo"))
     agent = result["services"]["agent"]
     assert agent["image"] == "image:sha" and "build" not in agent
     assert agent["environment"]["MIMIR_PLUGINS"] == "cultivate"
@@ -351,7 +355,7 @@ def test_compose_structural_changes_survive_format_drift_and_refuse_invalid_shap
     assert agent["environment"]["MIMIR_HOME"] == "/home/mimir/agent"
     for bad in ("services: {}", "services: {agent: {build: {}, environment: []}}", "broken: ["):
         with pytest.raises(installer.SetupError, match="Incompatible scaffold"):
-            installer.render_compose(bad, "image:sha", "rust")
+            installer.render_compose(bad, "image:sha", "rust", "repo")
 
 
 def test_plain_git_credential_helper_reads_environment_without_persisting_secret(tmp_path):
@@ -390,7 +394,7 @@ def test_secret_file_requires_private_mode(tmp_path):
 
 def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, monkeypatch):
     monkeypatch.setattr(installer.time, "sleep", lambda seconds: None)
-    pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch"], "reply": True}
+    pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True}
     reads = []
 
     def http(url, *, key=None, data=None):
@@ -421,6 +425,9 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     with pytest.raises(installer.SetupError, match="github-ci-watch"):
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
     pending["pollers"] = ["github-activity", "github-ci-watch"]
+    with pytest.raises(installer.SetupError, match="worklink-ready-queue"):
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    pending["pollers"] = ["github-activity", "github-ci-watch", "worklink-ready-queue"]
     pending["reply"] = False
     with pytest.raises(installer.SetupError, match="no assistant reply"):
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
@@ -451,7 +458,8 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     script = (installer._PROVISION
               .replace("/opt/cultivate-manifest.json", str(manifest))
               .replace("/home/mimir/agent", str(home))
-              .replace("Path('/workspace')", "Path(" + repr(str(tmp_path)) + ")"))
+              .replace("Path('/workspace')", "Path(" + repr(str(tmp_path)) + ")")
+              .replace("Path('/workspace/worklink/base')", "Path(" + repr(str(tmp_path / 'worklink/base')) + ")"))
     import mimir.plugins.skills as skills
 
     monkeypatch.setattr(skills, "resolve_skill", lambda name, core_names: SimpleNamespace(dirname=name.split(":")[1]))
@@ -466,8 +474,16 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
 
     def git(argv, **kwargs):
         calls.append(argv)
+        if argv[0] == 'chainlink':
+            (home / '.chainlink').mkdir(exist_ok=True)
+            (home / '.chainlink/agent.json').write_text('{"id":"cultivate-worklink"}')
+            return subprocess.CompletedProcess(argv, 0)
         if "clone" in argv:
-            (repo / ".git").mkdir(parents=True)
+            (Path(argv[-1]) / ".git").mkdir(parents=True)
+        if 'symbolic-ref' in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout='main\n')
+        if 'status' in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout='')
         return subprocess.CompletedProcess(argv, 0, stdout="https://github.com/org/repo.git\n")
 
     monkeypatch.setattr(subprocess, "run", git)
@@ -490,10 +506,18 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert {p["canonical"] for p in people} == {"another", "owner"}
     assert {"user", "admin"}.issubset(people[1]["access"]["roles"])
     assert installer._SHA.fullmatch("a" * 40)
-    assert sum("clone" in argv for argv in calls) == 1
-    assert all(argv[0] == "git" for argv in calls)
+    assert sum("clone" in argv for argv in calls) == 2
+    assert sum(argv[0] == 'chainlink' for argv in calls) == 1
+    from mimir_cultivate.worklink.backends.registry import WorklinkConfig
+    worklink = WorklinkConfig.load(home / 'worklink.yaml')
+    assert worklink.repository == inventory['repositories'][0]['slug']
+    assert worklink.defaults.base_branch == inventory['repositories'][0]['base_branch']
+    assert worklink.defaults.test_command == inventory['repositories'][0]['test_command']
+    assert worklink.defaults.allow_autonomous_local_subprocess
+    assert (home / '.chainlink/agent.json').read_text() == '{"id":"cultivate-worklink"}'
+    assert any(argv[-1] == str(tmp_path / 'worklink/base/repo') for argv in calls if 'clone' in argv)
     assert not any("setup-git" in argv for argv in calls)
-    clone = next(argv for argv in calls if "clone" in argv)
+    clone = next(argv for argv in calls if "clone" in argv and argv[-1] == str(repo))
     assert clone[-1] == str(tmp_path / "repo")
     assert "password=$GITHUB_TOKEN" in " ".join(clone)
     pushes = [argv for argv in calls if "push" in argv]
@@ -504,6 +528,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert pushes[0][6] != pushes[1][6]
     assert all("secret" not in " ".join(argv) for argv in pushes)
     prior_inventory = (home / "repositories.yaml").read_bytes()
+    prior_worklink = (home / 'worklink.yaml').read_bytes()
     prior_key = (home / "owner-web-key").read_bytes()
     (repo / ".git").rmdir()
     with pytest.raises(subprocess.CalledProcessError):
@@ -514,6 +539,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
         monkeypatch.setattr(subprocess, "run", fail_clone)
         exec(compile(script, "provision.py", "exec"), {"__name__": "__main__"})
     assert (home / "repositories.yaml").read_bytes() == prior_inventory
+    assert (home / 'worklink.yaml').read_bytes() == prior_worklink
     assert (home / "owner-web-key").read_bytes() == prior_key
     (repo / ".git").mkdir()
 
@@ -538,6 +564,155 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     (state / "identities.yaml").write_text(yaml.safe_dump(identities))
     with pytest.raises(RuntimeError, match=r"admin\+user"):
         exec(compile(script, "provision.py", "exec"), {"__name__": "__main__"})
+
+
+def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch):
+    original_run = subprocess.run
+    origin = tmp_path / 'remote.git'
+    seed = tmp_path / 'seed'
+    original_run(['git', 'init', '--bare', str(origin)], check=True, capture_output=True)
+    original_run(['git', 'init', '-b', 'integration', str(seed)], check=True, capture_output=True)
+    (seed / 'README').write_text('seed\n')
+    original_run(['git', '-C', str(seed), 'add', 'README'], check=True, capture_output=True)
+    original_run(['git', '-C', str(seed), '-c', 'user.name=Test', '-c', 'user.email=test@example.com',
+                  'commit', '-m', 'seed'], check=True, capture_output=True)
+    original_run(['git', '-C', str(seed), 'push', str(origin), 'HEAD:refs/heads/integration'],
+                 check=True, capture_output=True)
+    home = tmp_path / 'home'
+    home.mkdir()
+    base = tmp_path / 'worklink/base/repo'
+    checkout = tmp_path / 'repo'
+    entry = {'slug': 'org/repo', 'origin': str(origin), 'base_branch': 'integration',
+             'test_command': './tools/verify'}
+
+    def run(argv, **kw):
+        if argv[0] == 'chainlink':
+            assert argv == ['chainlink', 'agent', 'init', 'cultivate-worklink']
+            assert kw['cwd'] == home
+            (home / '.chainlink').mkdir()
+            (home / '.chainlink/agent.json').write_text('{"id": "cultivate-worklink"}')
+            return subprocess.CompletedProcess(argv, 0)
+        return original_run(argv, **kw)
+
+    monkeypatch.setattr(subprocess, 'run', run)
+    auth = ['git', '-c', 'credential.helper=', '-c', 'credential.https://github.com.helper=!f() { :; }; f']
+    assert installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
+    from mimir_cultivate.worklink.backends.registry import WorklinkConfig, BackendRegistry
+    config = WorklinkConfig.load(home / 'worklink.yaml')
+    BackendRegistry(config)
+    assert config.repository == entry['slug']
+    assert config.defaults.base_branch == entry['base_branch']
+    assert config.defaults.test_command == entry['test_command']
+    assert config.defaults.backend == 'opencode'
+    assert config.defaults.allow_autonomous_local_subprocess
+    assert original_run(['git', '-C', str(base), 'status', '--porcelain'], capture_output=True,
+                        text=True, check=True).stdout == ''
+    assert original_run(['git', '-C', str(base), 'symbolic-ref', '--short', 'HEAD'],
+                        capture_output=True, text=True, check=True).stdout.strip() == 'integration'
+    assert base != checkout and not base.is_relative_to(checkout)
+    from mimir_cultivate.worklink.checkout import create_isolated_checkout
+    monkeypatch.setenv('MIMIR_SOURCE_DIR', str(checkout))
+    monkeypatch.setattr('mimir_cultivate.worklink.checkout._cultivate_selected', lambda: False)
+    attempt = create_isolated_checkout(base, issue_id=2016, attempt=1, base='integration')
+    assert attempt.repo == base and attempt.branch == 'issue/2016-a1'
+    assert attempt.path != checkout and attempt.path != base
+    origin_tip = original_run(['git', '-C', str(base), 'rev-parse', 'origin/integration'],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    assert attempt.local_base == origin_tip
+    before = ((home / '.chainlink/agent.json').read_bytes(), (home / 'worklink.yaml').read_bytes(),
+              (base / '.git/config').read_bytes())
+    assert not installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
+    assert before == ((home / '.chainlink/agent.json').read_bytes(), (home / 'worklink.yaml').read_bytes(),
+                      (base / '.git/config').read_bytes())
+    (base / 'untracked').write_text('dirty')
+    with pytest.raises(RuntimeError, match='dirty.*clean'):
+        installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
+    (base / 'untracked').unlink()
+    original_run(['git', '-C', str(base), 'remote', 'set-url', 'origin', str(seed)], check=True)
+    with pytest.raises(RuntimeError, match='origin disagrees'):
+        installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
+    original_run(['git', '-C', str(base), 'remote', 'set-url', 'origin', str(origin)], check=True)
+    config_path = home / 'worklink.yaml'
+    config_path.write_text(config_path.read_text() + '# operator note\n')
+    with pytest.raises(RuntimeError, match='--force'):
+        installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
+    assert '# operator note' in config_path.read_text()
+    assert installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth, force=True)
+    with pytest.raises(RuntimeError, match='overlaps'):
+        installer._provision_worklink(home, entry, base=checkout, checkout=checkout, git_auth=auth)
+    alias = tmp_path / 'alias'
+    alias.symlink_to(base, target_is_directory=True)
+    with pytest.raises(RuntimeError, match='symlink'):
+        installer._provision_worklink(home, entry, base=alias, checkout=checkout, git_auth=auth)
+    original_run(['git', '-C', str(base), 'checkout', '-b', 'wrong-branch'], check=True, capture_output=True)
+    with pytest.raises(RuntimeError, match='not on integration'):
+        installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
+    original_run(['git', '-C', str(base), 'checkout', 'integration'], check=True, capture_output=True)
+    config_path.unlink()
+    config_path.symlink_to(home / '.chainlink/agent.json')
+    with pytest.raises(RuntimeError, match='regular file'):
+        installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth, force=True)
+    config_path.unlink()
+    installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
+    agent = home / '.chainlink/agent.json'
+    agent.unlink()
+    agent.symlink_to(config_path)
+    with pytest.raises(RuntimeError, match='regular file'):
+        installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
+
+
+def test_dedicated_base_selection_requires_declared_persistent_root(tmp_path, monkeypatch):
+    from mimir.plugins.manager import load_plugins
+    from mimir_cultivate.repository import RepositoryInventory, dedicated_worklink_base
+    from mimir_cultivate.worklink.merge_closure import resolve_completion_repository, ClosureReadError
+
+    home = tmp_path / 'home'
+    home.mkdir()
+    checkout = tmp_path / 'repo'
+    base = tmp_path / 'worklink/base/repo'
+    (home / 'worklink.yaml').write_text('repository: org/repo\n')
+    inventory = home / 'repositories.yaml'
+    inventory.write_text(yaml.safe_dump({'repositories': [{
+        'slug': 'org/repo', 'root': str(checkout), 'mode': 'rw',
+        'origin': 'https://github.com/org/repo.git', 'base_branch': 'main',
+    }], 'allowed_roots': [{'root': str(tmp_path / 'worklink'), 'mode': 'rw'}]}))
+    declaration = RepositoryInventory.load(inventory)
+    assert dedicated_worklink_base(declaration, declaration.repository('org/repo')) == base
+    selection = load_plugins(enable='cultivate').policy.policy_consumer_hooks.repository_selection
+    monkeypatch.setenv('WORKLINK_REPO', str(base))
+    selection(home, declaration)
+    base.mkdir(parents=True)
+
+    def git(argv):
+        assert argv[:3] == ['git', '-C', str(base)]
+        return subprocess.CompletedProcess(argv, 0, stdout=(
+            str(base) if argv[-1] == '--show-toplevel' else 'https://github.com/org/repo.git') + '\n')
+
+    assert resolve_completion_repository(home, runner=git).root == base.resolve()
+    monkeypatch.setenv('MIMIR_WORKLINK_REPO', str(checkout))
+    with pytest.raises(ClosureReadError, match='declared root'):
+        resolve_completion_repository(home, runner=git)
+    monkeypatch.delenv('MIMIR_WORKLINK_REPO')
+    monkeypatch.setenv('WORKLINK_REPO', str(checkout))
+    selection(home, declaration)
+    monkeypatch.setenv('WORKLINK_REPO', str(tmp_path / 'other'))
+    with pytest.raises(RuntimeError, match='disagrees'):
+        selection(home, declaration)
+    inventory.write_text(yaml.safe_dump({'repositories': [{
+        'slug': 'org/repo', 'root': str(checkout), 'mode': 'rw',
+        'origin': 'https://github.com/org/repo.git', 'base_branch': 'main',
+    }]}))
+    undeclared = RepositoryInventory.load(inventory)
+    monkeypatch.setenv('WORKLINK_REPO', str(base))
+    assert dedicated_worklink_base(undeclared, undeclared.repository('org/repo')) is None
+    with pytest.raises(RuntimeError, match='disagrees'):
+        selection(home, undeclared)
+    inventory.write_text(yaml.safe_dump({'repositories': [{
+        'slug': 'org/repo', 'root': str(checkout), 'mode': 'rw',
+        'origin': 'https://github.com/org/repo.git', 'base_branch': 'main',
+    }], 'allowed_roots': [{'root': str(tmp_path / 'worklink'), 'mode': 'ro'}]}))
+    read_only = RepositoryInventory.load(inventory)
+    assert dedicated_worklink_base(read_only, read_only.repository('org/repo')) is None
 
 
 @pytest.mark.parametrize("spec,embedding,llm,provider,dim,key", [
@@ -707,14 +882,22 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok,
     docker_calls = []
 
     def subprocess_run(argv, **kwargs):
+        if argv[0] == 'chainlink':
+            (home / '.chainlink').mkdir(exist_ok=True)
+            (home / '.chainlink/agent.json').write_text('{"id":"cultivate-worklink"}')
+            return subprocess.CompletedProcess(argv, 0)
         if argv[0] == "git":
             git_calls.append(argv)
             if "clone" in argv:
-                (repo / ".git").mkdir(parents=True)
+                (Path(argv[-1]) / ".git").mkdir(parents=True)
             if "push" in argv:
                 return subprocess.CompletedProcess(argv, 0 if push_ok else 128,
                                                    stdout=b"secret remote output fixture-token",
                                                    stderr=probe_stderr + b" remote secret fixture-token")
+            if 'symbolic-ref' in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout='main\n')
+            if 'status' in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout='')
             return subprocess.CompletedProcess(argv, 0, stdout="https://github.com/org/repo.git\n")
         if argv[:2] == ["docker", "exec"]:
             kwargs["stdout"].write(b"owner-key\n")
@@ -726,7 +909,8 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok,
             script = ((deploy / "provision.py").read_text()
                       .replace("/opt/cultivate-manifest.json", str(manifest))
                       .replace("/home/mimir/agent", str(home))
-                      .replace("Path('/workspace')", "Path(" + repr(str(tmp_path)) + ")"))
+                      .replace("Path('/workspace')", "Path(" + repr(str(tmp_path)) + ")")
+                      .replace("Path('/workspace/worklink/base')", "Path(" + repr(str(tmp_path / 'worklink/base')) + ")"))
             output = io.StringIO()
             with redirect_stdout(output):
                 try:
@@ -762,7 +946,7 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok,
         assert not verified and not any(argv[-3:] == ["up", "-d", "agent"] for argv in docker_calls)
         assert not (home / "repositories.yaml").exists()
     assert len([argv for argv in git_calls if "push" in argv]) == 1
-    assert len([argv for argv in git_calls if "clone" in argv]) == (0 if existing_checkout else 1)
+    assert len([argv for argv in git_calls if "clone" in argv]) == (1 if push_ok else 0) + (0 if existing_checkout else 1)
     assert all("fixture-token" not in " ".join(argv) for argv in git_calls + docker_calls)
     captured = capsys.readouterr()
     assert "fixture-token" not in captured.out + captured.err
