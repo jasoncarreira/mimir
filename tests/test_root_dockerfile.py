@@ -192,10 +192,15 @@ def _run_instructions(text: str) -> list[str]:
     ("cultivate", "mimir-cultivate==0.9.10", None, False),
     ("", "Mimir_Cultivate==0.9.10", None, False),
 ])
+@pytest.mark.parametrize("unrelated_words", ["", "github high ghcr"])
 def test_root_cultivate_selection_executes_verified_build_branches(
-    tmp_path, selection, packages, selected, success,
+    tmp_path, selection, packages, selected, success, unrelated_words,
 ) -> None:
     root = DOCKERFILE.read_text()
+    # Unrelated gh substrings must not remove an actual gated branch.
+    users = "sh /opt/cultivate-docker/users.sh;"
+    assert users in root
+    root = root.replace(users, users + f" : {unrelated_words};", 1)
     marker_dir = tmp_path / "cultivate-docker"
     marker_dir.mkdir()
     s6 = tmp_path / "s6-rc.d"
@@ -229,7 +234,8 @@ def test_root_cultivate_selection_executes_verified_build_branches(
     assert (marker_dir / "selected").read_text() == selected + "\n"
 
     gated = [p for p in programs if "cat /opt/cultivate-docker/selected" in p
-             and "chainlink" not in p and "gh" not in p]
+             and "chainlink" not in p and "/usr/local/bin/gh" not in p
+             and "gh --version" not in p]
     # users, executor, controller, bootstrap, worker-service removal, assembler pin.
     assert len(gated) == 6
     for program in gated:
@@ -388,7 +394,7 @@ def test_chainlink_install_and_version_check_follow_cultivate_selection(tmp_path
 
 def _assert_cultivate_gh_install(root: str) -> None:
     pin = re.search(r"(?m)^ARG GH_VERSION=(\d+\.\d+\.\d+)$", root)
-    assert pin is not None and tuple(map(int, pin[1].split("."))) >= (2, 83, 1)
+    assert pin is not None and tuple(map(int, pin[1].split("."))) >= (2, 102, 0), "gh must include the advisory fixes"
     for arch in ("AMD64", "ARM64"):
         assert re.search(rf"(?m)^ARG GH_{arch}_SHA256=[0-9a-f]{{64}}$", root)
     programs = _run_instructions(root)
@@ -405,7 +411,10 @@ def _assert_cultivate_gh_install(root: str) -> None:
     assert "gh_${GH_VERSION}_linux_${arch}/bin/gh" in install
     assert "Unsupported architecture for gh" in install
     assert 'case "$GH_VERSION" in *[!0-9.]*|.*|*..*|*.)' in install
-    assert 'gh --version;' in next(p for p in programs if "gh --version" in p and "s6-setuidgid" not in p)
+    controller_check = next(p for p in programs if "gh --version" in p and "s6-setuidgid" not in p)
+    assert 'gh --version;' in controller_check
+    assert controller_check.startswith("set -eu;"), "gh probe must fail closed"
+    assert 'gh api --help | grep -q -- --allow-escape-sequences;' in controller_check, "gh capability probe missing"
     assert '/command/s6-setuidgid worklink gh --version;' in next(
         p for p in programs if "/command/s6-setuidgid worklink gh --version" in p)
     # A core build selects 0; only the selected branch may fetch or install gh.
@@ -424,7 +433,7 @@ def test_core_gh_install_branch_does_not_fetch_or_install(tmp_path) -> None:
     selected.write_text("0\n")
     install = install.replace("/opt/cultivate-docker/selected", str(selected))
     result = subprocess.run(["/bin/sh", "-ceu", install], capture_output=True, text=True,
-                            env={**os.environ, "PATH": "/usr/bin:/bin", "GH_VERSION": "2.83.1"})
+                            env={**os.environ, "PATH": "/usr/bin:/bin", "GH_VERSION": "2.103.2"})
     assert result.returncode == 0, result.stderr
     assert not result.stdout
 
@@ -447,6 +456,48 @@ def test_cultivate_gh_static_guard_rejects_integrity_or_selection_bypass(old, ne
     assert old in install
     with pytest.raises(AssertionError):
         _assert_cultivate_gh_install(root.replace(install, install.replace(old, new), 1))
+
+
+@pytest.mark.parametrize("old,new,message", [
+    ("gh api --help | grep -q -- --allow-escape-sequences;", "true;", "capability probe"),
+    ("ARG GH_VERSION=2.103.2", "ARG GH_VERSION=2.83.1", "advisory fixes"),
+])
+def test_cultivate_gh_guard_rejects_missing_capability_or_old_pin(old, new, message) -> None:
+    root = DOCKERFILE.read_text()
+    assert old in root
+    with pytest.raises(AssertionError, match=message):
+        _assert_cultivate_gh_install(root.replace(old, new))
+
+
+@pytest.mark.parametrize("selected,version_exit,supports_flag,expected", [
+    ("0", 1, False, 0),
+    ("1", 0, True, 0),
+    ("1", 0, False, 1),
+    ("1", 1, True, 1),
+])
+def test_cultivate_gh_build_probe_requires_working_binary_and_flag(
+    tmp_path, selected, version_exit, supports_flag, expected,
+) -> None:
+    probe, = (p for p in _run_instructions(DOCKERFILE.read_text())
+              if "gh --version" in p and "s6-setuidgid" not in p)
+    marker = tmp_path / "selected"
+    marker.write_text(selected + "\n")
+    log = tmp_path / "calls"
+    binary = tmp_path / "gh"
+    binary.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$*" >> "$GH_TEST_LOG"\n'
+        'if [ "$1" = --version ]; then exit "$GH_TEST_VERSION_EXIT"; fi\n'
+        'if [ "$GH_TEST_FLAG" = 1 ]; then echo --allow-escape-sequences; else echo usage; fi\n'
+    )
+    binary.chmod(0o755)
+    probe = probe.replace("/opt/cultivate-docker/selected", str(marker))
+    result = subprocess.run(["/bin/sh", "-c", probe], capture_output=True, text=True, env={
+        **os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin", "GH_TEST_LOG": str(log),
+        "GH_TEST_VERSION_EXIT": str(version_exit), "GH_TEST_FLAG": str(int(supports_flag)),
+    })
+    assert result.returncode == expected, result.stderr
+    calls = log.read_text().splitlines() if log.exists() else []
+    assert calls == ([] if selected == "0" else ["--version"] if version_exit else ["--version", "api --help"])
 
 
 def test_root_assembler_pins_selected_cultivate_to_the_built_version(tmp_path) -> None:

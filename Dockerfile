@@ -193,11 +193,12 @@ RUN --mount=type=bind,from=chainlink-artifact,source=/usr/local/bin/chainlink,ta
         install -m 0755 /tmp/chainlink /usr/local/bin/chainlink; \
     fi
 # gh api --allow-escape-sequences is required by github-ci-watch for job logs;
-# pin a recent CLI with that flag. SHA-256 values are from the official v2.83.1
-# release assets (linux amd64/arm64); override both version and digest to bump.
-ARG GH_VERSION=2.83.1
-ARG GH_AMD64_SHA256=1c5252d4ce3db07b51c01ff0b909583da6364ff3fdc06d0c2e75e62dc0380a34
-ARG GH_ARM64_SHA256=36af472f8e96fd67253f813f71d9610624cc4e3c7a5b148459e42ffa1a933f64
+# pin 2.103.2, which supports that flag and includes the 2.102.0 security fixes.
+# SHA-256 values are from the official v2.103.2 linux amd64/arm64 release
+# assets; override the version and both digests together to bump.
+ARG GH_VERSION=2.103.2
+ARG GH_AMD64_SHA256=62ccf747115ddc61237efffdde66a3c8f70ba249433dc64f70801089b59c59c8
+ARG GH_ARM64_SHA256=4c3e99a50bd8b181a3fe9d69b25dd978bac768148d88f01507c6b4d1ef61a443
 RUN set -eu; \
     if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
         case "$(dpkg --print-architecture)" in \
@@ -330,8 +331,10 @@ RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
 RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
         chainlink --version; \
     fi
-RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+RUN set -eu; \
+    if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
         gh --version; \
+        gh api --help | grep -q -- --allow-escape-sequences; \
     fi
 
 # Auto-update behavior on this image:
