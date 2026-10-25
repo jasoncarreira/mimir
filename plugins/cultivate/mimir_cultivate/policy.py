@@ -918,6 +918,7 @@ def register_tools(registrar: PolicyRegistrar) -> None:
 
     def validate_repository_selection(home: Path, inventory: object) -> None:
         from .worklink.backends.registry import WorklinkConfig
+        from .repository import dedicated_worklink_base
 
         worklink = WorklinkConfig.load(home / "worklink.yaml")
         target = inventory.repository(worklink.repository) if worklink.repository else None
@@ -927,11 +928,14 @@ def register_tools(registrar: PolicyRegistrar) -> None:
                 f"{worklink.repository}"
             )
         declared_target = str(target.root) if target is not None else None
+        dedicated = dedicated_worklink_base(inventory, target) if target is not None else None
         for name in ("WORKLINK_REPO", "MIMIR_WORKLINK_REPO"):
             legacy_target = os.environ.get(name)
             if legacy_target and (
                 declared_target is None
-                or Path(legacy_target).resolve() != Path(declared_target)
+                or Path(legacy_target).resolve() not in (
+                    {Path(declared_target), dedicated} if dedicated is not None else {Path(declared_target)}
+                )
             ):
                 raise RuntimeError(
                     f"{name} disagrees with worklink.yaml: "

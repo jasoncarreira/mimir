@@ -34,6 +34,7 @@ class RepositoryConfig:
     base_branch: str
     test_command: str | None = None
     test_suites: tuple[RepositoryTestSuite, ...] = ()
+    worklink_base: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,17 @@ class RepositoryInventory:
     def repository_for_root(self, root: Path) -> RepositoryConfig | None:
         resolved = root.resolve()
         return next((repo for repo in self.repositories if repo.root == resolved), None)
+
+
+def dedicated_worklink_base(inventory: RepositoryInventory, repository: RepositoryConfig) -> Path | None:
+    """Trust only an explicitly configured base beneath a declared writable root."""
+    base = repository.worklink_base
+    if base is None or not any(
+        base.is_relative_to(item.root) and item.mode == "rw"
+        for item in inventory.allowed_roots
+    ):
+        return None
+    return base
 
 
 _REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -260,7 +272,11 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
         test_suites = _parse_test_suites(
             item.get("test_suites", []), f"{label}.test_suites", test_command,
         )
-        if set(item) - {"slug", "root", "mode", "origin", "base_branch", "test_command", "test_suites"}:
+        worklink_base = (
+            _parse_absolute_root(item["worklink_base"], f"{label}.worklink_base")
+            if "worklink_base" in item else None
+        )
+        if set(item) - {"slug", "root", "mode", "origin", "base_branch", "test_command", "test_suites", "worklink_base"}:
             raise ValueError(f"{label} contains unknown fields")
         if slug in slugs:
             raise ValueError(f"duplicate repository slug: {slug}")
@@ -277,6 +293,7 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
                 base_branch=base_branch.strip(),
                 test_command=test_command,
                 test_suites=test_suites,
+                worklink_base=worklink_base,
             )
         )
     return tuple(repositories)

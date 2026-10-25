@@ -321,7 +321,7 @@ def render_layer(kind: str, version: str, root_image: str, *,
     return f"FROM {root_image}\nUSER root\n{install}RUN mkdir -p /workspace /workspace/pr-leases /workspace/worklink && chown -R 1001:1001 /workspace\nUSER root\n"
 
 
-def render_compose(template: str, layer_tag: str, kind: str) -> str:
+def render_compose(template: str, layer_tag: str, kind: str, repo_name: str) -> str:
     """Modify the scaffold structurally; fail closed on incompatible shapes."""
     try:
         # Scaffold's prose header contains a shell printf example with a literal
@@ -339,9 +339,9 @@ def render_compose(template: str, layer_tag: str, kind: str) -> str:
         passthrough = "UV_PYTHON_INSTALL_DIR" if kind == "python" else "RUSTUP_HOME,CARGO_HOME" if kind == "rust" else ""
         environment.update({"MIMIR_ACP_ENABLED": "1", "MIMIR_PR_CHECKOUT_LEASE_ROOT": "/workspace/pr-leases",
                             "MIMIR_SHELL_PASS_ENV": passthrough, "MIMIR_ENABLE_CLAUDE_CODE": "0",
-                            "MIMIR_HOME": "/home/mimir/agent", "MIMIR_PLUGINS": "cultivate"})
-        # Worklink requires its own dedicated base, not the live working checkout.
-        environment.pop("WORKLINK_REPO", None)
+                            "MIMIR_HOME": "/home/mimir/agent", "MIMIR_PLUGINS": "cultivate",
+                            "MIMIR_WORKLINK_AGENT_ID": "cultivate-worklink"})
+        environment["WORKLINK_REPO"] = "/workspace/worklink/base/" + repo_name
         volumes = ["home:/home/mimir/agent", "cache:/home/mimir/.cache", "workspace:/workspace",
                    "pr-leases:/workspace/pr-leases", "worklink:/workspace/worklink"]
         agent["volumes"] = volumes
@@ -373,6 +373,82 @@ def _write(path: Path, text: str, *, mode: int = 0o644, replace: bool = False) -
             out.write(text)
     path.chmod(mode)
     return True
+
+
+def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
+                        git_auth: list[str], force: bool = False) -> bool:
+    """Reconcile the dedicated, controller-owned base and Worklink settings."""
+    from .worklink.backends.registry import BackendRegistry, WorklinkConfig, _derive_bash_allowlist
+
+    origin = entry["origin"]
+    branch = entry["base_branch"]
+    if (base.resolve() == checkout.resolve() or base.resolve().is_relative_to(checkout.resolve())
+            or checkout.resolve().is_relative_to(base.resolve())
+            or base.resolve().is_relative_to(Path('/workspace/pr-leases'))):
+        raise RuntimeError("Worklink base overlaps the live checkout or lease root; choose a dedicated base")
+    if base.is_symlink() or base.parent.is_symlink():
+        raise RuntimeError(f"Worklink base {base} is a symlink; move it aside and retry")
+    if base.exists() and (not base.is_dir() or not (base / '.git').is_dir()):
+        raise RuntimeError(f"Worklink base {base} is not a clone; move it aside and retry")
+
+    def git(*args: str) -> str:
+        result = subprocess.run(['git', '-C', str(base), *args], capture_output=True,
+                                text=True, check=False)
+        if result.returncode:
+            raise RuntimeError(f"Worklink base {base}: git {args[0]} failed; inspect the base and retry")
+        return result.stdout.strip()
+
+    created = not base.exists()
+    if created:
+        base.parent.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(git_auth + ['clone', '--branch', branch, origin, str(base)],
+                                capture_output=True, check=False)
+        if result.returncode:
+            raise RuntimeError(f"Cannot clone Worklink base {base}; check origin and base branch")
+    if git('config', '--local', '--get', 'remote.origin.url') != origin:
+        raise RuntimeError(f"Worklink base {base} origin disagrees with repositories.yaml; move it aside or reconcile it manually")
+    if git('symbolic-ref', '--short', 'HEAD') != branch:
+        raise RuntimeError(f"Worklink base {base} is not on {branch}; check out the declared base branch manually")
+    if git('status', '--porcelain=v1', '--untracked-files=all'):
+        raise RuntimeError(f"Worklink base {base} is dirty; clean it manually and retry setup")
+    # The controller later fetches origin from this clone, including private repos.
+    helper = git_auth[-1].split('=', 1)[1]
+    git('config', '--local', 'credential.helper', '')
+    git('config', '--local', 'credential.https://github.com.helper', helper)
+
+    path = home / 'worklink.yaml'
+    config = {'repository': entry['slug'], 'defaults': {
+        'backend': 'opencode', 'compute_backend': 'local_subprocess',
+        'allow_autonomous_local_subprocess': True,
+        'base_branch': branch, 'test_command': entry['test_command'],
+        'max_concurrent': 2, 'timeout_s': 5400, 'reaper_ttl_s': 86400,
+    }}
+    try:
+        allowlist = list(_derive_bash_allowlist(entry['test_command']))
+    except ValueError:
+        # Custom verification scripts cannot safely be widened to a runner
+        # wildcard; grant only the declared command and Git operations.
+        allowlist = ['git *', entry['test_command']]
+    config['backends'] = {'opencode': {'bash_allowlist': allowlist}}
+    text = yaml.safe_dump(config, sort_keys=False)
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise RuntimeError(f"Worklink config {path} must be a regular file; move it aside")
+    if path.exists() and path.read_text() != text and not force:
+        raise RuntimeError(f"Worklink config {path} differs; preserve operator edits or rerun with --force")
+    if not path.exists() or path.read_text() != text:
+        path.write_text(text)
+        created = True
+    BackendRegistry(WorklinkConfig.load(path))
+    agent = home / '.chainlink' / 'agent.json'
+    if agent.is_symlink() or (agent.exists() and not agent.is_file()):
+        raise RuntimeError(f"Chainlink agent identity {agent} must be a regular file")
+    if not agent.exists():
+        result = subprocess.run(['chainlink', 'agent', 'init', 'cultivate-worklink'], cwd=home,
+                                capture_output=True, check=False)
+        if result.returncode or not agent.is_file():
+            raise RuntimeError(f"Chainlink agent init failed in {home}; inspect .chainlink and retry")
+        created = True
+    return created
 
 
 def _env(deploy: Path, updates: dict[str, str]) -> str:
@@ -539,7 +615,7 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
     schedule = _http(url + "/api/v1/scheduler", key=owner_key)
     pollers = {row.get("name") for row in schedule.get("data", {}).get("pollers", [])
                if row.get("next_run_at")}
-    for poller in ("github-activity", "github-ci-watch"):
+    for poller in ("github-activity", "github-ci-watch", "worklink-ready-queue"):
         if poller not in pollers:
             raise SetupError(f"{poller} was not scheduled; inspect poller configuration and restart.")
     # POST only acknowledges enqueue. Confirm the assistant reply in history.
@@ -584,6 +660,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
     setup.add_argument("--accept-license", action="store_true", help="Explicitly accept the shipped Cultivate BSL 1.1 license for unattended setup.")
     setup.add_argument("--rotate-web-key", action="store_true", help="Replace the owner's existing web key intentionally.")
     setup.add_argument("--reembed", action="store_true", help="Re-embed existing Saga vectors offline when changing embeddings.")
+    setup.add_argument("--force", action="store_true", help="Replace an operator-edited worklink.yaml intentionally.")
     return parser
 
 
@@ -687,7 +764,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     # Start from the existing loopback-only compose renderer; use root-image
     # service/volumes rather than its pypi installation build path.
     compose = render_compose_yml(service_name="agent", web_port=port, mode="pypi")
-    compose = render_compose(compose, layer_tag, kind)
+    compose = render_compose(compose, layer_tag, kind, repo.lower().split('/')[1])
     _write(compose_path, compose)
     _write(deploy / ".gitignore", "*\n")
     # The toolchain layer has no COPY instructions. Docker still sends the
@@ -702,7 +779,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
     manifest = {"slug": repo.lower(), "branch": branch, "owner": owner, "display": display,
-                 "email": owner_email, "test": test, "rotate": bool(args.rotate_web_key),
+                  "email": owner_email, "test": test, "rotate": bool(args.rotate_web_key),
+                  "force": bool(getattr(args, "force", False)),
                  "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed)}
     _write(deploy / "manifest.json", json.dumps(manifest, indent=2) + "\n", replace=True)
     _write(deploy / "provision.py", _PROVISION)
@@ -744,6 +822,10 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     key_path.chmod(0o600)
     verify(deploy, port, repo, key_path.read_text().strip())
     print(f"Cultivate ready: http://127.0.0.1:{port}  Owner web key: {key_path}  Next: use the key to sign in.")
+    print("Issues are tracked in Chainlink in the agent home (/home/mimir/agent).")
+    print('File a leaf: docker compose exec -w /home/mimir/agent agent chainlink issue create '
+          '"<title>" --description "<acceptance and review criteria>" --priority medium')
+    print('Arm it: docker compose exec -w /home/mimir/agent agent chainlink issue label <issue-id> worklink:ready')
 
 
 _PROVISION = '''from pathlib import Path
@@ -756,7 +838,7 @@ import yaml
 from mimir.identities_populator import add_identity_alias, issue_web_key
 from mimir.identities import hash_web_key
 from mimir.plugins.skills import resolve_skill, install_skill
-from mimir_cultivate.setup import _provision_saga
+from mimir_cultivate.setup import _provision_saga, _provision_worklink
 
 m = json.loads(Path('/opt/cultivate-manifest.json').read_text())
 changed = False
@@ -799,10 +881,16 @@ if probe.returncode:
 inventory = home / 'repositories.yaml'
 config = yaml.safe_load(inventory.read_text()) if inventory.exists() else {}
 config = config or {}
+base = Path('/workspace/worklink/base') / repo.name
 entry = {'slug': m['slug'], 'root': str(repo), 'mode': 'rw', 'origin': origin,
-         'base_branch': m['branch'], 'test_command': m['test']}
+         'base_branch': m['branch'], 'test_command': m['test'], 'worklink_base': str(base)}
 rows = config.setdefault('repositories', [])
 old = next((r for r in rows if r.get('slug') == m['slug']), None)
+# Upgrade only an otherwise identical pre-Worklink declaration; never replace
+# an operator's explicitly selected alternate base.
+if old is not None and old == {k: v for k, v in entry.items() if k != 'worklink_base'}:
+    old['worklink_base'] = str(base)
+    changed = True
 if old is not None and old != entry:
     raise RuntimeError('existing repository declaration differs; reconcile manually')
 if old is None:
@@ -817,6 +905,8 @@ text = yaml.safe_dump(config, sort_keys=False)
 if not inventory.exists() or inventory.read_text() != text:
     inventory.write_text(text)
     changed = True
+changed = _provision_worklink(home, entry, base=base,
+                            checkout=repo, git_auth=git_auth, force=m.get('force', False)) or changed
 for name in ('github-poller', 'github-ci-watch', 'github', 'review'):
     skill = resolve_skill('cultivate:' + name, set())
     if skill is None:

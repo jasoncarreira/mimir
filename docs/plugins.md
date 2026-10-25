@@ -55,8 +55,17 @@ Setup prefers executable `tools/verify` or `scripts/verify` (including `.sh`
 variants) over language-default test commands. Rust nextest uses a versioned
 prebuilt binary, taking a `cargo-nextest@X.Y.Z` workflow pin when present
 (default `0.9.148`); Python uv is explicitly pinned (default `0.11.0`).
-The target checkout is `/workspace/<repo-name>`. `WORKLINK_REPO` is intentionally
-unset: configure a dedicated Worklink base separately, never the live checkout.
+The target working checkout is `/workspace/<repo-name>`. Setup also clones the
+same origin and base branch into the persistent Worklink volume at
+`/workspace/worklink/base/<repo-name>` and sets `WORKLINK_REPO` to that dedicated
+base. An existing base must be clean, on the declared branch and have the
+declared origin; reconcile a mismatch manually before retrying. The repository
+inventory keeps `/workspace/<repo-name>` as the working checkout and explicitly
+sets `worklink_base: /workspace/worklink/base/<repo-name>` on that repository's
+`repositories.yaml` entry. Worklink's repository selection and PR-completion
+checks recognize only that exact alternate path, and only beneath a declared
+`rw` allowed root. Omitting `worklink_base` preserves working-checkout-only
+selection; directory names alone never confer trust.
 
 For unattended runs, use `--help` to see the corresponding flags or set
 `MIMIR_CULTIVATE_REPO`, `MIMIR_CULTIVATE_BRANCH`, `MIMIR_CULTIVATE_BOT_LOGIN`,
@@ -72,8 +81,19 @@ web key as separate mode-600 files and does not print either key.
 The generated Compose binds only to `127.0.0.1`, has an init service to own
 the named volumes, and selects Cultivate in the **process environment**. Setup
 also writes a provenance-pinned `build.sh` for reproducible rebuilds. Setup
-provisions the checkout, the repository inventory, the optional GitHub pollers,
-and the owner key before starting the agent. It then checks health, plugin
+provisions the checkout, repository inventory, Chainlink agent identity
+(`cultivate-worklink`), Worklink config, dedicated base, optional GitHub pollers,
+and owner key before starting the agent. Issues are tracked in Chainlink in
+`/home/mimir/agent`. From the deployment directory, file and arm a leaf with:
+
+```sh
+docker compose exec -w /home/mimir/agent agent chainlink issue create "<title>" --description "<acceptance and review criteria>" --priority medium
+docker compose exec -w /home/mimir/agent agent chainlink issue label <issue-id> worklink:ready
+```
+
+Setup writes `<home>/worklink.yaml` from the repository inventory, selecting
+OpenCode, a 5400-second run timeout, and autonomous local-subprocess dispatch. Reruns preserve an
+operator-edited config; use `--force` to replace it intentionally. It then checks health, plugin
 selection, repository binding, poller scheduling, and a web-chat reply. Re-run
 the same command to repair missing provisioning without replacing operator
 secrets. Use `--rotate-web-key` only when intentionally revoking the old key.
