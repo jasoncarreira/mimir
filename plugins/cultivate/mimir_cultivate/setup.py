@@ -37,10 +37,23 @@ DEFAULT_UV_VERSION = "0.11.0"
 
 PAT_HELP = (
     "Create a fine-grained PAT at https://github.com/settings/personal-access-tokens/new: "
-    "resource owner = the bot account; repository access = only the target repository; "
-    "Contents, Pull requests, Issues: Read and write; Actions, Checks, Commit statuses, "
-    "Metadata: Read-only. Invite the bot as a Write collaborator on the repository "
+    "resource owner = the owner of the target repository (the organization for an org repo; "
+    "the org may require approval under Settings, Personal access tokens); "
+    "repository access = only the target repository; Contents, Pull requests, Issues: Read and write; "
+    "Actions, Commit statuses, Metadata: Read-only; optional Workflows: Read and write "
+    "to push changes under .github/workflows/. Invite the bot as a Write collaborator on the repository "
     "and have the bot accept the invitation before continuing."
+)
+_PUSH_PROBE_FAILED = "CULTIVATE_PUSH_PROBE_FAILED"
+_PUSH_PROBE_HELP = (
+    "Token cannot push to the target repository. Recreate the fine-grained PAT with "
+    "resource owner = the repository owner (the organization for an org repo), "
+    "repository access = only the target repository, and Contents: Read and write; "
+    "get organization approval if required."
+)
+_PUSH_PROBE_UNREACHABLE = "CULTIVATE_PUSH_PROBE_UNREACHABLE"
+_PUSH_PROBE_UNREACHABLE_HELP = (
+    "Push probe could not reach the remote (network or GitHub error); retry setup."
 )
 _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.-]*")
 _BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]*")
@@ -171,7 +184,7 @@ def _request(url: str, token: str, *, method: str = "GET") -> tuple[int, object]
 
 
 def validate_token(token: str, bot: str, slug: str, request=_request) -> None:
-    """Probe actual capabilities, not untrusted PAT scope headers."""
+    """Check identity, collaborator role and readable endpoints; push is probed after clone."""
     api = "https://api.github.com"
     status, user = request(api + "/user", token)
     if status != 200 or not isinstance(user, dict):
@@ -182,7 +195,7 @@ def validate_token(token: str, bot: str, slug: str, request=_request) -> None:
     if status != 200 or not isinstance(repo, dict):
         raise SetupError("Bot cannot access the target repository; invite it as a Write collaborator, accept the invitation, and select this repository on the PAT.")
     if repo.get("permissions", {}).get("push") is not True:
-        raise SetupError("Bot lacks push permission; invite it as a Write collaborator and accept the invitation (Contents: Read and write).")
+        raise SetupError("Bot lacks a Write collaborator role; invite the bot as a Write collaborator and accept the invitation.")
     for route, label in (("pulls?per_page=1", "Pull requests: Read and write"),
                          ("actions/runs?per_page=1", "Actions: Read-only")):
         status, _ = request(f"{api}/repos/{slug}/{route}", token)
@@ -373,6 +386,10 @@ def _run(args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None
                             capture_output=True, text=True, timeout=1200, check=False)
     if result.returncode:
         # Docker/gh may reflect a secret in their error output. Never relay it.
+        if _PUSH_PROBE_FAILED in result.stdout.splitlines():
+            raise SetupError(_PUSH_PROBE_HELP)
+        if _PUSH_PROBE_UNREACHABLE in result.stdout.splitlines():
+            raise SetupError(_PUSH_PROBE_UNREACHABLE_HELP)
         raise SetupError(f"{args[0]} operation failed (exit {result.returncode}); inspect the deployment without publishing secrets.")
     return result.stdout.strip()
 
@@ -597,7 +614,9 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
 _PROVISION = '''from pathlib import Path
 import json
 import os
+import re
 import subprocess
+import uuid
 import yaml
 from mimir.identities_populator import add_identity_alias, issue_web_key
 from mimir.identities import hash_web_key
@@ -623,6 +642,21 @@ result = subprocess.run(['git', '-C', str(repo), 'config', '--local', '--get', '
                         capture_output=True, text=True, check=True)
 if result.stdout.strip() != origin:
     raise RuntimeError('existing checkout origin disagrees with target; refuse to bind')
+# Use the checkout's persisted helper, exactly as the agent will. Never print
+# git output: remote errors can reflect credentials. A dry run creates no ref.
+probe = subprocess.run(['git', '-C', str(repo), 'push', '--dry-run', 'origin',
+                        'HEAD:refs/heads/cultivate-setup-probe-' + uuid.uuid4().hex],
+                       capture_output=True, check=False)
+if probe.returncode:
+    # Classify captured bytes locally; never relay git's credential-bearing output.
+    auth_failure = re.search(
+        rb'The requested URL returned error: (?:401|403)(?![0-9])|'
+        rb'Authentication failed|Permission to .+ denied|could not read Username',
+        probe.stderr, re.IGNORECASE,
+    )
+    marker = 'CULTIVATE_PUSH_PROBE_FAILED' if auth_failure else 'CULTIVATE_PUSH_PROBE_UNREACHABLE'
+    print(marker, flush=True)
+    raise SystemExit(1)
 inventory = home / 'repositories.yaml'
 config = yaml.safe_load(inventory.read_text()) if inventory.exists() else {}
 config = config or {}
