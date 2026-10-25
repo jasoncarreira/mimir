@@ -81,7 +81,8 @@ Coding is supplied by the separately packaged `mimir-cultivate` distribution
 `plugins/cultivate` workspace member at the same commit as core. From a source
 checkout, `uv sync --all-packages` (plus your usual `--extra` flags) installs
 both; a plain `uv sync` or `uv sync --extra …` removes it again. Images build it
-from the pinned source commit when `MIMIR_PLUGIN_SELECTION=cultivate` (see
+from the pinned source commit with `--build-arg MIMIR_PLUGIN_SELECTION=cultivate`
+and `--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` (see
 [Docker image assembly](#docker-image-assembly-and-services)). Then set
 `MIMIR_PLUGINS=cultivate` in the operator-owned process environment and restart.
 Installing without selecting does not activate or import the provider.
@@ -105,7 +106,8 @@ selected plugin owns. Startup does not fail.
      `start.sh` that `mimir scaffold-docker` generates does this when Cultivate is
      selected at scaffold time.
    - Root `Dockerfile`: rebuild with
-     `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` (and
+     `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` and
+     `--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` (and
      `--build-arg MIMIR_ENABLE_OPENCODE=1` for the OpenCode CLI the coding tools
      require). Do not list `mimir-cultivate` in `MIMIR_PLUGIN_PACKAGES`; the
      build refuses it.
@@ -357,9 +359,9 @@ still ends by execing `mimir run`; it does not background plugin services.
 Unsupported architecture fails the image build.
 
 The repository-root production `Dockerfile` has s6 and the core `mimir` and
-`watchdog` services. With `MIMIR_PLUGIN_SELECTION=cultivate` (or `all`) at
-build time it also assembles the trusted first-party fragment: pinned OpenCode
-and factory adapters, UID 1002 Worklink user, data directories,
+`watchdog` services. With `MIMIR_PLUGIN_SELECTION=cultivate` (or `all`) and
+`CHAINLINK_ARTIFACT_STAGE=chainlink-build` at build time it also assembles the
+trusted first-party fragment: pinned OpenCode and factory adapters, UID 1002 Worklink user, data directories,
 `opencode-bootstrap` and the exact `worklink-execd` s6 service (not a generic
 prefixed plugin service). Both venvs run Cultivate built from the verified
 source commit, never from an index: the root executor venv overlays core and

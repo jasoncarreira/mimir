@@ -82,7 +82,8 @@ def discover_plugins(*, enable: str | None = None) -> tuple[PluginCandidate, ...
     if missing:
         hint = ("; cultivate is the in-repo plugins/cultivate workspace member: install it with "
                 "`uv sync --all-packages` from the source checkout, or rebuild the image with "
-                "`--build-arg MIMIR_PLUGIN_SELECTION=cultivate`" if "cultivate" in missing else "")
+                "`--build-arg MIMIR_PLUGIN_SELECTION=cultivate` and "
+                "`--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build`" if "cultivate" in missing else "")
         raise PluginDiscoveryError(f"MIMIR_PLUGINS: missing plugin(s): {', '.join(sorted(missing))}{hint}")
     return tuple(candidates)
 

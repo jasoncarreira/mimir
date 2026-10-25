@@ -18,13 +18,29 @@ docker build \
   -t mimir:latest .
 ```
 
-Add `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` (and usually
+Add both `--build-arg MIMIR_PLUGIN_SELECTION=cultivate` and
+`--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build` (and usually
 `--build-arg MIMIR_ENABLE_OPENCODE=1`) for a coding image. Cultivate is not
 published to an index; the build installs core and the in-repo
 `plugins/cultivate` member from the pinned commit into both venvs. Then run the
 container with `MIMIR_PLUGINS=cultivate` in its environment. Without the build
 argument the image is core-only and has no Worklink executor. See
 [upgrading a coding deployment](../docs/plugins.md#upgrading-a-coding-deployment).
+
+The Cultivate image also ships `/usr/local/bin/chainlink` for Worklink claims,
+continuation, and the ready-queue poller. It is built from
+`CHAINLINK_COMMIT=9909d7e0d5c95251f3555e0dd9d71f894cfc4883` with
+`CHAINLINK_RUST_TOOLCHAIN=1.96.0` (both Docker build args). To bump it, resolve
+the intended Chainlink release to a full 40-character Git commit SHA, set
+`--build-arg CHAINLINK_COMMIT=<full-sha>` and, if needed, set
+`--build-arg CHAINLINK_RUST_TOOLCHAIN=<version>`. Update the Dockerfile defaults
+and rebuild the Cultivate image; its build runs `chainlink --version` in the
+runtime stage. The builder's Rust toolchain and Cargo cache are not copied into
+the image. `CHAINLINK_ARTIFACT_STAGE` defaults to `chainlink-none`, an empty
+placeholder stage: core-only builds neither include the binary nor schedule its
+Rust builder or fetch its source. Selecting Cultivate (including `all`) without
+`CHAINLINK_ARTIFACT_STAGE=chainlink-build` fails the build with an actionable
+error; a missing or broken installed CLI also fails `chainlink --version`.
 
 With Cultivate selected, and only then, the image also creates the `worklink`
 user and group (UID/GID 1002), the `/var/lib/mimir-worklink` checkout roots and

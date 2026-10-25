@@ -506,6 +506,7 @@ class TestConfigFromEnv:
     def _assert_upgrade_hint(self, message: str) -> None:
         assert "uv sync --all-packages" in message
         assert "--build-arg MIMIR_PLUGIN_SELECTION=cultivate" in message
+        assert "--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build" in message
         assert "set MIMIR_PLUGINS=cultivate in the process or supervisor environment" in message
         assert "Do NOT put MIMIR_PLUGINS in the agent home's .env" in message
 
