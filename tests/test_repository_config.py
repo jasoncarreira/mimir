@@ -316,6 +316,27 @@ def _load_test_suite_inventory(tmp_path: Path, **fields: object) -> RepositoryCo
     return RepositoryInventory.load(config).repositories[0]
 
 
+@pytest.mark.parametrize("branches", [None, [], ["feature/plugins", "release/next"]])
+def test_repository_integration_branches_parse(tmp_path: Path, branches: list[str] | None) -> None:
+    fields = {} if branches is None else {"integration_branches": branches}
+    assert _load_test_suite_inventory(tmp_path, **fields).integration_branches == tuple(branches or ())
+
+
+@pytest.mark.parametrize("branches", [None, "feature/plugins", {}, [""], ["a b"],
+                                      ["../escape"], ["feature//plugins"], [1]])
+def test_repository_integration_branches_reject_invalid_names(
+    tmp_path: Path, branches: object,
+) -> None:
+    with pytest.raises(ValueError, match="integration_branches must be a list of valid branch names"):
+        _load_test_suite_inventory(tmp_path, integration_branches=branches)
+
+
+@pytest.mark.parametrize("base", ["", "a b", "../escape", "feature//plugins"])
+def test_repository_base_branch_uses_same_branch_name_rules(tmp_path: Path, base: str) -> None:
+    with pytest.raises(ValueError, match="base_branch must be a valid branch name"):
+        _load_test_suite_inventory(tmp_path, base_branch=base)
+
+
 def test_repository_test_suite_defaults_and_immutability(tmp_path: Path) -> None:
     suite = RepositoryTestSuite("unit", "pytest")
     assert suite.default is False

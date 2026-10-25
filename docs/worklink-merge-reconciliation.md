@@ -19,9 +19,17 @@ The home must declare `repositories.yaml`, select that repository from
 `worklink.yaml`, grant it `rw` mode, and set `WORKLINK_REPO` (or its supported
 alias) to the exact configured Git root. The local Git top-level and origin,
 the PR URL and API identity, and the PR base repository must all match that
-inventory. The completing base is the inventory's `base_branch`; target branch
-overrides and intermediate stack bases are deliberately left for a human even
-when otherwise legitimate.
+inventory. An optional `integration_branches` list in the repository's
+`repositories.yaml` entry approves additional completion bases (empty by
+default). A leaf's `Worklink notes` Target branch must be `base_branch` or a
+listed integration branch; without a target, completion uses `base_branch`.
+The merged PR and active evidence must both name that leaf-specific base.
+Other targets and intermediate stack bases remain for human reconciliation.
+With no integration branches configured, an unapproved target retains the
+legacy `completion_base_mismatch` refusal; otherwise it reports
+`completion_target_not_allowed`.
+Open PRs raise no base or target notices, even if their current base differs;
+closed-unmerged PRs retain their existing handling.
 
 Only an open `worklink:review` ordinary leaf qualifies. `worklink:epic` and
 competing lifecycle labels do not. A parent ID alone does not make an issue an
@@ -40,7 +48,7 @@ For a qualifying merge, Worklink posts one deterministic audit marker, reads a
 fresh strict issue snapshot that contains that exact marker, then starts and
 submits the close. It verifies the issue is closed before removing
 `worklink:review`, and verifies label absence before finalizing. The audit names
-the PR URL, merge timestamp, merge commit, configured completion base, and
+the PR URL, merge timestamp, merge commit, actual completion base, and
 stable intent key. A finalized tombstone makes repeated sweeps harmless and
 prevents an operator-reopened issue from being closed again.
 
