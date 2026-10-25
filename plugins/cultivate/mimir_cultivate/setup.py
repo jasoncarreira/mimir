@@ -8,8 +8,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+from datetime import datetime, timezone
 import getpass
+import hashlib
+from importlib import metadata, resources
 import json
+from urllib.parse import quote
 import os
 from pathlib import Path
 import re
@@ -25,6 +29,11 @@ import yaml
 
 from .repository import valid_repository_slug
 
+
+# Tool defaults are explicit; repository declarations take precedence.
+DEFAULT_SOURCE_REPO = "jasoncarreira/mimir"
+DEFAULT_NEXTEST_VERSION = "0.9.148"
+DEFAULT_UV_VERSION = "0.11.0"
 
 PAT_HELP = (
     "Create a fine-grained PAT at https://github.com/settings/personal-access-tokens/new: "
@@ -43,10 +52,51 @@ class SetupError(Exception):
     """Actionable error; never include an untrusted response body or a secret."""
 
 
+def _installed_license() -> tuple[bytes, str]:
+    """Read the wheel resource (or its editable-distribution source), never cwd."""
+    dist = metadata.distribution("mimir-cultivate")
+    resource = resources.files("mimir_cultivate").joinpath("LICENSE")
+    if resource.is_file():
+        return resource.read_bytes(), dist.version
+    # Hatch editable installs expose the source package, with LICENSE beside it.
+    source_license = Path(__file__).resolve().parent.parent / "LICENSE"
+    if source_license.is_file():
+        return source_license.read_bytes(), dist.version
+    raise SetupError("Installed Cultivate license is missing; reinstall mimir-cultivate before setup.")
+
+
+def _license_gate(args: argparse.Namespace) -> None:
+    license_bytes, version = _installed_license()
+    digest = hashlib.sha256(license_bytes).hexdigest()
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    record = config / "mimir" / "cultivate-license-accepted.json"
+    try:
+        prior = json.loads(record.read_text())
+    except (OSError, ValueError):
+        prior = {}
+    if isinstance(prior, dict) and prior.get("sha256") == digest:
+        return
+    print("Cultivate uses the Business Source License 1.1 (BSL 1.1), NOT core Mimir's MIT license.")
+    print(license_bytes.decode("utf-8"))
+    if not getattr(args, "accept_license", False):
+        if not sys.stdin.isatty():
+            raise SetupError("Review the license above, then pass --accept-license for non-interactive setup.")
+        try:
+            accepted = input("Accept this license? Type yes or accept: ").strip().lower()
+        except EOFError:
+            accepted = ""
+        if accepted not in {"yes", "accept"}:
+            raise SetupError("Cultivate license not accepted; nothing was written.")
+    record.parent.mkdir(parents=True, exist_ok=True)
+    _write(record, json.dumps({"sha256": digest, "version": version,
+                              "accepted_at": datetime.now(timezone.utc).isoformat()}, indent=2) + "\n",
+           mode=0o600, replace=True)
+
+
 def validate(name: str, value: str) -> str:
     """Validate fields before any side effect or command interpolation."""
     value = value.strip()
-    if name == "repo":
+    if name in {"repo", "source_repo"}:
         ok = valid_repository_slug(value) and all(p not in {".", ".."} for p in value.split("/"))
     elif name in {"bot_login", "owner", "display_name"}:
         ok = bool(_NAME.fullmatch(value)) if name != "display_name" else bool(value) and "\n" not in value
@@ -178,22 +228,52 @@ def detect_toolchain(files: dict[str, str | None]) -> tuple[str, str, str]:
     raise SetupError("No supported toolchain found; add rust-toolchain.toml, package.json or pyproject.toml.")
 
 
-def render_layer(kind: str, version: str, root_image: str) -> str:
-    """Keep tools on the pinned /usr/local/bin PATH, without changing shell policy."""
+def _verify_script(slug: str, branch: str, token: str, request=_request) -> str | None:
+    status, tree = request(f"https://api.github.com/repos/{slug}/git/trees/{quote(branch, safe='')}?recursive=1", token)
+    if status != 200 or not isinstance(tree, dict) or tree.get("truncated"):
+        raise SetupError("Cannot inspect executable verification scripts; check Contents permission and repository tree size.")
+    executable = {row.get("path") for row in tree.get("tree", [])
+                  if row.get("type") == "blob" and row.get("mode") == "100755"}
+    for path in ("tools/verify", "scripts/verify", "tools/verify.sh", "scripts/verify.sh", "verify", "verify.sh"):
+        if path in executable:
+            return "./" + path
+    return None
+
+
+def _tool_pin(files: dict[str, str | None], tool: str, default: str) -> str:
+    patterns = {
+        "nextest": r"cargo-nextest@([0-9]+\.[0-9]+\.[0-9]+)",
+        "uv": r"uv-version:\s*['\"]?([0-9]+\.[0-9]+\.[0-9]+)",
+    }
+    pins = {match for text in files.values() if text for match in re.findall(patterns[tool], text)}
+    if len(pins) > 1:
+        raise SetupError(f"Conflicting {tool} version pins; reconcile the repository declarations.")
+    return next(iter(pins), default)
+
+
+def render_layer(kind: str, version: str, root_image: str, *,
+                 nextest_version: str = DEFAULT_NEXTEST_VERSION,
+                 uv_version: str = DEFAULT_UV_VERSION) -> str:
+    """Keep version-pinned tools on /usr/local/bin, without changing shell policy."""
     if kind == "rust":
         install = ("ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/workspace/.cargo\n"
                    "ENV CARGO_INSTALL_ROOT=/opt/cargo\n"
                    "ENV CARGO_HOME=/opt/cargo\n"
-                   "RUN mkdir -p /opt/rustup /opt/cargo && curl -fsSL https://sh.rustup.rs | sh -s -- -y "
-                   f"--no-modify-path --default-toolchain {version} && "
+                   "RUN arch=$(dpkg --print-architecture); case $arch in amd64) triple=x86_64-unknown-linux-gnu;; "
+                   "arm64) triple=aarch64-unknown-linux-gnu;; *) exit 2;; esac && "
+                   "mkdir -p /opt/rustup /opt/cargo && "
+                   "curl -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/$triple/rustup-init && "
+                   "chmod 755 /tmp/rustup-init && /tmp/rustup-init -y "
+                   f"--no-modify-path --default-toolchain {version} && rm /tmp/rustup-init && "
                    "chmod -R a+rX /opt/rustup /opt/cargo && "
                    "ln -s /opt/cargo/bin/rustup /usr/local/bin/rustup && "
                    "ln -s /opt/cargo/bin/cargo /usr/local/bin/cargo && "
                    "ln -s /opt/cargo/bin/rustc /usr/local/bin/rustc && "
                    "ln -s /opt/cargo/bin/rustfmt /usr/local/bin/rustfmt && "
                    "ln -s /opt/cargo/bin/cargo-clippy /usr/local/bin/cargo-clippy && "
-                   "RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo cargo install cargo-nextest --locked && "
-                   "ln -s /opt/cargo/bin/cargo-nextest /usr/local/bin/cargo-nextest\n"
+                   "arch=$(dpkg --print-architecture); case $arch in amd64) platform=linux;; arm64) platform=linux-arm;; *) exit 2;; esac && "
+                   f"curl -fsSLo /tmp/nextest.tar.gz https://get.nexte.st/{nextest_version}/$platform && "
+                   "tar -xzf /tmp/nextest.tar.gz -C /usr/local/bin cargo-nextest && rm /tmp/nextest.tar.gz\n"
                    "ENV CARGO_HOME=/workspace/.cargo\n")
     elif kind == "node":
         install = (f"RUN arch=$(dpkg --print-architecture); case $arch in amd64) arch=x64;; arm64) ;; *) exit 2;; esac && "
@@ -203,10 +283,47 @@ def render_layer(kind: str, version: str, root_image: str) -> str:
                    "&& ln -sf /opt/node/bin/npx /usr/local/bin/npx && rm /tmp/node.tar.xz\n")
     else:
         install = ("ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python\n"
-                   "RUN curl -LsSf https://astral.sh/uv/install.sh | sh && "
+                   f"RUN curl -LsSf https://astral.sh/uv/{uv_version}/install.sh | sh && "
                    "cp /root/.local/bin/uv /usr/local/bin/uv && cp /root/.local/bin/uvx /usr/local/bin/uvx\n"
                    f"RUN uv python install {version} && chmod -R a+rX /opt/uv-python\n")
     return f"FROM {root_image}\nUSER root\n{install}RUN mkdir -p /workspace /workspace/pr-leases /workspace/worklink && chown -R 1001:1001 /workspace\nUSER root\n"
+
+
+def render_compose(template: str, layer_tag: str, kind: str) -> str:
+    """Modify the scaffold structurally; fail closed on incompatible shapes."""
+    try:
+        # Scaffold's prose header contains a shell printf example with a literal
+        # newline; parse the document from its top-level services key instead.
+        document = re.search(r"(?m)^services:\s*$", template)
+        if document is None:
+            raise KeyError("services")
+        doc = yaml.safe_load(template[document.start():])
+        agent = doc["services"]["agent"]
+        environment = agent["environment"]
+        if not isinstance(environment, dict) or not isinstance(agent["build"], (dict, str)):
+            raise TypeError
+        del agent["build"]
+        agent["image"] = layer_tag
+        passthrough = "UV_PYTHON_INSTALL_DIR" if kind == "python" else "RUSTUP_HOME,CARGO_HOME" if kind == "rust" else ""
+        environment.update({"MIMIR_ACP_ENABLED": "1", "MIMIR_PR_CHECKOUT_LEASE_ROOT": "/workspace/pr-leases",
+                            "MIMIR_SHELL_PASS_ENV": passthrough, "MIMIR_ENABLE_CLAUDE_CODE": "0",
+                            "MIMIR_HOME": "/home/mimir/agent", "MIMIR_PLUGINS": "cultivate"})
+        # Worklink requires its own dedicated base, not the live working checkout.
+        environment.pop("WORKLINK_REPO", None)
+        volumes = ["home:/home/mimir/agent", "cache:/home/mimir/.cache", "workspace:/workspace",
+                   "pr-leases:/workspace/pr-leases", "worklink:/workspace/worklink"]
+        agent["volumes"] = volumes
+        agent.setdefault("depends_on", {})["init"] = {"condition": "service_completed_successfully"}
+        doc["services"]["init"] = {
+            "image": layer_tag, "user": "root", "entrypoint": ["/bin/sh", "-c"],
+            "command": ["mkdir -p /workspace/pr-leases /workspace/worklink /home/mimir/agent /home/mimir/.cache "
+                        "&& chown -R 1001:1001 /workspace /home/mimir/agent /home/mimir/.cache"],
+            "volumes": volumes,
+        }
+        doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink")}
+        return yaml.safe_dump(doc, sort_keys=False)
+    except (KeyError, TypeError, AttributeError, yaml.YAMLError):
+        raise SetupError("Incompatible scaffold Compose template; expected agent build and environment mapping.") from None
 
 
 def _write(path: Path, text: str, *, mode: int = 0o644, replace: bool = False) -> bool:
@@ -328,11 +445,13 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("port", "Free loopback port (default: next free from 8090)."),
         ("test-command", "Verification command for target repo; default detected from repo."),
         ("source-ref", "Pushed Mimir source ref (default: refs/heads/feature/plugins)."),
+        ("source-repo", "Mimir source owner/name (default: " + DEFAULT_SOURCE_REPO + ")."),
     ):
         setup.add_argument("--" + name, help=help_text)
     for name in ("github-token", "model-key"):
         setup.add_argument("--" + name + "-file", help="Read secret from a mode-600 file (never from argv).")
         setup.add_argument("--" + name + "-stdin", action="store_true", help="Read one secret line from stdin.")
+    setup.add_argument("--accept-license", action="store_true", help="Explicitly accept the shipped Cultivate BSL 1.1 license for unattended setup.")
     setup.add_argument("--rotate-web-key", action="store_true", help="Replace the owner's existing web key intentionally.")
     return parser
 
@@ -352,6 +471,7 @@ def dispatch(args: argparse.Namespace) -> int:
 
 
 def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verify) -> None:
+    _license_gate(args)
     repo = _field(args, "repo", "Target owner/name: find it in the GitHub repository URL; used for clone and policy.")
     branch = _field(args, "branch", "Base branch: select the repository's default branch on GitHub; used for PRs.", default="main")
     bot = _field(args, "bot_login", "Bot login: create a separate GitHub account; used to check token identity.")
@@ -372,13 +492,19 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     key_name = provider.upper() + "_API_KEY"
     model_key = _secret(args, "model_key", f"Model key: obtain it in your {provider} API console; input is hidden.", previous=prior.get(key_name))
     source_ref = _field(args, "source_ref", "Mimir source ref: a pushed branch or tag on the canonical GitHub repository.", default="refs/heads/feature/plugins")
-    status, source = request("https://api.github.com/repos/jasoncarreira/mimir/git/ref/" + source_ref[5:], token)
+    source_repo = _field(args, "source_repo", "Mimir source owner/name: canonical repo or a trusted fork.", default=DEFAULT_SOURCE_REPO)
+    source_url = "https://github.com/" + source_repo + ".git"
+    status, source = request("https://api.github.com/repos/" + source_repo + "/git/ref/" + source_ref[5:], token)
     if status != 200 or not isinstance(source, dict) or not _SHA.fullmatch(str(source.get("object", {}).get("sha", ""))):
         raise SetupError("Cannot verify a pushed full Mimir source SHA from --source-ref; push the ref and retry.")
     sha = source["object"]["sha"]
     files = {name: _content(repo, branch, name, token, request) for name in
-             ("rust-toolchain.toml", "Cargo.toml", "package.json", "pyproject.toml", "uv.lock", ".python-version")}
+             ("rust-toolchain.toml", "Cargo.toml", "package.json", "pyproject.toml", "uv.lock", ".python-version",
+              ".github/workflows/rust.yml", ".github/workflows/ci.yml")}
     kind, version, suggestion = detect_toolchain(files)
+    suggestion = _verify_script(repo, branch, token, request) or suggestion
+    nextest_version = _tool_pin(files, "nextest", DEFAULT_NEXTEST_VERSION)
+    uv_version = _tool_pin(files, "uv", DEFAULT_UV_VERSION)
     print(f"Detected {kind} {version}; suggested test command: {suggestion}")
     test = _field(args, "test_command", "Test command: verify in your repo's CI/docs, then confirm this suggestion or override it.", default=suggestion)
     previous_port = None
@@ -395,7 +521,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     deploy.chmod(0o700)
     tag = "mimir-cultivate-root:" + sha
     layer_tag = "mimir-cultivate-agent:" + sha + "-" + kind + version.replace(".", "-")
-    _write(deploy / "Dockerfile.toolchain", render_layer(kind, version, tag))
+    _write(deploy / "Dockerfile.toolchain", render_layer(kind, version, tag,
+           nextest_version=nextest_version, uv_version=uv_version))
     build_args = ["--build-arg MIMIR_GIT_REF=" + source_ref,
                   "--build-arg MIMIR_CONTROLLER_COMMIT=" + sha,
                   "--build-arg MIMIR_EXECUTOR_COMMIT=" + sha,
@@ -403,51 +530,14 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   "--build-arg MIMIR_ENABLE_OPENCODE=1",
                   "--build-arg MIMIR_EXTRAS=" + provider]
     _write(deploy / "build.sh", "#!/bin/sh\nset -eu\n"
-           + "docker build -t " + tag + " " + " ".join(build_args) + " https://github.com/jasoncarreira/mimir.git#" + sha + "\n"
+           + "docker build -t " + tag + " " + " ".join(build_args) + " " + source_url + "#" + sha + "\n"
            + "docker build -t " + layer_tag + " -f Dockerfile.toolchain .\n", mode=0o755)
     from mimir.scaffold_docker import render_compose_yml
 
     # Start from the existing loopback-only compose renderer; use root-image
     # service/volumes rather than its pypi installation build path.
     compose = render_compose_yml(service_name="agent", web_port=port, mode="pypi")
-    compose = compose[compose.index("services:\n"):]
-    compose = compose.replace("    build:\n" + compose.split("    build:\n", 1)[1].split("    container_name:", 1)[0],
-                              f"    image: {layer_tag}\n")
-    passthrough = "UV_PYTHON_INSTALL_DIR" if kind == "python" else "RUSTUP_HOME,CARGO_HOME" if kind == "rust" else ""
-    compose = compose.replace("      MIMIR_ENABLE_CLAUDE_CODE: ${MIMIR_ENABLE_CLAUDE_CODE:-0}",
-                              "      MIMIR_ACP_ENABLED: '1'\n      MIMIR_PR_CHECKOUT_LEASE_ROOT: /workspace/pr-leases\n      WORKLINK_REPO: /workspace/mimir\n      MIMIR_SHELL_PASS_ENV: '" + passthrough + "'\n      MIMIR_ENABLE_CLAUDE_CODE: '0'")
-    compose = compose.replace("      MIMIR_HOME: /mimir-home", "      MIMIR_HOME: /home/mimir/agent")
-    compose = compose.replace('      MIMIR_PLUGINS: "${MIMIR_PLUGINS:-}"', "      MIMIR_PLUGINS: cultivate")
-    compose = compose.replace("      # Persistent agent state", "      # Persistent agent state")
-    compose = compose[:compose.index("    volumes:\n")] + """    volumes:
-      - home:/home/mimir/agent
-      - cache:/home/mimir/.cache
-      - workspace:/workspace
-      - pr-leases:/workspace/pr-leases
-      - worklink:/workspace/worklink
-volumes:
-  home:
-  cache:
-  workspace:
-  pr-leases:
-  worklink:
-"""
-    # Root image creates the home/cache mount points. All other volumes are
-    # owned at every startup, before the non-root agent enters the container.
-    compose = compose.replace("services:\n", """services:
-  init:
-    image: """ + layer_tag + """
-    user: root
-    entrypoint: ["/bin/sh", "-c"]
-    command: ["mkdir -p /workspace/mimir /workspace/pr-leases /workspace/worklink /home/mimir/agent /home/mimir/.cache && chown -R 1001:1001 /workspace /home/mimir/agent /home/mimir/.cache"]
-    volumes:
-      - home:/home/mimir/agent
-      - cache:/home/mimir/.cache
-      - workspace:/workspace
-      - pr-leases:/workspace/pr-leases
-      - worklink:/workspace/worklink
-""", 1)
-    compose = compose.replace("  agent:\n", "  agent:\n    depends_on:\n      init:\n        condition: service_completed_successfully\n", 1)
+    compose = render_compose(compose, layer_tag, kind)
     _write(compose_path, compose)
     _write(deploy / ".gitignore", "*\n")
     # The toolchain layer has no COPY instructions. Docker still sends the
@@ -473,7 +563,7 @@ volumes:
     run(["docker", "build", "-t", tag, "--build-arg", "MIMIR_GIT_REF=" + source_ref,
          "--build-arg", "MIMIR_CONTROLLER_COMMIT=" + sha, "--build-arg", "MIMIR_EXECUTOR_COMMIT=" + sha,
          "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate", "--build-arg", "MIMIR_ENABLE_OPENCODE=1",
-         "--build-arg", "MIMIR_EXTRAS=" + provider, "https://github.com/jasoncarreira/mimir.git#" + sha], cwd=deploy)
+         "--build-arg", "MIMIR_EXTRAS=" + provider, source_url + "#" + sha], cwd=deploy)
     run(["docker", "build", "-t", layer_tag, "-f", "Dockerfile.toolchain", "."], cwd=deploy)
     run(["docker", "compose", "run", "--rm", "init"], cwd=deploy)
     provisioned = run(["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",
@@ -514,14 +604,19 @@ from mimir.plugins.skills import resolve_skill, install_skill
 m = json.loads(Path('/opt/cultivate-manifest.json').read_text())
 changed = False
 home = Path('/home/mimir/agent')
-repo = Path('/workspace/mimir')
+repo = Path('/workspace') / m['slug'].split('/')[1]
 origin = 'https://github.com/' + m['slug'] + '.git'
+# Persist only the helper program, never the token. Git runs it for future
+# fetch/push too; the credential is read at runtime from the process environment.
+helper = '!f() { if [ "$1" = get ]; then printf "%s\\\\n" "username=x-access-token" "password=$GITHUB_TOKEN"; fi; }; f'
+git_auth = ['git', '-c', 'credential.helper=', '-c', 'credential.https://github.com.helper=' + helper]
 if not (repo / '.git').is_dir():
-    # No credentials in URL/argv. git uses gh's token from the process env;
-    # never print git output (which may reflect authentication headers).
-    subprocess.run(['gh', 'auth', 'setup-git'], capture_output=True, check=True)
-    subprocess.run(['git', 'clone', '--branch', m['branch'], origin, str(repo)],
+    subprocess.run(git_auth + ['clone', '--branch', m['branch'], origin, str(repo)],
                    capture_output=True, check=True)
+subprocess.run(['git', '-C', str(repo), 'config', '--local', 'credential.helper', ''],
+               capture_output=True, check=True)
+subprocess.run(['git', '-C', str(repo), 'config', '--local', 'credential.https://github.com.helper', helper],
+               capture_output=True, check=True)
 result = subprocess.run(['git', '-C', str(repo), 'config', '--local', '--get', 'remote.origin.url'],
                         capture_output=True, text=True, check=True)
 if result.stdout.strip() != origin:

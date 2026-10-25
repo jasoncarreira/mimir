@@ -19,6 +19,76 @@ from mimir_cultivate import setup as installer
 SHA = "a" * 40
 
 
+@pytest.fixture(autouse=True)
+def isolated_license_record(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+
+@pytest.mark.parametrize("answer", ["no", "y", "", None])
+def test_license_decline_or_eof_writes_nothing_before_other_work(tmp_path, monkeypatch, capsys, answer):
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: True)
+    license_text = "Business Source License 1.1\nFULL SHIPPED TERMS\n"
+    monkeypatch.setattr(installer, "_installed_license", lambda: (license_text.encode(), "1.2.3"))
+    def prompt(text):
+        assert "FULL SHIPPED TERMS" in capsys.readouterr().out
+        if answer is None:
+            raise EOFError
+        return answer
+    monkeypatch.setattr("builtins.input", prompt)
+    monkeypatch.setattr(installer, "_field", lambda *a, **kw: pytest.fail("other prompt before license"))
+    assert installer.dispatch(argparse.Namespace(cultivate_action="setup")) == 1
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("answer", ["yes", "accept"])
+def test_license_acceptance_hash_version_timestamp_and_reprompt(tmp_path, monkeypatch, capsys, answer):
+    import hashlib
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: True)
+    text = [b"Full BSL 1.1 shipped terms\n"]
+    monkeypatch.setattr(installer, "_installed_license", lambda: (text[0], "1.2.3"))
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or answer)
+    args = argparse.Namespace(accept_license=False)
+    installer._license_gate(args)
+    record_path = tmp_path / "config/mimir/cultivate-license-accepted.json"
+    record = json.loads(record_path.read_text())
+    assert record["sha256"] == hashlib.sha256(text[0]).hexdigest()
+    assert record["version"] == "1.2.3" and record["accepted_at"]
+    original = record_path.read_bytes()
+    assert text[0].decode() in capsys.readouterr().out
+    installer._license_gate(args)
+    assert capsys.readouterr().out == ""
+    assert record_path.read_bytes() == original and len(prompts) == 1
+    text[0] += b"Changed terms\n"
+    installer._license_gate(args)
+    assert "Changed terms" in capsys.readouterr().out and len(prompts) == 2
+    assert json.loads(record_path.read_text())["sha256"] != record["sha256"]
+
+
+def test_noninteractive_license_needs_explicit_flag(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(installer, "_installed_license", lambda: (b"FULL LICENSE\n", "1.2.3"))
+    with pytest.raises(installer.SetupError, match="--accept-license"):
+        installer._license_gate(argparse.Namespace(accept_license=False))
+    assert not list(tmp_path.iterdir())
+    installer._license_gate(argparse.Namespace(accept_license=True))
+    assert "FULL LICENSE" in capsys.readouterr().out
+    installer._license_gate(argparse.Namespace(accept_license=False))
+    assert capsys.readouterr().out == ""
+
+
+def test_license_uses_installed_resource_not_cwd(tmp_path, monkeypatch):
+    from importlib import resources, metadata
+    text, version = installer._installed_license()
+    resource = resources.files("mimir_cultivate").joinpath("LICENSE")
+    expected = resource.read_bytes() if resource.is_file() else Path(installer.__file__).resolve().parent.parent.joinpath("LICENSE").read_bytes()
+    assert text == expected and b"Business Source License" in text
+    assert version == metadata.version("mimir-cultivate")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "LICENSE").write_text("wrong terms")
+    assert installer._installed_license() == (text, version)
+
+
 def test_validation_and_github_permissions():
     for name, value in (("repo", "../escape"), ("repo", "o/."),
                         ("branch", "../main"), ("bot_email", "bad\nname@example.com"),
@@ -70,7 +140,7 @@ def test_detects_repo_pins_and_pinned_path(files, expected):
     assert expected[1] in layer
     if expected[0] == "rust":
         assert "RUSTUP_HOME=/opt/rustup" in layer
-        assert "/usr/local/bin/cargo-nextest" in layer
+        assert "-C /usr/local/bin cargo-nextest" in layer
     if expected[0] == "node":
         assert "/usr/local/bin/node" in layer
     if expected[0] == "python":
@@ -91,7 +161,8 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     token_file.chmod(0o600)
     model_file.chmod(0o600)
     args = parser.parse_args([
-        "cultivate", "setup", "--repo", "org/repo", "--branch", "main", "--bot-login", "bot",
+        "cultivate", "setup", "--accept-license", "--source-repo", "neworg/mimir",
+        "--repo", "org/repo", "--branch", "main", "--bot-login", "bot",
         "--bot-email", "bot@example.com", "--owner", "owner", "--display-name", "Owner Name",
         "--owner-email", "owner@example.com", "--model-spec", "openai:gpt-test",
         "--github-token-file", str(token_file), "--model-key-file", str(model_file),
@@ -105,7 +176,10 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
         if url.endswith("/repos/org/repo"):
             return 200, {"permissions": {"push": True}}
         if "/git/ref/heads/feature/plugins" in url:
+            assert "/repos/neworg/mimir/" in url
             return 200, {"object": {"sha": SHA}}
+        if "/git/trees/" in url:
+            return 200, {"tree": [{"path": "tools/verify", "mode": "100755", "type": "blob"}]}
         if "/contents/" in url:
             if "package.json" in url:
                 return 200, {"encoding": "base64", "content": base64.b64encode(
@@ -145,13 +219,18 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert (deploy / "owner-web-key").stat().st_mode & 0o777 == 0o600
     assert github_secret in (deploy / "compose.env").read_text()
     assert (deploy / "build.sh").stat().st_mode & 0o777 == 0o755
-    assert "https://github.com/jasoncarreira/mimir.git#" + SHA in (deploy / "build.sh").read_text()
+    assert "https://github.com/neworg/mimir.git#" + SHA in (deploy / "build.sh").read_text()
+    assert any("https://github.com/neworg/mimir.git#" + SHA in argv for argv in calls)
+    assert json.loads((deploy / "manifest.json").read_text())["test"] == "./tools/verify"
     assert (deploy / ".dockerignore").read_text() == "*\n!Dockerfile.toolchain\n"
     for name in ("compose.yml", "Dockerfile.toolchain", "manifest.json", "provision.py"):
         text = (deploy / name).read_text()
         assert github_secret not in text and model_secret not in text
     compose = yaml.safe_load((deploy / "compose.yml").read_text())
     assert compose["services"]["agent"]["environment"]["MIMIR_PLUGINS"] == "cultivate"
+    assert "WORKLINK_REPO" not in compose["services"]["agent"]["environment"]
+    assert compose["services"]["agent"]["environment"]["MIMIR_ACP_ENABLED"] == "1"
+    assert compose["services"]["agent"]["environment"]["MIMIR_PR_CHECKOUT_LEASE_ROOT"] == "/workspace/pr-leases"
     assert compose["services"]["agent"]["depends_on"]["init"]["condition"] == "service_completed_successfully"
     assert set(compose["volumes"]) == {"home", "cache", "workspace", "pr-leases", "worklink"}
     assert any("MIMIR_CONTROLLER_COMMIT=" + SHA in part for argv in calls for part in argv)
@@ -168,6 +247,76 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     with pytest.raises(installer.SetupError, match="pushed full"):
         installer.setup(args, request=unpushed, run=run, verify=lambda *a: None)
     assert len(calls) == before_calls
+
+
+def test_pinned_auxiliary_tools_and_repo_override():
+    files = {".github/workflows/rust.yml": "uses: taiki-e/install-action@v2\nwith:\n  tool: cargo-nextest@0.9.147"}
+    pin = installer._tool_pin(files, "nextest", installer.DEFAULT_NEXTEST_VERSION)
+    assert pin == "0.9.147"
+    layer = installer.render_layer("rust", "1.99.1", "root:sha", nextest_version=pin)
+    assert "https://get.nexte.st/0.9.147/$platform" in layer
+    assert "platform=linux-arm" in layer and "platform=linux" in layer
+    assert "cargo install" not in layer and "sh.rustup.rs" not in layer
+    assert "/rustup/archive/1.28.2/" in layer
+    assert installer._tool_pin({}, "nextest", installer.DEFAULT_NEXTEST_VERSION) == "0.9.148"
+    assert "https://astral.sh/uv/" + installer.DEFAULT_UV_VERSION + "/install.sh" in installer.render_layer("python", "3.11.11", "root:sha")
+    files["another"] = "cargo-nextest@0.9.146"
+    with pytest.raises(installer.SetupError, match="Conflicting"):
+        installer._tool_pin(files, "nextest", installer.DEFAULT_NEXTEST_VERSION)
+
+
+@pytest.mark.parametrize("path", ["tools/verify", "scripts/verify", "tools/verify.sh", "scripts/verify.sh"])
+def test_executable_verify_script_preferred(path):
+    for mode, expected in (("100755", "./" + path), ("100644", None)):
+        assert installer._verify_script("org/repo", "feature/test", "secret", lambda url, token: (
+            200, {"tree": [{"path": path, "mode": mode, "type": "blob"}]})) == expected
+    with pytest.raises(installer.SetupError, match="inspect"):
+        installer._verify_script("org/repo", "main", "secret", lambda *a: (200, {"truncated": True}))
+
+
+def test_compose_structural_changes_survive_format_drift_and_refuse_invalid_shape():
+    from mimir.scaffold_docker import render_compose_yml
+    template = render_compose_yml(service_name="agent", web_port=8123, mode="pypi")
+    doc = yaml.safe_load(template[template.index("services:\n"):])
+    doc["services"]["agent"]["environment"].pop("MIMIR_PLUGINS")
+    doc["services"]["agent"]["environment"].pop("MIMIR_ENABLE_CLAUDE_CODE")
+    # Different ordering, indentation and missing old lines cannot silently
+    # omit required settings when the installer modifies a parsed mapping.
+    drifted = yaml.safe_dump(doc, sort_keys=True, indent=4)
+    result = yaml.safe_load(installer.render_compose(drifted, "image:sha", "rust"))
+    agent = result["services"]["agent"]
+    assert agent["image"] == "image:sha" and "build" not in agent
+    assert agent["environment"]["MIMIR_PLUGINS"] == "cultivate"
+    assert agent["environment"]["MIMIR_ACP_ENABLED"] == "1"
+    assert agent["environment"]["MIMIR_HOME"] == "/home/mimir/agent"
+    for bad in ("services: {}", "services: {agent: {build: {}, environment: []}}", "broken: ["):
+        with pytest.raises(installer.SetupError, match="Incompatible scaffold"):
+            installer.render_compose(bad, "image:sha", "rust")
+
+
+def test_plain_git_credential_helper_reads_environment_without_persisting_secret(tmp_path):
+    # Exercise Git's real helper protocol with no network or gh binary. Run the
+    # production helper assignments extracted from the provisioning program.
+    import ast
+    tree = ast.parse(installer._PROVISION)
+    helper_node = next(node for node in tree.body if isinstance(node, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == "helper" for t in node.targets))
+    helper = ast.literal_eval(helper_node.value)
+    import os
+    env = dict(os.environ, GITHUB_TOKEN="fixture-private-token", GIT_CONFIG_NOSYSTEM="1",
+               GIT_CONFIG_GLOBAL=str(tmp_path / "empty-config"), GIT_TERMINAL_PROMPT="0")
+    result = subprocess.run(["git", "-c", "credential.helper=", "-c", "credential.helper=" + helper,
+                             "credential", "fill"], input="protocol=https\nhost=github.com\n\n",
+                            text=True, capture_output=True, env=env, check=True)
+    assert "password=fixture-private-token" in result.stdout
+    assert "fixture-private-token" not in helper and not result.stderr
+
+
+def test_source_repo_validation():
+    assert installer.validate("source_repo", "neworg/mimir") == "neworg/mimir"
+    for slug in ("../escape", "o/.", "https://github.com/o/r", "o/r;evil"):
+        with pytest.raises(installer.SetupError):
+            installer.validate("source_repo", slug)
 
 
 def test_secret_file_requires_private_mode(tmp_path):
@@ -239,7 +388,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     script = (installer._PROVISION
               .replace("/opt/cultivate-manifest.json", str(manifest))
               .replace("/home/mimir/agent", str(home))
-              .replace("/workspace/mimir", str(repo)))
+              .replace("Path('/workspace')", "Path(" + repr(str(tmp_path)) + ")"))
     import mimir.plugins.skills as skills
 
     monkeypatch.setattr(skills, "resolve_skill", lambda name, core_names: SimpleNamespace(dirname=name.split(":")[1]))
@@ -278,7 +427,11 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert {"user", "admin"}.issubset(people[1]["access"]["roles"])
     assert installer._SHA.fullmatch("a" * 40)
     assert sum("clone" in argv for argv in calls) == 1
-    assert sum("setup-git" in argv for argv in calls) == 1
+    assert all(argv[0] == "git" for argv in calls)
+    assert not any("setup-git" in argv for argv in calls)
+    clone = next(argv for argv in calls if "clone" in argv)
+    assert clone[-1] == str(tmp_path / "repo")
+    assert "password=$GITHUB_TOKEN" in " ".join(clone)
     prior_inventory = (home / "repositories.yaml").read_bytes()
     prior_key = (home / "owner-web-key").read_bytes()
     (repo / ".git").rmdir()
