@@ -272,14 +272,13 @@ def _sweep_drafts(fd: int) -> None:
             log.warning("research_draft_sweep_failed")
 
 
-def _research_poller_names(home: Path, *, policy: PolicyRegistry | None = None) -> set[str]:
+def _research_poller_names(home: Path, *, policy: PolicyRegistry) -> set[str]:
     """Only sweep pollers whose installed manifest grants research proposals."""
     from .access_control import _is_research_proposal_poller
-    from .plugins.core import core_policy_registry
     from .pollers import discover_pollers
 
     if policy is None:
-        policy = core_policy_registry()
+        raise ValueError("research poller discovery requires an explicit plugin policy")
     names: set[str] = set()
     for root in (home / "skills", home / ".mimir_builtin_skills"):
         try:
@@ -291,8 +290,10 @@ def _research_poller_names(home: Path, *, policy: PolicyRegistry | None = None) 
     return names
 
 
-def sweep_turn_stores(home: Path, *, policy: PolicyRegistry | None = None) -> None:
-    """On upgrade purge unattributed legacy bytes; on restart sweep crashed turns."""
+def sweep_turn_stores(home: Path, *, policy: PolicyRegistry) -> None:
+    """Sweep crashed turns using the server's explicit active plugin policy."""
+    if policy is None:
+        raise ValueError("turn-store sweep requires an explicit plugin policy")
     home = home.resolve()
     marker = home / _MARKER
     first_start = not marker.exists()

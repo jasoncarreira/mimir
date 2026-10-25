@@ -13,6 +13,7 @@ import pytest
 
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.access_control import _shell_reads_home_content, ensure_turn_scratch
+from mimir.plugins.core import core_policy_registry
 from mimir.turn_stores import close_turn_stores, sweep_turn_stores, turn_store, wipe_turn_stores
 
 
@@ -81,7 +82,7 @@ def test_startup_sweeps_nested_research_drafts_but_preserves_operator_audit(tmp_
     audit.parent.mkdir(parents=True)
     payload = '{"message_id":"operator-data","subject":"keep","answers":{}}\n'
     audit.write_text(payload)
-    sweep_turn_stores(tmp_path)
+    sweep_turn_stores(tmp_path, policy=core_policy_registry())
     assert not draft.exists()
     assert cursor.read_text() == '{"seen": ["id"]}'
     assert audit.read_text() == payload
@@ -189,7 +190,7 @@ def test_startup_sweep_skips_symlinked_containers(tmp_path, caplog, linked):
     link.parent.mkdir(parents=True, exist_ok=True)
     link.symlink_to(outside, target_is_directory=True)
     with caplog.at_level(logging.WARNING, logger="mimir.turn_stores"):
-        sweep_turn_stores(home)
+        sweep_turn_stores(home, policy=core_policy_registry())
     assert (outside / "keep").read_text() == "operator"
     assert link.is_symlink()
     assert any(record.name == "mimir.turn_stores" for record in caplog.records)
@@ -215,7 +216,7 @@ def test_startup_sweep_permission_error_continues_other_sections(tmp_path, monke
 
     monkeypatch.setattr(turn_stores.os, "open", denied)
     with caplog.at_level(logging.WARNING, logger="mimir.turn_stores"):
-        sweep_turn_stores(tmp_path)
+        sweep_turn_stores(tmp_path, policy=core_policy_registry())
     assert observed
     assert (blocked / "notes-draft.md").read_text() == "keep on refusal"
     assert (tmp_path / ".mimir/turn-stores-v1").is_file()
@@ -229,7 +230,7 @@ def test_nonresearch_poller_drafts_survive_restart(tmp_path):
     for path in paths:
         path.parent.mkdir(parents=True)
         path.write_text("draft")
-    sweep_turn_stores(tmp_path)
+    sweep_turn_stores(tmp_path, policy=core_policy_registry())
     assert not paths[0].exists()
     assert paths[1].read_text() == "draft"
 
@@ -424,8 +425,8 @@ def test_manifest_with_nonresearch_authority_preserves_drafts(tmp_path):
     configs = discover_pollers(tmp_path / "skills", state_root=tmp_path / "state/pollers")
     assert {config.name for config in configs} == {"papers", "nonresearch"}
     assert all(config.authority is not None for config in configs)
-    assert _research_poller_names(tmp_path) == {"papers"}
-    sweep_turn_stores(tmp_path)
+    assert _research_poller_names(tmp_path, policy=core_policy_registry()) == {"papers"}
+    sweep_turn_stores(tmp_path, policy=core_policy_registry())
     assert not paths[0].exists()
     assert paths[1].read_text() == "draft"
 
@@ -463,7 +464,7 @@ def test_entry_refusal_does_not_skip_later_entries(tmp_path, monkeypatch, caplog
     monkeypatch.setattr(turn_stores.os, "listdir", ordered)
     monkeypatch.setattr(turn_stores, "_remove_entry", refuse_first)
     with caplog.at_level(logging.WARNING, logger="mimir.turn_stores"):
-        sweep_turn_stores(tmp_path)
+        sweep_turn_stores(tmp_path, policy=core_policy_registry())
     assert attempts == [first.name, second.name]
     assert first.read_text() == "refused"
     assert not second.exists()

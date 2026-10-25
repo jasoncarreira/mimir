@@ -1485,6 +1485,58 @@ async def test_build_app_skips_symlinked_store_root_and_continues_startup(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selected", [True, False], ids=["cultivate-selected", "core-only"])
+async def test_build_app_discovers_existing_cultivate_seeds_with_active_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, selected: bool,
+) -> None:
+    pytest.importorskip("mimir_cultivate")
+    from mimir import pollers
+    from mimir.plugins.defaults import seed_plugin_defaults
+    from mimir.plugins.manager import load_plugins
+
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate" if selected else "")
+    monkeypatch.setenv("WORKLINK_REPO", "o/r")
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    cultivate = load_plugins(enable="cultivate")
+    seed_plugin_defaults(tmp_path, selected=cultivate.policy.selected_plugin_candidates)
+    seeded_names = {"worklink-ready-queue", "worklink-tool-pins"}
+    for directory in ("cultivate-chainlink-orchestrator", "cultivate-worklink-tool-pins"):
+        assert (tmp_path / "skills" / directory / "pollers.json").is_file()
+
+    # Observe real discovery invoked by build_app's sweep. Do not replace the
+    # sweep or supply its policy from the test: startup must thread it itself.
+    real_discover = pollers.discover_pollers
+    discoveries = []
+
+    def observe_discovery(root, **kwargs):
+        invalid = kwargs.setdefault("invalid_entries", [])
+        configs = real_discover(root, **kwargs)
+        discoveries.append((root, {config.name for config in configs}, list(invalid)))
+        return configs
+
+    monkeypatch.setattr(pollers, "discover_pollers", observe_discovery)
+    with caplog.at_level(logging.WARNING, logger="mimir.pollers"):
+        app, control = _controlled_server_app(tmp_path, monkeypatch, real_skill_setup=True)
+        try:
+            await _run_startup(app)
+            assert "runtime" in control.events
+            home_discovery = [row for row in discoveries if row[0] == tmp_path / "skills"]
+            assert home_discovery, "startup never discovered the seeded home skills"
+            _, names, invalid = home_discovery[0]
+            if selected:
+                assert seeded_names <= names
+                assert invalid == []
+                assert "poller_plugin_seed_unselected" not in caplog.text
+            else:
+                assert seeded_names.isdisjoint(names)
+                assert any("seeded by plugin 'cultivate'" in reason for _, _, reason in invalid)
+                assert "poller_plugin_seed_unselected" in caplog.text
+        finally:
+            await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
 async def test_build_app_skips_symlinked_ignore_and_still_sweeps_stores(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:

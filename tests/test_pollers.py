@@ -346,7 +346,7 @@ def test_seeded_cultivate_pollers_do_not_run_when_cultivate_is_deselected(tmp_pa
 
 
 @pytest.mark.parametrize("selected", [True, False], ids=["cultivate-selected", "core-only"])
-def test_boot_sweep_and_admin_discover_scheduler_pollers_with_selected_policy(
+def test_sweep_and_admin_discover_scheduler_pollers_with_selected_policy(
     tmp_path, monkeypatch, caplog, selected,
 ):
     pytest.importorskip("mimir_cultivate")
@@ -400,8 +400,15 @@ def test_boot_sweep_and_admin_discover_scheduler_pollers_with_selected_policy(
         assert any("seeded by plugin 'cultivate'" in reason for _, _, reason in invalid)
         assert "poller_plugin_seed_unselected" in caplog.text
 
-    # An accidental policy-less call in either startup or admin must fail the
-    # selected-home case instead of emitting the misleading deselection warning.
+    # Omission must fail at the helper boundary, not silently choose core policy
+    # and recreate the false warning. Explicit None is not a policy either.
+    caplog.clear()
+    for helper in (sweep_turn_stores, _research_poller_names):
+        with pytest.raises(TypeError, match="required keyword-only argument: 'policy'"):
+            helper(home)
+        with pytest.raises(ValueError, match="explicit plugin policy"):
+            helper(home, policy=None)
+    assert "poller_plugin_seed_unselected" not in caplog.text
     with pytest.raises(ValueError, match="explicit plugin policy"):
         discover_pollers(home / "skills")
 
