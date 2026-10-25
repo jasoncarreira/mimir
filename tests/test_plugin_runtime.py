@@ -333,7 +333,8 @@ def test_installed_example_scaffold_service_wrapper(example_distribution, tmp_pa
     assert copied.read_bytes() == source.read_bytes()
     wrapper = context / "s6-rc.d/example-example-worker/run"
     image_script = "/usr/local/libexec/mimir-plugin-services/example/example-worker/run"
-    assert f"exec s6-setuidgid mimir {image_script}" in wrapper.read_text()
+    assert (f"exec s6-setuidgid mimir env HOME=/home/mimir USER=mimir LOGNAME=mimir {image_script}"
+            in wrapper.read_text())
     shim = tmp_path / "bin"
     shim.mkdir()
     shim_script = shim / "s6-setuidgid"

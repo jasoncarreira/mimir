@@ -7,7 +7,8 @@
 # catch on their own (the process is still alive). Tune the staleness threshold
 # with MIMIR_WATCHDOG_STALE_AFTER (default 300s = 5 missed 60s beats; high
 # enough not to false-kill a legitimately busy agent).
-exec s6-setuidgid mimir mimir watchdog \
+exec s6-setuidgid mimir env HOME=/home/mimir USER=mimir LOGNAME=mimir \
+    mimir watchdog \
     --home "${MIMIR_HOME:-/home/mimir/agent}" \
     --restart-on-stale \
     --stale-after "${MIMIR_WATCHDOG_STALE_AFTER:-300}"

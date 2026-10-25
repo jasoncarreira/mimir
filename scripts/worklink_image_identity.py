@@ -330,9 +330,14 @@ def main() -> None:
     if run(["git", "status", "--porcelain=v1"]).stdout.strip():
         raise RuntimeError("live image proof requires a clean source checkout")
     service = (ROOT / "deploy/s6-overlay/s6-rc.d/mimir/run").read_text()
-    expected = 'exec s6-setuidgid mimir mimir run --home "${MIMIR_HOME:-/home/mimir/agent}"'
-    if expected not in service:
-        raise RuntimeError("controller s6 service no longer drops to mimir")
+    # Match the shipped command after joining shell continuations. The identity
+    # environment is part of the privilege-drop contract, not an optional wrapper.
+    expected = (
+        'exec s6-setuidgid mimir env HOME=/home/mimir USER=mimir LOGNAME=mimir '
+        'mimir run --home "${MIMIR_HOME:-/home/mimir/agent}"'
+    )
+    if expected not in " ".join(service.replace("\\\n", " ").split()):
+        raise RuntimeError("controller s6 service no longer drops to mimir with matching identity environment")
     try:
         run([
             "docker", "build",
