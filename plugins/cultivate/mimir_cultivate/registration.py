@@ -310,6 +310,9 @@ class CultivateProvider:
         from . import commands
 
         registrar.register_cli_command("worklink", commands.add_argparse, commands.dispatch_worklink)
+        from . import setup
+
+        registrar.register_cli_command("cultivate", setup.add_argparse, setup.dispatch)
         registrar.register_cli_command(
             "opencode-bootstrap",
             commands.configure_opencode_bootstrap,

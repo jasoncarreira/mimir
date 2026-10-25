@@ -28,6 +28,37 @@ by name. Disabled provider modules are not imported.
 
 ### Cultivate (optional coding provider)
 
+#### Set up a Cultivate agent
+
+Run `mimir cultivate setup` from a source checkout with Cultivate installed and
+selected (`MIMIR_PLUGINS=cultivate uv run --all-packages mimir cultivate setup`).
+The installer asks for a GitHub repository and base branch, a bot login and
+commit email, an owner name and email, a model spec and API key, and a local
+deployment directory and loopback port. It shows the required fine-grained PAT
+permissions and verifies the bot's identity, Write invitation, PR read and
+Actions read before building. The source is fetched from a pushed ref and its
+full SHA is pinned into both the controller and executor image build.
+
+For unattended runs, use `--help` to see the corresponding flags or set
+`MIMIR_CULTIVATE_REPO`, `MIMIR_CULTIVATE_BRANCH`, `MIMIR_CULTIVATE_BOT_LOGIN`,
+`MIMIR_CULTIVATE_BOT_EMAIL`, `MIMIR_CULTIVATE_OWNER`,
+`MIMIR_CULTIVATE_DISPLAY_NAME`, `MIMIR_CULTIVATE_OWNER_EMAIL`,
+`MIMIR_CULTIVATE_MODEL_SPEC`, `MIMIR_CULTIVATE_DEPLOY`, and
+`MIMIR_CULTIVATE_PORT`. Pass secrets via `--github-token-file` and
+`--model-key-file` (private mode-600 files), their `-stdin` counterparts, or
+`MIMIR_CULTIVATE_GITHUB_TOKEN` / `MIMIR_CULTIVATE_MODEL_KEY`. Never put a key
+in a command-line argument. The installer writes `compose.env` and the owner's
+web key as separate mode-600 files and does not print either key.
+
+The generated Compose binds only to `127.0.0.1`, has an init service to own
+the named volumes, and selects Cultivate in the **process environment**. Setup
+also writes a provenance-pinned `build.sh` for reproducible rebuilds. Setup
+provisions the checkout, the repository inventory, the optional GitHub pollers,
+and the owner key before starting the agent. It then checks health, plugin
+selection, repository binding, poller scheduling, and a web-chat reply. Re-run
+the same command to repair missing provisioning without replacing operator
+secrets. Use `--rotate-web-key` only when intentionally revoking the old key.
+
 Coding is supplied by the separately packaged `mimir-cultivate` distribution
 (`BUSL-1.1`), not by an extra on the MIT `mimir-agent` distribution. It is
 **not published to a package index**: it is installed from the in-repo
