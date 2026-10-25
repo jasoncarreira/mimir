@@ -396,9 +396,11 @@ def _saga_settings(spec: str, embedding: str) -> dict[str, dict[str, object]]:
     embed_model = LOCAL_MODEL if embedding == "local" else embedding.split(":", 1)[1]
     llm: dict[str, object] = {"provider": "anthropic" if provider == "anthropic" else "openai_compat",
                               "model": model, "api_key_env": provider.upper() + "_API_KEY"}
+    # Fresh installs must omit temperature regardless of model or effort.
+    # Custom sampling is retained only for existing operator configurations.
+    llm["sampling"] = "default"
     if effort:
         llm["reasoning_effort"] = effort
-        llm["sampling"] = "default"
     if provider == "openai":
         llm["url"] = "https://api.openai.com/v1/chat/completions"
     emb: dict[str, object] = {"provider": kind, "model": embed_model, "dimensions": dim}

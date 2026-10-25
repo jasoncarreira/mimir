@@ -553,9 +553,9 @@ def test_saga_provisioning(tmp_path, spec, embedding, llm, provider, dim, key):
     parsed = tomllib.loads(text)
     assert parsed["llm"]["provider"] == llm
     assert parsed["llm"]["api_key_env"] == spec.split(":")[0].upper() + "_API_KEY"
+    assert parsed["llm"]["sampling"] == "default"
     if parsed["llm"]["model"] == installer.DEFAULT_SAGA_MODELS[spec.split(":")[0]]:
         assert parsed["llm"]["reasoning_effort"] == "low"
-        assert parsed["llm"]["sampling"] == "default"
     else:
         assert "reasoning_effort" not in parsed["llm"]
     assert parsed["embedding"]["provider"] == provider
@@ -666,7 +666,16 @@ def test_saga_spec_optional_effort(spec, effort):
     assert installer.validate("saga_model_spec", spec) == spec
     llm = installer._saga_settings(spec, "local")["llm"]
     assert llm.get("reasoning_effort") == effort
-    assert llm.get("sampling") == ("default" if effort else None)
+    assert llm["sampling"] == "default"
+
+
+@pytest.mark.parametrize("spec", ["anthropic:claude-opus-5-5", "openai:non-default-reasoning-model"])
+def test_non_default_saga_model_without_effort_uses_default_sampling(tmp_path, spec):
+    assert installer._provision_saga(tmp_path, spec, "local", prefetch=lambda: None)
+    llm = tomllib.loads((tmp_path / "saga.toml").read_text())["llm"]
+    assert llm["model"] == spec.split(":")[1]
+    assert llm["sampling"] == "default"
+    assert "reasoning_effort" not in llm
 
 
 @pytest.mark.parametrize("spec", ["openai:gpt-6-luna:none", "anthropic:claude-haiku-5-5:minimal", "openai:m:", "openai:m:low:high"])
