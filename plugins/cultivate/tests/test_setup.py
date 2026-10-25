@@ -228,12 +228,14 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     for argv in root_builds:
         index = argv.index("CHAINLINK_ARTIFACT_STAGE=chainlink-build")
         assert argv[index - 1] == "--build-arg"
+        assert argv[argv.index("MIMIR_EXTRAS=openai,mcp") - 1] == "--build-arg"
     import shlex
     build_lines = (deploy / "build.sh").read_text().splitlines()
     saved_build, = [shlex.split(line) for line in build_lines
                    if "MIMIR_PLUGIN_SELECTION=cultivate" in line]
     index = saved_build.index("CHAINLINK_ARTIFACT_STAGE=chainlink-build")
     assert saved_build[index - 1] == "--build-arg"
+    assert saved_build[saved_build.index("MIMIR_EXTRAS=openai,mcp") - 1] == "--build-arg"
     assert json.loads((deploy / "manifest.json").read_text())["test"] == "./tools/verify"
     assert (deploy / ".dockerignore").read_text() == "*\n!Dockerfile.toolchain\n"
     for name in ("compose.yml", "Dockerfile.toolchain", "manifest.json", "provision.py"):

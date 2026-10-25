@@ -192,6 +192,29 @@ RUN --mount=type=bind,from=chainlink-artifact,source=/usr/local/bin/chainlink,ta
         fi; \
         install -m 0755 /tmp/chainlink /usr/local/bin/chainlink; \
     fi
+# gh api --allow-escape-sequences is required by github-ci-watch for job logs;
+# pin a recent CLI with that flag. SHA-256 values are from the official v2.83.1
+# release assets (linux amd64/arm64); override both version and digest to bump.
+ARG GH_VERSION=2.83.1
+ARG GH_AMD64_SHA256=1c5252d4ce3db07b51c01ff0b909583da6364ff3fdc06d0c2e75e62dc0380a34
+ARG GH_ARM64_SHA256=36af472f8e96fd67253f813f71d9610624cc4e3c7a5b148459e42ffa1a933f64
+RUN set -eu; \
+    if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        case "$(dpkg --print-architecture)" in \
+            amd64) arch=amd64; digest="$GH_AMD64_SHA256" ;; \
+            arm64) arch=arm64; digest="$GH_ARM64_SHA256" ;; \
+            *) echo >&2 "Unsupported architecture for gh"; exit 2 ;; \
+        esac; \
+        case "$GH_VERSION" in *[!0-9.]*|.*|*..*|*.) echo >&2 "GH_VERSION must be pinned"; exit 2 ;; esac; \
+        test -n "$GH_VERSION"; \
+        archive="gh_${GH_VERSION}_linux_${arch}.tar.gz"; \
+        curl --fail --silent --show-error --location --retry 5 \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${archive}" -o /tmp/gh.tar.gz; \
+        printf '%s  %s\n' "$digest" /tmp/gh.tar.gz | sha256sum -c -; \
+        tar -xzf /tmp/gh.tar.gz -C /tmp "gh_${GH_VERSION}_linux_${arch}/bin/gh"; \
+        install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" /usr/local/bin/gh; \
+        rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${arch}"; \
+    fi
 # Core-only images create just the controller user; the worklink identity and
 # its state directories belong to the selected Cultivate worker.
 RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
@@ -303,9 +326,12 @@ RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
         MIMIR_PLUGINS=cultivate MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" \
         sh /opt/cultivate-docker/bootstrap.sh; \
     fi
-# Check the installed runtime binary as the non-root controller user.
+# Check the installed runtime binaries as the non-root controller user.
 RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
         chainlink --version; \
+    fi
+RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        gh --version; \
     fi
 
 # Auto-update behavior on this image:
@@ -360,6 +386,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 # bundle defines what runs.
 USER root
 COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        /command/s6-setuidgid worklink gh --version; \
+    fi
 RUN set -eu; \
     if [ "$(cat /opt/cultivate-docker/selected)" != 1 ]; then \
         rm -rf /etc/s6-overlay/s6-rc.d/worklink-execd \

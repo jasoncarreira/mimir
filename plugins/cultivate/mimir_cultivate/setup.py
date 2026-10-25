@@ -529,7 +529,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   "--build-arg MIMIR_PLUGIN_SELECTION=cultivate",
                   "--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build",
                   "--build-arg MIMIR_ENABLE_OPENCODE=1",
-                  "--build-arg MIMIR_EXTRAS=" + provider]
+                  "--build-arg MIMIR_EXTRAS=" + provider + ",mcp"]
     _write(deploy / "build.sh", "#!/bin/sh\nset -eu\n"
            + "docker build -t " + tag + " " + " ".join(build_args) + " " + source_url + "#" + sha + "\n"
            + "docker build -t " + layer_tag + " -f Dockerfile.toolchain .\n", mode=0o755)
@@ -565,7 +565,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
          "--build-arg", "MIMIR_CONTROLLER_COMMIT=" + sha, "--build-arg", "MIMIR_EXECUTOR_COMMIT=" + sha,
          "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate",
          "--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build", "--build-arg", "MIMIR_ENABLE_OPENCODE=1",
-         "--build-arg", "MIMIR_EXTRAS=" + provider, source_url + "#" + sha], cwd=deploy)
+         "--build-arg", "MIMIR_EXTRAS=" + provider + ",mcp", source_url + "#" + sha], cwd=deploy)
     run(["docker", "build", "-t", layer_tag, "-f", "Dockerfile.toolchain", "."], cwd=deploy)
     run(["docker", "compose", "run", "--rm", "init"], cwd=deploy)
     provisioned = run(["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",

@@ -220,7 +220,7 @@ def test_root_cultivate_selection_executes_verified_build_branches(
                               env={**env, "PATH": path})
 
     programs = _run_instructions(root)
-    selector, = (p for p in programs if "/opt/cultivate-docker/selected" in p and "printf" in p)
+    selector, = (p for p in programs if "printf '%s\\n' \"$selected\" > /opt/cultivate-docker/selected" in p)
     result = run(selector, stubbed=False)
     assert (result.returncode == 0) is success, result.stderr
     if not success:
@@ -229,7 +229,7 @@ def test_root_cultivate_selection_executes_verified_build_branches(
     assert (marker_dir / "selected").read_text() == selected + "\n"
 
     gated = [p for p in programs if "cat /opt/cultivate-docker/selected" in p
-             and "chainlink" not in p]
+             and "chainlink" not in p and "gh" not in p]
     # users, executor, controller, bootstrap, worker-service removal, assembler pin.
     assert len(gated) == 6
     for program in gated:
@@ -384,6 +384,69 @@ def test_chainlink_install_and_version_check_follow_cultivate_selection(tmp_path
     result = subprocess.run(["/bin/sh", "-ceu", version_program], env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == ("chainlink 1.6.0" if selected == "1" else "")
+
+
+def _assert_cultivate_gh_install(root: str) -> None:
+    pin = re.search(r"(?m)^ARG GH_VERSION=(\d+\.\d+\.\d+)$", root)
+    assert pin is not None and tuple(map(int, pin[1].split("."))) >= (2, 83, 1)
+    for arch in ("AMD64", "ARM64"):
+        assert re.search(rf"(?m)^ARG GH_{arch}_SHA256=[0-9a-f]{{64}}$", root)
+    programs = _run_instructions(root)
+    installs = [p for p in programs if "install -m 0755" in p and "/usr/local/bin/gh" in p]
+    assert len(installs) == 1, "Cultivate must install the pinned gh binary"
+    install, = installs
+    assert 'if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then' in install
+    assert "amd64) arch=amd64; digest=\"$GH_AMD64_SHA256\"" in install
+    assert "arm64) arch=arm64; digest=\"$GH_ARM64_SHA256\"" in install
+    assert 'https://github.com/cli/cli/releases/download/v${GH_VERSION}/${archive}' in install
+    assert "sha256sum -c -" in install
+    assert install.index("sha256sum -c -") < install.index("tar -xzf") < install.index("install -m 0755")
+    assert 'printf \'%s  %s\\n\' "$digest" /tmp/gh.tar.gz | sha256sum -c -' in install
+    assert "gh_${GH_VERSION}_linux_${arch}/bin/gh" in install
+    assert "Unsupported architecture for gh" in install
+    assert 'case "$GH_VERSION" in *[!0-9.]*|.*|*..*|*.)' in install
+    assert 'gh --version;' in next(p for p in programs if "gh --version" in p and "s6-setuidgid" not in p)
+    assert '/command/s6-setuidgid worklink gh --version;' in next(
+        p for p in programs if "/command/s6-setuidgid worklink gh --version" in p)
+    # A core build selects 0; only the selected branch may fetch or install gh.
+    assert root.count("/usr/local/bin/gh") == 1
+    assert "gh" not in (ROOT / "plugins/cultivate/mimir_cultivate/docker/base.sh").read_text().split("apt-get install", 1)[1].split("curl -fsSL", 1)[0].split()
+
+
+def test_cultivate_gh_is_pinned_verified_and_core_does_not_install_it() -> None:
+    _assert_cultivate_gh_install(DOCKERFILE.read_text())
+
+
+def test_core_gh_install_branch_does_not_fetch_or_install(tmp_path) -> None:
+    install, = (p for p in _run_instructions(DOCKERFILE.read_text())
+                if "install -m 0755" in p and "/usr/local/bin/gh" in p)
+    selected = tmp_path / "selected"
+    selected.write_text("0\n")
+    install = install.replace("/opt/cultivate-docker/selected", str(selected))
+    result = subprocess.run(["/bin/sh", "-ceu", install], capture_output=True, text=True,
+                            env={**os.environ, "PATH": "/usr/bin:/bin", "GH_VERSION": "2.83.1"})
+    assert result.returncode == 0, result.stderr
+    assert not result.stdout
+
+
+def test_cultivate_gh_static_guard_rejects_missing_install() -> None:
+    root = DOCKERFILE.read_text()
+    old = 'install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" /usr/local/bin/gh;'
+    assert old in root
+    with pytest.raises(AssertionError, match="install the pinned gh"):
+        _assert_cultivate_gh_install(root.replace(old, "true;"))
+
+
+@pytest.mark.parametrize("old,new", [
+    ("sha256sum -c -", "true"),
+    ('if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then', "if true; then"),
+])
+def test_cultivate_gh_static_guard_rejects_integrity_or_selection_bypass(old, new) -> None:
+    root = DOCKERFILE.read_text()
+    install = next(p for p in _run_instructions(root) if "/usr/local/bin/gh" in p)
+    assert old in install
+    with pytest.raises(AssertionError):
+        _assert_cultivate_gh_install(root.replace(install, install.replace(old, new), 1))
 
 
 def test_root_assembler_pins_selected_cultivate_to_the_built_version(tmp_path) -> None:

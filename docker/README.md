@@ -27,6 +27,17 @@ container with `MIMIR_PLUGINS=cultivate` in its environment. Without the build
 argument the image is core-only and has no Worklink executor. See
 [upgrading a coding deployment](../docs/plugins.md#upgrading-a-coding-deployment).
 
+Cultivate also ships `gh` 2.83.1 (`GH_VERSION` in the root Dockerfile) for
+GitHub skills, including `gh api --allow-escape-sequences` in github-ci-watch.
+The official linux amd64/arm64 release tarballs are checked against the
+Dockerfile's `GH_AMD64_SHA256` / `GH_ARM64_SHA256` pins before installing the
+binary to `/usr/local/bin/gh`. To bump it, take both tarball SHA-256 digests
+from the intended version's [official checksums](https://github.com/cli/cli/releases),
+update all three Dockerfile defaults together (or pass all three build args),
+and rebuild. The build runs `gh --version` as both `mimir` and `worklink`;
+core-only images do not download or install gh. `mimir cultivate setup` passes
+`MIMIR_EXTRAS=<provider>,mcp` to the root build, including its saved `build.sh`.
+
 The Cultivate image also ships `/usr/local/bin/chainlink` for Worklink claims,
 continuation, and the ready-queue poller. It is built from
 `CHAINLINK_COMMIT=9909d7e0d5c95251f3555e0dd9d71f894cfc4883` with
