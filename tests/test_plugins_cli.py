@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -116,6 +117,126 @@ assert 'poison_provider' not in sys.modules
 """
     result = subprocess.run([sys.executable, "-c", script], capture_output=True,
                             text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_unselected_cultivate_setup_cli_child_process():
+    # Exercise the installed distribution and entry point, not an in-process
+    # monkeypatch whose ambient selection could hide the regression.
+    env = dict(os.environ)
+    env.pop("MIMIR_PLUGINS", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "mimir.cli", "cultivate", "setup", "--help"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--accept-license" in result.stdout
+    # Follow the normal CLI dispatch with an injected external-effect boundary;
+    # installer integration (license, build, verification) is covered in test_setup.
+    script = """
+import mimir.cli
+import mimir_cultivate.setup as installer
+installer.setup = lambda args: print('SETUP_DISPATCHED:' + args.repo)
+mimir.cli.main(['cultivate', 'setup', '--repo', 'owner/project'])
+"""
+    result = subprocess.run([sys.executable, "-c", script], env=env,
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "SETUP_DISPATCHED:owner/project"
+
+
+def test_unselected_non_operator_command_explains_selection(monkeypatch, capsys):
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["worklink", "--help"])
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "plugin 'cultivate'" in error
+    assert "MIMIR_PLUGINS=cultivate" in error
+    assert "invalid choice" not in error
+
+
+def test_plugins_list_shows_installed_commands_without_selection(monkeypatch, capsys):
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    cli.main(["plugins", "list"])
+    output = capsys.readouterr().out
+    assert "mimir cultivate — operator" in output
+    assert "mimir worklink — requires MIMIR_PLUGINS=cultivate" in output
+
+
+def test_help_points_to_installed_plugin_inventory(monkeypatch, capsys):
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--help"])
+    assert exc.value.code == 0
+    assert "mimir plugins list" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("owner,operator", [("other", True), ("cultivate", False)])
+def test_operator_manifest_must_match_live_registration(monkeypatch, owner, operator):
+    from mimir.plugins import discovery, manager
+
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.setattr(discovery, "discover_plugins", lambda *, enable: (
+        SimpleNamespace(name="cultivate", diagnostic=None,
+                        manifest=SimpleNamespace(cli_commands={"cultivate": True})),
+    ))
+    command = CliCommand(owner, "cultivate", lambda sub: sub.add_parser("cultivate"),
+                         lambda args: None, operator)
+    monkeypatch.setattr(manager, "load_plugins", lambda *, enable: SimpleNamespace(
+        policy=SimpleNamespace(cli_commands={"cultivate": command})))
+    with pytest.raises(PolicyRegistrationError, match="does not match its manifest"):
+        cli.main(["cultivate", "--help"])
+
+
+def test_operator_command_claim_collision_fails_before_provider_load(monkeypatch):
+    from mimir.plugins import discovery, manager
+
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.setattr(discovery, "discover_plugins", lambda *, enable: tuple(
+        SimpleNamespace(name=name, diagnostic=None,
+                        manifest=SimpleNamespace(cli_commands={"setup-agent": True}))
+        for name in ("alpha", "beta")
+    ))
+    monkeypatch.setattr(manager, "load_plugins", lambda *, enable: (
+        pytest.fail("ambiguous command must not load a provider")
+    ))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["setup-agent"])
+    assert exc.value.code == 2
+
+
+def test_legacy_unselected_command_explains_selection(monkeypatch, capsys):
+    from mimir.plugins import discovery
+
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.setattr(discovery, "discover_plugins", lambda *, enable: (
+        SimpleNamespace(name="legacy", enabled=False, diagnostic=None,
+                        manifest=SimpleNamespace(cli_commands={})),
+    ))
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["legacy-hello", "--help"])
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "MIMIR_PLUGINS=legacy" in error
+    assert "invalid choice" not in error
+
+
+def test_unselected_run_help_never_imports_provider():
+    env = dict(os.environ)
+    env.pop("MIMIR_PLUGINS", None)
+    script = """
+import mimir.cli
+import sys
+try:
+    mimir.cli.main(['run', '--help'])
+except SystemExit as exc:
+    assert exc.code == 0
+assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.')
+               for name in sys.modules)
+"""
+    result = subprocess.run([sys.executable, "-c", script], env=env,
+                            capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
 
 

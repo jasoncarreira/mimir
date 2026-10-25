@@ -25,6 +25,8 @@ def test_selected_cli_registers_both_commands() -> None:
     policy.cli_commands["opencode-bootstrap"].configure(sub)
     assert parser.parse_args(["worklink", "run-epic", "42", "--autonomous"]).issue_id == 42
     assert parser.parse_args(["opencode-bootstrap", "--home", "/tmp/operator"]).home == Path("/tmp/operator")
+    assert policy.cli_commands["cultivate"].operator is True
+    assert policy.cli_commands["worklink"].operator is False
 
 
 @pytest.mark.parametrize("name", ["worklink", "opencode-bootstrap"])

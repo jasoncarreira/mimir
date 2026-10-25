@@ -56,11 +56,14 @@ def dispatch(args: argparse.Namespace, plugins_p: argparse.ArgumentParser) -> in
     elif not rows:
         print("No plugins installed.")
     else:
-        for row in rows:
+        for candidate, row in zip(candidates, rows):
             print(
                 f"{row['name']} {row['version'] or '-'} ({row['license'] or '-'}) "
                 f"from {row['distribution']} — {'enabled' if row['enabled'] else 'disabled'}"
             )
             if row["diagnostic"]:
                 print(f"  diagnostic: {row['diagnostic']}")
+            manifest = getattr(candidate, "manifest", None)
+            for command, operator in getattr(manifest, "cli_commands", {}).items():
+                print(f"  mimir {command} — {'operator' if operator else 'requires MIMIR_PLUGINS=' + candidate.name}")
     return 0

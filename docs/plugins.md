@@ -14,7 +14,7 @@ metadata without importing provider code. Its entry-point name must match the
 manifest `name` and match `[a-z][a-z0-9-]*`. Required TOML string keys are
 `name`, `version` (PEP 440), `license` (SPDX expression), and `requires_mimir`
 (PEP 440 specifier for the installed Mimir version). The optional keys
-`dockerfile`, `themes`, `frontend`, `defaults`, `optional`, and `config` describe the
+`dockerfile`, `themes`, `frontend`, `defaults`, `optional`, `config`, and `cli` describe the
 contributions below; other unknown top-level keys are rejected.
 
 Export `MIMIR_PLUGINS=one,two` in the operator-owned **process environment**,
@@ -24,14 +24,17 @@ home's `.env`: that file is agent-writable and cannot grant plugin execution.
 Selection is fixed for the process lifetime; restart to change it. Disabled
 providers' invalid or duplicate manifests are diagnostics only, while selected
 missing, invalid, duplicate, or version-incompatible providers reject startup
-by name. Disabled provider modules are not imported.
+by name. Disabled provider modules are not imported into the agent process;
+operator-only CLI invocation is described below.
 
 ### Cultivate (optional coding provider)
 
 #### Set up a Cultivate agent
 
-Run `mimir cultivate setup` from a source checkout with Cultivate installed and
-selected (`MIMIR_PLUGINS=cultivate uv run --all-packages mimir cultivate setup`).
+Run `mimir cultivate setup` from a source checkout with Cultivate installed
+(`uv run --all-packages mimir cultivate setup`). The operator workstation does
+not need `MIMIR_PLUGINS`: the installer selects Cultivate in the generated agent
+deployment, not in the operator's shell.
 Before any other prompt or provisioning, setup displays the full shipped
 Cultivate **Business Source License 1.1**, distinct from core Mimir's MIT
 license, and requires `yes` or `accept`. Decline or EOF writes nothing.
@@ -144,6 +147,15 @@ Use `mimir plugins list` for a human-readable inventory, or
 values are `null` in JSON; diagnostics describe invalid/duplicate manifests.
 Listing reads only installed package metadata and process selection: it does
 not import providers, load agent-home configuration, or start the runtime.
+The optional `[cli]` manifest table lists top-level command names with boolean
+operator flags. An installed, unselected provider's operator command may run in
+the operator's CLI process after its live registration is checked against the
+manifest; non-operator commands require `MIMIR_PLUGINS=<name>` and report that
+selection explicitly. Neither discovery nor `mimir run` imports unselected
+providers. For a legacy provider without `[cli]`, an unknown command word is
+reported with the installed unselected providers' selection hints, without
+importing them. `mimir --help`
+points to `mimir plugins list` for advertised commands.
 
 ## Provider contract
 
