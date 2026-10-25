@@ -433,7 +433,7 @@ async def test_selected_retained_middleware_attests_only_live_outputs(
     monkeypatch.setattr(budget_gate, "_result_is_error", lambda _tool, result, **_kw: result.status == "error")
     labels = []
 
-    def finish(_call, capture, result):
+    def finish(_call, capture, result, **_kwargs):
         labels.append(classify_protected_result(
             tool, arguments, context, authorization, result=result,
             failed=result.status == "error", retained_receipt=capture.retained_receipt,

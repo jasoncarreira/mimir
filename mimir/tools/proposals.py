@@ -430,6 +430,13 @@ async def submit_proposal(
             _finalize_proposal, home, title=title, rationale=rationale, lane=lane
         )
     if result.ok and result.pr_url:
+        if context is not None:
+            from .._context import get_current_turn
+            from ..turn_stores import wipe_research_drafts
+
+            turn = get_current_turn()
+            if turn is not None:
+                await asyncio.to_thread(wipe_research_drafts, home, turn.turn_id)
         # Positive feedback signal (chainlink #337/#339/#344): surfaces in the
         # prompt's feedback block and supersedes the open-proposal nudge (which
         # auto-clears now that the worktree is gone).

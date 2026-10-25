@@ -59,6 +59,7 @@ from typing import Annotated, Any, Awaitable, Callable, Iterator, Union, get_arg
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import ToolException
+from langgraph.errors import GraphBubbleUp, NodeCancelledError, NodeTimeoutError
 from langgraph.types import Command
 import yaml
 
@@ -2821,6 +2822,7 @@ def _emit_tool_call_sync(
     denied: bool = False,
     arguments: dict[str, Any] | None = None,
     operator_shell_audit: Mapping[str, str] | None = None,
+    exception_class: str | None = None,
 ) -> None:
     payload = {"tool": tool_name, "ok": ok}
     argument_summary = (
@@ -2840,6 +2842,8 @@ def _emit_tool_call_sync(
         )
     if denied:
         payload["denied"] = True
+    if exception_class is not None:
+        payload["exception_class"] = exception_class
     _emit_event_sync("tool_call", **payload)
     if operator_shell_audit is not None and "declared_executable" in operator_shell_audit:
         _emit_event_sync(
@@ -2864,6 +2868,8 @@ def _emit_tool_call_sync(
             )
         if denied:
             error_payload["denied"] = True
+        if exception_class is not None:
+            error_payload["exception_class"] = exception_class
         # The companion ``tool_call(ok=false)`` event owns the dashboard's
         # error numerator. Mark this branch as paired so consumers that read
         # both event types don't double-count the same failed invocation.
@@ -4180,6 +4186,8 @@ def _finish_tool_result(
     call: _PreparedToolCall,
     capture: _ToolExecutionCapture,
     result: ToolMessage | Command,
+    *,
+    exception_class: str | None = None,
 ) -> ToolMessage | Command:
     is_error = _result_is_error(call.tool_name, result, policy=call.policy)
     result_labels = _result_labels_for_call(
@@ -4212,6 +4220,7 @@ def _finish_tool_result(
         error=_result_error_text(result) if is_error else None,
         arguments=call.arguments,
         operator_shell_audit=call.operator_shell_audit,
+        exception_class=exception_class,
     )
     lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
     if lease_refusal is not None:
@@ -4514,6 +4523,24 @@ async def _hold_scoped_pr_dispatch_async(call: _PreparedToolCall, stack: ExitSta
         raise
 
 
+def _task_failure_result(call: _PreparedToolCall, exc: Exception) -> ToolMessage | None:
+    """Keep ordinary subagent failures inside the parent graph, without exposing content."""
+    if call.tool_name != "task" or isinstance(
+        exc, (TimeoutError, GraphBubbleUp, NodeCancelledError, NodeTimeoutError)
+    ):
+        return None
+    from ..quota_pause import is_quota_exhaustion
+
+    if is_quota_exhaustion(exc):
+        return None
+    return ToolMessage(
+        content="Subagent task failed. The parent may continue or try another approach.",
+        tool_call_id=_tool_call_id(call.request),
+        name="task",
+        status="error",
+    )
+
+
 class BudgetGateMiddleware(AgentMiddleware):
     """Intercept model and tool calls at their exact LangGraph boundaries."""
 
@@ -4580,6 +4607,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         checkout_token = None
         lease_stack = ExitStack()
         capture_ended = False
+        exception_class = None
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
@@ -4602,12 +4630,20 @@ class BudgetGateMiddleware(AgentMiddleware):
                         return _tool_call_refusal(call, "scoped PR checkout grant already used", arguments=None)
                 _hold_scoped_pr_dispatch(call, lease_stack)
                 with _retained_execution(call) as retained_scope:
-                    result = handler(call.execution_request)
+                    try:
+                        result = handler(call.execution_request)
+                    except ToolException:
+                        raise
+                    except Exception as exc:
+                        result = _task_failure_result(call, exc)
+                        if result is None:
+                            raise
+                        exception_class = type(exc).__name__[:120]
                     if retained_scope is not None and getattr(call.policy, "retained_effect_lease", None):
                         _capture_retained_result(call, capture, retained_scope, result)
                         _end_tool_execution(capture)
                         capture_ended = True
-                        return _finish_tool_result(call, capture, result)
+                        return _finish_tool_result(call, capture, result, exception_class=exception_class)
                 if retained_scope is not None:
                     _capture_retained_result(call, capture, retained_scope, result)
                 lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
@@ -4617,7 +4653,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                     return _tool_call_refusal(call, "scoped PR checkout lease was not observed", arguments=None)
             _end_tool_execution(capture)
             capture_ended = True
-            return _finish_tool_result(call, capture, result)
+            return _finish_tool_result(call, capture, result, exception_class=exception_class)
         except ToolException as exc:
             refusal = _finish_tool_exception(call, capture, exc)
             if refusal is None:
@@ -4705,6 +4741,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         checkout_token = None
         lease_stack = ExitStack()
         capture_ended = False
+        exception_class = None
         try:
             review_spec = _review_submission_for_call(call)
             if review_spec is not None:
@@ -4729,12 +4766,20 @@ class BudgetGateMiddleware(AgentMiddleware):
                         return _tool_call_refusal(call, "scoped PR checkout grant already used", arguments=None)
                 await _hold_scoped_pr_dispatch_async(call, lease_stack)
                 with _retained_execution(call) as retained_scope:
-                    result = await handler(call.execution_request)
+                    try:
+                        result = await handler(call.execution_request)
+                    except ToolException:
+                        raise
+                    except Exception as exc:
+                        result = _task_failure_result(call, exc)
+                        if result is None:
+                            raise
+                        exception_class = type(exc).__name__[:120]
                     if retained_scope is not None and getattr(call.policy, "retained_effect_lease", None):
                         _capture_retained_result(call, capture, retained_scope, result)
                         _end_tool_execution(capture)
                         capture_ended = True
-                        return _finish_tool_result(call, capture, result)
+                        return _finish_tool_result(call, capture, result, exception_class=exception_class)
                 if retained_scope is not None:
                     _capture_retained_result(call, capture, retained_scope, result)
                 lease_refusal = _scoped_pr_lease_observation_refusal(call, result)
@@ -4744,7 +4789,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                     return _tool_call_refusal(call, "scoped PR checkout lease was not observed", arguments=None)
             _end_tool_execution(capture)
             capture_ended = True
-            return _finish_tool_result(call, capture, result)
+            return _finish_tool_result(call, capture, result, exception_class=exception_class)
         except ToolException as exc:
             refusal = _finish_tool_exception(call, capture, exc)
             if refusal is None:

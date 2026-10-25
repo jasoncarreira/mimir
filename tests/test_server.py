@@ -938,6 +938,7 @@ def _controlled_server_app(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     control: _ServerControl | None = None,
+    *, real_skill_setup: bool = False,
 ) -> tuple[web.Application, _ServerControl]:
     import mimir.background_tasks
     import mimir.doc_seed
@@ -1263,8 +1264,9 @@ def _controlled_server_app(
         lambda kind, **fields: control.event_payloads.append((kind, fields)),
     )
     monkeypatch.setattr("mimir.server.seed_subagent_defs", lambda home: {})
-    monkeypatch.setattr("mimir.server.migrate_legacy_skills_dir", lambda home: None)
-    monkeypatch.setattr("mimir.server.refresh_builtin_skills", lambda home: {})
+    if not real_skill_setup:
+        monkeypatch.setattr("mimir.server.migrate_legacy_skills_dir", lambda home: None)
+        monkeypatch.setattr("mimir.server.refresh_builtin_skills", lambda home: {})
     monkeypatch.setattr("mimir.server.seed_prompts", lambda home: None)
     monkeypatch.setattr("mimir.server.seed_scheduler", lambda home: None)
     monkeypatch.setattr("mimir.server.ensure_chainlink_initialized", lambda home: None)
@@ -1360,6 +1362,175 @@ def _controlled_server_app(
 
     pairing_notifier.aclose = close_pairing
     return app, control
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True], ids=["upgrade", "restart"])
+@pytest.mark.parametrize("existing_ignore", [False, True], ids=["new-ignore", "existing-ignore"])
+async def test_build_app_sweeps_crashed_turn_stores_and_seeds_home_ignore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restart: bool, existing_ignore: bool,
+) -> None:
+    """Exercise real build_app wiring, not direct calls to the cleanup helpers."""
+    from tests.test_turn_content_followups import _install_research_manifest
+
+    _install_research_manifest(tmp_path, "papers")
+    marker = tmp_path / ".mimir/turn-stores-v1"
+    if restart:
+        marker.parent.mkdir(parents=True)
+        marker.touch()
+    stale = []
+    for store in (
+        "large_tool_results", "conversation_history", "attachments/fetch-cache",
+        ".mimir/conversation_history_labels",
+    ):
+        path = tmp_path / store / ("crashed-turn/body.txt" if restart else "legacy.txt")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("untrusted crashed-turn bytes", encoding="utf-8")
+        stale.append(path)
+    for relative in (
+        "state/pollers/github-ci-watch/logs/42-101.log",
+        "state/pollers/papers/paper-draft.md",
+        "state/pollers/papers/drafts/nested/paper.md",
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("abandoned untrusted output", encoding="utf-8")
+        stale.append(path)
+    durable = {
+        "state/pollers/papers/cursor.json": '{"last_id": 42}',
+        "state/pollers/papers/seen-ids.json": '["paper:42"]',
+        "state/pollers/worklink/diagnostic.log": "retained diagnostic",
+        "state/pollers/gmail/audit.jsonl": '{"operator_audit": true}',
+    }
+    for relative, content in durable.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    ignore = tmp_path / ".ignore"
+    if existing_ignore:
+        ignore.write_text("custom/\nlogs/\n", encoding="utf-8")
+
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    try:
+        await _run_startup(app)
+        assert "runtime" in control.events
+        assert all(not path.exists() for path in stale)
+        assert not (tmp_path / "state/pollers/papers/drafts").exists()
+        if restart:
+            assert all(not (tmp_path / store / "crashed-turn").exists() for store in (
+                "large_tool_results", "conversation_history", "attachments/fetch-cache",
+                ".mimir/conversation_history_labels",
+            ))
+        assert marker.is_file()
+        for relative, content in durable.items():
+            assert (tmp_path / relative).read_text() == content
+        entries = ignore.read_text().splitlines()
+        expected = {
+            "logs/", "messages/", "large_tool_results/", "conversation_history/",
+            "attachments/fetch-cache/", "state/pollers/",
+        }
+        if existing_ignore:
+            expected.add("custom/")
+        assert set(entries) >= expected
+        assert all(entries.count(entry) == 1 for entry in expected)
+    finally:
+        await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("linked_root", [
+    "large_tool_results", "conversation_history", "attachments/fetch-cache",
+    ".mimir/conversation_history_labels", "state/pollers/github-ci-watch/logs",
+    "state/pollers", ".mimir",
+])
+async def test_build_app_skips_symlinked_store_root_and_continues_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, linked_root: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    external = tmp_path / "outside-store"
+    external.mkdir()
+    sentinel = external / "keep.txt"
+    sentinel.write_text("must not be swept", encoding="utf-8")
+    link = home / linked_root
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(external, target_is_directory=True)
+    # This unrelated owned store must still be swept after refusing the link.
+    other_store = (
+        "conversation_history" if linked_root == "large_tool_results" else "large_tool_results"
+    )
+    stale = home / other_store / "crashed-turn/body.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale bytes", encoding="utf-8")
+    # Core turn-store startup only: plugin defaults install refuses a linked .mimir.
+    monkeypatch.setenv("MIMIR_PLUGINS", "")
+
+    with caplog.at_level(logging.WARNING, logger="mimir.turn_stores"):
+        app, control = _controlled_server_app(home, monkeypatch)
+        try:
+            await _run_startup(app)
+            assert "runtime" in control.events
+            assert link.is_symlink()
+            assert sentinel.read_text() == "must not be swept"
+            assert set(external.iterdir()) == {sentinel}
+            assert not stale.parent.exists()
+            if linked_root != ".mimir":
+                assert (home / ".mimir/turn-stores-v1").is_file()
+            assert "large_tool_results/" in (home / ".ignore").read_text().splitlines()
+            assert any(record.name == "mimir.turn_stores" and record.levelno >= logging.WARNING
+                       for record in caplog.records)
+        finally:
+            await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_build_app_skips_symlinked_ignore_and_still_sweeps_stores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    external = tmp_path / "operator-ignore"
+    external.write_text("operator-owned/\n", encoding="utf-8")
+    ignore = home / ".ignore"
+    ignore.symlink_to(external)
+    stale = home / "large_tool_results/crashed-turn/body.txt"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale bytes", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="mimir.turn_stores"):
+        app, control = _controlled_server_app(home, monkeypatch)
+        try:
+            await _run_startup(app)
+            assert "runtime" in control.events
+            assert ignore.is_symlink()
+            assert external.read_text() == "operator-owned/\n"
+            assert not stale.parent.exists()
+            assert (home / ".mimir/turn-stores-v1").is_file()
+            assert any(record.name == "mimir.turn_stores" and record.levelno >= logging.WARNING
+                       for record in caplog.records)
+        finally:
+            await _run_cleanup(app)
+
+
+@pytest.mark.asyncio
+async def test_startup_sweeps_research_drafts_after_legacy_skill_migration(tmp_path, monkeypatch):
+    from tests.test_turn_content_followups import _install_research_manifest
+
+    _install_research_manifest(tmp_path, "legacy-papers")
+    legacy = tmp_path / ".claude/skills"
+    legacy.parent.mkdir(parents=True)
+    (tmp_path / "skills").rename(legacy)
+    draft = tmp_path / "state/pollers/legacy-papers/drafts/paper.md"
+    draft.parent.mkdir(parents=True)
+    draft.write_text("crashed draft")
+    app, _ = _controlled_server_app(tmp_path, monkeypatch, real_skill_setup=True)
+    try:
+        assert (tmp_path / "skills/legacy-papers/pollers.json").is_file()
+        assert not draft.exists()
+        assert (tmp_path / ".mimir_builtin_skills").is_dir()
+    finally:
+        await _run_cleanup(app)
 
 
 def test_server_boot_installs_home_saga_config(tmp_path, monkeypatch):

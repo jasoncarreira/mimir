@@ -253,11 +253,11 @@ def test_provider_checkout_handoff_and_live_result_observation(
         calls.append("handler")
         return ToolMessage(content='{"ok": true}', tool_call_id=req.tool_call["id"])
 
-    def finish(call, capture, result):
+    def finish(call, capture, result, **kwargs):
         assert lock_is_held()
         assert not completed.is_set()
         calls.append("observed")
-        return original_finish(call, capture, result)
+        return original_finish(call, capture, result, **kwargs)
 
     monkeypatch.setattr(budget_gate, "_finish_tool_result", finish)
     ctx = _ifc_turn(auth)

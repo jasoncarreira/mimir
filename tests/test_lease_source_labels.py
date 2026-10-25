@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import importlib.util
 import subprocess
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from deepagents.backends.protocol import GlobResult
+from deepagents.middleware import filesystem as deepagents_filesystem
 from langchain_core.messages import ToolMessage
 
 from mimir import access_control as access_control_module
@@ -2675,6 +2678,160 @@ def test_successful_unanchored_read_still_vetoes_edit_but_missing_read_does_not(
     )
     assert not decision.allowed
     assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.parametrize("timeout", ["backend", "executor"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.asyncio
+async def test_glob_timeout_in_lease_does_not_veto_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: str, asynchronous: bool,
+) -> None:
+    from mimir.readonly_backend import (
+        MimirFilesystemMiddleware, _RootAwareFilesystemBackend, _TraversalDeadlineExceeded,
+    )
+
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    checkout, target, _ = _recorded_lease(lease_root)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{checkout}:rw")
+    auth = replace(_auth(), roles=("admin",))
+    authorization = ToolAuthorization(
+        tool_name="glob", decision=OperationDecision.RESOURCE_SCOPED, allowed=True,
+    )
+    edit_args = {"file_path": str(target)}
+    registry = ToolRegistry()
+    before = registry.authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target), arguments=edit_args,
+    )
+    assert before.allowed, before.reason
+
+    backend = _RootAwareFilesystemBackend(root_dir=checkout, virtual_mode=True)
+    released = threading.Event()
+    if timeout == "backend":
+        def partial_walk(*args, **kwargs):
+            yield target
+            raise _TraversalDeadlineExceeded
+
+        monkeypatch.setattr(backend, "_walk_files", partial_walk)
+        # The backend must drop the already-found match when its walk expires.
+        direct_capture = begin_protected_result_capture()
+        try:
+            direct = backend.glob("**/*.py", path="/")
+        finally:
+            direct_provenance = end_protected_result_capture(direct_capture)
+        assert direct.error and direct.matches == []
+        assert direct_provenance is not None
+        assert direct_provenance.content_free_error == direct.error
+    else:
+        monkeypatch.setattr(deepagents_filesystem, "GLOB_TIMEOUT", 0.01)
+
+        def delayed_glob(*args, **kwargs):
+            released.wait(timeout=2)
+            return GlobResult(matches=[])
+
+        monkeypatch.setattr(backend, "glob", delayed_glob)
+
+    tool = next(tool for tool in MimirFilesystemMiddleware(backend=backend).tools
+                if tool.name == "glob")
+    capture = begin_protected_result_capture()
+    try:
+        if asynchronous:
+            message = await tool.coroutine(
+                pattern="**/*.py", path="/", runtime=SimpleNamespace(tool_call_id="timeout"),
+            )
+        else:
+            message = tool.func(
+                pattern="**/*.py", path="/", runtime=SimpleNamespace(tool_call_id="timeout"),
+            )
+    finally:
+        provenance = end_protected_result_capture(capture)
+        released.set()
+    assert message.status == "error"
+    assert "glob timed out" in message.content
+    assert "work.py" not in message.content
+    assert provenance is not None
+    assert provenance.sources == ()
+    assert provenance.content_free_error in (message.content, message.content.removeprefix("Error: "))
+    labels = classify_protected_result(
+        "glob", {"pattern": "**/*.py", "path": str(checkout)}, auth, authorization,
+        result=message, provenance=provenance, failed=True,
+    )
+    assert labels is None
+    appended = message.model_copy(update={
+        "content": message.content + "\n\n[withheld: resource names]",
+    })
+    appended_labels = classify_protected_result(
+        "glob", {"pattern": "**/*.py", "path": str(checkout)}, auth, authorization,
+        result=appended, provenance=provenance, failed=True,
+    )
+    assert appended_labels is not None and appended_labels.has_untrusted_active_ingest
+    after = registry.authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target), arguments=edit_args,
+    )
+    assert after.allowed, after.reason
+    assert not auth.ifc_state.labels.has_untrusted_active_ingest
+
+
+@pytest.mark.parametrize("error_prefix", ["Glob", "glob"], ids=["generic", "timeout-prefix"])
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.asyncio
+async def test_glob_resource_error_in_lease_still_vetoes_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, asynchronous: bool, error_prefix: str,
+) -> None:
+    from mimir.readonly_backend import MimirFilesystemMiddleware, _RootAwareFilesystemBackend
+
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    checkout, target, _ = _recorded_lease(lease_root)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{checkout}:rw")
+    auth = replace(_auth(), roles=("admin",))
+    registry = ToolRegistry()
+    edit_args = {"file_path": str(target)}
+    before = registry.authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target), arguments=edit_args,
+    )
+    assert before.allowed, before.reason
+    backend = _RootAwareFilesystemBackend(root_dir=checkout, virtual_mode=True)
+    # The lowercase variant becomes "Error: glob ..." in the stock tool and
+    # must not be mistaken for its exact, content-free executor timeout.
+    error = f"{error_prefix} of '{checkout}' aborted partway: resource text from work.py"
+    monkeypatch.setattr(backend, "glob", lambda *args, **kwargs: GlobResult(error=error))
+    tool = next(tool for tool in MimirFilesystemMiddleware(backend=backend).tools
+                if tool.name == "glob")
+    capture = begin_protected_result_capture()
+    try:
+        if asynchronous:
+            message = await tool.coroutine(
+                pattern="**/*.py", path="/", runtime=SimpleNamespace(tool_call_id="error"),
+            )
+        else:
+            message = tool.func(
+                pattern="**/*.py", path="/", runtime=SimpleNamespace(tool_call_id="error"),
+            )
+    finally:
+        provenance = end_protected_result_capture(capture)
+    assert message.content == f"Error: {error}"
+    assert provenance is None or provenance.content_free_error is None
+    labels = classify_protected_result(
+        "glob", {"pattern": "**/*.py", "path": str(checkout)}, auth,
+        ToolAuthorization(tool_name="glob", decision=OperationDecision.RESOURCE_SCOPED,
+                          allowed=True),
+        result=message, provenance=provenance, failed=True,
+    )
+    assert labels is not None and labels.has_untrusted_active_ingest
+    assert len(labels.sources) == 1
+    source = labels.sources[0]
+    assert source.source_kind == "protected_tool"
+    assert source.resource_id == str(checkout)
+    assert source.integrity == "untrusted"
+    assert not source.is_complete
+    auth.ifc_state.merge(labels)
+    decision = registry.authorize_tool(
+        "edit_file", auth, enforce=True, target_channel=str(target), arguments=edit_args,
+    )
+    assert not decision.allowed and decision.reason == "write_blocked_by_untrusted_ingest"
 
 
 @pytest.mark.parametrize("method", ["glob", "aglob"])

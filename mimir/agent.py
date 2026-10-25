@@ -2534,6 +2534,10 @@ class Agent:
             )
             ctx_token = set_current_turn(ctx)
             ctx.turn_scratch_path = ensure_turn_scratch(self._config.home, ctx.turn_id)
+            from .turn_stores import move_ci_logs_to_turn
+            ctx.ci_log_paths = await asyncio.to_thread(
+                move_ci_logs_to_turn, self._config.home, event, ctx.turn_scratch_path,
+            )
             ctx.turn_event_emitter = emitter
             emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
             # WikiBacklinksHook pre-snapshot — capture mtimes of every
@@ -2663,6 +2667,15 @@ class Agent:
             # only what was actually created.
             if ctx_token is not None:
                 reset_current_turn(ctx_token)
+            if ctx is not None:
+                from .turn_stores import close_turn_stores, wipe_ci_logs, wipe_research_drafts, wipe_turn_stores
+                try:
+                    await asyncio.to_thread(close_turn_stores, ctx)
+                    await asyncio.to_thread(wipe_turn_stores, self._config.home, ctx.turn_id)
+                    await asyncio.to_thread(wipe_ci_logs, getattr(ctx, "ci_log_paths", ()))
+                    await asyncio.to_thread(wipe_research_drafts, self._config.home, ctx.turn_id)
+                except Exception:  # noqa: BLE001 — cleanup must not mask turn failure
+                    log.exception("turn_store_wipe_failed")
             if interactive_token is not None:
                 _reset_interactive(interactive_token)
             if cid_token is not None:

@@ -9702,7 +9702,7 @@ class ToolRegistry:
                 turn is not None
                 and artifact_root is not None
                 and artifact is not None
-                and artifact.parent == artifact_root
+                and artifact.parent == artifact_root / str(turn.turn_id)
                 and artifact.name in turn.evicted_tool_result_ids
             ):
                 return finish(ToolAuthorization(
@@ -11720,6 +11720,150 @@ def _provider_pr_lease_result_is_bound(
     )
 
 
+_SHELL_CONTENT_NAME = re.compile(
+    r"(?<![\w.-])(?:turns\.jsonl|events\.jsonl|chat_history\.jsonl|triage-dropped\.jsonl|worklink-ready-queue|conversation_history)(?![\w.-])"
+    r"|(?<![\w.-])(?:logs|messages)(?=/|\\)"
+    r"|/(?:logs|messages)(?=['\"\s/\\]|$)"
+)
+
+
+def _shell_search_path(word: str, cwd: Path, home: Path) -> Path:
+    """Expand only known HOME spellings; glob prefixes conservatively bound reads."""
+    word = re.sub(r"\$(?:\{(?:MIMIR_HOME|HOME)\}|(?:MIMIR_HOME|HOME)\b)", str(home), word)
+    if word == "~" or word.startswith("~/"):
+        word = str(home) + word[1:]
+    # Never enumerate a glob: its containing directory is the read boundary.
+    prefix = re.split(r"[?*\[]", word, maxsplit=1)[0]
+    if prefix != word:
+        word = prefix if prefix.endswith("/") else str(Path(prefix).parent)
+    path = Path(word)
+    return (path if path.is_absolute() else cwd / path).resolve()
+
+
+def _shell_search_self_authored(path: Path, home: Path) -> bool:
+    # Unlike a direct file read, searching state/ can descend into state/pollers.
+    return path.is_relative_to(home) and bool(path.relative_to(home).parts) and (
+        path.relative_to(home).parts[0] in _SELF_AUTHORED_FILE_ROOTS - {"state"}
+    )
+
+
+def _shell_search_operands(words: list[str]) -> list[str]:
+    """Separate common search options/patterns from path operands, without execution."""
+    operands: list[str] = []
+    pattern = False
+    options = True
+    index = 0
+    takes_value = {"-e", "--regexp", "-f", "--file", "-d", "--directories",
+                   "--include", "--exclude", "--exclude-dir", "-g", "--glob",
+                   "--iglob", "-t", "--type", "-T", "--type-not", "-m",
+                   "--max-count", "-A", "-B", "-C", "--context", "--encoding"}
+    while index < len(words):
+        word = words[index]
+        index += 1
+        if options and word == "--":
+            options = False
+        elif options and word == "--files":
+            pattern = True
+        elif options and word in takes_value:
+            if word in {"-e", "--regexp", "-f", "--file"}:
+                pattern = True
+            index += 1
+        elif options and word.startswith("-") and word != "-":
+            if word.startswith(("--regexp=", "--file=", "-e", "-f")):
+                pattern = True
+        elif not pattern:
+            pattern = True
+        else:
+            operands.append(word)
+    return operands
+
+
+def _shell_recursive_segment(words: list[str]) -> bool:
+    if not words:
+        return False
+    name = Path(words[0]).name
+    if name in {"rg", "ag"}:
+        return True
+    if name not in {"grep", "egrep", "fgrep"}:
+        return False
+    return any(
+        word == "--recursive" or word == "--directories=recurse"
+        or (word.startswith("-") and not word.startswith("--") and bool(re.search("[rR]", word)))
+        or (word in {"-d", "--directories"} and words[index + 1:index + 2] == ["recurse"])
+        for index, word in enumerate(words[1:], 1)
+    )
+
+
+def _shell_reads_home_content(arguments: dict[str, Any], *, tool_name: str = "shell_exec") -> bool:
+    """Conservative accidental-read classifier, not deliberate-bypass isolation.
+
+    Tokenize pipeline segments so unrelated echo operands do not change search
+    boundaries. No shell expansion, substitution, filesystem globbing or execution.
+    """
+    command = arguments.get("command")
+    if not isinstance(command, str):
+        return False
+    if _SHELL_CONTENT_NAME.search(command):
+        return True
+    home_raw = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_raw:
+        return False
+    home = Path(home_raw).resolve()
+    cwd_raw = arguments.get("cwd")
+    if isinstance(cwd_raw, str) and cwd_raw:
+        cwd = _shell_search_path(cwd_raw, home, home)
+    else:
+        from ._context import get_current_turn
+        from .tools.extra import _effective_shell_cwd
+        turn = get_current_turn()
+        cwd = (_effective_shell_cwd() if turn is None or hasattr(turn, "session_id") else home) or home
+    cwd = cwd.resolve()
+    # Nonrecursive reads from a remembered content-store cwd remain protected.
+    if cwd.is_relative_to(home):
+        relative = cwd.relative_to(home)
+        if any(part in {"logs", "messages", "conversation_history", "large_tool_results"}
+               for part in relative.parts) or relative.parts[:2] in {
+                   ("state", "pollers"), ("attachments", "fetch-cache"),
+               }:
+            return True
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        # Malformed quoting must not downgrade a possible HOME search.
+        return bool(re.search(r"\b(?:rg|ag|grep|egrep|fgrep)\b", command))
+    segments: list[list[str]] = [[]]
+    redirect = False
+    for token in tokens:
+        if token and all(char in ";&|()\n" for char in token):
+            segments.append([])
+            redirect = False
+        elif token and all(char in "<>&|" for char in token) and ("<" in token or ">" in token):
+            redirect = True
+            if segments[-1] and segments[-1][-1].isdigit():
+                segments[-1].pop()
+        elif redirect:
+            redirect = False
+        else:
+            segments[-1].append(token)
+    for words in segments:
+        if words[:1] == ["cd"] and len(words) >= 2:
+            cwd = _shell_search_path(words[1], cwd, home)
+        elif _shell_recursive_segment(words):
+            paths = [_shell_search_path(word, cwd, home)
+                     for word in _shell_search_operands(words[1:])] or [cwd]
+            if all(_shell_search_self_authored(path, home) for path in paths):
+                continue
+            if ((cwd.is_relative_to(home) and not _shell_search_self_authored(cwd, home))
+                    or home.is_relative_to(cwd)
+                    or any(path.is_relative_to(home) or home.is_relative_to(path) for path in paths)):
+                return True
+    return False
+
+
 @scoped_policy_call(lambda bound: getattr(bound.arguments["authorization"], "policy", None))
 def classify_protected_result(
     tool_name: str,
@@ -11806,6 +11950,22 @@ def classify_protected_result(
         return acp_error_labels
 
     args = arguments or {}
+    if tool_name in {"shell_exec", "bash_async"} and authorization.allowed and _shell_reads_home_content(args, tool_name=tool_name):
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        labels = InformationFlowLabels().with_source(SourceLabel(
+            principal=principal, domain="shell", resource_id=tool_name,
+            bridge_instance=getattr(auth_context, "bridge_instance", None),
+            sensitivity="internal",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            source_kind="protected_tool", integrity="untrusted",
+            integrity_effect="active_ingest",
+        ))
+        for source in provenance.sources if provenance is not None else ():
+            labels = labels.with_source(source)
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
     if tool_name == "chainlink_issue_show" and not failed:
         issue_id = args.get("issue_id")
         if type(issue_id) is not int or issue_id < 1:
