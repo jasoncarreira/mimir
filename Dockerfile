@@ -192,6 +192,30 @@ RUN --mount=type=bind,from=chainlink-artifact,source=/usr/local/bin/chainlink,ta
         fi; \
         install -m 0755 /tmp/chainlink /usr/local/bin/chainlink; \
     fi
+# gh api --allow-escape-sequences is required by github-ci-watch for job logs;
+# pin 2.103.2, which supports that flag and includes the 2.102.0 security fixes.
+# SHA-256 values are from the official v2.103.2 linux amd64/arm64 release
+# assets; override the version and both digests together to bump.
+ARG GH_VERSION=2.103.2
+ARG GH_AMD64_SHA256=62ccf747115ddc61237efffdde66a3c8f70ba249433dc64f70801089b59c59c8
+ARG GH_ARM64_SHA256=4c3e99a50bd8b181a3fe9d69b25dd978bac768148d88f01507c6b4d1ef61a443
+RUN set -eu; \
+    if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        case "$(dpkg --print-architecture)" in \
+            amd64) arch=amd64; digest="$GH_AMD64_SHA256" ;; \
+            arm64) arch=arm64; digest="$GH_ARM64_SHA256" ;; \
+            *) echo >&2 "Unsupported architecture for gh"; exit 2 ;; \
+        esac; \
+        case "$GH_VERSION" in *[!0-9.]*|.*|*..*|*.) echo >&2 "GH_VERSION must be pinned"; exit 2 ;; esac; \
+        test -n "$GH_VERSION"; \
+        archive="gh_${GH_VERSION}_linux_${arch}.tar.gz"; \
+        curl --fail --silent --show-error --location --retry 5 \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${archive}" -o /tmp/gh.tar.gz; \
+        printf '%s  %s\n' "$digest" /tmp/gh.tar.gz | sha256sum -c -; \
+        tar -xzf /tmp/gh.tar.gz -C /tmp "gh_${GH_VERSION}_linux_${arch}/bin/gh"; \
+        install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" /usr/local/bin/gh; \
+        rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${arch}"; \
+    fi
 # Core-only images create just the controller user; the worklink identity and
 # its state directories belong to the selected Cultivate worker.
 RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
@@ -303,9 +327,15 @@ RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
         MIMIR_PLUGINS=cultivate MIMIR_ENABLE_OPENCODE="$MIMIR_ENABLE_OPENCODE" \
         sh /opt/cultivate-docker/bootstrap.sh; \
     fi
-# Check the installed runtime binary as the non-root controller user.
+# Check the installed runtime binaries as the non-root controller user.
 RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
         chainlink --version; \
+    fi
+RUN set -eu; \
+    if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        export HOME=/home/mimir XDG_CONFIG_HOME=/home/mimir/.config GH_CONFIG_DIR=/home/mimir/.config/gh; \
+        gh --version; \
+        gh api --help | grep -q -- --allow-escape-sequences; \
     fi
 
 # Auto-update behavior on this image:
@@ -360,6 +390,17 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 # bundle defines what runs.
 USER root
 COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+# worker_exec._handle_launch creates a private HOME under this same root;
+# s6-setuidgid alone changes identity but would retain root's inaccessible HOME.
+RUN set -eu; \
+    if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        home="$(mktemp -d /var/lib/mimir-worklink/homes/gh-build-XXXXXX)"; \
+        trap 'rm -rf "$home"' EXIT; \
+        chown worklink:worklink "$home"; \
+        chmod 0700 "$home"; \
+        /command/s6-setuidgid worklink env HOME="$home" XDG_CONFIG_HOME="$home/.config" GH_CONFIG_DIR="$home/.config/gh" gh --version; \
+        /command/s6-setuidgid worklink env HOME="$home" XDG_CONFIG_HOME="$home/.config" GH_CONFIG_DIR="$home/.config/gh" gh api --help | grep -q -- --allow-escape-sequences; \
+    fi
 RUN set -eu; \
     if [ "$(cat /opt/cultivate-docker/selected)" != 1 ]; then \
         rm -rf /etc/s6-overlay/s6-rc.d/worklink-execd \
