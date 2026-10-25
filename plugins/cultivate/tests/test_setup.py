@@ -504,8 +504,21 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
         exec(compile(script, "provision.py", "exec"), {"__name__": "__main__"})
 
 
-@pytest.mark.parametrize("push_ok", [False, True])
-def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok):
+@pytest.mark.parametrize(("push_ok", "probe_stderr", "expected_marker"), [
+    pytest.param(True, b"", None, id="success"),
+    pytest.param(False, b"The requested URL returned error: 403", installer._PUSH_PROBE_FAILED, id="403"),
+    pytest.param(False, b"The requested URL returned error: 401", installer._PUSH_PROBE_FAILED, id="401"),
+    pytest.param(False, b"Authentication failed", installer._PUSH_PROBE_FAILED, id="authentication"),
+    pytest.param(False, b"Permission to org/repo.git denied to bot.", installer._PUSH_PROBE_FAILED, id="permission"),
+    pytest.param(False, b"could not read Username for 'https://github.com'", installer._PUSH_PROBE_FAILED, id="username"),
+    pytest.param(False, b"Could not resolve host: github.com", installer._PUSH_PROBE_UNREACHABLE, id="dns"),
+    pytest.param(False, b"Recv failure: Connection reset by peer", installer._PUSH_PROBE_UNREACHABLE, id="reset"),
+    pytest.param(False, b"Could not resolve proxy: proxy.example", installer._PUSH_PROBE_UNREACHABLE, id="proxy"),
+    pytest.param(False, b"The requested URL returned error: 503", installer._PUSH_PROBE_UNREACHABLE, id="github-503"),
+    pytest.param(False, b"unknown failure \\xff", installer._PUSH_PROBE_UNREACHABLE, id="unknown"),
+])
+@pytest.mark.parametrize("existing_checkout", [False, True], ids=["fresh", "rerun"])
+def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok, probe_stderr, expected_marker, existing_checkout):
     """Exercise setup's run boundary and the actual provision program, offline."""
     monkeypatch.setattr(installer, "_installed_license", lambda: (b"license", "1.0"))
     parser = argparse.ArgumentParser()
@@ -542,6 +555,8 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok)
     monkeypatch.setattr(skills, "install_skill", lambda home, skill: ((home / "skills" / skill.dirname).mkdir(parents=True), None))
     home = tmp_path / "home"
     repo = tmp_path / "repo"
+    if existing_checkout:
+        (repo / ".git").mkdir(parents=True)
     git_calls = []
     docker_calls = []
 
@@ -551,8 +566,9 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok)
             if "clone" in argv:
                 (repo / ".git").mkdir(parents=True)
             if "push" in argv:
-                return subprocess.CompletedProcess(argv, 0 if push_ok else 1,
-                                                   stdout=b"secret remote output fixture-token", stderr=b"secret")
+                return subprocess.CompletedProcess(argv, 0 if push_ok else 128,
+                                                   stdout=b"secret remote output fixture-token",
+                                                   stderr=probe_stderr + b" remote secret fixture-token")
             return subprocess.CompletedProcess(argv, 0, stdout="https://github.com/org/repo.git\n")
         if argv[:2] == ["docker", "exec"]:
             kwargs["stdout"].write(b"owner-key\n")
@@ -570,6 +586,8 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok)
                 try:
                     exec(compile(script, "provision.py", "exec"), {"__name__": "__main__"})
                 except SystemExit as exc:
+                    assert exc.code == 1
+                    assert output.getvalue().splitlines() == [expected_marker]
                     return subprocess.CompletedProcess(argv, exc.code, stdout=output.getvalue(), stderr="remote secret fixture-token")
             return subprocess.CompletedProcess(argv, 0, stdout=output.getvalue(), stderr="")
         if argv[-3:] == ["ps", "-q", "agent"]:
@@ -585,13 +603,20 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok)
         with pytest.raises(installer.SetupError) as caught:
             installer.setup(args, request=request, verify=lambda *a: verified.append(a))
         message = str(caught.value)
-        assert "resource owner = the repository owner" in message
-        assert "organization" in message and "Contents: Read and write" in message
-        assert "approval" in message
+        if expected_marker == installer._PUSH_PROBE_FAILED:
+            assert message == installer._PUSH_PROBE_HELP
+            assert "resource owner = the repository owner" in message
+            assert "organization" in message and "Contents: Read and write" in message
+            assert "approval" in message
+        else:
+            assert message == "Push probe could not reach the remote (network or GitHub error); retry setup."
+            assert "Token" not in message and "PAT" not in message
+        assert probe_stderr.decode("utf-8", errors="replace") not in message
         assert "fixture-token" not in message and "remote secret" not in message
         assert not verified and not any(argv[-3:] == ["up", "-d", "agent"] for argv in docker_calls)
         assert not (home / "repositories.yaml").exists()
     assert len([argv for argv in git_calls if "push" in argv]) == 1
+    assert len([argv for argv in git_calls if "clone" in argv]) == (0 if existing_checkout else 1)
     assert all("fixture-token" not in " ".join(argv) for argv in git_calls + docker_calls)
     captured = capsys.readouterr()
     assert "fixture-token" not in captured.out + captured.err

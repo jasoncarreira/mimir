@@ -51,6 +51,10 @@ _PUSH_PROBE_HELP = (
     "repository access = only the target repository, and Contents: Read and write; "
     "get organization approval if required."
 )
+_PUSH_PROBE_UNREACHABLE = "CULTIVATE_PUSH_PROBE_UNREACHABLE"
+_PUSH_PROBE_UNREACHABLE_HELP = (
+    "Push probe could not reach the remote (network or GitHub error); retry setup."
+)
 _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.-]*")
 _BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]*")
 _EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
@@ -384,6 +388,8 @@ def _run(args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None
         # Docker/gh may reflect a secret in their error output. Never relay it.
         if _PUSH_PROBE_FAILED in result.stdout.splitlines():
             raise SetupError(_PUSH_PROBE_HELP)
+        if _PUSH_PROBE_UNREACHABLE in result.stdout.splitlines():
+            raise SetupError(_PUSH_PROBE_UNREACHABLE_HELP)
         raise SetupError(f"{args[0]} operation failed (exit {result.returncode}); inspect the deployment without publishing secrets.")
     return result.stdout.strip()
 
@@ -608,6 +614,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
 _PROVISION = '''from pathlib import Path
 import json
 import os
+import re
 import subprocess
 import uuid
 import yaml
@@ -641,7 +648,14 @@ probe = subprocess.run(['git', '-C', str(repo), 'push', '--dry-run', 'origin',
                         'HEAD:refs/heads/cultivate-setup-probe-' + uuid.uuid4().hex],
                        capture_output=True, check=False)
 if probe.returncode:
-    print('CULTIVATE_PUSH_PROBE_FAILED', flush=True)
+    # Classify captured bytes locally; never relay git's credential-bearing output.
+    auth_failure = re.search(
+        rb'The requested URL returned error: (?:401|403)(?![0-9])|'
+        rb'Authentication failed|Permission to .+ denied|could not read Username',
+        probe.stderr, re.IGNORECASE,
+    )
+    marker = 'CULTIVATE_PUSH_PROBE_FAILED' if auth_failure else 'CULTIVATE_PUSH_PROBE_UNREACHABLE'
+    print(marker, flush=True)
     raise SystemExit(1)
 inventory = home / 'repositories.yaml'
 config = yaml.safe_load(inventory.read_text()) if inventory.exists() else {}
