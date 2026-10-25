@@ -35,9 +35,15 @@ binary to `/usr/local/bin/gh`. To bump it, take both tarball SHA-256 digests
 from the intended version's [official checksums](https://github.com/cli/cli/releases),
 update all three Dockerfile defaults together (or pass all three build args),
 and rebuild. The build runs `gh --version` as both `mimir` and `worklink`
-and requires `gh api --help` to advertise `--allow-escape-sequences`, so an
-incompatible override fails the build. The static version floor is 2.102.0
-(the advisory-patched release); the capability check remains required.
+and requires `gh api --help` to advertise `--allow-escape-sequences` as each
+identity, so an incompatible override fails the build. Controller probes explicitly
+use `/home/mimir`; worker probes use a disposable mode-0700 worklink-owned HOME
+under `/var/lib/mimir-worklink/homes`, with matching XDG and gh config paths.
+This mirrors the executor's private per-job HOME rather than inheriting `/root`
+through `s6-setuidgid` (the worklink account's passwd home is `/nonexistent`,
+but `worker_exec._handle_launch` replaces it before spawning jobs). The disposable
+build HOME is removed even when a probe fails. The static version floor is 2.102.0
+(the advisory-patched release); the capability checks remain required.
 Core-only images do not download or install gh. `mimir cultivate setup` passes
 `MIMIR_EXTRAS=<provider>,mcp` to the root build, including its saved `build.sh`.
 

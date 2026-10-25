@@ -415,8 +415,16 @@ def _assert_cultivate_gh_install(root: str) -> None:
     assert 'gh --version;' in controller_check
     assert controller_check.startswith("set -eu;"), "gh probe must fail closed"
     assert 'gh api --help | grep -q -- --allow-escape-sequences;' in controller_check, "gh capability probe missing"
-    assert '/command/s6-setuidgid worklink gh --version;' in next(
-        p for p in programs if "/command/s6-setuidgid worklink gh --version" in p)
+    assert 'export HOME=/home/mimir XDG_CONFIG_HOME=/home/mimir/.config GH_CONFIG_DIR=/home/mimir/.config/gh;' in controller_check
+    worker_check = next(p for p in programs if "s6-setuidgid" in p and "gh --version" in p)
+    assert worker_check.startswith("set -eu;"), "worker gh probe must fail closed"
+    assert 'mktemp -d /var/lib/mimir-worklink/homes/gh-build-XXXXXX' in worker_check
+    assert 'chown worklink:worklink "$home";' in worker_check
+    assert 'chmod 0700 "$home";' in worker_check
+    assert 'trap \'rm -rf "$home"\' EXIT;' in worker_check
+    prefix = '/command/s6-setuidgid worklink env HOME="$home" XDG_CONFIG_HOME="$home/.config" GH_CONFIG_DIR="$home/.config/gh" '
+    assert prefix + 'gh --version;' in worker_check
+    assert prefix + 'gh api --help | grep -q -- --allow-escape-sequences;' in worker_check, "worker gh capability probe missing"
     # A core build selects 0; only the selected branch may fetch or install gh.
     assert root.count("/usr/local/bin/gh") == 1
     assert "gh" not in (ROOT / "plugins/cultivate/mimir_cultivate/docker/base.sh").read_text().split("apt-get install", 1)[1].split("curl -fsSL", 1)[0].split()
@@ -469,6 +477,7 @@ def test_cultivate_gh_guard_rejects_missing_capability_or_old_pin(old, new, mess
         _assert_cultivate_gh_install(root.replace(old, new))
 
 
+@pytest.mark.parametrize("identity", ["mimir", "worklink"])
 @pytest.mark.parametrize("selected,version_exit,supports_flag,expected", [
     ("0", 1, False, 0),
     ("1", 0, True, 0),
@@ -476,28 +485,71 @@ def test_cultivate_gh_guard_rejects_missing_capability_or_old_pin(old, new, mess
     ("1", 1, True, 1),
 ])
 def test_cultivate_gh_build_probe_requires_working_binary_and_flag(
-    tmp_path, selected, version_exit, supports_flag, expected,
+    tmp_path, identity, selected, version_exit, supports_flag, expected,
 ) -> None:
+    result, calls = _run_gh_probe(tmp_path, identity, selected, version_exit, supports_flag)
+    assert result.returncode == expected, result.stderr
+    assert calls == ([] if selected == "0" else ["--version"] if version_exit else ["--version", "api --help"])
+
+
+def _run_gh_probe(tmp_path, identity, selected="1", version_exit=0, supports_flag=True,
+                  *, inherit_home=False):
     probe, = (p for p in _run_instructions(DOCKERFILE.read_text())
-              if "gh --version" in p and "s6-setuidgid" not in p)
+              if "gh --version" in p and ("s6-setuidgid" in p) == (identity == "worklink"))
     marker = tmp_path / "selected"
     marker.write_text(selected + "\n")
+    homes = tmp_path / "homes"
+    homes.mkdir()
+    controller_home = tmp_path / "controller"
+    controller_home.mkdir()
     log = tmp_path / "calls"
     binary = tmp_path / "gh"
+    # Model gh's config lookup, not just its output: inherited root config must
+    # fail even for --version. Both calls must see the identity-specific HOME.
     binary.write_text(
         '#!/bin/sh\nprintf "%s\\n" "$*" >> "$GH_TEST_LOG"\n'
+        'case "$GH_TEST_IDENTITY" in\n'
+        'mimir) [ "$HOME" = "$GH_TEST_CONTROLLER_HOME" ] || exit 41 ;;\n'
+        'worklink) case "$HOME" in "$GH_TEST_HOMES"/gh-build-*) ;; *) exit 41 ;; esac; '
+        '[ -d "$HOME" ] && [ "$(stat -c %a "$HOME" 2>/dev/null || stat -f %Lp "$HOME")" = 700 ] || exit 41 ;;\n'
+        'esac\n'
+        '[ "$XDG_CONFIG_HOME" = "$HOME/.config" ] || exit 41\n'
+        '[ "$GH_CONFIG_DIR" = "$HOME/.config/gh" ] || exit 41\n'
         'if [ "$1" = --version ]; then exit "$GH_TEST_VERSION_EXIT"; fi\n'
         'if [ "$GH_TEST_FLAG" = 1 ]; then echo --allow-escape-sequences; else echo usage; fi\n'
     )
     binary.chmod(0o755)
-    probe = probe.replace("/opt/cultivate-docker/selected", str(marker))
+    # Portable unit execution doesn't impersonate host accounts; ownership is
+    # asserted statically above and the real uid boundary is the image CI gate.
+    for name, body in (("s6-setuidgid", 'shift; exec "$@"'), ("chown", ":")):
+        stub = tmp_path / name
+        stub.write_text("#!/bin/sh\n" + body + "\n")
+        stub.chmod(0o755)
+    probe = probe.replace("/opt/cultivate-docker/selected", str(marker)).replace(
+        "/var/lib/mimir-worklink/homes", str(homes)).replace(
+        "/home/mimir", str(controller_home)).replace(
+        "/command/s6-setuidgid", str(tmp_path / "s6-setuidgid"))
+    if inherit_home:
+        if identity == "mimir":
+            probe = re.sub(r"export HOME=.*?;", "true;", probe)
+        else:
+            probe = probe.replace('env HOME="$home" XDG_CONFIG_HOME="$home/.config" GH_CONFIG_DIR="$home/.config/gh" ', "")
     result = subprocess.run(["/bin/sh", "-c", probe], capture_output=True, text=True, env={
         **os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin", "GH_TEST_LOG": str(log),
-        "GH_TEST_VERSION_EXIT": str(version_exit), "GH_TEST_FLAG": str(int(supports_flag)),
+        "HOME": "/root", "XDG_CONFIG_HOME": "/root/.config", "GH_CONFIG_DIR": "/root/.config/gh",
+        "GH_TEST_IDENTITY": identity, "GH_TEST_CONTROLLER_HOME": str(controller_home),
+        "GH_TEST_HOMES": str(homes), "GH_TEST_VERSION_EXIT": str(version_exit),
+        "GH_TEST_FLAG": str(int(supports_flag)),
     })
-    assert result.returncode == expected, result.stderr
-    calls = log.read_text().splitlines() if log.exists() else []
-    assert calls == ([] if selected == "0" else ["--version"] if version_exit else ["--version", "api --help"])
+    assert list(homes.iterdir()) == [], "disposable worker HOME must be removed on success and failure"
+    return result, log.read_text().splitlines() if log.exists() else []
+
+
+@pytest.mark.parametrize("identity", ["mimir", "worklink"])
+def test_cultivate_gh_probe_rejects_inherited_root_environment(tmp_path, identity):
+    result, calls = _run_gh_probe(tmp_path, identity, inherit_home=True)
+    assert result.returncode == 41, result.stderr
+    assert calls == ["--version"]
 
 
 def test_root_assembler_pins_selected_cultivate_to_the_built_version(tmp_path) -> None:

@@ -333,6 +333,7 @@ RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
     fi
 RUN set -eu; \
     if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        export HOME=/home/mimir XDG_CONFIG_HOME=/home/mimir/.config GH_CONFIG_DIR=/home/mimir/.config/gh; \
         gh --version; \
         gh api --help | grep -q -- --allow-escape-sequences; \
     fi
@@ -389,8 +390,16 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 # bundle defines what runs.
 USER root
 COPY deploy/s6-overlay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
-RUN if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
-        /command/s6-setuidgid worklink gh --version; \
+# worker_exec._handle_launch creates a private HOME under this same root;
+# s6-setuidgid alone changes identity but would retain root's inaccessible HOME.
+RUN set -eu; \
+    if [ "$(cat /opt/cultivate-docker/selected)" = 1 ]; then \
+        home="$(mktemp -d /var/lib/mimir-worklink/homes/gh-build-XXXXXX)"; \
+        trap 'rm -rf "$home"' EXIT; \
+        chown worklink:worklink "$home"; \
+        chmod 0700 "$home"; \
+        /command/s6-setuidgid worklink env HOME="$home" XDG_CONFIG_HOME="$home/.config" GH_CONFIG_DIR="$home/.config/gh" gh --version; \
+        /command/s6-setuidgid worklink env HOME="$home" XDG_CONFIG_HOME="$home/.config" GH_CONFIG_DIR="$home/.config/gh" gh api --help | grep -q -- --allow-escape-sequences; \
     fi
 RUN set -eu; \
     if [ "$(cat /opt/cultivate-docker/selected)" != 1 ]; then \
