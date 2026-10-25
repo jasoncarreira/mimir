@@ -17,6 +17,7 @@ Provider is configured via saga.toml [embedding] section.
 import logging
 import os
 import threading
+import tempfile
 import time
 import sqlite3
 from pathlib import Path
@@ -196,9 +197,10 @@ class ONNXProvider(EmbeddingProvider):
 
     Default model: BAAI/bge-small-en-v1.5 (33MB ONNX, 384 dimensions).
     fastembed handles model fetch, ONNX runtime, tokenizer config, and
-    pooling — same library mimir's file_search uses, so we share one
-    on-disk cache (``~/.cache/fastembed/``) instead of paying for the
-    model twice.
+    pooling. On first load, cache in ``FASTEMBED_CACHE_PATH`` if set,
+    otherwise ``$XDG_CACHE_HOME/fastembed`` or ``~/.cache/fastembed``.
+    If that directory is unwritable, use fastembed's temporary cache
+    (``<tempdir>/fastembed_cache``) and warn once.
 
     Pre-fastembed implementation downloaded model.onnx + tokenizer.json
     by hand and ran ``onnxruntime.InferenceSession`` directly with a
@@ -238,7 +240,22 @@ class ONNXProvider(EmbeddingProvider):
                     "this only fires in standalone-saga deployments that "
                     "skipped the optional embedding deps)."
                 )
-            self._model = TextEmbedding(model_name=self.model_name)
+            override = os.environ.get("FASTEMBED_CACHE_PATH")
+            if override:
+                cache = Path(override).expanduser()
+            else:
+                root = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+                cache = Path(root).expanduser() / "fastembed"
+            try:
+                cache.mkdir(parents=True, exist_ok=True)
+                # mkdir(exist_ok=True) also succeeds for an existing read-only
+                # directory; probe with the effective uid, not os.access().
+                with tempfile.TemporaryFile(dir=cache):
+                    pass
+            except OSError:
+                log.warning("fastembed cache %s is unwritable; using temporary cache", cache)
+                cache = Path(tempfile.gettempdir()) / "fastembed_cache"
+            self._model = TextEmbedding(model_name=self.model_name, cache_dir=str(cache))
         return self._model
 
     def embed(self, text: str, input_type: str = "passage") -> list[float]:

@@ -11,6 +11,7 @@ import logging
 import tomllib
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -564,6 +565,46 @@ def test_saga_provisioning(tmp_path, spec, embedding, llm, provider, dim, key):
     with pytest.raises(RuntimeError, match=r"\[llm\] conflicts"):
         installer._provision_saga(tmp_path, spec, embedding, prefetch=lambda: None)
     assert "operator-model" in (tmp_path / "saga.toml").read_text()
+
+
+def test_local_prefetch_and_agent_share_persistent_cache(tmp_path, monkeypatch):
+    """Execute the provision preamble with real Saga prefetch, without a model download."""
+    from mimir.scaffold_docker import render_compose_yml
+    from mimir.saga.embeddings import ONNXProvider
+
+    compose = installer.render_compose(
+        render_compose_yml(service_name="agent", web_port=8123, mode="pypi"),
+        "image:sha", "python",
+    )
+    agent = yaml.safe_load(compose)["services"]["agent"]
+    assert "cache:/home/mimir/.cache" in agent["volumes"]
+    assert "FASTEMBED_CACHE_PATH" not in agent["environment"]
+
+    container_home = tmp_path / "home-mimir"
+    (container_home / "agent").mkdir(parents=True)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"saga_model_spec": "openai:gpt-5.4-nano",
+                                    "embedding": "local", "reembed": False}))
+    prefetches = []
+    monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(
+        TextEmbedding=lambda **kwargs: prefetches.append(kwargs) or object(),
+    ))
+    monkeypatch.delenv("FASTEMBED_CACHE_PATH", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    # Only the prefetch portion of the actual provision program is needed.
+    script = (installer._PROVISION.split("repo = Path('/workspace')", 1)[0]
+              .replace("/opt/cultivate-manifest.json", str(manifest))
+              .replace("/home/mimir", str(container_home)))
+    exec(compile(script, "provision.py", "exec"), {"__name__": "__main__"})
+
+    cache = container_home / ".cache" / "fastembed"
+    assert cache.is_dir()
+    assert prefetches == [{"model_name": installer.LOCAL_MODEL, "cache_dir": str(cache)}]
+    # The agent has HOME=/home/mimir, but need not set XDG_CACHE_HOME.
+    monkeypatch.delenv("XDG_CACHE_HOME")
+    runtime = ONNXProvider(model_name=installer.LOCAL_MODEL)
+    runtime._load()
+    assert prefetches == [{"model_name": installer.LOCAL_MODEL, "cache_dir": str(cache)}] * 2
 
 
 def test_existing_vectors_require_explicit_reembed(tmp_path):
