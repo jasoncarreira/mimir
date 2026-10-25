@@ -24,6 +24,9 @@ test -f "$source/mimir/react_app/dist/index.html"
 # by this commit's core, or the install fails here instead of at boot.
 core="$source"
 if [ -n "${MIMIR_EXTRAS:-}" ]; then core="$source[$MIMIR_EXTRAS]"; fi
+case ",${MIMIR_EXTRAS:-}," in
+    *,local-embeddings,*) pip install --no-cache-dir 'torch==2.14.1+cpu' --extra-index-url https://download.pytorch.org/whl/cpu ;;
+esac
 pip install --no-cache-dir "$core" "$source/plugins/cultivate"
 python - "$source" <<'PY'
 import importlib.metadata as metadata

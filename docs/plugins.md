@@ -67,6 +67,17 @@ checks recognize only that exact alternate path, and only beneath a declared
 `rw` allowed root. Omitting `worklink_base` preserves working-checkout-only
 selection; directory names alone never confer trust.
 
+`--embedding local` (the default) selects `voyageai/voyage-4-nano` at 1024
+dimensions on CPU. Its query and document vectors share Voyage 4's embedding
+space with `voyage-4-lite`, so a keyless Voyage 4 deployment can fall back
+without re-embedding at supported dimensions (2048, 1024, 512 or 256).
+Setup builds with `local-embeddings` and prefetches the pinned model into the
+persistent `/home/mimir/.cache/huggingface` volume during provisioning; the
+first turn and an offline container restart can use that cached revision.
+For manual Linux installs, select the CPU torch wheel from
+`https://download.pytorch.org/whl/cpu` before installing
+`mimir-agent[local-embeddings]`.
+
 For unattended runs, use `--help` to see the corresponding flags or set
 `MIMIR_CULTIVATE_REPO`, `MIMIR_CULTIVATE_BRANCH`, `MIMIR_CULTIVATE_BOT_LOGIN`,
 `MIMIR_CULTIVATE_BOT_EMAIL`, `MIMIR_CULTIVATE_OWNER`,

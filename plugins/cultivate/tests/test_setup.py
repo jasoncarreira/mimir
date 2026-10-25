@@ -8,6 +8,7 @@ from contextlib import redirect_stdout
 import io
 import json
 import logging
+import os
 import tomllib
 from pathlib import Path
 import subprocess
@@ -264,7 +265,7 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert "https://github.com/neworg/mimir.git#" + SHA in (deploy / "build.sh").read_text()
     assert any("https://github.com/neworg/mimir.git#" + SHA in argv for argv in calls)
     # Check both providers and mcp independently, in the live and saved builds.
-    expected_extras = {"openai", "mcp"}
+    expected_extras = {"openai", "mcp", "local-embeddings"}
     if saga_spec:
         expected_extras.add(saga_spec.split(":", 1)[0])
     extras_arg = "MIMIR_EXTRAS=" + ",".join(sorted(expected_extras))
@@ -295,6 +296,8 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert compose["services"]["agent"]["environment"]["WORKLINK_REPO"] != "/workspace/repo"
     assert compose["services"]["agent"]["environment"]["MIMIR_ACP_ENABLED"] == "1"
     assert compose["services"]["agent"]["environment"]["MIMIR_PR_CHECKOUT_LEASE_ROOT"] == "/workspace/pr-leases"
+    assert compose["services"]["agent"]["environment"]["XDG_CACHE_HOME"] == "/home/mimir/.cache"
+    assert "cache:/home/mimir/.cache" in compose["services"]["agent"]["volumes"]
     assert compose["services"]["agent"]["depends_on"]["init"]["condition"] == "service_completed_successfully"
     assert set(compose["volumes"]) == {"home", "cache", "workspace", "pr-leases", "worklink"}
     assert any("MIMIR_CONTROLLER_COMMIT=" + SHA in part for argv in calls for part in argv)
@@ -782,7 +785,7 @@ def test_worklink_base_field_requires_absolute_path(tmp_path, value):
 
 
 @pytest.mark.parametrize("spec,embedding,llm,provider,dim,key", [
-    ("openai:gpt-5.4-nano", "local", "openai_compat", "onnx", 384, None),
+    ("openai:gpt-5.4-nano", "local", "openai_compat", "local", 1024, None),
     ("anthropic:claude-haiku-5-5", "openai:text-embedding-3-small", "anthropic", "openai", 1536, "OPENAI_API_KEY"),
     ("openai:gpt-5.4-nano", "voyage:voyage-4-lite", "openai_compat", "voyage", 1024, "VOYAGE_API_KEY"),
 ])
@@ -799,6 +802,8 @@ def test_saga_provisioning(tmp_path, spec, embedding, llm, provider, dim, key):
     else:
         assert "reasoning_effort" not in parsed["llm"]
     assert parsed["embedding"]["provider"] == provider
+    if embedding == "local":
+        assert parsed["embedding"]["model"] == "voyageai/voyage-4-nano"
     assert parsed["embedding"]["dimensions"] == dim
     assert parsed["embedding"].get("api_key_env") == key
     assert parsed["embedding"].get("send_input_type") == (True if provider == "voyage" else None)
@@ -815,7 +820,7 @@ def test_saga_provisioning(tmp_path, spec, embedding, llm, provider, dim, key):
 def test_local_prefetch_and_agent_share_persistent_cache(tmp_path, monkeypatch):
     """Execute the provision preamble with real Saga prefetch, without a model download."""
     from mimir.scaffold_docker import render_compose_yml
-    from mimir.saga.embeddings import ONNXProvider
+    from mimir.saga.embeddings import LocalProvider, REMOTE_CODE_REVISIONS
 
     compose = installer.render_compose(
         render_compose_yml(service_name="agent", web_port=8123, mode="pypi"),
@@ -831,9 +836,32 @@ def test_local_prefetch_and_agent_share_persistent_cache(tmp_path, monkeypatch):
     manifest.write_text(json.dumps({"saga_model_spec": "openai:gpt-5.4-nano",
                                     "embedding": "local", "reembed": False}))
     prefetches = []
-    monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(
-        TextEmbedding=lambda **kwargs: prefetches.append(kwargs) or object(),
-    ))
+    resolutions = []
+
+    class LocalEntryNotFoundError(Exception):
+        pass
+
+    def snapshot_download(model_name, *, revision, local_files_only):
+        cache = Path(os.environ["XDG_CACHE_HOME"]) / "huggingface"
+        snapshot = cache / "hub" / ("models--" + model_name.replace("/", "--")) / "snapshots" / revision
+        resolutions.append((model_name, revision, local_files_only, cache))
+        if not snapshot.is_dir():
+            raise LocalEntryNotFoundError("cold cache")
+        return str(snapshot)
+
+    def load(model_name, **kwargs):
+        cache = Path(os.environ["XDG_CACHE_HOME"]) / "huggingface"
+        if model_name == installer.LOCAL_MODEL:
+            snapshot = cache / "hub" / ("models--" + model_name.replace("/", "--")) / "snapshots" / kwargs["revision"]
+            snapshot.mkdir(parents=True, exist_ok=True)
+        else:
+            assert Path(model_name).is_dir()
+        prefetches.append((model_name, kwargs, cache))
+        return object()
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=snapshot_download))
+    monkeypatch.setitem(sys.modules, "huggingface_hub.errors", SimpleNamespace(LocalEntryNotFoundError=LocalEntryNotFoundError))
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=load))
     monkeypatch.delenv("FASTEMBED_CACHE_PATH", raising=False)
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     # Only the prefetch portion of the actual provision program is needed.
@@ -842,14 +870,22 @@ def test_local_prefetch_and_agent_share_persistent_cache(tmp_path, monkeypatch):
               .replace("/home/mimir", str(container_home)))
     exec(compile(script, "provision.py", "exec"), {"__name__": "__main__"})
 
-    cache = container_home / ".cache" / "fastembed"
+    cache = container_home / ".cache" / "huggingface"
     assert cache.is_dir()
-    assert prefetches == [{"model_name": installer.LOCAL_MODEL, "cache_dir": str(cache)}]
-    # The agent has HOME=/home/mimir, but need not set XDG_CACHE_HOME.
-    monkeypatch.delenv("XDG_CACHE_HOME")
-    runtime = ONNXProvider(model_name=installer.LOCAL_MODEL)
-    runtime._load()
-    assert prefetches == [{"model_name": installer.LOCAL_MODEL, "cache_dir": str(cache)}] * 2
+    expected = (installer.LOCAL_MODEL,
+                {"device": "cpu", "trust_remote_code": True,
+                 "revision": REMOTE_CODE_REVISIONS[installer.LOCAL_MODEL]},
+                cache)
+    assert prefetches == [expected]
+    # Match the agent's generated environment as well as the provision preamble.
+    monkeypatch.setenv("XDG_CACHE_HOME", agent["environment"]["XDG_CACHE_HOME"].replace(
+        "/home/mimir", str(container_home)))
+    runtime = LocalProvider(model_name=installer.LOCAL_MODEL, dimensions=1024)
+    runtime._load_model()
+    revision = REMOTE_CODE_REVISIONS[installer.LOCAL_MODEL]
+    snapshot = cache / "hub" / "models--voyageai--voyage-4-nano" / "snapshots" / revision
+    assert prefetches == [expected, (str(snapshot), {"device": "cpu", "trust_remote_code": True}, cache)]
+    assert resolutions == [(installer.LOCAL_MODEL, revision, True, cache)] * 2
 
 
 def test_existing_vectors_require_explicit_reembed(tmp_path):
@@ -860,7 +896,7 @@ def test_existing_vectors_require_explicit_reembed(tmp_path):
     (tmp_path / ".mimir/saga.db").touch()
     with pytest.raises(RuntimeError, match="--reembed"):
         installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "voyage:voyage-4-lite")
-    assert tomllib.loads((tmp_path / "saga.toml").read_text())["embedding"]["provider"] == "onnx"
+    assert tomllib.loads((tmp_path / "saga.toml").read_text())["embedding"]["provider"] == "local"
     updated = []
     assert installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "voyage:voyage-4-lite",
                                     reembed=True, repair=lambda path, **kw: updated.append((path, kw)) or {},
@@ -872,7 +908,7 @@ def test_existing_vectors_require_explicit_reembed(tmp_path):
 def test_operator_embedding_edit_is_never_replaced_even_with_reembed(tmp_path):
     installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "local", prefetch=lambda: None)
     path = tmp_path / "saga.toml"
-    path.write_text(path.read_text().replace("dimensions = 384", "dimensions = 768"))
+    path.write_text(path.read_text().replace("dimensions = 1024", "dimensions = 768"))
     original = path.read_bytes()
     with pytest.raises(RuntimeError, match="conflicts"):
         installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "voyage:voyage-4-lite",
@@ -909,7 +945,34 @@ def test_core_scaffold_is_only_unmarked_config_replaced(tmp_path):
     assert installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "local", prefetch=lambda: None)
     result = tomllib.loads(path.read_text())
     assert result["llm"]["provider"] == "openai_compat"
-    assert result["embedding"]["provider"] == "onnx"
+    assert result["embedding"]["provider"] == "local"
+
+
+def test_provision_prefetches_pinned_nano_before_publishing_config(tmp_path, monkeypatch):
+    from mimir.saga import embeddings
+
+    calls = []
+
+    def load(provider):
+        assert not (tmp_path / "saga.toml").exists()
+        calls.append((provider.model_id, provider.dimensions()))
+
+    monkeypatch.setattr(embeddings.LocalProvider, "_load_model", load)
+    installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "local")
+    assert calls == [("voyageai/voyage-4-nano", 1024)]
+
+
+def test_image_installers_select_locked_cpu_torch_for_local_extra():
+    root = Path(__file__).resolve().parents[3]
+    lock = tomllib.loads((root / "uv.lock").read_text())
+    cpu = next(p for p in lock["package"] if p["name"] == "torch" and p["version"].endswith("+cpu"))
+    assert cpu["source"]["registry"] == "https://download.pytorch.org/whl/cpu"
+    assert not any(p["name"].startswith("nvidia-") for p in lock["package"])
+    for path in ("Dockerfile", "plugins/cultivate/mimir_cultivate/docker/controller.sh"):
+        text = (root / path).read_text()
+        assert "*,local-embeddings,*" in text
+        assert "torch==" + cpu["version"] in text
+        assert "--extra-index-url https://download.pytorch.org/whl/cpu" in text
 
 
 def test_prompts_recommend_fast_model_and_reuse_embedding_key(monkeypatch, capsys):
@@ -1005,9 +1068,9 @@ def test_embedding_key_distinction():
 @pytest.mark.parametrize("existing_checkout", [False, True], ids=["fresh", "rerun"])
 def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok, probe_stderr, expected_marker, existing_checkout):
     """Exercise setup's run boundary and the actual provision program, offline."""
-    from mimir.saga.embeddings import ONNXProvider
+    from mimir.saga.embeddings import LocalProvider
 
-    monkeypatch.setattr(ONNXProvider, "_load", lambda self: None)
+    monkeypatch.setattr(LocalProvider, "_load_model", lambda self: None)
     monkeypatch.setenv("HOME", "/home/mimir")
     monkeypatch.setenv("XDG_CACHE_HOME", "/home/mimir/.cache")
     monkeypatch.setattr(installer, "_installed_license", lambda: (b"license", "1.0"))

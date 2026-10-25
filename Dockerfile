@@ -257,8 +257,12 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 #   anthropic, claude-code, openai, codex-plus  (model providers)
 #   discord, slack                              (bridges)
 #   mcp, acp                                    (Model Context Protocol)
+#   local-embeddings                            (Voyage 4 nano, CPU)
 #
 ARG MIMIR_EXTRAS="anthropic,discord,slack,mcp"
+RUN set -eu; case ",${MIMIR_EXTRAS}," in *,local-embeddings,*) \
+        pip install --no-cache-dir 'torch==2.14.1+cpu' --extra-index-url https://download.pytorch.org/whl/cpu ;; \
+    esac
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "mimir-agent[${MIMIR_EXTRAS}]"
 
@@ -368,7 +372,7 @@ EXPOSE 8080
 #   /home/mimir/agent   — agent home (memory/, state/, logs/, .mimir/saga.db,
 #                         .mimir/pending-update.flag when set)
 #   /home/mimir/.claude — Claude Code session credential (Max plan path)
-#   /home/mimir/.cache  — fastembed model cache
+#   /home/mimir/.cache  — fastembed and Hugging Face model caches
 VOLUME ["/home/mimir/agent", "/home/mimir/.claude", "/home/mimir/.cache"]
 
 # Container liveness probe → the in-process /health endpoint, which returns
