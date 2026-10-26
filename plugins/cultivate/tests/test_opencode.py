@@ -27,10 +27,7 @@ def _auth(home: Path, provider: str, entry: dict[str, str]) -> None:
     path.write_text(json.dumps({provider: entry}), encoding="utf-8")
 
 
-@pytest.mark.parametrize("model_spec", [None, "codex-plus:gpt-test", "openai:gpt-test"])
-def test_selected_provider_projects_only_selected_config_and_oauth(
-    tmp_path: Path, model_spec: str | None,
-) -> None:
+def test_selected_provider_projects_only_selected_config_and_oauth(tmp_path: Path) -> None:
     path = tmp_path / "opencode.jsonc"
     path.write_text(
         '{"model":"openai/gpt-test","provider":{"openai":'
@@ -39,15 +36,12 @@ def test_selected_provider_projects_only_selected_config_and_oauth(
         encoding="utf-8",
     )
     _auth(tmp_path, "openai", {"type": "oauth", "refresh": "private-refresh"})
-    # Default and explicit codex-plus routes reconcile the native OAuth store.
-    # Keep the real resolver; a refresh-only OpenCode entry is not that bundle.
-    seed_codex_subscription(tmp_path, refresh="private-refresh")
+    # This non-Codex projection test intentionally has no native Codex bundle.
     env = {
         "HOME": str(tmp_path), "OPENCODE_CONFIG": str(path),
+        "MIMIR_MODEL_SPEC": "openai:gpt-test",
         "OPENAI_TOKEN": "private-token", "OPENAI_API_KEY": "ambient-token",
     }
-    if model_spec is not None:
-        env["MIMIR_MODEL_SPEC"] = model_spec
     selected = opencode.resolve_opencode_invocation(env=env)
     assert (selected.model, selected.provider, selected.model_source) == (
         "openai/gpt-test", "openai", "opencode_config",
@@ -61,6 +55,37 @@ def test_selected_provider_projects_only_selected_config_and_oauth(
     assert isinstance(documents.scrubber, opencode.SensitiveMaterialScrubber)
     assert "private-refresh" not in repr(selected)
     assert "private-token" not in documents.scrubber.scrub_text("private-token")
+
+
+@pytest.mark.parametrize("with_bundle", [False, True])
+def test_unset_spec_requires_native_codex_oauth(
+    tmp_path: Path, with_bundle: bool,
+) -> None:
+    # Even an ambient key and refresh-only OpenCode entry cannot substitute
+    # for the subscription bundle when the omitted spec selects default Codex.
+    _auth(tmp_path, "openai", {"type": "oauth", "refresh": "subscription-refresh"})
+    env = {"HOME": str(tmp_path), "OPENAI_API_KEY": "ambient-token"}
+    assert "MIMIR_MODEL_SPEC" not in env
+    if not with_bundle:
+        with pytest.raises(opencode.OpenCodeAuthError) as raised:
+            opencode.resolve_opencode_invocation(env=env)
+        assert raised.value.reason_code == "auth_missing"
+        return
+
+    seed_codex_subscription(tmp_path, refresh="native-refresh")
+    selected = opencode.resolve_opencode_invocation(env=env)
+    assert selected.provider == "openai"
+    assert selected.auth_type == "oauth"
+    assert selected.remove_env == ("OPENAI_API_KEY",)
+    assert "OPENAI_API_KEY" not in selected.pass_env
+    documents = opencode.opencode_worker_documents(selected, env)
+    native = json.loads((tmp_path / ".codex" / "auth.json").read_text())
+    projected = json.loads(documents.auth_document)["openai"]
+    assert projected["type"] == "oauth"
+    assert projected["access"] == native["tokens"]["access_token"]
+    assert projected["refresh"] == native["tokens"]["refresh_token"]
+    assert "plugin" not in json.loads(documents.config_document)
+    assert b"ambient-token" not in documents.auth_document
 
 
 @pytest.mark.parametrize("provider_config", [
