@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -20,18 +21,28 @@ async def capture_controller_source_commit(app: Any) -> None:
     if "worklink_controller_source_commit" in app:
         return
     controller_source_commit = None
-    repo = os.environ.get("WORKLINK_REPO")
-    if app.get("check_worker_executor_health") and repo:
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run, ["git", "-C", repo, "rev-parse", "--verify", "HEAD"],
-                capture_output=True, text=True, check=True, timeout=5,
-            )
-            commit = result.stdout.strip()
-            if re.fullmatch(r"[0-9a-f]{40}", commit):
-                controller_source_commit = commit
-        except (OSError, subprocess.SubprocessError):
-            pass
+    if app.get("check_worker_executor_health"):
+        marker = Path(sys.prefix) / "controller-source-commit"
+        if marker.exists():
+            try:
+                commit = marker.read_text(encoding="utf-8").strip()
+                if re.fullmatch(r"[0-9a-f]{40}", commit):
+                    controller_source_commit = commit
+            except (OSError, UnicodeError):
+                pass
+        else:
+            repo = os.environ.get("WORKLINK_REPO")
+            if repo:
+                try:
+                    result = await asyncio.to_thread(
+                        subprocess.run, ["git", "-C", repo, "rev-parse", "--verify", "HEAD"],
+                        capture_output=True, text=True, check=True, timeout=5,
+                    )
+                    commit = result.stdout.strip()
+                    if re.fullmatch(r"[0-9a-f]{40}", commit):
+                        controller_source_commit = commit
+                except (OSError, subprocess.SubprocessError):
+                    pass
     app["worklink_controller_source_commit"] = controller_source_commit
 
 
