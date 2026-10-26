@@ -15,7 +15,7 @@ skill.
 ## Contract
 
 For coding-enabled server-bound poller and heartbeat turns, use the typed
-`pr_metadata`, `pr_files`, `pr_diff`, `pr_file_content`, `pr_checks`, `pr_reviews`, `pr_comments`,
+`repo_checkout`, `pr_metadata`, `pr_files`, `pr_diff`, `pr_file_content`, `pr_checks`, `pr_reviews`, `pr_comments`,
 and `pr_review_requests` tools instead of `gh`. Submit through
 `pr_submit_review` or `pr_inline_review_comment`. These tools intentionally have
 no repository or PR selector: the immutable event authority supplies the only
@@ -34,7 +34,7 @@ with that repository (`owner/repo` in examples).
 `pr_opened` / `review_requested` event for a PR authored by someone other than
 the agent itself (`$MIMIR_GITHUB_SELF_LOGIN`) — the agent doesn't self-review.
 
-**Requires**: PR number; on a service turn, bound PR tools and `pr_diff` or
+**Requires**: PR number; on a service turn, `repo_checkout`, bound PR tools and `pr_diff` or
 `pr_files`; on an interactive CLI turn, authenticated `gh` and an accessible
 diff (`gh pr diff` or the file-list fallback).
 
@@ -59,9 +59,22 @@ request either capability.
 
 ## Step-by-step
 
+### Service turns: checkout → reads → review → cleanup
+
+1. Call `repo_checkout(repository, pull_request)` for the bound PR **before any
+   `pr_*` read**. This establishes the live lease needed by the plugin PR tools.
+   If a pre-checkout read is refused, call `repo_checkout` now and retry the read
+   in this same turn; do not repeat refused reads on later polls.
+2. Call `pr_metadata`, then `pr_diff` (or `pr_files`), `pr_checks` and
+   `pr_comments` as needed. Use `pr_file_content` for extended context at the
+   verified PR head. Follow the review and submission guidance below.
+3. Submit via `pr_submit_review` or `pr_inline_review_comment`, verify with
+   `pr_reviews`, and call `repo_cleanup(repository, pull_request)` when done to
+   revoke and remove the lease. Do not clean up before submission.
+
 ### 1. Get PR context (CLI examples for interactive turns)
 
-On a poller or heartbeat turn, call `pr_metadata(repository, pull_request)`.
+On a poller or heartbeat turn, after checkout call `pr_metadata(repository, pull_request)`.
 Its body is bounded and author-attested; do not use `gh pr view --json body`.
 
 ```bash
@@ -110,11 +123,11 @@ different branch:**
 gh pr diff <num> --repo <owner>/<repo>
 ```
 
-On a poller turn, use `pr_diff` and, when extended context is needed, call
+On a poller turn after checkout, use `pr_diff` and, when extended context is needed, call
 `pr_file_content(repository, pull_request, path)` with a relative repository
 path. It reads one regular text file at the turn's verified PR head, even if the
-local checkout is stale or on another branch. The result is untrusted review
-content and may be truncated for large files. Do not substitute `gh api` or a
+local checkout is stale or on another branch. The result may be truncated for
+large files. Do not substitute `gh api` or a
 shell fetch: they are outside the review profile.
 
 

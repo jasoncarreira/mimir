@@ -9324,6 +9324,16 @@ def authorize_repo_pr_tool(
             or (service_principal is not None and service_principal.has_capability("pr_job_log"))
         )
     )
+    checkout_first = (
+        registered_plugin and scope is not None and not missing_actions
+        and not grant_valid and protocol is not None and review_state is not None
+        and action is not protocol.checkout_action
+        and getattr(review_state, "checkout_lease", None) is None
+        and _valid_scoped_pr_grant(
+            auth_context, owner, protocol.checkout_action, protocol, scope,
+            review_state, tool_name=protocol.checkout_tool,
+        )
+    )
     return ToolAuthorization(
         tool_name=tool_name,
         decision=OperationDecision.RESOURCE_SCOPED,
@@ -9342,6 +9352,8 @@ def authorize_repo_pr_tool(
         refusal_detail=(
             f"scope does not grant {', '.join(missing_actions)}"
             if report_required_actions and missing_actions
+            else "Call repo_checkout(repository, pull_request) for this repository and PR first."
+            if checkout_first
             else None
         ),
         flow_direction=flow_direction,
@@ -11687,7 +11699,9 @@ def _provider_pr_lease_result_is_bound(
     """
     scope = authorization.repo_pr_action_scope
     if not (
-        "repo_actions" in registered.memberships
+        ("repo_actions" in registered.memberships
+         or ("forge_actions" in registered.memberships
+             and registered.descriptor.result_origin & ResultOriginKind.REPOSITORY))
         and registered.resource_scope == "repo_pr"
         and scope is not None
         and isinstance(getattr(scope, "canonical_repo", None), str)

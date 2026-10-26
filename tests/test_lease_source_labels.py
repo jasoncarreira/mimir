@@ -622,6 +622,117 @@ def test_selected_push_porcelain_uses_attested_origin(tmp_path: Path, attested, 
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
+@pytest.mark.parametrize("trusted_author", [True, False])
+def test_cultivate_forge_reads_match_core_result_and_review_sink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trusted_author: bool,
+) -> None:
+    from mimir.plugins.core import selected_policy_registry
+
+    auth, scope, _lease, _, _ = _real_attested_lease(tmp_path)
+    policy = selected_policy_registry()
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = trusted_author
+    arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    principal = auth.canonical_principal
+    source = SourceLabel(
+        principal=principal, domain="repository",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({principal}), source_kind="protected_tool",
+        integrity="trusted" if trusted_author else "untrusted",
+        integrity_effect="active_ingest",
+    )
+    provenance = ProtectedResultProvenance((source,))
+    # Compare the exact same host-attested PR response through the core-owned
+    # (main-shaped) and selected provider declarations, without weakening IFC.
+    for name in ("pr_metadata", "pr_diff", "pr_checks", "pr_comments", "pr_file_content"):
+        registration = policy.tools[name]
+        authorization = ToolAuthorization(
+            tool_name=name, decision="resource_scoped", allowed=True,
+            repo_pr_action_scope=scope, policy=policy,
+        )
+        def read():
+            return classify_protected_result(
+                name, arguments, auth, authorization,
+                result={"content": "collaborator PR"}, provenance=provenance,
+            )
+
+        with monkeypatch.context() as patch:
+            patch.setitem(policy._tools, name, replace(registration, owner="core"))
+            core = read()
+        plugin = read()
+        assert core.sources[0].integrity == plugin.sources[0].integrity == (
+            "trusted" if trusted_author else "untrusted"
+        ), name
+        for labels in (core, plugin):
+            # An outsider has no bound review scope on either path; the
+            # classifier still marks its content untrusted if presented.
+            review_scope = scope if trusted_author else None
+            sink = SinkGate.check_sink_flow(
+                "pr_submit_review",
+                f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}:{scope.scope_id}",
+                labels, auth, enforce=True, repo_pr_action_scope=review_scope,
+            )
+            assert sink.allowed is trusted_author
+
+
+@pytest.mark.usefixtures("selected_repository_policy")
+@pytest.mark.parametrize("boundary", ["missing_lease", "stale_head", "wrong_repository", "missing_author_trust"])
+def test_cultivate_forge_read_provenance_fails_closed_without_binding(
+    tmp_path: Path, boundary: str,
+) -> None:
+    from mimir.plugins.core import selected_policy_registry
+
+    auth, scope, _lease, _, _ = _real_attested_lease(tmp_path)
+    args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    if boundary == "missing_lease":
+        object.__setattr__(auth.repo_review_state, "checkout_lease", None)
+    elif boundary == "wrong_repository":
+        args["repository"] = "other/repo"
+    elif boundary == "missing_author_trust":
+        auth.ifc_state.pr_checkout_author_trust.pop(scope.scope_id)
+    source = SourceLabel(
+        principal=auth.canonical_principal, domain="repository",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({auth.canonical_principal}),
+        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+    )
+    if boundary == "stale_head":
+        source = replace(source, resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{'b' * 40}")
+    labels = classify_protected_result(
+        "pr_diff", args, auth, ToolAuthorization(
+            tool_name="pr_diff", decision="resource_scoped", allowed=True,
+            repo_pr_action_scope=scope, policy=selected_policy_registry(),
+        ), result={"content": "PR text"}, provenance=ProtectedResultProvenance((source,)),
+    )
+    assert labels.has_untrusted_active_ingest
+
+
+@pytest.mark.usefixtures("selected_repository_policy")
+def test_non_repository_forge_result_cannot_use_pr_read_classification(tmp_path: Path) -> None:
+    from mimir.plugins.core import selected_policy_registry
+
+    auth, scope, _lease, _, _ = _real_attested_lease(tmp_path)
+    principal = auth.canonical_principal
+    source = SourceLabel(
+        principal=principal, domain="repository",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({principal}), source_kind="protected_tool",
+        integrity="trusted", integrity_effect="active_ingest",
+    )
+    labels = classify_protected_result(
+        "pr_rerequest_review", {"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        auth, ToolAuthorization(
+            tool_name="pr_rerequest_review", decision="resource_scoped", allowed=True,
+            repo_pr_action_scope=scope, policy=selected_policy_registry(),
+        ), result={"ok": True}, provenance=ProtectedResultProvenance((source,)),
+    )
+    assert labels.has_untrusted_active_ingest
+    assert labels.sources[0].resource_id == "<unresolved-resource:protected_tool:pr_rerequest_review>"
+
+
+@pytest.mark.usefixtures("selected_repository_policy")
 @pytest.mark.parametrize("boundary,guard", [
     ("membership", '"repo_actions" in registered.memberships'),
     ("resource_scope", 'registered.resource_scope == "repo_pr"'),
@@ -1341,9 +1452,9 @@ def test_attested_forge_error_after_scope_resolution(tmp_path, monkeypatch):
         provenance=provenance, failed=True,
     )
     assert provenance is not None and provenance.sources[0].integrity == "trusted"
-    assert labels.sources[0].integrity == "untrusted"
+    assert labels.sources[0].integrity == "trusted"
     auth.ifc_state.merge(labels)
-    assert not SinkGate.check_sink_flow(
+    assert SinkGate.check_sink_flow(
         "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
         auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
     ).allowed
@@ -1398,15 +1509,18 @@ def test_missing_scoped_pr_file_preserves_edit_decision(
         result=ToolMessage(content=f"Error: {raised.value}", tool_call_id="missing", status="error"),
         provenance=provenance, failed=True,
     )
-    assert labels.has_untrusted_active_ingest
+    assert labels.has_untrusted_active_ingest is not (allowed and not moved)
     auth.ifc_state.merge(labels)
-    assert auth.ifc_state.has_untrusted_active_ingest()
+    assert auth.ifc_state.has_untrusted_active_ingest() is not (allowed and not moved)
     decision = ToolRegistry().authorize_tool(
         "edit_file", auth, enforce=True, target_channel=str(target),
         arguments={"file_path": str(target)},
     )
-    assert not decision.allowed
-    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    if allowed and not moved:
+        assert decision.reason != "write_blocked_by_untrusted_ingest"
+    else:
+        assert not decision.allowed
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
 
 
 @pytest.mark.parametrize("field,value", [
@@ -1850,11 +1964,14 @@ def test_checkout_records_native_author_trust_for_file_reads(
     assert len(labels.sources) == 1
     source = labels.sources[0]
     assert (source.domain, source.integrity, source.integrity_effect) == (
-        "repository", "untrusted", "active_ingest",
+        "repository", "trusted" if trusted else "untrusted", "active_ingest",
     )
-    assert source.resource_id == "<unresolved-resource:protected_tool:pr_diff>"
+    assert source.resource_id == (
+        f"owner/repo#pull/7@{scope.observed_head_sha}" if trusted
+        else "<unresolved-resource:protected_tool:pr_diff>"
+    )
     auth.ifc_state.merge(labels)
-    assert auth.ifc_state.has_untrusted_active_ingest()
+    assert auth.ifc_state.has_untrusted_active_ingest() is not trusted
     assert len(calls) == (3 if verdict is None else 1)
 
 

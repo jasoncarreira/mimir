@@ -800,9 +800,10 @@ REVIEW_NEEDED_EVENT_TYPES = frozenset({
 
 _REVIEW_SUBMISSION_RULE = (
     "\n\n──── REVIEW SUBMISSION RULE ────\n"
-    "This event needs a review. After drafting your review prose, "
-    "you MUST submit it via `gh pr review` (or "
-    "`pull_request_review_write` MCP tool). Review prose alone — "
+    "This event needs a review. First call `repo_checkout(repository, pull_request)` "
+    "for the bound PR; only then read with `pr_metadata`, `pr_diff`, `pr_checks` "
+    "and `pr_comments`. After drafting, submit via `pr_submit_review`, verify "
+    "with `pr_reviews`, and call `repo_cleanup` when done. Review prose alone — "
     "left in turn output and never sent — is a non-review. The "
     "trusted-service shell executes one argv with no shell: use one "
     "command per shell call and never use cd, &&, semicolons, pipes, "

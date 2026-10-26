@@ -253,8 +253,28 @@ def test_review_needed_event_carries_submission_rule_and_marker(monkeypatch):
     assert ev["event_type"] == "pr_opened"
     assert "REVIEW SUBMISSION RULE" in ev["prompt"]
     assert "Add config.json" in ev["prompt"]  # base prompt preserved
-    assert "one command per shell call" in ev["prompt"]
-    assert "never use cd, &&, semicolons, pipes, redirects" in ev["prompt"]
+    prompt = ev["prompt"]
+    ordered_tools = (
+        "repo_checkout(repository, pull_request)", "pr_metadata", "pr_diff",
+        "pr_checks", "pr_comments", "pr_submit_review", "pr_reviews", "repo_cleanup",
+    )
+    positions = [prompt.index(f"`{tool}`") for tool in ordered_tools]
+    assert positions == sorted(positions)
+    assert "gh pr review" not in prompt  # service turns use the typed submission tool
+    assert "trusted-service shell executes one argv with no shell" in prompt
+    assert "one command per shell call" in prompt
+    assert (
+        "never use cd, &&, semicolons, pipes, redirects, heredocs, or command substitution"
+        in prompt
+    )
+    assert (
+        "Read `fetch_url` cache paths with `read_file` (offset/limit for a line range) "
+        "or bounded `grep` before_context/after_context" in prompt
+    )
+    assert (
+        "shell slicing forms and direct `curl` are intentionally refused because "
+        "they bypass the bounded file/egress tools" in prompt
+    )
     marker = ev.get("expected_tool_call")
     assert isinstance(marker, dict)
     assert marker["signal_on_missing"] == "poller_review_missed_submission"
