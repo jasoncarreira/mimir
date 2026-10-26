@@ -52,7 +52,7 @@ def test_checkout_root_env_and_default_are_shared(monkeypatch: pytest.MonkeyPatc
     assert checkout._isolated_checkout_path(repo, ".worklink", 1, 1, worker_authorized=False) == (
         worker_client.worklink_checkout_root() / "trellis" / "1-1"
     )
-    assert worker_exec.worklink_checkout_root() == worker_client.worklink_checkout_root()
+    assert worker_exec.worklink_checkout_root is worker_client.worklink_checkout_root
 
 
 def test_reattach_observation_uses_checkout_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -129,7 +129,19 @@ async def test_executor_identity_requires_matching_independent_root(
     monkeypatch.setattr(worker_client.WorkerClient, "_connect", lambda self: Socket())
     assert await worker_client.verify_executor_identity() == "a" * 40
     response["checkout_root"] = str(tmp_path / "wrong-root")
-    with pytest.raises(worker_client.StaleWorkerExecutorError):
+    with pytest.raises(worker_client.CheckoutRootMismatchError) as mismatch:
+        await worker_client.verify_executor_identity()
+    assert str(tmp_path / "checkouts") in str(mismatch.value)
+    assert str(tmp_path / "wrong-root") in str(mismatch.value)
+    assert "align WORKLINK_CHECKOUT_ROOT" in str(mismatch.value)
+    assert "rebuild" not in str(mismatch.value)
+    # A stale protocol still gets the image-rebuild remedy, even if roots differ.
+    response["executor_identity"] = "old-protocol"
+    with pytest.raises(worker_client.StaleWorkerExecutorError, match="rebuild the image"):
+        await worker_client.verify_executor_identity()
+    response["executor_identity"] = worker_exec.EXECUTOR_PROTOCOL_IDENTITY
+    del response["checkout_root"]
+    with pytest.raises(worker_client.StaleWorkerExecutorError, match="rebuild the image"):
         await worker_client.verify_executor_identity()
 
 

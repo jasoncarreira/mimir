@@ -31,7 +31,7 @@ from .worker_client import (
     MAX_REQUEST_BYTES,
     _PROJECTION_PATHS,
     _validate_identifier,
-    WORKLINK_CHECKOUT_ROOT,
+    worklink_checkout_root,
 )
 from .run_state import process_start_ticks
 
@@ -87,12 +87,6 @@ _launching: set[str] = set()
 _jobs_lock = threading.Lock()
 _OUTPUT_LIMIT_POLL_S = 0.01
 _FACTORY_STOP_TIMEOUT_S = 5.0
-
-
-def worklink_checkout_root() -> Path:
-    # The executor's image has its own environment, separate from the controller.
-    # Keep the fallback imported from the client contract, not from the request.
-    return Path(os.environ.get("WORKLINK_CHECKOUT_ROOT", str(WORKLINK_CHECKOUT_ROOT))).resolve()
 
 
 @dataclass

@@ -23,10 +23,6 @@ DEFAULT_EXECUTOR_SOCKET = Path("/run/mimir-worklink/socket/worklink-execd.sock")
 ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
 WORKLINK_CHECKOUT_ROOT = Path("/workspace/.worklink")
 
-
-def worklink_checkout_root() -> Path:
-    """The controller and image-owned executor read their own service environment."""
-    return Path(os.environ.get("WORKLINK_CHECKOUT_ROOT", str(WORKLINK_CHECKOUT_ROOT))).resolve()
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
@@ -41,6 +37,15 @@ _PROJECTION_PATHS = frozenset({
     ".config/opencode/opencode.json",
     ".local/share/opencode/auth.json",
 })
+
+
+def worklink_checkout_root() -> Path:
+    """The controller and image-owned executor read their own service environment."""
+    return Path(os.environ.get("WORKLINK_CHECKOUT_ROOT", str(WORKLINK_CHECKOUT_ROOT))).resolve()
+
+
+class CheckoutRootMismatchError(RuntimeError):
+    """The controller and executor have different checkout-root configuration."""
 
 
 class CheckoutCapability(Protocol):
@@ -534,12 +539,19 @@ async def verify_executor_identity(
         if (
             response.get("status") != "identity"
             or response.get("executor_identity") != EXECUTOR_PROTOCOL_IDENTITY
-            or response.get("checkout_root") != str(worklink_checkout_root())
+            or not isinstance(response.get("checkout_root"), str)
             or not isinstance(response.get("source_commit"), str)
             or len(response["source_commit"]) != 40
             or any(character not in "0123456789abcdef" for character in response["source_commit"])
         ):
             raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
+        controller_root = str(worklink_checkout_root())
+        if response["checkout_root"] != controller_root:
+            raise CheckoutRootMismatchError(
+                f"Worklink checkout root mismatch: controller={controller_root!r}, "
+                f"executor={response['checkout_root']!r}; align WORKLINK_CHECKOUT_ROOT "
+                "in the controller and executor service environments"
+            )
         return response["source_commit"]
     finally:
         sock.close()

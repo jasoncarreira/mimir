@@ -440,6 +440,19 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     monkeypatch.setattr(installer.time, "sleep", lambda seconds: None)
     pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok", "root": "ok"}
     reads = []
+    from mimir_cultivate.worklink import worker_client
+
+    async def verify_executor_identity():
+        errors = {
+            "checkout_root_mismatch": worker_client.CheckoutRootMismatchError("different roots"),
+            "executor_stale": worker_client.StaleWorkerExecutorError("old protocol"),
+            "executor_unreachable": OSError("socket unavailable"),
+        }
+        if pending["root"] != "ok":
+            raise errors[pending["root"]]
+        return "a" * 40
+
+    monkeypatch.setattr(worker_client, "verify_executor_identity", verify_executor_identity)
 
     def http(url, *, key=None, data=None):
         reads.append((url, key, data))
@@ -458,15 +471,25 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         if "resolve_opencode_invocation" in argv[-1]:
             return pending["auth"]
         if "verify_executor_identity" in argv[-1]:
-            return pending["root"]
+            # Execute the actual docker python -c payload: exceptions must be
+            # converted to stdout reason codes rather than a nonzero exit.
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exec(compile(argv[-1], "<executor-verification>", "exec"), {})
+            return output.getvalue().strip()
         return json.dumps(pending["alerts"])
 
     monkeypatch.setattr(installer, "_http", http)
     monkeypatch.setattr(installer, "_run", run)
     installer._verify(tmp_path, 8123, "org/repo", "owner-key")
-    pending["root"] = "mismatch"
-    with pytest.raises(installer.SetupError, match="checkout root verification"):
-        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    for reason, message in (
+        ("checkout_root_mismatch", "checkout root mismatch; align WORKLINK_CHECKOUT_ROOT"),
+        ("executor_stale", "executor is stale; rebuild the image"),
+        ("executor_unreachable", "executor is unreachable; inspect its service and socket"),
+    ):
+        pending["root"] = reason
+        with pytest.raises(installer.SetupError, match=message):
+            installer._verify(tmp_path, 8123, "org/repo", "owner-key")
     pending["root"] = "ok"
     pending["auth"] = "auth_missing"
     with pytest.raises(installer.SetupError, match="OpenCode credential resolution failed.*auth_missing"):

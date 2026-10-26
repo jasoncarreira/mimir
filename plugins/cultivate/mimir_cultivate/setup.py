@@ -629,10 +629,20 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
     # The executor answers from its own image/service environment, never from a
     # root included in a controller request. Also detects a stale executor image.
     root_check = _run(["docker", "compose", "exec", "-T", "agent", "python", "-c",
-        "import asyncio; from mimir_cultivate.worklink.worker_client import verify_executor_identity; "
-        "asyncio.run(verify_executor_identity()); print('ok')"], cwd=deploy)
+        "import asyncio\n"
+        "from mimir_cultivate.worklink.worker_client import (verify_executor_identity, "
+        "CheckoutRootMismatchError, StaleWorkerExecutorError)\n"
+        "try:\n asyncio.run(verify_executor_identity())\n print('ok')\n"
+        "except CheckoutRootMismatchError:\n print('checkout_root_mismatch')\n"
+        "except StaleWorkerExecutorError:\n print('executor_stale')\n"
+        "except (OSError, RuntimeError, ValueError):\n print('executor_unreachable')"], cwd=deploy)
+    root_errors = {
+        "checkout_root_mismatch": "Worklink checkout root mismatch; align WORKLINK_CHECKOUT_ROOT in the controller and executor service environments.",
+        "executor_stale": "Worklink executor is stale; rebuild the image and restart the container.",
+        "executor_unreachable": "Worklink executor is unreachable; inspect its service and socket.",
+    }
     if root_check != "ok":
-        raise SetupError("Worklink checkout root verification failed; inspect the executor service.")
+        raise SetupError(root_errors.get(root_check, "Worklink executor verification returned an unexpected result; inspect the executor service."))
     # Run in the agent container with its actual HOME, config and compose env.
     # Only a stable reason code crosses the Docker boundary, never the bundle.
     auth_check = _run(["docker", "compose", "exec", "-T", "agent", "python", "-c",
