@@ -253,6 +253,7 @@ async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> No
                 "status": "identity",
                 "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
                 "source_commit": "a" * 40,
+                "checkout_root": "/workspace/.worklink",
             }).encode()
 
         def close(self) -> None:

@@ -349,8 +349,9 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str) -> 
         agent.setdefault("depends_on", {})["init"] = {"condition": "service_completed_successfully"}
         doc["services"]["init"] = {
             "image": layer_tag, "user": "root", "entrypoint": ["/bin/sh", "-c"],
-            "command": ["mkdir -p /workspace/pr-leases /workspace/worklink /home/mimir/agent /home/mimir/.cache "
-                        "&& chown -R 1001:1001 /workspace /home/mimir/agent /home/mimir/.cache"],
+            "command": ["mkdir -p /workspace/pr-leases /workspace/worklink /workspace/.worklink /home/mimir/agent /home/mimir/.cache "
+                        "&& chown -R 1001:1001 /workspace /home/mimir/agent /home/mimir/.cache "
+                        "&& chmod 0755 /workspace/.worklink"],
             "volumes": volumes,
         }
         doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink")}
@@ -625,6 +626,13 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
                     "print(json.dumps(repo_binding_startup_alerts()))"], cwd=deploy)
     if json.loads(binding):
         raise SetupError("Repository binding attention required; check checkout origin and repositories.yaml.")
+    # The executor answers from its own image/service environment, never from a
+    # root included in a controller request. Also detects a stale executor image.
+    root_check = _run(["docker", "compose", "exec", "-T", "agent", "python", "-c",
+        "import asyncio; from mimir_cultivate.worklink.worker_client import verify_executor_identity; "
+        "asyncio.run(verify_executor_identity()); print('ok')"], cwd=deploy)
+    if root_check != "ok":
+        raise SetupError("Worklink checkout root verification failed; inspect the executor service.")
     # Run in the agent container with its actual HOME, config and compose env.
     # Only a stable reason code crosses the Docker boundary, never the bundle.
     auth_check = _run(["docker", "compose", "exec", "-T", "agent", "python", "-c",

@@ -12,6 +12,11 @@ from typing import Sequence
 
 pytestmark = pytest.mark.usefixtures("authorized_fake_backend_gate")
 
+
+@pytest.fixture(autouse=True)
+def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
+
 pytest.importorskip("mimir_cultivate", reason="Worklink reattachment belongs to Cultivate")
 
 from mimir_cultivate.worklink.backends.base import Caps, RawResult, WorkOrder

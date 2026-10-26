@@ -393,6 +393,10 @@ def test_compose_structural_changes_survive_format_drift_and_refuse_invalid_shap
     assert agent["environment"]["MIMIR_PLUGINS"] == "cultivate"
     assert agent["environment"]["MIMIR_ACP_ENABLED"] == "1"
     assert agent["environment"]["MIMIR_HOME"] == "/home/mimir/agent"
+    assert "WORKLINK_CHECKOUT_ROOT" not in agent["environment"]
+    assert "workspace:/workspace" in agent["volumes"]
+    assert "mkdir -p /workspace/pr-leases /workspace/worklink /workspace/.worklink" in result["services"]["init"]["command"][0]
+    assert "chmod 0755 /workspace/.worklink" in result["services"]["init"]["command"][0]
     for bad in ("services: {}", "services: {agent: {build: {}, environment: []}}", "broken: ["):
         with pytest.raises(installer.SetupError, match="Incompatible scaffold"):
             installer.render_compose(bad, "image:sha", "rust", "repo")
@@ -434,7 +438,7 @@ def test_secret_file_requires_private_mode(tmp_path):
 
 def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, monkeypatch):
     monkeypatch.setattr(installer.time, "sleep", lambda seconds: None)
-    pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok"}
+    pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok", "root": "ok"}
     reads = []
 
     def http(url, *, key=None, data=None):
@@ -453,11 +457,17 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
             return json.dumps([{"name": "cultivate", "enabled": True}])
         if "resolve_opencode_invocation" in argv[-1]:
             return pending["auth"]
+        if "verify_executor_identity" in argv[-1]:
+            return pending["root"]
         return json.dumps(pending["alerts"])
 
     monkeypatch.setattr(installer, "_http", http)
     monkeypatch.setattr(installer, "_run", run)
     installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    pending["root"] = "mismatch"
+    with pytest.raises(installer.SetupError, match="checkout root verification"):
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    pending["root"] = "ok"
     pending["auth"] = "auth_missing"
     with pytest.raises(installer.SetupError, match="OpenCode credential resolution failed.*auth_missing"):
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
@@ -684,6 +694,7 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch)
     assert base != checkout and not base.is_relative_to(checkout)
     from mimir_cultivate.worklink.checkout import create_isolated_checkout
     monkeypatch.setenv('MIMIR_SOURCE_DIR', str(checkout))
+    monkeypatch.setenv('WORKLINK_CHECKOUT_ROOT', str(tmp_path / '.worklink'))
     monkeypatch.setattr('mimir_cultivate.worklink.checkout._cultivate_selected', lambda: False)
     attempt = create_isolated_checkout(base, issue_id=2016, attempt=1, base='integration')
     assert attempt.repo == base and attempt.branch == 'issue/2016-a1'

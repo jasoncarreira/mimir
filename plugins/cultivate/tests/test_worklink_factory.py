@@ -179,6 +179,7 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     seed_codex_subscription(operator_home)
     (tmp_path / "worklink.yaml").write_text(f"defaults:\n  test_command: \"{gate_command}\"\n")
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(
         mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid(),
     ))

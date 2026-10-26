@@ -79,6 +79,7 @@ from .run_state import (
     save_run_state,
 )
 from .checkout import CheckoutLease, cleanup_checkout, _cultivate_selected, create_isolated_checkout
+from .worker_client import worklink_checkout_root
 from mimir.redaction import redact_text
 from ..repository import RepositoryInventory
 from mimir.secret_scan import secret_matches
@@ -1021,7 +1022,7 @@ class WorklinkRunner:
             )
             order = WorkOrder(
                 issue_id=issue.issue_id,
-                checkout=self.repo / ".worklink" / f"{issue.issue_id}-DRYRUN",
+                checkout=worklink_checkout_root() / self.repo.name / f"{issue.issue_id}-DRYRUN",
                 prompt=prompt,
                 rules=None,
                 timeout_s=config.defaults.timeout_s,
@@ -4279,9 +4280,9 @@ def _verify_factory_recovery_target(
     if not retained.session:
         raise WorklinkError("retained factory session is missing")
     sandbox = Path(retained.sandbox)
-    from .worker_client import WORKLINK_CHECKOUT_ROOT, factory_checkout_for_path
+    from .worker_client import worklink_checkout_root, factory_checkout_for_path
 
-    if sandbox.is_relative_to(WORKLINK_CHECKOUT_ROOT) and factory_checkout_for_path(sandbox) is None:
+    if sandbox.is_relative_to(worklink_checkout_root()) and factory_checkout_for_path(sandbox) is None:
         raise WorklinkError(
             "legacy factory checkout has no private ownership-transfer boundary; "
             "retain it for offline migration, not privileged in-place normalization"
@@ -5369,7 +5370,7 @@ def _create_observation_worktree(
     at a docker-sibling / ecs worker can still resolve the observation
     worktree. Detached + a dedicated ``reattach-`` path so it never collides
     with the (possibly surviving) original attempt worktree."""
-    path = repo / ".worklink" / f"reattach-{issue_id}-{attempt}"
+    path = worklink_checkout_root() / repo.name / f"reattach-{issue_id}-{attempt}"
     # Clear any leftover from a previous reattach of the same leaf.
     runner(["git", "-C", str(repo), "worktree", "remove", "--force", str(path)])
     shutil.rmtree(path, ignore_errors=True)

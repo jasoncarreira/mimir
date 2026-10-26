@@ -3453,6 +3453,7 @@ class TestHandleHealth:
                         "status": "identity",
                         "executor_identity": worker_client.EXECUTOR_PROTOCOL_IDENTITY,
                         "source_commit": worker_exec._executor_source_commit(),
+                        "checkout_root": str(worker_exec.worklink_checkout_root()),
                     }
                 except RuntimeError as exc:
                     response = {"error": str(exc)}

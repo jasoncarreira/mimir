@@ -89,6 +89,12 @@ _OUTPUT_LIMIT_POLL_S = 0.01
 _FACTORY_STOP_TIMEOUT_S = 5.0
 
 
+def worklink_checkout_root() -> Path:
+    # The executor's image has its own environment, separate from the controller.
+    # Keep the fallback imported from the client contract, not from the request.
+    return Path(os.environ.get("WORKLINK_CHECKOUT_ROOT", str(WORKLINK_CHECKOUT_ROOT))).resolve()
+
+
 @dataclass
 class _FactoryProcess:
     process: subprocess.Popen[bytes]
@@ -335,7 +341,7 @@ def _open_path_checkout(request: dict[str, Any]) -> int:
     if request.get("run_uid") != get_identities().worklink_uid:
         raise RuntimeError("path-addressed checkout requested an invalid worker uid")
     try:
-        root = WORKLINK_CHECKOUT_ROOT.resolve(strict=True)
+        root = worklink_checkout_root().resolve(strict=True)
         requested = Path(path_value)
         resolved = requested.resolve(strict=True)
         relative = resolved.relative_to(root)
@@ -374,7 +380,7 @@ def _open_factory_checkout(
         raise RuntimeError("factory checkout path or invalid worker uid")
     path = Path(raw)
     try:
-        relative = path.relative_to(WORKLINK_CHECKOUT_ROOT)
+        relative = path.relative_to(worklink_checkout_root())
     except ValueError:
         raise RuntimeError("factory checkout is outside the Worklink root") from None
     if (
@@ -985,6 +991,7 @@ def _handle_identity(connection: socket.socket, request: dict[str, Any], fds: li
         "status": "identity",
         "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
         "source_commit": _executor_source_commit(),
+        "checkout_root": str(worklink_checkout_root()),
     })
 
 
