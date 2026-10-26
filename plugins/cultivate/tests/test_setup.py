@@ -440,13 +440,17 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     monkeypatch.setattr(installer.time, "sleep", lambda seconds: None)
     pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok", "root": "ok"}
     reads = []
+    exec_calls = []
     from mimir_cultivate.worklink import worker_client
 
     async def verify_executor_identity():
         errors = {
             "checkout_root_mismatch": worker_client.CheckoutRootMismatchError("different roots"),
             "executor_stale": worker_client.StaleWorkerExecutorError("old protocol"),
-            "executor_unreachable": OSError("socket unavailable"),
+            "executor_peer_rejected": ConnectionResetError("peer rejected"),
+            "executor_permission_denied": PermissionError("peer denied"),
+            "executor_unreachable": FileNotFoundError("socket unavailable"),
+            "executor_refused": ConnectionRefusedError("socket not listening"),
         }
         if pending["root"] != "ok":
             raise errors[pending["root"]]
@@ -466,6 +470,9 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         return {"ok": True}
 
     def run(argv, *, cwd):
+        exec_calls.append(argv)
+        assert cwd == tmp_path
+        assert argv[:7] == ["docker", "compose", "exec", "-T", "-u", "mimir", "agent"]
         if "plugins" in argv:
             return json.dumps([{"name": "cultivate", "enabled": True}])
         if "resolve_opencode_invocation" in argv[-1]:
@@ -482,10 +489,16 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     monkeypatch.setattr(installer, "_http", http)
     monkeypatch.setattr(installer, "_run", run)
     installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    assert len(exec_calls) == 4
+    assert [argv[7:9] for argv in exec_calls] == [
+        ["mimir", "plugins"], ["python", "-c"], ["python", "-c"], ["python", "-c"]]
     for reason, message in (
         ("checkout_root_mismatch", "checkout root mismatch; align WORKLINK_CHECKOUT_ROOT"),
         ("executor_stale", "executor is stale; rebuild the image"),
+        ("executor_peer_rejected", "executor rejected the agent peer"),
+        ("executor_permission_denied", "executor rejected the agent peer"),
         ("executor_unreachable", "executor is unreachable; inspect its service and socket"),
+        ("executor_refused", "executor is unreachable; inspect its service and socket"),
     ):
         pending["root"] = reason
         with pytest.raises(installer.SetupError, match=message):
