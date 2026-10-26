@@ -1220,7 +1220,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
 
     assert result.backend_status == "success"
     assert calls[0]["args"] == (
-        "opencode", "run", "--dir", str(order.checkout),
+        opencode_module.resolve_opencode_binary(), "run", "--dir", str(order.checkout),
         "-m", "openai/gpt-5.6-luna", "--variant", "high", "--", "-starts with dash"
     )
     assert calls[0]["args"].count("-m") == 1

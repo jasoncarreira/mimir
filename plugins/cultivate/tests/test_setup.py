@@ -438,7 +438,7 @@ def test_secret_file_requires_private_mode(tmp_path):
 
 def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, monkeypatch):
     monkeypatch.setattr(installer.time, "sleep", lambda seconds: None)
-    pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok", "root": "ok"}
+    pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok", "root": "ok", "binary": "ok"}
     reads = []
     from mimir_cultivate.worklink import worker_client
 
@@ -477,6 +477,9 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
             with redirect_stdout(output):
                 exec(compile(argv[-1], "<executor-verification>", "exec"), {})
             return output.getvalue().strip()
+        if "resolve_opencode_binary" in argv[-1]:
+            assert argv[4:7] == ["--user", "1002:1002", "agent"]
+            return pending["binary"]
         return json.dumps(pending["alerts"])
 
     monkeypatch.setattr(installer, "_http", http)
@@ -491,6 +494,10 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         with pytest.raises(installer.SetupError, match=message):
             installer._verify(tmp_path, 8123, "org/repo", "owner-key")
     pending["root"] = "ok"
+    pending["binary"] = "opencode_missing"
+    with pytest.raises(installer.SetupError, match="opencode_missing"):
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    pending["binary"] = "ok"
     pending["auth"] = "auth_missing"
     with pytest.raises(installer.SetupError, match="OpenCode credential resolution failed.*auth_missing"):
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
@@ -513,6 +520,48 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     pending["pollers"] = ["github-activity", "github-ci-watch", "worklink-ready-queue"]
     pending["reply"] = False
     with pytest.raises(installer.SetupError, match="no assistant reply"):
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+
+
+def test_setup_binary_probe_executes_with_worker_path(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink.backends import opencode as backend
+    binary = tmp_path / "opt/mimir-opencode/bin/opencode"
+    marker = tmp_path / "version-invoked"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(f"#!/bin/sh\ntest \"$1\" = --version || exit 2\nprintf ok > {marker}\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr(backend, "IMAGE_OPENCODE_BIN", binary)
+    monkeypatch.setattr(backend.shutil, "which", lambda name: None)
+    captured = []
+
+    def run(argv, *, cwd):
+        if "resolve_opencode_binary" in argv[-1]:
+            captured.append(argv)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exec(compile(argv[-1], "<binary-probe>", "exec"), {})
+            return output.getvalue().strip()
+        if "plugins" in argv:
+            return json.dumps([{"name": "cultivate", "enabled": True}])
+        if "verify_executor_identity" in argv[-1] or "resolve_opencode_invocation" in argv[-1]:
+            return "ok"
+        return "[]"
+
+    monkeypatch.setattr(installer, "_run", run)
+    histories = iter([[], [{"role": "assistant", "text": "ok"}],
+                      [], [{"role": "assistant", "text": "ok"}]])
+    monkeypatch.setattr(installer, "_http", lambda url, **kw: (
+        {"ok": True} if url.endswith("/health") else
+        {"data": {"pollers": [{"name": p, "next_run_at": "now"} for p in (
+            "github-activity", "github-ci-watch", "worklink-ready-queue")]}} if url.endswith("/scheduler") else
+        {"data": {"messages": next(histories)}} if url.endswith("/history") else
+        {"ok": True}
+    ))
+    installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    assert len(captured) == 1
+    assert marker.read_text() == "ok"
+    binary.chmod(0o644)
+    with pytest.raises(installer.SetupError, match="opencode_missing"):
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
 
 

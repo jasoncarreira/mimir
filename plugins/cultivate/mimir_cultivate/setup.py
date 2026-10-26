@@ -643,6 +643,22 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
     }
     if root_check != "ok":
         raise SetupError(root_errors.get(root_check, "Worklink executor verification returned an unexpected result; inspect the executor service."))
+    # Probe as the leaf uid with the same fixed PATH and controller-side binary
+    # resolution. The probe must execute, not merely find, the installed CLI.
+    binary_check = _run(["docker", "compose", "exec", "-T", "--user", "1002:1002", "agent", "python", "-c",
+        "import subprocess\n"
+        "from mimir_cultivate.contained_execution import base_worker_environment\n"
+        "from mimir_cultivate.worklink.backends.opencode import resolve_opencode_binary\n"
+        "try:\n"
+        " binary = resolve_opencode_binary()\n"
+        " env = base_worker_environment('setup-probe')\n"
+        " env['HOME'] = '/nonexistent'\n"
+        " result = subprocess.run([binary, '--version'], env=env, cwd='/tmp', "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)\n"
+        " print('ok' if result.returncode == 0 else 'opencode_missing')\n"
+        "except (OSError, subprocess.TimeoutExpired, ValueError):\n print('opencode_missing')"], cwd=deploy)
+    if binary_check != "ok":
+        raise SetupError("OpenCode leaf executable verification failed (opencode_missing); rebuild the agent image and check its OpenCode installation.")
     # Run in the agent container with its actual HOME, config and compose env.
     # Only a stable reason code crosses the Docker boundary, never the bundle.
     auth_check = _run(["docker", "compose", "exec", "-T", "agent", "python", "-c",
