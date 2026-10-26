@@ -168,7 +168,6 @@ def _sanitized_git_env() -> dict[str, str]:
 _CONFIG_REASON_CODES = frozenset({
     "config_malformed", "config_missing", "config_oversize",
     "config_provider_selection", "config_unreadable", "config_unsafe_inline_secret",
-    "config_missing_codex_plugin",
 })
 _AUTH_REASON_CODES = frozenset({
     "auth_invalid", "auth_malformed", "auth_missing", "auth_oversize", "auth_unreadable",
@@ -181,11 +180,7 @@ class OpenCodeConfigError(ValueError):
         if reason_code not in _CONFIG_REASON_CODES:
             raise ValueError("invalid OpenCode configuration reason code")
         self.reason_code = reason_code
-        message = (
-            "OpenCode Codex subscription requires opencode-openai-codex-auth in the effective OpenCode plugin config"
-            if reason_code == "config_missing_codex_plugin" else "OpenCode configuration unavailable"
-        )
-        super().__init__(message)
+        super().__init__("OpenCode configuration unavailable")
 
 
 class OpenCodeAuthError(OpenCodeConfigError):
@@ -208,7 +203,6 @@ class OpenCodeInvocation:
     pass_env: tuple[str, ...] = ()
     provider_config: object = field(default_factory=dict, repr=False, compare=False)
     auth_entry: object | None = field(default=None, repr=False, compare=False)
-    plugins: tuple[str, ...] = field(default=(), repr=False, compare=False)
     scrubber: SensitiveMaterialScrubber = field(repr=False, compare=False, default_factory=SensitiveMaterialScrubber)
 
 
@@ -298,12 +292,6 @@ def resolve_opencode_invocation(
 
     provider = _provider_from_model(model)
     codex = provider == "openai" and values.get("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC).strip().startswith("codex-plus:")
-    plugins = native.get("plugin", [])
-    if codex and (not isinstance(plugins, list) or not any(
-        isinstance(plugin, str) and plugin.split("@", 1)[0] == "opencode-openai-codex-auth"
-        for plugin in plugins
-    )):
-        raise OpenCodeConfigError("config_missing_codex_plugin")
     if codex:
         reconcile_codex_auth(values, scrubber=scrubber)
     provider_config, env_references = _selected_provider_config(native, provider)
@@ -316,10 +304,6 @@ def resolve_opencode_invocation(
         auth_path=auth_path, auth_type=auth_type, remove_env=remove_env,
         pass_env=tuple(sorted(env_references)), provider_config=provider_config,
         auth_entry=auth_entry, scrubber=scrubber,
-        plugins=tuple(
-            plugin for plugin in plugins
-            if isinstance(plugin, str) and plugin.split("@", 1)[0] == "opencode-openai-codex-auth"
-        ) if codex else (),
     )
 
 
@@ -516,8 +500,6 @@ def opencode_worker_documents(
         "provider": {invocation.provider: provider_config},
         "permission": {"external_directory": "deny"},
     }
-    if invocation.plugins:
-        config["plugin"] = list(invocation.plugins)
     config_document = _encode_projection(config, auth=False)
     auth_document: bytes | None = None
     if invocation.auth_entry is not None:

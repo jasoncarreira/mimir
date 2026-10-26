@@ -634,9 +634,9 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
     if auth_check != "ok":
         raise SetupError(
             "OpenCode credential resolution failed (" + (
-                auth_check if auth_check in {"auth_missing", "auth_invalid", "auth_malformed", "auth_unreadable",
-                                              "config_missing_codex_plugin"} else "unavailable"
-            ) + "); check the agent container's model API key or Codex OAuth login and OpenCode plugin config."
+                auth_check if auth_check in {"auth_missing", "auth_invalid", "auth_malformed", "auth_unreadable"}
+                else "unavailable"
+            ) + "); check the agent container's model API key or Codex OAuth login and OpenCode config."
         )
     schedule = _http(url + "/api/v1/scheduler", key=owner_key)
     pollers = {row.get("name") for row in schedule.get("data", {}).get("pollers", [])
