@@ -446,13 +446,17 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'trellisbot@example.com'], check=True)
     pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok", "root": "ok"}
     reads = []
+    exec_calls = []
     from mimir_cultivate.worklink import worker_client
 
     async def verify_executor_identity():
         errors = {
             "checkout_root_mismatch": worker_client.CheckoutRootMismatchError("different roots"),
             "executor_stale": worker_client.StaleWorkerExecutorError("old protocol"),
-            "executor_unreachable": OSError("socket unavailable"),
+            "executor_peer_rejected": ConnectionResetError("peer rejected"),
+            "executor_permission_denied": PermissionError("peer denied"),
+            "executor_unreachable": FileNotFoundError("socket unavailable"),
+            "executor_refused": ConnectionRefusedError("socket not listening"),
         }
         if pending["root"] != "ok":
             raise errors[pending["root"]]
@@ -472,6 +476,9 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         return {"ok": True}
 
     def run(argv, *, cwd):
+        exec_calls.append(argv)
+        assert cwd == tmp_path
+        assert argv[:7] == ["docker", "compose", "exec", "-T", "-u", "mimir", "agent"]
         if "plugins" in argv:
             return json.dumps([{"name": "cultivate", "enabled": True}])
         if "resolve_opencode_invocation" in argv[-1]:
@@ -491,16 +498,34 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     monkeypatch.setattr(installer, "_http", http)
     monkeypatch.setattr(installer, "_run", run)
     installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    assert len(exec_calls) == 5
+    assert [argv[7:9] for argv in exec_calls] == [
+        ["mimir", "plugins"], ["python", "-c"], ["python", "-c"],
+        ["python", "-c"], ["python", "-c"]]
     assert any(url.endswith("/api/v1/chat") and key == "owner-key" for url, key, _ in reads)
     subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'wrong@example.com'], check=True)
     reads.clear()
-    with pytest.raises(installer.SetupError, match="Worklink base identity mismatch"):
+    with pytest.raises(installer.SetupError, match="Worklink base identity mismatch.*base_identity_mismatch"):
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    # A missing key (git rc 1) is a mismatch, not an unreadable repository.
+    subprocess.run(['git', '-C', str(base), 'config', '--local', '--unset', 'user.email'], check=True)
+    with pytest.raises(installer.SetupError, match="Worklink base identity mismatch.*base_identity_mismatch"):
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
     subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'trellisbot@example.com'], check=True)
+    # Real git returns rc 128 when the configured base cannot be opened.
+    moved_base = tmp_path / 'moved-base'
+    base.rename(moved_base)
+    with pytest.raises(installer.SetupError, match="Worklink base identity unreadable.*base_identity_unreadable") as raised:
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    assert 'fatal:' not in str(raised.value)
+    moved_base.rename(base)
     for reason, message in (
         ("checkout_root_mismatch", "checkout root mismatch; align WORKLINK_CHECKOUT_ROOT"),
         ("executor_stale", "executor is stale; rebuild the image"),
+        ("executor_peer_rejected", "executor rejected the agent peer"),
+        ("executor_permission_denied", "executor rejected the agent peer"),
         ("executor_unreachable", "executor is unreachable; inspect its service and socket"),
+        ("executor_refused", "executor is unreachable; inspect its service and socket"),
     ):
         pending["root"] = reason
         with pytest.raises(installer.SetupError, match=message):

@@ -480,7 +480,9 @@ def _configure_build_identity(
             resolved[key] = value
     # A local clone never copies user.*, and the worker has no HOME. Use the
     # agent's configured commit identity only for fields the parent cannot lend.
-    # Never let the backend invent an author when neither source supplies one.
+    # Never let the backend invent an author when neither source supplies one:
+    # OpenCode <opencode@localhost> can credit an unrelated real GitHub account
+    # on squash-merge, so an unconfigured identity must fail closed instead.
     name = resolved.get("user.name") or os.environ.get("GH_USER_NAME", "").strip()
     email = resolved.get("user.email") or os.environ.get("GH_USER_EMAIL", "").strip()
     if not name or not email:
