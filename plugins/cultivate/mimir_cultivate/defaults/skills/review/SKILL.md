@@ -185,11 +185,11 @@ gh pr view <num> --repo jasoncarreira/mimir --json reviews
 
 Read the last entry of `reviews` from the returned JSON.
 
-Verify your login (`mimir-carreira`) appears in the reviews list.
+Verify your GitHub login (`MIMIR_GITHUB_SELF_LOGIN`) appears in the reviews list.
 
-### 7. Operator ping (non-mimir-carreira PRs)
+### 7. Operator ping (PRs not authored by you)
 
-For PRs authored by anyone other than `mimir-carreira`, fulfill commitment
+For PRs authored by anyone other than you (`MIMIR_GITHUB_SELF_LOGIN`), fulfill commitment
 `c-5494103062`: send a message to the operator channel noting the PR number
 and your verdict.
 

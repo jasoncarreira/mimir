@@ -458,14 +458,6 @@ def normalize_checkout(
 
 
 
-#: Identity written into every attempt checkout when the parent repository has
-#: none to lend. ``git clone`` never copies ``user.*``, and the worklink uid runs
-#: with ``HOME=/nonexistent``, so without this the backend CLI invents its own:
-#: opencode commits as ``OpenCode <opencode@localhost>``, and GitHub's
-#: squash-merge then credits an unrelated real account that owns that username.
-FALLBACK_BUILD_IDENTITY = ("mimir-carreira", "mimir@muninnai.ai")
-
-
 def _configure_build_identity(
     repo: Path,
     path: Path,
@@ -486,8 +478,15 @@ def _configure_build_identity(
         value = probe.stdout.strip() if probe.returncode == 0 else ""
         if value:
             resolved[key] = value
-    name = resolved.get("user.name") or FALLBACK_BUILD_IDENTITY[0]
-    email = resolved.get("user.email") or FALLBACK_BUILD_IDENTITY[1]
+    # A local clone never copies user.*, and the worker has no HOME. Use the
+    # agent's configured commit identity only for fields the parent cannot lend.
+    # Never let the backend invent an author when neither source supplies one:
+    # OpenCode <opencode@localhost> can credit an unrelated real GitHub account
+    # on squash-merge, so an unconfigured identity must fail closed instead.
+    name = resolved.get("user.name") or os.environ.get("GH_USER_NAME", "").strip()
+    email = resolved.get("user.email") or os.environ.get("GH_USER_EMAIL", "").strip()
+    if not name or not email:
+        raise ValueError("build_identity_unconfigured")
     inherited = len(resolved) == 2
     for key, value in (("user.name", name), ("user.email", email)):
         applied = runner(["git", "-C", str(path), "config", key, value])
@@ -637,7 +636,7 @@ def create_isolated_checkout(
 
     try:
         _configure_build_identity(repo, path, runner=runner, event_logger=event_logger)
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         shutil.rmtree(path, ignore_errors=True)
         raise
 

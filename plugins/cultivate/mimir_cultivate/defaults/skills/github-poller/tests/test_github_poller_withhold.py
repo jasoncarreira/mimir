@@ -52,6 +52,8 @@ def trust(monkeypatch):
 def test_outsider_issue_signal_deduplicates_in_cursor_and_never_leaks(
     monkeypatch, tmp_path, capsys, trust,
 ):
+    # main() budgets from process startup; this test owns only its two ticks.
+    monkeypatch.setattr(poller, "_PROCESS_START", poller.time.monotonic())
     monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
     monkeypatch.setattr(poller, "CURSOR_FILE", tmp_path / "cursor.json")
     monkeypatch.setattr(poller, "_resolve_token", lambda: "token")
@@ -174,6 +176,7 @@ def test_null_user_activity_withholds_without_attestation_or_window_hold(monkeyp
 
 
 def test_null_user_comment_advances_since_watermark_across_ticks(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(poller, "_PROCESS_START", poller.time.monotonic())
     monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
     monkeypatch.setattr(poller, "CURSOR_FILE", tmp_path / "cursor.json")
     monkeypatch.setattr(poller, "_resolve_token", lambda: "token")
