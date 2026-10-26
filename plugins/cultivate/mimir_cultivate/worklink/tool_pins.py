@@ -18,7 +18,7 @@ class ToolPin:
     risk: str | None = None
 
 
-OPENCODE_VERSION = "1.18.21"
+OPENCODE_VERSION = "1.19.4"
 
 
 DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (

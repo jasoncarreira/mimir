@@ -20,6 +20,7 @@ from mimir.plugins.discovery import PluginDiscoveryError
 
 def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -> None:
     pins = {pin.name: pin for pin in default_tool_pins()}
+    assert pins["opencode"].pin == "1.19.4"
 
     expected = {
         "chainlink", "mermaid-cli", "osv-scanner", "gogcli",

@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import pytest
 
 FACTORY_VERSION = "0.12.1"
-OPENCODE_VERSION = "1.18.21"
+OPENCODE_VERSION = "1.19.4"
 from mimir.scaffold_docker import (
     DEFAULT_BASE_IMAGE,
     Fragment,

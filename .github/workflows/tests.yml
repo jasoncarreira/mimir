@@ -440,7 +440,7 @@ jobs:
 
       - name: Install pinned OpenCode for required child-session resume coverage
         if: matrix.python-version == '3.12'
-        run: npm install --global opencode-ai@1.18.21
+        run: npm install --global opencode-ai@1.19.4
 
       - name: Run selected Cultivate suite (shadow, Python 3.12)
         if: matrix.python-version == '3.12'
@@ -911,7 +911,7 @@ jobs:
         run: env -u MIMIR_PLUGINS uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
 
       - name: Install pinned OpenCode for required child-session resume coverage
-        run: npm install --global opencode-ai@1.18.21
+        run: npm install --global opencode-ai@1.19.4
 
       - name: Run selected Cultivate suite (enforcement on)
         env:

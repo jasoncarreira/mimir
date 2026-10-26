@@ -736,6 +736,10 @@ def _error_from_status(
         return None
     detail = stderr.strip() or stdout.strip()
     message = detail.splitlines()[-1] if detail else status
+    if status == "failed":
+        structured = _unknown_error_detail(stderr)
+        if structured is not None:
+            return redact_text(structured)
     if status == "auth_error":
         message = _provider_auth_line(stderr) or message
     if status == "quota_exhausted":
@@ -748,6 +752,33 @@ def _error_from_status(
     if re.search(r"\bEACCES\b", detail, re.IGNORECASE):
         return detail
     return message
+
+
+def _unknown_error_detail(stderr: str) -> str | None:
+    """Extract OpenCode's UnknownError JSON and its preceding diagnostic log."""
+    lines = stderr.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != "{":
+            continue
+        try:
+            payload = json.loads("\n".join(lines[index:]))
+        except ValueError:
+            continue
+        if not isinstance(payload, dict) or payload.get("name") != "UnknownError":
+            continue
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("message"), str):
+            continue
+        parts = [data["message"]]
+        ref = payload.get("ref", data.get("ref"))
+        if isinstance(ref, str) and ref:
+            parts.append(f"ref: {ref}")
+        for previous in reversed(lines[:index]):
+            if "level=ERROR" in previous and "error=" in previous:
+                parts.insert(0, previous.strip())
+                break
+        return " | ".join(parts)
+    return None
 
 
 def _provider_from_command(command: Sequence[str]) -> str:
