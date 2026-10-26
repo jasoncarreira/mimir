@@ -434,7 +434,7 @@ def test_secret_file_requires_private_mode(tmp_path):
 
 def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, monkeypatch):
     monkeypatch.setattr(installer.time, "sleep", lambda seconds: None)
-    pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True}
+    pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok"}
     reads = []
 
     def http(url, *, key=None, data=None):
@@ -451,11 +451,21 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     def run(argv, *, cwd):
         if "plugins" in argv:
             return json.dumps([{"name": "cultivate", "enabled": True}])
+        if "resolve_opencode_invocation" in argv[-1]:
+            return pending["auth"]
         return json.dumps(pending["alerts"])
 
     monkeypatch.setattr(installer, "_http", http)
     monkeypatch.setattr(installer, "_run", run)
     installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    pending["auth"] = "auth_missing"
+    with pytest.raises(installer.SetupError, match="OpenCode credential resolution failed.*auth_missing"):
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    pending["auth"] = "private-key-material"
+    with pytest.raises(installer.SetupError, match="unavailable") as raised:
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    assert "private-key-material" not in str(raised.value)
+    pending["auth"] = "ok"
     assert any(url.endswith("/api/v1/chat") and key == "owner-key" for url, key, _ in reads)
     pending["alerts"] = [{"repository": "org/repo"}]
     with pytest.raises(installer.SetupError, match="binding"):

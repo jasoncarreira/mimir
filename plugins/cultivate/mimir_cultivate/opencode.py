@@ -15,7 +15,9 @@ import shutil
 import shlex
 import stat
 import subprocess
+import tempfile
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from langchain_core.tools import tool
@@ -27,6 +29,7 @@ from mimir.contained_snapshot import (
     SnapshotUnsafeEntry,
 )
 from mimir import event_logger
+from mimir.codex_auth import auth_file_path, load_codex_auth
 from mimir.tools.registry import (
     _STATE, _spawn_acquire_rate_slot, _spawn_current_depth, _spawn_guard_init,
     _spawn_release_rate_slot,
@@ -165,6 +168,7 @@ def _sanitized_git_env() -> dict[str, str]:
 _CONFIG_REASON_CODES = frozenset({
     "config_malformed", "config_missing", "config_oversize",
     "config_provider_selection", "config_unreadable", "config_unsafe_inline_secret",
+    "config_missing_codex_plugin",
 })
 _AUTH_REASON_CODES = frozenset({
     "auth_invalid", "auth_malformed", "auth_missing", "auth_oversize", "auth_unreadable",
@@ -177,7 +181,11 @@ class OpenCodeConfigError(ValueError):
         if reason_code not in _CONFIG_REASON_CODES:
             raise ValueError("invalid OpenCode configuration reason code")
         self.reason_code = reason_code
-        super().__init__("OpenCode configuration unavailable")
+        message = (
+            "OpenCode Codex subscription requires opencode-openai-codex-auth in the effective OpenCode plugin config"
+            if reason_code == "config_missing_codex_plugin" else "OpenCode configuration unavailable"
+        )
+        super().__init__(message)
 
 
 class OpenCodeAuthError(OpenCodeConfigError):
@@ -200,6 +208,7 @@ class OpenCodeInvocation:
     pass_env: tuple[str, ...] = ()
     provider_config: object = field(default_factory=dict, repr=False, compare=False)
     auth_entry: object | None = field(default=None, repr=False, compare=False)
+    plugins: tuple[str, ...] = field(default=(), repr=False, compare=False)
     scrubber: SensitiveMaterialScrubber = field(repr=False, compare=False, default_factory=SensitiveMaterialScrubber)
 
 
@@ -288,21 +297,35 @@ def resolve_opencode_invocation(
         source = "agent_model"
 
     provider = _provider_from_model(model)
+    codex = provider == "openai" and values.get("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC).strip().startswith("codex-plus:")
+    plugins = native.get("plugin", [])
+    if codex and (not isinstance(plugins, list) or not any(
+        isinstance(plugin, str) and plugin.split("@", 1)[0] == "opencode-openai-codex-auth"
+        for plugin in plugins
+    )):
+        raise OpenCodeConfigError("config_missing_codex_plugin")
+    if codex:
+        reconcile_codex_auth(values, scrubber=scrubber)
     provider_config, env_references = _selected_provider_config(native, provider)
     auth_type, remove_env, auth_entry = _inspect_auth(
         provider, values, auth_path=auth_path, env_references=env_references, scrubber=scrubber,
+        codex=codex,
     )
     return OpenCodeInvocation(
         model=model, provider=provider, model_source=source, config_path=path,
         auth_path=auth_path, auth_type=auth_type, remove_env=remove_env,
         pass_env=tuple(sorted(env_references)), provider_config=provider_config,
         auth_entry=auth_entry, scrubber=scrubber,
+        plugins=tuple(
+            plugin for plugin in plugins
+            if isinstance(plugin, str) and plugin.split("@", 1)[0] == "opencode-openai-codex-auth"
+        ) if codex else (),
     )
 
 
 def _inspect_auth(
     provider: str, env: Mapping[str, str], *, auth_path: Path,
-    env_references: set[str], scrubber: SensitiveMaterialScrubber,
+    env_references: set[str], scrubber: SensitiveMaterialScrubber, codex: bool = False,
 ) -> tuple[str | None, tuple[str, ...], object | None]:
     if auth_path.exists():
         entries, auth_source = _read_object(auth_path, kind="auth")
@@ -315,7 +338,7 @@ def _inspect_auth(
     ambient_present = bool(env.get(ambient_name, "").strip())
 
     if entry is None:
-        if provider == "openai" and ambient_present:
+        if codex:
             raise OpenCodeAuthError("auth_missing")
         if ambient_present:
             credential = env[ambient_name].strip()
@@ -330,6 +353,13 @@ def _inspect_auth(
     if not isinstance(auth_type, str) or not auth_type.strip():
         raise OpenCodeAuthError("auth_invalid")
     auth_type = auth_type.strip()
+    if codex and auth_type != "oauth":
+        raise OpenCodeAuthError("auth_invalid")
+    if codex and not all(
+        isinstance(entry.get(key), str) and bool(entry[key].strip())
+        for key in ("access", "refresh")
+    ):
+        raise OpenCodeAuthError("auth_invalid")
     required = {
         "oauth": ("access", "refresh"), "api": ("key",), "wellknown": ("key", "token"),
     }.get(auth_type)
@@ -346,6 +376,101 @@ def _inspect_auth(
     _add_sensitive_scalars(scrubber, copied, skip_keys=frozenset({"type"}))
     remove = (ambient_name,) if auth_type == "oauth" else ()
     return auth_type, remove, copied
+
+
+def _jwt_exp(token: str) -> int:
+    try:
+        segment = token.split(".")[1]
+        payload = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+        exp = payload["exp"]
+        return exp if isinstance(exp, int) and not isinstance(exp, bool) else 0
+    except (IndexError, ValueError, KeyError, TypeError):
+        return 0
+
+
+def _atomic_auth_write(path: Path, document: dict[str, object]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".auth-", delete=False) as output:
+            temporary = output.name
+            os.fchmod(output.fileno(), 0o600)
+            json.dump(document, output)
+            output.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def reconcile_codex_auth(
+    env: Mapping[str, str] | None = None, *, scrubber: SensitiveMaterialScrubber | None = None,
+    refreshed_path: Path | None = None,
+) -> None:
+    """Keep Codex and OpenCode on one refresh-token family (newer JWT exp wins)."""
+    values = os.environ if env is None else env
+    home = _home(values)
+    codex_home = Path(values.get("CODEX_HOME") or home / ".codex").expanduser()
+    codex_path = auth_file_path(codex_home)
+    opencode_path = opencode_auth_path(values)
+    if scrubber is not None:
+        scrubber.add_path(codex_path)
+        scrubber.add_path(opencode_path)
+    try:
+        auth = load_codex_auth(codex_path)
+        if auth is None:
+            raise OpenCodeAuthError("auth_missing")
+        if auth.auth_mode != "chatgpt" or not isinstance(auth.refresh_token, str) or not auth.refresh_token:
+            raise OpenCodeAuthError("auth_invalid")
+        if _jwt_exp(auth.access_token) <= 0:
+            raise OpenCodeAuthError("auth_invalid")
+        codex_document, codex_source = _read_object(codex_path, kind="auth")
+        if scrubber is not None:
+            scrubber.add_document(codex_source)
+            _add_sensitive_scalars(scrubber, codex_document)
+        entries = _read_object(opencode_path, kind="auth")[0] if opencode_path.exists() else {}
+        refreshed = (
+            _read_object(refreshed_path, kind="auth")[0].get("openai")
+            if refreshed_path is not None and refreshed_path.exists() else None
+        )
+        if isinstance(refreshed, dict) and refreshed.get("type") == "oauth" and (
+            isinstance(refreshed.get("access"), str) and isinstance(refreshed.get("refresh"), str)
+            and refreshed["refresh"] and _jwt_exp(refreshed["access"]) > max(
+                _jwt_exp(auth.access_token),
+                _jwt_exp(entries.get("openai", {}).get("access", ""))
+                if isinstance(entries.get("openai"), dict) else 0,
+            )
+        ):
+            entries["openai"] = refreshed
+            _atomic_auth_write(opencode_path, entries)
+        if scrubber is not None:
+            _add_sensitive_scalars(scrubber, entries)
+        openai = entries.get("openai")
+        if openai is not None and not isinstance(openai, dict):
+            raise OpenCodeAuthError("auth_invalid")
+        if isinstance(openai, dict) and openai.get("type") == "oauth":
+            if openai.get("refresh") == auth.refresh_token:
+                return
+            if (isinstance(openai.get("access"), str) and isinstance(openai.get("refresh"), str)
+                    and openai["refresh"] and _jwt_exp(openai["access"]) > _jwt_exp(auth.access_token)):
+                tokens = codex_document.get("tokens")
+                if not isinstance(tokens, dict):
+                    raise OpenCodeAuthError("auth_invalid")
+                tokens["access_token"] = openai["access"]
+                tokens["refresh_token"] = openai["refresh"]
+                codex_document["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                _atomic_auth_write(codex_path, codex_document)
+                return
+        entries["openai"] = {
+            "type": "oauth", "access": auth.access_token, "refresh": auth.refresh_token,
+            "expires": _jwt_exp(auth.access_token) * 1000,
+        }
+        _atomic_auth_write(opencode_path, entries)
+    except OpenCodeAuthError as exc:
+        raise OpenCodeAuthError(exc.reason_code) from None
+    except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+        raise OpenCodeAuthError("auth_invalid") from None
 
 
 def _read_object(path: Path, *, kind: str) -> tuple[dict[str, object], bytes]:
@@ -391,6 +516,8 @@ def opencode_worker_documents(
         "provider": {invocation.provider: provider_config},
         "permission": {"external_directory": "deny"},
     }
+    if invocation.plugins:
+        config["plugin"] = list(invocation.plugins)
     config_document = _encode_projection(config, auth=False)
     auth_document: bytes | None = None
     if invocation.auth_entry is not None:

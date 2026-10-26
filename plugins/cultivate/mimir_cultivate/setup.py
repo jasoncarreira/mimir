@@ -625,6 +625,19 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
                     "print(json.dumps(repo_binding_startup_alerts()))"], cwd=deploy)
     if json.loads(binding):
         raise SetupError("Repository binding attention required; check checkout origin and repositories.yaml.")
+    # Run in the agent container with its actual HOME, config and compose env.
+    # Only a stable reason code crosses the Docker boundary, never the bundle.
+    auth_check = _run(["docker", "compose", "exec", "-T", "agent", "python", "-c",
+        "from mimir_cultivate.opencode import resolve_opencode_invocation, OpenCodeAuthError, OpenCodeConfigError\n"
+        "try:\n resolve_opencode_invocation()\n print('ok')\n"
+        "except (OpenCodeAuthError, OpenCodeConfigError) as exc:\n print(exc.reason_code)"], cwd=deploy)
+    if auth_check != "ok":
+        raise SetupError(
+            "OpenCode credential resolution failed (" + (
+                auth_check if auth_check in {"auth_missing", "auth_invalid", "auth_malformed", "auth_unreadable",
+                                              "config_missing_codex_plugin"} else "unavailable"
+            ) + "); check the agent container's model API key or Codex OAuth login and OpenCode plugin config."
+        )
     schedule = _http(url + "/api/v1/scheduler", key=owner_key)
     pollers = {row.get("name") for row in schedule.get("data", {}).get("pollers", [])
                if row.get("next_run_at")}

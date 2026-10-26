@@ -8505,6 +8505,8 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
         json.dumps({"openai": {"type": "oauth", "refresh": "synthetic"}}),
         encoding="utf-8",
     )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path, "synthetic")
     parent_env = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": str(tmp_path),

@@ -5392,6 +5392,8 @@ def _configure_opencode_oauth(
         json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
         encoding="utf-8",
     )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
 
 
 def _run_factory_preflight_case(

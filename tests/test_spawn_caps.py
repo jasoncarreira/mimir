@@ -187,6 +187,8 @@ def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     auth = home / ".local/share/opencode/auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "test"}}))
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(home, "test")
     subprocess.run(["git", "init", "-q", str(seed)], check=True)
     subprocess.run(["git", "-C", str(seed), "config", "user.name", "Test"], check=True)
     subprocess.run(["git", "-C", str(seed), "config", "user.email", "test@example.invalid"], check=True)

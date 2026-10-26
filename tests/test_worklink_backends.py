@@ -1112,6 +1112,8 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
         encoding="utf-8",
     )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
     order = WorkOrder(
         issue_id=1606,
         checkout=tmp_path,
@@ -1185,6 +1187,8 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
         json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
         encoding="utf-8",
     )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
     backend = OpenCodeBackend()
     transcript_root = tmp_path / "state" / "worklink" / "transcripts"
     order = WorkOrder(
@@ -1337,13 +1341,17 @@ def test_opencode_backend_logs_native_model_divergence_from_home_default(
     )
     config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
     config.parent.mkdir(parents=True)
-    config.write_text('{"model":"openai/gpt-native"}', encoding="utf-8")
+    config.write_text('{"model":"openai/gpt-native","plugin":["opencode-openai-codex-auth"]}', encoding="utf-8")
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
     auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text(
         json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
         encoding="utf-8",
     )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
     monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
     monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
@@ -1556,6 +1564,9 @@ async def test_opencode_backend_transcript_filename_contract(
         json.dumps({"openai": {"type": "oauth", "refresh": "test-refresh"}}),
         encoding="utf-8",
     )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path, "test-refresh")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
     backend = OpenCodeBackend()
@@ -2013,6 +2024,9 @@ def _provider_env(tmp_path: Path, spec: str, **values: str) -> dict[str, str]:
     """Hermetic env for a Worklink resolution selecting an arbitrary provider."""
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
+    if spec.startswith("codex-plus:"):
+        from tests.opencode_fixtures import seed_codex_subscription
+        seed_codex_subscription(tmp_path)
     return {
         "HOME": str(tmp_path),
         "MIMIR_HOME": str(home),
@@ -2028,6 +2042,9 @@ def _write_opencode_auth(tmp_path: Path, payload: object) -> None:
     path = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+    if (tmp_path / ".codex/auth.json").exists():
+        from tests.opencode_fixtures import seed_codex_subscription
+        seed_codex_subscription(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -2077,8 +2094,8 @@ def test_opencode_leaf_reasoning_from_home_dotenv_and_native_model(tmp_path: Pat
         "MIMIR_WORKLINK_REASONING_EFFORT=xhigh\n", encoding="utf-8",
     )
     config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
-    config.parent.mkdir(parents=True)
-    config.write_text('{"model":"openai/gpt-native"}', encoding="utf-8")
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('{"model":"openai/gpt-native","plugin":["opencode-openai-codex-auth"]}', encoding="utf-8")
     _write_opencode_auth(tmp_path, {"openai": {"type": "oauth", "refresh": "subscription"}})
     spec = OpenCodeBackend().work_spec(
         WorkOrder(1844, tmp_path, "prompt", None, 30, env),
