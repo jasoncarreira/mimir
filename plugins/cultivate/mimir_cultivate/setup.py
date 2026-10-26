@@ -417,6 +417,17 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
     helper = git_auth[-1].split('=', 1)[1]
     git('config', '--local', 'credential.helper', '')
     git('config', '--local', 'credential.https://github.com.helper', helper)
+    for key, env_key in (('user.name', 'GH_USER_NAME'), ('user.email', 'GH_USER_EMAIL')):
+        value = os.environ.get(env_key, '').strip()
+        if not value:
+            raise RuntimeError(f'Worklink base identity unconfigured: {env_key}')
+        current = subprocess.run(['git', '-C', str(base), 'config', '--local', '--get', key],
+                                 capture_output=True, text=True, check=False)
+        if current.returncode not in (0, 1):
+            raise RuntimeError(f'Worklink base {base}: git config {key} failed')
+        if current.stdout.strip() != value:
+            git('config', '--local', key, value)
+            created = True
 
     path = home / 'worklink.yaml'
     config = {'repository': entry['slug'], 'defaults': {
@@ -650,6 +661,26 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
     }
     if root_check != "ok":
         raise SetupError(root_errors.get(root_check, "Worklink executor verification returned an unexpected result; inspect the executor service."))
+    identity_check = _agent_exec(deploy, "python", "-c",
+        "import os, subprocess\n"
+        "repo = os.environ.get('WORKLINK_REPO', '')\n"
+        "expected = (os.environ.get('GH_USER_NAME', '').strip(), os.environ.get('GH_USER_EMAIL', '').strip())\n"
+        "def local(key):\n"
+        " result = subprocess.run(['git', '-C', repo, 'config', '--local', '--get', key], capture_output=True, text=True)\n"
+        " if result.returncode not in (0, 1):\n"
+        "  raise RuntimeError('base_identity_unreadable')\n"
+        " return result.stdout.strip() if result.returncode == 0 else ''\n"
+        "try:\n"
+        " if not repo:\n"
+        "  raise RuntimeError('base_identity_unreadable')\n"
+        " actual = (local('user.name'), local('user.email'))\n"
+        " print('ok' if all(expected) and actual == expected else 'base_identity_mismatch')\n"
+        "except (OSError, RuntimeError):\n"
+        " print('base_identity_unreadable')")
+    if identity_check == "base_identity_unreadable":
+        raise SetupError("Worklink base identity unreadable (base_identity_unreadable); check that the runtime user can read the base clone's local Git config.")
+    if identity_check != "ok":
+        raise SetupError("Worklink base identity mismatch (base_identity_mismatch); check the base clone's local user.name/user.email and the bot identity in compose.env.")
     # Run in the agent container with its actual HOME, config and compose env.
     # Only a stable reason code crosses the Docker boundary, never the bundle.
     auth_check = _agent_exec(deploy, "python", "-c",

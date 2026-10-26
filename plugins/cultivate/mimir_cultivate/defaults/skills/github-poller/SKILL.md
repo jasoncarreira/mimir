@@ -12,7 +12,7 @@ env:
       example: "ghp_..."
     - name: MIMIR_GITHUB_SELF_LOGIN
       description: "GitHub login mimir authors as. Events from this login are filtered out."
-      example: "mimir-carreira"
+      example: "your-bot-login"
     - name: MIMIR_GITHUB_PRELOAD_REVIEW_SKILL
       description: "Set to true to inline the selected Cultivate review skill from <home>/skills/cultivate-review/SKILL.md into PR-review prompts. No path override is needed after provider defaults seed the home."
       example: "true"

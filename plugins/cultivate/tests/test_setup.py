@@ -28,6 +28,8 @@ SHA = "a" * 40
 @pytest.fixture(autouse=True)
 def isolated_license_record(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("GH_USER_NAME", "trellisbot-squashmerge")
+    monkeypatch.setenv("GH_USER_EMAIL", "trellisbot@example.com")
 
 
 @pytest.mark.parametrize("answer", ["no", "y", "", None])
@@ -438,6 +440,10 @@ def test_secret_file_requires_private_mode(tmp_path):
 
 def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, monkeypatch):
     monkeypatch.setattr(installer.time, "sleep", lambda seconds: None)
+    base = tmp_path / 'base'
+    subprocess.run(['git', 'init', str(base)], check=True, capture_output=True)
+    subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.name', 'trellisbot-squashmerge'], check=True)
+    subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'trellisbot@example.com'], check=True)
     pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok", "root": "ok"}
     reads = []
     exec_calls = []
@@ -484,14 +490,35 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
             with redirect_stdout(output):
                 exec(compile(argv[-1], "<executor-verification>", "exec"), {})
             return output.getvalue().strip()
+        if "base_identity_mismatch" in argv[-1]:
+            return subprocess.run([sys.executable, '-c', argv[-1]], check=True, capture_output=True, text=True,
+                env=dict(os.environ, WORKLINK_REPO=str(base))).stdout.strip()
         return json.dumps(pending["alerts"])
 
     monkeypatch.setattr(installer, "_http", http)
     monkeypatch.setattr(installer, "_run", run)
     installer._verify(tmp_path, 8123, "org/repo", "owner-key")
-    assert len(exec_calls) == 4
+    assert len(exec_calls) == 5
     assert [argv[7:9] for argv in exec_calls] == [
-        ["mimir", "plugins"], ["python", "-c"], ["python", "-c"], ["python", "-c"]]
+        ["mimir", "plugins"], ["python", "-c"], ["python", "-c"],
+        ["python", "-c"], ["python", "-c"]]
+    assert any(url.endswith("/api/v1/chat") and key == "owner-key" for url, key, _ in reads)
+    subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'wrong@example.com'], check=True)
+    reads.clear()
+    with pytest.raises(installer.SetupError, match="Worklink base identity mismatch.*base_identity_mismatch"):
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    # A missing key (git rc 1) is a mismatch, not an unreadable repository.
+    subprocess.run(['git', '-C', str(base), 'config', '--local', '--unset', 'user.email'], check=True)
+    with pytest.raises(installer.SetupError, match="Worklink base identity mismatch.*base_identity_mismatch"):
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'trellisbot@example.com'], check=True)
+    # Real git returns rc 128 when the configured base cannot be opened.
+    moved_base = tmp_path / 'moved-base'
+    base.rename(moved_base)
+    with pytest.raises(installer.SetupError, match="Worklink base identity unreadable.*base_identity_unreadable") as raised:
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    assert 'fatal:' not in str(raised.value)
+    moved_base.rename(base)
     for reason, message in (
         ("checkout_root_mismatch", "checkout root mismatch; align WORKLINK_CHECKOUT_ROOT"),
         ("executor_stale", "executor is stale; rebuild the image"),
@@ -512,7 +539,6 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
     assert "private-key-material" not in str(raised.value)
     pending["auth"] = "ok"
-    assert any(url.endswith("/api/v1/chat") and key == "owner-key" for url, key, _ in reads)
     pending["alerts"] = [{"repository": "org/repo"}]
     with pytest.raises(installer.SetupError, match="binding"):
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
@@ -567,6 +593,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
 
     monkeypatch.setattr(skills, "install_skill", install_skill)
     calls = []
+    base_identity = {}
 
     def git(argv, **kwargs):
         calls.append(argv)
@@ -579,6 +606,13 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
             return subprocess.CompletedProcess(argv, 0)
         if "clone" in argv:
             (Path(argv[-1]) / ".git").mkdir(parents=True)
+        if argv[:3] == ['git', '-C', str(tmp_path / 'worklink/base/repo')] and 'config' in argv:
+            if argv[-2:] in (['--get', 'user.name'], ['--get', 'user.email']):
+                key = argv[-1]
+                return subprocess.CompletedProcess(argv, 0 if key in base_identity else 1,
+                                                   stdout=base_identity.get(key, '') + '\n')
+            if argv[-2] in ('user.name', 'user.email'):
+                base_identity[argv[-2]] = argv[-1]
         if 'symbolic-ref' in argv:
             return subprocess.CompletedProcess(argv, 0, stdout='main\n')
         if 'status' in argv:
@@ -601,6 +635,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert inventory["repositories"][0]["worklink_base"] == str(tmp_path / 'worklink/base/repo')
     assert inventory["repositories"][0]["origin"] == "https://github.com/org/repo.git"
     assert len(inventory["repositories"]) == 1
+    assert base_identity == {'user.name': 'trellisbot-squashmerge', 'user.email': 'trellisbot@example.com'}
     assert {r["root"] for r in inventory["allowed_roots"]} == {"/workspace/pr-leases", "/workspace/worklink"}
     people = yaml.safe_load((state / "identities.yaml").read_text())["people"]
     assert {p["canonical"] for p in people} == {"another", "owner"}
@@ -714,6 +749,10 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch)
     monkeypatch.setattr(subprocess, 'run', run)
     auth = ['git', '-c', 'credential.helper=', '-c', 'credential.https://github.com.helper=!f() { :; }; f']
     assert installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
+    assert original_run(['git', '-C', str(base), 'config', '--local', '--get', 'user.name'],
+                        capture_output=True, text=True, check=True).stdout.strip() == 'trellisbot-squashmerge'
+    assert original_run(['git', '-C', str(base), 'config', '--local', '--get', 'user.email'],
+                        capture_output=True, text=True, check=True).stdout.strip() == 'trellisbot@example.com'
     from mimir_cultivate.worklink.backends.registry import WorklinkConfig, BackendRegistry
     config = WorklinkConfig.load(home / 'worklink.yaml')
     BackendRegistry(config)
@@ -732,17 +771,30 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch)
     monkeypatch.setenv('MIMIR_SOURCE_DIR', str(checkout))
     monkeypatch.setenv('WORKLINK_CHECKOUT_ROOT', str(tmp_path / '.worklink'))
     monkeypatch.setattr('mimir_cultivate.worklink.checkout._cultivate_selected', lambda: False)
-    attempt = create_isolated_checkout(base, issue_id=2016, attempt=1, base='integration')
+    events = []
+    attempt = create_isolated_checkout(base, issue_id=2016, attempt=1, base='integration',
+        event_logger=lambda name, **payload: events.append((name, payload)))
     assert attempt.repo == base and attempt.branch == 'issue/2016-a1'
     assert attempt.path != checkout and attempt.path != base
+    assert original_run(['git', '-C', str(attempt.path), 'config', '--local', '--get', 'user.name'],
+                        capture_output=True, text=True, check=True).stdout.strip() == 'trellisbot-squashmerge'
+    assert original_run(['git', '-C', str(attempt.path), 'config', '--local', '--get', 'user.email'],
+                        capture_output=True, text=True, check=True).stdout.strip() == 'trellisbot@example.com'
+    [identity] = [p for n, p in events if n == 'worklink_checkout_identity_configured']
+    assert (identity['user_name'], identity['user_email'], identity['inherited']) == (
+        'trellisbot-squashmerge', 'trellisbot@example.com', True)
     origin_tip = original_run(['git', '-C', str(base), 'rev-parse', 'origin/integration'],
                               capture_output=True, text=True, check=True).stdout.strip()
     assert attempt.local_base == origin_tip
     before = ((home / '.chainlink/agent.json').read_bytes(), (home / 'worklink.yaml').read_bytes(),
-              (base / '.git/config').read_bytes())
+               (base / '.git/config').read_bytes())
     assert not installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
     assert before == ((home / '.chainlink/agent.json').read_bytes(), (home / 'worklink.yaml').read_bytes(),
                       (base / '.git/config').read_bytes())
+    monkeypatch.delenv('GH_USER_NAME')
+    with pytest.raises(RuntimeError, match='identity unconfigured: GH_USER_NAME'):
+        installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
+    monkeypatch.setenv('GH_USER_NAME', 'trellisbot-squashmerge')
     (base / 'untracked').write_text('dirty')
     with pytest.raises(RuntimeError, match='dirty.*clean'):
         installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
@@ -797,6 +849,7 @@ def test_worklink_store_init_precedes_agent_and_refuses_bad_store(tmp_path, monk
     elif store_state == 'file':
         store.write_text('not a store')
     calls = []
+    identity = {}
 
     def run(argv, **kw):
         if argv[0] == 'chainlink':
@@ -814,6 +867,12 @@ def test_worklink_store_init_precedes_agent_and_refuses_bad_store(tmp_path, monk
             return subprocess.CompletedProcess(argv, 0)
         if 'clone' in argv:
             (Path(argv[-1]) / '.git').mkdir(parents=True)
+        if argv[-2:] in (['--get', 'user.name'], ['--get', 'user.email']):
+            key = argv[-1]
+            return subprocess.CompletedProcess(argv, 0 if key in identity else 1,
+                                               stdout=identity.get(key, '') + '\n')
+        if len(argv) > 5 and argv[-2] in ('user.name', 'user.email'):
+            identity[argv[-2]] = argv[-1]
         stdout = ('main' if 'symbolic-ref' in argv else '' if 'status' in argv else 'origin') + '\n'
         return subprocess.CompletedProcess(argv, 0, stdout=stdout)
 

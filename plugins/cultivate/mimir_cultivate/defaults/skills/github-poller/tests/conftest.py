@@ -1,8 +1,6 @@
 """Make ``scripts/poller.py`` importable for tests."""
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from github_poller_test_support import poller
@@ -33,9 +31,3 @@ def _no_leaked_tick_budget():
     poller.set_active_tick_budget(None)
     yield
     poller.set_active_tick_budget(None)
-
-
-@pytest.fixture(autouse=True)
-def _fresh_poller_process_start(monkeypatch: pytest.MonkeyPatch):
-    """main()'s startup budget must start with the test, not suite collection."""
-    monkeypatch.setattr(poller, "_PROCESS_START", time.monotonic())

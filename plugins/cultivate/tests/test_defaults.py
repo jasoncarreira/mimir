@@ -27,18 +27,35 @@ NAMES = {
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
 
-# Identity wording belongs to #2024. Keep these four pre-existing lines until
-# that change lands; the repository guard must not exempt any gh command.
-IDENTITY_EXCEPTIONS = {
-    "skills/review/SKILL.md": {
-        "Verify your login (`mimir-carreira`) appears in the reviews list.",
-        "### 7. Operator ping (non-mimir-carreira PRs)",
-        "For PRs authored by anyone other than `mimir-carreira`, fulfill commitment",
-    },
-    "skills/github-poller/SKILL.md": {
-        '      example: "mimir-carreira"',
-    },
-}
+# The identity cleanup from #2024 is integrated; no exceptions are allowed.
+IDENTITY_EXCEPTIONS: dict[str, set[str]] = {}
+
+
+@pytest.mark.parametrize("literal", ["--repo jasoncarreira/mimir", "mimir-carreira"])
+def test_shipped_repository_guard_rejects_mutation(tmp_path, monkeypatch, literal):
+    skills = tmp_path / "skills"
+    review = skills / "review" / "SKILL.md"
+    review.parent.mkdir(parents=True)
+    review.write_text((SKILLS / "review" / "SKILL.md").read_text())
+    monkeypatch.setattr(__import__(__name__, fromlist=["SKILLS"]), "SKILLS", skills)
+    test_shipped_skills_do_not_pin_repository_or_identity()
+    with review.open("a") as stream:
+        stream.write(f"\ngh pr review <num> {literal}\n")
+    with pytest.raises(AssertionError, match="skills/review/SKILL.md"):
+        test_shipped_skills_do_not_pin_repository_or_identity()
+
+
+@pytest.mark.parametrize("name", ["review", "github-poller", "github", "github-ci-watch"])
+def test_current_repository_skill_release_hash(name):
+    import hashlib
+
+    releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
+    expected = releases["0.9.10-2025"][name]["SKILL.md"]
+    actual = hashlib.sha256((SKILLS / name / "SKILL.md").read_bytes()).hexdigest()
+    assert actual == expected
+
+
+# The guard scans the shipped defaults, not test fixtures or cache files.
 
 
 def test_shipped_skills_do_not_pin_repository_or_identity() -> None:
