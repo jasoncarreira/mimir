@@ -435,8 +435,10 @@ def local_exec(argv, *, cwd):
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
 setup._run = local_exec
-setup._verify_opencode_binary(Path('/tmp'))
-assert calls == ['mimir', 'worklink']
+binary = setup._verify_opencode_binary(Path('/tmp'))
+for model in ('openai/gpt-6.1-sol', 'openai/gpt-6-luna', 'anthropic/claude-haiku-5-5'):
+    setup._verify_opencode_model(Path('/tmp'), binary, model)
+assert calls == ['mimir', 'worklink', 'worklink', 'worklink', 'worklink']
 print('real-image setup OpenCode probe passed')
 ''')
 

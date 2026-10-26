@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import tomllib
 from pathlib import Path
@@ -444,7 +445,7 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     subprocess.run(['git', 'init', str(base)], check=True, capture_output=True)
     subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.name', 'trellisbot-squashmerge'], check=True)
     subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'trellisbot@example.com'], check=True)
-    pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok", "root": "ok", "binary": "ok"}
+    pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok", "root": "ok", "binary": "ok", "model": "ok"}
     reads = []
     exec_calls = []
     from mimir_cultivate.worklink import worker_client
@@ -482,9 +483,15 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
             assert argv[:10] == ["docker", "compose", "exec", "-T", "-u", "worklink",
                                 "-w", "/tmp", "agent", "/usr/local/bin/python"]
             return pending["binary"]
+        if installer._OPENCODE_MODEL_PROBE in argv:
+            assert argv[4:9] == ["-u", "worklink", "-w", "/tmp", "agent"]
+            assert argv[-3:] == ["/opt/mimir-opencode/bin/opencode", "openai", "openai/gpt-6.1-sol"]
+            return pending["model"]
         assert argv[:7] == ["docker", "compose", "exec", "-T", "-u", "mimir", "agent"]
         if "plugins" in argv:
             return json.dumps([{"name": "cultivate", "enabled": True}])
+        if "print(resolve_opencode_invocation().model)" in argv[-1]:
+            return "openai/gpt-6.1-sol"
         if "resolve_opencode_invocation" in argv[-1]:
             return pending["auth"]
         if "verify_executor_identity" in argv[-1]:
@@ -505,11 +512,11 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     monkeypatch.setattr(installer, "_http", http)
     monkeypatch.setattr(installer, "_run", run)
     installer._verify(tmp_path, 8123, "org/repo", "owner-key")
-    assert len(exec_calls) == 7
+    assert len(exec_calls) == 9
     assert [argv[7:9] for argv in exec_calls] == [
         ["mimir", "plugins"], ["python", "-c"], ["python", "-c"],
         ["python", "-c"], ["/home/mimir/venv/bin/python", "-c"],
-        ["/tmp", "agent"], ["python", "-c"]]
+        ["/tmp", "agent"], ["python", "-c"], ["python", "-c"], ["/tmp", "agent"]]
     assert any(url.endswith("/api/v1/chat") and key == "owner-key" for url, key, _ in reads)
     subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'wrong@example.com'], check=True)
     reads.clear()
@@ -551,6 +558,10 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
     assert "private-key-material" not in str(raised.value)
     pending["auth"] = "ok"
+    pending["model"] = "opencode_model_unknown"
+    with pytest.raises(installer.SetupError, match="opencode_model_unknown.*openai/gpt-6.1-sol"):
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    pending["model"] = "ok"
     pending["alerts"] = [{"repository": "org/repo"}]
     with pytest.raises(installer.SetupError, match="binding"):
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
@@ -661,6 +672,94 @@ def test_setup_binary_probe_executes_with_worker_path(
         assert not marker.exists(), 'failed launches must not execute the CLI body'
 
 
+@pytest.mark.parametrize('runtime_injected', [False, True])
+@pytest.mark.parametrize('outcome', ['listed', 'unknown', 'nonzero', 'missing', 'timeout'])
+@pytest.mark.parametrize('provider, model', [
+    ('openai', 'openai/gpt-6.1-sol'), ('anthropic', 'anthropic/claude-haiku-5-5'),
+])
+def test_setup_model_probe_uses_isolated_worker_cli(
+    tmp_path, monkeypatch, provider, model, outcome, runtime_injected
+):
+    from mimir_cultivate.contained_execution import (
+        base_worker_environment,
+        opencode_worker_environment,
+    )
+
+    binary = tmp_path / 'opencode'
+    marker = tmp_path / 'model-probe.json'
+    launch_marker = tmp_path / 'model-launch-environment.json'
+    binary.write_text(
+        f'#!{sys.executable}\nimport json, os, pathlib, sys\n'
+        + ("os.environ['TEST_RUNTIME_ADDED'] = 'runtime-only'\n" if runtime_injected else '')
+        + f"assert sys.argv[1:] == ['models', {provider!r}]\n"
+        "home = pathlib.Path(os.environ['HOME'])\n"
+        "assert home.is_dir() and home.stat().st_mode & 0o777 == 0o700\n"
+        f'pathlib.Path({str(marker)!r}).write_text(json.dumps(dict(os.environ)))\n'
+        # A prefix-only match must not satisfy the exact model check.
+        f"print({model + '-fast'!r})\n"
+        + (f"print({model!r})\n" if outcome != 'unknown' else '')
+        + f"sys.exit({1 if outcome == 'nonzero' else 0})\n"
+    )
+    binary.chmod(0o755)
+    if outcome == 'missing':
+        binary.unlink()
+    real_run = subprocess.run
+    captured = []
+    monkeypatch.setenv('OPENAI_API_KEY', 'private-openai-key')
+    monkeypatch.setenv('ANTHROPIC_API_KEY', 'private-anthropic-key')
+
+    def run(argv, *, cwd):
+        captured.append(argv)
+        assert cwd == tmp_path
+        assert argv[:10] == ['docker', 'compose', 'exec', '-T', '-u', 'worklink',
+                             '-w', '/tmp', 'agent', '/usr/local/bin/python']
+        assert argv[-4:] == [installer._OPENCODE_MODEL_PROBE, str(binary), provider, model]
+        # Capture the exact launch mapping before the child runtime can add
+        # platform variables. Execute the unmodified stdlib-only setup payload.
+        recorder = (
+            'import json, pathlib, subprocess\n'
+            'real_run = subprocess.run\n'
+            'def record_launch(*args, **kwargs):\n'
+            f' pathlib.Path({str(launch_marker)!r}).write_text(json.dumps(kwargs["env"]))\n'
+            + (' raise subprocess.TimeoutExpired(args[0], 30)\n' if outcome == 'timeout'
+               else ' return real_run(*args, **kwargs)\n')
+            + 'subprocess.run = record_launch\n'
+        )
+        result = real_run([sys.executable, '-I', '-S', '-c', recorder + argv[-4], *argv[-3:]],
+                          capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+
+    monkeypatch.setattr(installer, '_run', run)
+    if outcome == 'listed':
+        installer._verify_opencode_model(tmp_path, str(binary), model)
+    else:
+        with pytest.raises(installer.SetupError, match=f'opencode_model_unknown.*{re.escape(model)}'):
+            installer._verify_opencode_model(tmp_path, str(binary), model)
+    assert len(captured) == 1
+    assert launch_marker.exists(), 'every outcome must reach the subprocess boundary'
+    launch_env = json.loads(launch_marker.read_text())
+    base = base_worker_environment('setup-model-probe-parity')
+    runtime_home = str(Path(base['XDG_CONFIG_HOME']).parent)
+    expected = opencode_worker_environment(base, {})
+    expected = {key: value.replace(runtime_home, launch_env['HOME'])
+                for key, value in expected.items()}
+    expected['HOME'] = launch_env['HOME']
+    # The inert catalog key is the ONLY permitted difference from the worker.
+    expected[provider.upper() + '_API_KEY'] = 'model-catalog-probe'
+    assert launch_env == expected
+    assert not Path(launch_env['HOME']).exists(), 'probe must clean up after every outcome'
+    if outcome in {'listed', 'unknown', 'nonzero'}:
+        assert marker.exists(), 'positive control must execute the CLI body'
+        observed_env = json.loads(marker.read_text())
+        for key, value in expected.items():
+            assert observed_env[key] == value
+        if runtime_injected:
+            assert observed_env['TEST_RUNTIME_ADDED'] == 'runtime-only'
+            assert 'TEST_RUNTIME_ADDED' not in launch_env
+    else:
+        assert not marker.exists(), 'failed launches must not execute the CLI body'
+
+
 def test_real_image_probe_adapter_accepts_actual_setup_argv(monkeypatch):
     import ast
     import subprocess
@@ -687,6 +786,12 @@ def test_real_image_probe_adapter_accepts_actual_setup_argv(monkeypatch):
          installer._OPENCODE_RESOLVE_PROBE],
         ['/command/s6-setuidgid', 'worklink', '/usr/local/bin/python', '-c',
          installer._OPENCODE_WORKER_PROBE, '/opt/mimir-opencode/bin/opencode'],
+        ['/command/s6-setuidgid', 'worklink', '/usr/local/bin/python', '-c',
+         installer._OPENCODE_MODEL_PROBE, '/opt/mimir-opencode/bin/opencode', 'openai', 'openai/gpt-6.1-sol'],
+        ['/command/s6-setuidgid', 'worklink', '/usr/local/bin/python', '-c',
+         installer._OPENCODE_MODEL_PROBE, '/opt/mimir-opencode/bin/opencode', 'openai', 'openai/gpt-6-luna'],
+        ['/command/s6-setuidgid', 'worklink', '/usr/local/bin/python', '-c',
+         installer._OPENCODE_MODEL_PROBE, '/opt/mimir-opencode/bin/opencode', 'anthropic', 'anthropic/claude-haiku-5-5'],
     ]
     assert all(kwargs == dict(cwd='/tmp', capture_output=True, text=True, timeout=30)
                for _, kwargs in calls)

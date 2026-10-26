@@ -649,9 +649,32 @@ try:
 except (OSError, subprocess.TimeoutExpired, ValueError):
  print('opencode_missing')
 """
+_OPENCODE_MODEL_PROBE = """\
+import subprocess
+import sys
+import tempfile
+try:
+ with tempfile.TemporaryDirectory(prefix='mimir-opencode-probe-') as home:
+  env = {
+   'USER': 'worklink', 'LOGNAME': 'worklink', 'SHELL': '/bin/sh',
+   'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
+   'HOME': home, 'XDG_CONFIG_HOME': home + '/.config',
+   'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
+   'OPENCODE_CONFIG': home + '/.config/opencode/opencode.json',
+  }
+  # The catalog command requires a configured provider. This is an inert
+  # placeholder, never the operator's API key and never used for a completion.
+  env[sys.argv[2].upper() + '_API_KEY'] = 'model-catalog-probe'
+  result = subprocess.run([sys.argv[1], 'models', sys.argv[2]], env=env, cwd='/tmp',
+   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+  print('ok' if result.returncode == 0 and sys.argv[3] in result.stdout.splitlines()
+        else 'opencode_model_unknown')
+except (OSError, subprocess.TimeoutExpired, ValueError):
+ print('opencode_model_unknown')
+"""
 
 
-def _verify_opencode_binary(deploy: Path) -> None:
+def _verify_opencode_binary(deploy: Path) -> str:
     binary = _agent_exec(deploy, "/home/mimir/venv/bin/python", "-c", _OPENCODE_RESOLVE_PROBE)
     check = "opencode_missing"
     if binary.startswith("/") and "\n" not in binary and "\x00" not in binary:
@@ -659,6 +682,20 @@ def _verify_opencode_binary(deploy: Path) -> None:
                       "agent", "/usr/local/bin/python", "-c", _OPENCODE_WORKER_PROBE, binary], cwd=deploy)
     if check != "ok":
         raise SetupError("OpenCode leaf executable verification failed (opencode_missing); rebuild the agent image and check its OpenCode installation.")
+    return binary
+
+
+def _verify_opencode_model(deploy: Path, binary: str, model: str) -> None:
+    # Only the provider/model crosses into the isolated worker probe, never the
+    # configured credential or the controller's private OpenCode config.
+    if not re.fullmatch(r"(openai|anthropic)/[A-Za-z0-9_.-]+", model):
+        raise SetupError("OpenCode model verification failed (opencode_model_unknown); check the configured provider/model.")
+    provider = model.split("/", 1)[0]
+    check = _run(["docker", "compose", "exec", "-T", "-u", "worklink", "-w", "/tmp",
+                  "agent", "/usr/local/bin/python", "-c", _OPENCODE_MODEL_PROBE,
+                  binary, provider, model], cwd=deploy)
+    if check != "ok":
+        raise SetupError(f"OpenCode model verification failed (opencode_model_unknown): {model}; update the agent image or choose a listed model.")
 
 
 def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
@@ -721,7 +758,7 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
         raise SetupError("Worklink base identity unreadable (base_identity_unreadable); check that the runtime user can read the base clone's local Git config.")
     if identity_check != "ok":
         raise SetupError("Worklink base identity mismatch (base_identity_mismatch); check the base clone's local user.name/user.email and the bot identity in compose.env.")
-    _verify_opencode_binary(deploy)
+    binary = _verify_opencode_binary(deploy)
     # Run in the agent container with its actual HOME, config and compose env.
     # Only a stable reason code crosses the Docker boundary, never the bundle.
     auth_check = _agent_exec(deploy, "python", "-c",
@@ -735,6 +772,10 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
                 else "unavailable"
             ) + "); check the agent container's model API key or Codex OAuth login and OpenCode config."
         )
+    model = _agent_exec(deploy, "python", "-c",
+        "from mimir_cultivate.opencode import resolve_opencode_invocation; "
+        "print(resolve_opencode_invocation().model)")
+    _verify_opencode_model(deploy, binary, model)
     schedule = _http(url + "/api/v1/scheduler", key=owner_key)
     pollers = {row.get("name") for row in schedule.get("data", {}).get("pollers", [])
                if row.get("next_run_at")}

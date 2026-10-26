@@ -1547,6 +1547,45 @@ def test_opencode_provider_auth_quotes_evidence_line(line: str, evidence: str) -
     assert "\x1b" not in message
 
 
+@pytest.mark.parametrize('cause', ['',
+    'level=ERROR service=session message=failed ref=err_1cfd5f57 '
+    'error="ProviderModelNotFoundError: Model not found: openai/gpt-6.1-sol"\n',
+])
+@pytest.mark.parametrize('trailing', ['', '\nadditional shutdown diagnostic\n'])
+def test_opencode_unknown_error_reports_json_and_diagnostic(cause: str, trailing: str) -> None:
+    from mimir_cultivate.worklink.backends.opencode import _error_from_status, _unknown_error_detail
+
+    # Verbatim observed trellisbot stderr: ANSI Error: prefix shares the opening
+    # JSON line, and the reference lives inside data, not at the top level.
+    stderr = cause + (
+        '\x1b[91m\x1b[1mError: \x1b[0m{\n'
+        '  "name": "UnknownError",\n'
+        '  "data": {\n'
+        '    "message": "Unexpected server error. Check server logs for details.",\n'
+        '    "ref": "err_1cfd5f57"\n'
+        '  }\n'
+        '}\n'
+    ) + trailing
+    expected = 'Unexpected server error. Check server logs for details. | ref: err_1cfd5f57'
+    if cause:
+        expected = cause.strip() + ' | ' + expected
+    assert _unknown_error_detail(stderr) == expected
+    assert _error_from_status('failed', '', stderr) == expected
+
+
+def test_opencode_unknown_error_scrubs_diagnostic_and_ref() -> None:
+    from mimir_cultivate.worklink.backends.opencode import _error_from_status
+
+    secret = 'ghp_' + 'a' * 36
+    stderr = (f'level=ERROR error=ProviderModelNotFoundError token={secret}\n'
+              '{\n"name":"UnknownError",\n"data":{"message":"Unexpected server error"},\n'
+              f'"ref":"{secret}"\n}}')
+    message = _error_from_status('failed', '', stderr)
+    assert message is not None
+    assert secret not in message
+    assert 'ProviderModelNotFoundError' in message
+
+
 @pytest.mark.asyncio
 async def test_opencode_backend_transcript_filename_contract(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

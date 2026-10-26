@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 FACTORY_VERSION = "0.12.1"
-OPENCODE_VERSION = "1.18.21"
+OPENCODE_VERSION = "1.19.4"
 from mimir.plugin_dockerfile import main as assemble_main, verify_pins
 
 DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
@@ -52,10 +52,11 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
     assert root.index("USER mimir", invocations[2]) < controller < invocations[3]
     assert root.index("COPY deploy/s6-overlay/s6-rc.d/") < invocations[4] < root.index('ENTRYPOINT ["/init"]')
     assert f"ARG FACTORY_VERSION={FACTORY_VERSION}" in root
-    assert "ARG FACTORY_VERSION=0.10.16" in fixture  # The only version drift in the snapshot.
+    assert "ARG FACTORY_VERSION=0.10.16" in fixture  # Historical snapshot; pins have since advanced.
 
     def normal(text: str) -> str:
-        return " ".join(text.replace("\\\n", " ").replace('"', "").replace("'", "").split())
+        return " ".join(text.replace("\\\n", " ").replace('"', "").replace("'", "")
+                        .replace("opencode-ai@1.18.21", "opencode-ai@1.19.4").split())
 
     baseline = (
         blocks[0], blocks[1], blocks[2] + "\n" + blocks[3], blocks[4], blocks[5]
@@ -69,7 +70,7 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
          "poppler-utils tesseract-ocr tesseract-ocr-eng libjemalloc2",
          "curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash -",
          "apt-get install -y --no-install-recommends nodejs",
-         "npm install --global --prefix /opt/mimir-opencode", "opencode-ai@1.18.21",
+         "npm install --global --prefix /opt/mimir-opencode", "opencode-ai@1.19.4",
          "feature-factory@${FACTORY_VERSION}", "opencode-feature-factory@${FACTORY_VERSION}",
          "opencode-project-memory@0.1.0", "opencode-openai-codex-auth@4.4.0",
          "opencode-anthropic-auth@0.0.13", "apt-get clean", "rm -rf /var/lib/apt/lists/*"),
@@ -142,6 +143,9 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
     for name, original in zip(names, baseline, strict=True):
         expected_steps = steps(original)
         actual_steps = steps((source / name).read_text())
+        if name == "base.sh":
+            expected_steps = [step.replace("opencode-ai@1.18.21", "opencode-ai@1.19.4")
+                              for step in expected_steps]
         if name == "executor.sh":
             # Intentional post-extraction changes, each pinned exactly:
             # 0. The executor never embeds; filter the controller-only extra.

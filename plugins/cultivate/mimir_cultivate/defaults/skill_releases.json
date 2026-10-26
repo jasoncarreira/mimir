@@ -140,5 +140,14 @@
       "tests/test_github_poller_withhold.py": "77cedc5e891bad03a401e1548238097ae83cf423b91d7275db4fbce16d29e209"
     },
     "review": {"SKILL.md": "1d19235a852d7b6e47505682f173920a5b6a36f256f9fc8d59700eec350bd685"}
+  },
+  "0.9.10-2027": {
+    "worklink-tool-pins": {
+      "SKILL.md": "4263c91d41a772f018bc755a1232fa5619ddaef01ecb35d354ad4bb51c1b055b",
+      "pollers.json": "0f1a6281e89ce354681add39dac58a9e95c12c5d4dfa6d3408c0fdf7bd897c4a",
+      "scripts/poller.py": "de83dba8293ac100a723de5398fcae560f083297fb862fd7e0c3438ff7dc972a",
+      "tests/conftest.py": "5df4b16fedf0d178373d2c2196d579d9571ecc0d7c5f1c394360b5b45a937c1a",
+      "tests/test_worklink_tool_pins_poller.py": "1ce74f66db36488f50afcb40ced0b7c45ff44c85a8ca7d5ad720145cd19a3603"
+    }
   }
 }
