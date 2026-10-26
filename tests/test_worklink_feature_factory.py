@@ -961,6 +961,8 @@ def test_opencode_launch_argv_has_exact_staged_factory_payload(
         json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
         encoding="utf-8",
     )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
     if configured is None:
         monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
     else:
@@ -1024,6 +1026,8 @@ def test_factory_launch_rejects_work_item_run_id_disagreement(
         json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
         encoding="utf-8",
     )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
     order = WorkOrder(
         issue_id=1551,
         checkout=tmp_path,
@@ -1424,6 +1428,8 @@ def _own_opencode_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
         encoding="utf-8",
     )
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
 
 
 def _factory_order(tmp_path: Path, identity: str) -> WorkOrder:

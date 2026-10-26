@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import base64
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,10 @@ from mimir_cultivate.opencode import (
     OpenCodeConfigError,
     opencode_config_path,
     opencode_worker_documents,
+    reconcile_codex_auth,
     resolve_opencode_invocation,
+    SensitiveMaterialScrubber,
+    _inspect_auth,
 )
 
 
@@ -24,6 +28,23 @@ def _write_auth(tmp_path: Path, payload: object) -> None:
     path = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _jwt(exp: int) -> str:
+    segment = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
+    return ".".join(("header", segment, "signature"))
+
+
+def _codex(tmp_path: Path, exp: int = 300) -> dict[str, object]:
+    document = {"auth_mode": "chatgpt", "tokens": {
+        "access_token": _jwt(exp), "refresh_token": "refresh-" + str(exp),
+        "id_token": "kept", "account_id": "account",
+    }, "operator_field": "preserved"}
+    path = tmp_path / ".codex" / "auth.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document))
+    path.chmod(0o600)
+    return document
 
 
 def test_native_jsonc_model_wins_over_live_agent_model(tmp_path: Path) -> None:
@@ -66,7 +87,7 @@ def test_explicit_model_wins_over_native_config(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("spec", "expected"),
     [
-        ("codex-plus:gpt-5.6-luna", "openai/gpt-5.6-luna"),
+        ("openai:gpt-5.6-luna", "openai/gpt-5.6-luna"),
         ("claude-code:claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
         ("openrouter:moonshotai/kimi-k2", "openrouter/moonshotai/kimi-k2"),
     ],
@@ -84,7 +105,7 @@ def test_missing_config_falls_back_to_live_agent_model(
 def test_openai_oauth_is_distinguished_and_disables_metered_fallback(
     tmp_path: Path,
 ) -> None:
-    _write_auth(tmp_path, {"openai": {"type": "oauth", "refresh": "oauth-secret"}})
+    _codex(tmp_path)
     resolved = resolve_opencode_invocation(
         env=_env(
             tmp_path,
@@ -94,11 +115,18 @@ def test_openai_oauth_is_distinguished_and_disables_metered_fallback(
     )
     assert resolved.auth_type == "oauth"
     assert resolved.remove_env == ("OPENAI_API_KEY",)
-    assert "oauth-secret" not in repr(resolved)
+    assert "refresh-300" not in repr(resolved)
     assert "metered-secret" not in repr(resolved)
 
 
 def test_openai_ambient_key_without_stored_auth_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(OpenCodeAuthError) as isolated:
+        _inspect_auth(
+            "openai", _env(tmp_path, OPENAI_API_KEY="metered-key"),
+            auth_path=tmp_path / "absent.json", env_references=set(),
+            scrubber=SensitiveMaterialScrubber(home=tmp_path), codex=True,
+        )
+    assert isolated.value.reason_code == "auth_missing"
     with pytest.raises(OpenCodeAuthError, match="OpenCode authentication unavailable") as raised:
         resolve_opencode_invocation(
             env=_env(
@@ -390,6 +418,7 @@ def test_explicit_missing_config_has_stable_failure(tmp_path: Path) -> None:
 
 
 def test_auth_parse_failure_has_stable_failure(tmp_path: Path) -> None:
+    _codex(tmp_path)
     auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text('{"openai":{"type":"oauth","refresh":"secret"},broken}', encoding="utf-8")
@@ -403,6 +432,182 @@ def test_auth_parse_failure_has_stable_failure(tmp_path: Path) -> None:
     assert str(raised.value) == "OpenCode authentication unavailable"
     assert "secret" not in str(raised.value)
     assert str(auth) not in str(raised.value)
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "proxy"])
+def test_api_provider_uses_ambient_key_and_stored_entry_wins(tmp_path: Path, provider: str) -> None:
+    name = provider.upper() + "_API_KEY"
+    env = _env(tmp_path, MIMIR_MODEL_SPEC=provider + ":model", **{name: "ambient-value"})
+    invocation = resolve_opencode_invocation(env=env)
+    assert invocation.auth_type == "api"
+    assert invocation.auth_entry == {"type": "api", "key": "ambient-value"}
+    assert json.loads(opencode_worker_documents(invocation, env).auth_document or b"{}")[provider]["key"] == "ambient-value"
+    assert "ambient-value" not in repr(invocation)
+    _write_auth(tmp_path, {provider: {"type": "api", "key": "stored-value"}})
+    assert resolve_opencode_invocation(env=env).auth_entry == {"type": "api", "key": "stored-value"}
+
+
+def test_codex_newer_reseeds_and_preserves_other_entries(tmp_path: Path) -> None:
+    _codex(tmp_path, 500)
+    _write_auth(tmp_path, {"openai": {"type": "oauth", "access": _jwt(200), "refresh": "old"},
+                           "anthropic": {"type": "api", "key": "unchanged"}})
+    resolved = resolve_opencode_invocation(env=_env(tmp_path, MIMIR_MODEL_SPEC="codex-plus:model", OPENAI_API_KEY="metered"))
+    entries = json.loads(resolved.auth_path.read_text())
+    assert entries["openai"] == {"type": "oauth", "access": _jwt(500), "refresh": "refresh-500", "expires": 500000}
+    assert entries["anthropic"] == {"type": "api", "key": "unchanged"}
+    assert resolved.auth_path.stat().st_mode & 0o777 == 0o600
+    assert resolved.remove_env == ("OPENAI_API_KEY",)
+    assert "plugin" not in json.loads(opencode_worker_documents(resolved).config_document)
+
+
+def test_opencode_newer_writes_back_codex_fields_and_same_refresh_is_noop(tmp_path: Path) -> None:
+    original = _codex(tmp_path, 200)
+    _write_auth(tmp_path, {"openai": {"type": "oauth", "access": _jwt(500), "refresh": "new"}})
+    env = _env(tmp_path, MIMIR_MODEL_SPEC="codex-plus:model")
+    resolved = resolve_opencode_invocation(env=env)
+    document = json.loads((tmp_path / ".codex" / "auth.json").read_text())
+    assert document["tokens"] == {**original["tokens"], "access_token": _jwt(500), "refresh_token": "new"}
+    assert document["operator_field"] == "preserved" and document["last_refresh"]
+    assert (tmp_path / ".codex" / "auth.json").stat().st_mode & 0o777 == 0o600
+    before = ((tmp_path / ".codex" / "auth.json").stat().st_mtime_ns, resolved.auth_path.stat().st_mtime_ns)
+    reconcile_codex_auth(env)
+    assert before == ((tmp_path / ".codex" / "auth.json").stat().st_mtime_ns, resolved.auth_path.stat().st_mtime_ns)
+
+
+def test_worker_plugin_refresh_is_reconciled_back_to_both_stores(tmp_path: Path) -> None:
+    _codex(tmp_path, 200)
+    env = _env(tmp_path, MIMIR_MODEL_SPEC="codex-plus:model")
+    resolved = resolve_opencode_invocation(env=env)
+    refreshed = tmp_path / "runtime" / "auth.json"
+    refreshed.parent.mkdir()
+    refreshed.write_text(json.dumps({"openai": {"type": "oauth", "access": _jwt(500), "refresh": "worker-new"}}))
+    reconcile_codex_auth(env, refreshed_path=refreshed)
+    assert json.loads((tmp_path / ".codex/auth.json").read_text())["tokens"]["refresh_token"] == "worker-new"
+    assert json.loads(resolved.auth_path.read_text())["openai"]["refresh"] == "worker-new"
+
+
+def test_stale_worker_refresh_does_not_overwrite_newer_codex(tmp_path: Path) -> None:
+    _codex(tmp_path, 500)
+    env = _env(tmp_path, MIMIR_MODEL_SPEC="codex-plus:model")
+    reconcile_codex_auth(env)
+    refreshed = tmp_path / "runtime/auth.json"
+    refreshed.parent.mkdir()
+    refreshed.write_text(json.dumps({"openai": {"type": "oauth", "access": _jwt(200), "refresh": "spent"}}))
+    path = tmp_path / ".local/share/opencode/auth.json"
+    before = path.stat().st_mtime_ns
+    reconcile_codex_auth(env, refreshed_path=refreshed)
+    assert json.loads((tmp_path / ".codex/auth.json").read_text())["tokens"]["refresh_token"] == "refresh-500"
+    assert json.loads(path.read_text())["openai"]["refresh"] == "refresh-500"
+    assert path.stat().st_mtime_ns == before
+
+
+def test_worklink_refreshes_projected_auth_immediately_before_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir_cultivate.worklink.backends import opencode as backend_module
+    from mimir_cultivate.worklink.backends.base import WorkOrder
+
+    monkeypatch.setattr(backend_module, "_coding_enabled", lambda: True)
+    _codex(tmp_path, 200)
+    env = _env(tmp_path, MIMIR_MODEL_SPEC="codex-plus:model")
+    backend = backend_module.OpenCodeBackend()
+    env["XDG_CONFIG_HOME"] = str(tmp_path / ".config")
+    env["XDG_DATA_HOME"] = str(tmp_path / ".local/share")
+    spec = backend.work_spec(
+        WorkOrder(2020, tmp_path, "prompt", None, 30, env),
+        attempt=1, repo_url="u", base_ref="main", branch="issue/2020-a1", test_command="true",
+    )
+    codex_path = tmp_path / ".codex/auth.json"
+    document = json.loads(codex_path.read_text())
+    document["tokens"].update(access_token=_jwt(500), refresh_token="new-family-token")
+    codex_path.write_text(json.dumps(document))
+    refreshed = backend.refresh_codex_projections(spec, env)
+    assert json.loads(spec.backend_config["worker_projections"][1].document)["openai"]["refresh"] == "refresh-200"
+    assert json.loads(refreshed.backend_config["worker_projections"][1].document)["openai"]["refresh"] == "new-family-token"
+
+
+@pytest.mark.parametrize("plugins", [None, [], ["file:///opt/opencode-feature-factory/plugin/index.js"],
+                                     ["opencode-openai-codex-auth@4.4.0"]])
+def test_codex_native_oauth_needs_no_plugin_and_projects_none(tmp_path: Path, plugins: list[str] | None) -> None:
+    _codex(tmp_path)
+    if plugins is not None:
+        config = tmp_path / ".config/opencode/opencode.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"plugin": plugins}))
+    env = _env(tmp_path, MIMIR_MODEL_SPEC="codex-plus:model", OPENAI_API_KEY="metered-key")
+    invocation = resolve_opencode_invocation(env=env)
+    documents = opencode_worker_documents(invocation, env)
+    assert invocation.auth_type == "oauth"
+    assert invocation.remove_env == ("OPENAI_API_KEY",)
+    assert "OPENAI_API_KEY" not in invocation.pass_env
+    assert "plugin" not in json.loads(documents.config_document)
+    assert json.loads(documents.auth_document)["openai"]["type"] == "oauth"
+    assert "metered-key" not in repr(invocation)
+
+
+@pytest.mark.parametrize("coding_enabled", [False, True])
+def test_codex_worklink_never_passes_ambient_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coding_enabled: bool) -> None:
+    from mimir_cultivate.worklink.backends import opencode as backend_module
+    from mimir_cultivate.worklink.backends.base import WorkOrder
+
+    monkeypatch.setattr(backend_module, "_coding_enabled", lambda: coding_enabled)
+    monkeypatch.setenv("OPENAI_API_KEY", "metered-key")
+    _codex(tmp_path)
+    env = _env(tmp_path, MIMIR_MODEL_SPEC="codex-plus:model", OPENAI_API_KEY="metered-key",
+               XDG_CONFIG_HOME=str(tmp_path / ".config"), XDG_DATA_HOME=str(tmp_path / ".local/share"))
+    spec = backend_module.OpenCodeBackend().work_spec(
+        WorkOrder(2020, tmp_path, "prompt", None, 30, env),
+        attempt=1, repo_url="u", base_ref="main", branch="issue/2020-a1", test_command="true",
+    )
+    # Uncontained runs must explicitly override the inherited parent key;
+    # contained runs carry only the credential-free allowlist and OAuth projection.
+    if coding_enabled:
+        assert "OPENAI_API_KEY" not in spec.env
+        assert "OPENAI_API_KEY" not in spec.backend_config["pass_env"]
+        projections = spec.backend_config["worker_projections"]
+        assert "plugin" not in json.loads(projections[0].document)
+        assert json.loads(projections[1].document)["openai"]["type"] == "oauth"
+    else:
+        assert spec.env["OPENAI_API_KEY"] == ""
+    assert "metered-key" not in str(spec.local_argv)
+
+
+def test_codex_invalid_bundle_fails_without_secrets(tmp_path: Path) -> None:
+    _codex(tmp_path)
+    env = _env(tmp_path, MIMIR_MODEL_SPEC="codex-plus:model", OPENAI_API_KEY="metered-key")
+    (tmp_path / ".codex" / "auth.json").write_text(json.dumps({"auth_mode": "apikey"}))
+    with pytest.raises(OpenCodeAuthError) as raised:
+        resolve_opencode_invocation(env=env)
+    assert raised.value.reason_code == "auth_missing"
+    assert "metered-key" not in repr(raised.value)
+    document = _codex(tmp_path)
+    document["tokens"]["access_token"] = "not-a-jwt"
+    (tmp_path / ".codex/auth.json").write_text(json.dumps(document))
+    with pytest.raises(OpenCodeAuthError) as raised:
+        resolve_opencode_invocation(env=env)
+    assert raised.value.reason_code == "auth_invalid"
+
+
+@pytest.mark.asyncio
+async def test_worklink_reconciles_before_and_after_invocation(tmp_path: Path) -> None:
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+    from mimir_cultivate.worklink.compute import ComputeResult
+
+    _codex(tmp_path, 200)
+    env = _env(tmp_path, MIMIR_MODEL_SPEC="codex-plus:model")
+    path = tmp_path / ".local/share/opencode/auth.json"
+    worker = tmp_path / "runtime/auth.json"
+    worker.parent.mkdir()
+
+    async def invoke() -> ComputeResult:
+        assert json.loads(path.read_text())["openai"]["refresh"] == "refresh-200"
+        worker.write_text(json.dumps({"openai": {"type": "oauth", "access": _jwt(500), "refresh": "refreshed"}}))
+        return ComputeResult(exit_code=0, stdout="", stderr="")
+
+    result = await OpenCodeBackend().invoke_with_startup_retry(
+        invoke, issue_id=1, checkout_snapshot=lambda: (), codex=True, env=env,
+        refreshed_path=worker,
+    )
+    assert result.exit_code == 0
+    assert json.loads((tmp_path / ".codex/auth.json").read_text())["tokens"]["refresh_token"] == "refreshed"
 
 
 def test_oversize_config_is_refused_before_parsing(tmp_path: Path) -> None:

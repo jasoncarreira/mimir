@@ -661,22 +661,34 @@ class LocalSubprocessComputeBackend:
                         )
                 else:
                     environment = _enabled_child_env(spec, identifier)
-                return await execute_contained(
-                    command,
-                    capability,
-                    {
-                        key: value
-                        for key, value in environment.items()
-                        if key != "HOME"
-                    },
-                    projections,
-                    identifier=identifier,
-                    timeout_s=spec.timeout_s,
-                    stdout_limit=stdout_limit,
-                    stderr_limit=stderr_limit,
-                    stdout_sink=stdout_sink,
-                    stderr_sink=stderr_sink,
-                )
+                try:
+                    return await execute_contained(
+                        command,
+                        capability,
+                        {
+                            key: value
+                            for key, value in environment.items()
+                            if key != "HOME"
+                        },
+                        projections,
+                        identifier=identifier,
+                        timeout_s=spec.timeout_s,
+                        stdout_limit=stdout_limit,
+                        stderr_limit=stderr_limit,
+                        stdout_sink=stdout_sink,
+                        stderr_sink=stderr_sink,
+                    )
+                finally:
+                    if factory and Path(command[0]).name == "opencode" and (
+                        resolution.invocation.provider == "openai"
+                        and resolution.env.get("MIMIR_MODEL_SPEC", "").startswith("codex-plus:")
+                    ):
+                        from mimir_cultivate.opencode import reconcile_codex_auth
+
+                        reconcile_codex_auth(
+                            resolution.env,
+                            refreshed_path=spec.local_checkout.parent / ".factory-runtime/data/opencode/auth.json",
+                        )
             except asyncio.CancelledError:
                 if not started.done():
                     started.cancel()

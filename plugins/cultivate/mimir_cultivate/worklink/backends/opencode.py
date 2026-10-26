@@ -16,9 +16,11 @@ from typing import Awaitable, Callable, Mapping, Sequence
 from mimir._reasoning_effort import validate_effort
 from mimir.config import model_spec_at_call_time
 from mimir_cultivate.opencode import (
+    OpenCodeConfigError,
     OpenCodeInvocation,
     opencode_model_from_agent_spec,
     opencode_worker_documents,
+    reconcile_codex_auth,
     resolve_opencode_invocation,
 )
 from mimir.redaction import redact_text
@@ -146,6 +148,19 @@ class OpenCodeBackend:
         validate_extra_args(self.extra_args)
         validate_test_env(self.test_env)
 
+    def refresh_codex_projections(self, spec: WorkSpec, env: Mapping[str, str]) -> WorkSpec:
+        """Use the just-reconciled token, not a pre-launch work-spec snapshot."""
+        if not spec.backend_config.get("codex") or "worker_projections" not in spec.backend_config:
+            return spec
+        invocation = resolve_worklink_opencode_invocation(env).invocation
+        if invocation.model != spec.backend_config["model"]:
+            raise OpenCodeConfigError("config_provider_selection")
+        documents = opencode_worker_documents(invocation, {**os.environ, **env})
+        projections = [WorkerProjection(".config/opencode/opencode.json", documents.config_document)]
+        if documents.auth_document is not None:
+            projections.append(WorkerProjection(".local/share/opencode/auth.json", documents.auth_document))
+        return replace(spec, backend_config={**spec.backend_config, "worker_projections": projections})
+
     def capabilities(self) -> Caps:
         return Caps(
             tool_category="coding-cli",
@@ -211,6 +226,7 @@ class OpenCodeBackend:
             "configured_model": resolution.configured_model,
             "model_diverged": resolution.model_diverged,
             "model_source": invocation.model_source,
+            "codex": invocation.provider == "openai" and resolution_env.get("MIMIR_MODEL_SPEC", "").startswith("codex-plus:"),
             "variant": variant,
             "variant_source": variant_source,
             "test_env": dict(self.test_env),
@@ -268,6 +284,9 @@ class OpenCodeBackend:
         startup_window_s: float = STARTUP_CONTENTION_WINDOW_S,
         sleeper: Sleeper = asyncio.sleep,
         clock: Clock = time.monotonic,
+        codex: bool = False,
+        env: Mapping[str, str] | None = None,
+        refreshed_path: Path | None = None,
     ) -> ComputeResult:
         """Retry transient SQLite contention only before the run can mutate work."""
         max_attempts = max(1, max_attempts)
@@ -277,7 +296,15 @@ class OpenCodeBackend:
         result: ComputeResult | None = None
         for attempt in range(1, max_attempts + 1):
             invoked_at = clock()
-            result = await invoke()
+            # A refreshed token must reach the other store even when the run
+            # fails, times out or is cancelled. Each retry is a new invocation.
+            if codex:
+                reconcile_codex_auth(env)
+            try:
+                result = await invoke()
+            finally:
+                if codex:
+                    reconcile_codex_auth(env, refreshed_path=refreshed_path)
             elapsed_s = max(0.0, clock() - invoked_at)
             retryable = (
                 _is_sqlite_contention(result)

@@ -39,6 +39,7 @@ def _git(path: Path, *args: str) -> str:
 
 @pytest.fixture
 def spawn_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    from tests.opencode_fixtures import seed_codex_subscription
     _spawn_reset_for_tests()
     home = tmp_path / "home"
     seed = tmp_path / "repos" / "seed"
@@ -46,11 +47,13 @@ def spawn_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, P
     seed.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.delenv(_SPAWN_DEPTH_ENV, raising=False)
     auth = home / ".local/share/opencode/auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "refresh-secret"}}))
+    seed_codex_subscription(home, "refresh-secret")
     _git(seed, "init")
     _git(seed, "config", "user.name", "Test")
     _git(seed, "config", "user.email", "test@example.invalid")
@@ -685,7 +688,7 @@ async def test_terminal_state_contract(
         )
     elif case == "prompt_auth":
         config_source = tmp_path / "repos" / "opencode.json"
-        config_source.write_text(json.dumps({"model": "openai/test-model"}))
+        config_source.write_text(json.dumps({"model": "openai/test-model", "plugin": ["opencode-openai-codex-auth"]}))
         set_spawn_config({
             "default_cwd": tmp_path / "repos",
             "artifact_root": tmp_path / "home/artifacts",

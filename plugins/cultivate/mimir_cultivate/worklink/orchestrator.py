@@ -1275,8 +1275,11 @@ class WorklinkRunner:
                     configured_model=spec.backend_config.get("configured_model"),
                 )
             async def invoke_backend() -> ComputeResult:
+                nonlocal spec
                 handle = None
                 try:
+                    if isinstance(backend, OpenCodeBackend) and spec.backend_config.get("codex"):
+                        spec = backend.refresh_codex_projections(spec, order.env)
                     handle = await compute.launch(spec)
                     # Atomically replace the provisional controller record with
                     # the real cancellable worker handle immediately after spawn.
@@ -1325,6 +1328,10 @@ class WorklinkRunner:
                     issue_id=issue.issue_id,
                     checkout_snapshot=lambda: _checkout_snapshot(lease.path, runner=runner, publication=publication),
                     event_logger=_log_event,
+                    codex=bool(spec.backend_config.get("codex")),
+                    env={**os.environ, **order.env},
+                    refreshed_path=(lease.path.parent / ".factory-runtime/data/opencode/auth.json"
+                                    if worker_uid_drop else None),
                 )
             else:
                 compute_result = await invoke_backend()
