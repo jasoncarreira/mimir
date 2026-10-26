@@ -191,6 +191,36 @@ async def main():
 asyncio.run(main())
 """
 
+TOOLCHAIN_PROOF = r"""
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+from mimir_cultivate.setup import toolchain_test_env, toolchain_probe_environment, _TOOLCHAIN_WORKER_PROBE
+from mimir_cultivate.worklink.backends.registry import WorklinkConfig
+import yaml
+
+with tempfile.TemporaryDirectory() as directory:
+    path = Path(directory) / 'worklink.yaml'
+    path.write_text(yaml.safe_dump({'backends': {'opencode': {'test_env': toolchain_test_env('rust')}}}))
+    config = WorklinkConfig.load(path)
+    for missing in (None, 'RUSTUP_HOME'):
+        if missing:
+            del config.backend_settings['opencode']['test_env'][missing]
+        selected = toolchain_probe_environment(config)
+        # env -i is essential: Docker image ENV must not rescue a broken gate.
+        result = subprocess.run(
+            ['/command/s6-setuidgid', 'worklink', 'env', '-i',
+             '/usr/local/bin/python', '-c', _TOOLCHAIN_WORKER_PROBE,
+             json.dumps(selected), 'rust', '1.90.0'],
+            cwd='/tmp', capture_output=True, text=True, timeout=120,
+        )
+        expected = 'toolchain_missing: rustc' if missing else 'ok'
+        assert result.returncode == 0 and result.stdout.strip() == expected, (missing, result)
+print('real-image clean gate toolchain proof passed (including missing-RUSTUP_HOME control)')
+"""
+
+
 SPAWN_PROOF = r"""
 from __future__ import annotations
 import asyncio
@@ -353,6 +383,14 @@ def main() -> None:
             "--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build",
             "--tag", IMAGE, ".",
         ], timeout=1200)
+        # Exercise the actual generated Rust layer, not the root build's private
+        # chainlink compiler. The tag now names the toolchain child image.
+        layer = run(['docker', 'run', '--rm', '--entrypoint',
+                     '/opt/mimir-worklink/venv/bin/python', IMAGE, '-c',
+                     'from mimir_cultivate.setup import render_layer; '
+                     f'print(render_layer("rust", "1.90.0", {IMAGE!r}))']).stdout
+        run(['docker', 'build', '--file', '-', '--tag', IMAGE, '.'],
+            input_text=layer, timeout=1200)
         run([
             "docker", "run", "--detach", "--env", "HOME=/home/mimir",
             "--env", "MIMIR_PLUGINS=cultivate",
@@ -441,6 +479,8 @@ for model in ('openai/gpt-6.1-sol', 'openai/gpt-6-luna', 'anthropic/claude-haiku
 assert calls == ['mimir', 'worklink', 'worklink', 'worklink', 'worklink']
 print('real-image setup OpenCode probe passed')
 ''')
+
+        docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', TOOLCHAIN_PROOF)
 
         setup = r"""
             set -eu

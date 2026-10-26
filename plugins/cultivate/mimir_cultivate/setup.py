@@ -306,7 +306,8 @@ def render_layer(kind: str, version: str, root_image: str, *,
                    "case $arch in amd64) platform=linux;; arm64) platform=linux-arm;; *) exit 2;; esac && "
                    f"curl -fsSLo /tmp/nextest.tar.gz https://get.nexte.st/{nextest_version}/$platform && "
                    "tar -xzf /tmp/nextest.tar.gz -C /usr/local/bin cargo-nextest && rm /tmp/nextest.tar.gz\n"
-                   "ENV CARGO_HOME=/workspace/.cargo\n")
+                   "RUN set -eu; install -d -o worklink -g worklink -m 0700 /var/cache/mimir-cargo\n"
+                   "ENV CARGO_HOME=/var/cache/mimir-cargo\n")
     elif kind == "node":
         install = (f"RUN set -eu; arch=$(dpkg --print-architecture); case $arch in amd64) arch=x64;; arm64) ;; *) exit 2;; esac && "
                    f"curl -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v{version}/node-v{version}-linux-$arch.tar.xz "
@@ -378,8 +379,19 @@ def _write(path: Path, text: str, *, mode: int = 0o644, replace: bool = False) -
     return True
 
 
+def toolchain_test_env(kind: str) -> dict[str, str]:
+    """Settings persisted for both the leaf build and its evidence gate."""
+    from .worklink.backends.opencode import validate_test_env
+
+    env = {'rust': {'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'},
+           'python': {'UV_PYTHON_INSTALL_DIR': '/opt/uv-python'}, 'node': {}}[kind]
+    validate_test_env(env)
+    return env
+
+
 def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
-                        git_auth: list[str], force: bool = False) -> bool:
+                        git_auth: list[str], force: bool = False,
+                        toolchain: str | None = None) -> bool:
     """Reconcile the dedicated, controller-owned base and Worklink settings."""
     from .worklink.backends.registry import BackendRegistry, WorklinkConfig, _derive_bash_allowlist
 
@@ -443,7 +455,8 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         # Custom verification scripts cannot safely be widened to a runner
         # wildcard; grant only the declared command and Git operations.
         allowlist = ['git *', entry['test_command']]
-    config['backends'] = {'opencode': {'bash_allowlist': allowlist}}
+    config['backends'] = {'opencode': {'bash_allowlist': allowlist,
+                                     'test_env': toolchain_test_env(toolchain) if toolchain else {}}}
     text = yaml.safe_dump(config, sort_keys=False)
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise RuntimeError(f"Worklink config {path} must be a regular file; move it aside")
@@ -675,12 +688,14 @@ except (OSError, subprocess.TimeoutExpired, ValueError):
 """
 
 _TOOLCHAIN_WORKER_PROBE = """\
-import os
+import json
 import subprocess
 import sys
 import tempfile
 
-kind, version = sys.argv[1:]
+configured, kind, version = sys.argv[1:]
+env = json.loads(configured)
+runtime_home = env['HOME']
 commands = {
  'rust': [('rustc', ['rustc', '--version']), ('cargo', ['cargo', '--version']),
           ('cargo-nextest', ['cargo', 'nextest', '--version'])],
@@ -689,17 +704,15 @@ commands = {
  'python': [('uv', ['uv', '--version'])],
 }[kind]
 with tempfile.TemporaryDirectory(prefix='mimir-toolchain-probe-') as home:
- env = {
-  'USER': 'worklink', 'LOGNAME': 'worklink', 'SHELL': '/bin/sh',
-  'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
-  'HOME': home, 'XDG_CONFIG_HOME': home + '/.config',
-  'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
-  'OPENCODE_CONFIG': home + '/.config/opencode/opencode.json',
- }
+ env = {key: value.replace(runtime_home, home) for key, value in env.items()}
  if kind == 'rust':
-  env.update(RUSTUP_HOME='/opt/rustup', CARGO_HOME='/workspace/.cargo')
+  try:
+   with tempfile.NamedTemporaryFile(dir=env['CARGO_HOME'], prefix='setup-write-'):
+    pass
+  except (KeyError, OSError):
+   print('toolchain_missing: cargo')
+   sys.exit(0)
  if kind == 'python':
-  env['UV_PYTHON_INSTALL_DIR'] = '/opt/uv-python'
   commands.append(('python', ['uv', 'python', 'find', '--managed-python', '--no-python-downloads', '--no-project', version]))
  for tool, argv in commands:
   try:
@@ -726,10 +739,35 @@ with tempfile.TemporaryDirectory(prefix='mimir-toolchain-probe-') as home:
 """
 
 
+def toolchain_probe_environment(config) -> dict[str, str]:
+    """Use the gate builder and persisted settings, never probe-only tool vars."""
+    from .worklink.backends.opencode import _permission_override, validate_test_env
+    from .worklink.compute import WorkSpec, _enabled_child_env
+
+    settings = config.backend_settings.get('opencode', {})
+    test_env = settings.get('test_env', {})
+    validate_test_env(test_env)
+    spec = WorkSpec(issue_id=0, attempt=1, repo_url='', base_ref='', branch='',
+                    prompt='', rules=None, test_command='', backend='opencode', timeout_s=30,
+                    env={'OPENCODE_PERMISSION': _permission_override(settings.get('bash_allowlist', [])),
+                         **test_env}, backend_config={'pass_env': tuple(test_env)})
+    return _enabled_child_env(spec, 'setup-toolchain-probe')
+
+
+_TOOLCHAIN_ENV_PROBE = """\
+import json
+from pathlib import Path
+from mimir_cultivate.setup import toolchain_probe_environment
+from mimir_cultivate.worklink.backends.registry import WorklinkConfig
+print(json.dumps(toolchain_probe_environment(WorklinkConfig.load(Path('/home/mimir/agent/worklink.yaml')))))
+"""
+
+
 def _verify_toolchain(deploy: Path, kind: str, version: str) -> None:
+    configured = _agent_exec(deploy, '/home/mimir/venv/bin/python', '-c', _TOOLCHAIN_ENV_PROBE)
     check = _run(["docker", "compose", "exec", "-T", "-u", "worklink", "-w", "/tmp",
                   "agent", "/usr/local/bin/python", "-c", _TOOLCHAIN_WORKER_PROBE,
-                  kind, version], cwd=deploy)
+                  configured, kind, version], cwd=deploy)
     if check != "ok":
         tools = {"rust": {"rustc", "cargo", "cargo-nextest"},
                  "node": {"node", "npm", "npx"}, "python": {"uv", "python"}}
@@ -1006,7 +1044,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     })
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
-    manifest = {"slug": repo.lower(), "branch": branch, "owner": owner, "display": display,
+    manifest = {"slug": repo.lower(), "branch": branch, "toolchain": kind, "owner": owner, "display": display,
                   "email": owner_email, "test": test, "rotate": bool(args.rotate_web_key),
                   "force": bool(getattr(args, "force", False)),
                  "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed)}
@@ -1143,7 +1181,8 @@ if not inventory.exists() or inventory.read_text() != text:
     inventory.write_text(text)
     changed = True
 changed = _provision_worklink(home, entry, base=base,
-                            checkout=repo, git_auth=git_auth, force=m.get('force', False)) or changed
+                            checkout=repo, git_auth=git_auth, force=m.get('force', False),
+                            toolchain=m.get('toolchain')) or changed
 for name in ('github-poller', 'github-ci-watch', 'github', 'review'):
     skill = resolve_skill('cultivate:' + name, set())
     if skill is None:

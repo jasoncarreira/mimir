@@ -459,10 +459,14 @@ def validate_test_env(value: object) -> None:
     if not isinstance(value, Mapping):
         raise ValueError(f"{label} must be a mapping")
     for key, text in value.items():
-        if key not in {"PYTEST_ADDOPTS"}:
+        if key not in {"PYTEST_ADDOPTS", "RUSTUP_HOME", "CARGO_HOME", "UV_PYTHON_INSTALL_DIR"}:
             raise ValueError(f"{label} key {key!r} is not allowed")
         if not isinstance(text, str) or any(not char.isprintable() for char in text):
             raise ValueError(f"{label}.{key} must be plain text without newlines or control characters")
+        if key != "PYTEST_ADDOPTS" and (
+            not text.startswith("/") or ".." in Path(text).parts
+        ):
+            raise ValueError(f"{label}.{key} must be an absolute path without traversal")
 
 
 def validate_extra_args(args: Sequence[str]) -> None:

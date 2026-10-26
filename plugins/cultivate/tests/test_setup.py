@@ -531,6 +531,8 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     def run(argv, *, cwd):
         exec_calls.append(argv)
         assert cwd == tmp_path
+        if installer._TOOLCHAIN_ENV_PROBE in argv:
+            return json.dumps(installer.toolchain_probe_environment(SimpleNamespace(backend_settings={})))
         if installer._TOOLCHAIN_WORKER_PROBE in argv:
             assert argv[:10] == ["docker", "compose", "exec", "-T", "-u", "worklink",
                                  "-w", "/tmp", "agent", "/usr/local/bin/python"]
@@ -572,10 +574,11 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         installer._verify(tmp_path, 8123, "org/repo", "owner-key", 'rust', '1.99.1')
 
     verify()
-    assert len(exec_calls) == 10
+    assert len(exec_calls) == 11
     assert [argv[7:9] for argv in exec_calls] == [
         ["mimir", "plugins"], ["python", "-c"], ["python", "-c"],
-        ["python", "-c"], ["/tmp", "agent"], ["/home/mimir/venv/bin/python", "-c"],
+        ["python", "-c"], ["/home/mimir/venv/bin/python", "-c"],
+        ["/tmp", "agent"], ["/home/mimir/venv/bin/python", "-c"],
         ["/tmp", "agent"], ["python", "-c"], ["python", "-c"], ["/tmp", "agent"]]
     assert any(url.endswith("/api/v1/chat") and key == "owner-key" for url, key, _ in reads)
     subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'wrong@example.com'], check=True)
@@ -892,31 +895,70 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
                f'print({("rustc " if tool == "rustc" else "v" if tool == "node" else "Python " if tool == "python" else tool + " ") + version!r})\n')
         )
         binary.chmod(0o755)
+    from mimir_cultivate.worklink.backends.registry import WorklinkConfig
+    from mimir_cultivate.worklink.compute import _enabled_child_env
+
+    cache = tmp_path / 'cargo-cache'
+    cache.mkdir()
+    test_env = installer.toolchain_test_env(kind)
+    if kind == 'rust':
+        assert test_env == {'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'}
+        test_env['CARGO_HOME'] = str(cache)
+    config_path = tmp_path / 'worklink.yaml'
+    config_path.write_text(yaml.safe_dump({'defaults': {'test_command': './tools/verify'},
+        'backends': {'opencode': {'test_env': test_env, 'bash_allowlist': ['./tools/verify']}}}))
+    config = WorklinkConfig.load(config_path)
     real_run = subprocess.run
     missing = {'rust': 'rustc', 'node': 'node', 'python': 'uv'}[kind]
+    launch_marker = tmp_path / 'launch-env.json'
 
     def run(argv, *, cwd):
         assert cwd == tmp_path
+        if installer._TOOLCHAIN_ENV_PROBE in argv:
+            return json.dumps(installer.toolchain_probe_environment(config))
         assert argv[:10] == ['docker', 'compose', 'exec', '-T', '-u', 'worklink',
                              '-w', '/tmp', 'agent', '/usr/local/bin/python']
         assert argv[-2:] == [kind, version]
         # Remap only the executable at the child subprocess boundary. Its env,
         # argv and isolated HOME remain the production worker probe's values.
         recorder = (
-            'import pathlib, subprocess\n'
+            'import json, pathlib, subprocess\n'
             'real_run = subprocess.run\n'
             'def launch(argv, **kwargs):\n'
+            f' pathlib.Path({str(launch_marker)!r}).write_text(json.dumps(kwargs["env"]))\n'
             f' name = pathlib.Path(argv[0]).name\n'
             f' binary = pathlib.Path({str(bin_dir)!r}) / name\n'
             ' return real_run([str(binary), *argv[1:]], **kwargs)\n'
             'subprocess.run = launch\n'
         )
-        output = real_run([sys.executable, '-I', '-S', '-c', recorder + argv[11], kind, version],
+        output = real_run([sys.executable, '-I', '-S', '-c', recorder + argv[11], *argv[12:]],
                           capture_output=True, text=True, check=True)
         return output.stdout.strip()
 
     monkeypatch.setattr(installer, '_run', run)
     installer._verify_toolchain(tmp_path, kind, version)
+    observed = json.loads(launch_marker.read_text())
+    from mimir_cultivate.worklink.backends import opencode as backend_module
+    from mimir_cultivate.worklink.backends.base import WorkOrder
+    from mimir_cultivate.worklink.backends.registry import BackendRegistry
+    invocation = SimpleNamespace(model='proof/model', provider='proof', model_source='test',
+                                 config_path=tmp_path / 'absent', pass_env=(), remove_env=())
+    monkeypatch.setattr(backend_module, '_coding_enabled', lambda: True)
+    monkeypatch.setattr(backend_module, 'resolve_opencode_binary', lambda _: '/usr/local/bin/opencode')
+    monkeypatch.setattr(backend_module, 'resolve_worklink_opencode_invocation', lambda _: SimpleNamespace(
+        invocation=invocation, env={}, configured_model='proof/model', model_diverged=False))
+    monkeypatch.setattr(backend_module, 'opencode_worker_documents', lambda *_: SimpleNamespace(
+        config_document=b'{}', auth_document=None))
+    spec = BackendRegistry(config).get('opencode').work_spec(
+        WorkOrder(1, tmp_path, '', None, 30, {}), attempt=1,
+        repo_url='', base_ref='', branch='', test_command='./tools/verify')
+    expected = _enabled_child_env(spec, 'parity-control')
+    runtime_home = expected['HOME']
+    expected = {key: value.replace(runtime_home, observed['HOME']) for key, value in expected.items()}
+    assert observed == expected
+    if kind == 'rust':
+        assert observed['RUSTUP_HOME'] == '/opt/rustup'
+        assert not list(cache.iterdir()), 'probe must remove its cache write test'
     launches = [json.loads(row) for row in marker.read_text().splitlines()]
     assert [row[0] for row in launches] == (['rustc', 'cargo', 'cargo'] if kind == 'rust' else
                                              ['node', 'npm', 'npx'] if kind == 'node' else
@@ -928,6 +970,24 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
     assert len(homes) == 1 and not Path(homes.pop()).exists()
     if kind == 'rust':
         assert launches[-1][1] == ['nextest', '--version']
+        # A cache that cannot accept a file must fail before version probes.
+        cache.rmdir()
+        cache.write_text('not a directory')
+        with pytest.raises(installer.SetupError, match='toolchain_missing: cargo'):
+            installer._verify_toolchain(tmp_path, kind, version)
+        cache.unlink()
+        cache.mkdir()
+        # Rustup proxies must fail with the *configured* gate env, not be
+        # rescued by tool-specific settings injected inside the probe.
+        rustc = bin_dir / 'rustc'
+        rustc.write_text(f'#!{sys.executable}\nimport os, sys\n'
+                         'sys.exit(7) if os.environ.get("RUSTUP_HOME") != "/opt/rustup" else None\n'
+                         f'print("rustc {version}")\n')
+        installer._verify_toolchain(tmp_path, kind, version)
+        del config.backend_settings['opencode']['test_env']['RUSTUP_HOME']
+        with pytest.raises(installer.SetupError, match='toolchain_missing: rustc'):
+            installer._verify_toolchain(tmp_path, kind, version)
+        config.backend_settings['opencode']['test_env']['RUSTUP_HOME'] = '/opt/rustup'
     (bin_dir / missing).unlink()
     with pytest.raises(installer.SetupError, match='toolchain_missing: ' + missing):
         installer._verify_toolchain(tmp_path, kind, version)
@@ -943,6 +1003,53 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
         uv.chmod(0o755)
         with pytest.raises(installer.SetupError, match='toolchain_missing: python'):
             installer._verify_toolchain(tmp_path, kind, version)
+
+
+def test_real_image_toolchain_proof_uses_clean_env_and_negative_control(tmp_path, monkeypatch):
+    import runpy
+
+    script = Path(__file__).resolve().parents[3] / 'scripts/worklink_image_identity.py'
+    proof = runpy.run_path(str(script))['TOOLCHAIN_PROOF']
+    calls = []
+
+    def launch(argv, **kwargs):
+        assert argv[:4] == ['/command/s6-setuidgid', 'worklink', 'env', '-i']
+        assert argv[4:7] == ['/usr/local/bin/python', '-c', installer._TOOLCHAIN_WORKER_PROBE]
+        env = json.loads(argv[7])
+        assert env['CARGO_HOME'] == '/var/cache/mimir-cargo'
+        assert kwargs == dict(cwd='/tmp', capture_output=True, text=True, timeout=120)
+        calls.append(env)
+        return SimpleNamespace(returncode=0, stdout='ok' if 'RUSTUP_HOME' in env else 'toolchain_missing: rustc')
+
+    monkeypatch.setattr(subprocess, 'run', launch)
+    exec(compile(proof, '<image-toolchain-proof>', 'exec'), {})
+    assert len(calls) == 2 and calls[0]['RUSTUP_HOME'] == '/opt/rustup'
+    assert calls[1] == {k: v for k, v in calls[0].items() if k != 'RUSTUP_HOME'}
+    # Mutation: a config producer that forgets Rust's required home must make
+    # the live proof's positive control fail, not just its negative pass.
+    original = installer.toolchain_test_env
+    monkeypatch.setattr(installer, 'toolchain_test_env', lambda kind:
+                        {k: v for k, v in original(kind).items() if k != 'RUSTUP_HOME'})
+    with pytest.raises(AssertionError):
+        exec(compile(proof, '<mutated-image-toolchain-proof>', 'exec'), {})
+    assert "'-c', TOOLCHAIN_PROOF" in script.read_text()
+    assert 'print(render_layer("rust", "1.90.0"' in script.read_text()
+
+
+@pytest.mark.parametrize('env', [
+    {'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'},
+    {'UV_PYTHON_INSTALL_DIR': '/opt/uv-python'},
+])
+def test_toolchain_test_env_validates_paths_and_keeps_reserved_names_closed(env):
+    from mimir_cultivate.worklink.backends.opencode import validate_test_env
+    validate_test_env(env)
+    for key in env:
+        for value in ('relative', '/opt/../home/mimir', '/opt/tool\nsecret', ''):
+            with pytest.raises(ValueError):
+                validate_test_env({key: value})
+    for key in ('PATH', 'HOME', 'LD_PRELOAD', 'GITHUB_TOKEN'):
+        with pytest.raises(ValueError, match='not allowed'):
+            validate_test_env({key: '/tmp/value'})
 
 
 def test_existing_env_never_overwrites_operator_secrets(tmp_path):
@@ -963,7 +1070,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     existing = {"people": [{"canonical": "another", "aliases": ["email:another@example.com"]}]}
     (state / "identities.yaml").write_text(yaml.safe_dump(existing))
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"slug": "org/repo", "branch": "main", "owner": "owner",
+    manifest.write_text(json.dumps({"slug": "org/repo", "branch": "main", "toolchain": "rust", "owner": "owner",
                                      "display": "Owner", "email": "owner@example.com",
                                      "test": "npm run verify", "rotate": False,
                                      "saga_model_spec": "openai:gpt-5.4-nano", "embedding": "local", "reembed": False}))
@@ -1040,6 +1147,8 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert worklink.defaults.base_branch == inventory['repositories'][0]['base_branch']
     assert worklink.defaults.test_command == inventory['repositories'][0]['test_command']
     assert worklink.defaults.allow_autonomous_local_subprocess
+    assert worklink.backend_settings['opencode']['test_env'] == {
+        'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'}
     assert (home / '.chainlink/agent.json').read_text() == '{"id":"cultivate-worklink"}'
     assert any(argv[-1] == str(tmp_path / 'worklink/base/repo') for argv in calls if 'clone' in argv)
     assert not any("setup-git" in argv for argv in calls)
@@ -1105,7 +1214,10 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
         exec(compile(script, "provision.py", "exec"), {"__name__": "__main__"})
 
 
-def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch):
+@pytest.mark.parametrize('toolchain', ['rust', 'python', 'node'])
+def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch, toolchain):
+    from functools import partial
+    monkeypatch.setattr(installer, '_provision_worklink', partial(installer._provision_worklink, toolchain=toolchain))
     original_run = subprocess.run
     origin = tmp_path / 'remote.git'
     seed = tmp_path / 'seed'
@@ -1150,6 +1262,9 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch)
     assert config.defaults.base_branch == entry['base_branch']
     assert config.defaults.test_command == entry['test_command']
     assert config.defaults.backend == 'opencode'
+    expected_env = {'rust': {'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'},
+                    'python': {'UV_PYTHON_INSTALL_DIR': '/opt/uv-python'}, 'node': {}}[toolchain]
+    assert config.backend_settings['opencode']['test_env'] == expected_env
     assert config.defaults.timeout_s == 5400
     assert config.defaults.allow_autonomous_local_subprocess
     assert original_run(['git', '-C', str(base), 'status', '--porcelain'], capture_output=True,
