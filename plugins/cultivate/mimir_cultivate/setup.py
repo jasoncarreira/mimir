@@ -291,7 +291,7 @@ def render_layer(kind: str, version: str, root_image: str, *,
         install = ("ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/workspace/.cargo\n"
                    "ENV CARGO_INSTALL_ROOT=/opt/cargo\n"
                    "ENV CARGO_HOME=/opt/cargo\n"
-                   "RUN arch=$(dpkg --print-architecture); case $arch in amd64) triple=x86_64-unknown-linux-gnu;; "
+                   "RUN set -eu; arch=$(dpkg --print-architecture); case $arch in amd64) triple=x86_64-unknown-linux-gnu;; "
                    "arm64) triple=aarch64-unknown-linux-gnu;; *) exit 2;; esac && "
                    "mkdir -p /opt/rustup /opt/cargo && "
                    "curl -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/$triple/rustup-init && "
@@ -303,22 +303,24 @@ def render_layer(kind: str, version: str, root_image: str, *,
                    "ln -s /opt/cargo/bin/rustc /usr/local/bin/rustc && "
                    "ln -s /opt/cargo/bin/rustfmt /usr/local/bin/rustfmt && "
                    "ln -s /opt/cargo/bin/cargo-clippy /usr/local/bin/cargo-clippy && "
-                   "arch=$(dpkg --print-architecture); case $arch in amd64) platform=linux;; arm64) platform=linux-arm;; *) exit 2;; esac && "
+                   "case $arch in amd64) platform=linux;; arm64) platform=linux-arm;; *) exit 2;; esac && "
                    f"curl -fsSLo /tmp/nextest.tar.gz https://get.nexte.st/{nextest_version}/$platform && "
                    "tar -xzf /tmp/nextest.tar.gz -C /usr/local/bin cargo-nextest && rm /tmp/nextest.tar.gz\n"
-                   "ENV CARGO_HOME=/workspace/.cargo\n")
+                   "RUN set -eu; install -d -o worklink -g worklink -m 0700 /var/cache/mimir-cargo\n"
+                   "ENV CARGO_HOME=/var/cache/mimir-cargo\n")
     elif kind == "node":
-        install = (f"RUN arch=$(dpkg --print-architecture); case $arch in amd64) arch=x64;; arm64) ;; *) exit 2;; esac && "
+        install = (f"RUN set -eu; arch=$(dpkg --print-architecture); case $arch in amd64) arch=x64;; arm64) ;; *) exit 2;; esac && "
                    f"curl -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v{version}/node-v{version}-linux-$arch.tar.xz "
                    "&& mkdir -p /opt/node && tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1 "
                    "&& ln -sf /opt/node/bin/node /usr/local/bin/node && ln -sf /opt/node/bin/npm /usr/local/bin/npm "
                    "&& ln -sf /opt/node/bin/npx /usr/local/bin/npx && rm /tmp/node.tar.xz\n")
     else:
         install = ("ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python\n"
-                   f"RUN curl -LsSf https://astral.sh/uv/{uv_version}/install.sh | sh && "
+                   f"RUN set -eu; curl -fsSLo /tmp/uv-install.sh https://astral.sh/uv/{uv_version}/install.sh && "
+                   "sh /tmp/uv-install.sh && rm /tmp/uv-install.sh && "
                    "cp /root/.local/bin/uv /usr/local/bin/uv && cp /root/.local/bin/uvx /usr/local/bin/uvx\n"
-                   f"RUN uv python install {version} && chmod -R a+rX /opt/uv-python\n")
-    return f"FROM {root_image}\nUSER root\n{install}RUN mkdir -p /workspace /workspace/pr-leases /workspace/worklink && chown -R 1001:1001 /workspace\nUSER root\n"
+                   f"RUN set -eu; uv python install {version} && chmod -R a+rX /opt/uv-python\n")
+    return f"FROM {root_image}\nUSER root\n{install}RUN set -eu; mkdir -p /workspace /workspace/pr-leases /workspace/worklink && chown -R 1001:1001 /workspace\nUSER root\n"
 
 
 def render_compose(template: str, layer_tag: str, kind: str, repo_name: str) -> str:
@@ -377,8 +379,19 @@ def _write(path: Path, text: str, *, mode: int = 0o644, replace: bool = False) -
     return True
 
 
+def toolchain_test_env(kind: str) -> dict[str, str]:
+    """Settings persisted for both the leaf build and its evidence gate."""
+    from .worklink.backends.opencode import validate_test_env
+
+    env = {'rust': {'RUSTUP_HOME': '/opt/rustup', 'CARGO_HOME': '/var/cache/mimir-cargo'},
+           'python': {'UV_PYTHON_INSTALL_DIR': '/opt/uv-python'}, 'node': {}}[kind]
+    validate_test_env(env)
+    return env
+
+
 def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
-                        git_auth: list[str], force: bool = False) -> bool:
+                        git_auth: list[str], force: bool = False,
+                        toolchain: str | None = None) -> bool:
     """Reconcile the dedicated, controller-owned base and Worklink settings."""
     from .worklink.backends.registry import BackendRegistry, WorklinkConfig, _derive_bash_allowlist
 
@@ -442,7 +455,8 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         # Custom verification scripts cannot safely be widened to a runner
         # wildcard; grant only the declared command and Git operations.
         allowlist = ['git *', entry['test_command']]
-    config['backends'] = {'opencode': {'bash_allowlist': allowlist}}
+    config['backends'] = {'opencode': {'bash_allowlist': allowlist,
+                                     'test_env': toolchain_test_env(toolchain) if toolchain else {}}}
     text = yaml.safe_dump(config, sort_keys=False)
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise RuntimeError(f"Worklink config {path} must be a regular file; move it aside")
@@ -673,6 +687,93 @@ except (OSError, subprocess.TimeoutExpired, ValueError):
  print('opencode_model_unknown')
 """
 
+_TOOLCHAIN_WORKER_PROBE = """\
+import json
+import subprocess
+import sys
+import tempfile
+
+configured, kind, version = sys.argv[1:]
+env = json.loads(configured)
+runtime_home = env['HOME']
+commands = {
+ 'rust': [('rustc', ['rustc', '--version']), ('cargo', ['cargo', '--version']),
+          ('cargo-nextest', ['cargo', 'nextest', '--version'])],
+ 'node': [('node', ['node', '--version']), ('npm', ['npm', '--version']),
+          ('npx', ['npx', '--version'])],
+ 'python': [('uv', ['uv', '--version'])],
+}[kind]
+with tempfile.TemporaryDirectory(prefix='mimir-toolchain-probe-') as home:
+ env = {key: value.replace(runtime_home, home) for key, value in env.items()}
+ if kind == 'rust':
+  try:
+   with tempfile.NamedTemporaryFile(dir=env['CARGO_HOME'], prefix='setup-write-'):
+    pass
+  except (KeyError, OSError):
+   print('toolchain_missing: cargo')
+   sys.exit(0)
+ if kind == 'python':
+  commands.append(('python', ['uv', 'python', 'find', '--managed-python', '--no-python-downloads', '--no-project', version]))
+ for tool, argv in commands:
+  try:
+   result = subprocess.run(argv, env=env, cwd='/tmp', stdin=subprocess.DEVNULL,
+    capture_output=True, text=True, timeout=30)
+   if result.returncode or (tool == 'rustc' and result.stdout.split()[:2] != ['rustc', version]) or (tool == 'node' and result.stdout.strip() != 'v' + version):
+    print('toolchain_missing: ' + tool)
+    break
+   if tool == 'python':
+    binary = result.stdout.strip()
+    if not binary.startswith('/opt/uv-python/'):
+     print('toolchain_missing: python')
+     break
+    result = subprocess.run([binary, '--version'], env=env, cwd='/tmp',
+     stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    if result.returncode or result.stdout.strip() != 'Python ' + version:
+     print('toolchain_missing: python')
+     break
+  except (OSError, subprocess.TimeoutExpired, ValueError):
+   print('toolchain_missing: ' + tool)
+   break
+ else:
+  print('ok')
+"""
+
+
+def toolchain_probe_environment(config) -> dict[str, str]:
+    """Use the gate builder and persisted settings, never probe-only tool vars."""
+    from .worklink.backends.opencode import _permission_override, validate_test_env
+    from .worklink.compute import WorkSpec, _enabled_child_env
+
+    settings = config.backend_settings.get('opencode', {})
+    test_env = settings.get('test_env', {})
+    validate_test_env(test_env)
+    spec = WorkSpec(issue_id=0, attempt=1, repo_url='', base_ref='', branch='',
+                    prompt='', rules=None, test_command='', backend='opencode', timeout_s=30,
+                    env={'OPENCODE_PERMISSION': _permission_override(settings.get('bash_allowlist', [])),
+                         **test_env}, backend_config={'pass_env': tuple(test_env)})
+    return _enabled_child_env(spec, 'setup-toolchain-probe')
+
+
+_TOOLCHAIN_ENV_PROBE = """\
+import json
+from pathlib import Path
+from mimir_cultivate.setup import toolchain_probe_environment
+from mimir_cultivate.worklink.backends.registry import WorklinkConfig
+print(json.dumps(toolchain_probe_environment(WorklinkConfig.load(Path('/home/mimir/agent/worklink.yaml')))))
+"""
+
+
+def _verify_toolchain(deploy: Path, kind: str, version: str) -> None:
+    configured = _agent_exec(deploy, '/home/mimir/venv/bin/python', '-c', _TOOLCHAIN_ENV_PROBE)
+    check = _run(["docker", "compose", "exec", "-T", "-u", "worklink", "-w", "/tmp",
+                  "agent", "/usr/local/bin/python", "-c", _TOOLCHAIN_WORKER_PROBE,
+                  configured, kind, version], cwd=deploy)
+    if check != "ok":
+        tools = {"rust": {"rustc", "cargo", "cargo-nextest"},
+                 "node": {"node", "npm", "npx"}, "python": {"uv", "python"}}
+        reason = check if check in {"toolchain_missing: " + tool for tool in tools[kind]} else "toolchain_missing: " + kind
+        raise SetupError(f"Leaf toolchain verification failed ({reason}); rebuild the agent image and check its toolchain installation.")
+
 
 def _verify_opencode_binary(deploy: Path) -> str:
     binary = _agent_exec(deploy, "/home/mimir/venv/bin/python", "-c", _OPENCODE_RESOLVE_PROBE)
@@ -698,7 +799,7 @@ def _verify_opencode_model(deploy: Path, binary: str, model: str) -> None:
         raise SetupError(f"OpenCode model verification failed (opencode_model_unknown): {model}; update the agent image or choose a listed model.")
 
 
-def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
+def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, version: str) -> None:
     url = f"http://127.0.0.1:{port}"
     for attempt in range(60):
         try:
@@ -758,6 +859,7 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
         raise SetupError("Worklink base identity unreadable (base_identity_unreadable); check that the runtime user can read the base clone's local Git config.")
     if identity_check != "ok":
         raise SetupError("Worklink base identity mismatch (base_identity_mismatch); check the base clone's local user.name/user.email and the bot identity in compose.env.")
+    _verify_toolchain(deploy, kind, version)
     binary = _verify_opencode_binary(deploy)
     # Run in the agent container with its actual HOME, config and compose env.
     # Only a stable reason code crosses the Docker boundary, never the bundle.
@@ -942,7 +1044,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     })
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
-    manifest = {"slug": repo.lower(), "branch": branch, "owner": owner, "display": display,
+    manifest = {"slug": repo.lower(), "branch": branch, "toolchain": kind, "owner": owner, "display": display,
                   "email": owner_email, "test": test, "rotate": bool(args.rotate_web_key),
                   "force": bool(getattr(args, "force", False)),
                  "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed)}
@@ -993,7 +1095,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         if proc.returncode:
             raise SetupError("Could not retrieve owner web key; check container home volume.")
     key_path.chmod(0o600)
-    verify(deploy, port, repo, key_path.read_text().strip())
+    verify(deploy, port, repo, key_path.read_text().strip(), kind, version)
     print(f"Cultivate ready: http://127.0.0.1:{port}  Owner web key: {key_path}  Next: use the key to sign in.")
     print("Issues are tracked in Chainlink in the agent home (/home/mimir/agent).")
     print('File a leaf: docker compose exec -w /home/mimir/agent agent chainlink issue create '
@@ -1079,7 +1181,8 @@ if not inventory.exists() or inventory.read_text() != text:
     inventory.write_text(text)
     changed = True
 changed = _provision_worklink(home, entry, base=base,
-                            checkout=repo, git_auth=git_auth, force=m.get('force', False)) or changed
+                            checkout=repo, git_auth=git_auth, force=m.get('force', False),
+                            toolchain=m.get('toolchain')) or changed
 for name in ('github-poller', 'github-ci-watch', 'github', 'review'):
     skill = resolve_skill('cultivate:' + name, set())
     if skill is None:
