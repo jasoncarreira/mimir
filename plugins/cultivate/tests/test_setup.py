@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import tomllib
 from pathlib import Path
 import subprocess
@@ -318,6 +319,40 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert len(calls) == before_calls
 
 
+@pytest.mark.parametrize('step', ['build', 'init', 'provision', 'up'])
+def test_docker_failure_names_step_without_secrets(tmp_path, monkeypatch, step):
+    monkeypatch.setattr(installer, '_license_gate', lambda args: None)
+    fields = {'repo': 'org/repo', 'branch': 'main', 'bot_login': 'bot',
+              'bot_email': 'bot@example.com', 'owner': 'owner', 'display_name': 'Owner',
+              'owner_email': 'owner@example.com', 'deploy': str(tmp_path / 'deploy'),
+              'model_spec': 'openai:model', 'saga_model_spec': 'openai:model',
+              'embedding': 'openai:model', 'source_ref': 'refs/heads/feature/plugins',
+              'source_repo': 'org/mimir', 'test_command': 'npm test', 'port': '8123'}
+    monkeypatch.setattr(installer, '_field', lambda args, name, *a, **kw: fields[name])
+    monkeypatch.setattr(installer, '_secret', lambda *a, **kw: 'secret-from-compose-env')
+    monkeypatch.setattr(installer, 'validate_token', lambda *a: None)
+    monkeypatch.setattr(installer, '_content', lambda *a: '{"engines":{"node":"22.16.0"}}' if a[2] == 'package.json' else None)
+    monkeypatch.setattr(installer, '_verify_script', lambda *a: None)
+
+    def request(url, token):
+        return 200, {'object': {'sha': SHA}}
+
+    def run(argv, *, cwd):
+        if argv[-3:] == ['ps', '-q', 'agent']:
+            return ''
+        current = ('build' if argv[1] == 'build' else
+                   'provision' if 'compose.provision.yml' in argv else
+                   'init' if argv[-2:] == ['--rm', 'init'] else 'up')
+        if current == step:
+            raise installer.SetupError('docker operation failed (exit 1): secret-from-compose-env')
+        return ''
+
+    args = argparse.Namespace(rotate_web_key=False, reembed=False, force=False)
+    with pytest.raises(installer.SetupError, match=f'Docker {step} failed') as caught:
+        installer.setup(args, request=request, run=run)
+    assert 'secret-from-compose-env' not in str(caught.value)
+
+
 def test_pinned_auxiliary_tools_and_repo_override():
     files = {".github/workflows/rust.yml": "uses: taiki-e/install-action@v2\nwith:\n  tool: cargo-nextest@0.9.147"}
     pin = installer._tool_pin(files, "nextest", installer.DEFAULT_NEXTEST_VERSION)
@@ -480,8 +515,11 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     def git(argv, **kwargs):
         calls.append(argv)
         if argv[0] == 'chainlink':
-            (home / '.chainlink').mkdir(exist_ok=True)
-            (home / '.chainlink/agent.json').write_text('{"id":"cultivate-worklink"}')
+            if argv[1:] == ['init', '-q']:
+                (home / '.chainlink').mkdir()
+            else:
+                assert argv[1:] == ['agent', 'init', 'cultivate-worklink']
+                (home / '.chainlink/agent.json').write_text('{"id":"cultivate-worklink"}')
             return subprocess.CompletedProcess(argv, 0)
         if "clone" in argv:
             (Path(argv[-1]) / ".git").mkdir(parents=True)
@@ -513,7 +551,8 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert {"user", "admin"}.issubset(people[1]["access"]["roles"])
     assert installer._SHA.fullmatch("a" * 40)
     assert sum("clone" in argv for argv in calls) == 2
-    assert sum(argv[0] == 'chainlink' for argv in calls) == 1
+    assert [argv for argv in calls if argv[0] == 'chainlink'] == [
+        ['chainlink', 'init', '-q'], ['chainlink', 'agent', 'init', 'cultivate-worklink']]
     from mimir_cultivate.worklink.backends.registry import WorklinkConfig
     worklink = WorklinkConfig.load(home / 'worklink.yaml')
     assert worklink.repository == inventory['repositories'][0]['slug']
@@ -606,10 +645,13 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch)
 
     def run(argv, **kw):
         if argv[0] == 'chainlink':
-            assert argv == ['chainlink', 'agent', 'init', 'cultivate-worklink']
             assert kw['cwd'] == home
-            (home / '.chainlink').mkdir()
-            (home / '.chainlink/agent.json').write_text('{"id": "cultivate-worklink"}')
+            if argv == ['chainlink', 'init', '-q']:
+                (home / '.chainlink').mkdir()
+            else:
+                assert argv == ['chainlink', 'agent', 'init', 'cultivate-worklink']
+                assert (home / '.chainlink').is_dir()
+                (home / '.chainlink/agent.json').write_text('{"id": "cultivate-worklink"}')
             return subprocess.CompletedProcess(argv, 0)
         return original_run(argv, **kw)
 
@@ -679,6 +721,87 @@ def test_worklink_base_and_config_reconcile_with_real_git(tmp_path, monkeypatch)
     agent.symlink_to(config_path)
     with pytest.raises(RuntimeError, match='regular file'):
         installer._provision_worklink(home, entry, base=base, checkout=checkout, git_auth=auth)
+
+
+@pytest.mark.parametrize('store_state', ['fresh', 'existing', 'init_failure', 'init_missing_cli', 'init_no_store',
+                                         'symlink', 'dangling_symlink', 'file', 'init_symlink'])
+def test_worklink_store_init_precedes_agent_and_refuses_bad_store(tmp_path, monkeypatch, store_state):
+    home = tmp_path / 'home'
+    home.mkdir()
+    store = home / '.chainlink'
+    if store_state == 'existing':
+        store.mkdir()
+    elif store_state in {'symlink', 'init_symlink'}:
+        (tmp_path / 'target').mkdir()
+        if store_state == 'symlink':
+            store.symlink_to(tmp_path / 'target', target_is_directory=True)
+    elif store_state == 'dangling_symlink':
+        store.symlink_to(tmp_path / 'absent', target_is_directory=True)
+    elif store_state == 'file':
+        store.write_text('not a store')
+    calls = []
+
+    def run(argv, **kw):
+        if argv[0] == 'chainlink':
+            calls.append((argv, kw['cwd']))
+            if argv == ['chainlink', 'init', '-q']:
+                if store_state == 'init_missing_cli':
+                    raise FileNotFoundError('chainlink')
+                if store_state == 'init_symlink':
+                    store.symlink_to(tmp_path / 'target', target_is_directory=True)
+                elif store_state != 'init_no_store':
+                    store.mkdir()
+                return subprocess.CompletedProcess(argv, 1 if store_state == 'init_failure' else 0)
+            assert argv == ['chainlink', 'agent', 'init', 'cultivate-worklink']
+            (store / 'agent.json').write_text('{"id":"cultivate-worklink"}')
+            return subprocess.CompletedProcess(argv, 0)
+        if 'clone' in argv:
+            (Path(argv[-1]) / '.git').mkdir(parents=True)
+        stdout = ('main' if 'symbolic-ref' in argv else '' if 'status' in argv else 'origin') + '\n'
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout)
+
+    monkeypatch.setattr(subprocess, 'run', run)
+    entry = {'slug': 'org/repo', 'origin': 'origin', 'base_branch': 'main', 'test_command': 'npm test'}
+    kwargs = {'base': tmp_path / 'base', 'checkout': tmp_path / 'checkout',
+              'git_auth': ['git', '-c', 'credential.helper=fixture']}
+    if store_state in {'symlink', 'dangling_symlink', 'file', 'init_symlink', 'init_failure', 'init_missing_cli', 'init_no_store'}:
+        message = ('must be a real directory' if store_state in {'symlink', 'dangling_symlink', 'file'} else
+                   'could not run' if store_state == 'init_missing_cli' else 'Chainlink init failed')
+        with pytest.raises(RuntimeError, match=message) as caught:
+            installer._provision_worklink(home, entry, **kwargs)
+        assert str(home) in str(caught.value)
+        assert calls == ([(['chainlink', 'init', '-q'], home)] if store_state.startswith('init_') else [])
+    else:
+        assert installer._provision_worklink(home, entry, **kwargs)
+        assert calls == ([(['chainlink', 'init', '-q'], home)] if store_state == 'fresh' else []) + [
+            (['chainlink', 'agent', 'init', 'cultivate-worklink'], home)]
+        before = (store / 'agent.json').read_bytes()
+        assert not installer._provision_worklink(home, entry, **kwargs)
+        assert (store / 'agent.json').read_bytes() == before
+        assert len(calls) == (2 if store_state == 'fresh' else 1)
+
+
+def test_worklink_provisions_fresh_home_with_real_chainlink(tmp_path):
+    if not shutil.which('chainlink'):
+        pytest.skip('chainlink CLI is not on PATH')
+    origin = tmp_path / 'origin.git'
+    seed = tmp_path / 'seed'
+    subprocess.run(['git', 'init', '--bare', str(origin)], check=True, capture_output=True)
+    subprocess.run(['git', 'init', '-b', 'main', str(seed)], check=True, capture_output=True)
+    (seed / 'README').write_text('seed\n')
+    subprocess.run(['git', '-C', str(seed), 'add', 'README'], check=True, capture_output=True)
+    subprocess.run(['git', '-C', str(seed), '-c', 'user.name=Test', '-c', 'user.email=test@example.com',
+                    'commit', '-m', 'seed'], check=True, capture_output=True)
+    subprocess.run(['git', '-C', str(seed), 'push', str(origin), 'HEAD:refs/heads/main'],
+                   check=True, capture_output=True)
+    home = tmp_path / 'home'
+    home.mkdir()
+    assert installer._provision_worklink(home, {
+        'slug': 'org/repo', 'origin': str(origin), 'base_branch': 'main', 'test_command': 'npm test',
+    }, base=tmp_path / 'base', checkout=tmp_path / 'checkout',
+        git_auth=['git', '-c', 'credential.helper='])
+    agent = json.loads((home / '.chainlink/agent.json').read_text())
+    assert agent.get('agent_id') == 'cultivate-worklink', agent
 
 
 @pytest.mark.parametrize('relation', ['equal', 'nested', 'contains', 'lease'])
@@ -1116,8 +1239,11 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok,
 
     def subprocess_run(argv, **kwargs):
         if argv[0] == 'chainlink':
-            (home / '.chainlink').mkdir(exist_ok=True)
-            (home / '.chainlink/agent.json').write_text('{"id":"cultivate-worklink"}')
+            if argv[1:] == ['init', '-q']:
+                (home / '.chainlink').mkdir()
+            else:
+                assert argv[1:] == ['agent', 'init', 'cultivate-worklink']
+                (home / '.chainlink/agent.json').write_text('{"id":"cultivate-worklink"}')
             return subprocess.CompletedProcess(argv, 0)
         if argv[0] == "git":
             git_calls.append(argv)

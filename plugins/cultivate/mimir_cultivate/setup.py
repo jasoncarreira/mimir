@@ -440,7 +440,19 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         path.write_text(text)
         created = True
     BackendRegistry(WorklinkConfig.load(path))
-    agent = home / '.chainlink' / 'agent.json'
+    store = home / '.chainlink'
+    if store.is_symlink() or (store.exists() and not store.is_dir()):
+        raise RuntimeError(f"Chainlink store {store} must be a real directory; move it aside and retry")
+    if not store.exists():
+        try:
+            result = subprocess.run(['chainlink', 'init', '-q'], cwd=home,
+                                    capture_output=True, check=False)
+        except OSError:
+            raise RuntimeError(f"Chainlink init could not run in {home}; check the CLI and retry") from None
+        if result.returncode or store.is_symlink() or not store.is_dir():
+            raise RuntimeError(f"Chainlink init failed in {home}; inspect .chainlink and retry")
+        created = True
+    agent = store / 'agent.json'
     if agent.is_symlink() or (agent.exists() and not agent.is_file()):
         raise RuntimeError(f"Chainlink agent identity {agent} must be a regular file")
     if not agent.exists():
@@ -791,17 +803,26 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     was_running = bool(run(["docker", "compose", "ps", "-q", "agent"], cwd=deploy))
     if args.reembed and was_running:
         run(["docker", "compose", "stop", "agent"], cwd=deploy)
+    def docker_step(step: str, argv: list[str]) -> str:
+        try:
+            return run(argv, cwd=deploy)
+        except SetupError as exc:
+            if str(exc) in {_PUSH_PROBE_HELP, _PUSH_PROBE_UNREACHABLE_HELP}:
+                raise
+            # Do not interpolate subprocess output (including compose.env values).
+            raise SetupError(f"Docker {step} failed; inspect the deployment and docker compose logs.") from None
+
     print(f"Building pushed Mimir commit {sha} ({source_ref})")
-    run(["docker", "build", "-t", tag, "--build-arg", "MIMIR_GIT_REF=" + source_ref,
-         "--build-arg", "MIMIR_CONTROLLER_COMMIT=" + sha, "--build-arg", "MIMIR_EXECUTOR_COMMIT=" + sha,
-         "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate",
-         "--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build", "--build-arg", "MIMIR_ENABLE_OPENCODE=1",
-         "--build-arg", "MIMIR_EXTRAS=" + ",".join(sorted({provider, saga_provider, "mcp", "local-embeddings"})), source_url + "#" + sha], cwd=deploy)
-    run(["docker", "build", "-t", layer_tag, "-f", "Dockerfile.toolchain", "."], cwd=deploy)
-    run(["docker", "compose", "run", "--rm", "init"], cwd=deploy)
-    provisioned = run(["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",
-                       "--user", "1001:1001", "--entrypoint", "python", "agent", "/opt/cultivate-provision.py"], cwd=deploy)
-    run(["docker", "compose", "up", "-d", "agent"], cwd=deploy)
+    docker_step("build", ["docker", "build", "-t", tag, "--build-arg", "MIMIR_GIT_REF=" + source_ref,
+          "--build-arg", "MIMIR_CONTROLLER_COMMIT=" + sha, "--build-arg", "MIMIR_EXECUTOR_COMMIT=" + sha,
+          "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate",
+          "--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build", "--build-arg", "MIMIR_ENABLE_OPENCODE=1",
+          "--build-arg", "MIMIR_EXTRAS=" + ",".join(sorted({provider, saga_provider, "mcp", "local-embeddings"})), source_url + "#" + sha])
+    docker_step("build", ["docker", "build", "-t", layer_tag, "-f", "Dockerfile.toolchain", "."])
+    docker_step("init", ["docker", "compose", "run", "--rm", "init"])
+    provisioned = docker_step("provision", ["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",
+                                      "--user", "1001:1001", "--entrypoint", "python", "agent", "/opt/cultivate-provision.py"])
+    docker_step("up", ["docker", "compose", "up", "-d", "agent"])
     if was_running and "SETUP_CHANGED=1" in provisioned.splitlines():
         run(["docker", "compose", "restart", "agent"], cwd=deploy)
         print("Restarted the existing agent once to load provisioned repositories, identities and pollers.")
