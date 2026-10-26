@@ -21,6 +21,11 @@ from importlib.metadata import PackageNotFoundError, version
 
 pytestmark = pytest.mark.usefixtures("authorized_fake_backend_gate")
 
+
+@pytest.fixture(autouse=True)
+def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
+
 try:
     version("mimir-cultivate")
 except PackageNotFoundError:
@@ -1287,6 +1292,7 @@ def test_dry_run_prints_rendered_work_order_without_mutations(
     assert result.dry_run is True
     assert "worklink slice" in out
     assert "Acceptance criteria" in out
+    assert str(tmp_path / ".worklink" / "repo" / "441-DRYRUN") in out
     # The work order teaches backends how to signal a design-level block.
     assert "WORKLINK_BLOCKED:" in out
     assert not any(isinstance(call, list) and call[:2] == ["chainlink", "locks"] for call in calls)
@@ -7118,7 +7124,7 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
     if refusal == "ownership_boundary":
         import mimir_cultivate.worklink.worker_client as worker_client
 
-        monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+        monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
         monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: None)
     if refusal in {"checkout_root_unavailable", "checkout_git_dir_unavailable"}:
         real_resolve = Path.resolve
@@ -10348,7 +10354,7 @@ def factory_completion_sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     import mimir_cultivate.worklink.orchestrator as orchestrator
     import mimir_cultivate.worklink.worker_client as worker_client
 
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     identities = orchestrator.get_identities()
     monkeypatch.setattr(
         orchestrator, "get_identities",
@@ -10607,6 +10613,8 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     idle_park: bool,
     live_running: bool,
 ) -> None:
+    # These retained legacy clones predate the executor's path-addressed root.
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / "executor-root"))
     _stub_factory_launch_identity(monkeypatch)
     from mimir_cultivate.worklink.compute import LocalSubprocessComputeBackend
     from mimir_cultivate.worklink.run_state import process_start_ticks

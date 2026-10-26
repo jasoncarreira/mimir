@@ -38,6 +38,11 @@ from mimir_cultivate.worklink.claims import (
 from mimir_cultivate.worklink.checkout import create_isolated_checkout
 
 
+@pytest.fixture(autouse=True)
+def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
+
+
 def _claim(issue_id: int, attempt: int) -> str:
     return CLAIM_PREFIX + json.dumps({
         "issue_id": issue_id,

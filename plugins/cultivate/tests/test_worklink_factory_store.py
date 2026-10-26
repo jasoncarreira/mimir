@@ -213,7 +213,7 @@ def test_ttl_partial_worker_layout_without_checkout(tmp_path, monkeypatch, reape
     shutil.rmtree(checkout)
     # Keep the real lexical worker binding: the old code attempted to reopen
     # this nonexistent checkout through the executor and could never reclaim it.
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", attempt.parent.parent)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(attempt.parent.parent))
     assert worker_client.factory_checkout_for_path(checkout) is not None
     monkeypatch.setattr(worker_client, "run_factory_control",
                         lambda *a, **kw: pytest.fail("missing checkout cannot be a worker cwd"))
@@ -231,7 +231,7 @@ def test_ttl_partial_layout_permission_failure_is_retained(tmp_path, monkeypatch
     attempt = checkout.parent
     db.write_bytes(b"worker-owned")
     shutil.rmtree(checkout)
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", attempt.parent.parent)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(attempt.parent.parent))
     def denied(path):
         raise PermissionError("worker-owned runtime")
     monkeypatch.setattr(factory_store, "_clear_runtime", denied)

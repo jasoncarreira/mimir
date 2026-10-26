@@ -238,8 +238,7 @@ def remediation_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("WORKLINK_REPO", str(controller_repo))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{external}:ro")
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
-    monkeypatch.setattr(provider_worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(retained_root))
     monkeypatch.setattr(
         "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
         lambda _record: False,
@@ -903,11 +902,9 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
             state_root=home / "state" / "pollers",
         )
 
-        monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
-        monkeypatch.setattr(provider_worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
+        monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(retained_root))
         monkeypatch.setattr(provider_worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
         monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
-        monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", retained_root)
         monkeypatch.setattr(worker_exec, "HOME_ROOT", executor_homes)
         monkeypatch.setattr(worker_exec, "REPO_TEST_CHECKOUT_ROOT", snapshots)
         monkeypatch.setattr(worker_exec, "REPO_TEST_UV_CACHE", uv_cache)
@@ -1207,8 +1204,7 @@ def test_leaf_checkout_lets_the_worklink_uid_run_real_git(
 
         monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
         monkeypatch.setenv("HOME", str(controller_home))
-        monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", worklink_root)
-        monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", worklink_root)
+        monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(worklink_root))
         monkeypatch.setattr(worker_exec, "HOME_ROOT", executor_homes)
         script = "\n".join((
             "set -eu",

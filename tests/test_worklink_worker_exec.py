@@ -253,6 +253,7 @@ async def test_identity_probe_accepts_matching_image_executor(monkeypatch) -> No
                 "status": "identity",
                 "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
                 "source_commit": "a" * 40,
+                "checkout_root": "/workspace/.worklink",
             }).encode()
 
         def close(self) -> None:
@@ -480,7 +481,7 @@ def test_path_checkout_accepts_group_checkout_without_0700_boundary(
     checkout.mkdir(parents=True)
     checkout.chmod(0o2770)
     checkout.parent.chmod(0o755)
-    monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     monkeypatch.setattr(
         worker_exec,
         "get_identities",
@@ -752,7 +753,7 @@ def test_execution_copy_is_owned_by_the_runner_not_the_controller(
     checkout_root = (
         worker_exec.REPO_TEST_CHECKOUT_ROOT
         if surface == "repo_test"
-        else worker_exec.WORKLINK_CHECKOUT_ROOT
+        else worker_exec.worklink_checkout_root()
     )
     result = worker_exec._execution_checkout_fd(
         command, 17, tmp_path / "home", checkout_root=checkout_root
@@ -1522,7 +1523,7 @@ def factory_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(worker_exec, "get_identities", lambda: SimpleNamespace(
         mimir_uid=os.getuid(), worklink_uid=worker_uid, worklink_gid=os.getgid(),
     ))
-    monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     monkeypatch.setattr(worker_exec, "HOME_ROOT", tmp_path / "homes")
     worker_exec.HOME_ROOT.mkdir()
     return {
@@ -1767,7 +1768,7 @@ def test_factory_path_guards_reject_otherwise_openable_trees(factory_request, mo
         raw = str(moved / "41-2/checkout")
     elif guard == "repo_parent":
         path.parent.rename(tmp_path / "41-2")
-        raw = str(worker_exec.WORKLINK_CHECKOUT_ROOT) + "/../41-2/checkout"
+        raw = str(worker_exec.worklink_checkout_root()) + "/../41-2/checkout"
     elif guard == "worker_uid":
         factory_request["run_uid"] = 0
         raw = str(path)
@@ -2076,7 +2077,7 @@ def test_factory_file_rpc_creates_as_worklink_not_controller() -> None:
     except KeyError:
         pytest.skip("requires the real mimir account")
 
-    repo = worker_exec.WORKLINK_CHECKOUT_ROOT / f"factory-file-test-{uuid.uuid4()}"
+    repo = worker_exec.worklink_checkout_root() / f"factory-file-test-{uuid.uuid4()}"
     boundary = repo / "41-2"
     checkout = boundary / "checkout"
     sandbox = checkout / ".factory-sandboxes" / "chainlink-41"
@@ -2721,7 +2722,7 @@ def test_factory_descendant_cannot_write_controller_canary_and_negative_control_
         pytest.skip("Linux root sandbox lacks authority for the real worker identity drop")
     assert os.waitstatus_to_exitcode(status) == 0
 
-    repo = worker_exec.WORKLINK_CHECKOUT_ROOT / f"factory-test-{uuid.uuid4()}"
+    repo = worker_exec.worklink_checkout_root() / f"factory-test-{uuid.uuid4()}"
     boundary = Path("/tmp") / f"factory-exec-{uuid.uuid4()}"
     checkout = repo / "41-2" / "checkout"
     home_root = boundary / "homes"

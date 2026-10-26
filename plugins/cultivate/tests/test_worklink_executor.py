@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ast
 import array
+import asyncio
 import json
 import os
 from pathlib import Path
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -16,8 +18,9 @@ from types import SimpleNamespace
 import pytest
 
 from mimir_cultivate.worklink import (
-    claims, compute, continuation, control, detached_dispatch, dispatch_failures,
+    checkout, claims, compute, continuation, control, detached_dispatch, dispatch_failures,
     merge_closure, poller_hooks, retained_scope, tool_pins, worker_client, worker_exec,
+    orchestrator,
 )
 from mimir_cultivate.worklink.backends import opencode
 from mimir_cultivate.worklink.backends.base import WorkOrder
@@ -33,6 +36,134 @@ def test_worker_protocol_matches_executor_image_contract() -> None:
     assert worker_client.DEFAULT_EXECUTOR_SOCKET == worker_exec.DEFAULT_EXECUTOR_SOCKET == Path(
         "/run/mimir-worklink/socket/worklink-execd.sock"
     )
+
+
+def test_checkout_root_env_and_default_are_shared(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = tmp_path / "worklink" / "base" / "trellis"
+    monkeypatch.delenv("WORKLINK_CHECKOUT_ROOT", raising=False)
+    assert worker_client.worklink_checkout_root() == Path("/workspace/.worklink")
+    assert checkout._isolated_checkout_path(repo, ".worklink", 1, 1, worker_authorized=False) == (
+        Path("/workspace/.worklink/trellis/1-1")
+    )
+    assert checkout._isolated_checkout_path(Path("/workspace/mimir"), ".worklink", 12, 3,
+                                           worker_authorized=False) == Path("/workspace/.worklink/mimir/12-3")
+    root = tmp_path / "checkouts"
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+    assert checkout._isolated_checkout_path(repo, ".worklink", 1, 1, worker_authorized=False) == (
+        worker_client.worklink_checkout_root() / "trellis" / "1-1"
+    )
+    assert worker_exec.worklink_checkout_root is worker_client.worklink_checkout_root
+
+
+def test_retained_checkout_policy_follows_shared_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import worklink_retained_checkout_root
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        monkeypatch.delenv("WORKLINK_CHECKOUT_ROOT", raising=False)
+        assert worklink_retained_checkout_root() == Path("/workspace/.worklink")
+        root = tmp_path / "custom-checkouts"
+        monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+        assert worklink_retained_checkout_root() == root.resolve()
+        assert worklink_retained_checkout_root() == worker_client.worklink_checkout_root()
+        # The already-registered hook must read the setting on every call.
+        other_root = tmp_path / "other-checkouts"
+        monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(other_root))
+        assert worklink_retained_checkout_root() == other_root.resolve()
+
+
+def test_reattach_observation_uses_checkout_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "checkouts"
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+    repo = tmp_path / "worklink" / "base" / "trellis"
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    lease = orchestrator._create_observation_worktree(
+        repo, issue_id=1, attempt=2, base="main", local_base="main",
+        branch="issue/1-a2", runner=runner,
+    )
+    assert lease.path == root / "trellis" / "reattach-1-2"
+    assert calls[-1][-1] == str(lease.path)
+
+
+def test_foreign_base_checkout_is_accepted_without_request_supplied_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "checkouts"
+    repo = tmp_path / "worklink" / "base" / "trellis"
+    root.mkdir()
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+    path = checkout._isolated_checkout_path(repo, ".worklink", 1, 1, worker_authorized=False)
+    path.mkdir(parents=True)
+    path.chmod(0o2770)
+    monkeypatch.setattr(worker_exec, "get_identities", lambda: SimpleNamespace(
+        mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid(),
+    ))
+    request = {"issue": 1, "attempt": 1, "path": str(path), "run_uid": os.getuid()}
+    fd = worker_exec._open_path_checkout(request)
+    try:
+        assert stat.S_ISDIR(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+    # This untrusted field cannot move the executor's boundary to the base clone.
+    (repo / "1-1").mkdir(parents=True)
+    (repo / "1-1").chmod(0o2770)
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "elsewhere").chmod(0o2770)
+    with pytest.raises(RuntimeError, match="outside the Worklink root"):
+        worker_exec._open_path_checkout({**request, "path": str(repo / "1-1"),
+                                         "checkout_root": str(repo.parent)})
+    with pytest.raises(RuntimeError, match="outside the Worklink root"):
+        worker_exec._open_path_checkout({**request, "path": str(tmp_path / "elsewhere"),
+                                         "checkout_root": str(tmp_path)})
+    (path / "nested").mkdir()
+    with pytest.raises(RuntimeError, match="shape is invalid"):
+        worker_exec._open_path_checkout({**request, "path": str(path / "nested")})
+
+
+@pytest.mark.asyncio
+async def test_executor_identity_requires_matching_independent_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / "checkouts"))
+    response = {"status": "identity", "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
+                "source_commit": "a" * 40, "checkout_root": str(worker_exec.worklink_checkout_root())}
+
+    class Socket:
+        def send(self, payload):
+            assert "checkout_root" not in json.loads(payload)
+
+        def recv(self, size):
+            return json.dumps(response).encode()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker_client.WorkerClient, "_connect", lambda self: Socket())
+    assert await worker_client.verify_executor_identity() == "a" * 40
+    response["checkout_root"] = str(tmp_path / "wrong-root")
+    with pytest.raises(worker_client.CheckoutRootMismatchError) as mismatch:
+        await worker_client.verify_executor_identity()
+    assert str(tmp_path / "checkouts") in str(mismatch.value)
+    assert str(tmp_path / "wrong-root") in str(mismatch.value)
+    assert "align WORKLINK_CHECKOUT_ROOT" in str(mismatch.value)
+    assert "rebuild" not in str(mismatch.value)
+    # A stale protocol still gets the image-rebuild remedy, even if roots differ.
+    response["executor_identity"] = "old-protocol"
+    with pytest.raises(worker_client.StaleWorkerExecutorError, match="rebuild the image"):
+        await worker_client.verify_executor_identity()
+    response["executor_identity"] = worker_exec.EXECUTOR_PROTOCOL_IDENTITY
+    del response["checkout_root"]
+    with pytest.raises(worker_client.StaleWorkerExecutorError, match="rebuild the image"):
+        await worker_client.verify_executor_identity()
 
 
 def test_factory_checkout_binding_rejects_ambiguous_paths() -> None:
@@ -153,7 +284,7 @@ def test_provider_executor_refuses_fd_identity_and_symlink_checkout(
     root.mkdir()
     (root / "repo").mkdir()
     (root / "repo" / "1949-1").symlink_to(checkout, target_is_directory=True)
-    monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     with pytest.raises((OSError, RuntimeError)):
         worker_exec._open_factory_checkout({
             "issue": 1949, "attempt": 1, "path": str(root / "repo/1949-1/checkout"),
@@ -178,7 +309,7 @@ def test_provider_executor_refuses_mismatched_factory_run_uid_before_opening(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "worklink"
-    monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     monkeypatch.setattr(
         worker_exec, "get_identities",
         lambda: SimpleNamespace(worklink_uid=2001),

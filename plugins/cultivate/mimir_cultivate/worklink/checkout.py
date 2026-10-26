@@ -19,6 +19,7 @@ from typing import Any, Callable, Sequence
 from mimir._rmtree import rmtree_missing_ok
 from mimir.plugins.discovery import enabled_plugins
 from .identities import get_identities
+from .worker_client import worklink_checkout_root
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 EventLogger = Callable[..., None]
@@ -1259,8 +1260,8 @@ def _isolated_checkout_path(
     Codex resolves the active git repository from the filesystem, so the clone
     must not live inside the repo it was cloned from: nesting invites both the
     parent-resolution walk-up and a ``git clone --local`` into the repo's own
-    working tree under concurrent load. Placing it at a sibling
-    ``<repo.parent>/<worklink_dir>/<repo.name>/<issue>-<attempt>`` keeps the
+    working tree under concurrent load. Placing it at
+    ``<WORKLINK_CHECKOUT_ROOT>/<repo.name>/<issue>-<attempt>`` keeps the
     independent clone fully detached, and the ``<repo.name>`` segment keeps
     attempts for repos that share a parent directory from colliding. Worker
     checkouts add ``<issue>-<attempt>/checkout``: the attempt directory is a
@@ -1277,7 +1278,7 @@ def _isolated_checkout_path(
             / f"{issue_id}-{attempt}"
             / "checkout"
         )
-    return repo.parent / worklink_dir / repo.name / f"{issue_id}-{attempt}"
+    return worklink_checkout_root() / repo.name / f"{issue_id}-{attempt}"
 
 
 def _assert_self_contained_checkout(path: Path, *, runner: Runner) -> None:
@@ -1362,7 +1363,7 @@ def prune_attempt_checkouts(
     numeric names under known Worklink attempt roots are eligible.  Legacy git
     worktrees live at ``repo/<worklink_dir>/<issue>-<attempt>``; isolated Codex
     checkouts (#517) live outside the repo at
-    ``repo.parent/<worklink_dir>/<repo.name>/<issue>-<attempt>``.  Both shapes
+    ``<WORKLINK_CHECKOUT_ROOT>/<repo.name>/<issue>-<attempt>``.  Both shapes
     retain failed/blocked attempts for autopsy, so both must be covered by the
     TTL prune path (#613).
 
@@ -1412,9 +1413,12 @@ def _attempt_roots(repo: Path, worklink_dir: str) -> list[tuple[Path, bool]]:
     """Return ``(root, isolated_checkout)`` attempt roots for ``repo`` (#613)."""
     legacy_root = repo / worklink_dir
     relocated_root = repo.parent / worklink_dir / repo.name
+    configured_root = worklink_checkout_root() / repo.name
     roots = [(legacy_root, False)]
     if relocated_root != legacy_root:
         roots.append((relocated_root, True))
+    if configured_root not in {legacy_root, relocated_root}:
+        roots.append((configured_root, True))
     if _cultivate_selected():
         enabled_root = _isolated_checkout_path(
             repo, worklink_dir, 0, 0, worker_authorized=True

@@ -12,6 +12,11 @@ from mimir_cultivate.worklink.backends.base import WorkOrder
 from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
 
 
+@pytest.fixture(autouse=True)
+def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
+
+
 def _write_native_files(home: Path) -> None:
     config = home / ".config" / "opencode" / "opencode.jsonc"
     config.parent.mkdir(parents=True)

@@ -43,7 +43,7 @@ def _executor_in_process(
     homes.mkdir()
     monkeypatch.setattr(worker_client.identities, "get_identities", lambda: identities)
     monkeypatch.setattr(worker_exec, "get_identities", lambda: identities)
-    monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     monkeypatch.setattr(worker_exec, "HOME_ROOT", homes)
     monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
 
@@ -178,7 +178,7 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     auth.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}))
     seed_codex_subscription(operator_home)
     (tmp_path / "worklink.yaml").write_text(f"defaults:\n  test_command: \"{gate_command}\"\n")
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(
         mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid(),
     ))

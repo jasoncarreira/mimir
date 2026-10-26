@@ -62,6 +62,7 @@ def test_selected_checkout_path_and_pruning_ignore_legacy_flag(
     repo = tmp_path / "repo"
     repo.mkdir()
     root = tmp_path / "worker-checkouts"
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
     monkeypatch.setattr(checkout, "_ENABLED_CHECKOUT_ROOT", root)
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
     monkeypatch.setenv("MIMIR_PLUGINS", "")
@@ -95,6 +96,7 @@ def test_selected_worker_leaf_checkout_is_path_addressed_like_base(
     """
     monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
     root = tmp_path / "worker-checkouts"
     monkeypatch.setattr(checkout, "_ENABLED_CHECKOUT_ROOT", root)
     monkeypatch.setattr(checkout, "get_identities", lambda: SimpleNamespace(
@@ -143,6 +145,7 @@ def test_selected_worker_checkout_refuses_replaced_checkout_symlink(
 ) -> None:
     monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
     root = tmp_path / "worker-checkouts"
     monkeypatch.setattr(checkout, "_ENABLED_CHECKOUT_ROOT", root)
     monkeypatch.setattr(checkout, "get_identities", lambda: SimpleNamespace(

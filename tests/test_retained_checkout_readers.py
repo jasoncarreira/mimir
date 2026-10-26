@@ -59,7 +59,7 @@ def retained_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_cu
     external.mkdir()
     external_target = external / "input.txt"
     external_target.write_text("external instructions\n", encoding="utf-8")
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(retained))
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{external}:ro")
 
@@ -186,11 +186,7 @@ async def exercise_real_worklink_failure_turn(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{external}:ro")
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
-    if selected_provider:
-        from mimir_cultivate.worklink import worker_client as provider_worker_client
-
-        monkeypatch.setattr(provider_worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(retained))
 
     skills = home / "skills"
     ready = next(
@@ -423,7 +419,7 @@ async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
     monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(retained))
     monkeypatch.setattr(
         "mimir_cultivate.worklink.retained_scope._factory_session_lock_is_fresh",
         lambda _record: False,

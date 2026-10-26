@@ -28,6 +28,11 @@ from mimir_cultivate.worklink.checkout import (
 )
 
 
+@pytest.fixture(autouse=True)
+def attempt_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path / ".worklink"))
+
+
 def completed(args: Sequence[str], returncode: int = 0) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(list(args), returncode, stdout="", stderr="")
 

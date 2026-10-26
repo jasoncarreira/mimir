@@ -31,7 +31,7 @@ from .worker_client import (
     MAX_REQUEST_BYTES,
     _PROJECTION_PATHS,
     _validate_identifier,
-    WORKLINK_CHECKOUT_ROOT,
+    worklink_checkout_root,
 )
 from .run_state import process_start_ticks
 
@@ -335,7 +335,7 @@ def _open_path_checkout(request: dict[str, Any]) -> int:
     if request.get("run_uid") != get_identities().worklink_uid:
         raise RuntimeError("path-addressed checkout requested an invalid worker uid")
     try:
-        root = WORKLINK_CHECKOUT_ROOT.resolve(strict=True)
+        root = worklink_checkout_root().resolve(strict=True)
         requested = Path(path_value)
         resolved = requested.resolve(strict=True)
         relative = resolved.relative_to(root)
@@ -374,7 +374,7 @@ def _open_factory_checkout(
         raise RuntimeError("factory checkout path or invalid worker uid")
     path = Path(raw)
     try:
-        relative = path.relative_to(WORKLINK_CHECKOUT_ROOT)
+        relative = path.relative_to(worklink_checkout_root())
     except ValueError:
         raise RuntimeError("factory checkout is outside the Worklink root") from None
     if (
@@ -985,6 +985,7 @@ def _handle_identity(connection: socket.socket, request: dict[str, Any], fds: li
         "status": "identity",
         "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
         "source_commit": _executor_source_commit(),
+        "checkout_root": str(worklink_checkout_root()),
     })
 
 
