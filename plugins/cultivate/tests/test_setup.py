@@ -440,13 +440,17 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     monkeypatch.setattr(installer.time, "sleep", lambda seconds: None)
     pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok", "root": "ok", "binary": "ok"}
     reads = []
+    exec_calls = []
     from mimir_cultivate.worklink import worker_client
 
     async def verify_executor_identity():
         errors = {
             "checkout_root_mismatch": worker_client.CheckoutRootMismatchError("different roots"),
             "executor_stale": worker_client.StaleWorkerExecutorError("old protocol"),
-            "executor_unreachable": OSError("socket unavailable"),
+            "executor_peer_rejected": ConnectionResetError("peer rejected"),
+            "executor_permission_denied": PermissionError("peer denied"),
+            "executor_unreachable": FileNotFoundError("socket unavailable"),
+            "executor_refused": ConnectionRefusedError("socket not listening"),
         }
         if pending["root"] != "ok":
             raise errors[pending["root"]]
@@ -466,6 +470,13 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         return {"ok": True}
 
     def run(argv, *, cwd):
+        exec_calls.append(argv)
+        assert cwd == tmp_path
+        if installer._OPENCODE_WORKER_PROBE in argv:
+            assert argv[:10] == ["docker", "compose", "exec", "-T", "-u", "worklink",
+                                "-w", "/tmp", "agent", "/usr/local/bin/python"]
+            return pending["binary"]
+        assert argv[:7] == ["docker", "compose", "exec", "-T", "-u", "mimir", "agent"]
         if "plugins" in argv:
             return json.dumps([{"name": "cultivate", "enabled": True}])
         if "resolve_opencode_invocation" in argv[-1]:
@@ -478,20 +489,24 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
                 exec(compile(argv[-1], "<executor-verification>", "exec"), {})
             return output.getvalue().strip()
         if argv[-1] == installer._OPENCODE_RESOLVE_PROBE:
-            assert argv[4:8] == ["-u", "mimir", "-w", "/tmp"]
+            assert argv[7:9] == ["/home/mimir/venv/bin/python", "-c"]
             return "/opt/mimir-opencode/bin/opencode"
-        if installer._OPENCODE_WORKER_PROBE in argv:
-            assert argv[4:8] == ["-u", "worklink", "-w", "/tmp"]
-            return pending["binary"]
         return json.dumps(pending["alerts"])
 
     monkeypatch.setattr(installer, "_http", http)
     monkeypatch.setattr(installer, "_run", run)
     installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    assert len(exec_calls) == 6
+    assert [argv[7:9] for argv in exec_calls] == [
+        ["mimir", "plugins"], ["python", "-c"], ["python", "-c"],
+        ["/home/mimir/venv/bin/python", "-c"], ["/tmp", "agent"], ["python", "-c"]]
     for reason, message in (
         ("checkout_root_mismatch", "checkout root mismatch; align WORKLINK_CHECKOUT_ROOT"),
         ("executor_stale", "executor is stale; rebuild the image"),
+        ("executor_peer_rejected", "executor rejected the agent peer"),
+        ("executor_permission_denied", "executor rejected the agent peer"),
         ("executor_unreachable", "executor is unreachable; inspect its service and socket"),
+        ("executor_refused", "executor is unreachable; inspect its service and socket"),
     ):
         pending["root"] = reason
         with pytest.raises(installer.SetupError, match=message):
@@ -531,6 +546,11 @@ def test_setup_binary_probe_executes_with_worker_path(tmp_path, monkeypatch, out
     import subprocess
     import sys
 
+    from mimir_cultivate.contained_execution import (
+        base_worker_environment,
+        opencode_worker_environment,
+    )
+
     binary = tmp_path / "opencode"
     marker = tmp_path / "probe-environment.json"
     binary.write_text(
@@ -554,8 +574,8 @@ def test_setup_binary_probe_executes_with_worker_path(tmp_path, monkeypatch, out
     def run(argv, *, cwd):
         captured.append(argv)
         if argv[-1] == installer._OPENCODE_RESOLVE_PROBE:
-            assert argv[4:8] == ['-u', 'mimir', '-w', '/tmp']
-            assert argv[9] == '/home/mimir/venv/bin/python'
+            assert argv[:9] == ['docker', 'compose', 'exec', '-T', '-u', 'mimir',
+                                'agent', '/home/mimir/venv/bin/python', '-c']
             return str(binary)
         assert argv[4:8] == ['-u', 'worklink', '-w', '/tmp']
         assert argv[9] == '/usr/local/bin/python'
@@ -579,6 +599,15 @@ def test_setup_binary_probe_executes_with_worker_path(tmp_path, monkeypatch, out
     if outcome in {'ok', 'nonzero'}:
         assert marker.exists(), 'positive control must execute the CLI body'
         env = json.loads(marker.read_text())
+        # Compare the entire launch contract, not only PATH: changing any base
+        # variable or OpenCode's config derivation must invalidate this probe.
+        base = base_worker_environment('setup-probe-parity')
+        runtime_home = str(Path(base['XDG_CONFIG_HOME']).parent)
+        expected = opencode_worker_environment(base, {})
+        expected = {key: value.replace(runtime_home, env['HOME'])
+                    for key, value in expected.items()}
+        expected['HOME'] = env['HOME']  # assigned by the real executor too
+        assert env == expected
         assert not Path(env['HOME']).exists(), 'probe must clean up on success and nonzero exit'
 
 

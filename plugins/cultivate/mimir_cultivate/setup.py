@@ -605,6 +605,11 @@ def _http(url: str, *, key: str | None = None, data: dict | None = None) -> dict
         return json.load(response)
 
 
+def _agent_exec(deploy: Path, *argv: str) -> str:
+    """Run agent-state checks with the agent's uid and HOME, not image root."""
+    return _run(["docker", "compose", "exec", "-T", "-u", "mimir", "agent", *argv], cwd=deploy)
+
+
 # The worklink uid cannot traverse the controller's private venv. Resolve there
 # as mimir, then run a stdlib-only probe with the system interpreter as worklink.
 _OPENCODE_RESOLVE_PROBE = """\
@@ -636,8 +641,7 @@ except (OSError, subprocess.TimeoutExpired, ValueError):
 
 
 def _verify_opencode_binary(deploy: Path) -> None:
-    binary = _run(["docker", "compose", "exec", "-T", "-u", "mimir", "-w", "/tmp",
-                   "agent", "/home/mimir/venv/bin/python", "-c", _OPENCODE_RESOLVE_PROBE], cwd=deploy)
+    binary = _agent_exec(deploy, "/home/mimir/venv/bin/python", "-c", _OPENCODE_RESOLVE_PROBE)
     check = "opencode_missing"
     if binary.startswith("/") and "\n" not in binary and "\x00" not in binary:
         check = _run(["docker", "compose", "exec", "-T", "-u", "worklink", "-w", "/tmp",
@@ -657,29 +661,31 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
         time.sleep(2)
     else:
         raise SetupError("/health did not become ready; inspect docker compose logs.")
-    rows = json.loads(_run(["docker", "compose", "exec", "-T", "agent", "mimir", "plugins", "list", "--json"], cwd=deploy))
+    rows = json.loads(_agent_exec(deploy, "mimir", "plugins", "list", "--json"))
     if not any(row.get("name") == "cultivate" and row.get("enabled") is True for row in rows):
         raise SetupError("mimir plugins list did not show cultivate enabled; check process MIMIR_PLUGINS.")
     # Check current binding, not historical logs (a resolved alert may remain
     # in the log forever after an operator fixes the checkout).
-    binding = _run(["docker", "compose", "exec", "-T", "agent", "python", "-c",
+    binding = _agent_exec(deploy, "python", "-c",
                     "import json; from mimir_cultivate.repository import repo_binding_startup_alerts; "
-                    "print(json.dumps(repo_binding_startup_alerts()))"], cwd=deploy)
+                    "print(json.dumps(repo_binding_startup_alerts()))")
     if json.loads(binding):
         raise SetupError("Repository binding attention required; check checkout origin and repositories.yaml.")
     # The executor answers from its own image/service environment, never from a
     # root included in a controller request. Also detects a stale executor image.
-    root_check = _run(["docker", "compose", "exec", "-T", "agent", "python", "-c",
+    root_check = _agent_exec(deploy, "python", "-c",
         "import asyncio\n"
         "from mimir_cultivate.worklink.worker_client import (verify_executor_identity, "
         "CheckoutRootMismatchError, StaleWorkerExecutorError)\n"
         "try:\n asyncio.run(verify_executor_identity())\n print('ok')\n"
         "except CheckoutRootMismatchError:\n print('checkout_root_mismatch')\n"
         "except StaleWorkerExecutorError:\n print('executor_stale')\n"
-        "except (OSError, RuntimeError, ValueError):\n print('executor_unreachable')"], cwd=deploy)
+        "except (ConnectionResetError, PermissionError):\n print('executor_peer_rejected')\n"
+        "except (OSError, RuntimeError, ValueError):\n print('executor_unreachable')")
     root_errors = {
         "checkout_root_mismatch": "Worklink checkout root mismatch; align WORKLINK_CHECKOUT_ROOT in the controller and executor service environments.",
         "executor_stale": "Worklink executor is stale; rebuild the image and restart the container.",
+        "executor_peer_rejected": "Worklink executor rejected the agent peer; inspect its service and socket permissions.",
         "executor_unreachable": "Worklink executor is unreachable; inspect its service and socket.",
     }
     if root_check != "ok":
@@ -687,10 +693,10 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
     _verify_opencode_binary(deploy)
     # Run in the agent container with its actual HOME, config and compose env.
     # Only a stable reason code crosses the Docker boundary, never the bundle.
-    auth_check = _run(["docker", "compose", "exec", "-T", "agent", "python", "-c",
+    auth_check = _agent_exec(deploy, "python", "-c",
         "from mimir_cultivate.opencode import resolve_opencode_invocation, OpenCodeAuthError, OpenCodeConfigError\n"
         "try:\n resolve_opencode_invocation()\n print('ok')\n"
-        "except (OpenCodeAuthError, OpenCodeConfigError) as exc:\n print(exc.reason_code)"], cwd=deploy)
+        "except (OpenCodeAuthError, OpenCodeConfigError) as exc:\n print(exc.reason_code)")
     if auth_check != "ok":
         raise SetupError(
             "OpenCode credential resolution failed (" + (
