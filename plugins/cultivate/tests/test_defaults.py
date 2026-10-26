@@ -50,7 +50,7 @@ def test_current_repository_skill_release_hash(name):
     import hashlib
 
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    expected = releases["0.9.10-2025"][name]["SKILL.md"]
+    expected = releases["0.9.10-2026" if name in {"review", "github-poller"} else "0.9.10-2025"][name]["SKILL.md"]
     actual = hashlib.sha256((SKILLS / name / "SKILL.md").read_bytes()).hexdigest()
     assert actual == expected
 
@@ -178,9 +178,20 @@ def test_selected_home_github_poller_emits_resolvable_review_guidance(
     poller._emit("Review this pull request", event_type="pr_opened")
     emitted = json.loads(capsys.readouterr().out)
     assert "/cultivate-review skill spells out the full flow" in emitted["prompt"]
+    guidance = emitted["prompt"].split("──── /cultivate-review SKILL.md (pre-loaded) ────", 1)[0]
+    assert guidance.index("repo_checkout") < guidance.index("pr_metadata")
+    assert guidance.index("pr_metadata") < guidance.index("pr_submit_review")
     assert "/cultivate-review SKILL.md (pre-loaded)" in emitted["prompt"]
     assert "submit via" in emitted["prompt"]
     assert "/review skill spells out" not in emitted["prompt"]
     frontmatter = (SKILLS / "github-poller/SKILL.md").read_text(encoding="utf-8")
     assert "<home>/skills/cultivate-review/SKILL.md" in frontmatter
     assert ".mimir_builtin_skills/review/" not in frontmatter
+
+
+def test_service_review_skill_checks_out_before_every_pr_read():
+    skill = (SKILLS / "review/SKILL.md").read_text(encoding="utf-8")
+    steps = skill.split("### Service turns: checkout", 1)[1].split("### 1. Get PR context", 1)[0]
+    assert steps.index("repo_checkout(repository, pull_request)") < steps.index("pr_metadata")
+    assert steps.index("pr_metadata") < steps.index("pr_diff") < steps.index("pr_submit_review")
+    assert steps.index("pr_submit_review") < steps.index("repo_cleanup(repository, pull_request)")

@@ -6,6 +6,7 @@ import hashlib
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 from langchain.agents.middleware import ToolCallRequest
@@ -17,9 +18,12 @@ from langchain_core.tools import ToolException
 from mimir.access_control import (
     ScopedPRGrants, _SCOPED_PR_ISSUER, _valid_scoped_pr_grant,
     create_auth_context, consume_scoped_pr_checkout, observe_scoped_pr_checkout,
+    ToolRegistry, CapabilityTier, build_trigger_service_principal,
+    publish_protected_result,
 )
 from mimir.models import (
-    AgentEvent, AuthContext, TurnInteractivity,
+    AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState,
+    SourceLabel, TurnInteractivity,
 )
 from mimir.plugins.registry import PolicyRegistry
 from mimir_cultivate.repository import active_pr_checkout_lease_for_path, create_pr_checkout_lease
@@ -149,6 +153,177 @@ def test_trusted_poller_issues_checkout_grant_but_http_ingress_does_not(tmp_path
     )
     untrusted = create_auth_context(event, event_ingress="http_event", policy=policy, enforce=False)
     assert untrusted.scoped_pr_grants is None
+
+
+@pytest.mark.parametrize("read", ["pr_metadata", "pr_diff", "pr_checks", "pr_comments", "pr_file_content"])
+def test_precheckout_pr_read_reports_checkout_remedy_and_recovers(
+    tmp_path, monkeypatch, read,
+):
+    from mimir.plugins.manager import load_plugins
+    policy = load_plugins(enable="cultivate").policy
+    _repo, scope = _repo_and_scope(tmp_path)
+    scope = replace(scope, event_type="pr_opened", principal="collaborator",
+                    pull_request_author="collaborator")
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    registry = ToolRegistry()
+    args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    if read == "pr_file_content":
+        args["path"] = "file.txt"
+    refused = registry.authorize_tool(read, auth, arguments=args, enforce=True, policy=policy)
+    assert not refused.allowed and refused.reason == "repo_pr_grant_denied"
+    assert refused.refusal_detail == (
+        "Call repo_checkout(repository, pull_request) for this repository and PR first."
+    )
+    request = ToolCallRequest(
+        tool_call={"name": read, "args": args, "id": read, "type": "tool_call"},
+        tool=policy.tools[read].factory(), state=None, runtime=Runtime(context=auth),
+    )
+    calls = []
+    surfaced = BudgetGateMiddleware(policy).wrap_tool_call(
+        request, lambda _request: calls.append(read) or ToolMessage(content="ok", tool_call_id=read),
+    )
+    assert surfaced.status == "error" and "repo_checkout" in str(surfaced.content)
+    assert not calls
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    assert token is not None
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", policy.scoped_actions["cultivate"])
+    assert registry.authorize_tool(read, auth, arguments=args, enforce=True, policy=policy).allowed
+    lease.revoke()
+    expired = registry.authorize_tool(read, auth, arguments=args, enforce=True, policy=policy)
+    assert not expired.allowed and expired.refusal_detail is None
+
+
+def test_expired_precheckout_grant_does_not_offer_checkout_remedy(tmp_path):
+    from mimir.plugins.manager import load_plugins
+
+    policy = load_plugins(enable="cultivate").policy
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    auth = _auth(policy, state, True)
+    grants = auth.scoped_pr_grants
+    key = ("cultivate", scope.scope_id)
+    grants._prelease[key] = replace(grants._prelease[key], expires_at=0)
+    refusal = ToolRegistry().authorize_tool(
+        "pr_metadata", auth,
+        arguments={"repository": scope.canonical_repo, "pull_request": scope.pr_number},
+        enforce=True, policy=policy,
+    )
+    assert refusal.reason == "repo_pr_grant_denied"
+    assert refusal.refusal_detail is None
+
+
+def test_unrequested_collaborator_review_recovers_in_same_poller_turn(tmp_path, monkeypatch):
+    from mimir.plugins.manager import load_plugins
+    from mimir.access_control import RepoBindingResolution
+    from mimir_cultivate import forge
+
+    policy = load_plugins(enable="cultivate").policy
+    repo, checkout_scope = _repo_and_scope(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(repo), "push", "-q", "origin", "HEAD:refs/pull/7/head"],
+        check=True,
+    )
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setattr(
+        "mimir.access_control._canonical_repo_binding_resolution",
+        lambda _name: RepoBindingResolution(
+            (str(repo.resolve()), checkout_scope.canonical_origin), (str(repo.resolve()),), 1,
+        ),
+    )
+    item = {
+        "event_type": "pr_opened", "repo": "owner/repo", "number": 7,
+        "author": "test", "pr_author_is_trusted": True,
+        "head_repo": "owner/repo", "head_remote": "origin",
+        "head_ref": checkout_scope.head_ref,
+        "head_sha": checkout_scope.observed_head_sha,
+        "base_ref": checkout_scope.base_ref,
+        "base_sha": checkout_scope.observed_base_sha,
+    }
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("repo_checkout", "pr_metadata", "pr_diff", "pr_checks",
+                      "pr_comments", "pr_submit_review", "pr_review_others"),
+        creation_path="test", policy=policy, poller_owner="cultivate",
+    )
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        service_principal=service.canonical, service_authority=service,
+        extra={"poller_name": "github-activity", "items": [item]},
+    )
+    labels = InformationFlowLabels()
+    auth = replace(
+        create_auth_context(event, policy=policy, enforce=True),
+        ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+    )
+    assert auth.repo_pr_action_scope is not None
+    state = auth.repo_pr_scope_registry.resolve("owner/repo", 7)
+    scope = state.action_scope
+    monkeypatch.setattr(forge, "_client_for_repository", lambda _repo: SimpleNamespace(
+        get_pull_request_snapshot=lambda *_: SimpleNamespace(
+            repo=scope.canonical_repo, number=scope.pr_number,
+            state="open", head_sha=scope.observed_head_sha,
+        ),
+    ))
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    gate = BudgetGateMiddleware(policy)
+    calls = []
+    args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+
+    def publish_attestation():
+        principal = "service:poller:github-activity"
+        publish_protected_result((SourceLabel(
+            principal=principal, domain="repository",
+            resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+            bridge_instance="forge", sensitivity="internal",
+            authorized_principals=frozenset({principal}),
+            source_kind="protected_tool", integrity="trusted",
+            integrity_effect="active_ingest",
+        ),))
+
+    def invoke(name, handler, **extra):
+        request = ToolCallRequest(
+            tool_call={"name": name, "args": {**args, **extra}, "id": name, "type": "tool_call"},
+            tool=policy.tools[name].factory(), state=None, runtime=Runtime(context=auth),
+        )
+        return gate.wrap_tool_call(request, handler)
+
+    def checkout(_request):
+        calls.append("repo_checkout")
+        create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+        publish_attestation()
+        return ToolMessage(content="checked out", tool_call_id="repo_checkout")
+
+    decision = ToolRegistry().authorize_tool(
+        "repo_checkout", auth, arguments=args, enforce=True, policy=policy,
+    )
+    assert decision.allowed, decision.reason
+    assert invoke("repo_checkout", checkout).status != "error"
+    for name in ("pr_metadata", "pr_diff", "pr_checks", "pr_comments"):
+        def read(_request, name=name):
+            calls.append(name)
+            publish_attestation()
+            return ToolMessage(content="review evidence", tool_call_id=name)
+
+        assert invoke(name, read).status != "error"
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    def submit(_request):
+        calls.append("pr_submit_review")
+        return ToolMessage(content="posted", tool_call_id="pr_submit_review")
+
+    assert invoke("pr_submit_review", submit, body="Reviewed", verdict="comment").status != "error"
+    assert calls == ["repo_checkout", "pr_metadata", "pr_diff", "pr_checks",
+                     "pr_comments", "pr_submit_review"]
 
 
 def test_legacy_scope_id_preserves_recorded_checkout_lease(tmp_path, monkeypatch):
