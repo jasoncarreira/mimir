@@ -177,6 +177,49 @@ def test_every_generated_run_fails_closed(kind, version):
     assert scripts and all(script.startswith('set -eu; ') for script in scripts)
 
 
+@pytest.mark.parametrize('kind, packages', [
+    ('rust', 'gcc libc6-dev binutils pkg-config'),
+    ('node', 'g++ make python3'),
+    ('python', 'gcc libc6-dev'),
+])
+def test_native_build_tools_are_installed_fail_closed(kind, packages):
+    layer = installer.render_layer(kind, '1.99.1', 'root:sha')
+    install = next(line for line in layer.splitlines() if 'apt-get install' in line)
+    assert install.startswith('RUN set -eu; ')
+    assert f'apt-get update && apt-get install -y --no-install-recommends {packages} && ' in install
+    assert 'rm -rf /var/lib/apt/lists/* && ' in install
+
+
+def test_real_image_proof_rejects_layer_without_its_own_compiler():
+    import runpy
+
+    script = Path(__file__).resolve().parents[3] / 'scripts/worklink_image_identity.py'
+    require = runpy.run_path(str(script))['require_rust_native_toolchain']
+    layer = installer.render_layer('rust', '1.90.0', 'root:sha')
+    require(layer)
+    mutated = layer.replace('apt-get install -y --no-install-recommends gcc libc6-dev binutils pkg-config && ', '')
+    assert mutated != layer
+    with pytest.raises(RuntimeError, match='omitted its native toolchain'):
+        require(mutated)
+
+
+def test_rust_layer_stops_before_rustup_if_apt_install_fails(tmp_path):
+    layer = installer.render_layer('rust', '1.99.1', 'root:sha')
+    script = next(line.removeprefix('RUN ') for line in layer.splitlines() if 'rustup-init' in line)
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    marker = tmp_path / 'curl-ran'
+    for name, body in [('dpkg', 'printf "amd64\\n"\n'),
+                       ('apt-get', 'exit 23\n'), ('curl', f'touch {marker}\n')]:
+        binary = bin_dir / name
+        binary.write_text('#!/bin/sh\n' + body)
+        binary.chmod(0o755)
+    result = subprocess.run(['/bin/sh', '-c', script],
+                            env=dict(os.environ, PATH=str(bin_dir) + ':/usr/bin:/bin'),
+                            capture_output=True, text=True)
+    assert result.returncode != 0 and not marker.exists()
+
+
 @pytest.mark.parametrize('architecture', ['amd64', 'unsupported'])
 def test_rust_layer_failed_install_cannot_be_masked_by_nextest(tmp_path, architecture):
     layer = installer.render_layer('rust', '1.99.1', 'root:sha')
@@ -895,6 +938,21 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
                f'print({("rustc " if tool == "rustc" else "v" if tool == "node" else "Python " if tool == "python" else tool + " ") + version!r})\n')
         )
         binary.chmod(0o755)
+    # A fake native compiler only links when invoked with source and -o;
+    # --version alone cannot satisfy this test.
+    compiler = {'rust': 'rustc', 'node': 'c++', 'python': 'cc'}[kind]
+    (bin_dir / compiler).write_text(
+        f'#!{sys.executable}\nimport os, json, pathlib, sys\n'
+        f'with pathlib.Path({str(marker)!r}).open("a") as out:\n'
+        ' out.write(json.dumps([pathlib.Path(sys.argv[0]).name, sys.argv[1:], dict(os.environ)]) + "\\n")\n'
+        'if "--version" in sys.argv:\n'
+        f' print({("rustc " if kind == "rust" else compiler + " ") + version!r})\n'
+        'else:\n'
+        ' output = pathlib.Path(sys.argv[sys.argv.index("-o") + 1])\n'
+        ' output.write_text("#!/bin/sh\\nexit 0\\n")\n'
+        ' output.chmod(0o755)\n'
+    )
+    (bin_dir / compiler).chmod(0o755)
     from mimir_cultivate.worklink.backends.registry import WorklinkConfig
     from mimir_cultivate.worklink.compute import _enabled_child_env
 
@@ -928,6 +986,9 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
             f' pathlib.Path({str(launch_marker)!r}).write_text(json.dumps(kwargs["env"]))\n'
             f' name = pathlib.Path(argv[0]).name\n'
             f' binary = pathlib.Path({str(bin_dir)!r}) / name\n'
+            ' if not binary.exists() and pathlib.Path(argv[0]).is_absolute():\n'
+            f'  pathlib.Path({str(tmp_path / "executed")!r}).write_text(name)\n'
+            '  binary = pathlib.Path(argv[0])\n'
             ' return real_run([str(binary), *argv[1:]], **kwargs)\n'
             'subprocess.run = launch\n'
         )
@@ -960,16 +1021,18 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
         assert observed['RUSTUP_HOME'] == '/opt/rustup'
         assert not list(cache.iterdir()), 'probe must remove its cache write test'
     launches = [json.loads(row) for row in marker.read_text().splitlines()]
-    assert [row[0] for row in launches] == (['rustc', 'cargo', 'cargo'] if kind == 'rust' else
-                                             ['node', 'npm', 'npx'] if kind == 'node' else
-                                             ['uv', 'uv', 'python'])
+    assert [row[0] for row in launches] == (['rustc', 'cargo', 'cargo', 'rustc'] if kind == 'rust' else
+                                             ['node', 'npm', 'npx', 'c++'] if kind == 'node' else
+                                             ['uv', 'uv', 'python', 'cc'])
+    assert (tmp_path / 'executed').read_text() == 'probe'
+    assert launches[-1][1][-2].endswith('/probe') and launches[-1][1][-1].endswith(('.rs', '.cc', '.c'))
     assert all(row[2]['PATH'] == '/usr/local/bin:/usr/bin:/bin' for row in launches)
     if kind == 'python':
         assert launches[1][1] == ['python', 'find', '--managed-python', '--no-python-downloads', '--no-project', version]
     homes = {row[2]['HOME'] for row in launches}
     assert len(homes) == 1 and not Path(homes.pop()).exists()
     if kind == 'rust':
-        assert launches[-1][1] == ['nextest', '--version']
+        assert launches[2][1] == ['nextest', '--version']
         # A cache that cannot accept a file must fail before version probes.
         cache.rmdir()
         cache.write_text('not a directory')
@@ -982,12 +1045,21 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
         rustc = bin_dir / 'rustc'
         rustc.write_text(f'#!{sys.executable}\nimport os, sys\n'
                          'sys.exit(7) if os.environ.get("RUSTUP_HOME") != "/opt/rustup" else None\n'
-                         f'print("rustc {version}")\n')
+                         f'print("rustc {version}") if "--version" in sys.argv else None\n'
+                         'if "-o" in sys.argv:\n'
+                         ' from pathlib import Path\n'
+                         ' binary = Path(sys.argv[sys.argv.index("-o") + 1])\n'
+                         ' binary.write_text("#!/bin/sh\\nexit 0\\n")\n'
+                         ' binary.chmod(0o755)\n')
         installer._verify_toolchain(tmp_path, kind, version)
         del config.backend_settings['opencode']['test_env']['RUSTUP_HOME']
         with pytest.raises(installer.SetupError, match='toolchain_missing: rustc'):
             installer._verify_toolchain(tmp_path, kind, version)
         config.backend_settings['opencode']['test_env']['RUSTUP_HOME'] = '/opt/rustup'
+        rustc.write_text(f'#!{sys.executable}\nimport sys\n'
+                         f'print("rustc {version}") if "--version" in sys.argv else None\n')
+        with pytest.raises(installer.SetupError, match='toolchain_missing: cc'):
+            installer._verify_toolchain(tmp_path, kind, version)
     (bin_dir / missing).unlink()
     with pytest.raises(installer.SetupError, match='toolchain_missing: ' + missing):
         installer._verify_toolchain(tmp_path, kind, version)

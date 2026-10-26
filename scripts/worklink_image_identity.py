@@ -350,6 +350,13 @@ def source_ref() -> str:
     return tracked_ref
 
 
+def require_rust_native_toolchain(layer: str) -> None:
+    # The root image may acquire a compiler independently; require this
+    # child layer to provide the tools whose linking is proved below.
+    if 'apt-get install -y --no-install-recommends gcc libc6-dev binutils pkg-config && ' not in layer:
+        raise RuntimeError('generated Rust layer omitted its native toolchain')
+
+
 def main() -> None:
     repo = os.environ.get("WORKLINK_REPO", "").strip()
     if not repo or not Path(repo).is_absolute():
@@ -389,6 +396,7 @@ def main() -> None:
                      '/opt/mimir-worklink/venv/bin/python', IMAGE, '-c',
                      'from mimir_cultivate.setup import render_layer; '
                      f'print(render_layer("rust", "1.90.0", {IMAGE!r}))']).stdout
+        require_rust_native_toolchain(layer)
         run(['docker', 'build', '--file', '-', '--tag', IMAGE, '.'],
             input_text=layer, timeout=1200)
         run([
