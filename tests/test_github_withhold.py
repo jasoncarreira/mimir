@@ -126,6 +126,13 @@ def test_sanitize_url_keeps_only_exact_expected_repo() -> None:
     assert sanitize_url(url, "owner/repo|other") is None
 
 
+def test_sanitize_url_accepts_github_repo_case_only() -> None:
+    url = "https://github.com/SquashMerge/trellis/pull/357"
+    assert sanitize_url(url, "squashmerge/trellis") == url
+    assert sanitize_url(url.replace("/trellis/", "/other/"), "squashmerge/trellis") is None
+    assert sanitize_url(url.replace("github.com/", "github.com.evil/"), "squashmerge/trellis") is None
+
+
 @pytest.mark.parametrize("value", [
     "2026-10-10 12:34:56Z", "2026-10-10T12:34:56+00:00",
     "2026-10-10T12:34:56Z injected", "2026-10-10T12:34Z",

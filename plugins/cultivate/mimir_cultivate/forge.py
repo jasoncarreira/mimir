@@ -2013,7 +2013,7 @@ def _publish_scoped_error(runtime: ToolRuntime[AuthContext] | None, scope: RepoP
         context is None or context.ifc_state is None or not author
         or scope.head_repo != scope.canonical_repo
         or scope.head_remote != "origin"
-        or _github_repo_from_remote(scope.canonical_origin) != scope.canonical_repo
+        or (_github_repo_from_remote(scope.canonical_origin) or "").casefold() != scope.canonical_repo.casefold()
         or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
     ):
         return
@@ -2124,6 +2124,33 @@ def _publish_write_projection(runtime: ToolRuntime[AuthContext] | None, scope: R
         log.warning("forge write completed; result attestation unavailable")
 
 
+def _check_url_matches_scope(url: str, scope: RepoPRActionScope) -> bool:
+    from urllib.parse import unquote, urlsplit
+
+    if not url.startswith("https://github.com/"):
+        return False
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    parts = parsed.path.split("/")
+    if (parsed.scheme != "https" or parsed.netloc != "github.com"
+            or len(parts) < 4 or parts[0] != ""
+            or "/".join(parts[1:3]).casefold() != scope.canonical_repo.casefold()):
+        return False
+    for part in parts[1:]:
+        # A browser can decode path components before resolving dot segments.
+        # Never attest a URL that could escape the checked repository prefix.
+        while True:
+            decoded = unquote(part)
+            if decoded in {".", ".."} or (decoded != part and ("/" in decoded or "\\" in decoded)):
+                return False
+            if decoded == part:
+                break
+            part = decoded
+    return True
+
+
 def _safe_check_projection(check: Any, scope: RepoPRActionScope) -> bool:
     url = check.details_url
     return (
@@ -2131,8 +2158,7 @@ def _safe_check_projection(check: Any, scope: RepoPRActionScope) -> bool:
         and (check.conclusion is None or isinstance(check.conclusion, str)
              and check.conclusion in _CHECK_CONCLUSIONS)
         and isinstance(check.name, str) and _CHECK_NAME.fullmatch(check.name) is not None
-        and (url is None or isinstance(url, str)
-             and url.startswith(f"https://github.com/{scope.canonical_repo}/"))
+        and (url is None or isinstance(url, str) and _check_url_matches_scope(url, scope))
     )
 
 
@@ -2664,7 +2690,7 @@ def _trusted_ci_head(context: AuthContext, repository: str, run: dict[str, Any])
 def _github_origin_matches(scope: RepoPRActionScope) -> bool:
     from mimir.access_control import _github_repo_from_remote
 
-    return _github_repo_from_remote(scope.canonical_origin) == scope.canonical_repo
+    return (_github_repo_from_remote(scope.canonical_origin) or "").casefold() == scope.canonical_repo.casefold()
 
 
 @tool

@@ -221,6 +221,7 @@ def test_unrequested_collaborator_review_recovers_in_same_poller_turn(tmp_path, 
     from mimir.plugins.manager import load_plugins
     from mimir.access_control import RepoBindingResolution
     from mimir_cultivate import forge
+    from mimir_cultivate.forge import CheckProjection, PullRequestProjection
 
     policy = load_plugins(enable="cultivate").policy
     repo, checkout_scope = _repo_and_scope(tmp_path)
@@ -228,7 +229,7 @@ def test_unrequested_collaborator_review_recovers_in_same_poller_turn(tmp_path, 
         ["git", "-C", str(repo), "push", "-q", "origin", "HEAD:refs/pull/7/head"],
         check=True,
     )
-    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("GITHUB_REPOS", "SquashMerge/trellis")
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
     monkeypatch.setattr(
         "mimir.access_control._canonical_repo_binding_resolution",
@@ -237,9 +238,9 @@ def test_unrequested_collaborator_review_recovers_in_same_poller_turn(tmp_path, 
         ),
     )
     item = {
-        "event_type": "pr_opened", "repo": "owner/repo", "number": 7,
+        "event_type": "pr_opened", "repo": "SquashMerge/trellis", "number": 7,
         "author": "test", "pr_author_is_trusted": True,
-        "head_repo": "owner/repo", "head_remote": "origin",
+        "head_repo": "SquashMerge/trellis", "head_remote": "origin",
         "head_ref": checkout_scope.head_ref,
         "head_sha": checkout_scope.observed_head_sha,
         "base_ref": checkout_scope.base_ref,
@@ -266,14 +267,29 @@ def test_unrequested_collaborator_review_recovers_in_same_poller_turn(tmp_path, 
         ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
     )
     assert auth.repo_pr_action_scope is not None
-    state = auth.repo_pr_scope_registry.resolve("owner/repo", 7)
+    state = auth.repo_pr_scope_registry.resolve("squashmerge/trellis", 7)
     scope = state.action_scope
-    monkeypatch.setattr(forge, "_client_for_repository", lambda _repo: SimpleNamespace(
+    client = SimpleNamespace(
         get_pull_request_snapshot=lambda *_: SimpleNamespace(
             repo=scope.canonical_repo, number=scope.pr_number,
             state="open", head_sha=scope.observed_head_sha,
         ),
-    ))
+        get_pull_request=lambda _: PullRequestProjection(
+            7, "Title", "open", "test", False, "main", "worklink/7",
+            scope.observed_head_sha, True, "created", "updated",
+        ),
+        author_is_trusted=lambda *_: True,
+        list_checks=lambda _: (
+            CheckProjection("test (ubuntu-latest)", "completed", "success", None, None,
+                            "https://github.com/SquashMerge/trellis/actions/runs/40411654556/job/1"),
+            CheckProjection("test (macos-latest)", "completed", "success", None, None,
+                            "https://github.com/SquashMerge/trellis/actions/runs/40411654556/job/2"),
+        ),
+    )
+    monkeypatch.setattr(forge, "_client_for_repository", lambda _repo: client)
+    # The local fixture uses a bare file:// origin; this test exercises the
+    # bound review turn while origin validation is covered separately.
+    monkeypatch.setattr(forge, "_github_origin_matches", lambda _: True)
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
     assert not auth.ifc_state.has_untrusted_active_ingest()
     gate = BudgetGateMiddleware(policy)
@@ -312,7 +328,14 @@ def test_unrequested_collaborator_review_recovers_in_same_poller_turn(tmp_path, 
     for name in ("pr_metadata", "pr_diff", "pr_checks", "pr_comments"):
         def read(_request, name=name):
             calls.append(name)
-            publish_attestation()
+            if name == "pr_checks":
+                checks = forge.pr_checks.func(
+                    scope.canonical_repo, scope.pr_number,
+                    runtime=Runtime(context=auth),
+                )
+                assert len(checks) == 2
+            else:
+                publish_attestation()
             return ToolMessage(content="review evidence", tool_call_id=name)
 
         assert invoke(name, read).status != "error"

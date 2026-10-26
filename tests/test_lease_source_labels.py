@@ -1706,7 +1706,7 @@ def test_ci_classifier_refuses_nonretained_plugin_provenance(monkeypatch, tool_n
     ("head_repo", "outsider/fork", "or scope.head_repo != scope.canonical_repo"),
     ("head_remote", "upstream", 'or scope.head_remote != "origin"'),
     ("canonical_origin", "https://github.com/outsider/repo.git",
-     "or _github_repo_from_remote(scope.canonical_origin) != scope.canonical_repo"),
+     'or (_github_repo_from_remote(scope.canonical_origin) or "").casefold() != scope.canonical_repo.casefold()'),
     ("checkout_ref", "refs/pull/8/head",
      'or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")'),
 ])
