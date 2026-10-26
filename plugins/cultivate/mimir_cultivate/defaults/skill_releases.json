@@ -85,5 +85,39 @@
       "tests/test_github_poller_withhold.py": "77cedc5e891bad03a401e1548238097ae83cf423b91d7275db4fbce16d29e209"
     },
     "review": {"SKILL.md": "4f7ad9820fdc71beb03371edcae5cdd5ed8509cac8a5bde02b85af9e1890b8f0"}
+  },
+  "0.9.10-2025": {
+    "github-poller": {
+      "SKILL.md": "b5d67d576819d97b3e1e4bbc55c2f602e31764b9d1d42060d14b494b34a6123b",
+      "pollers.json": "273c2d13e8f8fcf7f353d5d9107a729cbd522819ebd2897f0608492353e1d243",
+      "scripts/hooks.py": "2cbfc1ddc10f0ff808bb6da032e55e9bc76526012efb4779e4d235da41399335",
+      "scripts/poller.py": "a6ed2a027baedf58f98baf5d66ee65654139f092e3d5d8960ca9fce06ed2c5db",
+      "tests/conftest.py": "06c6fdd21e3fe55ee2e29085aefb21740cf9941ad0bba4a5499056d662816de1",
+      "tests/github_poller_test_support.py": "43bba3c7a2dc4f741aa090dd4c23bb01a2457413ff7a3e4bd6d552aa57756fab",
+      "tests/test_github_poller_changes_requested.py": "bea0e7d4db2638b6e6735ddfbb9b61b64349e42b8e292ba44c4dfd3c517930f2",
+      "tests/test_github_poller_ci_failures.py": "28e0988e8820647ed6b6a01730fd0ead59f8985b220a01f9e536ad1e1bf55ed0",
+      "tests/test_github_poller_ci_logs.py": "b517316e2db9c6a805257660a5645c9aeeee6035699902a0303c4d565d122c5b",
+      "tests/test_github_poller_event_coalescing.py": "0caef493043d07e209f3b9e19fd28ff2ad0da870d5ef73cbf1f700d93d0498f5",
+      "tests/test_github_poller_mergeability.py": "88a30924512f8df77b9ad0dd0afd5ab5d8343190d44d85b8daa533fb7031d1d1",
+      "tests/test_github_poller_pr_pushes.py": "00825f7dcc6c055d37f6e1d87e212ab3dfaf684fcb30f5e277b15476e6b91ff9",
+      "tests/test_github_poller_pr_scope_snapshot.py": "a864a97259d8e1613a741b4f995e6352a2b967ddec000b7cec2397c19cb6d8a2",
+      "tests/test_github_poller_pr_trust.py": "58fade4ccb673e234cc75e514afc7712cc9b8c0ca9dba919d44d1e80153a7af4",
+      "tests/test_github_poller_windows.py": "6137357e7d82133fe9d026f29952b994e21fe5d9ba3b6c59ce2ea274e574e604",
+      "tests/test_github_poller_withhold.py": "77cedc5e891bad03a401e1548238097ae83cf423b91d7275db4fbce16d29e209"
+    },
+    "github-ci-watch": {
+      "SKILL.md": "ff502554b1aaa77f6ba62859850429b5acd2400a9733fea1e8214a029f51830d",
+      "pollers.json": "c2ab19c68ba514fe74ba12decbc368a34b943df2a580d08579096b2b42cc45c0",
+      "scripts/ci_logs.py": "897902c578741b17b8987da7bd4126a9f918198df05148f4f981c6b012f68c87",
+      "scripts/poller.py": "8f600defe469eea2d0445136a5da31ae430b9a65cab054b9a1bcbd9b5eec8c14",
+      "tests/conftest.py": "0ad004f92857df903eb394bdd197d1d7a946cd1a40a82e2e3c07510e911437da",
+      "tests/github_ci_test_support.py": "02b3334cfeb6a73641cdeeb8ad413fdbc5716fda63b94122cff2b0d6b356cf87",
+      "tests/test_ci_logs.py": "ea1b6bd17544651441d4b1aff24716d479aed0e1057298a8bf4832fe39320a77",
+      "tests/test_ci_state.py": "19967b370dacfe8a65829637e3c9d6ba0b4991cd6b538aec5a6d6f17b85b3964",
+      "tests/test_ci_watch_attention.py": "941aada8f3b8f02187dd54ef3369b32f89be260f8734e9dc926263fee03b7a1d",
+      "tests/test_github_ci_watch.py": "aa1d9cba4f82e4c72c84a511c94bb51d031a348b77057624f7390856f366e43d"
+    },
+    "github": {"SKILL.md": "12229c5e5fe051300b7214bc59ff88edf464311b5b08d40ed372b5dcede29129"},
+    "review": {"SKILL.md": "aeb6a2bf74b0775c0f3a2a6717203cc6f31f77befaa11d5f7e09e55f377bbaa1"}
   }
 }

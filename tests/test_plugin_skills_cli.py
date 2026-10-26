@@ -272,6 +272,7 @@ def test_previous_release_inventory_rejects_drift(tmp_path, path, drift):
 @pytest.mark.parametrize("edit", ["none", "doc", "manifest"])
 def test_real_previous_release_poller_seeds_keep_running(tmp_path, monkeypatch, capsys, edit):
     pytest.importorskip("mimir_cultivate")
+    import re
     monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setenv("GITHUB_REPOS", "o/r")
     manager = load_plugins(enable="cultivate")
@@ -338,7 +339,9 @@ def test_real_previous_release_poller_seeds_keep_running(tmp_path, monkeypatch, 
         for name in _PRE_OPTIONAL_SKILLS:
             if expected_states[name] == "upgrade available":
                 assert f"upgraded skill cultivate:{name}" in output
-                backup, = (tmp_path / ".mimir/plugin-skill-backups").glob(f"cultivate-{name}-*")
+                # github is also a prefix of github-poller and github-ci-watch.
+                backup, = (path for path in (tmp_path / ".mimir/plugin-skill-backups").glob(f"cultivate-{name}-*")
+                           if re.fullmatch(rf"cultivate-{re.escape(name)}-\d{{8}}T\d{{12}}Z", path.name))
                 assert (backup / "SKILL.md").read_bytes() == released[f"{name}/SKILL.md"]
             else:
                 assert f"cultivate:{name}: installed (skipped)" in output

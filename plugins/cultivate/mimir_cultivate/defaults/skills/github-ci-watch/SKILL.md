@@ -4,8 +4,8 @@ description: "Watch GitHub Actions runs on the main branch of configured reposit
 env:
   required:
     - name: GITHUB_REPOS
-      description: "Comma-separated owner/repo list to watch CI on (e.g. jasoncarreira/mimir,jasoncarreira/mimirbot)."
-      example: "jasoncarreira/mimir"
+      description: "Comma-separated owner/repo list to watch CI on (e.g. owner/repo,owner/another-repo)."
+      example: "owner/repo"
   optional:
     - name: GITHUB_TOKEN
       description: "GitHub PAT with repo scope. Falls back to ``gh auth token`` when unset."
@@ -13,6 +13,10 @@ env:
 ---
 
 # Cultivate GitHub CI Watch — react when CI breaks
+
+Use the repository named in the PR URL or triggering event; for configured
+watches, use the matching entry in `GITHUB_REPOS`. Replace `<owner>/<repo>`
+with that repository (`owner/repo` in examples).
 
 A selected Cultivate poller skill. It is absent from core; installations
 selecting `mimir-cultivate` with `MIMIR_PLUGINS=cultivate` seed it under
