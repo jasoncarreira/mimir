@@ -1169,6 +1169,12 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     -- <prompt>` and interprets its output."""
     monkeypatch.setenv("MIMIR_PLUGINS", "")
     calls: list[dict[str, Any]] = []
+    binary = tmp_path / "controller/bin/opencode"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr(opencode_module, "IMAGE_OPENCODE_BIN", tmp_path / "absent-image-bin")
+    monkeypatch.setattr(opencode_module.shutil, "which", lambda name: str(binary) if name == "opencode" else None)
 
     async def fake_exec(*args: str, **kwargs: Any) -> FakeProcess:
         calls.append({"args": args, "kwargs": kwargs})
@@ -1220,7 +1226,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
 
     assert result.backend_status == "success"
     assert calls[0]["args"] == (
-        opencode_module.resolve_opencode_binary(), "run", "--dir", str(order.checkout),
+        str(binary), "run", "--dir", str(order.checkout),
         "-m", "openai/gpt-5.6-luna", "--variant", "high", "--", "-starts with dash"
     )
     assert calls[0]["args"].count("-m") == 1

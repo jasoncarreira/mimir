@@ -347,6 +347,9 @@ def main() -> None:
             # The worker exists only in a Cultivate image; select the in-repo
             # plugin so this proof exercises it from the same commit.
             "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate",
+            # Setup's leaf-executable proof must run the real pinned OpenCode,
+            # not only the fake protocol CLIs used by the other proofs below.
+            "--build-arg", "MIMIR_ENABLE_OPENCODE=1",
             "--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build",
             "--tag", IMAGE, ".",
         ], timeout=1200)
@@ -408,6 +411,30 @@ PY
             raise RuntimeError(f"live mimir service is not uid 1001\n{process_table}")
         if not any(uid == "0" and "mimir_cultivate.worklink.worker_exec" in cmd for _, uid, cmd in rows):
             raise RuntimeError(f"live worker executor is not root\n{process_table}")
+
+        # Exercise setup's real generated probes before any fake OpenCode is
+        # installed below. Only Docker's transport is adapted: the production
+        # argv, named users, private controller venv and installed CLI are real.
+        docker_exec('/opt/mimir-worklink/venv/bin/python', '-c', r'''
+import subprocess
+from pathlib import Path
+from mimir_cultivate import setup
+
+calls = []
+def local_exec(argv, *, cwd):
+    assert argv[:4] == ['docker', 'compose', 'exec', '-T']
+    assert argv[4:9] in (['-u', 'mimir', '-w', '/tmp', 'agent'],
+                         ['-u', 'worklink', '-w', '/tmp', 'agent'])
+    calls.append(argv[5])
+    result = subprocess.run(['/command/s6-setuidgid', argv[5], *argv[9:]],
+                            cwd='/tmp', capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+setup._run = local_exec
+setup._verify_opencode_binary(Path('/tmp'))
+assert calls == ['mimir', 'worklink']
+print('real-image setup OpenCode probe passed')
+''')
 
         setup = r"""
             set -eu
@@ -602,6 +629,9 @@ PY
             input_text=SPAWN_PROOF,
         )
         docker_exec(
+            # This separate protocol proof intentionally uses its fake CLI,
+            # not the real /opt installation exercised by the setup probe.
+            "env", "PATH=/usr/local/bin:/usr/bin:/bin",
             "/opt/mimir-worklink/venv/bin/python", "/tmp/worklink-spawn-proof.py",
             user="mimir",
         )

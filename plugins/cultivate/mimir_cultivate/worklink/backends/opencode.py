@@ -60,6 +60,8 @@ def resolve_opencode_binary(bin_name: str = "opencode") -> str:
     # Keep the image-owned symlink in argv[0]; its target is an npm package
     # under the same prefix and is named opencode.exe, not opencode.
     return str(candidate if candidate.is_absolute() else resolved)
+
+
 DERIVABLE_TEST_RUNNERS: frozenset[str] = frozenset({
     "bun",
     "cargo",

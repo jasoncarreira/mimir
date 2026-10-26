@@ -477,8 +477,11 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
             with redirect_stdout(output):
                 exec(compile(argv[-1], "<executor-verification>", "exec"), {})
             return output.getvalue().strip()
-        if "resolve_opencode_binary" in argv[-1]:
-            assert argv[4:7] == ["--user", "1002:1002", "agent"]
+        if argv[-1] == installer._OPENCODE_RESOLVE_PROBE:
+            assert argv[4:8] == ["-u", "mimir", "-w", "/tmp"]
+            return "/opt/mimir-opencode/bin/opencode"
+        if installer._OPENCODE_WORKER_PROBE in argv:
+            assert argv[4:8] == ["-u", "worklink", "-w", "/tmp"]
             return pending["binary"]
         return json.dumps(pending["alerts"])
 
@@ -523,46 +526,72 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
 
 
-def test_setup_binary_probe_executes_with_worker_path(tmp_path, monkeypatch):
-    from mimir_cultivate.worklink.backends import opencode as backend
-    binary = tmp_path / "opt/mimir-opencode/bin/opencode"
-    marker = tmp_path / "version-invoked"
-    binary.parent.mkdir(parents=True)
-    binary.write_text(f"#!/bin/sh\ntest \"$1\" = --version || exit 2\nprintf ok > {marker}\n")
+@pytest.mark.parametrize("outcome", ["ok", "nonzero", "missing", "timeout"])
+def test_setup_binary_probe_executes_with_worker_path(tmp_path, monkeypatch, outcome):
+    import subprocess
+    import sys
+
+    binary = tmp_path / "opencode"
+    marker = tmp_path / "probe-environment.json"
+    binary.write_text(
+        f"#!{sys.executable}\nimport json, os, pathlib, sys\n"
+        "assert sys.argv[1:] == ['--version']\n"
+        "home = pathlib.Path(os.environ['HOME'])\n"
+        "assert home.is_dir() and home.stat().st_mode & 0o777 == 0o700\n"
+        "assert os.environ['PATH'] == '/usr/local/bin:/usr/bin:/bin'\n"
+        "for key, suffix in [('XDG_CONFIG_HOME', '.config'), ('XDG_DATA_HOME', '.local/share'), ('XDG_CACHE_HOME', '.cache')]:\n"
+        " assert os.environ[key] == str(home / suffix)\n"
+        " (home / suffix).mkdir(parents=True, exist_ok=True)\n"
+        f"pathlib.Path({str(marker)!r}).write_text(json.dumps(dict(os.environ)))\n"
+        f"sys.exit({1 if outcome == 'nonzero' else 0})\n"
+    )
     binary.chmod(0o755)
-    monkeypatch.setattr(backend, "IMAGE_OPENCODE_BIN", binary)
-    monkeypatch.setattr(backend.shutil, "which", lambda name: None)
+    if outcome == "missing":
+        binary.unlink()
+    real_run = subprocess.run
     captured = []
 
     def run(argv, *, cwd):
-        if "resolve_opencode_binary" in argv[-1]:
-            captured.append(argv)
-            output = io.StringIO()
-            with redirect_stdout(output):
-                exec(compile(argv[-1], "<binary-probe>", "exec"), {})
-            return output.getvalue().strip()
-        if "plugins" in argv:
-            return json.dumps([{"name": "cultivate", "enabled": True}])
-        if "verify_executor_identity" in argv[-1] or "resolve_opencode_invocation" in argv[-1]:
-            return "ok"
-        return "[]"
+        captured.append(argv)
+        if argv[-1] == installer._OPENCODE_RESOLVE_PROBE:
+            assert argv[4:8] == ['-u', 'mimir', '-w', '/tmp']
+            assert argv[9] == '/home/mimir/venv/bin/python'
+            return str(binary)
+        assert argv[4:8] == ['-u', 'worklink', '-w', '/tmp']
+        assert argv[9] == '/usr/local/bin/python'
+        assert argv[-2:] == [installer._OPENCODE_WORKER_PROBE, str(binary)]
+        # A clean interpreter cannot import the plugin, just like system Python
+        # under worklink. Timeout is injected only at the subprocess boundary.
+        code = argv[-2]
+        if outcome == 'timeout':
+            code = "import subprocess\ndef timed_out(*a, **kw):\n raise subprocess.TimeoutExpired(a[0], 15)\nsubprocess.run = timed_out\n" + code
+        result = real_run([sys.executable, '-I', '-S', '-c', code, str(binary)],
+                          capture_output=True, text=True, check=True)
+        return result.stdout.strip()
 
-    monkeypatch.setattr(installer, "_run", run)
-    histories = iter([[], [{"role": "assistant", "text": "ok"}],
-                      [], [{"role": "assistant", "text": "ok"}]])
-    monkeypatch.setattr(installer, "_http", lambda url, **kw: (
-        {"ok": True} if url.endswith("/health") else
-        {"data": {"pollers": [{"name": p, "next_run_at": "now"} for p in (
-            "github-activity", "github-ci-watch", "worklink-ready-queue")]}} if url.endswith("/scheduler") else
-        {"data": {"messages": next(histories)}} if url.endswith("/history") else
-        {"ok": True}
-    ))
-    installer._verify(tmp_path, 8123, "org/repo", "owner-key")
-    assert len(captured) == 1
-    assert marker.read_text() == "ok"
-    binary.chmod(0o644)
-    with pytest.raises(installer.SetupError, match="opencode_missing"):
-        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    monkeypatch.setattr(installer, '_run', run)
+    if outcome == 'ok':
+        installer._verify_opencode_binary(tmp_path)
+    else:
+        with pytest.raises(installer.SetupError, match='opencode_missing'):
+            installer._verify_opencode_binary(tmp_path)
+    assert len(captured) == 2
+    if outcome in {'ok', 'nonzero'}:
+        assert marker.exists(), 'positive control must execute the CLI body'
+        env = json.loads(marker.read_text())
+        assert not Path(env['HOME']).exists(), 'probe must clean up on success and nonzero exit'
+
+
+def test_setup_binary_resolution_failure_does_not_launch_worker(tmp_path, monkeypatch):
+    calls = []
+    def run(argv, *, cwd):
+        calls.append(argv)
+        return 'opencode_missing'
+    monkeypatch.setattr(installer, '_run', run)
+    with pytest.raises(installer.SetupError, match='opencode_missing'):
+        installer._verify_opencode_binary(tmp_path)
+    assert len(calls) == 1
+    assert calls[0][-1] == installer._OPENCODE_RESOLVE_PROBE
 
 
 def test_existing_env_never_overwrites_operator_secrets(tmp_path):
