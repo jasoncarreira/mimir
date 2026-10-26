@@ -672,48 +672,92 @@ def test_setup_binary_probe_executes_with_worker_path(
         assert not marker.exists(), 'failed launches must not execute the CLI body'
 
 
-@pytest.mark.parametrize('model, listed', [
-    ('openai/gpt-6.1-sol', True), ('openai/gpt-6.1-sol-fast', False),
+@pytest.mark.parametrize('runtime_injected', [False, True])
+@pytest.mark.parametrize('outcome', ['listed', 'unknown', 'nonzero', 'missing', 'timeout'])
+@pytest.mark.parametrize('provider, model', [
+    ('openai', 'openai/gpt-6.1-sol'), ('anthropic', 'anthropic/claude-haiku-5-5'),
 ])
-def test_setup_model_probe_uses_isolated_worker_cli(tmp_path, monkeypatch, model, listed):
+def test_setup_model_probe_uses_isolated_worker_cli(
+    tmp_path, monkeypatch, provider, model, outcome, runtime_injected
+):
+    from mimir_cultivate.contained_execution import (
+        base_worker_environment,
+        opencode_worker_environment,
+    )
+
     binary = tmp_path / 'opencode'
     marker = tmp_path / 'model-probe.json'
+    launch_marker = tmp_path / 'model-launch-environment.json'
     binary.write_text(
         f'#!{sys.executable}\nimport json, os, pathlib, sys\n'
-        "assert sys.argv[1:] == ['models', 'openai']\n"
+        + ("os.environ['TEST_RUNTIME_ADDED'] = 'runtime-only'\n" if runtime_injected else '')
+        + f"assert sys.argv[1:] == ['models', {provider!r}]\n"
         "home = pathlib.Path(os.environ['HOME'])\n"
         "assert home.is_dir() and home.stat().st_mode & 0o777 == 0o700\n"
         f'pathlib.Path({str(marker)!r}).write_text(json.dumps(dict(os.environ)))\n'
-        "print('openai/gpt-6.1-sol')\nprint('openai/gpt-6-luna')\n"
+        # A prefix-only match must not satisfy the exact model check.
+        f"print({model + '-fast'!r})\n"
+        + (f"print({model!r})\n" if outcome != 'unknown' else '')
+        + f"sys.exit({1 if outcome == 'nonzero' else 0})\n"
     )
     binary.chmod(0o755)
+    if outcome == 'missing':
+        binary.unlink()
     real_run = subprocess.run
     captured = []
+    monkeypatch.setenv('OPENAI_API_KEY', 'private-openai-key')
+    monkeypatch.setenv('ANTHROPIC_API_KEY', 'private-anthropic-key')
 
     def run(argv, *, cwd):
         captured.append(argv)
         assert cwd == tmp_path
         assert argv[:10] == ['docker', 'compose', 'exec', '-T', '-u', 'worklink',
                              '-w', '/tmp', 'agent', '/usr/local/bin/python']
-        assert argv[-4:] == [installer._OPENCODE_MODEL_PROBE, str(binary), 'openai', model]
-        result = real_run([sys.executable, '-I', '-S', '-c', argv[-4], *argv[-3:]],
+        assert argv[-4:] == [installer._OPENCODE_MODEL_PROBE, str(binary), provider, model]
+        # Capture the exact launch mapping before the child runtime can add
+        # platform variables. Execute the unmodified stdlib-only setup payload.
+        recorder = (
+            'import json, pathlib, subprocess\n'
+            'real_run = subprocess.run\n'
+            'def record_launch(*args, **kwargs):\n'
+            f' pathlib.Path({str(launch_marker)!r}).write_text(json.dumps(kwargs["env"]))\n'
+            + (' raise subprocess.TimeoutExpired(args[0], 30)\n' if outcome == 'timeout'
+               else ' return real_run(*args, **kwargs)\n')
+            + 'subprocess.run = record_launch\n'
+        )
+        result = real_run([sys.executable, '-I', '-S', '-c', recorder + argv[-4], *argv[-3:]],
                           capture_output=True, text=True, check=True)
         return result.stdout.strip()
 
     monkeypatch.setattr(installer, '_run', run)
-    if listed:
+    if outcome == 'listed':
         installer._verify_opencode_model(tmp_path, str(binary), model)
     else:
         with pytest.raises(installer.SetupError, match=f'opencode_model_unknown.*{re.escape(model)}'):
             installer._verify_opencode_model(tmp_path, str(binary), model)
     assert len(captured) == 1
-    env = json.loads(marker.read_text())
-    assert env['PATH'] == '/usr/local/bin:/usr/bin:/bin'
-    assert env['USER'] == 'worklink'
-    assert env['OPENCODE_CONFIG'] == env['XDG_CONFIG_HOME'] + '/opencode/opencode.json'
-    assert not Path(env['HOME']).exists()
-    assert env['OPENAI_API_KEY'] == 'model-catalog-probe'
-    assert 'ANTHROPIC_API_KEY' not in env
+    assert launch_marker.exists(), 'every outcome must reach the subprocess boundary'
+    launch_env = json.loads(launch_marker.read_text())
+    base = base_worker_environment('setup-model-probe-parity')
+    runtime_home = str(Path(base['XDG_CONFIG_HOME']).parent)
+    expected = opencode_worker_environment(base, {})
+    expected = {key: value.replace(runtime_home, launch_env['HOME'])
+                for key, value in expected.items()}
+    expected['HOME'] = launch_env['HOME']
+    # The inert catalog key is the ONLY permitted difference from the worker.
+    expected[provider.upper() + '_API_KEY'] = 'model-catalog-probe'
+    assert launch_env == expected
+    assert not Path(launch_env['HOME']).exists(), 'probe must clean up after every outcome'
+    if outcome in {'listed', 'unknown', 'nonzero'}:
+        assert marker.exists(), 'positive control must execute the CLI body'
+        observed_env = json.loads(marker.read_text())
+        for key, value in expected.items():
+            assert observed_env[key] == value
+        if runtime_injected:
+            assert observed_env['TEST_RUNTIME_ADDED'] == 'runtime-only'
+            assert 'TEST_RUNTIME_ADDED' not in launch_env
+    else:
+        assert not marker.exists(), 'failed launches must not execute the CLI body'
 
 
 def test_real_image_probe_adapter_accepts_actual_setup_argv(monkeypatch):

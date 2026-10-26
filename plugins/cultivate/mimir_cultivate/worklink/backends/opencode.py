@@ -756,12 +756,13 @@ def _error_from_status(
 
 def _unknown_error_detail(stderr: str) -> str | None:
     """Extract OpenCode's UnknownError JSON and its preceding diagnostic log."""
-    lines = stderr.splitlines()
+    lines = _ANSI_CSI.sub("", stderr).splitlines()
     for index, line in enumerate(lines):
-        if line.strip() != "{":
+        start = line.find("{")
+        if start < 0:
             continue
         try:
-            payload = json.loads("\n".join(lines[index:]))
+            payload, _ = json.JSONDecoder().raw_decode("\n".join([line[start:], *lines[index + 1:]]))
         except ValueError:
             continue
         if not isinstance(payload, dict) or payload.get("name") != "UnknownError":

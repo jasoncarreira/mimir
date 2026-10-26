@@ -1548,29 +1548,29 @@ def test_opencode_provider_auth_quotes_evidence_line(line: str, evidence: str) -
 
 
 @pytest.mark.parametrize('cause', ['',
-    '2026-10-26T12:00:00 level=ERROR service=session error=ProviderModelNotFoundError: Model not found: openai/gpt-6.1-sol\n',
+    'level=ERROR service=session message=failed ref=err_1cfd5f57 '
+    'error="ProviderModelNotFoundError: Model not found: openai/gpt-6.1-sol"\n',
 ])
-def test_opencode_unknown_error_reports_json_and_diagnostic(cause: str) -> None:
-    from mimir_cultivate.worklink.backends.opencode import _error_from_status
+@pytest.mark.parametrize('trailing', ['', '\nadditional shutdown diagnostic\n'])
+def test_opencode_unknown_error_reports_json_and_diagnostic(cause: str, trailing: str) -> None:
+    from mimir_cultivate.worklink.backends.opencode import _error_from_status, _unknown_error_detail
 
+    # Verbatim observed trellisbot stderr: ANSI Error: prefix shares the opening
+    # JSON line, and the reference lives inside data, not at the top level.
     stderr = cause + (
-        '{\n'
+        '\x1b[91m\x1b[1mError: \x1b[0m{\n'
         '  "name": "UnknownError",\n'
         '  "data": {\n'
-        '    "message": "Unexpected server error. Check server logs for details."\n'
-        '  },\n'
-        '  "ref": "oc-error-123"\n'
+        '    "message": "Unexpected server error. Check server logs for details.",\n'
+        '    "ref": "err_1cfd5f57"\n'
+        '  }\n'
         '}\n'
-    )
-    message = _error_from_status('failed', '', stderr)
-    assert message is not None
-    assert 'Unexpected server error. Check server logs for details.' in message
-    assert 'ref: oc-error-123' in message
+    ) + trailing
+    expected = 'Unexpected server error. Check server logs for details. | ref: err_1cfd5f57'
     if cause:
-        assert 'ProviderModelNotFoundError: Model not found: openai/gpt-6.1-sol' in message
-    else:
-        assert 'ProviderModelNotFoundError' not in message
-    assert message != '}'
+        expected = cause.strip() + ' | ' + expected
+    assert _unknown_error_detail(stderr) == expected
+    assert _error_from_status('failed', '', stderr) == expected
 
 
 def test_opencode_unknown_error_scrubs_diagnostic_and_ref() -> None:
