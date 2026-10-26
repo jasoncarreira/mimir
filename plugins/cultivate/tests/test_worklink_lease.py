@@ -113,6 +113,8 @@ def test_selected_worker_leaf_checkout_is_path_addressed_like_base(
     git("init", "-b", "main", str(repo))
     git("-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.org",
         "commit", "--allow-empty", "-m", "initial")
+    git("-C", str(repo), "config", "--local", "user.name", "Test")
+    git("-C", str(repo), "config", "--local", "user.email", "test@example.org")
     git("-C", str(repo), "remote", "add", "origin", str(repo))
     calls: list[list[str]] = []
 
@@ -157,6 +159,8 @@ def test_selected_worker_checkout_refuses_replaced_checkout_symlink(
     subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test",
                     "-c", "user.email=test@example.org", "commit", "--allow-empty", "-m", "initial"],
                    check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "--local", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "--local", "user.email", "test@example.org"], check=True)
     subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(repo)],
                    check=True, capture_output=True)
     original = checkout._assert_self_contained_checkout

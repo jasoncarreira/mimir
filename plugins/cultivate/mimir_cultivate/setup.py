@@ -417,6 +417,17 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
     helper = git_auth[-1].split('=', 1)[1]
     git('config', '--local', 'credential.helper', '')
     git('config', '--local', 'credential.https://github.com.helper', helper)
+    for key, env_key in (('user.name', 'GH_USER_NAME'), ('user.email', 'GH_USER_EMAIL')):
+        value = os.environ.get(env_key, '').strip()
+        if not value:
+            raise RuntimeError(f'Worklink base identity unconfigured: {env_key}')
+        current = subprocess.run(['git', '-C', str(base), 'config', '--local', '--get', key],
+                                 capture_output=True, text=True, check=False)
+        if current.returncode not in (0, 1):
+            raise RuntimeError(f'Worklink base {base}: git config {key} failed')
+        if current.stdout.strip() != value:
+            git('config', '--local', key, value)
+            created = True
 
     path = home / 'worklink.yaml'
     config = {'repository': entry['slug'], 'defaults': {
@@ -643,6 +654,16 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
     }
     if root_check != "ok":
         raise SetupError(root_errors.get(root_check, "Worklink executor verification returned an unexpected result; inspect the executor service."))
+    identity_check = _run(["docker", "compose", "exec", "-T", "agent", "python", "-c",
+        "import os, subprocess\n"
+        "repo = os.environ.get('WORKLINK_REPO', '')\n"
+        "expected = (os.environ.get('GH_USER_NAME', '').strip(), os.environ.get('GH_USER_EMAIL', '').strip())\n"
+        "def local(key):\n"
+        " result = subprocess.run(['git', '-C', repo, 'config', '--local', '--get', key], capture_output=True, text=True)\n"
+        " return result.stdout.strip() if result.returncode == 0 else ''\n"
+        "print('ok' if repo and all(expected) and (local('user.name'), local('user.email')) == expected else 'base_identity_mismatch')"], cwd=deploy)
+    if identity_check != "ok":
+        raise SetupError("Worklink base identity mismatch; check the base clone's local user.name/user.email and the bot identity in compose.env.")
     # Run in the agent container with its actual HOME, config and compose env.
     # Only a stable reason code crosses the Docker boundary, never the bundle.
     auth_check = _run(["docker", "compose", "exec", "-T", "agent", "python", "-c",

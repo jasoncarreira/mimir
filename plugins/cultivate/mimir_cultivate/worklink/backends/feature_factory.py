@@ -954,7 +954,7 @@ def _control_environment() -> dict[str, str]:
         # feature-factory 0.8.0+ reads the declared publishing identity from this
         # inherited variable and compares it against ``gh api /user``. The mimir
         # repository is published from two accounts -- ``jasoncarreira`` from a
-        # maintainer's checkout and ``mimir-carreira`` from mimirbot -- so the
+        # maintainer's checkout and a bot's own checkout -- so the
         # deployment must select the identity.
         #
         # It MUST be allow-listed here or the deployment can export it and the driver
