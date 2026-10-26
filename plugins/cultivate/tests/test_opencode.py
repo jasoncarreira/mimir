@@ -10,6 +10,7 @@ import subprocess
 import pytest
 
 from mimir_cultivate import opencode, repository
+from tests.opencode_fixtures import seed_codex_subscription
 
 
 def test_selected_spawn_factory_is_provider_owned() -> None:
@@ -26,7 +27,10 @@ def _auth(home: Path, provider: str, entry: dict[str, str]) -> None:
     path.write_text(json.dumps({provider: entry}), encoding="utf-8")
 
 
-def test_selected_provider_projects_only_selected_config_and_oauth(tmp_path: Path) -> None:
+@pytest.mark.parametrize("model_spec", [None, "codex-plus:gpt-test", "openai:gpt-test"])
+def test_selected_provider_projects_only_selected_config_and_oauth(
+    tmp_path: Path, model_spec: str | None,
+) -> None:
     path = tmp_path / "opencode.jsonc"
     path.write_text(
         '{"model":"openai/gpt-test","provider":{"openai":'
@@ -35,10 +39,15 @@ def test_selected_provider_projects_only_selected_config_and_oauth(tmp_path: Pat
         encoding="utf-8",
     )
     _auth(tmp_path, "openai", {"type": "oauth", "refresh": "private-refresh"})
+    # Default and explicit codex-plus routes reconcile the native OAuth store.
+    # Keep the real resolver; a refresh-only OpenCode entry is not that bundle.
+    seed_codex_subscription(tmp_path, refresh="private-refresh")
     env = {
         "HOME": str(tmp_path), "OPENCODE_CONFIG": str(path),
         "OPENAI_TOKEN": "private-token", "OPENAI_API_KEY": "ambient-token",
     }
+    if model_spec is not None:
+        env["MIMIR_MODEL_SPEC"] = model_spec
     selected = opencode.resolve_opencode_invocation(env=env)
     assert (selected.model, selected.provider, selected.model_source) == (
         "openai/gpt-test", "openai", "opencode_config",

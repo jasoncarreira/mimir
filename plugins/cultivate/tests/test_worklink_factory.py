@@ -27,6 +27,7 @@ from mimir_cultivate.worklink.claims import ClaimRecord, ClaimResult
 from mimir_cultivate.worklink.compute import ComputeResult, LaunchHandle, LocalSubprocessComputeBackend, WorkSpec
 from mimir_cultivate.worklink.factory_state import load_factory_record
 from mimir_cultivate.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
+from tests.opencode_fixtures import seed_codex_subscription
 
 
 @contextmanager
@@ -175,6 +176,7 @@ async def test_provider_completion_uses_emitted_record_and_worker_gate(
     auth = operator_home / ".local" / "share" / "opencode" / "auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}))
+    seed_codex_subscription(operator_home)
     (tmp_path / "worklink.yaml").write_text(f"defaults:\n  test_command: \"{gate_command}\"\n")
     monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", root)
     monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(

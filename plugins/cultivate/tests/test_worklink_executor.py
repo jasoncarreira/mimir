@@ -21,6 +21,7 @@ from mimir_cultivate.worklink import (
 )
 from mimir_cultivate.worklink.backends import opencode
 from mimir_cultivate.worklink.backends.base import WorkOrder
+from tests.opencode_fixtures import seed_codex_subscription
 
 
 def test_worker_protocol_matches_executor_image_contract() -> None:
@@ -77,6 +78,7 @@ def test_opencode_work_spec_scrubs_model_selection_with_empty_remove_env(
     auth = tmp_path / ".local/share/opencode/auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}))
+    seed_codex_subscription(tmp_path)
     spec = opencode.OpenCodeBackend().work_spec(
         WorkOrder(1949, tmp_path, "prompt", None, 30, environment),
         attempt=1, repo_url="repo", base_ref="main", branch="issue/1949",
