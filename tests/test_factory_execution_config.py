@@ -159,7 +159,7 @@ async def test_retained_factory_control_uses_worker_without_runtime_refresh(
 ):
     from mimir_cultivate.worklink import worker_client
 
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     checkout = tmp_path / "repo/41-2/checkout"
     calls = []
 
@@ -195,7 +195,7 @@ def test_factory_control_rejects_incomplete_results(
 ):
     from mimir_cultivate.worklink import worker_client
 
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
 
     async def launch(client, **kwargs):
         assert client.run_uid == factory_control_identity.worklink_uid
@@ -252,7 +252,7 @@ def test_executor_requires_peer_credentials_before_side_effects(tmp_path, monkey
 def test_factory_control_path_classification(tmp_path, monkeypatch, relative, result):
     from mimir_cultivate.worklink import worker_client
 
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     path = tmp_path / relative
     if result == "error":
         with pytest.raises(ValueError):
@@ -268,7 +268,7 @@ def test_factory_control_path_classification(tmp_path, monkeypatch, relative, re
 def test_factory_controller_boundary_guard(tmp_path, monkeypatch, guard):
     from mimir_cultivate.worklink import orchestrator, worker_client
 
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(mimir_uid=os.getuid()))
     path = tmp_path / "repo/41-2/checkout"
     path.mkdir(parents=True)
@@ -301,7 +301,7 @@ def test_factory_controller_boundary_guard(tmp_path, monkeypatch, guard):
 def test_factory_git_recovery_uses_owner_not_safe_directory(tmp_path, monkeypatch, text):
     from mimir_cultivate.worklink import orchestrator, worker_client
 
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     monkeypatch.setattr(orchestrator, "get_identities", lambda: SimpleNamespace(mimir_uid=os.getuid()))
     checkout = tmp_path / "repo/41-2/checkout"
     checkout.mkdir(parents=True)
@@ -337,7 +337,7 @@ def test_factory_git_recovery_uses_owner_not_safe_directory(tmp_path, monkeypatc
 def test_legacy_factory_recovery_refuses_before_git_or_lock_mutation(tmp_path, monkeypatch):
     from mimir_cultivate.worklink import orchestrator, worker_client
 
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     launcher = tmp_path / "installed/factory.js"
     retained = SimpleNamespace(
         issue_id=41, run_id=orchestrator.factory_record_run_ids(41)[0], repository="owner/repo",
@@ -366,7 +366,7 @@ def test_factory_backend_controls_use_retained_owner(tmp_path, monkeypatch, comm
     from mimir_cultivate.worklink import worker_client
     from mimir_cultivate.worklink.backends import feature_factory
 
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(tmp_path))
     entrypoint = tmp_path / "installed/bin/factory.js"
     monkeypatch.setattr(feature_factory, "resolve_factory_entrypoint", lambda path: entrypoint)
     sandbox = tmp_path / "repo/41-2/checkout/.factory-sandboxes/run"

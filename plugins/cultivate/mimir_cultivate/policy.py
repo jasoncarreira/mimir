@@ -912,9 +912,9 @@ def register_tools(registrar: PolicyRegistrar) -> None:
     from .worklink.retained_scope import derive_retained_factory_scope
 
     def retained_checkout_root() -> Path:
-        from .worklink.worker_client import WORKLINK_CHECKOUT_ROOT
+        from .worklink.worker_client import worklink_checkout_root
 
-        return WORKLINK_CHECKOUT_ROOT
+        return worklink_checkout_root()
 
     def validate_repository_selection(home: Path, inventory: object) -> None:
         from .worklink.backends.registry import WorklinkConfig

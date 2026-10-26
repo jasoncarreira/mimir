@@ -139,7 +139,7 @@ def _case(monkeypatch, tmp_path):
     sandbox = root / "repo" / "1949-1" / "checkout" / ".factory-sandboxes" / "chainlink-1949"
     sandbox.mkdir(parents=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     subprocess.run(["git", "-C", str(sandbox), "init", "-q"], check=True)
     subprocess.run(["git", "-C", str(sandbox), "checkout", "-q", "-b", "feature"], check=True)
     (sandbox / "file.txt").write_text("seed\n")

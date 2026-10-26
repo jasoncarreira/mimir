@@ -55,6 +55,27 @@ def test_checkout_root_env_and_default_are_shared(monkeypatch: pytest.MonkeyPatc
     assert worker_exec.worklink_checkout_root is worker_client.worklink_checkout_root
 
 
+def test_retained_checkout_policy_follows_shared_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import worklink_retained_checkout_root
+    from mimir.plugins.core import policy_scope
+    from mimir.plugins.manager import load_plugins
+
+    selected = load_plugins(enable="cultivate").policy
+    with policy_scope(selected):
+        monkeypatch.delenv("WORKLINK_CHECKOUT_ROOT", raising=False)
+        assert worklink_retained_checkout_root() == Path("/workspace/.worklink")
+        root = tmp_path / "custom-checkouts"
+        monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
+        assert worklink_retained_checkout_root() == root.resolve()
+        assert worklink_retained_checkout_root() == worker_client.worklink_checkout_root()
+        # The already-registered hook must read the setting on every call.
+        other_root = tmp_path / "other-checkouts"
+        monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(other_root))
+        assert worklink_retained_checkout_root() == other_root.resolve()
+
+
 def test_reattach_observation_uses_checkout_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "checkouts"
     monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))

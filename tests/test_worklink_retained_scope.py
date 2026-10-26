@@ -47,8 +47,7 @@ def retained_incident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     sandbox = checkout / ".factory-sandboxes" / "chainlink-1810"
     sandbox.mkdir(parents=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", root)
-    monkeypatch.setattr(provider_worker_client, "WORKLINK_CHECKOUT_ROOT", root)
+    monkeypatch.setenv("WORKLINK_CHECKOUT_ROOT", str(root))
     incident = record_failure(
         dispatch_failure_state_dir(home), issue_id=1810, attempt=1,
         exit_status=1, error="factory failed", log_path="run.log",
