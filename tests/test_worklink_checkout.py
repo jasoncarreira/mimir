@@ -17,7 +17,6 @@ pytest.importorskip("mimir_cultivate", reason="Worklink checkouts belong to Cult
 import mimir_cultivate.worklink.checkout as checkout_module
 from mimir_cultivate.worklink.backends.feature_factory import DEFAULT_FACTORY_ENTRYPOINT
 from mimir_cultivate.worklink.checkout import (
-    FALLBACK_BUILD_IDENTITY,
     CheckoutAuthorization,
     CheckoutLease,
     _assert_self_contained_checkout,
@@ -1693,8 +1692,10 @@ def test_isolated_checkout_can_commit_without_an_ambient_identity(tmp_path: Path
 
 
 def test_isolated_checkout_falls_back_when_the_parent_lends_no_identity(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("GH_USER_NAME", "trellisbot-squashmerge")
+    monkeypatch.setenv("GH_USER_EMAIL", "trellisbot@example.com")
     repo = _repo_with_main(tmp_path)
     _git(repo, "config", "--unset", "user.name")
     _git(repo, "config", "--unset", "user.email")
@@ -1713,17 +1714,18 @@ def test_isolated_checkout_falls_back_when_the_parent_lends_no_identity(
         event_logger=lambda name, **payload: events.append((name, payload)),
     )
 
-    name, email = FALLBACK_BUILD_IDENTITY
+    name, email = "trellisbot-squashmerge", "trellisbot@example.com"
     assert _git(lease.path, "config", "--get", "user.name") == name
     assert _git(lease.path, "config", "--get", "user.email") == email
 
     [identity] = [p for n, p in events if n.endswith("identity_configured")]
+    assert (identity["user_name"], identity["user_email"]) == (name, email)
     assert identity["inherited"] is False
 
 
 @pytest.mark.parametrize("lent", ["user.name", "user.email"])
 def test_isolated_checkout_reports_a_partial_identity_as_not_inherited(
-    tmp_path: Path, lent: str,
+    tmp_path: Path, lent: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """One field inherited and one fallen back is NOT ``inherited``.
 
@@ -1731,6 +1733,8 @@ def test_isolated_checkout_reports_a_partial_identity_as_not_inherited(
     identity reports False exactly like a parent that lends none. Pin that, and
     pin that the lent field is still the one used.
     """
+    monkeypatch.setenv("GH_USER_NAME", "trellisbot-squashmerge")
+    monkeypatch.setenv("GH_USER_EMAIL", "trellisbot@example.com")
     repo = _repo_with_main(tmp_path)
     dropped = "user.email" if lent == "user.name" else "user.name"
     _git(repo, "config", "--unset", dropped)
@@ -1747,12 +1751,45 @@ def test_isolated_checkout_reports_a_partial_identity_as_not_inherited(
     )
 
     expected = {"user.name": "t", "user.email": "t@e.com"}[lent]
-    fallback = dict(zip(("user.name", "user.email"), FALLBACK_BUILD_IDENTITY))[dropped]
+    fallback = {"user.name": "trellisbot-squashmerge", "user.email": "trellisbot@example.com"}[dropped]
     assert _git(lease.path, "config", "--get", lent) == expected
     assert _git(lease.path, "config", "--get", dropped) == fallback
 
     [identity] = [p for n, p in events if n.endswith("identity_configured")]
     assert identity["inherited"] is False
+
+
+def test_isolated_checkout_refuses_unconfigured_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _repo_with_main(tmp_path)
+    _git(repo, "config", "--unset", "user.name")
+    _git(repo, "config", "--unset", "user.email")
+    monkeypatch.delenv("GH_USER_NAME", raising=False)
+    monkeypatch.delenv("GH_USER_EMAIL", raising=False)
+    events = []
+
+    def runner(args):
+        return subprocess.run(list(args), capture_output=True, text=True, env=_clean_git_env())
+
+    with pytest.raises(ValueError, match="^build_identity_unconfigured$"):
+        create_isolated_checkout(repo, issue_id=9105, attempt=1, runner=runner,
+                                 event_logger=lambda name, **payload: events.append(name))
+    assert "worklink_checkout_identity_configured" not in events
+    assert not (tmp_path / ".worklink" / repo.name / "9105-1").exists()
+
+
+def test_mimirbot_shaped_parent_identity_stays_inherited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _repo_with_main(tmp_path)
+    _git(repo, "config", "user.name", "mimir-carreira")
+    _git(repo, "config", "user.email", "mimir@muninnai.ai")
+    monkeypatch.setenv("GH_USER_NAME", "trellisbot-squashmerge")
+    monkeypatch.setenv("GH_USER_EMAIL", "trellisbot@example.com")
+    events = []
+    lease = create_isolated_checkout(repo, issue_id=9106, attempt=1,
+        event_logger=lambda name, **payload: events.append((name, payload)))
+    assert _git(lease.path, "config", "--local", "--get", "user.name") == "mimir-carreira"
+    assert _git(lease.path, "config", "--local", "--get", "user.email") == "mimir@muninnai.ai"
+    [identity] = [p for n, p in events if n == "worklink_checkout_identity_configured"]
+    assert identity["inherited"] is True
 
 
 def test_isolated_checkout_is_removed_when_the_identity_write_fails(

@@ -4,15 +4,15 @@ description: "Watch configured GitHub repositories for actionable issues, pull r
 env:
   required:
     - name: GITHUB_REPOS
-      description: "Comma-separated owner/repo list (e.g. jasoncarreira/mimir,jasoncarreira/mimirbot)"
-      example: "jasoncarreira/mimir"
+      description: "Comma-separated owner/repo list (e.g. owner/repo,owner/another-repo)"
+      example: "owner/repo"
   optional:
     - name: GITHUB_TOKEN
       description: "GitHub PAT with repo scope. Falls back to gh auth token when unset."
       example: "ghp_..."
     - name: MIMIR_GITHUB_SELF_LOGIN
       description: "GitHub login mimir authors as. Events from this login are filtered out."
-      example: "mimir-carreira"
+      example: "your-bot-login"
     - name: MIMIR_GITHUB_PRELOAD_REVIEW_SKILL
       description: "Set to true to inline the selected Cultivate review skill from <home>/skills/cultivate-review/SKILL.md into PR-review prompts. No path override is needed after provider defaults seed the home."
       example: "true"
@@ -23,6 +23,10 @@ env:
 ---
 
 # Cultivate GitHub Poller — watch GitHub repos for activity
+
+Use the repository named in the PR URL or triggering event; for configured
+watches, use the matching entry in `GITHUB_REPOS`. Replace `<owner>/<repo>`
+with that repository (`owner/repo` in examples).
 
 This poller ships in `mimir-cultivate`, not core. When selected with
 `MIMIR_PLUGINS=cultivate`, provider defaults seed it under
@@ -40,7 +44,7 @@ This poller ships in `mimir-cultivate`, not core. When selected with
 
    | Variable | Required | Description |
    |---|---|---|
-   | `GITHUB_REPOS` | yes | Comma-separated `owner/repo` list (e.g. `jasoncarreira/mimir,jasoncarreira/mimirbot`) |
+   | `GITHUB_REPOS` | yes | Comma-separated `owner/repo` list (e.g. `owner/repo,owner/another-repo`) |
    | `GITHUB_TOKEN` | recommended | GitHub PAT. Falls back to `gh auth token` when unset. |
    | `MIMIR_GITHUB_SELF_LOGIN` | optional | GitHub login mimir authors as. Events from this login get filtered out (mimir doesn't wake itself). Leave empty if mimir uses the operator's PAT — the operator is the signal you want, not the noise. |
 

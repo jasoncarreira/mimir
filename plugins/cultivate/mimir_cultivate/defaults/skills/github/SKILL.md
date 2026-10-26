@@ -34,6 +34,10 @@ credential helper, so `gh pr create` and `git push` both work.
 
 ## Contract
 
+Use the repository named in the PR URL or triggering event; for configured
+watches, use the matching entry in `GITHUB_REPOS`. Replace `<owner>/<repo>`
+with that repository (`owner/repo` in examples).
+
 **Trigger**: Any interaction with GitHub that goes beyond local git — reading issues
 or PRs, filing comments, checking CI, querying the API. If the task requires GitHub
 state (not just local repo state), invoke this skill.
@@ -200,9 +204,9 @@ gh run watch <run-id>                          # block until done
 When the subcommands don't cover what you need, drop to the API:
 
 ```bash
-gh api repos/jasoncarreira/mimir/pulls/42 --jq '.title, .state, .user.login'
-gh api repos/jasoncarreira/mimir/pulls/42/comments
-gh api 'repos/jasoncarreira/mimir/issues?state=open&labels=bug' --jq '.[] | "\(.number): \(.title)"'
+gh api repos/owner/repo/pulls/42 --jq '.title, .state, .user.login'
+gh api repos/owner/repo/pulls/42/comments
+gh api 'repos/owner/repo/issues?state=open&labels=bug' --jq '.[] | "\(.number): \(.title)"'
 ```
 
 `--jq` filters work like inline jq queries; chain with shell tools when needed.

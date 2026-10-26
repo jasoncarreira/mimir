@@ -1197,6 +1197,10 @@ def test_leaf_checkout_lets_the_worklink_uid_run_real_git(
         _git(repo, "init", "-q", "-b", "main")
         _git(repo, "-c", "user.name=t", "-c", "user.email=t@example.com",
              "commit", "-q", "--allow-empty", "-m", "base")
+        # Model the provisioned base clone: per-command -c identity above is
+        # not persisted for the controller to lend to the attempt checkout.
+        _git(repo, "config", "--local", "user.name", "leaf-test-bot")
+        _git(repo, "config", "--local", "user.email", "leaf-test-bot@example.com")
         _git(repo, "remote", "add", "origin", str(repo))
         _chown_tree(repo, identities.mimir_uid, identities.mimir_gid)
         os.chown(controller_home, identities.mimir_uid, identities.mimir_gid)
