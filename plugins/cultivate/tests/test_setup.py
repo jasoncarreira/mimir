@@ -444,7 +444,7 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     subprocess.run(['git', 'init', str(base)], check=True, capture_output=True)
     subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.name', 'trellisbot-squashmerge'], check=True)
     subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'trellisbot@example.com'], check=True)
-    pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok", "root": "ok"}
+    pending = {"alerts": [], "pollers": ["github-activity", "github-ci-watch", "worklink-ready-queue"], "reply": True, "auth": "ok", "root": "ok", "binary": "ok"}
     reads = []
     exec_calls = []
     from mimir_cultivate.worklink import worker_client
@@ -478,6 +478,10 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     def run(argv, *, cwd):
         exec_calls.append(argv)
         assert cwd == tmp_path
+        if installer._OPENCODE_WORKER_PROBE in argv:
+            assert argv[:10] == ["docker", "compose", "exec", "-T", "-u", "worklink",
+                                "-w", "/tmp", "agent", "/usr/local/bin/python"]
+            return pending["binary"]
         assert argv[:7] == ["docker", "compose", "exec", "-T", "-u", "mimir", "agent"]
         if "plugins" in argv:
             return json.dumps([{"name": "cultivate", "enabled": True}])
@@ -490,6 +494,9 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
             with redirect_stdout(output):
                 exec(compile(argv[-1], "<executor-verification>", "exec"), {})
             return output.getvalue().strip()
+        if argv[-1] == installer._OPENCODE_RESOLVE_PROBE:
+            assert argv[7:9] == ["/home/mimir/venv/bin/python", "-c"]
+            return "/opt/mimir-opencode/bin/opencode"
         if "base_identity_mismatch" in argv[-1]:
             return subprocess.run([sys.executable, '-c', argv[-1]], check=True, capture_output=True, text=True,
                 env=dict(os.environ, WORKLINK_REPO=str(base))).stdout.strip()
@@ -498,10 +505,11 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     monkeypatch.setattr(installer, "_http", http)
     monkeypatch.setattr(installer, "_run", run)
     installer._verify(tmp_path, 8123, "org/repo", "owner-key")
-    assert len(exec_calls) == 5
+    assert len(exec_calls) == 7
     assert [argv[7:9] for argv in exec_calls] == [
         ["mimir", "plugins"], ["python", "-c"], ["python", "-c"],
-        ["python", "-c"], ["python", "-c"]]
+        ["python", "-c"], ["/home/mimir/venv/bin/python", "-c"],
+        ["/tmp", "agent"], ["python", "-c"]]
     assert any(url.endswith("/api/v1/chat") and key == "owner-key" for url, key, _ in reads)
     subprocess.run(['git', '-C', str(base), 'config', '--local', 'user.email', 'wrong@example.com'], check=True)
     reads.clear()
@@ -531,6 +539,10 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         with pytest.raises(installer.SetupError, match=message):
             installer._verify(tmp_path, 8123, "org/repo", "owner-key")
     pending["root"] = "ok"
+    pending["binary"] = "opencode_missing"
+    with pytest.raises(installer.SetupError, match="opencode_missing"):
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+    pending["binary"] = "ok"
     pending["auth"] = "auth_missing"
     with pytest.raises(installer.SetupError, match="OpenCode credential resolution failed.*auth_missing"):
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
@@ -553,6 +565,143 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     pending["reply"] = False
     with pytest.raises(installer.SetupError, match="no assistant reply"):
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
+
+
+@pytest.mark.parametrize("runtime_injected", [False, True])
+@pytest.mark.parametrize("outcome", ["ok", "nonzero", "missing", "timeout"])
+def test_setup_binary_probe_executes_with_worker_path(
+    tmp_path, monkeypatch, outcome, runtime_injected
+):
+    import subprocess
+    import sys
+
+    from mimir_cultivate.contained_execution import (
+        base_worker_environment,
+        opencode_worker_environment,
+    )
+
+    binary = tmp_path / "opencode"
+    marker = tmp_path / "probe-environment.json"
+    launch_marker = tmp_path / "probe-launch-environment.json"
+    binary.write_text(
+        f"#!{sys.executable}\nimport json, os, pathlib, sys\n"
+        # Model runtime-added state on every platform, without adding it to the
+        # environment supplied by the probe itself.
+        + ("os.environ['TEST_RUNTIME_ADDED'] = 'runtime-only'\n" if runtime_injected else "")
+        + "assert sys.argv[1:] == ['--version']\n"
+        "home = pathlib.Path(os.environ['HOME'])\n"
+        "assert home.is_dir() and home.stat().st_mode & 0o777 == 0o700\n"
+        "assert os.environ['PATH'] == '/usr/local/bin:/usr/bin:/bin'\n"
+        "for key, suffix in [('XDG_CONFIG_HOME', '.config'), ('XDG_DATA_HOME', '.local/share'), ('XDG_CACHE_HOME', '.cache')]:\n"
+        " assert os.environ[key] == str(home / suffix)\n"
+        " (home / suffix).mkdir(parents=True, exist_ok=True)\n"
+        f"pathlib.Path({str(marker)!r}).write_text(json.dumps(dict(os.environ)))\n"
+        f"sys.exit({1 if outcome == 'nonzero' else 0})\n"
+    )
+    binary.chmod(0o755)
+    if outcome == "missing":
+        binary.unlink()
+    real_run = subprocess.run
+    captured = []
+
+    def run(argv, *, cwd):
+        captured.append(argv)
+        if argv[-1] == installer._OPENCODE_RESOLVE_PROBE:
+            assert argv[:9] == ['docker', 'compose', 'exec', '-T', '-u', 'mimir',
+                                'agent', '/home/mimir/venv/bin/python', '-c']
+            return str(binary)
+        assert argv[4:8] == ['-u', 'worklink', '-w', '/tmp']
+        assert argv[9] == '/usr/local/bin/python'
+        assert argv[-2:] == [installer._OPENCODE_WORKER_PROBE, str(binary)]
+        # Record the exact environment passed at the real subprocess boundary,
+        # before the child runtime can inject platform-specific variables.
+        # The clean interpreter still executes the unmodified production probe.
+        recorder = (
+            "import json, pathlib, subprocess\n"
+            "real_run = subprocess.run\n"
+            "def record_launch(*args, **kwargs):\n"
+            f" pathlib.Path({str(launch_marker)!r}).write_text(json.dumps(kwargs['env']))\n"
+            + (" raise subprocess.TimeoutExpired(args[0], 15)\n" if outcome == 'timeout'
+               else " return real_run(*args, **kwargs)\n")
+            + "subprocess.run = record_launch\n"
+        )
+        code = recorder + argv[-2]
+        result = real_run([sys.executable, '-I', '-S', '-c', code, str(binary)],
+                          capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+
+    monkeypatch.setattr(installer, '_run', run)
+    if outcome == 'ok':
+        installer._verify_opencode_binary(tmp_path)
+    else:
+        with pytest.raises(installer.SetupError, match='opencode_missing'):
+            installer._verify_opencode_binary(tmp_path)
+    assert len(captured) == 2
+    assert launch_marker.exists(), 'every outcome must reach the subprocess boundary'
+    launch_env = json.loads(launch_marker.read_text())
+    # Exact equality rejects every extra launch variable, including names the
+    # platform might subsequently inject into the child interpreter.
+    base = base_worker_environment('setup-probe-parity')
+    runtime_home = str(Path(base['XDG_CONFIG_HOME']).parent)
+    expected = opencode_worker_environment(base, {})
+    expected = {key: value.replace(runtime_home, launch_env['HOME'])
+                for key, value in expected.items()}
+    expected['HOME'] = launch_env['HOME']  # assigned by the real executor too
+    assert launch_env == expected
+    assert not Path(launch_env['HOME']).exists(), 'probe must clean up after every outcome'
+    if outcome in {'ok', 'nonzero'}:
+        assert marker.exists(), 'positive control must execute the CLI body'
+        observed_env = json.loads(marker.read_text())
+        for key, value in expected.items():
+            assert observed_env[key] == value
+        if runtime_injected:
+            assert observed_env['TEST_RUNTIME_ADDED'] == 'runtime-only'
+            assert 'TEST_RUNTIME_ADDED' not in launch_env
+    else:
+        assert not marker.exists(), 'failed launches must not execute the CLI body'
+
+
+def test_real_image_probe_adapter_accepts_actual_setup_argv(monkeypatch):
+    import ast
+    import subprocess
+
+    # Execute the shipped image-proof payload, not a copy of its adapter. Only
+    # the final setuid transport is faked; setup generates both real argv shapes.
+    script = Path(__file__).resolve().parents[3] / 'scripts/worklink_image_identity.py'
+    payloads = [node.value for node in ast.walk(ast.parse(script.read_text()))
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and 'real-image setup OpenCode probe passed' in node.value]
+    assert len(payloads) == 1
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        output = '/opt/mimir-opencode/bin/opencode' if argv[1] == 'mimir' else 'ok'
+        return SimpleNamespace(returncode=0, stdout=output, stderr='')
+
+    monkeypatch.setattr(subprocess, 'run', run)
+    monkeypatch.setattr(installer, '_run', installer._run)
+    exec(compile(payloads[0], '<real-image-setup-probe>', 'exec'), {})
+    assert [argv for argv, _ in calls] == [
+        ['/command/s6-setuidgid', 'mimir', '/home/mimir/venv/bin/python', '-c',
+         installer._OPENCODE_RESOLVE_PROBE],
+        ['/command/s6-setuidgid', 'worklink', '/usr/local/bin/python', '-c',
+         installer._OPENCODE_WORKER_PROBE, '/opt/mimir-opencode/bin/opencode'],
+    ]
+    assert all(kwargs == dict(cwd='/tmp', capture_output=True, text=True, timeout=30)
+               for _, kwargs in calls)
+
+
+def test_setup_binary_resolution_failure_does_not_launch_worker(tmp_path, monkeypatch):
+    calls = []
+    def run(argv, *, cwd):
+        calls.append(argv)
+        return 'opencode_missing'
+    monkeypatch.setattr(installer, '_run', run)
+    with pytest.raises(installer.SetupError, match='opencode_missing'):
+        installer._verify_opencode_binary(tmp_path)
+    assert len(calls) == 1
+    assert calls[0][-1] == installer._OPENCODE_RESOLVE_PROBE
 
 
 def test_existing_env_never_overwrites_operator_secrets(tmp_path):

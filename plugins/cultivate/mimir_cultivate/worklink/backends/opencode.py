@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import time
 from typing import Awaitable, Callable, Mapping, Sequence
 
@@ -36,6 +37,31 @@ from .base import (
 
 
 DEFAULT_BASH_ALLOWLIST: tuple[str, ...] = ("git *", "uv *")
+IMAGE_OPENCODE_BIN = Path("/opt/mimir-opencode/bin/opencode")
+
+
+def resolve_opencode_binary(bin_name: str = "opencode") -> str:
+    """Select an executable from the image or controller, never the worker env."""
+    if not bin_name or ("/" in bin_name and not Path(bin_name).is_absolute()):
+        raise ValueError("worklink opencode bin must be an absolute path or a bare name")
+    if bin_name == "opencode" and IMAGE_OPENCODE_BIN.is_file() and os.access(IMAGE_OPENCODE_BIN, os.X_OK):
+        candidate = IMAGE_OPENCODE_BIN
+    else:
+        found = bin_name if Path(bin_name).is_absolute() else shutil.which(bin_name)
+        if found is None:
+            raise FileNotFoundError("opencode_missing")
+        candidate = Path(found)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise FileNotFoundError("opencode_missing") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise FileNotFoundError("opencode_missing")
+    # Keep the image-owned symlink in argv[0]; its target is an npm package
+    # under the same prefix and is named opencode.exe, not opencode.
+    return str(candidate if candidate.is_absolute() else resolved)
+
+
 DERIVABLE_TEST_RUNNERS: frozenset[str] = frozenset({
     "bun",
     "cargo",
@@ -180,6 +206,7 @@ class OpenCodeBackend:
         branch: str,
         test_command: str,
     ) -> WorkSpec:
+        binary = resolve_opencode_binary(self.bin)
         prompt = _prompt_for_order(order)
         args = list(self.extra_args)
         env = dict(order.env)
@@ -219,7 +246,7 @@ class OpenCodeBackend:
 
         env["OPENCODE_PERMISSION"] = _permission_override(self.bash_allowlist)
         backend_config: dict[str, object] = {
-            "bin": self.bin,
+            "bin": binary,
             "args": args,
             "bash_allowlist": list(self.bash_allowlist),
             "model": invocation.model,
@@ -267,7 +294,7 @@ class OpenCodeBackend:
             backend_config=backend_config,
             local_checkout=order.checkout,
             local_argv=_local_argv(
-                self.bin, args, order.checkout, prompt, fd_anchored=enabled
+                binary, args, order.checkout, prompt, fd_anchored=enabled
             ),
             output_root=order.transcript_root,
         )

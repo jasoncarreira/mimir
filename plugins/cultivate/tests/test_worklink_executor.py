@@ -193,8 +193,9 @@ def test_provider_execution_modules_do_not_import_legacy_worklink() -> None:
         assert not any(name and name.startswith("mimir.worklink") for name in imports)
 
 
+@pytest.mark.parametrize("image_install", [True, False])
 def test_opencode_work_spec_scrubs_model_selection_with_empty_remove_env(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, image_install: bool,
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
@@ -210,6 +211,22 @@ def test_opencode_work_spec_scrubs_model_selection_with_empty_remove_env(
     auth.parent.mkdir(parents=True)
     auth.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}))
     seed_codex_subscription(tmp_path)
+    image_bin = tmp_path / "opt/mimir-opencode/bin/opencode"
+    fallback = tmp_path / "usr/bin/opencode"
+    fallback.parent.mkdir(parents=True)
+    fallback.write_text("#!/bin/sh\nexit 0\n")
+    fallback.chmod(0o755)
+    if image_install:
+        image_bin.parent.mkdir(parents=True)
+        image_bin.write_text("#!/bin/sh\nexit 0\n")
+        image_bin.chmod(0o755)
+    monkeypatch.setattr(opencode, "IMAGE_OPENCODE_BIN", image_bin)
+    monkeypatch.setattr(opencode.shutil, "which", lambda name: str(fallback) if name == "opencode" else None)
+    # A checkout or worker PATH with its own opencode must never choose argv[0].
+    hostile = tmp_path / "checkout/bin"
+    hostile.mkdir(parents=True)
+    (hostile / "opencode").write_text("untrusted")
+    environment["PATH"] = str(hostile)
     spec = opencode.OpenCodeBackend().work_spec(
         WorkOrder(1949, tmp_path, "prompt", None, 30, environment),
         attempt=1, repo_url="repo", base_ref="main", branch="issue/1949",
@@ -217,7 +234,33 @@ def test_opencode_work_spec_scrubs_model_selection_with_empty_remove_env(
     )
     assert spec.backend_config["args"] == ["-m", "openai/gpt-agent"]
     assert "MIMIR_MODEL_SPEC" not in spec.env
-    assert spec.local_argv[:4] == ("opencode", "run", "--dir", str(tmp_path))
+    expected = image_bin if image_install else fallback
+    assert spec.local_argv[:4] == (str(expected), "run", "--dir", str(tmp_path))
+    assert spec.local_argv[0] == spec.backend_config["bin"]
+    assert expected.is_absolute() and expected.is_file()
+    assert spec.local_argv[0] != "opencode"
+    assert spec.local_argv[0] != str(hostile / "opencode")
+
+
+def test_opencode_image_symlink_is_preserved_and_missing_binary_fails_closed(tmp_path, monkeypatch):
+    image_bin = tmp_path / "opt/mimir-opencode/bin/opencode"
+    target = tmp_path / "opt/mimir-opencode/lib/node_modules/opencode-ai/bin/opencode.exe"
+    target.parent.mkdir(parents=True)
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    image_bin.parent.mkdir(parents=True)
+    image_bin.symlink_to(target)
+    monkeypatch.setattr(opencode, "IMAGE_OPENCODE_BIN", image_bin)
+    monkeypatch.setattr(opencode.shutil, "which", lambda name: None)
+    assert opencode.resolve_opencode_binary() == str(image_bin)
+    image_bin.unlink()
+    with pytest.raises(FileNotFoundError, match="opencode_missing"):
+        opencode.resolve_opencode_binary()
+    with pytest.raises(ValueError, match="absolute path or a bare name"):
+        opencode.resolve_opencode_binary("./opencode")
+    target.chmod(0o644)
+    with pytest.raises(FileNotFoundError, match="opencode_missing"):
+        opencode.resolve_opencode_binary(str(target))
 
 
 def test_provider_worker_wire_and_executor_contract(tmp_path: Path) -> None:

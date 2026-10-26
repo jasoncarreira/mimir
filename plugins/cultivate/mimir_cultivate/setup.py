@@ -621,6 +621,46 @@ def _agent_exec(deploy: Path, *argv: str) -> str:
     return _run(["docker", "compose", "exec", "-T", "-u", "mimir", "agent", *argv], cwd=deploy)
 
 
+# The worklink uid cannot traverse the controller's private venv. Resolve there
+# as mimir, then run a stdlib-only probe with the system interpreter as worklink.
+_OPENCODE_RESOLVE_PROBE = """\
+try:
+ from mimir_cultivate.worklink.backends.opencode import resolve_opencode_binary
+ print(resolve_opencode_binary())
+except (ImportError, OSError, ValueError):
+ print('opencode_missing')
+"""
+_OPENCODE_WORKER_PROBE = """\
+import subprocess
+import sys
+import tempfile
+try:
+ with tempfile.TemporaryDirectory(prefix='mimir-opencode-probe-') as home:
+  env = {
+   'USER': 'worklink', 'LOGNAME': 'worklink', 'SHELL': '/bin/sh',
+   'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
+   'HOME': home, 'XDG_CONFIG_HOME': home + '/.config',
+   'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
+   'OPENCODE_CONFIG': home + '/.config/opencode/opencode.json',
+  }
+  result = subprocess.run([sys.argv[1], '--version'], env=env, cwd='/tmp',
+   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+  print('ok' if result.returncode == 0 else 'opencode_missing')
+except (OSError, subprocess.TimeoutExpired, ValueError):
+ print('opencode_missing')
+"""
+
+
+def _verify_opencode_binary(deploy: Path) -> None:
+    binary = _agent_exec(deploy, "/home/mimir/venv/bin/python", "-c", _OPENCODE_RESOLVE_PROBE)
+    check = "opencode_missing"
+    if binary.startswith("/") and "\n" not in binary and "\x00" not in binary:
+        check = _run(["docker", "compose", "exec", "-T", "-u", "worklink", "-w", "/tmp",
+                      "agent", "/usr/local/bin/python", "-c", _OPENCODE_WORKER_PROBE, binary], cwd=deploy)
+    if check != "ok":
+        raise SetupError("OpenCode leaf executable verification failed (opencode_missing); rebuild the agent image and check its OpenCode installation.")
+
+
 def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
     url = f"http://127.0.0.1:{port}"
     for attempt in range(60):
@@ -681,6 +721,7 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str) -> None:
         raise SetupError("Worklink base identity unreadable (base_identity_unreadable); check that the runtime user can read the base clone's local Git config.")
     if identity_check != "ok":
         raise SetupError("Worklink base identity mismatch (base_identity_mismatch); check the base clone's local user.name/user.email and the bot identity in compose.env.")
+    _verify_opencode_binary(deploy)
     # Run in the agent container with its actual HOME, config and compose env.
     # Only a stable reason code crosses the Docker boundary, never the bundle.
     auth_check = _agent_exec(deploy, "python", "-c",
