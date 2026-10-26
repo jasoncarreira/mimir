@@ -27,6 +27,35 @@ NAMES = {
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
 
+# Identity wording belongs to #2024. Keep these four pre-existing lines until
+# that change lands; the repository guard must not exempt any gh command.
+IDENTITY_EXCEPTIONS = {
+    "skills/review/SKILL.md": {
+        "Verify your login (`mimir-carreira`) appears in the reviews list.",
+        "### 7. Operator ping (non-mimir-carreira PRs)",
+        "For PRs authored by anyone other than `mimir-carreira`, fulfill commitment",
+    },
+    "skills/github-poller/SKILL.md": {
+        '      example: "mimir-carreira"',
+    },
+}
+
+
+def test_shipped_skills_do_not_pin_repository_or_identity() -> None:
+    root = SKILLS.parent
+    observed_exceptions: dict[str, set[str]] = {}
+    for path in root.rglob("*"):
+        if not path.is_file() or {"tests", "__pycache__", ".pytest_cache"}.intersection(path.relative_to(root).parts):
+            continue
+        relative = path.relative_to(root).as_posix()
+        for line in path.read_text(encoding="utf-8").splitlines():
+            assert "jasoncarreira/" not in line, f"{relative}: {line}"
+            if "mimir-carreira" in line:
+                assert line in IDENTITY_EXCEPTIONS.get(relative, set()), f"{relative}: {line}"
+                assert line not in observed_exceptions.setdefault(relative, set()), f"{relative}: duplicate {line}"
+                observed_exceptions[relative].add(line)
+    assert observed_exceptions == IDENTITY_EXCEPTIONS
+
 
 def test_selected_provider_seeds_only_its_coding_skills() -> None:
     [candidate] = enabled_plugins(enable="cultivate")

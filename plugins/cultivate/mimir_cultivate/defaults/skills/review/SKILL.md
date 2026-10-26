@@ -26,6 +26,10 @@ issue context use `chainlink_issue_show(issue_id)`; for local changes use
 `repo_diff` rather than passing arbitrary revision ranges to `git diff` on a
 `repo_review` service turn.
 
+Use the repository named in the PR URL or triggering event; for configured
+watches, use the matching entry in `GITHUB_REPOS`. Replace `<owner>/<repo>`
+with that repository (`owner/repo` in examples).
+
 **Trigger**: Operator asks to review a PR; or the github-activity poller fires a
 `pr_opened` / `review_requested` event for a PR authored by someone other than
 the agent itself (`$MIMIR_GITHUB_SELF_LOGIN`) — the agent doesn't self-review.
@@ -61,7 +65,7 @@ On a poller or heartbeat turn, call `pr_metadata(repository, pull_request)`.
 Its body is bounded and author-attested; do not use `gh pr view --json body`.
 
 ```bash
-gh pr view <num> --json number,title,body,author,baseRefName,headRefName,headRefOid,state,additions,deletions,changedFiles
+gh pr view <num> --repo <owner>/<repo> --json number,title,body,author,baseRefName,headRefName,headRefOid,state,additions,deletions,changedFiles
 ```
 
 Note the `headRefOid` (SHA) when comparing against a local checkout.
@@ -69,7 +73,7 @@ Note the `headRefOid` (SHA) when comparing against a local checkout.
 ### 2. Get the diff
 
 ```bash
-gh pr diff <num>
+gh pr diff <num> --repo <owner>/<repo>
 ```
 
 The diff is the **authoritative source for what changed**. Read it carefully
@@ -78,7 +82,7 @@ before reaching for local file reads.
 For PRs whose diff exceeds ~20k lines use the file-list fallback:
 
 ```bash
-gh pr view <num> --repo jasoncarreira/mimir --json files
+gh pr view <num> --repo <owner>/<repo> --json files
 ```
 
 Filter the returned JSON yourself rather than with `--jq` (see the note below).
@@ -103,7 +107,7 @@ out locally, the file may not exist or may show the wrong version.
 different branch:**
 
 ```bash
-gh pr diff <num> --repo jasoncarreira/mimir
+gh pr diff <num> --repo <owner>/<repo>
 ```
 
 On a poller turn, use `pr_diff` and, when extended context is needed, call
@@ -162,9 +166,9 @@ during authorization and never re-opened at execution.
 #    to <scratch>/pr-<num>-review.md
 
 # 2. Submit exactly one of these, as a single command:
-gh pr review <num> --repo jasoncarreira/mimir --approve         --body-file <scratch>/pr-<num>-review.md
-gh pr review <num> --repo jasoncarreira/mimir --request-changes --body-file <scratch>/pr-<num>-review.md
-gh pr review <num> --repo jasoncarreira/mimir --comment         --body-file <scratch>/pr-<num>-review.md
+gh pr review <num> --repo <owner>/<repo> --approve         --body-file <scratch>/pr-<num>-review.md
+gh pr review <num> --repo <owner>/<repo> --request-changes --body-file <scratch>/pr-<num>-review.md
+gh pr review <num> --repo <owner>/<repo> --comment         --body-file <scratch>/pr-<num>-review.md
 ```
 
 The body file must resolve beneath the agent scratch root, be a regular file
@@ -180,7 +184,7 @@ backticks and multi-line text need no escaping at all.
 After an interactive `gh pr review` call completes:
 
 ```bash
-gh pr view <num> --repo jasoncarreira/mimir --json reviews
+gh pr view <num> --repo <owner>/<repo> --json reviews
 ```
 
 Read the last entry of `reviews` from the returned JSON.
@@ -230,6 +234,6 @@ nothing about the submission requirement.
 | Symptom | Fix |
 |---|---|
 | `Read(tests/foo.py)` -> "file does not exist" | Skip Read, continue from diff, still submit |
-| `gh pr diff <num>` -> HTTP 406 "diff too large" | Use `gh pr view <num> --repo <owner>/<repo> --json files` (`gh api` is not admitted) |
+| `gh pr diff <num> --repo <owner>/<repo>` -> HTTP 406 "diff too large" | Use `gh pr view <num> --repo <owner>/<repo> --json files` (`gh api` is not admitted) |
 | `gh pr review` exits non-zero | Check `--help`; verify PR is open; retry once |
 | Review body contains backticks / `${}` | Nothing special — `--body-file` reads the file directly, so no shell expansion occurs |
