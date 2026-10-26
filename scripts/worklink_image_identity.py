@@ -423,10 +423,14 @@ from mimir_cultivate import setup
 calls = []
 def local_exec(argv, *, cwd):
     assert argv[:4] == ['docker', 'compose', 'exec', '-T']
-    assert argv[4:9] in (['-u', 'mimir', '-w', '/tmp', 'agent'],
-                         ['-u', 'worklink', '-w', '/tmp', 'agent'])
+    if argv[5] == 'mimir':
+        assert argv[4:7] == ['-u', 'mimir', 'agent']
+        command = argv[7:]
+    else:
+        assert argv[4:9] == ['-u', 'worklink', '-w', '/tmp', 'agent']
+        command = argv[9:]
     calls.append(argv[5])
-    result = subprocess.run(['/command/s6-setuidgid', argv[5], *argv[9:]],
+    result = subprocess.run(['/command/s6-setuidgid', argv[5], *command],
                             cwd='/tmp', capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()

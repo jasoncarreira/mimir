@@ -541,8 +541,11 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
         installer._verify(tmp_path, 8123, "org/repo", "owner-key")
 
 
+@pytest.mark.parametrize("runtime_injected", [False, True])
 @pytest.mark.parametrize("outcome", ["ok", "nonzero", "missing", "timeout"])
-def test_setup_binary_probe_executes_with_worker_path(tmp_path, monkeypatch, outcome):
+def test_setup_binary_probe_executes_with_worker_path(
+    tmp_path, monkeypatch, outcome, runtime_injected
+):
     import subprocess
     import sys
 
@@ -553,9 +556,13 @@ def test_setup_binary_probe_executes_with_worker_path(tmp_path, monkeypatch, out
 
     binary = tmp_path / "opencode"
     marker = tmp_path / "probe-environment.json"
+    launch_marker = tmp_path / "probe-launch-environment.json"
     binary.write_text(
         f"#!{sys.executable}\nimport json, os, pathlib, sys\n"
-        "assert sys.argv[1:] == ['--version']\n"
+        # Model runtime-added state on every platform, without adding it to the
+        # environment supplied by the probe itself.
+        + ("os.environ['TEST_RUNTIME_ADDED'] = 'runtime-only'\n" if runtime_injected else "")
+        + "assert sys.argv[1:] == ['--version']\n"
         "home = pathlib.Path(os.environ['HOME'])\n"
         "assert home.is_dir() and home.stat().st_mode & 0o777 == 0o700\n"
         "assert os.environ['PATH'] == '/usr/local/bin:/usr/bin:/bin'\n"
@@ -580,11 +587,19 @@ def test_setup_binary_probe_executes_with_worker_path(tmp_path, monkeypatch, out
         assert argv[4:8] == ['-u', 'worklink', '-w', '/tmp']
         assert argv[9] == '/usr/local/bin/python'
         assert argv[-2:] == [installer._OPENCODE_WORKER_PROBE, str(binary)]
-        # A clean interpreter cannot import the plugin, just like system Python
-        # under worklink. Timeout is injected only at the subprocess boundary.
-        code = argv[-2]
-        if outcome == 'timeout':
-            code = "import subprocess\ndef timed_out(*a, **kw):\n raise subprocess.TimeoutExpired(a[0], 15)\nsubprocess.run = timed_out\n" + code
+        # Record the exact environment passed at the real subprocess boundary,
+        # before the child runtime can inject platform-specific variables.
+        # The clean interpreter still executes the unmodified production probe.
+        recorder = (
+            "import json, pathlib, subprocess\n"
+            "real_run = subprocess.run\n"
+            "def record_launch(*args, **kwargs):\n"
+            f" pathlib.Path({str(launch_marker)!r}).write_text(json.dumps(kwargs['env']))\n"
+            + (" raise subprocess.TimeoutExpired(args[0], 15)\n" if outcome == 'timeout'
+               else " return real_run(*args, **kwargs)\n")
+            + "subprocess.run = record_launch\n"
+        )
+        code = recorder + argv[-2]
         result = real_run([sys.executable, '-I', '-S', '-c', code, str(binary)],
                           capture_output=True, text=True, check=True)
         return result.stdout.strip()
@@ -596,19 +611,59 @@ def test_setup_binary_probe_executes_with_worker_path(tmp_path, monkeypatch, out
         with pytest.raises(installer.SetupError, match='opencode_missing'):
             installer._verify_opencode_binary(tmp_path)
     assert len(captured) == 2
+    assert launch_marker.exists(), 'every outcome must reach the subprocess boundary'
+    launch_env = json.loads(launch_marker.read_text())
+    # Exact equality rejects every extra launch variable, including names the
+    # platform might subsequently inject into the child interpreter.
+    base = base_worker_environment('setup-probe-parity')
+    runtime_home = str(Path(base['XDG_CONFIG_HOME']).parent)
+    expected = opencode_worker_environment(base, {})
+    expected = {key: value.replace(runtime_home, launch_env['HOME'])
+                for key, value in expected.items()}
+    expected['HOME'] = launch_env['HOME']  # assigned by the real executor too
+    assert launch_env == expected
+    assert not Path(launch_env['HOME']).exists(), 'probe must clean up after every outcome'
     if outcome in {'ok', 'nonzero'}:
         assert marker.exists(), 'positive control must execute the CLI body'
-        env = json.loads(marker.read_text())
-        # Compare the entire launch contract, not only PATH: changing any base
-        # variable or OpenCode's config derivation must invalidate this probe.
-        base = base_worker_environment('setup-probe-parity')
-        runtime_home = str(Path(base['XDG_CONFIG_HOME']).parent)
-        expected = opencode_worker_environment(base, {})
-        expected = {key: value.replace(runtime_home, env['HOME'])
-                    for key, value in expected.items()}
-        expected['HOME'] = env['HOME']  # assigned by the real executor too
-        assert env == expected
-        assert not Path(env['HOME']).exists(), 'probe must clean up on success and nonzero exit'
+        observed_env = json.loads(marker.read_text())
+        for key, value in expected.items():
+            assert observed_env[key] == value
+        if runtime_injected:
+            assert observed_env['TEST_RUNTIME_ADDED'] == 'runtime-only'
+            assert 'TEST_RUNTIME_ADDED' not in launch_env
+    else:
+        assert not marker.exists(), 'failed launches must not execute the CLI body'
+
+
+def test_real_image_probe_adapter_accepts_actual_setup_argv(monkeypatch):
+    import ast
+    import subprocess
+
+    # Execute the shipped image-proof payload, not a copy of its adapter. Only
+    # the final setuid transport is faked; setup generates both real argv shapes.
+    script = Path(__file__).resolve().parents[3] / 'scripts/worklink_image_identity.py'
+    payloads = [node.value for node in ast.walk(ast.parse(script.read_text()))
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and 'real-image setup OpenCode probe passed' in node.value]
+    assert len(payloads) == 1
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        output = '/opt/mimir-opencode/bin/opencode' if argv[1] == 'mimir' else 'ok'
+        return SimpleNamespace(returncode=0, stdout=output, stderr='')
+
+    monkeypatch.setattr(subprocess, 'run', run)
+    monkeypatch.setattr(installer, '_run', installer._run)
+    exec(compile(payloads[0], '<real-image-setup-probe>', 'exec'), {})
+    assert [argv for argv, _ in calls] == [
+        ['/command/s6-setuidgid', 'mimir', '/home/mimir/venv/bin/python', '-c',
+         installer._OPENCODE_RESOLVE_PROBE],
+        ['/command/s6-setuidgid', 'worklink', '/usr/local/bin/python', '-c',
+         installer._OPENCODE_WORKER_PROBE, '/opt/mimir-opencode/bin/opencode'],
+    ]
+    assert all(kwargs == dict(cwd='/tmp', capture_output=True, text=True, timeout=30)
+               for _, kwargs in calls)
 
 
 def test_setup_binary_resolution_failure_does_not_launch_worker(tmp_path, monkeypatch):
