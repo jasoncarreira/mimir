@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 def _ensure_mimir_import_path() -> None:
@@ -53,10 +53,14 @@ def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=45, check=False)
 
 
-def _count(platform: str, state_dir: Path) -> int | None:
+def _count(platform: str, state_dir: Path, today: str = "today") -> int | None:
+    args = [sys.executable, str(SCRIPTS / "count.py"), "--platform", platform,
+            "--action", "post", "--since", today]
+    if today != "today":
+        until = (date.fromisoformat(today) + timedelta(days=1)).isoformat()
+        args.extend(["--until", until])
     try:
-        result = _run([sys.executable, str(SCRIPTS / "count.py"), "--platform", platform,
-                       "--action", "post", "--since", "today"], state_dir)
+        result = _run(args, state_dir)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
@@ -67,7 +71,7 @@ def _count(platform: str, state_dir: Path) -> int | None:
         return None
 
 
-def _cap_allows(text: str, state_dir: Path, reserved: dict[str, int]) -> dict[str, int] | None:
+def _cap_allows(text: str, state_dir: Path, reserved: dict[str, int], today: str) -> dict[str, int] | None:
     from mimir.social_outbox import load_outbox, validate_outbox
 
     doc = load_outbox(text)
@@ -85,14 +89,14 @@ def _cap_allows(text: str, state_dir: Path, reserved: dict[str, int]) -> dict[st
         for platform in platforms:
             proposed[platform] = proposed.get(platform, 0) + units
 
-    result = _run([sys.executable, str(SCRIPTS / "cap_check.py")], state_dir)
+    result = _run([sys.executable, str(SCRIPTS / "cap_check.py"), "--today", today], state_dir)
     if result.returncode != 0:
         return None
     match = re.search(r"\beffective=(\d+) / 5\b", result.stdout)
     if match is None:
         return None
     for platform, units in proposed.items():
-        current = int(match.group(1)) if platform == "bsky" else _count(platform, state_dir)
+        current = int(match.group(1)) if platform == "bsky" else _count(platform, state_dir, today)
         if current is None or max(current, reserved.get(platform, 0)) + units > CAP:
             return None
     return proposed
@@ -204,7 +208,7 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
                     _withheld(poller, "privacy_scan_refused", rel)
                     print(f"social-cli: privacy scan refused {rel}", file=sys.stderr)
                     continue
-                posts = _cap_allows(text, state_dir, reserved)
+                posts = _cap_allows(text, state_dir, reserved, today)
                 if posts is None:
                     _withheld(poller, "cap_check_refused", rel)
                     print(f"social-cli: cap check refused {rel}", file=sys.stderr)
