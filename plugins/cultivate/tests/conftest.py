@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from tests.isolation_fixtures import (  # noqa: F401  (autouse fixtures)
+    _isolate_github_identity_latch,
     _clear_host_mimir_environment,
     _clear_inherited_git_environment,
     _disable_git_auto_maintenance,
