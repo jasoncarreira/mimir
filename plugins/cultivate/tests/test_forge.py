@@ -214,6 +214,74 @@ def test_provider_pr_metadata_bounds_body_and_preserves_merged_at(monkeypatch) -
     assert result.body and result.body.endswith("é")
 
 
+@pytest.mark.parametrize("url", [
+    "https://github.com/other/trellis/actions/runs/40411654556/job/1",
+    "https://github.com/SquashMerge/other/actions/runs/40411654556/job/1",
+    "https://github.com.evil/SquashMerge/trellis/actions/runs/1",
+    "https://api.github.com/SquashMerge/trellis/actions/runs/1",
+    "http://github.com/SquashMerge/trellis/actions/runs/1",
+    " HTTPS://github.com/SquashMerge/trellis/actions/runs/1",
+    "https://x@github.com/SquashMerge/trellis/actions/runs/1",
+    "https://github.com/SquashMerge/trellis/../other/actions/runs/1",
+    "https://github.com/SquashMerge/trellis/%2e%2e/other/actions/runs/1",
+    "https://github.com/SquashMerge/trellis/%252e%252e/other/actions/runs/1",
+    "https://github.com/SquashMerge/trellis/%2e%2e%2fother/actions/runs/1",
+    "https://github.com/SquashMerge/trellis.evil/actions/runs/1",
+])
+def test_check_url_outside_exact_repo_is_unsafe(url) -> None:
+    scope = replace(_runtime().context.repo_pr_action_scope,
+                    canonical_repo="squashmerge/trellis")
+    check = CheckProjection("test (ubuntu-latest)", "completed", "success", None, None, url)
+    assert not forge._safe_check_projection(check, scope)
+
+
+def test_check_url_preserves_path_case_and_allows_repo_case() -> None:
+    scope = replace(_runtime().context.repo_pr_action_scope,
+                    canonical_repo="squashmerge/trellis")
+    url = "https://github.com/SquashMerge/trellis/actions/runs/40411654556/job/123"
+    check = CheckProjection("test (macos-latest)", "completed", "success", None, None, url)
+    assert forge._safe_check_projection(check, scope)
+    assert check.details_url == url
+
+
+def test_github_origin_repo_comparison_ignores_slug_case() -> None:
+    scope = replace(_runtime().context.repo_pr_action_scope,
+                    canonical_repo="squashmerge/trellis",
+                    canonical_origin="https://github.com/SquashMerge/trellis.git")
+    assert forge._github_origin_matches(scope)
+    assert not forge._github_origin_matches(replace(
+        scope, canonical_origin="https://github.com/SquashMerge/other.git",
+    ))
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/other/repo/actions/runs/1",
+    "https://github.com.evil/owner/repo/actions/runs/1",
+    "https://api.github.com/owner/repo/actions/runs/1",
+    "http://github.com/owner/repo/actions/runs/1",
+    "https://x@github.com/owner/repo/actions/runs/1",
+    "https://github.com/owner/repo/../other/actions/runs/1",
+    "https://github.com/owner/repo/%2e%2e/other/actions/runs/1",
+])
+def test_pr_checks_unsafe_url_downgrades_attestation(url) -> None:
+    runtime = _runtime()
+    client = _Forge()
+    client.author_is_trusted = lambda *_: True
+    client.list_checks = lambda _: (
+        CheckProjection("test", "completed", "success", None, None, url),
+    )
+    forge.set_forge_client(client)
+    try:
+        token = access_control.begin_protected_result_capture()
+        try:
+            assert forge.pr_checks.func("owner/repo", 17, runtime=runtime)[0]["details_url"] == url
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+    finally:
+        forge.set_forge_client(None)
+    assert [source.integrity for source in provenance.sources] == ["trusted", "untrusted"]
+
+
 @pytest.mark.parametrize("method,warning", [
     ("GET", False), ("POST", True), ("PATCH", True),
 ])

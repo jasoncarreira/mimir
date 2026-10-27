@@ -2313,6 +2313,21 @@ def test_https_push_refuses_when_acting_identity_is_unverified(
     assert "cache is empty" in str(refusal.value)
 
 
+def test_https_push_accepts_mixed_case_github_repo_origin(repo_tools, monkeypatch) -> None:
+    _origin, _source, scope, old_state, _tools = repo_tools
+    mixed = "https://github.com/SquashMerge/trellis.git"
+    altered = replace(scope, canonical_repo="squashmerge/trellis", canonical_origin=mixed)
+    lease = replace(old_state.checkout_lease, canonical_repo=altered.canonical_repo,
+                    canonical_origin=mixed, scope_id=altered.scope_id)
+    state = RepoReviewState(altered)
+    state.attach_checkout_lease(lease)
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+    monkeypatch.setattr("mimir_cultivate.forge.confirm_github_identity", lambda *_: None)
+    origin, config, _secrets = RepoGitTools(state)._push_remote()
+    assert origin == mixed
+    assert config["GIT_CONFIG_KEY_0"] == f"http.{mixed}.extraheader"
+
+
 def test_push_failure_reports_and_preserves_stranded_local_commit(repo_tools) -> None:
     _origin, _source, _scope, state, tools = repo_tools
     lease = state.checkout_lease
@@ -2349,6 +2364,7 @@ def test_push_failure_reports_and_preserves_stranded_local_commit(repo_tools) ->
         "https://user@github.com/owner/repo.git",
         "https://github.com:443/owner/repo.git",
         "https://github.com/owner/repo.git?redirect=attacker",
+        "https://github.com/owner/repo.GIT",
     ],
 )
 def test_push_credential_is_available_only_for_exact_canonical_github_origin(

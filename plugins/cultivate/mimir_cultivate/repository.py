@@ -3241,14 +3241,16 @@ class RepoGitTools:
                 port = parsed.port
             except ValueError:
                 port = -1
-            expected_paths = {
-                f"/{self._scope.canonical_repo}",
-                f"/{self._scope.canonical_repo}.git",
-            }
+            expected_repo_path = f"/{self._scope.canonical_repo}".casefold()
+            repo_path_matches = (
+                parsed.path.casefold() == expected_repo_path
+                or parsed.path.endswith(".git")
+                and parsed.path[:-4].casefold() == expected_repo_path
+            )
             if (
                 parsed.scheme != "https"
                 or parsed.hostname != "github.com"
-                or parsed.path not in expected_paths
+                or not repo_path_matches
                 or parsed.username
                 or parsed.password
                 or port
@@ -4954,7 +4956,7 @@ def _publish_attested_lease_result(
     if (
         scope.head_remote != "origin"
         or scope.head_repo != scope.canonical_repo
-        or _github_repo_from_remote(scope.canonical_origin) != scope.canonical_repo
+        or (_github_repo_from_remote(scope.canonical_origin) or "").casefold() != scope.canonical_repo.casefold()
         or not scope.destination_ref.startswith("refs/heads/")
         or scope.destination_ref != f"refs/heads/{scope.head_ref}"
         or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")

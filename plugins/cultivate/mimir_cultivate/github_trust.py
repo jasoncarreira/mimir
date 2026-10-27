@@ -61,8 +61,11 @@ def sanitize_url(url: object, repo: object) -> str | None:
     """Keep only a canonical issue/PR URL under the exact expected repository."""
     if not isinstance(url, str) or not isinstance(repo, str) or not _REPO.fullmatch(repo):
         return None
-    pattern = rf"https://github\.com/{re.escape(repo)}/(?:issues|pull)/[0-9]+(?:\#[A-Za-z0-9_-]{{1,64}})?"
-    return url if re.fullmatch(pattern, url, re.ASCII) else None
+    match = re.fullmatch(
+        r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/[0-9]+(?:\#[A-Za-z0-9_-]{1,64})?",
+        url, re.ASCII,
+    )
+    return url if match is not None and match[1].casefold() == repo.casefold() else None
 
 
 def sanitize_timestamp(value: object) -> str | None:
