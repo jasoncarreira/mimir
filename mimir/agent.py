@@ -44,7 +44,6 @@ import subprocess
 import time
 import traceback
 import threading
-import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -3336,15 +3335,7 @@ class Agent:
                 # delivers via the send_message tool.)
                 invoke_config = {
                     "configurable": {
-                        # Saga sessions span multiple poller events, but their
-                        # graph transcripts must not: a previous event may have
-                        # ingested untrusted tool output. Keep the saga id for
-                        # lifecycle/memory; give each poller invocation a fresh
-                        # model thread (including retried turn ids).
-                        "thread_id": (
-                            f"poller:{turn_id}:{uuid.uuid4().hex}"
-                            if event.trigger == "poller" else saga_session_id or session_id
-                        ),
+                        "thread_id": saga_session_id or session_id,
                         # Per-turn channel id so send_message / react /
                         # fetch_channel_history can default to it when
                         # the model doesn't supply ``channel_id``
@@ -4879,11 +4870,6 @@ class Agent:
         event: AgentEvent,
         auth_context: AuthContext,
     ) -> tuple[list[Message], tuple[PromptBlock, ...]]:
-        # Recent activity is a second, independent transcript path: the
-        # channel buffer includes earlier poller triggers and assistant replies.
-        # The current trigger is already included in the per-turn prompt.
-        if event.trigger == "poller":
-            return [], ()
         candidates = self._buffer.assemble_recent_activity_candidates(
             channel_id=event.channel_id or "",
             author=event.author,

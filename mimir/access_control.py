@@ -11713,7 +11713,8 @@ def _provider_pr_lease_result_is_bound(
         and scope is not None
         and isinstance(getattr(scope, "canonical_repo", None), str)
         and type(getattr(scope, "pr_number", None)) is int
-        and arguments.get("repository") == scope.canonical_repo
+        and isinstance(arguments.get("repository"), str)
+        and arguments["repository"].lower() == scope.canonical_repo.lower()
         and arguments.get("pull_request") == scope.pr_number
         and authorization.allowed and not authorization.would_block
         and authorization.decision == OperationDecision.RESOURCE_SCOPED
