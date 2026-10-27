@@ -215,13 +215,14 @@ class WebChatBridge(Bridge):
         final: bool = True,
         reply_to_message_id: str | None = None,
         blocks: list[dict[str, Any]] | None = None,
+        message_id: str | None = None,
     ) -> SendResult:
         # chainlink #5: ``final`` is informational. The web stub fans
         # each send out as its own SSE payload, so a plan-then-result
         # turn naturally arrives as two events without further
         # gating. No typing-indicator affordance to hold.
         del final, reply_to_message_id, blocks
-        message_id = uuid.uuid4().hex[:12]
+        message_id = message_id or uuid.uuid4().hex[:12]
         legacy_payload = {
             "channel_id": channel_id,
             "text": text,
@@ -547,15 +548,13 @@ class WebChatBridge(Bridge):
         bridge = _channel_registry.find(destination) if _channel_registry is not None else None
         if bridge is None:
             return json_error("alert_bridge_unconnected", "alert bridge unavailable", status=409)
-        if destination.startswith("discord-") and (
-            getattr(bridge, "_client", None) is None or not bridge._client.is_ready()
-        ):
-            return json_error("alert_bridge_unconnected", "alert bridge unavailable", status=409)
-        if destination.startswith("slack-") and (
-            getattr(bridge, "_handler", None) is None
-            or not await bridge._handler.client.is_connected()
-        ):
-            return json_error("alert_bridge_unconnected", "alert bridge unavailable", status=409)
+        if destination.startswith(("discord-", "slack-")):
+            try:
+                connected = await bridge.connection_state()
+            except Exception:
+                connected = None
+            if connected is not True:
+                return json_error("alert_bridge_unconnected", "alert bridge unavailable", status=409)
         labels = InformationFlowLabels().with_source(SourceLabel(
             principal=identity.canonical, domain="channel", resource_id=_web_channel_for(identity.canonical),
             bridge_instance="web", sensitivity="internal",

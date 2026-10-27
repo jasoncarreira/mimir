@@ -198,6 +198,9 @@ class SlackBridge(Bridge):
     prefixes = ("slack-", "dm-slack-")
     name = "slack"
 
+    async def connection_state(self) -> bool:
+        return self._handler is not None and await self._handler.client.is_connected()
+
     # Reconnect backoff schedule for the supervisor wrapping
     # ``handler.start_async()``. Mirrors DiscordBridge — Slack 5xx
     # incidents and Socket-Mode WebSocket disconnects typically recover

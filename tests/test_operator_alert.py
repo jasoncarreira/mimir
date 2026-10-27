@@ -140,9 +140,19 @@ async def test_alert_setup_check_requires_connected_bot_and_successful_send(tmp_
     from mimir.bridges.web_chat import WebChatBridge
     from mimir.bridges.base import SendResult
 
+    if adapter == "discord":
+        pytest.importorskip("discord")
+        from mimir.bridges.discord import DiscordBridge
+        bot = DiscordBridge(token="test-token", enqueue=lambda _: None)
+    else:
+        pytest.importorskip("slack_bolt")
+        from mimir.bridges.slack import SlackBridge
+        bot = SlackBridge(bot_token="xoxb-test", app_token="xapp-test", enqueue=lambda _: None)
+    assert await bot.connection_state() is False
+
     class Bot:
-        _client = SimpleNamespace(is_ready=lambda: False)
-        _handler = None
+        async def connection_state(self):
+            return True
 
     class Channels:
         def __init__(self):
@@ -176,20 +186,11 @@ async def test_alert_setup_check_requires_connected_bot_and_successful_send(tmp_
         channels.bot = None
         response = await client.post(route)
         assert response.status == 409 and (await response.json())["error"]["code"] == "alert_bridge_unconnected"
-        channels.bot = Bot()
+        channels.bot = bot  # Real production bridge, never started.
         response = await client.post(route)
         assert response.status == 409 and (await response.json())["error"]["code"] == "alert_bridge_unconnected"
         assert channels.calls == []
-        channels.bot._client = SimpleNamespace(is_ready=lambda: True)
-        async def disconnected():
-            return False
-        channels.bot._handler = SimpleNamespace(client=SimpleNamespace(is_connected=disconnected))
-        response = await client.post(route)
-        if adapter == "slack":
-            assert response.status == 409 and (await response.json())["error"]["code"] == "alert_bridge_unconnected"
-        async def connected():
-            return True
-        channels.bot._handler = SimpleNamespace(client=SimpleNamespace(is_connected=connected))
+        channels.bot = Bot()  # Connected control exposes only the public API.
         channels.calls.clear()
         response = await client.post(route)
         assert response.status == 503 and (await response.json())["error"]["code"] == "alert_send_failed"
@@ -200,6 +201,81 @@ async def test_alert_setup_check_requires_connected_bot_and_successful_send(tmp_
         assert channels.calls == [(destination, "Cultivate setup: operator alerts enabled", False)] * 2
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["unavailable", "write"])
+async def test_web_history_failure_precedes_send_and_refunds_only_its_slot(tmp_path, monkeypatch, failure):
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    buffer = MessageBuffer(tmp_path / "history.jsonl")
+    channels = _Channels()
+    set_global_buffer(buffer if failure == "write" else None)
+    set_operator_alert_dependencies(channels, SimpleNamespace(operator_alert_channel="web-owner"))
+    turn, _ = _tainted_poller(tmp_path)
+    # Two other reservations must survive this failure, including a pending one.
+    turn.operator_alert_count = 2
+    if failure == "write":
+        # Exercise actual MessageBuffer I/O, including its default soft-error
+        # behavior: the strict append must not publish an in-memory record.
+        buffer.history_path.mkdir()
+    token = set_current_turn(turn)
+    try:
+        reason = "web history is unavailable" if failure == "unavailable" else "web history write failed"
+        with pytest.raises(ToolException, match=reason):
+            await operator_alert.coroutine(text="must not arrive")
+        assert channels.calls == []
+        assert turn.operator_alert_count == 2
+        assert "web-owner" not in turn.delivered_channel_ids
+        assert buffer.channel_count("web-owner") == 0
+    finally:
+        reset_current_turn(token)
+        set_global_buffer(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fanout_failure", [None, "exception", "unsent"])
+async def test_web_history_precedes_fanout_with_same_id_and_no_retry_on_live_failure(tmp_path, fanout_failure):
+    from mimir.bridges.web_chat import WebChatBridge, _Subscriber
+    from mimir.channel_registry import ChannelRegistry
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    buffer = MessageBuffer(tmp_path / "history.jsonl")
+    set_global_buffer(buffer)
+    queue = asyncio.Queue()
+    bridge = WebChatBridge(enqueue=lambda _: None, home=tmp_path)
+    bridge._subscribers.append(_Subscriber(queue=queue, allowed_channels=frozenset({"web-owner"})))
+
+    class Channels(ChannelRegistry):
+        async def send(self, channel, text, *, final, message_id=None):
+            record, = buffer.recent_in_channel(channel, 10)
+            assert record.msg_id == message_id and message_id
+            replay = MessageBuffer(buffer.history_path)
+            assert replay.replay() == 1  # Disk completed before any live send.
+            if fanout_failure == "exception":
+                raise OSError("offline")
+            if fanout_failure == "unsent":
+                return SimpleNamespace(sent=False)
+            return await super().send(channel, text, final=final, message_id=message_id)
+
+    channels = Channels()
+    channels.register(bridge)
+    set_operator_alert_dependencies(channels, SimpleNamespace(operator_alert_channel="web-owner"))
+    turn, _ = _tainted_poller(tmp_path)
+    token = set_current_turn(turn)
+    try:
+        result = await operator_alert.coroutine(text="durable alert")
+        record, = buffer.recent_in_channel("web-owner", 10)
+        assert result == f"operator_alert ok: message_id={record.msg_id}"
+        assert turn.operator_alert_count == 1
+        assert "web-owner" in turn.delivered_channel_ids
+        if fanout_failure is None:
+            assert queue.get_nowait()["message_id"] == record.msg_id
+        else:
+            assert queue.empty()
+    finally:
+        reset_current_turn(token)
+        set_global_buffer(None)
 
 
 class _Channels:
