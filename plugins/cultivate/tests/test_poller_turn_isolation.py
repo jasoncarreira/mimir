@@ -25,9 +25,13 @@ from tests.test_pr_checkout_lease import _repo_and_scope
 
 
 @pytest.fixture(autouse=True)
-def cultivate_policy():
+def cultivate_policy(monkeypatch):
     from mimir.plugins.core import policy_scope
 
+    # The review fixture stubs the forge adapter and models a healthy identity.
+    # Core tests in the same worker may have latched a degraded identity earlier.
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge, "_github_identity_degraded_error", None)
     with policy_scope(load_plugins(enable="cultivate").policy):
         yield
 
@@ -227,4 +231,3 @@ async def test_real_review_sequence_detects_case_binding_regression(tmp_path, mo
     # emulation. The first post-checkout model request acquires untrusted ingest.
     with pytest.raises(AssertionError, match="unresolved-resource:protected_tool:repo_checkout"):
         await test_real_poller_review_sequence(tmp_path, monkeypatch, "github-activity", False)
-
