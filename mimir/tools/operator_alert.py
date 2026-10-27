@@ -97,6 +97,29 @@ async def operator_alert(text: str) -> str:
         detail = f" ({error})" if error else ""
         raise ToolException(f"operator_alert failed: message was not delivered{detail}")
 
+    # Web sends only fan out to live SSE subscribers. Persist this tool's
+    # out-of-turn notification once; ordinary replies use their own turn hooks.
+    if destination.startswith("web-"):
+        from ..history import get_global_buffer
+
+        buffer = get_global_buffer()
+        if buffer is None:
+            raise ToolException("operator_alert failed: web history is unavailable")
+        try:
+            from ..agent import _effective_persisted_integrity
+
+            integrity = (
+                _effective_persisted_integrity(turn.ifc_labels, turn.auth_context)
+                if turn.ifc_labels is not None else "untrusted"
+            )
+            await buffer.append(buffer.make_message(
+                channel_id=destination, kind="assistant_message", content=text.strip(),
+                msg_id=getattr(result, "message_id", None), source="web",
+                integrity=integrity,
+            ))
+        except Exception as exc:
+            raise ToolException("operator_alert failed: web history write failed") from exc
+
     try:
         turn.delivered_channel_ids.add(destination)
     except (AttributeError, TypeError):

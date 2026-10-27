@@ -35,6 +35,173 @@ from mimir.tools.operator_alert import (
 )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("integrity", ["trusted", "untrusted", None])
+async def test_web_alert_persists_once_without_sse_and_keeps_turn_integrity(tmp_path, integrity):
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from mimir.bridges.web_chat import WebChatBridge
+    from mimir.channel_registry import ChannelRegistry
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    buffer = MessageBuffer(tmp_path / "chat_history.jsonl")
+    set_global_buffer(buffer)
+    bridge = WebChatBridge(enqueue=lambda _: None, home=tmp_path)
+    channels = ChannelRegistry()
+    channels.register(bridge)
+    set_operator_alert_dependencies(channels, SimpleNamespace(operator_alert_channel="web-owner"))
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="service:poller", domain="channel", resource_id="poller:test",
+        bridge_instance="poller", sensitivity="internal",
+        authorized_principals=frozenset({"service:poller"}), source_kind="service",
+        integrity=integrity or "untrusted", integrity_effect="active_ingest",
+    )) if integrity is not None else None
+    turn = TurnContext(turn_id="alert-history", session_id="poller:test", trigger="poller",
+                       channel_id="poller:test", started_at=time.monotonic(), ifc_labels=labels)
+    token = set_current_turn(turn)
+    try:
+        result = await operator_alert.coroutine(text="failure requires attention")
+    finally:
+        reset_current_turn(token)
+    assert result.startswith("operator_alert ok:")
+    assert bridge._subscribers == []
+    assert buffer.channel_count("web-owner") == 1
+    record, = buffer.recent_for_channel("web-owner", 10, source_allowlist=frozenset({"web"}))
+    expected_integrity = integrity or "untrusted"
+    assert record.content == "failure requires attention" and record.integrity == expected_integrity
+    assert record.source == "web" and record.kind == "assistant_message"
+    from mimir.agent import _recent_message_is_self_authored
+    assert _recent_message_is_self_authored(record) is (integrity == "trusted")
+    replayed = MessageBuffer(buffer.history_path)
+    assert replayed.replay() == 1
+    assert replayed.recent_in_channel("web-owner", 1)[0].integrity == expected_integrity
+
+    @web.middleware
+    async def authenticate(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="owner", access=SimpleNamespace(is_admin=True))
+        return await handler(request)
+
+    app = web.Application(middlewares=[authenticate])
+    bridge.register_routes(app)
+    client = TestClient(TestServer(app))
+    try:
+        await client.start_server()
+        response = await client.get("/api/v1/chat/history")
+        assert response.status == 200
+        messages = (await response.json())["data"]["messages"]
+        assert [(m["role"], m["text"]) for m in messages] == [("assistant", "failure requires attention")]
+    finally:
+        await client.close()
+        set_global_buffer(None)
+
+
+@pytest.mark.asyncio
+async def test_alert_setup_check_requires_owner_admin_and_uses_real_tool(tmp_path):
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from mimir.bridges.web_chat import WebChatBridge
+    from mimir.channel_registry import ChannelRegistry
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    buffer = MessageBuffer(tmp_path / "chat_history.jsonl")
+    set_global_buffer(buffer)
+    bridge = WebChatBridge(enqueue=lambda _: None, home=tmp_path)
+    channels = ChannelRegistry()
+    channels.register(bridge)
+    set_operator_alert_dependencies(channels, SimpleNamespace(operator_alert_channel="web-owner"))
+    @web.middleware
+    async def authenticate(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical=request.headers.get("X-Identity", "owner"),
+            access=SimpleNamespace(is_admin=request.headers.get("X-Admin") == "yes"))
+        return await handler(request)
+    app = web.Application(middlewares=[authenticate])
+    bridge.register_routes(app)
+    client = TestClient(TestServer(app))
+    try:
+        await client.start_server()
+        route = "/api/v1/chat/operator-alert-check"
+        assert (await client.post(route)).status == 403
+        assert (await client.post(route, headers={"X-Admin": "yes", "X-Identity": "other"})).status == 409
+        assert buffer.channel_count("web-owner") == 0
+        response = await client.post(route, headers={"X-Admin": "yes"})
+        assert response.status == 200 and (await response.json())["data"]["sent"] is True
+        assert [m.content for m in buffer.recent_in_channel("web-owner", 10)] == [
+            "Cultivate setup: operator alerts enabled"]
+    finally:
+        await client.close()
+        set_global_buffer(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter", ["discord", "slack"])
+async def test_alert_setup_check_requires_connected_bot_and_successful_send(tmp_path, adapter):
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from mimir.bridges.web_chat import WebChatBridge
+    from mimir.bridges.base import SendResult
+
+    class Bot:
+        _client = SimpleNamespace(is_ready=lambda: False)
+        _handler = None
+
+    class Channels:
+        def __init__(self):
+            self.bot = Bot()
+            self.sent = False
+            self.calls = []
+
+        def find(self, channel):
+            return self.bot
+
+        async def send(self, channel, text, *, final):
+            self.calls.append((channel, text, final))
+            return SendResult(sent=self.sent, message_id="probe-id", error="token-sensitive-error")
+
+    destination = adapter + ("-123456789012345678" if adapter == "discord" else "-C12345678")
+    channels = Channels()
+    set_operator_alert_dependencies(channels, SimpleNamespace(operator_alert_channel=destination))
+    bridge = WebChatBridge(enqueue=lambda _: None, home=tmp_path)
+
+    @web.middleware
+    async def authenticate(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="owner", access=SimpleNamespace(is_admin=True))
+        return await handler(request)
+
+    app = web.Application(middlewares=[authenticate])
+    bridge.register_routes(app)
+    client = TestClient(TestServer(app))
+    try:
+        await client.start_server()
+        route = "/api/v1/chat/operator-alert-check"
+        channels.bot = None
+        response = await client.post(route)
+        assert response.status == 409 and (await response.json())["error"]["code"] == "alert_bridge_unconnected"
+        channels.bot = Bot()
+        response = await client.post(route)
+        assert response.status == 409 and (await response.json())["error"]["code"] == "alert_bridge_unconnected"
+        assert channels.calls == []
+        channels.bot._client = SimpleNamespace(is_ready=lambda: True)
+        async def disconnected():
+            return False
+        channels.bot._handler = SimpleNamespace(client=SimpleNamespace(is_connected=disconnected))
+        response = await client.post(route)
+        if adapter == "slack":
+            assert response.status == 409 and (await response.json())["error"]["code"] == "alert_bridge_unconnected"
+        async def connected():
+            return True
+        channels.bot._handler = SimpleNamespace(client=SimpleNamespace(is_connected=connected))
+        channels.calls.clear()
+        response = await client.post(route)
+        assert response.status == 503 and (await response.json())["error"]["code"] == "alert_send_failed"
+        assert "token-sensitive-error" not in await response.text()
+        channels.sent = True
+        response = await client.post(route)
+        assert response.status == 200 and (await response.json())["data"]["sent"] is True
+        assert channels.calls == [(destination, "Cultivate setup: operator alerts enabled", False)] * 2
+    finally:
+        await client.close()
+
+
 class _Channels:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, bool]] = []

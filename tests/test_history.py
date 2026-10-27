@@ -1374,4 +1374,6 @@ def test_message_buffer_consumer_inventory_is_closed() -> None:
         ("mimir/tools/registry.py", "send_message", "_buf.append"),
         ("mimir/tools/registry.py", "send_message", "_buf.make_message"),
         ("mimir/tools/registry.py", "send_message", "get_global_buffer"),
+        # Web operator alerts persist even without a live SSE subscriber.
+        ("mimir/tools/operator_alert.py", "operator_alert", "get_global_buffer"),
     }
