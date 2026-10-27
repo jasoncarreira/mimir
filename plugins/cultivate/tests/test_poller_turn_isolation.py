@@ -30,7 +30,8 @@ def cultivate_policy(monkeypatch):
 
     # The review fixture stubs the forge adapter and models a healthy identity.
     # Core tests in the same worker may have latched a degraded identity earlier.
-    monkeypatch.setattr(forge, "github_identity_is_degraded", lambda: False)
+    monkeypatch.setattr(forge, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge, "_github_identity_degraded_error", None)
     with policy_scope(load_plugins(enable="cultivate").policy):
         yield
 
