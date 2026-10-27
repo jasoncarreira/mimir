@@ -61,7 +61,9 @@ def _api(pr: dict, checks: list[dict], runs: list[dict] | None = None,
         if endpoint == "repos/o/r/issues/42/timeline?per_page=100":
             return timeline or []
         if endpoint == f"repos/o/r/commits/{pr['head']['sha']}/check-runs?per_page=100":
-            return {"check_runs": checks}
+            return {"check_runs": checks, "total_count": len(checks)}
+        if endpoint == f"repos/o/r/commits/{pr['head']['sha']}/status":
+            return {"statuses": []}
         if endpoint == f"repos/o/r/actions/runs?head_sha={pr['head']['sha']}&per_page=100":
             return {"workflow_runs": runs or [], "total_count": len(runs or [])}
         raise AssertionError(endpoint)
@@ -76,7 +78,7 @@ def _deferred_review(**changes):
     }
 
 
-@pytest.mark.parametrize("conclusion", ["success", "failure", "neutral", "skipped", None])
+@pytest.mark.parametrize("conclusion", ["success", "failure", "neutral", "skipped"])
 @pytest.mark.parametrize("request_cleared", [False, True])
 def test_deferred_review_resumes_once_when_checks_conclude(
     monkeypatch, tmp_path, capsys, conclusion, request_cleared,
@@ -94,16 +96,16 @@ def test_deferred_review_resumes_once_when_checks_conclude(
     assert capsys.readouterr().out == ""
     assert "42:review_ci" not in cursor
 
-    checks[:] = [_check(conclusion)] if conclusion else []
+    checks[:] = [_check(conclusion)]
     _, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     prompts = [e for e in events if e.get("reason") == "checks_concluded"]
     assert len(prompts) == 1
     event = prompts[0]
-    assert event["event_type"] == "pr_review_requested"
+    assert event["event_type"] == "pr_checks_completed"
     assert "prompt" in event and "signal" not in event
-    assert "Checks concluded" in event["prompt"]
-    assert "complete your deferred COMMENTED review" in event["prompt"]
+    assert "CI follow-up" in event["prompt"]
+    assert ("approve without a full re-review" if conclusion != "failure" else "Request changes") in event["prompt"]
     assert event["head_sha"] == HEAD
     assert event["requested_reviewer"] == "mimir-bot"
     assert event["dedup_scope"] == "head_sha,reviewer"
@@ -158,17 +160,21 @@ def test_completion_dedup_is_per_head_and_reviewer(monkeypatch, captured_emits):
     assert len(captured_emits) == 3
 
 
-@pytest.mark.parametrize("reason", ["no_request", "wrong_head", "wrong_reviewer", "workflow_running",
-                                         "check_unknown", "malformed_check", "incomplete_checks"])
+@pytest.mark.parametrize("reason", ["wrong_head", "wrong_reviewer", "workflow_running",
+                                          "check_unknown", "malformed_check", "incomplete_checks", "draft", "no_checks"])
 def test_deferred_review_completion_requires_evidence(monkeypatch, captured_emits, reason):
     pr = _pr("contributor")
-    pr["requested_reviewers"] = [] if reason == "no_request" else [{"login": "mimir-bot"}]
+    pr["requested_reviewers"] = [{"login": "mimir-bot"}]
+    if reason == "draft":
+        pr["draft"] = True
     review = _deferred_review()
     if reason == "wrong_head":
         review["commit_id"] = "c" * 40
     if reason == "wrong_reviewer":
         review["user"] = {"login": "someone-else"}
     checks = [_check("success")]
+    if reason == "no_checks":
+        checks = []
     if reason == "check_unknown":
         checks[0]["conclusion"] = None
     if reason == "malformed_check":
@@ -181,6 +187,71 @@ def test_deferred_review_completion_requires_evidence(monkeypatch, captured_emit
     ))
     count, _ = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {})
     assert count == 0 and captured_emits == []
+
+
+def test_followup_waits_for_commit_status_and_restart_preserves_dedupe(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    pr = _pr("contributor")
+    api = _api(pr, [_check("success")], reviews=[_deferred_review()])
+    status = {"statuses": [{"context": "legacy", "state": "pending"}]}
+    monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: (
+        status if endpoint.endswith("/status") else api(endpoint, token)
+    ))
+    _, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {})
+    assert capsys.readouterr().out == ""
+    status["statuses"][0]["state"] = "success"
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
+    assert count == 1
+    assert "approve without a full re-review" in capsys.readouterr().out
+    monkeypatch.setattr(poller, "CURSOR_FILE", tmp_path / "cursor.json")
+    poller._save_cursor({"pr_ci_failures": {"o/r": cursor}})
+    restored = poller._load_cursor()["pr_ci_failures"]["o/r"]
+    count, _ = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", restored)
+    assert count == 0 and capsys.readouterr().out == ""
+
+
+def test_commit_status_only_ci_can_resume_a_withheld_review(monkeypatch, capsys):
+    pr = _pr("contributor")
+    api = _api(pr, [], reviews=[_deferred_review()])
+    monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: (
+        {"statuses": [{"context": "legacy", "state": "success"}]}
+        if endpoint.endswith("/status") else api(endpoint, token)
+    ))
+    count, _cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {})
+    assert count == 1
+    assert "approve without a full re-review" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("failure,log", [
+    ("startup_failure", "CI log limitation: unavailable"),
+    ("failure", "registry toomanyrequests"),
+    ("failure", "registry HTTP 429"),
+])
+def test_infrastructure_rerun_is_capped_per_head(monkeypatch, captured_emits, failure, log):
+    pr = _pr("contributor")
+    checks = [dict(_check(failure), details_url="https://github.com/o/r/actions/runs/21/job/4")]
+    reviews = [_deferred_review()]
+    monkeypatch.setattr(poller, "_gh_api", _api(pr, checks, reviews=reviews))
+    attempts = []
+    monkeypatch.setattr(poller, "_rerun_infrastructure_jobs", lambda *args: attempts.append(args) or True)
+    monkeypatch.setattr(poller, "_remediation_logs", lambda *args: "\n" + log)
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", {})
+    assert count == 0 and len(attempts) == 1
+    assert cursor["42:review_ci"]["rerun_attempted"] is True
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
+    assert len(attempts) == 1
+    assert count == 0
+    checks[0]["completed_at"] = "2026-08-16T10:05:00Z"
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
+    assert len(attempts) == 1
+    assert count == 1
+    assert captured_emits[0]["event_type"] == "pr_checks_completed"
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
+    assert count == 0 and len(attempts) == 1
+    pr["head"]["sha"] = "b" * 40
+    reviews[:] = [_deferred_review(commit_id="b" * 40)]
+    count, cursor = poller._check_pr_ci_failures("o/r", SINCE, "token", "mimir-bot", cursor)
+    assert count == 0 and len(attempts) == 2
 
 
 def test_owned_failure_emits_bound_remediation(monkeypatch, captured_emits):
@@ -363,6 +434,8 @@ def _multi_api(prs: list[dict], checks: list[dict]):
     def fake(endpoint: str, _token: str):
         if endpoint.startswith("repos/o/r/pulls?state=open"):
             return prs
+        if endpoint.endswith("/reviews"):
+            return []
         if "/check-runs" in endpoint:
             return {"check_runs": checks}
         if "/actions/runs?head_sha=" in endpoint:

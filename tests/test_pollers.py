@@ -3935,6 +3935,25 @@ def test_github_activity_integrity_classification_is_total() -> None:
     assert all(_GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES.values())
 
 
+def test_ci_followup_attests_author_and_exact_head(monkeypatch) -> None:
+    from mimir import pollers
+
+    observed = []
+    def api(endpoint, token, **kwargs):
+        observed.append(endpoint)
+        return 200, {"user": {"login": "collaborator"}, "head": {"sha": "a" * 40}}
+
+    monkeypatch.setattr(pollers, "_github_api_attestation", api)
+    item = {
+        "event_type": "pr_checks_completed", "url": "https://github.com/o/r/pull/17",
+        "head_sha": "a" * 40,
+    }
+    assert pollers._github_content_author("o/r", item, "token") == "collaborator"
+    assert observed == ["repos/o/r/pulls/17"]
+    assert pollers._github_content_author("o/r", {**item, "head_sha": "b" * 40}, "token") is None
+    assert pollers._github_content_author("o/r", {**item, "url": "https://github.com/o/r/pull/18#x"}, "token") is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event_type", ["pr_synchronize", "pr_review_requested"])
 @pytest.mark.parametrize("collaborator", [True, False])

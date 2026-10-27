@@ -155,6 +155,17 @@ Write a review that covers:
 
 ### 5. Submit — MANDATORY last step
 
+Approval is allowed only when the reviewed head has at least one check and
+every check run and commit status is complete and passing (`success`, `neutral`,
+or `skipped`). The submission tools enforce this on the exact head. While CI
+is pending, submit `COMMENTED` with the code findings and withhold approval;
+request changes immediately for blocking findings. A `pr_checks_completed`
+event is a CI follow-up, not a fresh review: if the head is unchanged and CI
+green, approve without a full re-review; if red, request changes naming failed
+checks and the first failing test or log excerpt. Infrastructure reruns are
+limited to one per head by the poller; after that, post a comment for the
+operator rather than requesting another rerun.
+
 Reserve budget for submission. Once you know the verdict, stop optional
 exploration and submit before doing long validation, repeated polling, or
 extra context reads. If the tool-call counter is visibly high (around 90+
