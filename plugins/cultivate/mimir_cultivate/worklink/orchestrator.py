@@ -114,8 +114,7 @@ _COMMIT_SUBJECT_MAX_BYTES = 512
 _PUBLICATION_REFERENCE_RE = re.compile(
     r"https?://(?:www\.)?github\.com/[^\s]+|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+|#\d+", re.I,
 )
-_PUBLICATION_CLOSING_RE = re.compile(r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\b", re.I)
-_HOST_PATH_RE = re.compile(r"(?<![\w])/(?:[\w.-]+/)+[\w.-]+")
+_HOST_PATH_RE = re.compile(r"(?<!\S)/(?:[\w.-]+/)*[\w.-]+|(?<=[`\"'])/(?:[\w.-]+/)*[\w.-]+")
 _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
 _FACTORY_CONTROLLER_ERROR_MAX_BYTES = 4000
@@ -6151,16 +6150,9 @@ def _open_pr(
             + evidence_block.split("\n\n", 1)[1]
         )
     body += f"\n{attribution[1]}\n"
-    # The completion bot scans the entire body for refusal language and extra
-    # tracker references. Keep the canonical first line, scrub untrusted prose
-    # and gate commands separately so they cannot veto an otherwise complete PR.
-    from .merge_closure import _FORBIDDEN
-    marker, rest = body.split("\n", 1)
-    rest = _HOST_PATH_RE.sub("[path omitted]", rest)
-    rest = _PUBLICATION_REFERENCE_RE.sub("[reference omitted]", rest)
-    rest = re.sub(r"\bchainlink\b", "[tracker]", rest, flags=re.I)
-    rest = _FORBIDDEN.sub("[omitted]", rest)
-    body = marker + "\n" + rest
+    # Preserve the builder's meaning and the exact gate command. Refusal
+    # language or extra references must remain visible to merge_closure's
+    # fail-closed check; publication must not turn partial work into completion.
     command = ["gh", "pr", "create", "--base", base, "--head", branch]
     repo_slug = _repo_slug(repo, runner=runner)
     if repo_slug:
@@ -6177,7 +6169,6 @@ def _open_pr(
 
 def _fallback_commit_subject(title: str) -> str:
     clean = _PUBLICATION_REFERENCE_RE.sub("", title)
-    clean = _PUBLICATION_CLOSING_RE.sub("", clean)
     clean = _HOST_PATH_RE.sub("", clean)
     clean = " ".join(clean.split())
     clean = "".join(char for char in clean if char.isprintable())
@@ -6211,7 +6202,6 @@ def _read_commit_subject(checkout: Path, title: str) -> str:
     if (
         not subject or len(subject) > 72 or not subject.isprintable()
         or _PUBLICATION_REFERENCE_RE.search(subject)
-        or _PUBLICATION_CLOSING_RE.search(subject)
         or _HOST_PATH_RE.search(subject)
         or subject != subject.strip()
     ):

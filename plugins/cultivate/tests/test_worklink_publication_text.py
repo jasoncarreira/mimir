@@ -25,7 +25,19 @@ def _git(repo: Path, *args: str) -> str:
     (None, "Fallback for #12 and org/repo#34", "Fallback for and"),
     ("x" * 73, "Fallback title", "Fallback title"),
     ("Contains #12", "Fallback title", "Fallback title"),
-    ("Closes the issue", "Fallback title", "Fallback title"),
+    ("Closes the issue", "Fallback title", "Closes the issue"),
+    ("fix(readme): document ./tools/verify", "Fallback title", "fix(readme): document ./tools/verify"),
+    ("docs: resolve broken links in README", "Fallback title", "docs: resolve broken links in README"),
+    ("Fix the parser crash", "Fallback title", "Fix the parser crash"),
+    (None, "fix(readme): document ./tools/verify", "fix(readme): document ./tools/verify"),
+    (None, "docs: resolve broken links in README", "docs: resolve broken links in README"),
+    (None, "Fix the parser crash", "Fix the parser crash"),
+    ("docs: describe src/a.py", "Fallback title", "docs: describe src/a.py"),
+    (None, "see /home/mimir/agent/x", "see"),
+    (None, "/home/mimir/agent/x", "Worklink change"),
+    ("see `/home/mimir/agent/x`", "Fallback title", "Fallback title"),
+    ('see "/home/mimir/agent/x"', "Fallback title", "Fallback title"),
+    ("see '/home/mimir/agent/x'", "Fallback title", "Fallback title"),
     ("Contains\nmore lines", "Fallback title", "Fallback title"),
     ("Read /home/mimir/agent/state", "Fallback title", "Fallback title"),
     ("x" * 600, "Fallback title", "Fallback title"),
@@ -112,6 +124,52 @@ def test_publication_text_from_real_commit_and_pr(
     assert not merge_closure.parse_completion_reference(
         body.replace("chainlink-2042", "chainlink #2042", 1), expected_issue_id=2042,
     ).qualifies
+
+
+@pytest.mark.parametrize(("summary", "qualifies", "reason"), [
+    ("This is a partial fix: the retry path is not covered yet; TODO follow-up for the cache.",
+     False, "completion_body_contains_refusal_language"),
+    ("Related work: chainlink-2043 and example/repo#7.",
+     False, "ambiguous_chainlink_reference"),
+    ("Fixes example/repo#7", False, "conflicting_github_closing_clause"),
+    ("Implemented the retry path.", True, "qualified"),
+])
+@pytest.mark.parametrize("gate_command", ["./tools/verify", "/usr/bin/python -m pytest -q"])
+def test_pr_preserves_summary_and_gate_for_fail_closed_completion(
+    tmp_path: Path, summary: str, qualifies: bool, reason: str, gate_command: str,
+) -> None:
+    (tmp_path / ".worklink-pr-body.md").write_text(summary)
+    section = orchestrator._read_pr_body_section(tmp_path)
+    assert section == summary
+    calls: list[list[str]] = []
+
+    def runner(args: list[str]):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "https://github.com/example/repo/pull/4\n", "")
+
+    evidence = WorklinkEvidence(
+        issue=2042, attempt=3, backend="opencode", branch="issue/2042-a3",
+        checkout=str(tmp_path), started_at=datetime.now(UTC).isoformat(),
+        finished_at=datetime.now(UTC).isoformat(), files_changed=["change.txt"],
+        diff_stat="1 file changed", commands=[],
+        tests=TestResult(cmd=gate_command, exit_code=0, gate_run_id="gate-77"),
+        pr_url=None, status="completed", model="openai/test-model",
+        transcript="/home/mimir/agent/state/worklink/transcripts/secret.json",
+    )
+    orchestrator._open_pr(
+        tmp_path, orchestrator.IssueContext(2042, "Fix the parser crash", "", set()),
+        evidence.branch, evidence, base="feature/plugins", runner=runner,
+        pr_body_section=section,
+    )
+    command = next(call for call in calls if call[:3] == ["gh", "pr", "create"])
+    assert command[command.index("--title") + 1] == "Fix the parser crash"
+    body = command[command.index("--body") + 1]
+    assert f"Build summary:\n\n{summary}\n\n" in body
+    assert f"- Tests: `{gate_command}` → 0\n" in body
+    assert "- Transcript run: `2042-3 (gate-77)`" in body
+    assert evidence.transcript not in body
+    decision = merge_closure.parse_completion_reference(body, expected_issue_id=2042)
+    assert (decision.qualifies, decision.reason) == (qualifies, reason)
 
 
 @pytest.mark.parametrize("value", [

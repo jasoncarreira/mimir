@@ -1784,7 +1784,7 @@ def test_gate_flakes_survive_second_observation_without_masking_failure(
         assert "- Tests: `echo ok` → 0" in body
         assert "- Original gate: `echo ok` → 1" in body
         assert "- Diagnostic rerun (serial, failed nodes only): `echo ok` → 0" in body
-        assert f'flaky_tests (passed in isolation; [omitted] proof of flakiness): ["{flaky}"]' in body
+        assert f'flaky_tests (passed in isolation; not proof of flakiness): ["{flaky}"]' in body
 
 
 @pytest.mark.parametrize("has_tests", [True, False])
