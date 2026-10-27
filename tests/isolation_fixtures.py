@@ -23,6 +23,30 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolate_github_identity_latch():
+    """Runtime startup can latch Cultivate coding off; restore this test's state.
+
+    Do not import the optional provider just to isolate an unselected test.
+    The initial values apply even when the first import happens inside the test.
+    """
+    forge = sys.modules.get("mimir_cultivate.forge")
+    if forge is None:
+        before = (False, None, None)
+    else:
+        with forge._github_identity_degraded_lock:
+            before = (forge._github_identity_degraded, forge._github_identity_degraded_error)
+        before += (forge._github_identity_degraded_callback,)
+    try:
+        yield
+    finally:
+        forge = sys.modules.get("mimir_cultivate.forge")
+        if forge is not None:
+            with forge._github_identity_degraded_lock:
+                forge._github_identity_degraded, forge._github_identity_degraded_error = before[:2]
+            forge._github_identity_degraded_callback = before[2]
+
+
+@pytest.fixture(autouse=True)
 def _isolate_installed_saga_config():
     """An entrypoint's explicit installation must not affect the next test."""
     from mimir.saga import _config_io
