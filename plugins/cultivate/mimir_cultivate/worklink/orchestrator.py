@@ -1663,17 +1663,23 @@ class WorklinkRunner:
                 lease.path, runner=runner, publication=publication,
                 protected=snapshot.fingerprints,
             )
-            gate_excluded.update(after.dirty - snapshot.dirty - snapshot.fingerprints.keys())
+            # Only newly untracked output is a disposable gate byproduct.
+            # Newly dirty tracked paths must block publication: excluding them
+            # would publish a different tree from the one the gate tested.
+            gate_excluded.update(after.untracked - snapshot.untracked - snapshot.fingerprints.keys())
+            changed_tracked = (
+                after.dirty - after.untracked - snapshot.dirty - snapshot.fingerprints.keys()
+            )
             observed = replace(observed, evidence=replace(
                 observed.evidence,
                 files_changed=[p for p in observed.evidence.files_changed if p not in gate_excluded],
                 gate_byproducts_count=len(gate_excluded),
                 gate_byproducts_top_level=sorted({_top_level(p) for p in gate_excluded}),
             ))
-            altered = sorted(
+            altered = sorted(changed_tracked | {
                 path for path, fingerprint in snapshot.fingerprints.items()
                 if after.fingerprints[path] != fingerprint
-            )
+            })
             if altered or snapshot.index_diff != after.index_diff:
                 reason = "gate_changed_builder_content: " + ", ".join(altered[:10])
                 if not altered:
@@ -5861,9 +5867,7 @@ def _commit_checkout_changes(
     for path in added:
         top = _top_level(path)
         counts[top] = counts.get(top, 0) + 1
-    if len(added) > max_new_untracked_files or any(
-        count > max_new_untracked_files for count in counts.values()
-    ):
+    if len(added) > max_new_untracked_files:
         detail = ", ".join(f"{name}: {count}" for name, count in sorted(counts.items()))
         raise WorklinkError(
             f"bulk new untracked files ({len(added)}, limit {max_new_untracked_files}); "

@@ -43,7 +43,9 @@ class _Release:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", [
     "gate_output", "gate_rewrite", "gate_delete", "gate_stage", "gate_tracked_output",
-    "late_rewrite", "bulk", "source_files", "tracked_delete", "tracked_rename",
+    "gate_tracked_delete", "gate_tracked_mode", "gate_tracked_rename",
+    "gate_untracked_rewrite", "late_rewrite", "late_tracked_rewrite",
+    "bulk", "bulk_distributed", "source_files", "tracked_delete", "tracked_rename",
 ])
 async def test_finalize_publishes_only_builder_content(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str,
@@ -73,14 +75,28 @@ async def test_finalize_publishes_only_builder_content(
         gate = "git add README.md"
     elif case == "gate_tracked_output":
         gate = "printf gate > old.txt"
-    elif case == "late_rewrite":
-        gate = "if test -f target-test-support/seen; then printf gate > README.md; " \
+    elif case == "gate_tracked_delete":
+        gate = "rm old.txt"
+    elif case == "gate_tracked_mode":
+        _git(repo, "config", "core.filemode", "true")
+        (repo / "old.txt").chmod(0o644)
+        gate = "chmod +x old.txt"
+    elif case == "gate_tracked_rename":
+        gate = "mv old.txt renamed.txt"
+    elif case == "gate_untracked_rewrite":
+        (repo / "new.txt").write_text("builder\n")
+        gate = "printf gate > new.txt"
+    elif case in {"late_rewrite", "late_tracked_rewrite"}:
+        target = "README.md" if case == "late_rewrite" else "old.txt"
+        gate = f"if test -f target-test-support/seen; then printf gate > {target}; " \
                "else mkdir -p target-test-support; touch target-test-support/seen; fi"
-    elif case == "bulk":
-        output = repo / "build-output"
-        output.mkdir()
-        for index in range(4):
-            (output / f"{index}.bin").write_text("output")
+    elif case in {"bulk", "bulk_distributed"}:
+        directories = {"build-output": 4} if case == "bulk" else {"build-a": 2, "build-b": 2}
+        for name, count in directories.items():
+            output = repo / name
+            output.mkdir()
+            for index in range(count):
+                (output / f"{index}.bin").write_text("output")
     elif case == "source_files":
         source = repo / "src"
         source.mkdir()
@@ -114,17 +130,30 @@ async def test_finalize_publishes_only_builder_content(
         terminal_release=_Release(),
     )
     evidence = json.loads(result.evidence_path.read_text())
-    if case in {"gate_rewrite", "gate_delete", "gate_stage", "late_rewrite", "bulk"}:
-        assert result.status == "blocked", (result.reason, (repo / "README.md").read_text() if (repo / "README.md").exists() else None, evidence["gate_byproducts_count"])
+    late_changes = {"late_rewrite", "late_tracked_rewrite"}
+    gate_changes = {
+        "gate_rewrite", "gate_delete", "gate_stage", "gate_tracked_output",
+        "gate_tracked_delete", "gate_tracked_mode", "gate_tracked_rename",
+        "gate_untracked_rewrite", *late_changes,
+    }
+    if case in gate_changes | {"bulk", "bulk_distributed"}:
+        assert result.status == "blocked", result.reason
         assert result.pr_url is None
-        if case != "late_rewrite":
+        if case not in late_changes:
             assert _git(repo, "rev-parse", "HEAD") == base
         else:
             assert _git(repo, "show", "HEAD:README.md") == "builder"
-        if case in {"gate_rewrite", "gate_delete", "gate_stage", "late_rewrite"}:
+        if case in gate_changes:
             assert "gate_changed_builder_content" in result.reason
+            if case.startswith("gate_tracked_"):
+                assert "old.txt" in result.reason
+                assert "old.txt" not in evidence["gate_byproducts_top_level"]
         else:
-            assert "build-output: 4" in result.reason
+            if case == "bulk":
+                assert "build-output: 4" in result.reason
+            else:
+                assert "build-a: 2" in result.reason
+                assert "build-b: 2" in result.reason
             assert "defaults.max_new_untracked_files" in result.reason
         orchestrator._git_push.assert_not_called()
     else:
@@ -139,11 +168,9 @@ async def test_finalize_publishes_only_builder_content(
             expected.add("new.txt")
         assert committed == expected
         assert set(evidence["files_changed"]) == expected
-        if case in {"gate_output", "gate_tracked_output"}:
+        if case == "gate_output":
             assert evidence["gate_byproducts_count"] == 1
-            assert evidence["gate_byproducts_top_level"] == [
-                "target-test-support" if case == "gate_output" else "old.txt"
-            ]
+            assert evidence["gate_byproducts_top_level"] == ["target-test-support"]
             assert "target-test-support" not in " ".join(evidence["files_changed"])
 
 
