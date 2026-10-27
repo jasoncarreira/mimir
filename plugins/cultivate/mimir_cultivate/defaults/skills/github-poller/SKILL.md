@@ -93,6 +93,14 @@ For each repo in `GITHUB_REPOS`:
   comments on ordinary issues do not start turns)
 - **New PR review comments** (inline diff comments — distinct from conversation comments)
 - **New PR reviews** (approve / changes-requested / commented with body)
+  Trusted conversation comments, inline review comments, and non-empty COMMENTED
+  reviews on the bot's own open PRs produce one remediation turn per PR per poll.
+  It quotes the feedback, asks the bot to decide whether changes are needed,
+  make and test requested fixes, push to the PR branch and reply. A comment
+  needing no change may receive a brief reply or end without a push. These
+  comments never request a review of the bot's own PR. Non-collaborator feedback
+  is withheld with a content-free operator notice; the bot's own comments and
+  closed/merged PR comments are ignored.
 - **PR pushes/updates** (`pr_synchronize`) — new commits pushed to an existing open PR.
   The poller calls `GET /repos/{repo}/compare/{prev}...{new}` to fetch up to 3
   commit subjects inline. If multiple commits land between polls, all are
@@ -245,6 +253,12 @@ Persists at `<home>/state/pollers/github-activity/cursor.json` (the framework-in
 The `pr_changes_requested` key maps `{repo: {pr_number: {"head_sha": sha, "last_reminded_at": ISO-8601 UTC timestamp, "attempts": count}}}`. It tracks unresolved own-PR stale states, the hourly reminder floor, and bounded attempt series while the live snapshot remains semantically blocked. Attempts are charged from framework-written turn outcomes, not reminder emission. Authorization and tool-boundary refusals are reported but exempt from the content-failure budget and retry only at the 24-hour backstop, preventing a permanent configuration fault from firing at poll cadence. At the cap it emits one `pr_changes_requested_gave_up` signal with the charged outcome reasons; a head change re-arms immediately, and an unchanged parked entry re-arms after the same 24-hour delivery-loss backstop. Closed, unblocked, or substantively changed PRs drop out. Pre-cadence bare-string and structured-without-`attempts` entries migrate quietly as attempt 1 with `last_reminded_at` set to that poll's time, preventing an upgrade-time emit storm.
 
 The `pr_review_requests` key maps `{repo: {pr_number: attempts}}` — `attempts` counts `pr_review_requested` emits while you stayed requested (chainlink #299; a dormant PR that gave up parks at `cap + 1`). The pre-#299 bare-list format (`{repo: [pr_number, ...]}`) migrates automatically on first load.
+
+The `pr_feedback_seen` key maps `{repo: ["issue_comment:<id>",
+"pr_review_comment:<id>", "pr_review:<id>", ...]}`. IDs are recorded after
+emitting the own-PR remediation turn, survive restarts, and suppress duplicate
+turns if a poll window is replayed. Several trusted items on one PR in the same
+window are included in one turn.
 
 The `pr_mergeability` key maps `{repo: {pr_number: {head_sha, reason, last_attempt_at, attempts}}}`. A new head or changed failure reason starts a fresh bounded series; current and closed PRs drop out during snapshot rebuild.
 
