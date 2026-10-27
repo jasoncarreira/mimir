@@ -190,6 +190,60 @@ def test_native_build_tools_are_installed_fail_closed(kind, packages):
     assert 'rm -rf /var/lib/apt/lists/* && ' in install
 
 
+@pytest.mark.parametrize('kind', ['rust', 'node', 'python'])
+def test_extra_system_packages_run_in_fail_closed_layer(kind):
+    layer = installer.render_layer(kind, '1.99.1', 'root:sha',
+                                   system_packages=['lsof', 'libfoo-dev=1:2.3-4~deb12'])
+    assert ('RUN set -eu; apt-get update && apt-get install -y --no-install-recommends '
+            'lsof libfoo-dev=1:2.3-4~deb12 && rm -rf /var/lib/apt/lists/*\n') in layer
+    assert layer.index('USER root\nRUN set -eu; apt-get update') < layer.index('libfoo-dev=')
+
+
+@pytest.mark.parametrize('bad', ['lsof; rm -rf /', '$(id)', 'LSOF', '', 'lsof,',
+                                 'lsof=1;id', 'a'])
+def test_invalid_system_packages_rejected_before_any_file_written(tmp_path, monkeypatch, bad):
+    monkeypatch.setattr(installer, '_license_gate', lambda args: pytest.fail('license file written before validation'))
+    deploy = tmp_path / 'deploy'
+    with pytest.raises(installer.SetupError, match='Invalid system packages'):
+        installer.setup(argparse.Namespace(system_packages=bad, deploy=str(deploy)))
+    assert not list(tmp_path.iterdir())
+    with pytest.raises(installer.SetupError, match='Invalid system packages'):
+        installer.render_layer('node', '22.16.0', 'root:sha', system_packages=[bad])
+
+
+def test_base_image_installs_common_tools():
+    base = Path(installer.__file__).parent / 'docker/base.sh'
+    text = base.read_text()
+    install = text.split('apt-get install -y --no-install-recommends \\', 1)[1].split('curl -fsSL', 1)[0]
+    packages = set(install.replace('\\', ' ').split())
+    assert {'lsof', 'file', 'unzip', 'less', 'make', 'netcat-openbsd', 'iproute2', 'psmisc'} <= packages
+
+
+def test_system_packages_are_checked_as_worklink_in_gate_context(tmp_path, monkeypatch):
+    calls = []
+    statuses = {'lsof': 'install ok installed', 'file': 'install ok installed'}
+
+    def run(argv, *, cwd):
+        assert cwd == tmp_path
+        calls.append(argv)
+        return statuses[argv[-1]]
+
+    monkeypatch.setattr(installer, '_run', run)
+    installer._verify_system_packages(tmp_path, ['lsof', 'file=1:2.3-4'])
+    assert calls == [['docker', 'compose', 'exec', '-T', '-u', 'worklink', '-w', '/tmp',
+                      'agent', 'dpkg-query', '-W', '-f=${Status}', name] for name in ('lsof', 'file')]
+    statuses['file'] = 'deinstall ok config-files'
+    with pytest.raises(installer.SetupError, match='system_package_missing: file'):
+        installer._verify_system_packages(tmp_path, ['lsof', 'file'])
+
+    def missing(argv, *, cwd):
+        raise installer.SetupError('dpkg-query operation failed')
+
+    monkeypatch.setattr(installer, '_run', missing)
+    with pytest.raises(installer.SetupError, match='system_package_missing: lsof'):
+        installer._verify_system_packages(tmp_path, ['lsof'])
+
+
 def test_real_image_proof_rejects_layer_without_its_own_compiler():
     import runpy
 
@@ -286,7 +340,7 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     other_file = tmp_path / "other"
     other_file.write_text("other-secret-test-2008")
     other_file.chmod(0o600)
-    extra = ["--embedding", embedding]
+    extra = ["--embedding", embedding, "--system-packages", "lsof,libfoo-dev=1:2.3-4~deb12"]
     if embedding.startswith("voyage:"):
         extra += ["--embedding-key-file", str(other_file)]
     if saga_spec:
@@ -337,7 +391,9 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     monkeypatch.setattr(installer.subprocess, "run", docker_exec)
     verified = []
     caplog.set_level(logging.DEBUG)
-    for _ in range(2):
+    for index in range(2):
+        if index:
+            args.system_packages = None  # Re-run without the flag keeps the manifest's list.
         installer.setup(args, request=request, run=run,
                         verify=lambda *a: verified.append(a))
     stdout, stderr = capsys.readouterr()
@@ -345,7 +401,8 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
         assert "faster, cheaper" in stdout and "openai:gpt-test" in stdout
         assert "openai:gpt-6-luna:low" in stdout
     assert len(verified) == 2
-    assert all(call[4:] == ('node', '22.16.0') for call in verified)
+    assert all(call[4:] == ('node', '22.16.0', ['lsof', 'libfoo-dev=1:2.3-4~deb12']) for call in verified)
+    assert 'System packages: lsof, libfoo-dev=1:2.3-4~deb12' in stdout
     for secret in (github_secret, model_secret, "other-secret-test-2008", "owner-key-test-2008"):
         assert secret not in stdout + stderr + caplog.text
         for argv in calls:
@@ -359,6 +416,8 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     saga = json.loads((deploy / "manifest.json").read_text())
     assert saga["saga_model_spec"] == (saga_spec or "openai:" + installer.DEFAULT_SAGA_MODELS["openai"] + ":low")
     assert saga["embedding"] == embedding
+    assert saga["system_packages"] == ['lsof', 'libfoo-dev=1:2.3-4~deb12']
+    assert 'lsof libfoo-dev=1:2.3-4~deb12 && rm -rf /var/lib/apt/lists/*' in (deploy / 'Dockerfile.toolchain').read_text()
     assert saga["saga_model_spec"] != "openai:gpt-test"
     assert (deploy / "build.sh").stat().st_mode & 0o777 == 0o755
     assert "https://github.com/neworg/mimir.git#" + SHA in (deploy / "build.sh").read_text()
