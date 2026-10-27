@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 def _ensure_mimir_import_path() -> None:
@@ -54,9 +54,13 @@ def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _count(platform: str, state_dir: Path, today: str = "today") -> int | None:
+    args = [sys.executable, str(SCRIPTS / "count.py"), "--platform", platform,
+            "--action", "post", "--since", today]
+    if today != "today":
+        until = (date.fromisoformat(today) + timedelta(days=1)).isoformat()
+        args.extend(["--until", until])
     try:
-        result = _run([sys.executable, str(SCRIPTS / "count.py"), "--platform", platform,
-                       "--action", "post", "--since", today], state_dir)
+        result = _run(args, state_dir)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:

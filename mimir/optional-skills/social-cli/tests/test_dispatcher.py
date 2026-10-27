@@ -207,7 +207,7 @@ def test_cap_units_from_validated_schema(setup, text, expected):
     import dispatcher
 
     _, state, _, _, _ = setup
-    assert dispatcher._cap_allows(text, state, {}, "2026-10-27") == expected
+    assert dispatcher._cap_allows(text, state, {}, "2020-03-04") == expected
 
 
 @pytest.mark.parametrize("action,payload", [
@@ -234,7 +234,7 @@ def test_dispatch_revalidates_shared_schema(setup, monkeypatch):
 
     _, state, _, _, _ = setup
     monkeypatch.setattr(schema, "validate_outbox", lambda doc: ["forced rejection"])
-    assert dispatcher._cap_allows(POST, state, {}, "2026-10-27") is None
+    assert dispatcher._cap_allows(POST, state, {}, "2020-03-04") is None
 
 
 def test_stray_outbox_name_is_flagged_once_per_content_and_never_dispatched(setup, capsys):
@@ -352,22 +352,23 @@ def freeze_dispatch_clock(monkeypatch, now: datetime) -> None:
     monkeypatch.setattr(dispatcher, "datetime", FrozenDatetime)
 
 
-def seed_five_posts(state: Path, timestamp: datetime) -> None:
+def seed_five_posts(state: Path, timestamp: datetime, platform: str = "bsky") -> None:
     import yaml
 
-    (state / "sent_ledger-bsky.yaml").write_text(yaml.safe_dump([
-        {"action": "post", "platform": "bsky", "timestamp": timestamp.isoformat(),
+    (state / f"sent_ledger-{platform}.yaml").write_text(yaml.safe_dump([
+        {"action": "post", "platform": platform, "timestamp": timestamp.isoformat(),
          "createdId": str(i)}
         for i in range(5)
     ]))
-    # Keep the two cap sources in agreement so the refusal is due to the
-    # five-post limit, not the cap check's divergence guard.
-    archives = state / "outbox_archive"
-    archives.mkdir(exist_ok=True)
-    stamp = timestamp.strftime("%Y-%m-%dT%H-%M-%S-000Z")
-    (archives / f"{stamp}_outbox-bsky.yaml").write_text(yaml.safe_dump({
-        "dispatch": [{"post": {"text": f"prior post {i}"}} for i in range(5)]
-    }))
+    # Keep the two bsky cap sources in agreement so refusal exercises the
+    # five-post limit rather than divergence handling.
+    if platform == "bsky":
+        archives = state / "outbox_archive"
+        archives.mkdir(exist_ok=True)
+        stamp = timestamp.strftime("%Y-%m-%dT%H-%M-%S-000Z")
+        (archives / f"{stamp}_outbox-bsky.yaml").write_text(yaml.safe_dump({
+            "dispatch": [{"post": {"text": f"prior post {i}"}} for i in range(5)]
+        }))
 
 
 @pytest.mark.parametrize("case", ["privacy", "cap"])
@@ -378,7 +379,7 @@ def test_scan_and_cap_refuse(setup, monkeypatch, case, capsys):
         commit_file(home, path, POST.replace("A public update", "ghp_" + "A" * 36))
     else:
         commit_file(home, path)
-        now = datetime(2026, 10, 27, 23, 59, 59, tzinfo=timezone.utc)
+        now = datetime(2020, 3, 4, 23, 59, 59, tzinfo=timezone.utc)
         freeze_dispatch_clock(monkeypatch, now)
         seed_five_posts(state, now)
     module.main()
@@ -386,13 +387,18 @@ def test_scan_and_cap_refuse(setup, monkeypatch, case, capsys):
     assert ("privacy scan refused" if case == "privacy" else "cap check refused") in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("prior_day,allowed", [(False, False), (True, True)])
-def test_cap_utc_midnight_boundary(setup, monkeypatch, capsys, prior_day, allowed):
+@pytest.mark.parametrize("platform", ["bsky", "x"])
+@pytest.mark.parametrize("day_offset,allowed", [(-1, True), (0, False), (1, True)])
+def test_cap_utc_midnight_boundary(setup, monkeypatch, capsys, platform, day_offset, allowed):
     home, state, root, calls, module = setup
-    now = datetime(2026, 10, 27, 23, 59, 59, tzinfo=timezone.utc)
+    # Deliberately far from wall-clock today: ignored clock injection must fail.
+    now = datetime(2020, 3, 4, 23, 59, 59, tzinfo=timezone.utc)
     freeze_dispatch_clock(monkeypatch, now)
-    seed_five_posts(state, now - timedelta(days=1) if prior_day else now)
-    commit_file(home, root / "outbox-one.yaml")
+    timestamp = now + timedelta(days=day_offset)
+    if day_offset == 1:
+        timestamp = timestamp.replace(hour=0, minute=0, second=0)
+    seed_five_posts(state, timestamp, platform)
+    commit_file(home, root / "outbox-one.yaml", POST.replace("bsky", platform))
 
     assert module.main() == 0
     assert len(dispatches(calls)) == int(allowed)

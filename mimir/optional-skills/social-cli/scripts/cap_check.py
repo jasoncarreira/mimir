@@ -159,6 +159,7 @@ def count_ledger(home: Path, today: str) -> int | None:
                 "--platform", "bsky",
                 "--action", "post",
                 "--since", today,
+                "--until", (datetime.date.fromisoformat(today) + datetime.timedelta(days=1)).isoformat(),
             ],
             capture_output=True,
             text=True,
