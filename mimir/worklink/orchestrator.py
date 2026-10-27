@@ -1473,31 +1473,37 @@ class WorklinkRunner:
         finally:
             try:
                 try:
-                    _close_attempt_capabilities(
-                        publication,
-                        lease.authorization if lease is not None else None,
-                        lease.path if lease is not None else None,
-                        delete_checkout=delete_authorized_checkout,
-                    )
-                except Exception as exc:  # noqa: BLE001 - teardown must continue
-                    _log_event(
-                        "worklink_cleanup_failed",
-                        issue_id=issue.issue_id,
-                        attempt=record.attempt,
-                        cleanup="attempt_capabilities",
-                        error=str(exc),
-                    )
-                if executor_report_dir is not None:
-                    await _remove_executor_basetemp_best_effort(
-                        executor_report_dir, worker_uid_drop=worker_uid_drop,
-                        compute=compute, spec=spec, checkout=lease.path if lease else None,
-                        issue_id=issue.issue_id, attempt=record.attempt,
-                    )
-                    _remove_executor_report_dir_best_effort(
-                        executor_report_dir,
-                        issue_id=issue.issue_id,
-                        attempt=record.attempt,
-                    )
+                    if executor_report_dir is not None:
+                        # Worker cleanup needs the still-live checkout. Even a
+                        # cancellation here must close capabilities below.
+                        await _remove_executor_basetemp_best_effort(
+                            executor_report_dir, worker_uid_drop=worker_uid_drop,
+                            compute=compute, spec=spec, checkout=lease.path if lease else None,
+                            issue_id=issue.issue_id, attempt=record.attempt,
+                        )
+                finally:
+                    try:
+                        _close_attempt_capabilities(
+                            publication,
+                            lease.authorization if lease is not None else None,
+                            lease.path if lease is not None else None,
+                            delete_checkout=delete_authorized_checkout,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - teardown must continue
+                        _log_event(
+                            "worklink_cleanup_failed",
+                            issue_id=issue.issue_id,
+                            attempt=record.attempt,
+                            cleanup="attempt_capabilities",
+                            error=str(exc),
+                        )
+                    finally:
+                        if executor_report_dir is not None:
+                            _remove_executor_report_dir_best_effort(
+                                executor_report_dir,
+                                issue_id=issue.issue_id,
+                                attempt=record.attempt,
+                            )
             finally:
                 terminal_release()
 
@@ -4700,7 +4706,7 @@ async def _remove_executor_basetemp_best_effort(
                 raise OSError("worker executor basetemp cleanup failed")
         else:
             rmtree_missing_ok(tmp)
-    except BaseException as exc:  # teardown must not change the attempt's verdict
+    except Exception as exc:  # noqa: BLE001 - cleanup errors must not change the verdict
         _log_event(
             "worklink_cleanup_failed", issue_id=issue_id, attempt=attempt,
             cleanup="executor_basetemp", path=str(tmp) if tmp is not None else None,

@@ -12094,10 +12094,13 @@ def test_worker_capability_cleanup_tolerates_entry_removed_concurrently(
         "pr_exception",
         "publication_exception",
         "branch_cleanup_exception",
+        "cleanup_failure",
+        "cleanup_cancel",
     ],
 )
 def test_authorized_runner_closes_real_attempt_capabilities(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str,
+    request: pytest.FixtureRequest,
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
     from mimir.worklink.compute import (
@@ -12120,6 +12123,23 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     checkout_kwargs = {}
     bound_specs = []
     persisted_gate_handles = []
+    cleanup_specs: list[WorkSpec] = []
+    cleanup_started = asyncio.Event()
+    cleanup_cancelled = []
+    cleanup_worker_handles = []
+    report = tmp_path / "executor-report"
+    basetemp = _gate_tmp_directory(report)
+    exercise_basetemp = scenario in {"success", "cleanup_failure", "cleanup_cancel"}
+    if exercise_basetemp:
+        monkeypatch.setattr(orchestrator, "_make_executor_report_dir", lambda *a, **kw: report)
+        request.addfinalizer(lambda: shutil.rmtree(basetemp) if basetemp.is_dir() else None)
+        original_remove = orchestrator.rmtree_missing_ok
+
+        def controller_remove(path: Path) -> None:
+            assert path != basetemp, "private basetemp must be removed by the worker"
+            original_remove(path)
+
+        monkeypatch.setattr(orchestrator, "rmtree_missing_ok", controller_remove)
 
     class Authorization:
         def __init__(self):
@@ -12198,7 +12218,22 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             return ComputeCaps(True, False, True, False)
 
         async def launch(self, spec):
+            # Match worker_exec's path-checkout admission: teardown cannot
+            # launch after the successful publication deletes the checkout.
+            assert spec.local_checkout is not None
+            assert spec.local_checkout.resolve(strict=True).is_dir()
+            assert publication.closed == 0
+            if spec.local_argv[:2] == ("/bin/sh", "-c") and "shutil.rmtree" in spec.local_argv[2]:
+                cleanup_specs.append(spec)
+                return LaunchHandle("local_subprocess", "123e4567-e89b-42d3-a456-426614174004")
             bound_specs.append(spec)
+            if exercise_basetemp and len(bound_specs) == 1:
+                basetemp.mkdir(mode=0o700)
+                (basetemp / "popen-gw0").mkdir()
+                report.mkdir(exist_ok=True)
+                (report / "junit.xml").write_text(
+                    '<testsuite tests="1" failures="0" errors="0" skipped="0" />'
+                )
             if scenario == "pre_launch_exception" and len(bound_specs) == 1:
                 raise ComputeLaunchError("launch failed")
             identifiers = (
@@ -12216,6 +12251,18 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             )
 
         async def wait(self, handle, timeout_s):
+            if cleanup_specs and handle.identifier.endswith("4004"):
+                lifecycle.append("basetemp-cleanup")
+                if scenario == "cleanup_cancel":
+                    cleanup_started.set()
+                    await asyncio.Future()
+                if scenario == "cleanup_failure":
+                    return ComputeResult(1, "", "cleanup denied", handle=handle)
+                spec = cleanup_specs[-1]
+                child = subprocess.run(
+                    spec.local_argv, cwd=spec.local_checkout, capture_output=True, text=True,
+                )
+                return ComputeResult(child.returncode, child.stdout, child.stderr, handle=handle)
             if len(bound_specs) > 1:
                 from mimir.worklink.run_state import load_run_state
 
@@ -12227,10 +12274,11 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             return ComputeResult(0, "build ok", "", handle=handle)
 
         async def cleanup(self, handle):
-            return None
+            if handle.identifier.endswith("4004"):
+                cleanup_worker_handles.append(handle)
 
         async def cancel(self, handle):
-            return None
+            cleanup_cancelled.append(handle)
 
     bound = BoundCompute()
 
@@ -12335,12 +12383,42 @@ def test_authorized_runner_closes_real_attempt_capabilities(
             raise RuntimeError("evidence failed")
         monkeypatch.setattr(orchestrator, "observe_evidence", fail_evidence)
 
-    result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
-            1410, backend_name="opencode", test_command="pytest -q"
+    async def invoke():
+        task = asyncio.create_task(
+            WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+                1410, backend_name="opencode", test_command="pytest -q"
+            )
         )
-    )
+        if scenario == "cleanup_cancel":
+            try:
+                await asyncio.wait_for(cleanup_started.wait(), timeout=10)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            return None
+        return await task
 
+    result = asyncio.run(invoke())
+
+    if exercise_basetemp:
+        assert len(cleanup_specs) == 1
+        assert len(cleanup_worker_handles) == 1
+        assert lifecycle.index("basetemp-cleanup") < lifecycle.index("publication")
+        assert basetemp.exists() is (scenario != "success")
+        assert not report.exists()
+        assert ["chainlink", "locks", "release", "1410"] in calls
+    if scenario == "cleanup_cancel":
+        assert len(cleanup_cancelled) == 1
+        assert publication.closed == 1
+        assert not checkout.exists()
+        assert sibling_marker.read_text() == "keep me\n"
+        authorization.close()
+        return
+    assert result is not None
     assert checkout_kwargs["worker_eligible"] is True
     assert requested_uids == [worker_uid]
     assert lifecycle.count("publication-acquired") == 1
@@ -12348,7 +12426,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
     assert publication.closed == 1
     assert authorization.closed == 0
     authorization.close()
-    expected_published = scenario in {"success", "branch_cleanup_exception"}
+    expected_published = scenario in {"success", "branch_cleanup_exception", "cleanup_failure"}
     expected_blocked = scenario in {
         "blocked",
         "commit_exception",
@@ -12370,6 +12448,7 @@ def test_authorized_runner_closes_real_attempt_capabilities(
         "commit_exception": 2,
         "success": 3,
         "branch_cleanup_exception": 3,
+        "cleanup_failure": 3,
         "push_exception": 3,
         "pr_exception": 3,
     }
