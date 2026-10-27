@@ -72,16 +72,6 @@ def _auto_review_skipped(ev: dict) -> str:
             "a verified collaborator or active organization member; review deliberately")
 
 
-def _github_issue_notice(ev: dict) -> str:
-    repo = sanitize(ev.get("repo") or "?")
-    number = sanitize(ev.get("number") or "?")
-    title = sanitize(ev.get("title") or "")
-    author = sanitize(ev.get("author") or "unknown")
-    url = sanitize(ev.get("url") or "")
-    return (f"GitHub issue {repo}#{number}: {title} (by @{author}) {url}; "
-            "issues aren't handled on service turns yet")
-
-
 EXTENSION = FeedbackExtension(
     rules={
         "worklink_claimed": ("positive", "worklink_claimed"),
@@ -93,7 +83,6 @@ EXTENSION = FeedbackExtension(
         "worklink_run_orphan_reconcile_failed": ("negative", "worklink_run_orphan_reconcile_failed"),
         "worklink_tool_pin_dedupe_check_failed": ("negative", "worklink_tool_pin_dedupe_check_failed"),
         "pr_auto_review_skipped_untrusted_author": ("negative", "pr_auto_review_skipped_untrusted_author"),
-        "github_issue_notice": ("negative", "github_issue_notice"),
         "poller_review_missed_submission": ("negative", "review_missed_submission"),
         "github_identity_degraded": ("negative", "github_identity_degraded"),
         "pr_merge_blocked_by_changes_requested": ("negative", "pr_merge_blocked"),
@@ -110,7 +99,6 @@ EXTENSION = FeedbackExtension(
         "spawn_work_fail": lambda ev: _spawn("spawn_work_fail", ev),
         "pr_merge_blocked": _pr_merge_blocked,
         "pr_auto_review_skipped_untrusted_author": _auto_review_skipped,
-        "github_issue_notice": _github_issue_notice,
     },
     valence_groups={
         "spawn": ValenceGroup(

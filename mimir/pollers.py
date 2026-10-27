@@ -3294,6 +3294,7 @@ async def run_poller(
                 repo = payload.get("repo")
                 number = payload.get("number")
                 title = payload.get("title")
+                author_trusted = payload.get("author_trusted") is True
                 payload = {
                     "repo": repo if isinstance(repo, str) and _safe_signal_url(
                         f"https://github.com/{repo}/issues/1", repo,
@@ -3306,6 +3307,7 @@ async def run_poller(
                     from .prompt_safety import sanitize_prompt_field
 
                     payload["title"] = sanitize_prompt_field(title or "")
+                    payload["author_trusted"] = author_trusted
             try:
                 # Same ordering rule as the mid-run barrier: the receipt durably
                 # acknowledges this signal, so the signal must be durable first.
@@ -3334,10 +3336,11 @@ async def run_poller(
                             _safe_signal_login(payload.get("author")),
                         )
                         if signal_name == "github_issue_notice":
-                            outsider_notices.append(
-                                f"GitHub issue notice: {repo}#{payload['number']} "
-                                f"{payload['title']} (by {login}) {url}"
-                            )
+                            # Titles stay exclusively in authenticated Signals
+                            # UI/events storage, never bot-authored history.
+                            prefix = ("GitHub issue notice" if payload["author_trusted"]
+                                      else "Outsider issue withheld")
+                            outsider_notices.append(f"{prefix}: {login} {url}")
                         else:
                             kind = "issue" if signal_name == "github_outsider_issue_withheld" else "PR"
                             outsider_notices.append(f"Outsider {kind} withheld: {login} {url}")

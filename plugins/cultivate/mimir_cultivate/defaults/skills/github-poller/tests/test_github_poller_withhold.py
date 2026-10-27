@@ -72,6 +72,7 @@ def test_issue_notice_deduplicates_in_cursor_and_never_leaks_body(
             assert signals[0] == dict(
                 poller=poller.POLLER_NAME, signal="github_issue_notice",
                 repo=REPO, number=7, title=OUTSIDER_MARKER, author="outsider",
+                author_trusted=False,
                 url=f"https://github.com/{REPO}/issues/7",
             )
         assert "body" not in str(records)
@@ -155,7 +156,7 @@ def test_null_user_activity_withholds_without_attestation_or_window_hold(monkeyp
     budget = poller.TickBudget()
     if surface == "issue":
         poller._check_issues(REPO, SINCE, "token", "mimir",
-                             surfaced_outsiders=set(), tick_budget=budget)
+                             tick_budget=budget)
     elif surface == "pr":
         poller._check_prs(REPO, SINCE, "token", "mimir",
                           surfaced_untrusted=set(), tick_budget=budget)
@@ -217,27 +218,31 @@ def test_mixed_pr_context_keeps_trusted_prose_only(monkeypatch, capsys, trust):
     assert_marker_absent(context, records)
 
 
-def test_issue_notice_needs_no_author_attestation(monkeypatch, capsys):
+@pytest.mark.parametrize("verdict,expected_trust", [(True, True), (False, False), (None, False)])
+def test_issue_notice_attestation_is_fail_closed(monkeypatch, capsys, verdict, expected_trust):
     cache = {}
     monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: [_issue()])
-    monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *args: None)
+    monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *args: verdict)
     budget = poller.TickBudget()
     assert poller._check_issues(REPO, SINCE, "token", "", trust_cache=cache,
-                               surfaced_outsiders=set(), tick_budget=budget) == 1
-    assert cache == {} and not budget.hard_truncated
-    assert json.loads(capsys.readouterr().out)["signal"] == "github_issue_notice"
+                               tick_budget=budget) == 1
+    assert not budget.hard_truncated
+    assert cache == ({} if verdict is None else {(REPO, "outsider"): verdict})
+    notice = json.loads(capsys.readouterr().out)
+    assert notice["signal"] == "github_issue_notice"
+    assert notice["author_trusted"] is expected_trust
 
 
 def test_issue_notice_does_not_attest_even_with_exhausted_budget(monkeypatch, capsys):
     monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: [_issue()])
     monkeypatch.setattr(poller, "_github_author_is_trusted",
                         lambda *args: pytest.fail("attestation exceeded budget"))
-    cache, surfaced = {}, set()
+    cache = {}
     budget = poller.TickBudget(hard_deadline_seconds=0)
     assert poller._check_issues(REPO, SINCE, "token", "", trust_cache=cache,
-                               surfaced_outsiders=surfaced, tick_budget=budget) == 1
-    assert not budget.hard_truncated and cache == {} and surfaced == set()
-    assert json.loads(capsys.readouterr().out)["signal"] == "github_issue_notice"
+                               tick_budget=budget) == 1
+    assert not budget.hard_truncated and cache == {}
+    assert json.loads(capsys.readouterr().out)["author_trusted"] is False
 
 
 def test_trusted_issue_also_produces_notice_not_prompt(monkeypatch, capsys, trust):

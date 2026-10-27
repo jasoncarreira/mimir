@@ -1378,7 +1378,7 @@ def _surface_untrusted_pr_once(
 
 def _check_issues(
     repo: str, since: str, token: str, me: str,
-    *, trust_cache: dict | None = None, surfaced_outsiders: set[str] | None = None,
+    *, trust_cache: dict | None = None,
     noticed_issues: dict[str, str] | None = None,
     tick_budget: "TickBudget | None" = None,
 ) -> int:
@@ -1410,11 +1410,17 @@ def _check_issues(
         key = str(number)
         if noticed_issues.get(key) == updated:
             continue
-        # This is metadata only, regardless of author trust. Never include body,
-        # labels or comments in a notice (even when the author is trusted).
+        # Titles are stored only for authenticated operator views. Attest the
+        # author for the content-free channel notice; missing attestation must
+        # never enable trusted-author delivery or hold this metadata window.
+        kept, _ = _partition_activity(
+            repo, token, [issue], "issue", me, trust_cache, tick_budget,
+            "issues_trust", since_window=False,
+        )
         _emit_signal(
             "github_issue_notice", repo=repo, number=number,
             title=sanitize_prompt_field(issue.get("title") or ""),
+            author_trusted=bool(kept),
             author=sanitize_login((issue.get("user") or {}).get("login")),
             url=sanitize_url(issue.get("html_url"), repo),
         )
@@ -3604,8 +3610,6 @@ def main() -> None:
     mergeability_attempt_budget = [1]
     untrusted_all: dict = cursor.get("pr_untrusted_authors", {}) or {}
     new_untrusted_all: dict[str, list[str]] = {}
-    outsider_issues_all: dict = cursor.get("github_outsider_issues", {}) or {}
-    new_outsider_issues_all: dict[str, list[str]] = {}
     issue_notices_all: dict = cursor.get("github_issue_notices", {}) or {}
     new_issue_notices_all: dict[str, dict[str, str]] = {}
     trust_cache: dict[tuple[str, object], object] = {}
@@ -3613,21 +3617,16 @@ def main() -> None:
     total = 0
     for repo in repos:
         print(f"Checking {repo} since {since}...", file=sys.stderr)
-        surfaced_issues = {
-            str(value) for value in (outsider_issues_all.get(repo, []) or [])
-            if isinstance(value, (str, int)) and not isinstance(value, bool)
-        }
         noticed_issues = {
             key: value for key, value in (issue_notices_all.get(repo) or {}).items()
             if isinstance(key, str) and isinstance(value, str)
         }
         total += _check_issues(
             repo, since, token, me, trust_cache=trust_cache,
-            surfaced_outsiders=surfaced_issues, noticed_issues=noticed_issues,
+            noticed_issues=noticed_issues,
             tick_budget=budget,
         )
         new_issue_notices_all[repo] = noticed_issues
-        new_outsider_issues_all[repo] = sorted(surfaced_issues)
         surfaced_untrusted = {
             str(value) for value in (untrusted_all.get(repo, []) or [])
             if isinstance(value, (str, int)) and not isinstance(value, bool)
@@ -3743,7 +3742,7 @@ def main() -> None:
     cursor["pr_mergeability"] = new_mergeability_all
     cursor["pr_ci_failures"] = new_ci_failures_all
     cursor["pr_untrusted_authors"] = new_untrusted_all
-    cursor["github_outsider_issues"] = new_outsider_issues_all
+    cursor.pop("github_outsider_issues", None)  # retired; notices dedupe by updated_at
     cursor["github_issue_notices"] = new_issue_notices_all
     set_active_tick_budget(None)
     _save_cursor(cursor)

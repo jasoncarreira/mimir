@@ -83,7 +83,10 @@ For each repo in `GITHUB_REPOS`:
 - **New and updated issues** (including edits, labels and comments) are recorded
   as deduplicated `github_issue_notice` signals in the owner-visible Ops > Signals
   page and authenticated events API, even without an operator alert channel.
-  Notices contain only repository, number, sanitized title, URL and author login.
+  Stored notices contain repository, number, sanitized title, URL, author login
+  and an author-trust verdict. Titles never enter model feedback or bot-authored
+  channel messages. Channel notices carry only login and URL; outsiders and
+  unavailable attestations use `Outsider issue withheld: <login> <url>`.
   Issues never start a service turn until issue tools are available.
 - **New pull requests** opened
 - **New PR conversation comments** (from GitHub's shared issues/comments endpoint;

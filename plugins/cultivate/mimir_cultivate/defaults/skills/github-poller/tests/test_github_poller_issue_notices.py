@@ -49,11 +49,12 @@ def test_issue_updates_dedupe_without_turns_and_pr_still_emits(monkeypatch, tmp_
     monkeypatch.setattr(poller, "_resolve_token", lambda: "token")
     monkeypatch.setattr(poller, "_utc_now_iso", lambda: since)
     monkeypatch.setattr(poller, "_gh_api", api)
+    monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *a: True)
     monkeypatch.setattr(poller, "_pr_author_trust", lambda *a, **k: (True, "collaborator"))
     monkeypatch.setattr(poller, "_pr_scope_fields", lambda *a, **k: {"head_sha": "a" * 40})
     monkeypatch.setenv("GITHUB_REPOS", repo)
     monkeypatch.delenv("MIMIR_OPERATOR_ALERT_CHANNEL", raising=False)
-    poller._save_cursor({"last_checked": since})
+    poller._save_cursor({"last_checked": since, "github_outsider_issues": {repo: ["358"]}})
 
     for expected in (1, 0, 1):
         poller.main()
@@ -66,15 +67,14 @@ def test_issue_updates_dedupe_without_turns_and_pr_still_emits(monkeypatch, tmp_
             assert notices[0] == {
                 "poller": poller.POLLER_NAME, "signal": "github_issue_notice",
                 "repo": repo, "number": 358, "title": sanitize_prompt_field(title),
-                "url": issue["html_url"], "author": "alice",
+                "url": issue["html_url"], "author": "alice", "author_trusted": True,
             }
-            assert "issues aren't handled on service turns yet" in (
-                EXTENSION.renderers["github_issue_notice"](notices[0])
-            )
-            assert EXTENSION.rules["github_issue_notice"][0] == "negative"
+            assert "github_issue_notice" not in EXTENSION.rules
+            assert "github_issue_notice" not in EXTENSION.renderers
         assert any(row.get("event_type") == "pr_opened" for row in records)
         if expected == 0:
             issue["updated_at"] = "2026-10-27T01:00:00Z"
+    assert "github_outsider_issues" not in json.loads(poller.CURSOR_FILE.read_text())
     assert json.loads(poller.CURSOR_FILE.read_text())["github_issue_notices"][repo] == {
         "358": "2026-10-27T01:00:00Z",
     }

@@ -122,23 +122,23 @@
   },
   "0.9.10-2026": {
     "github-poller": {
-      "SKILL.md": "5c5d5b701140abc27fbd42698a3b65056f1b017a0de1a29235d92ef9118b118a",
+      "SKILL.md": "09912adad069c9cd29251c84181f3a43a042d371d1a8d012ca1da42e7754fde1",
       "pollers.json": "273c2d13e8f8fcf7f353d5d9107a729cbd522819ebd2897f0608492353e1d243",
       "scripts/hooks.py": "2cbfc1ddc10f0ff808bb6da032e55e9bc76526012efb4779e4d235da41399335",
-      "scripts/poller.py": "7e4cd75e4cbe9a452ae8ba74d5740a91548ef69ae64115c7dd175a6df3e7dbc1",
+      "scripts/poller.py": "476f79dbede91cf616fade02adfaa352cbb35d3af50438cd56bfb0eca92941fc",
       "tests/conftest.py": "06c6fdd21e3fe55ee2e29085aefb21740cf9941ad0bba4a5499056d662816de1",
       "tests/github_poller_test_support.py": "43bba3c7a2dc4f741aa090dd4c23bb01a2457413ff7a3e4bd6d552aa57756fab",
       "tests/test_github_poller_changes_requested.py": "bea0e7d4db2638b6e6735ddfbb9b61b64349e42b8e292ba44c4dfd3c517930f2",
       "tests/test_github_poller_ci_failures.py": "28e0988e8820647ed6b6a01730fd0ead59f8985b220a01f9e536ad1e1bf55ed0",
       "tests/test_github_poller_ci_logs.py": "b517316e2db9c6a805257660a5645c9aeeee6035699902a0303c4d565d122c5b",
       "tests/test_github_poller_event_coalescing.py": "9eb91518a4166353d8e32bb0a2eb3a40a63c47c4efdef64f16629f18cea20edf",
-      "tests/test_github_poller_issue_notices.py": "d09167a43af7786a64f1b8e40e77afcae2919f7cbd3404cd3986acb35c1c8c10",
+      "tests/test_github_poller_issue_notices.py": "8bf270a5fc30e418c425d46ad1d9dd54b96f4e2f26681a3e8c7230152f97e61f",
       "tests/test_github_poller_mergeability.py": "88a30924512f8df77b9ad0dd0afd5ab5d8343190d44d85b8daa533fb7031d1d1",
       "tests/test_github_poller_pr_pushes.py": "95736a6f2500e30692eafb147aeb0d060b8a9503a21215752a8c3cab77732924",
       "tests/test_github_poller_pr_scope_snapshot.py": "a864a97259d8e1613a741b4f995e6352a2b967ddec000b7cec2397c19cb6d8a2",
       "tests/test_github_poller_pr_trust.py": "58fade4ccb673e234cc75e514afc7712cc9b8c0ca9dba919d44d1e80153a7af4",
       "tests/test_github_poller_windows.py": "6137357e7d82133fe9d026f29952b994e21fe5d9ba3b6c59ce2ea274e574e604",
-      "tests/test_github_poller_withhold.py": "54fb832c3196ada68dae0990885339e669bdfdbd375f7fc8fb3be8d4e615d428"
+      "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3"
     },
     "review": {"SKILL.md": "1d19235a852d7b6e47505682f173920a5b6a36f256f9fc8d59700eec350bd685"}
   },

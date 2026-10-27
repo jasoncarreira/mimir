@@ -2899,8 +2899,42 @@ print(json.dumps({'signal': 'github_issue_notice', 'repo': 'acme/widget',
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("trust_fields,prefix", [
+    ({"author_trusted": False}, "Outsider issue withheld"),
+    ({}, "Outsider issue withheld"),
+    ({"author_trusted": None}, "Outsider issue withheld"),
+    ({"author_trusted": "true"}, "Outsider issue withheld"),
+    ({"author_trusted": True}, "GitHub issue notice"),
+])
+async def test_issue_title_is_stored_but_never_delivered_to_channel_history(
+    tmp_path: Path, home: Path, trust_fields: dict, prefix: str,
+) -> None:
+    marker = "OUTSIDER_ISSUE_TITLE_UNIQUE_MARKER"
+    signal = dict(signal="github_issue_notice", repo="acme/widget", number=358,
+                  title=marker, author="outsider",
+                  url="https://github.com/acme/widget/issues/358", **trust_fields)
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"print({json.dumps(signal)!r})\n")
+    cfg = PollerConfig(name="github-activity", command=f"{sys.executable} poller.py",
+                       cron="* * * * *", env={}, skill_dir=skill_dir)
+    delivered = []
+
+    async def send(text):
+        delivered.append(text)
+
+    enq = _CapturingEnqueue()
+    assert await run_poller(cfg, enqueue=enq, operator_notice=send) == 0
+    assert enq.events == []
+    assert delivered == [f"{prefix}: outsider https://github.com/acme/widget/issues/358"]
+    assert marker not in str(delivered)
+    [notice] = [row for row in _read_events(home) if row["type"] == "github_issue_notice"]
+    assert notice["title"] == marker
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("signal_name", [
     "github_outsider_issue_withheld", "pr_auto_review_skipped_untrusted_author",
+    "github_issue_notice",
 ])
 @pytest.mark.parametrize("unsafe_url", [
     "https://github.com/foreign/repo/issues/7",
@@ -2930,7 +2964,7 @@ print(json.dumps({{'signal': {signal_name!r}, 'repo': 'acme/widget',
     enq = _CapturingEnqueue()
     assert await run_poller(cfg, enqueue=enq, operator_notice=send) == 0
     assert enq.events == []
-    kind = "issue" if signal_name == "github_outsider_issue_withheld" else "PR"
+    kind = "issue" if signal_name in {"github_outsider_issue_withheld", "github_issue_notice"} else "PR"
     assert delivered == [
         f"Outsider {kind} withheld: outsider https://github.com/acme/widget/issues/8",
     ]
