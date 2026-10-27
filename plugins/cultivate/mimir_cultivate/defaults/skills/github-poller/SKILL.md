@@ -1,6 +1,6 @@
 ---
 name: cultivate-github-poller
-description: "Watch configured GitHub repositories for actionable issues, pull requests, comments and reviews. Install mimir-cultivate and select MIMIR_PLUGINS=cultivate to seed <home>/skills/cultivate-github-poller/, then configure GITHUB_REPOS and MIMIR_GITHUB_SELF_LOGIN."
+description: "Watch configured GitHub repositories for pull requests, comments and reviews; surface issues as operator notices. Install mimir-cultivate and select MIMIR_PLUGINS=cultivate to seed <home>/skills/cultivate-github-poller/, then configure GITHUB_REPOS and MIMIR_GITHUB_SELF_LOGIN."
 env:
   required:
     - name: GITHUB_REPOS
@@ -80,9 +80,14 @@ the registered list.
 
 For each repo in `GITHUB_REPOS`:
 
-- **New issues** opened (since last poll)
+- **New and updated issues** (including edits, labels and comments) are recorded
+  as deduplicated `github_issue_notice` signals in the owner-visible Ops > Signals
+  page and authenticated events API, even without an operator alert channel.
+  Notices contain only repository, number, sanitized title, URL and author login.
+  Issues never start a service turn until issue tools are available.
 - **New pull requests** opened
-- **New issue comments** (covers both issue + PR conversation comments)
+- **New PR conversation comments** (from GitHub's shared issues/comments endpoint;
+  comments on ordinary issues do not start turns)
 - **New PR review comments** (inline diff comments — distinct from conversation comments)
 - **New PR reviews** (approve / changes-requested / commented with body)
 - **PR pushes/updates** (`pr_synchronize`) — new commits pushed to an existing open PR.

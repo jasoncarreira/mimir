@@ -422,7 +422,10 @@ class GitHubForgeClient:
         body: Mapping[str, Any] | None = None,
         accept: str = "application/vnd.github+json",
         max_bytes: int = _MAX_RESPONSE_BYTES,
-        not_found: str = "pull request not found",
+        not_found: str = (
+            "pull request not found; this may be an issue, not a PR; "
+            "issues aren't handled on service turns yet"
+        ),
         truncate_text: bool = False,
     ) -> Any:
         """Read a bounded response; oversized text is checked only through the cap.
