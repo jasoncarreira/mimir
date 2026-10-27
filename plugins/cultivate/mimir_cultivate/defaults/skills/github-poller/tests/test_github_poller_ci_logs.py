@@ -323,7 +323,11 @@ def test_external_review_does_not_capture(ci, capsys):
 def test_nonblocking_review_does_not_capture(ci, capsys, state):
     ci.review["state"] = state
     poller._check_pr_reviews("o/r", SINCE, "test-token", "bot")
-    assert "FAILED sentinel" not in json.loads(capsys.readouterr().out)["prompt"]
+    output = capsys.readouterr().out
+    if state == "COMMENTED":
+        assert output == ""  # an empty COMMENTED review is not feedback
+    else:
+        assert "FAILED sentinel" not in json.loads(output)["prompt"]
     assert not any("/actions/" in " ".join(call) for call in ci.calls)
 
 

@@ -171,7 +171,7 @@ def test_pr_review_on_own_pr_grants_remediation_authority(monkeypatch, captured)
 
 @pytest.mark.parametrize("event_type", ["issue_comment", "pr_review_comment"])
 def test_pr_comment_emits_live_scope_snapshot(monkeypatch, captured, event_type):
-    pr = _full_pr(12, author=SELF)
+    pr = _full_pr(12)
     monkeypatch.setattr(
         poller,
         "_gh_api",
@@ -196,7 +196,7 @@ def test_pr_comment_emits_live_scope_snapshot(monkeypatch, captured, event_type)
 
     event = _only_of(captured, event_type)
     assert event["actor"] == "jasoncarreira"
-    assert event["author"] == SELF
+    assert event["author"] == "alice"
     assert event["number"] == 12
     assert event["pr_state"] == "open"
     scope = _scope_from(event)
@@ -275,7 +275,7 @@ def _drive_trust_event(monkeypatch, pr, path):
 
 @pytest.mark.parametrize("path", ["opened", "synchronize", "review", "comment"])
 @pytest.mark.parametrize("author,verdict", [
-    ("outsider", False), ("outsider", None), ("collaborator", True), (SELF, True),
+    ("outsider", False), ("outsider", None), ("collaborator", True),
 ])
 def test_scope_verdict_survives_each_poller_emitter(
     monkeypatch, captured, path, author, verdict,
@@ -307,17 +307,7 @@ def test_scope_verdict_survives_each_poller_emitter(
             monkeypatch.setattr(
                 poller, "_partition_activity", lambda *args, **kwargs: (args[2], []),
             )
-        if author == SELF:
-            # _check_prs intentionally filters own new PRs; test the shared
-            # scope builder directly, then its normal downstream emitter.
-            assert poller._emit_pr_review_needed(
-                "own PR", token="token", reviewer=SELF,
-                current_head_reviewed=False, event_type="pr_opened",
-                repo=REPO, number=21, author=SELF,
-                **poller._pr_scope_fields(pr, REPO, token="token", me=SELF),
-            )
-        else:
-            assert _drive_trust_event(monkeypatch, pr, path)
+        assert _drive_trust_event(monkeypatch, pr, path)
     else:
         if path == "review" and author == "outsider":
             monkeypatch.setattr(poller, "_trusted_pr", lambda *args: True)
@@ -330,7 +320,7 @@ def test_scope_verdict_survives_each_poller_emitter(
     event = _only_of(captured, event_type)
     assert event["pr_author_is_trusted"] is verdict
     expected_lookups = 2 if author == "collaborator" and path in {"opened", "review"} else 1
-    assert calls == ([] if author == SELF else [(REPO, 21, "token")] * expected_lookups)
+    assert calls == [(REPO, 21, "token")] * expected_lookups
     scope = _framework_scope_from(event, monkeypatch)
     if verdict is True:
         assert scope is not None

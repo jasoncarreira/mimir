@@ -1259,6 +1259,78 @@ def _pr_scope_fields(
     }
 
 
+def _queue_own_feedback(
+    pending: dict[str, dict], seen: set[str], repo: str, me: str,
+    pr: dict, item: dict, kind: str, text: str,
+) -> None:
+    """Collect only identified, trusted feedback for an open, same-repo own PR."""
+    number = pr.get("number")
+    item_id = item.get("id")
+    if (
+        not me or (pr.get("user") or {}).get("login") != me
+        or pr.get("state") != "open"
+        or ((pr.get("head") or {}).get("repo") or {}).get("full_name", "").lower() != repo.lower()
+        or type(number) is not int or number < 1
+        or type(item_id) is not int or item_id < 1
+    ):
+        return
+    key = f"{kind}:{item_id}"
+    entry = pending.setdefault(str(number), {"pr": pr, "feedback": []})
+    if key not in seen and all(existing[0] != key for existing in entry["feedback"]):
+        entry["feedback"].append((key, text, item.get("html_url", ""),
+                                  (item.get("user") or {}).get("login")))
+
+
+def _emit_own_feedback(
+    repo: str, me: str, pending: dict[str, dict], seen: set[str],
+) -> int:
+    """Emit one remediation per PR, then persist each included feedback id."""
+    count = 0
+    for entry in pending.values():
+        feedback = entry["feedback"]
+        if not feedback:
+            continue
+        pr = entry["pr"]
+        number = pr["number"]
+        prompt = (
+            f"Trusted feedback on your open PR #{number} on {repo}: {pr.get('title', '')}\n"
+            "Decide whether each comment needs a change. Make the requested changes, "
+            f"{_verification_guidance()}, push the fixes to the PR branch, and reply "
+            "on the PR. If no change is needed (for example, plain approval), "
+            "answer briefly or end the turn without pushing. First call "
+            f"repo_checkout(repository={repo!r}, pull_request={number}) to activate "
+            "the scoped checkout grant; PR reads such as pr_comments are refused "
+            "before checkout. Then read the bound PR's review, inline, and "
+            "conversation comments before acting.\n"
+            "Trusted feedback (quoted):\n"
+            + "\n".join(
+                f"@{sanitize_login(author)} {url}: {json.dumps(text, ensure_ascii=False)}"
+                for _, text, url, author in feedback
+            )
+        )
+        first_kind = feedback[0][0].split(":", 1)[0]
+        _emit(
+            prompt, event_type=first_kind, repo=repo, number=number,
+            url=feedback[0][2], author=me, actor=feedback[0][3],
+            **({"state": "COMMENTED"} if first_kind == "pr_review" else {}),
+            pr_state="open", **_pr_scope_fields(pr, repo, me=me),
+        )
+        seen.update(key for key, *_ in feedback)
+        count += 1
+    return count
+
+
+def _notice_own_withheld(repo: str, number: int, withheld: list) -> None:
+    """Content-free operator notice for an untrusted own-PR commenter."""
+    for item in withheld:
+        if item.reason != "attestation_unavailable":
+            _emit_signal(
+                "github_content_withheld", repo=repo, number=number,
+                kind=item.kind, author=item.author, url=item.html_url,
+                reason=item.reason,
+            )
+
+
 def _emit_pr_synchronize(
     repo: str,
     number: int,
@@ -1575,6 +1647,8 @@ def _check_issue_comments(
     trust_cache: dict | None = None,
     review_context: dict[str, str] | None = None,
     tick_budget: "TickBudget | None" = None,
+    own_feedback: dict[str, dict] | None = None,
+    feedback_seen: set[str] | None = None,
 ) -> int:
     """New issue + PR conversation comments.
 
@@ -1603,6 +1677,8 @@ def _check_issue_comments(
         _refused_window(tick_budget, data, "issue_comments_window")
         return 0
     count = 0
+    pending = own_feedback if own_feedback is not None else {}
+    seen = feedback_seen if feedback_seen is not None else set()
     parent_cache: dict[str, dict | None] = {}
     for comment in data:
         if _hard_stop(tick_budget, "issue_comments"):
@@ -1633,29 +1709,36 @@ def _check_issue_comments(
             continue
         if not is_pr_comment:
             continue
-        kept, _ = _partition_activity(
+        if parent.get("state") != "open":
+            continue
+        kept, withheld = _partition_activity(
             repo, token, [comment], "comment", me, trust_cache,
             tick_budget, "issue_comments_trust",
         )
+        if not kept and not (comment.get("user") or {}).get("login"):
+            continue
+        pr = _gh_api(f"repos/{repo}/pulls/{issue_num}", token)
+        if not isinstance(pr, dict):
+            if tick_budget is not None:
+                tick_budget.hard_truncated = True
+                tick_budget.note_truncation("comment_pr_lookup", 1)
+            continue
+        if pr.get("state") not in (None, "open"):
+            continue
         if not kept:
+            if me and (pr.get("user") or {}).get("login") == me:
+                _notice_own_withheld(repo, pr["number"], withheld)
             continue
         author = (comment.get("user") or {}).get("login", "unknown")
         body = _truncate(comment.get("body") or "")
-        if is_pr_comment or presentation_is_pr:
-            if issue_num in (review_needed_pr_numbers or set()):
-                continue
-            if is_pr_comment and parent.get("state") != "open":
-                continue
-            pr = _gh_api(f"repos/{repo}/pulls/{issue_num}", token)
-            if not isinstance(pr, dict):
-                if tick_budget is not None:
-                    tick_budget.hard_truncated = True
-                    tick_budget.note_truncation("comment_pr_lookup", 1)
-                continue
-            if not _trusted_pr(
-                repo, token, pr, me, trust_cache, tick_budget, "comment_pr_trust",
-            ):
-                continue
+        if not _trusted_pr(
+            repo, token, pr, me, trust_cache, tick_budget, "comment_pr_trust",
+        ):
+            continue
+        if me and (pr.get("user") or {}).get("login") == me:
+            _queue_own_feedback(pending, seen, repo, me, pr, comment,
+                                "issue_comment", body)
+            continue
         prompt = (
             f"New comment on {repo} #{issue_num} by @{author}: {body}\n{url}"
         )
@@ -1664,26 +1747,29 @@ def _check_issue_comments(
                      if " comment(s) by non-collaborators withheld (" in line]
             if notes:
                 prompt += "\n" + "\n".join(notes)
-        if is_pr_comment or presentation_is_pr:
-            emitted = _emit_pr_review_needed(
-                prompt,
-                token=token,
-                reviewer=me,
-                activity_at=comment.get("created_at"),
-                event_type="issue_comment",
-                subject_type="pull_request",
-                repo=repo,
-                number=issue_num,
-                url=url,
-                author=author,
-            )
+        emitted = _emit_pr_review_needed(
+            prompt,
+            token=token,
+            reviewer=me,
+            activity_at=comment.get("created_at"),
+            event_type="issue_comment",
+            subject_type="pull_request",
+            repo=repo,
+            number=issue_num,
+            url=url,
+            author=author,
+        )
         count += int(emitted)
+    if own_feedback is None:
+        count += _emit_own_feedback(repo, me, pending, seen)
     return count
 
 
 def _check_pr_review_comments(
     repo: str, since: str, token: str, me: str,
     *, trust_cache: dict | None = None, tick_budget: "TickBudget | None" = None,
+    own_feedback: dict[str, dict] | None = None,
+    feedback_seen: set[str] | None = None,
 ) -> int:
     """New PR review comments — these are INLINE diff comments,
     distinct from issue/PR conversation comments. The bulk of code
@@ -1698,17 +1784,17 @@ def _check_pr_review_comments(
         _refused_window(tick_budget, data, "review_comments_window")
         return 0
     count = 0
+    pending = own_feedback if own_feedback is not None else {}
+    seen = feedback_seen if feedback_seen is not None else set()
     for comment in data:
         if me and (comment.get("user") or {}).get("login") == me:
             continue
         if (comment.get("created_at", "") or "") <= since:
             continue
-        kept, _ = _partition_activity(
+        kept, withheld = _partition_activity(
             repo, token, [comment], "review_comment", me, trust_cache,
             tick_budget, "review_comments_trust",
         )
-        if not kept:
-            continue
         author = (comment.get("user") or {}).get("login", "unknown")
         body = _truncate(comment.get("body") or "")
         url = comment.get("html_url", "")
@@ -1720,6 +1806,12 @@ def _check_pr_review_comments(
                 tick_budget.hard_truncated = True
                 tick_budget.note_truncation("review_comment_pr_lookup", 1)
             continue
+        if parent.get("state") not in (None, "open"):
+            continue
+        if not kept:
+            if me and (parent.get("user") or {}).get("login") == me:
+                _notice_own_withheld(repo, parent["number"], withheld)
+            continue
         if not _trusted_pr(
             repo, token, parent, me, trust_cache, tick_budget, "review_comment_pr_trust",
         ):
@@ -1730,6 +1822,10 @@ def _check_pr_review_comments(
             f"New PR review comment on {repo} #{pr_num} "
             f"by @{author}{location}: {body}\n{url}"
         )
+        if me and (parent.get("user") or {}).get("login") == me:
+            _queue_own_feedback(pending, seen, repo, me, parent, comment,
+                                "pr_review_comment", f"{path}: {body}" if path else body)
+            continue
         count += int(_emit_pr_review_needed(
             prompt,
             token=token,
@@ -1742,6 +1838,8 @@ def _check_pr_review_comments(
             path=path,
             author=author,
         ))
+    if own_feedback is None:
+        count += _emit_own_feedback(repo, me, pending, seen)
     return count
 
 
@@ -1835,10 +1933,7 @@ def _check_pr_pushes(
         return 0, dict(pr_heads), dict(prior_review_requests)
     count = 0
     for pr in data:
-        # Push-detection self-filter: skip PRs the agent authored.
-        # NOTE: this filter does NOT apply to review-request detection
-        # below — the agent CAN be added as a reviewer to a PR it
-        # authored (rare, but legal) and we'd want to surface that.
+        # Push detection and review requests cannot review the agent's own PR.
         pr_author = (pr.get("user") or {}).get("login")
         number = pr.get("number")
         if not number:
@@ -1902,7 +1997,7 @@ def _check_pr_pushes(
 
         # ─── pr_review_requested (reviewer added) ───
         # Skip if no agent login configured — nothing to match against.
-        if me:
+        if me and pr_author != me:
             currently_requested = explicitly_requested
             if currently_requested:
                 # State reconciliation (chainlink #299): ``me`` being a
@@ -2176,6 +2271,8 @@ def _emit_pr_review_needed(
     pr = None
     repo = extras.get("repo")
     number = extras.get("number")
+    if reviewer and (extras.get("author") == reviewer or extras.get("pr_author") == reviewer):
+        return False  # the PR author cannot review their own PR
     if (
         extras.get("event_type") in {"issue_comment", "pr_review_comment"}
         and isinstance(repo, str)
@@ -2183,6 +2280,8 @@ def _emit_pr_review_needed(
     ):
         pr = _gh_api(f"repos/{repo}/pulls/{number}", token)
         if isinstance(pr, dict):
+            if reviewer and (pr.get("user") or {}).get("login") == reviewer:
+                return False
             extras["actor"] = extras.get("author")
             extras["author"] = (pr.get("user") or {}).get("login")
             extras["number"] = pr.get("number")
@@ -3523,6 +3622,8 @@ def _check_own_mergeability(
 def _check_pr_reviews(
     repo: str, since: str, token: str, me: str,
     *, trust_cache: dict | None = None, tick_budget: "TickBudget | None" = None,
+    own_feedback: dict[str, dict] | None = None,
+    feedback_seen: set[str] | None = None,
 ) -> int:
     """New PR reviews (approve / changes-requested / commented).
     No ``since=`` query on reviews endpoint — walk open PRs + filter
@@ -3539,6 +3640,8 @@ def _check_pr_reviews(
         _refused_window(tick_budget, prs, "pr_reviews_window")
         return 0
     count = 0
+    pending = own_feedback if own_feedback is not None else {}
+    seen = feedback_seen if feedback_seen is not None else set()
     for pr in prs:
         pr_number = pr.get("number")
         if not pr_number:
@@ -3561,14 +3664,18 @@ def _check_pr_reviews(
             state = (review.get("state") or "").upper()
             if state == "PENDING":
                 continue
-            kept, _ = _partition_activity(
+            kept, withheld = _partition_activity(
                 repo, token, [review], "review", me, trust_cache,
                 tick_budget, "pr_reviews_trust",
             )
             if not kept:
+                if me and (pr.get("user") or {}).get("login") == me:
+                    _notice_own_withheld(repo, pr_number, withheld)
                 continue
             reviewer_login = (review.get("user") or {}).get("login", "unknown")
             body = _truncate(review.get("body") or "")
+            if me and (pr.get("user") or {}).get("login") == me and state == "COMMENTED" and not body:
+                continue
             url = review.get("html_url", "")
             pr_title = pr.get("title", "")
             state_label = {
@@ -3584,6 +3691,10 @@ def _check_pr_reviews(
             if body:
                 prompt += f"\n{body}"
             prompt += f"\n{url}"
+            if me and (pr.get("user") or {}).get("login") == me and state == "COMMENTED" and body:
+                _queue_own_feedback(pending, seen, repo, me, pr, review,
+                                    "pr_review", body)
+                continue
             if state == "CHANGES_REQUESTED" and me and (pr.get("user") or {}).get("login") == me:
                 prompt += _remediation_logs(repo, pr, token)
             # ``author`` carries the PR's author, not the reviewer, matching
@@ -3600,6 +3711,8 @@ def _check_pr_reviews(
                    **_pr_scope_fields(pr, repo, token=token, me=me,
                                       trust_cache=trust_cache, tick_budget=tick_budget))
             count += 1
+    if own_feedback is None:
+        count += _emit_own_feedback(repo, me, pending, seen)
     return count
 
 
@@ -3705,6 +3818,8 @@ def main() -> None:
     issue_notices_all: dict = cursor.get("github_issue_notices", {}) or {}
     new_issue_notices_all: dict[str, dict[str, str]] = {}
     trust_cache: dict[tuple[str, object], object] = {}
+    feedback_all: dict = cursor.get("pr_feedback_seen", {}) or {}
+    new_feedback_all: dict[str, list[str]] = {}
 
     total = 0
     for repo in repos:
@@ -3724,6 +3839,10 @@ def main() -> None:
             if isinstance(value, (str, int)) and not isinstance(value, bool)
         }
         review_needed_pr_numbers: set[str] = set()
+        pending_feedback: dict[str, dict] = {}
+        feedback_seen = {
+            key for key in (feedback_all.get(repo) or []) if isinstance(key, str)
+        }
         issue_comments, review_context = _collect_issue_comment_context(
             repo, since, token, me, trust_cache=trust_cache, tick_budget=budget,
         )
@@ -3736,9 +3855,11 @@ def main() -> None:
         total += pr_opened_count
         total += _check_pr_review_comments(
             repo, since, token, me, trust_cache=trust_cache, tick_budget=budget,
+            own_feedback=pending_feedback, feedback_seen=feedback_seen,
         )
         total += _check_pr_reviews(
             repo, since, token, me, trust_cache=trust_cache, tick_budget=budget,
+            own_feedback=pending_feedback, feedback_seen=feedback_seen,
         )
         repo_heads = pr_heads_all.get(repo, {}) or {}
         repo_rr = _coerce_review_requests(rr_all.get(repo))
@@ -3761,7 +3882,10 @@ def main() -> None:
             trust_cache=trust_cache,
             review_context=review_context,
             tick_budget=budget,
+            own_feedback=pending_feedback, feedback_seen=feedback_seen,
         )
+        total += _emit_own_feedback(repo, me, pending_feedback, feedback_seen)
+        new_feedback_all[repo] = sorted(feedback_seen)
         new_pr_heads_all[repo] = new_repo_heads
         new_rr_all[repo] = new_repo_rr
         new_untrusted_all[repo] = sorted(surfaced_untrusted)
@@ -3831,6 +3955,7 @@ def main() -> None:
             deadline_seconds=PR_RECONCILE_DEADLINE_SECONDS,
         )
     cursor["pr_changes_requested"] = new_cr_all
+    cursor["pr_feedback_seen"] = new_feedback_all
     cursor["pr_mergeability"] = new_mergeability_all
     cursor["pr_ci_failures"] = new_ci_failures_all
     cursor["pr_untrusted_authors"] = new_untrusted_all
