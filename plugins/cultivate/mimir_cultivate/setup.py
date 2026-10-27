@@ -293,7 +293,8 @@ def render_layer(kind: str, version: str, root_image: str, *,
                    "ENV CARGO_HOME=/opt/cargo\n"
                    "RUN set -eu; arch=$(dpkg --print-architecture); case $arch in amd64) triple=x86_64-unknown-linux-gnu;; "
                    "arm64) triple=aarch64-unknown-linux-gnu;; *) exit 2;; esac && "
-                   "mkdir -p /opt/rustup /opt/cargo && "
+                   "apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev binutils pkg-config && "
+                   "rm -rf /var/lib/apt/lists/* && mkdir -p /opt/rustup /opt/cargo && "
                    "curl -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.28.2/$triple/rustup-init && "
                    "chmod 755 /tmp/rustup-init && /tmp/rustup-init -y "
                    f"--no-modify-path --default-toolchain {version} && rm /tmp/rustup-init && "
@@ -310,13 +311,17 @@ def render_layer(kind: str, version: str, root_image: str, *,
                    "ENV CARGO_HOME=/var/cache/mimir-cargo\n")
     elif kind == "node":
         install = (f"RUN set -eu; arch=$(dpkg --print-architecture); case $arch in amd64) arch=x64;; arm64) ;; *) exit 2;; esac && "
-                   f"curl -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v{version}/node-v{version}-linux-$arch.tar.xz "
+                    "apt-get update && apt-get install -y --no-install-recommends g++ make python3 && "
+                    "rm -rf /var/lib/apt/lists/* && "
+                    f"curl -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v{version}/node-v{version}-linux-$arch.tar.xz "
                    "&& mkdir -p /opt/node && tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1 "
                    "&& ln -sf /opt/node/bin/node /usr/local/bin/node && ln -sf /opt/node/bin/npm /usr/local/bin/npm "
                    "&& ln -sf /opt/node/bin/npx /usr/local/bin/npx && rm /tmp/node.tar.xz\n")
     else:
         install = ("ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python\n"
-                   f"RUN set -eu; curl -fsSLo /tmp/uv-install.sh https://astral.sh/uv/{uv_version}/install.sh && "
+                    "RUN set -eu; apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && "
+                    "rm -rf /var/lib/apt/lists/* && "
+                    f"curl -fsSLo /tmp/uv-install.sh https://astral.sh/uv/{uv_version}/install.sh && "
                    "sh /tmp/uv-install.sh && rm /tmp/uv-install.sh && "
                    "cp /root/.local/bin/uv /usr/local/bin/uv && cp /root/.local/bin/uvx /usr/local/bin/uvx\n"
                    f"RUN set -eu; uv python install {version} && chmod -R a+rX /opt/uv-python\n")
@@ -689,6 +694,7 @@ except (OSError, subprocess.TimeoutExpired, ValueError):
 
 _TOOLCHAIN_WORKER_PROBE = """\
 import json
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
@@ -735,7 +741,24 @@ with tempfile.TemporaryDirectory(prefix='mimir-toolchain-probe-') as home:
    print('toolchain_missing: ' + tool)
    break
  else:
-  print('ok')
+  # Version checks do not exercise the native linker. Build in the disposable
+  # gate HOME, with exactly the same env used above, and execute the result.
+  source = Path(home) / ('main.rs' if kind == 'rust' else 'main.cc' if kind == 'node' else 'main.c')
+  source.write_text('fn main() {}\\n' if kind == 'rust' else
+                    'int main() { return 0; }\\n')
+  compiler = {'rust': 'rustc', 'node': 'c++', 'python': 'cc'}[kind]
+  binary = str(Path(home) / 'probe')
+  try:
+   built = subprocess.run([compiler, *(['--edition', '2021'] if kind == 'rust' else []),
+                           '-o', binary, str(source)], env=env, cwd=home,
+                          stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+   if built.returncode == 0:
+    built = subprocess.run([binary], env=env, cwd=home,
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+   print('ok' if built.returncode == 0 else 'toolchain_missing: ' +
+         ('cc' if kind == 'rust' else compiler))
+  except (OSError, subprocess.TimeoutExpired, ValueError):
+   print('toolchain_missing: ' + ('cc' if kind == 'rust' else compiler))
 """
 
 
@@ -769,8 +792,8 @@ def _verify_toolchain(deploy: Path, kind: str, version: str) -> None:
                   "agent", "/usr/local/bin/python", "-c", _TOOLCHAIN_WORKER_PROBE,
                   configured, kind, version], cwd=deploy)
     if check != "ok":
-        tools = {"rust": {"rustc", "cargo", "cargo-nextest"},
-                 "node": {"node", "npm", "npx"}, "python": {"uv", "python"}}
+        tools = {"rust": {"rustc", "cargo", "cargo-nextest", "cc"},
+                 "node": {"node", "npm", "npx", "c++"}, "python": {"uv", "python", "cc"}}
         reason = check if check in {"toolchain_missing: " + tool for tool in tools[kind]} else "toolchain_missing: " + kind
         raise SetupError(f"Leaf toolchain verification failed ({reason}); rebuild the agent image and check its toolchain installation.")
 
