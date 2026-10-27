@@ -102,6 +102,8 @@ class WorklinkEvidence:
     tests: TestResult | None
     pr_url: str | None
     status: str
+    gate_byproducts_count: int = 0
+    gate_byproducts_top_level: list[str] = field(default_factory=list)
     base_ref: str = "main"
     model: str | None = None
     failure_reason: str | None = None

@@ -132,6 +132,7 @@ class WorklinkDefaults:
     priority: str = "normal"
     test_command: str = "uv run pytest -q"
     gate_rerun_max_failures: int = 10
+    max_new_untracked_files: int = 200
     backend_by_category: Mapping[str, str] = field(default_factory=dict)
     compute_backend: str = "local_subprocess"
     # Branch that attempt checkouts are cut from and that leaf PRs target. Point
@@ -176,6 +177,8 @@ class WorklinkDefaults:
         """Validate all cross-field constraints for Worklink defaults."""
         if type(self.gate_rerun_max_failures) is not int or self.gate_rerun_max_failures < 0:
             raise ValueError("worklink gate_rerun_max_failures must be a nonnegative integer")
+        if type(self.max_new_untracked_files) is not int or self.max_new_untracked_files < 0:
+            raise ValueError("worklink max_new_untracked_files must be a nonnegative integer")
         required_reaper_ttl_s = minimum_reaper_ttl_s(self.timeout_s)
         if self.reaper_ttl_s < required_reaper_ttl_s:
             raise WorklinkDefaultsValidationError(
@@ -267,6 +270,9 @@ class WorklinkConfig:
             ),
             gate_rerun_max_failures=defaults_data.get(
                 "gate_rerun_max_failures", default_values.gate_rerun_max_failures
+            ),
+            max_new_untracked_files=defaults_data.get(
+                "max_new_untracked_files", default_values.max_new_untracked_files
             ),
             backend_by_category={
                 str(key): str(value) for key, value in category_defaults.items()
