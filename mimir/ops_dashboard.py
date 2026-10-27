@@ -528,18 +528,31 @@ async def build_dashboard_payload_async(
 
 
 def _build_algedonic_signals(events_log: Path, turns_log: Path) -> dict[str, Any]:
-    """Render the same recent feedback-signal body used in agent prompts.
+    """Render feedback plus owner-only issue notices, never fed to the agent.
 
-    The prompt block is intentionally a 24h algedonic window, independent of
-    the dashboard's broader analytics ``days`` filter. Keeping this as the
-    rendered Markdown body makes the Ops > Signals page match what the agent
-    sees instead of introducing a second formatter with drift risk.
+    Issue titles belong only in authenticated operator views, not the feedback
+    vocabulary that is reused in model prompts. Both use a 24h window.
     """
     window_hours = 24
     block = FeedbackLog(
         events_path=events_log,
         turns_path=turns_log,
     ).recent_block(window_hours=window_hours)
+    # This projection is dashboard-only. Do not move these notices into
+    # FeedbackLog: its output is also injected into later model prompts.
+    from .prompt_safety import sanitize_prompt_field
+
+    notices = [event for event in _load_events(events_log, 1)
+               if event.get("type") == "github_issue_notice"][-30:]
+    if notices:
+        lines = ["Owner-only GitHub issue notices:"]
+        for event in notices:
+            repo, number, title, author, url = (
+                sanitize_prompt_field(event.get(key) or "")
+                for key in ("repo", "number", "title", "author", "url")
+            )
+            lines.append(f"- {repo}#{number}: {title} (by @{author}) {url}")
+        block = "\n\n".join(part for part in (block, "\n".join(lines)) if part)
     return {
         "title": "Recent feedback signals",
         "window_hours": window_hours,

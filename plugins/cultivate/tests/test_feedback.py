@@ -9,6 +9,7 @@ from pathlib import Path
 
 from mimir.feedback import FeedbackLog, classify
 from mimir.feedback.renderers import _render_event_line
+from mimir.ops_dashboard import _build_algedonic_signals
 from mimir.access_control import SinkGate
 from mimir.models import AuthContext, InformationFlowState, Integrity
 from mimir.plugins.core import policy_scope
@@ -49,6 +50,26 @@ def test_selected_spawn_valence_and_sanitized_renderer(tmp_path: Path) -> None:
         line = _render_event_line("spawn_auth_fail", events[1])
         assert "\n" not in line
         assert "auth-failed" in line
+
+
+def test_issue_notice_is_visible_in_ops_signals_without_alert_channel(tmp_path: Path) -> None:
+    event = _event(
+        "github_issue_notice", 1, repo="owner/repo", number=358,
+        title="OUTSIDER_ISSUE_TITLE_UNIQUE_MARKER", author="outsider",
+        url="https://github.com/owner/repo/issues/358",
+    )
+    events_log = tmp_path / "events.jsonl"
+    events_log.write_text(json.dumps(event) + "\n")
+    for selection in ("", "cultivate"):
+        with policy_scope(load_plugins(enable=selection).policy):
+            feedback = FeedbackLog(events_log, tmp_path / "turns.jsonl")
+            assert classify("github_issue_notice") is None
+            assert "OUTSIDER_ISSUE_TITLE_UNIQUE_MARKER" not in (feedback.recent_block() or "")
+            signals = _build_algedonic_signals(events_log, tmp_path / "turns.jsonl")
+        assert "owner/repo#358" in signals["block"]
+        assert "https://github.com/owner/repo/issues/358" in signals["block"]
+        assert "OUTSIDER_ISSUE_TITLE_UNIQUE_MARKER" in signals["block"]
+    assert json.loads(events_log.read_text())["title"] == "OUTSIDER_ISSUE_TITLE_UNIQUE_MARKER"
 
 
 def test_selected_feedback_keeps_owner_and_ifc_provenance(tmp_path: Path) -> None:

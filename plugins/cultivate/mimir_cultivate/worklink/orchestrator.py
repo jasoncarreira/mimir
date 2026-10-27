@@ -5552,10 +5552,10 @@ def _leaf_publication(home: Path, issue_id: int, attempt: int) -> Iterator[_Publ
                 continue
             payload = json.loads(evidence_path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict) or payload.get("status") not in {
-                "completed", "failed", "blocked",
+                "completed", "failed", "blocked", "stopped",
             }:
                 raise WorklinkError(f"publication evidence unavailable: {evidence_path}")
-            if payload.get("pr_url"):
+            if payload.get("pr_url") is not None:
                 raise WorklinkError(f"publication already recorded: {evidence_path}")
         yield intent
     finally:

@@ -49,7 +49,7 @@ def trust(monkeypatch):
     return calls
 
 
-def test_outsider_issue_signal_deduplicates_in_cursor_and_never_leaks(
+def test_issue_notice_deduplicates_in_cursor_and_never_leaks_body(
     monkeypatch, tmp_path, capsys, trust,
 ):
     # main() budgets from process startup; this test owns only its two ticks.
@@ -65,17 +65,18 @@ def test_outsider_issue_signal_deduplicates_in_cursor_and_never_leaks(
     for tick in range(2):
         poller.main()
         records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-        assert_marker_absent(records, poller.CURSOR_FILE)
-        signals = [item for item in records if item.get("signal") == "github_outsider_issue_withheld"]
+        signals = [item for item in records if item.get("signal") == "github_issue_notice"]
         assert len(signals) == (1 if tick == 0 else 0)
         assert not any("prompt" in item for item in records)
         if signals:
             assert signals[0] == dict(
-                poller=poller.POLLER_NAME, signal="github_outsider_issue_withheld",
-                repo=REPO, number=7, author="outsider",
+                poller=poller.POLLER_NAME, signal="github_issue_notice",
+                repo=REPO, number=7, title=OUTSIDER_MARKER, author="outsider",
+                author_trusted=False,
                 url=f"https://github.com/{REPO}/issues/7",
             )
-    assert json.loads(poller.CURSOR_FILE.read_text())["github_outsider_issues"][REPO] == ["7"]
+        assert "body" not in str(records)
+    assert json.loads(poller.CURSOR_FILE.read_text())["github_issue_notices"][REPO] == {"7": STAMP}
 
 
 @pytest.mark.parametrize("surface", ["issue_comment", "pr_context", "review_comment", "review"])
@@ -139,6 +140,8 @@ def test_null_user_activity_withholds_without_attestation_or_window_hold(monkeyp
     def api(endpoint, token):
         if endpoint.endswith("/pulls/8"):
             return pr
+        if endpoint.endswith("/issues/8"):
+            return dict(pr, pull_request={"url": "pr"})
         if endpoint.endswith("/pulls/8/reviews") or "/comments?" in endpoint:
             return [child]
         if "/issues?" in endpoint:
@@ -153,7 +156,7 @@ def test_null_user_activity_withholds_without_attestation_or_window_hold(monkeyp
     budget = poller.TickBudget()
     if surface == "issue":
         poller._check_issues(REPO, SINCE, "token", "mimir",
-                             surfaced_outsiders=set(), tick_budget=budget)
+                             tick_budget=budget)
     elif surface == "pr":
         poller._check_prs(REPO, SINCE, "token", "mimir",
                           surfaced_untrusted=set(), tick_budget=budget)
@@ -170,7 +173,8 @@ def test_null_user_activity_withholds_without_attestation_or_window_hold(monkeyp
     else:
         poller._check_pr_reviews(REPO, SINCE, "token", "mimir", tick_budget=budget)
     output = capsys.readouterr().out
-    assert_marker_absent(output)
+    if surface != "issue":
+        assert_marker_absent(output)
     assert not any("prompt" in json.loads(line) for line in output.splitlines())
     assert not budget.hard_truncated
 
@@ -188,7 +192,9 @@ def test_null_user_comment_advances_since_watermark_across_ticks(monkeypatch, tm
     monkeypatch.setattr(poller, "_github_author_is_trusted",
                         lambda *args: pytest.fail("null-user author attested"))
     monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token:
-                        [dict(_comment(), user=None)] if "/issues/comments?" in endpoint else [])
+                        [dict(_comment(), user=None)] if "/issues/comments?" in endpoint
+                        else dict(_pr(), pull_request={"url": "pr"})
+                        if endpoint.endswith("/issues/8") else [])
     for expected in ["2026-10-10T00:00:00Z", "2026-10-11T00:00:00Z"]:
         poller.main()
         assert json.loads(poller.CURSOR_FILE.read_text())["last_checked"] == expected
@@ -212,42 +218,41 @@ def test_mixed_pr_context_keeps_trusted_prose_only(monkeypatch, capsys, trust):
     assert_marker_absent(context, records)
 
 
-def test_unresolved_author_is_retryable_and_not_cached(monkeypatch, capsys):
+@pytest.mark.parametrize("verdict,expected_trust", [(True, True), (False, False), (None, False)])
+def test_issue_notice_attestation_is_fail_closed(monkeypatch, capsys, verdict, expected_trust):
     cache = {}
     monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: [_issue()])
-    monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *args: None)
+    monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *args: verdict)
     budget = poller.TickBudget()
     assert poller._check_issues(REPO, SINCE, "token", "", trust_cache=cache,
-                               surfaced_outsiders=set(), tick_budget=budget) == 0
-    assert cache == {} and budget.hard_truncated
-    assert capsys.readouterr().out == ""
-    monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *args: False)
-    assert poller._check_issues(REPO, SINCE, "token", "", trust_cache=cache,
-                               surfaced_outsiders=set()) == 1
-    assert_marker_absent(capsys.readouterr().out)
+                               tick_budget=budget) == 1
+    assert not budget.hard_truncated
+    assert cache == ({} if verdict is None else {(REPO, "outsider"): verdict})
+    notice = json.loads(capsys.readouterr().out)
+    assert notice["signal"] == "github_issue_notice"
+    assert notice["author_trusted"] is expected_trust
 
 
-def test_exhausted_attestation_budget_is_not_an_outsider_verdict(monkeypatch, capsys):
+def test_issue_notice_does_not_attest_even_with_exhausted_budget(monkeypatch, capsys):
     monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: [_issue()])
     monkeypatch.setattr(poller, "_github_author_is_trusted",
                         lambda *args: pytest.fail("attestation exceeded budget"))
-    cache, surfaced = {}, set()
+    cache = {}
     budget = poller.TickBudget(hard_deadline_seconds=0)
     assert poller._check_issues(REPO, SINCE, "token", "", trust_cache=cache,
-                               surfaced_outsiders=surfaced, tick_budget=budget) == 0
-    assert budget.hard_truncated and cache == {} and surfaced == set()
-    assert capsys.readouterr().out == ""
+                               tick_budget=budget) == 1
+    assert not budget.hard_truncated and cache == {}
+    assert json.loads(capsys.readouterr().out)["author_trusted"] is False
 
 
-def test_trusted_issue_prompt_is_unchanged(monkeypatch, capsys, trust):
+def test_trusted_issue_also_produces_notice_not_prompt(monkeypatch, capsys, trust):
     issue = dict(_issue(author="trusted"), title="A genuine issue", body="Full report")
     monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: [issue])
     assert poller._check_issues(REPO, SINCE, "token", "") == 1
     record = json.loads(capsys.readouterr().out)
-    assert record["prompt"] == (
-        "New issue on acme/widget: #7 A genuine issue (by @trusted)\n"
-        "Full report\nhttps://github.com/acme/widget/issues/7"
-    )
+    assert record["signal"] == "github_issue_notice"
+    assert record["title"] == "A genuine issue"
+    assert "prompt" not in record and "Full report" not in str(record)
 
 
 def test_outsider_requested_pr_and_ci_are_silent(monkeypatch, capsys, trust):
