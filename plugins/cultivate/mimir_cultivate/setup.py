@@ -299,11 +299,8 @@ def render_layer(kind: str, version: str, root_image: str, *,
                    "chmod 755 /tmp/rustup-init && /tmp/rustup-init -y "
                    f"--no-modify-path --default-toolchain {version} && rm /tmp/rustup-init && "
                    "chmod -R a+rX /opt/rustup /opt/cargo && "
-                   "ln -s /opt/cargo/bin/rustup /usr/local/bin/rustup && "
-                   "ln -s /opt/cargo/bin/cargo /usr/local/bin/cargo && "
-                   "ln -s /opt/cargo/bin/rustc /usr/local/bin/rustc && "
-                   "ln -s /opt/cargo/bin/rustfmt /usr/local/bin/rustfmt && "
-                   "ln -s /opt/cargo/bin/cargo-clippy /usr/local/bin/cargo-clippy && "
+                   "for proxy in /opt/cargo/bin/*; do [ -e \"$proxy\" ] && "
+                   "ln -s \"$proxy\" \"/usr/local/bin/${proxy##*/}\" || exit 1; done && "
                    "case $arch in amd64) platform=linux;; arm64) platform=linux-arm;; *) exit 2;; esac && "
                    f"curl -fsSLo /tmp/nextest.tar.gz https://get.nexte.st/{nextest_version}/$platform && "
                    "tar -xzf /tmp/nextest.tar.gz -C /usr/local/bin cargo-nextest && rm /tmp/nextest.tar.gz\n"
@@ -704,6 +701,8 @@ env = json.loads(configured)
 runtime_home = env['HOME']
 commands = {
  'rust': [('rustc', ['rustc', '--version']), ('cargo', ['cargo', '--version']),
+          ('cargo-fmt', ['cargo', 'fmt', '--version']),
+          ('cargo-clippy', ['cargo', 'clippy', '--version']),
           ('cargo-nextest', ['cargo', 'nextest', '--version'])],
  'node': [('node', ['node', '--version']), ('npm', ['npm', '--version']),
           ('npx', ['npx', '--version'])],
@@ -792,7 +791,7 @@ def _verify_toolchain(deploy: Path, kind: str, version: str) -> None:
                   "agent", "/usr/local/bin/python", "-c", _TOOLCHAIN_WORKER_PROBE,
                   configured, kind, version], cwd=deploy)
     if check != "ok":
-        tools = {"rust": {"rustc", "cargo", "cargo-nextest", "cc"},
+        tools = {"rust": {"rustc", "cargo", "cargo-fmt", "cargo-clippy", "cargo-nextest", "cc"},
                  "node": {"node", "npm", "npx", "c++"}, "python": {"uv", "python", "cc"}}
         reason = check if check in {"toolchain_missing: " + tool for tool in tools[kind]} else "toolchain_missing: " + kind
         raise SetupError(f"Leaf toolchain verification failed ({reason}); rebuild the agent image and check its toolchain installation.")

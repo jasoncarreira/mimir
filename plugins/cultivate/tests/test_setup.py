@@ -249,6 +249,33 @@ def test_rust_layer_failed_install_cannot_be_masked_by_nextest(tmp_path, archite
     assert not marker.exists(), 'nextest must not run after a failed rustup install or unsupported arch'
 
 
+def test_rust_layer_links_all_installed_proxies_fail_closed(tmp_path):
+    layer = installer.render_layer('rust', '1.99.1', 'root:sha')
+    script = next(line.removeprefix('RUN ') for line in layer.splitlines() if 'rustup-init' in line)
+    loop = script[script.index('for proxy in /opt/cargo/bin/*;'):].split(' done && ', 1)[0] + ' done'
+    cargo_bin = tmp_path / 'cargo/bin'
+    cargo_bin.mkdir(parents=True)
+    installed = tmp_path / 'installed'
+    installed.mkdir()
+    names = ('rustup', 'cargo', 'rustc', 'rustfmt', 'cargo-fmt', 'cargo-clippy',
+             'rustdoc', 'cargo-miri', 'new-rustup-proxy')
+    for name in names:
+        (cargo_bin / name).write_text('proxy')
+    loop = loop.replace('/opt/cargo/bin', str(cargo_bin)).replace('/usr/local/bin', str(installed))
+    result = subprocess.run(['/bin/sh', '-ceu', loop], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert {link.name for link in installed.iterdir()} == set(names)
+    assert all((installed / name).is_symlink() and (installed / name).resolve() == cargo_bin / name
+               for name in names)
+    # A failed link must stop the build, even if another proxy could still link.
+    result = subprocess.run(['/bin/sh', '-ceu', loop], capture_output=True, text=True)
+    assert result.returncode != 0
+    for proxy in cargo_bin.iterdir():
+        proxy.unlink()
+    result = subprocess.run(['/bin/sh', '-ceu', loop], capture_output=True, text=True)
+    assert result.returncode != 0, 'an empty proxy directory must not produce a successful layer'
+
+
 def test_node_layer_rejects_unsupported_architecture(tmp_path):
     script = next(line.removeprefix('RUN ') for line in installer.render_layer('node', '22.16.0', 'root:sha').splitlines()
                   if 'dpkg --print-architecture' in line)
@@ -920,7 +947,7 @@ def test_setup_binary_resolution_failure_does_not_launch_worker(tmp_path, monkey
 
 
 @pytest.mark.parametrize('kind, version, tools', [
-    ('rust', '1.99.1', ('rustc', 'cargo', 'cargo-nextest')),
+    ('rust', '1.99.1', ('rustc', 'cargo', 'cargo-fmt', 'cargo-clippy', 'cargo-nextest')),
     ('node', '22.16.0', ('node', 'npm', 'npx')),
     ('python', '3.11.11', ('uv', 'python')),
 ])
@@ -985,6 +1012,9 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
             'def launch(argv, **kwargs):\n'
             f' pathlib.Path({str(launch_marker)!r}).write_text(json.dumps(kwargs["env"]))\n'
             f' name = pathlib.Path(argv[0]).name\n'
+            ' if name == "cargo" and len(argv) > 1 and argv[1] in ("fmt", "clippy"):\n'
+            '  name = "cargo-" + argv[1]\n'
+            '  argv = [name, *argv[2:]]\n'
             f' binary = pathlib.Path({str(bin_dir)!r}) / name\n'
             ' if not binary.exists() and pathlib.Path(argv[0]).is_absolute():\n'
             f'  pathlib.Path({str(tmp_path / "executed")!r}).write_text(name)\n'
@@ -1021,7 +1051,7 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
         assert observed['RUSTUP_HOME'] == '/opt/rustup'
         assert not list(cache.iterdir()), 'probe must remove its cache write test'
     launches = [json.loads(row) for row in marker.read_text().splitlines()]
-    assert [row[0] for row in launches] == (['rustc', 'cargo', 'cargo', 'rustc'] if kind == 'rust' else
+    assert [row[0] for row in launches] == (['rustc', 'cargo', 'cargo-fmt', 'cargo-clippy', 'cargo', 'rustc'] if kind == 'rust' else
                                              ['node', 'npm', 'npx', 'c++'] if kind == 'node' else
                                              ['uv', 'uv', 'python', 'cc'])
     assert (tmp_path / 'executed').read_text() == 'probe'
@@ -1032,7 +1062,18 @@ def test_toolchain_probe_runs_versions_on_worker_path(tmp_path, monkeypatch, kin
     homes = {row[2]['HOME'] for row in launches}
     assert len(homes) == 1 and not Path(homes.pop()).exists()
     if kind == 'rust':
-        assert launches[2][1] == ['nextest', '--version']
+        assert launches[2][1] == ['--version'] and launches[3][1] == ['--version']
+        assert launches[4][1] == ['nextest', '--version']
+        # Cargo subcommands must be available on the fixed worker PATH,
+        # independently of the installer's /opt/cargo/bin.
+        for name in ('cargo-fmt', 'cargo-clippy'):
+            binary = bin_dir / name
+            contents = binary.read_text()
+            binary.unlink()
+            with pytest.raises(installer.SetupError, match='toolchain_missing: ' + name):
+                installer._verify_toolchain(tmp_path, kind, version)
+            binary.write_text(contents)
+            binary.chmod(0o755)
         # A cache that cannot accept a file must fail before version probes.
         cache.rmdir()
         cache.write_text('not a directory')
@@ -1083,20 +1124,45 @@ def test_real_image_toolchain_proof_uses_clean_env_and_negative_control(tmp_path
     script = Path(__file__).resolve().parents[3] / 'scripts/worklink_image_identity.py'
     proof = runpy.run_path(str(script))['TOOLCHAIN_PROOF']
     calls = []
+    linked = {'cargo-fmt', 'cargo-clippy', 'rustdoc'}
 
     def launch(argv, **kwargs):
         assert argv[:4] == ['/command/s6-setuidgid', 'worklink', 'env', '-i']
-        assert argv[4:7] == ['/usr/local/bin/python', '-c', installer._TOOLCHAIN_WORKER_PROBE]
-        env = json.loads(argv[7])
+        if argv[4] == '/usr/local/bin/python':
+            assert argv[4:7] == ['/usr/local/bin/python', '-c', installer._TOOLCHAIN_WORKER_PROBE]
+            env = json.loads(argv[7])
+            command = 'probe'
+        else:
+            assignments = dict(item.split('=', 1) for item in argv[4:] if '=' in item)
+            env = assignments
+            command = ' '.join(arg for arg in argv[4:] if '=' not in arg)
+            assert env['PATH'] == '/usr/local/bin:/usr/bin:/bin'
         assert env['CARGO_HOME'] == '/var/cache/mimir-cargo'
-        assert kwargs == dict(cwd='/tmp', capture_output=True, text=True, timeout=120)
-        calls.append(env)
-        return SimpleNamespace(returncode=0, stdout='ok' if 'RUSTUP_HOME' in env else 'toolchain_missing: rustc')
+        assert {k: v for k, v in kwargs.items() if k != 'cwd'} == dict(
+            capture_output=True, text=True, timeout=120)
+        if command == 'cargo doc --offline --no-deps':
+            assert (Path(kwargs['cwd']) / 'src/lib.rs').read_text() == 'pub fn proof() {}\n'
+        else:
+            assert kwargs['cwd'] == '/tmp'
+        calls.append((command, env))
+        if command == 'probe':
+            return SimpleNamespace(returncode=0, stdout='ok' if 'RUSTUP_HOME' in env else 'toolchain_missing: rustc')
+        required = {'cargo fmt --version': 'cargo-fmt',
+                    'cargo clippy --version': 'cargo-clippy', 'rustdoc --version': 'rustdoc'}
+        return SimpleNamespace(returncode=int(required.get(command) not in linked) if command in required else 0,
+                               stdout='version')
 
     monkeypatch.setattr(subprocess, 'run', launch)
     exec(compile(proof, '<image-toolchain-proof>', 'exec'), {})
-    assert len(calls) == 2 and calls[0]['RUSTUP_HOME'] == '/opt/rustup'
-    assert calls[1] == {k: v for k, v in calls[0].items() if k != 'RUSTUP_HOME'}
+    assert [command for command, _ in calls] == [
+        'probe', 'cargo fmt --version', 'cargo clippy --version', 'rustdoc --version',
+        'cargo doc --offline --no-deps', 'probe']
+    assert calls[0][1]['RUSTUP_HOME'] == '/opt/rustup'
+    assert calls[-1][1] == {k: v for k, v in calls[0][1].items() if k != 'RUSTUP_HOME'}
+    linked.remove('cargo-fmt')
+    with pytest.raises(AssertionError):
+        exec(compile(proof, '<missing-cargo-fmt-image-proof>', 'exec'), {})
+    linked.add('cargo-fmt')
     # Mutation: a config producer that forgets Rust's required home must make
     # the live proof's positive control fail, not just its negative pass.
     original = installer.toolchain_test_env
