@@ -217,6 +217,26 @@ with tempfile.TemporaryDirectory() as directory:
         )
         expected = 'toolchain_missing: rustc' if missing else 'ok'
         assert result.returncode == 0 and result.stdout.strip() == expected, (missing, result)
+        if not missing:
+            # Execute Cargo's own subcommand lookup with exactly the clean gate
+            # environment. The probe's version checks must not hide a missing
+            # /usr/local/bin/cargo-fmt behind the install-time CARGO_HOME.
+            gate = ['/command/s6-setuidgid', 'worklink', 'env', '-i',
+                    *(f'{key}={value}' for key, value in selected.items())]
+            for command in (['cargo', 'fmt', '--version'], ['cargo', 'clippy', '--version'],
+                            ['rustdoc', '--version']):
+                checked = subprocess.run([*gate, *command], cwd='/tmp',
+                                         capture_output=True, text=True, timeout=120)
+                assert checked.returncode == 0, (command, checked)
+            with tempfile.TemporaryDirectory() as project:
+                root = Path(project)
+                root.chmod(0o777)  # worklink must be able to write Cargo's target/.
+                (root / 'Cargo.toml').write_text('[package]\nname = "toolchain-proof"\nversion = "0.1.0"\nedition = "2021"\n')
+                (root / 'src').mkdir()
+                (root / 'src/lib.rs').write_text('pub fn proof() {}\n')
+                checked = subprocess.run([*gate, 'cargo', 'doc', '--offline', '--no-deps'],
+                                         cwd=project, capture_output=True, text=True, timeout=120)
+                assert checked.returncode == 0, checked
 print('real-image clean gate toolchain proof passed (including missing-RUSTUP_HOME control)')
 """
 
