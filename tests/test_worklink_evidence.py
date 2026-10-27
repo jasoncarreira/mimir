@@ -592,10 +592,12 @@ def test_passes():
     assert tests.failed_tests == tests.initial_run.failed_tests
     assert result.status == "failed"
     assert "tests_failed" in result.reasons
-    assert f"- Tests: `{command}` → 1" in body
-    assert f"- Original gate: `{command}` → 1" in body
-    assert f"- Diagnostic rerun (serial, failed nodes only): `{tests.rerun.cmd}` → 0" in body
-    assert "flaky_tests (passed in isolation; not proof of flakiness)" in body
+    assert "- Tests: `[path omitted] -m pytest -q -n 2` → 1" in body
+    assert str(sys.executable) not in body
+    assert "- Original gate: `[path omitted] -m pytest -q -n 2` → 1" in body
+    assert "- Diagnostic rerun (serial, failed nodes only): `[path omitted]" in body
+    assert " → 0" in body
+    assert "flaky_tests (passed in isolation; [omitted] proof of flakiness)" in body
     assert "test_gate_sample.py::test_candidate" in body
 
 

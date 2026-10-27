@@ -41,6 +41,12 @@ WORKLINK_MERGED_LABEL = "worklink:merged"
 SHIPPING_BACKENDS = frozenset({"feature_factory", "opencode"})
 SHIPPING_COMPUTE_BACKENDS = frozenset({"local_subprocess"})
 DEFAULT_FACTORY_RUN_TIMEOUT_S = 43200.0
+_PUBLICATION_REFERENCE = re.compile(r"#\d+|https?://\S+|(?<!\w)/(?:[\w.-]+/)+[\w.-]+", re.I)
+_PUBLICATION_CLOSING = re.compile(r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\b", re.I)
+_PUBLICATION_REFUSAL = re.compile(
+    r"(?<![\w-])(?:no|not|never|partial|partially|incomplete|unfinished|remaining|"
+    r"follow-up|followup|todo|wip|refs|stack|stacked|epic)(?![\w-])", re.I,
+)
 
 
 def factory_run_timeout_s() -> float:
@@ -219,6 +225,32 @@ class WorklinkRoute:
 
 
 @dataclass(frozen=True)
+class WorklinkPublication:
+    commit_trailers: tuple[str, ...] | None = None
+    pr_footer: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.commit_trailers is not None:
+            if not isinstance(self.commit_trailers, (tuple, list)) or not all(
+                isinstance(line, str)
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*: [^\r\n\x00-\x1f\x7f]+", line)
+                and not _PUBLICATION_REFERENCE.search(line)
+                and not _PUBLICATION_CLOSING.search(line)
+                for line in self.commit_trailers
+            ):
+                raise ValueError("worklink publication.commit_trailers must be single-line 'Key: value' trailers without references or closing keywords")
+        if self.pr_footer is not None and (
+            not isinstance(self.pr_footer, str)
+            or not 0 < len(self.pr_footer) <= 200
+            or not self.pr_footer.isprintable()
+            or _PUBLICATION_REFERENCE.search(self.pr_footer)
+            or _PUBLICATION_CLOSING.search(self.pr_footer)
+            or _PUBLICATION_REFUSAL.search(self.pr_footer)
+        ):
+            raise ValueError("worklink publication.pr_footer must be a printable single line of at most 200 characters without references or refusal language")
+
+
+@dataclass(frozen=True)
 class WorklinkConfig:
     defaults: WorklinkDefaults = field(default_factory=WorklinkDefaults)
     repository: str | None = None
@@ -226,6 +258,7 @@ class WorklinkConfig:
     backend_settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     compute_backend_settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     tool_pins: tuple[ToolPin, ...] = ()
+    publication: WorklinkPublication = field(default_factory=WorklinkPublication)
 
     @classmethod
     def load(cls, path: Path) -> "WorklinkConfig":
@@ -234,6 +267,16 @@ class WorklinkConfig:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if not isinstance(data, dict):
             raise ValueError("worklink config root must be a mapping")
+        publication_data = data.get("publication", {})
+        if not isinstance(publication_data, dict):
+            raise ValueError("worklink publication must be a mapping")
+        trailers = publication_data.get("commit_trailers")
+        if trailers is not None and not isinstance(trailers, list):
+            raise ValueError("worklink publication.commit_trailers must be a list")
+        publication = WorklinkPublication(
+            commit_trailers=tuple(trailers) if trailers is not None else None,
+            pr_footer=publication_data.get("pr_footer"),
+        )
         defaults_data = data.get("defaults") or {}
         if not isinstance(defaults_data, dict):
             raise ValueError("worklink defaults must be a mapping")
@@ -383,6 +426,7 @@ class WorklinkConfig:
                 for name, settings in normalized_compute_backends.items()
             },
             tool_pins=tool_pins,
+            publication=publication,
         )
 
     def select_compute_backend_name(
