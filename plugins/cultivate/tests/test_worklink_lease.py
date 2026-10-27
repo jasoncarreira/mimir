@@ -349,13 +349,13 @@ def test_provider_continuation_delivers_after_receipt_only_once(tmp_path: Path) 
 
 def test_merge_closure_rejects_ambiguous_completion() -> None:
     assert merge_closure.parse_completion_reference(
-        "Closes chainlink #1949.\n\nImplemented.", expected_issue_id=1949,
+        "Closes chainlink-1949.\n\nImplemented.", expected_issue_id=1949,
     ).qualifies
     assert not merge_closure.parse_completion_reference(
-        "Closes chainlink #1949.\n\nStill incomplete.", expected_issue_id=1949,
+        "Closes chainlink-1949.\n\nStill incomplete.", expected_issue_id=1949,
     ).qualifies
     assert not merge_closure.parse_completion_reference(
-        "Closes chainlink #1950.\n\nImplemented.", expected_issue_id=1949,
+        "Closes chainlink-1950.\n\nImplemented.", expected_issue_id=1949,
     ).qualifies
 
 
@@ -422,7 +422,7 @@ def test_merge_reconciliation_audits_before_closing_once(
         assert args == ["gh", "api", "repos/example/project/pulls/42"]
         return result({
             "number": 42, "html_url": "https://github.com/example/project/pull/42",
-            "body": "Closes chainlink #1949.\n\nImplemented.", "state": "closed",
+            "body": "Closes chainlink-1949.\n\nImplemented.", "state": "closed",
             "merged": True, "merged_at": "2026-09-20T12:00:00Z",
             "merge_commit_sha": "abcdef1234567890",
             "base": {"repo": {"full_name": "example/project"}, "ref": "main"},

@@ -10,6 +10,7 @@ from typing import Any, Protocol
 
 from mimir.models import NormalizedPullRequestSnapshot
 from .policy import RepoPRActionScope
+from .review_checks import approval_blocker
 
 
 class ForgeError(RuntimeError):
@@ -1106,6 +1107,25 @@ class GitHubForgeClient:
             ReviewVerdict.REQUEST_CHANGES: "REQUEST_CHANGES",
         }
         self._confirm_effect_identity(scope)
+        if verdict == ReviewVerdict.APPROVE:
+            try:
+                live = self._request("GET", f"/repos/{repository}/pulls/{number}")
+            except ForgeError as exc:
+                raise ForgeError("approval refused: reviewed PR head could not be read") from exc
+            if not isinstance(live, Mapping) or not isinstance(live.get("head"), Mapping) or live["head"].get("sha") != scope.observed_head_sha:
+                raise ForgeError("approval refused: reviewed PR head is no longer current")
+            try:
+                checks = self._request(
+                    "GET", f"/repos/{repository}/commits/{scope.observed_head_sha}/check-runs?per_page=100",
+                )
+                statuses = self._request(
+                    "GET", f"/repos/{repository}/commits/{scope.observed_head_sha}/status",
+                )
+                blocker = approval_blocker(checks, statuses)
+            except (ForgeError, requests.RequestException) as exc:
+                raise ForgeError("approval refused: CI checks could not be read") from exc
+            if blocker:
+                raise ForgeError(f"approval refused: {blocker}")
         data = self._request(
             "POST",
             f"/repos/{repository}/pulls/{number}/reviews",
@@ -1264,7 +1284,7 @@ _REPOSITORY = re.compile(r"[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}")
 _REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 _BOT_LOGIN = re.compile(r"[A-Za-z0-9-]{1,39}\[bot\]", re.I)
 _DIAGNOSTIC_LOGIN = re.compile(r"(?:[A-Za-z0-9_.-]{1,100}|[A-Za-z0-9-]{1,39}\[bot\])", re.I)
-_CHECK_NAME = re.compile(r"[A-Za-z0-9 _./()\[\]-]{1,64}")
+_CHECK_NAME = re.compile(r"[A-Za-z0-9 _./()\[\],-]{1,128}")
 _CHECK_STATUSES = frozenset({"queued", "in_progress", "completed", "waiting", "pending", "requested"})
 _CHECK_CONCLUSIONS = frozenset({
     "success", "failure", "neutral", "cancelled", "skipped", "timed_out",
@@ -2154,15 +2174,31 @@ def _check_url_matches_scope(url: str, scope: RepoPRActionScope) -> bool:
     return True
 
 
-def _safe_check_projection(check: Any, scope: RepoPRActionScope) -> bool:
-    url = check.details_url
-    return (
-        isinstance(check.status, str) and check.status in _CHECK_STATUSES
-        and (check.conclusion is None or isinstance(check.conclusion, str)
-             and check.conclusion in _CHECK_CONCLUSIONS)
-        and isinstance(check.name, str) and _CHECK_NAME.fullmatch(check.name) is not None
-        and (url is None or isinstance(url, str) and _check_url_matches_scope(url, scope))
-    )
+def _safe_check_projection(check: Any, scope: RepoPRActionScope, index: int) -> dict[str, Any]:
+    from mimir.event_logger import log_event_sync
+
+    result = asdict(check)
+
+    def withhold(field: str, replacement: Any) -> None:
+        result[field] = replacement
+        try:
+            log_event_sync("pr_checks_field_withheld", field=field, check_index=index)
+        except RuntimeError:
+            pass
+
+    if not isinstance(check.name, str) or _CHECK_NAME.fullmatch(check.name) is None:
+        withhold("name", "<withheld-check-name>")
+    if not isinstance(check.status, str) or check.status not in _CHECK_STATUSES:
+        withhold("status", "unknown")
+    if check.conclusion is not None and (
+        not isinstance(check.conclusion, str) or check.conclusion not in _CHECK_CONCLUSIONS
+    ):
+        withhold("conclusion", "unknown")
+    if check.details_url is not None and (
+        not isinstance(check.details_url, str) or not _check_url_matches_scope(check.details_url, scope)
+    ):
+        withhold("details_url", None)
+    return result
 
 
 def _publish_author_attestation(
@@ -2585,9 +2621,7 @@ def pr_checks(
         checks = _call(lambda: client.list_checks(scope), runtime=runtime, scope=scope)
     finally:
         _verify_scoped_read_head(runtime, scope, client, "forge_projection", before)
-    if not all(_safe_check_projection(item, scope) for item in checks):
-        _publish_author_attestation(runtime, scope, ("",), "pr_checks")
-    return [asdict(item) for item in checks]
+    return [_safe_check_projection(item, scope, index) for index, item in enumerate(checks)]
 
 
 @tool

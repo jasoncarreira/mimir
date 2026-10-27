@@ -104,6 +104,10 @@ def test_provider_review_claim_tracks_current_head_and_duplicate(monkeypatch: py
             body = head[0]
         elif args[-1] == "--paginate":
             body = json.dumps(reviews)
+        elif "/check-runs?" in args[1]:
+            body = json.dumps({"check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}], "total_count": 1})
+        elif args[1].endswith("/status"):
+            body = json.dumps({"statuses": []})
         else:
             raise AssertionError(args)
         return SimpleNamespace(returncode=0, stdout=body)

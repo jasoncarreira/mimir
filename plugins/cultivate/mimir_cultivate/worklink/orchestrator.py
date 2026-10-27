@@ -37,7 +37,7 @@ from .backends import (
     checkout_shape_for_backend,
 )
 from .backends.opencode import OpenCodeBackend
-from .backends.registry import BackendRegistry, WorklinkConfig
+from .backends.registry import BackendRegistry, WorklinkConfig, WorklinkPublication
 from .compute import (
     ComputeLaunchError,
     ComputeResult,
@@ -109,6 +109,12 @@ from .detached_dispatch import FactoryRecoveryIdentity
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 _CLAIM_HEARTBEAT_INTERVAL_S = 60.0
 _PR_BODY_SECTION_FILE = ".worklink-pr-body.md"
+_COMMIT_SUBJECT_FILE = ".worklink-commit-subject"
+_COMMIT_SUBJECT_MAX_BYTES = 512
+_PUBLICATION_REFERENCE_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/[^\s]+|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+|#\d+", re.I,
+)
+_HOST_PATH_RE = re.compile(r"(?<!\S)/(?:[\w.-]+/)*[\w.-]+|(?<=[`\"'])/(?:[\w.-]+/)*[\w.-]+")
 _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
 _FACTORY_CONTROLLER_ERROR_MAX_BYTES = 4000
@@ -1584,6 +1590,7 @@ class WorklinkRunner:
                 attempt=attempt,
             )
         pr_body_section = _read_pr_body_section(lease.path)
+        commit_subject = _read_commit_subject(lease.path, issue.title)
         invocation_model = spec.backend_config.get("model")
         executor_failed = raw.exit_code != 0
         # A backend may report failure without the executor process exiting
@@ -1709,6 +1716,9 @@ class WorklinkRunner:
                     lease.path, issue, runner=runner, publication=publication,
                     paths=builder_paths, excluded=gate_excluded,
                     max_new_untracked_files=config.defaults.max_new_untracked_files,
+                    subject=commit_subject, attribution=_publication_attribution(
+                        config.publication, selected_name, invocation_model,
+                    ),
                 )
                 _ensure_clean_checkout(
                     lease.path, runner=runner, publication=publication, excluded=gate_excluded,
@@ -1775,6 +1785,9 @@ class WorklinkRunner:
                     pr_url = _open_pr(
                         self.repo, issue, lease.branch, validation.evidence,
                         pr_body_section=pr_body_section, base=lease.base_ref, runner=runner,
+                        subject=commit_subject, attribution=_publication_attribution(
+                            config.publication, selected_name, invocation_model,
+                        ),
                     )
                     validation = _with_pr_url(validation, pr_url)
                     step = "completed evidence"
@@ -5851,17 +5864,28 @@ def _commit_checkout_changes(
     paths: Iterable[str] | None = None,
     excluded: Iterable[str] = (),
     max_new_untracked_files: int = 200,
+    subject: str | None = None,
+    attribution: tuple[tuple[str, ...], str] | None = None,
 ) -> None:
     def run_git(*args: str) -> subprocess.CompletedProcess[str]:
         if publication is not None:
             return publication.run(*args)
         return runner(["git", "-C", str(checkout), *args])
 
+    if subject is None:
+        subject = _read_commit_subject(checkout, issue.title)
+    if attribution is None:
+        attribution = _publication_attribution(WorklinkPublication(), "unknown", None)
+    unstaged = run_git("reset", "--quiet", "--", _COMMIT_SUBJECT_FILE, _PR_BODY_SECTION_FILE)
+    if unstaged.returncode != 0:
+        raise WorklinkError("cannot exclude Worklink publication files from commit")
     snapshot = _gate_checkout_snapshot(
         checkout, runner=runner, publication=publication, protected=(),
     )
     selected = set(paths) if paths is not None else snapshot.dirty
     selected -= set(excluded)
+    selected.discard(_COMMIT_SUBJECT_FILE)
+    selected.discard(_PR_BODY_SECTION_FILE)
     added = snapshot.untracked & selected
     counts: dict[str, int] = {}
     for path in added:
@@ -5887,7 +5911,10 @@ def _commit_checkout_changes(
     # Fail closed before commit/push/PR if the backend staged a secret (or if
     # the scan cannot run).
     _assert_staged_diff_has_no_secret(checkout, runner=runner, publication=publication)
-    commit = run_git("commit", "-m", f"worklink: issue #{issue.issue_id}")
+    message = f"{subject}\n\nRefs: chainlink-{issue.issue_id}\n" + "".join(
+        f"{trailer}\n" for trailer in attribution[0]
+    )
+    commit = run_git("commit", "-m", message)
     if commit.returncode != 0:
         raise WorklinkError((commit.stderr or commit.stdout).strip() or "git commit failed")
 
@@ -6077,9 +6104,19 @@ def _open_pr(
     pr_body_section: str | None = None,
     base: str,
     runner: Runner,
+    subject: str | None = None,
+    attribution: tuple[tuple[str, ...], str] | None = None,
 ) -> str:
+    if subject is None:
+        subject = _fallback_commit_subject(issue.title)
+    if attribution is None:
+        attribution = _publication_attribution(WorklinkPublication(), evidence.backend, evidence.model)
+    run_id = f"{issue.issue_id}-{evidence.attempt}"
+    gate_run_id = evidence.tests.gate_run_id if evidence.tests else None
+    if gate_run_id:
+        run_id += f" ({gate_run_id})"
     evidence_block = (
-        f"Closes chainlink #{issue.issue_id}.\n\n"
+        f"Closes chainlink-{issue.issue_id}.\n\n"
         f"Worklink evidence:\n"
         f"- Base: `{base}`\n"
         f"- Branch: `{branch}`\n"
@@ -6087,7 +6124,7 @@ def _open_pr(
         "- Tests: "
         f"`{evidence.tests.cmd if evidence.tests else '(none)'}` → "
         f"{evidence.tests.exit_code if evidence.tests else 'missing'}\n"
-        f"- Transcript: `{evidence.transcript or '(none)'}`\n"
+        f"- Transcript run: `{run_id}`\n"
     )
     if evidence.tests is not None:
         tests = evidence.tests
@@ -6108,22 +6145,86 @@ def _open_pr(
     body = evidence_block
     if pr_body_section:
         body = (
-            f"Closes chainlink #{issue.issue_id}.\n\n"
+            f"Closes chainlink-{issue.issue_id}.\n\n"
             f"Build summary:\n\n{pr_body_section}\n\n"
             + evidence_block.split("\n\n", 1)[1]
         )
+    body += f"\n{attribution[1]}\n"
+    # Preserve the builder's meaning and the exact gate command. Refusal
+    # language or extra references must remain visible to merge_closure's
+    # fail-closed check; publication must not turn partial work into completion.
     command = ["gh", "pr", "create", "--base", base, "--head", branch]
     repo_slug = _repo_slug(repo, runner=runner)
     if repo_slug:
         command.extend(["--repo", repo_slug])
     command.extend([
-        "--title", f"Worklink #{issue.issue_id}: {issue.title}",
+        "--title", subject,
         "--body", body,
     ])
     result = runner(command)
     if result.returncode != 0:
         raise WorklinkError((result.stderr or result.stdout).strip() or "gh pr create failed")
     return result.stdout.strip().splitlines()[-1]
+
+
+def _fallback_commit_subject(title: str) -> str:
+    clean = _PUBLICATION_REFERENCE_RE.sub("", title)
+    clean = _HOST_PATH_RE.sub("", clean)
+    clean = " ".join(clean.split())
+    clean = "".join(char for char in clean if char.isprintable())
+    return clean[:72].rstrip() or "Worklink change"
+
+
+def _read_commit_subject(checkout: Path, title: str) -> str:
+    """Consume a bounded, regular, untrusted build-supplied subject."""
+    fallback = _fallback_commit_subject(title)
+    path = checkout / _COMMIT_SUBJECT_FILE
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        if path.is_symlink():
+            path.unlink(missing_ok=True)
+        return fallback
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return fallback
+        raw = os.read(fd, _COMMIT_SUBJECT_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        subject = raw.decode("utf-8").removesuffix("\n")
+    except UnicodeDecodeError:
+        return fallback
+    if (
+        not subject or len(subject) > 72 or not subject.isprintable()
+        or _PUBLICATION_REFERENCE_RE.search(subject)
+        or _HOST_PATH_RE.search(subject)
+        or subject != subject.strip()
+    ):
+        return fallback
+    return subject
+
+
+def _publication_attribution(
+    settings: WorklinkPublication, backend: str, model: object,
+) -> tuple[tuple[str, ...], str]:
+    # Backend and model names originate in controller configuration; bound them
+    # before interpolating into a public commit message or PR body.
+    def label(value: object) -> str:
+        text = str(value) if value else "unknown"
+        text = _PUBLICATION_REFERENCE_RE.sub("", text)
+        text = _HOST_PATH_RE.sub("", text)
+        return "".join(c for c in text if c.isprintable() and c not in "`\\")[0:80] or "unknown"
+
+    credit = f"Cultivate Worklink ({label(backend)}, {label(model)})"
+    return (
+        settings.commit_trailers if settings.commit_trailers is not None else (f"Generated-By: {credit}",),
+        settings.pr_footer if settings.pr_footer is not None else f"Generated by {credit}.",
+    )
 
 
 def _read_pr_body_section(checkout: Path) -> str | None:
@@ -6163,6 +6264,7 @@ def _read_pr_body_section(checkout: Path) -> str | None:
     text = redact_text(text).strip()
     # A build-authored lookalike must not precede the canonical parser anchor.
     text = _EVIDENCE_HEADING_RE.sub("[Build-authored evidence heading removed]", text)
+    text = re.sub(r"(?im)^\s*Closes chainlink-\d+\.\s*$", "[Build-authored completion removed]", text)
     text = _render_chainlink_text(text)
     encoded = text.encode("utf-8")
     truncated = len(raw) > _PR_BODY_SECTION_MAX_BYTES or len(encoded) > _PR_BODY_SECTION_MAX_BYTES

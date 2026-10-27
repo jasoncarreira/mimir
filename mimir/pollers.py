@@ -227,6 +227,7 @@ _GITHUB_ACTOR_EVENT_TYPES = {
     "pr_review": "reviewer",
     "pr_synchronize": "server-linked head commit author or committer",
     "pr_review_requested": "review requester",
+    "pr_checks_completed": "pull request author",
 }
 _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES = {
     "pr_changes_requested_stale": "derived from live review and pull request state",
@@ -768,6 +769,8 @@ def _github_content_author(
             endpoint = f"repos/{repo}/compare/{previous_head}...{new_head}"
     elif event_type == "pr_review_requested":
         endpoint = f"repos/{repo}/issues/{number}/timeline?per_page=100"
+    elif event_type == "pr_checks_completed" and path[2] == "pull" and not fragment:
+        endpoint = f"repos/{repo}/pulls/{number}"
     if endpoint is None:
         return None
     attestation = _github_api_attestation(
@@ -814,6 +817,11 @@ def _github_content_author(
         if not matching:
             return None
         user = matching[-1].get("user")
+    elif event_type == "pr_checks_completed":
+        if (not isinstance(payload, dict) or not isinstance(payload.get("head"), dict)
+                or payload["head"].get("sha") != extras.get("head_sha")):
+            return None
+        user = payload.get("user")
     else:
         user = payload.get("user") if isinstance(payload, dict) else None
     author = user.get("login") if isinstance(user, dict) else None

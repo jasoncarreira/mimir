@@ -78,6 +78,18 @@ class FakeGitHub:
         elif (
             len(arguments) >= 2
             and arguments[0] == "api"
+            and "/check-runs?" in arguments[1]
+        ):
+            output = json.dumps({"check_runs": [{"name": "tests", "status": "completed", "conclusion": "success"}], "total_count": 1})
+        elif (
+            len(arguments) >= 2
+            and arguments[0] == "api"
+            and arguments[1].endswith("/status")
+        ):
+            output = json.dumps({"statuses": []})
+        elif (
+            len(arguments) >= 2
+            and arguments[0] == "api"
             and arguments[1].endswith(f"/pulls/{spec.number}/reviews")
         ):
             with self.lock:

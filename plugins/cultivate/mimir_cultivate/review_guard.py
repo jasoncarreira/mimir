@@ -17,6 +17,7 @@ from langchain_core.tools import ToolException
 from mimir.tools._shell_env import _DIRECT_EXEC_ARGV, direct_exec_env
 from mimir.tools.extra import _effective_shell_cwd
 from mimir.tools.refusals import ToolPolicyRefusal
+from .review_checks import approval_blocker
 
 
 _locks_guard = threading.Lock()
@@ -292,6 +293,15 @@ def _matching_review_exists(spec: ReviewSubmission, repo: str, head: str, review
     )
 
 
+def _approval_blocker(spec: ReviewSubmission, repo: str, head: str) -> str:
+    checks = _text(spec, ["api", f"repos/{repo}/commits/{head}/check-runs?per_page=100"])
+    statuses = _text(spec, ["api", f"repos/{repo}/commits/{head}/status"])
+    try:
+        return approval_blocker(json.loads(checks or ""), json.loads(statuses or "")) or ""
+    except (ValueError, TypeError):
+        return "CI checks could not be read"
+
+
 def claim_review_submission(spec: ReviewSubmission) -> ReviewClaim | None:
     """Hold a per-head review lock through the outbound submission."""
     if not spec.repo and not spec.repository_context_known:
@@ -322,6 +332,12 @@ def claim_review_submission(spec: ReviewSubmission) -> ReviewClaim | None:
             if not current_head:
                 return None
             continue
+        if spec.state == "APPROVED":
+            blocker = _approval_blocker(spec, repo, head)
+            if blocker:
+                lock.release()
+                _release_lock_user(key, lock)
+                raise _review_refusal(blocker)
         exists = _matching_review_exists(spec, repo, head, reviewer)
         if exists is None:
             lock.release()

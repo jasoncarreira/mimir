@@ -160,6 +160,7 @@ from mimir.pollers import (
 from mimir.prompt_safety import sanitize_prompt_field
 from mimir_cultivate.ci import capture_job_log, clean_log_tail, classify_cancelled_run
 from mimir_cultivate.github_trust import partition, sanitize_login, sanitize_url
+from mimir_cultivate.review_checks import approval_blocker
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "cursor.json"
@@ -797,6 +798,7 @@ REVIEW_NEEDED_EVENT_TYPES = frozenset({
     "pr_synchronize",           # push to an existing PR (re-review)
     "pr_review_requested",      # the agent's login was added to
                                 # ``requested_reviewers`` on an open PR
+    "pr_checks_completed",       # CI follow-up to a withheld current-head review
 })
 
 _REVIEW_SUBMISSION_RULE = (
@@ -956,7 +958,8 @@ def _emit(prompt: str, **extras: object) -> None:
             "not shell, gh, or direct API fallbacks. The existing pr_rerequest_review "
             "path remains supported only with pr.rerequest authority."
         )
-    if isinstance(event_type, str) and event_type in REVIEW_NEEDED_EVENT_TYPES:
+    if (isinstance(event_type, str) and event_type in REVIEW_NEEDED_EVENT_TYPES
+            and extras.get("followup_action") != "operator_comment"):
         related_comment = extras.pop("related_comment", "")
         if isinstance(related_comment, str) and related_comment:
             prompt = f"{prompt}\n\nRelated PR comment:\n{related_comment}"
@@ -2184,7 +2187,7 @@ def _latest_current_head_review(
     reviewer: str,
     token: str,
 ) -> dict | None:
-    """Return the reviewer's latest substantive review at ``head_sha``."""
+    """Return the reviewer's latest substantive review only if on ``head_sha``."""
     if not head_sha or not reviewer:
         return None
     data = _gh_api(f"repos/{repo}/pulls/{number}/reviews", token)
@@ -2198,16 +2201,17 @@ def _latest_current_head_review(
         login = (review.get("user") or {}).get("login")
         state = str(review.get("state") or "").upper()
         commit_id = review.get("commit_id")
-        if login == reviewer and commit_id == head_sha and state in substantive:
+        if login == reviewer and state in substantive:
             matching.append(review)
     if not matching:
         return None
-    return max(
+    latest = max(
         matching,
         key=lambda review: _parse_utc_datetime(
             str(review.get("submitted_at") or "")
         ) or datetime.min.replace(tzinfo=timezone.utc),
     )
+    return latest if latest.get("commit_id") == head_sha else None
 
 
 def _latest_review_request_at(
@@ -2957,6 +2961,37 @@ def _blocking_reviewers(reviews: list, me: str) -> list[str]:
     )
 
 
+def _rerun_infrastructure_jobs(repo: str, checks: list[dict], token: str) -> bool:
+    """Request one rerun of failed Actions jobs; never retry a failed request."""
+    run_ids = set()
+    for check in checks:
+        url = check.get("details_url") or check.get("html_url")
+        match = re.fullmatch(
+            rf"https://github\.com/{re.escape(repo)}/actions/runs/([1-9][0-9]*)(?:/job/[1-9][0-9]*)?",
+            url, re.IGNORECASE,
+        ) if isinstance(url, str) else None
+        if not match:
+            return False
+        run_ids.add(match[1])
+    for run_id in sorted(run_ids):
+        budget = _ACTIVE_TICK_BUDGET
+        timeout = budget.call_timeout() if budget is not None else GH_API_TIMEOUT_SECONDS
+        if timeout is None:
+            return False
+        try:
+            result = subprocess.run(
+                ["gh", "api", "--method", "POST",
+                 f"repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs"],
+                capture_output=True, text=True, timeout=timeout,
+                env={**os.environ, "GH_TOKEN": token} if token else None,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if result.returncode != 0:
+            return False
+    return bool(run_ids)
+
+
 def _check_pr_ci_failures(
     repo: str,
     since: str,
@@ -3065,46 +3100,103 @@ def _check_pr_ci_failures(
             continue
         # A submitted review may clear requested_reviewers. Retain completion
         # markers for the PR's open lifetime, including across head changes.
-        # Empty successful listings conclude immediately: there is no CI to await.
         checks_concluded = all(
             isinstance(item, dict)
             and item.get("status") == "completed"
             and bool(item.get("conclusion"))
             for item in [*checks, *runs]
         )
-        if me and (_review_requested(pr, me) or (pr.get("user") or {}).get("login") != me):
+        if me and not pr.get("draft") and checks_concluded:
             entry = prior.get(review_ci_key)
             completed_reviews = list(entry.get("completed_reviews", [])) if isinstance(entry, dict) else []
             completion_key = f"{repo}:{number}:{head_sha}:{me}:review_ci_completed"
             if completion_key not in completed_reviews:
                 review = _latest_current_head_review(repo, number, head_sha, me, token)
-                if (
-                    review
-                    and not _review_satisfies_activity(review, checks_concluded=checks_concluded)
-                    and (_review_requested(pr, me) or _latest_review_request_at(repo, number, me, token))
-                ):
-                    _emit_pr_review_needed(
-                        f"Checks concluded on {repo} PR #{number} at {head_sha}. "
-                        f"@{me}, complete your deferred COMMENTED review; "
-                        "the head is unchanged. All checks have concluded "
-                        "(an empty check list means there is no CI to await); "
-                        "inspect the outcomes before deciding the review.\n"
-                        f"{pr.get('html_url', '')}",
-                        token=token, reviewer=me, current_head_reviewed=False,
-                        event_type="pr_review_requested", reason="checks_concluded",
-                        repo=repo, number=number,
-                        url=pr.get("html_url", ""), head_sha=head_sha,
-                        head_repo=(head.get("repo") or {}).get("full_name"),
-                        head_remote="source", head_ref=head.get("ref"),
-                        base_ref=(pr.get("base") or {}).get("ref"),
-                        base_sha=(pr.get("base") or {}).get("sha"),
-                        author=(pr.get("user") or {}).get("login"),
-                        requested_reviewer=me, checks_concluded=True,
-                        delivery_key=completion_key, dedup_scope="head_sha,reviewer",
-                    )
-                    count += 1
-                    completed_reviews.append(completion_key)
-                    new[review_ci_key] = {"completed_reviews": completed_reviews}
+                if review and str(review.get("state") or "").upper() == "COMMENTED":
+                    status_data = _gh_api(f"repos/{repo}/commits/{head_sha}/status", token)
+                    if (
+                        isinstance(status_data, dict)
+                        and isinstance(status_data.get("statuses"), list)
+                        and all(
+                            isinstance(status, dict) and status.get("state") != "pending"
+                            for status in status_data["statuses"]
+                        )
+                    ):
+                        reason = approval_blocker(
+                            {"check_runs": checks, "total_count": len(checks)}, status_data,
+                        )
+                        if not reason or reason.startswith("CI checks not green:"):
+                            failed = [check for check in checks if check.get("conclusion") not in {
+                                "success", "neutral", "skipped",
+                            }]
+                            evidence = _remediation_logs(repo, pr, token, failed) if failed else ""
+                            infrastructure = any(
+                                check.get("conclusion") == "startup_failure" for check in failed
+                            ) or bool(re.search(r"toomanyrequests|HTTP 429|runner startup failure", evidence, re.I))
+                            failure_snapshot = sorted(
+                                f"{check.get('id')}:{check.get('completed_at')}:{check.get('conclusion')}"
+                                for check in failed
+                            )
+                            rerun_attempted = bool(
+                                isinstance(entry, dict) and entry.get("head_sha") == head_sha
+                                and entry.get("rerun_attempted")
+                            )
+                            if (infrastructure and rerun_attempted
+                                    and entry.get("rerun_ok")
+                                    and entry.get("rerun_baseline") == failure_snapshot):
+                                continue  # GitHub has not reported the rerun's result yet.
+                            if infrastructure and not rerun_attempted:
+                                rerun_ok = _rerun_infrastructure_jobs(repo, failed, token)
+                                new[review_ci_key] = {
+                                    "completed_reviews": completed_reviews,
+                                    "rerun_attempted": True, "head_sha": head_sha,
+                                    "rerun_ok": rerun_ok, "rerun_baseline": failure_snapshot,
+                                }
+                                if rerun_ok:
+                                    continue
+                                rerun_attempted = True
+                            names = ", ".join(
+                                clean_log_tail(BytesIO(str(check.get("name") or "unknown").encode()), 200).decode()
+                                for check in failed
+                            )
+                            prompt = (
+                                f"CI follow-up for {repo} PR #{number} on unchanged reviewed head {head_sha}. "
+                                "This is not a fresh review. Re-check the head and CI before submitting. "
+                            )
+                            if infrastructure and rerun_attempted:
+                                prompt += (
+                                    "Infrastructure failure; the one permitted rerun for this head has "
+                                    "already been attempted. Post a PR comment flagging the failure "
+                                    "for the operator; do not rerun again. "
+                                )
+                            elif reason:
+                                prompt += (
+                                    f"Request changes naming failed checks ({names or reason}) and "
+                                    "the first failing test or log excerpt. "
+                                )
+                            else:
+                                prompt += "CI is green; approve without a full re-review. "
+                            _emit(
+                                prompt + f"\n{pr.get('html_url', '')}" + evidence,
+                                event_type="pr_checks_completed", reason="checks_concluded",
+                                repo=repo, number=number, url=pr.get("html_url", ""),
+                                **_pr_scope_fields(pr, repo, token=token, me=me,
+                                                   trust_cache=trust_cache, tick_budget=tick_budget),
+                                author=(pr.get("user") or {}).get("login"),
+                                followup_action=("operator_comment" if infrastructure and rerun_attempted
+                                                 else "review"),
+                                requested_reviewer=me, checks_concluded=True,
+                                delivery_key=completion_key, dedup_scope="head_sha,reviewer",
+                            )
+                            count += 1
+                            completed_reviews.append(completion_key)
+                            new[review_ci_key] = {
+                                "completed_reviews": completed_reviews,
+                                "rerun_attempted": rerun_attempted, "head_sha": head_sha,
+                                "rerun_ok": bool(isinstance(entry, dict) and entry.get("rerun_ok")),
+                                "rerun_baseline": (entry.get("rerun_baseline")
+                                                   if isinstance(entry, dict) else None),
+                            }
         cancelled = [
             run for run in runs
             if run.get("head_sha") == head_sha

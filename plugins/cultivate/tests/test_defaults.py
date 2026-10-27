@@ -50,7 +50,7 @@ def test_current_repository_skill_release_hash(name):
     import hashlib
 
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    expected = releases["0.9.10-2026" if name in {"review", "github-poller"} else "0.9.10-2025"][name]["SKILL.md"]
+    expected = releases["0.9.10-2028" if name in {"review", "github-poller"} else "0.9.10-2025"][name]["SKILL.md"]
     actual = hashlib.sha256((SKILLS / name / "SKILL.md").read_bytes()).hexdigest()
     assert actual == expected, f"{name}/SKILL.md: actual sha256={actual}"
 
@@ -63,7 +63,7 @@ def test_current_github_poller_release_hash(relative):
     import hashlib
 
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    expected = releases["0.9.10-2026"]["github-poller"][relative]
+    expected = releases["0.9.10-2028"]["github-poller"][relative]
     actual = hashlib.sha256((SKILLS / "github-poller" / relative).read_bytes()).hexdigest()
     assert actual == expected, f"{relative}: actual sha256={actual}"
 
