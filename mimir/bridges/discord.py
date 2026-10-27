@@ -301,6 +301,9 @@ class DiscordBridge(Bridge):
     _RECONNECT_BACKOFF_INITIAL_SECONDS: float = 5.0
     _RECONNECT_BACKOFF_CAP_SECONDS: float = 300.0
 
+    async def connection_state(self) -> bool:
+        return self._client is not None and self._client.is_ready()
+
     async def connect(self) -> None:
         if self._client is not None:
             return

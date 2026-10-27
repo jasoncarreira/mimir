@@ -179,10 +179,14 @@ class ChannelRegistry:
         attachment_paths: list | None = None,
         *,
         final: bool = True,
+        message_id: str | None = None,
     ) -> SendResult:
         bridge = self.find_or_raise(channel_id)
+        # Web history allocates the durable ID before live fan-out. Other
+        # transports allocate native IDs and do not receive this optional kwarg.
+        kwargs = {"message_id": message_id} if message_id is not None else {}
         return await bridge.send(
-            channel_id, text, attachment_paths, final=final,
+            channel_id, text, attachment_paths, final=final, **kwargs,
         )
 
     async def react(self, channel_id: str, message_id: str, emoji: str) -> bool:

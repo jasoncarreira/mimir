@@ -148,6 +148,127 @@ def test_pat_help_describes_owner_permissions_and_approval():
     assert "Checks" not in help_text
 
 
+@pytest.mark.parametrize("adapter,channel,credentials", [
+    ("web", None, {}), ("none", None, {}),
+    ("discord", "123456789012345678", {"DISCORD_TOKEN": "discord.bot-token"}),
+    ("slack", "C12345678", {"SLACK_BOT_TOKEN": "xoxb-bot-token", "SLACK_APP_TOKEN": "xapp-app-token"}),
+])
+def test_alert_interactive_instructions_precede_hidden_credentials(monkeypatch, capsys, adapter, channel, credentials):
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: True)
+    for name in credentials:
+        monkeypatch.delenv("MIMIR_CULTIVATE_" + name, raising=False)
+    prompts = []
+    def prompt(text):
+        prompts.append(text)
+        return adapter if "Where should" in text else channel
+    monkeypatch.setattr("builtins.input", prompt)
+    displayed = []
+    def hidden(text):
+        output = capsys.readouterr().out
+        displayed.append(output)
+        assert (installer.DISCORD_BOT_SETUP if adapter == "discord" else installer.SLACK_BOT_SETUP) in "".join(displayed)
+        prompts.append("hidden:" + text)
+        return credentials[text.split(":", 1)[0].replace(" ", "_").upper()]
+    monkeypatch.setattr(installer.getpass, "getpass", hidden)
+    selected, selected_channel, env = installer._alert_settings(argparse.Namespace(), "Owner", {}, {})
+    assert selected == adapter and selected_channel == channel
+    assert all(env[key] == value for key, value in credentials.items())
+    assert sum(text.startswith("hidden:") for text in prompts) == len(credentials)
+    assert all(secret not in "".join(displayed) + capsys.readouterr().out for secret in credentials.values())
+
+
+def test_shipped_bot_instructions_cover_bridge_permissions_and_ids():
+    discord = installer.DISCORD_BOT_SETUP
+    for step in ("Developer Portal", "discord.com/developers/applications", "Message Content Intent",
+                 "bot scope", "scope=bot&permissions=101440", "Developer Mode", "channel ID"):
+        assert step in discord
+    permissions = (1 << 10) | (1 << 11) | (1 << 16) | (1 << 6) | (1 << 15)
+    assert permissions == 101440
+    slack = installer.SLACK_BOT_SETUP
+    for step in ("Socket Mode", "connections:write", "xapp-", "xoxb-", "install", "channel ID",
+                 "chat:write", "channels:history", "groups:history", "im:history", "mpim:history",
+                 "im:write", "reactions:write", "users:read", "users:read.email", "files:write",
+                 "app_mention", "reaction_added"):
+        assert step.lower() in slack.lower()
+
+
+@pytest.mark.parametrize("adapter,channel,creds,reason", [
+    ("discord", None, {}, "--operator-alert-channel-id"),
+    ("discord", "abc", {}, "channel ID"),
+    ("slack", "C12345678", {}, "--slack-bot-token-file"),
+    ("discord", "123456789012345678", {"DISCORD_TOKEN": "bad token"}, "DISCORD_TOKEN"),
+    ("slack", "C12345678", {"SLACK_BOT_TOKEN": "wrong", "SLACK_APP_TOKEN": "xapp-valid"}, "SLACK_BOT_TOKEN"),
+    ("slack", "C12345678", {"SLACK_BOT_TOKEN": "xoxb-valid", "SLACK_APP_TOKEN": "wrong"}, "SLACK_APP_TOKEN"),
+])
+def test_alert_noninteractive_errors_before_deployment_write(tmp_path, monkeypatch, adapter, channel, creds, reason):
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: False)
+    args = argparse.Namespace(operator_alert_adapter=adapter, operator_alert_channel_id=channel)
+    with pytest.raises(installer.SetupError, match=reason):
+        installer._alert_settings(args, "owner", {}, creds)
+    assert not list(tmp_path.iterdir())
+
+
+def test_alert_flags_manifest_round_trip_and_none(monkeypatch, capsys):
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: False)
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(["cultivate", "setup", "--operator-alert-adapter", "web"])
+    adapter, channel, env = installer._alert_settings(args, "Alice.Name", {}, {})
+    assert env == {"MIMIR_OPERATOR_ALERT_CHANNEL": "web-Alice.Name"}
+    args.operator_alert_adapter = None
+    assert installer._alert_settings(args, "Alice.Name", json.loads(json.dumps({
+        "operator_alert_adapter": adapter, "operator_alert_channel_id": channel,
+    })), {}) == (adapter, channel, env)
+    args.operator_alert_adapter = "none"
+    assert installer._alert_settings(args, "Alice.Name", {}, {}) == ("none", None, {})
+    assert "rerun setup" in capsys.readouterr().out
+
+
+def test_alert_adapter_change_removes_old_bot_credentials(tmp_path):
+    deploy = tmp_path / "deploy"
+    deploy.mkdir()
+    assert installer._env(deploy, {"MIMIR_API_KEY": "master",
+        "DISCORD_TOKEN": "discord-secret", "MIMIR_OPERATOR_ALERT_CHANNEL": "discord-123456789012345678",
+        "MIMIR_DISCORD_ALLOWED_CHANNELS": "123456789012345678",
+        "MIMIR_DISCORD_REQUIRE_MENTION": "true"}, manage_alerts=True) == "master"
+    installer._env(deploy, {"MIMIR_API_KEY": "rotated-but-preserved",
+        "MIMIR_OPERATOR_ALERT_CHANNEL": "web-owner"}, manage_alerts=True)
+    text = (deploy / "compose.env").read_text()
+    assert "MIMIR_API_KEY=master" in text and "web-owner" in text
+    assert "DISCORD_TOKEN" not in text and "MIMIR_DISCORD_" not in text and "discord-secret" not in text
+    installer._env(deploy, {"MIMIR_API_KEY": "other"}, manage_alerts=True)
+    assert "MIMIR_OPERATOR_ALERT_CHANNEL" not in (deploy / "compose.env").read_text()
+    assert (deploy / "compose.env").stat().st_mode & 0o777 == 0o600
+
+
+def test_alert_verification_checks_owner_history_and_stable_failures(monkeypatch):
+    calls = []
+    messages = []
+    def http(url, *, key, data=None):
+        calls.append((url, key, data))
+        if url.endswith("history"):
+            return {"data": {"messages": list(messages)}}
+        assert url.endswith("operator-alert-check") and data == {} and key == "owner-key"
+        messages.append({"role": "assistant", "text": "Cultivate setup: operator alerts enabled"})
+        return {"ok": True, "data": {"sent": True}}
+    monkeypatch.setattr(installer, "_http", http)
+    installer._verify_alert("http://127.0.0.1:8123", "owner-key", "web")
+    assert [c[0].split("/")[-1] for c in calls] == ["history", "operator-alert-check", "history"]
+    calls.clear()
+    installer._verify_alert("http://127.0.0.1:8123", "owner-key", "slack")
+    assert len(calls) == 1
+    def failure(url, *, key, data=None):
+        raise installer.urllib.error.HTTPError(url, 409, "token-must-not-leak", {}, None)
+    monkeypatch.setattr(installer, "_http", failure)
+    with pytest.raises(installer.SetupError, match="alert_bridge_unconnected") as exc:
+        installer._verify_alert("http://127.0.0.1:8123", "owner-key", "slack")
+    assert "token-must-not-leak" not in str(exc.value)
+    monkeypatch.setattr(installer, "_http", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("private token")))
+    with pytest.raises(installer.SetupError, match="alert_send_failed") as exc:
+        installer._verify_alert("http://127.0.0.1:8123", "owner-key", "discord")
+    assert "private token" not in str(exc.value)
+
+
 @pytest.mark.parametrize(("files", "expected"), [
     ({"rust-toolchain.toml": '[toolchain]\nchannel = "1.99.1"', "Cargo.toml": "[package]"},
      ("rust", "1.99.1", "cargo nextest run")),
@@ -355,7 +476,8 @@ def test_node_layer_rejects_unsupported_architecture(tmp_path):
     ("local", None), ("openai:text-embedding-3-small", None),
     ("voyage:voyage-4-lite", "anthropic:claude-haiku-5-5"),
 ])
-def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypatch, capsys, caplog, embedding, saga_spec):
+@pytest.mark.parametrize("alert_adapter", ["none", "web", "discord", "slack"])
+def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypatch, capsys, caplog, embedding, saga_spec, alert_adapter):
     compile(installer._PROVISION, "provision.py", "exec")
     monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _: "")
@@ -378,6 +500,19 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
         extra += ["--embedding-key-file", str(other_file)]
     if saga_spec:
         extra += ["--saga-model-spec", saga_spec, "--saga-model-key-file", str(other_file)]
+    alert_secrets = {}
+    if alert_adapter in {"discord", "slack"}:
+        extra += ["--operator-alert-channel-id", "123456789012345678" if alert_adapter == "discord" else "C12345678"]
+        names = ("discord-token",) if alert_adapter == "discord" else ("slack-bot-token", "slack-app-token")
+        for name in names:
+            value = {"discord-token": "discord.secret.test", "slack-bot-token": "xoxb-bot-secret",
+                     "slack-app-token": "xapp-app-secret"}[name]
+            path = tmp_path / name
+            path.write_text(value)
+            path.chmod(0o600)
+            extra += ["--" + name + "-file", str(path)]
+            alert_secrets[name.upper().replace("-", "_")] = value
+    extra += ["--operator-alert-adapter", alert_adapter]
     args = parser.parse_args([
         "cultivate", "setup", "--accept-license", "--source-repo", "neworg/mimir",
         "--repo", "org/repo", "--branch", "main", "--bot-login", "bot",
@@ -427,6 +562,11 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     for index in range(2):
         if index:
             args.system_packages = None  # Re-run without the flag keeps the manifest's list.
+            args.operator_alert_adapter = None
+            args.operator_alert_channel_id = None
+            args.discord_token_file = None
+            args.slack_bot_token_file = None
+            args.slack_app_token_file = None
         installer.setup(args, request=request, run=run,
                         verify=lambda *a: verified.append(a))
     stdout, stderr = capsys.readouterr()
@@ -434,9 +574,9 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
         assert "faster, cheaper" in stdout and "openai:gpt-test" in stdout
         assert "openai:gpt-6-luna:low" in stdout
     assert len(verified) == 2
-    assert all(call[4:] == ('node', '22.16.0', ['lsof', 'libfoo-dev=1:2.3-4~deb12']) for call in verified)
+    assert all(call[4:] == ('node', '22.16.0', ['lsof', 'libfoo-dev=1:2.3-4~deb12'], alert_adapter) for call in verified)
     assert 'System packages: lsof, libfoo-dev=1:2.3-4~deb12' in stdout
-    for secret in (github_secret, model_secret, "other-secret-test-2008", "owner-key-test-2008"):
+    for secret in (github_secret, model_secret, "other-secret-test-2008", "owner-key-test-2008", *alert_secrets.values()):
         assert secret not in stdout + stderr + caplog.text
         for argv in calls:
             assert secret not in " ".join(argv)
@@ -444,11 +584,25 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert (deploy / "owner-web-key").stat().st_mode & 0o777 == 0o600
     assert github_secret in (deploy / "compose.env").read_text()
     env_text = (deploy / "compose.env").read_text()
+    for key, value in alert_secrets.items():
+        assert f"{key}={value}" in env_text
+    if alert_adapter == "web":
+        assert "MIMIR_OPERATOR_ALERT_CHANNEL=web-owner" in env_text
+    elif alert_adapter in {"discord", "slack"}:
+        prefix = alert_adapter.upper()
+        channel = "123456789012345678" if alert_adapter == "discord" else "C12345678"
+        assert f"MIMIR_OPERATOR_ALERT_CHANNEL={alert_adapter}-{channel}" in env_text
+        assert f"MIMIR_{prefix}_ALLOWED_CHANNELS={channel}" in env_text
+        assert f"MIMIR_{prefix}_REQUIRE_MENTION=true" in env_text
+    else:
+        assert "MIMIR_OPERATOR_ALERT_CHANNEL=" not in env_text
     assert ("VOYAGE_API_KEY=other-secret-test-2008" in env_text) == embedding.startswith("voyage:")
     assert ("ANTHROPIC_API_KEY=other-secret-test-2008" in env_text) == bool(saga_spec)
     saga = json.loads((deploy / "manifest.json").read_text())
     assert saga["saga_model_spec"] == (saga_spec or "openai:" + installer.DEFAULT_SAGA_MODELS["openai"] + ":low")
     assert saga["embedding"] == embedding
+    assert saga["operator_alert_adapter"] == alert_adapter
+    assert saga["operator_alert_channel_id"] == ("123456789012345678" if alert_adapter == "discord" else "C12345678" if alert_adapter == "slack" else None)
     assert saga["system_packages"] == ['lsof', 'libfoo-dev=1:2.3-4~deb12']
     assert 'lsof libfoo-dev=1:2.3-4~deb12 && rm -rf /var/lib/apt/lists/*' in (deploy / 'Dockerfile.toolchain').read_text()
     assert saga["saga_model_spec"] != "openai:gpt-test"
@@ -457,6 +611,8 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert any("https://github.com/neworg/mimir.git#" + SHA in argv for argv in calls)
     # Check both providers and mcp independently, in the live and saved builds.
     expected_extras = {"openai", "mcp", "local-embeddings"}
+    if alert_adapter in {"discord", "slack"}:
+        expected_extras.add(alert_adapter)
     if saga_spec:
         expected_extras.add(saga_spec.split(":", 1)[0])
     extras_arg = "MIMIR_EXTRAS=" + ",".join(sorted(expected_extras))
@@ -478,7 +634,7 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert (deploy / ".dockerignore").read_text() == "*\n!Dockerfile.toolchain\n"
     for name in ("compose.yml", "Dockerfile.toolchain", "manifest.json", "provision.py"):
         text = (deploy / name).read_text()
-        assert github_secret not in text and model_secret not in text and "other-secret-test-2008" not in text
+        assert all(secret not in text for secret in (github_secret, model_secret, "other-secret-test-2008", *alert_secrets.values()))
     compose = yaml.safe_load((deploy / "compose.yml").read_text())
     assert compose["services"]["agent"]["environment"]["MIMIR_PLUGINS"] == "cultivate"
     assert compose["services"]["agent"]["environment"]["MIMIR_ENABLE_CLAUDE_CODE"] == "0"
@@ -525,7 +681,26 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
             'node', '22.16.0', 'mimir-cultivate-root:' + SHA, system_packages=expected)
         if not expected:
             assert 'RUN set -eu; apt-get update' not in layer
-        assert verified[-1][-1] == expected
+        assert verified[-1][-2] == expected
+
+    if alert_adapter == "none":
+        # Enabling a bot later must regenerate the saved root build as well as
+        # the live build. The old generated build.sh has different extras.
+        new_token = tmp_path / "new-discord-token"
+        new_token.write_text("new.discord.token")
+        new_token.chmod(0o600)
+        args.operator_alert_adapter = "discord"
+        args.operator_alert_channel_id = "123456789012345678"
+        args.discord_token_file = str(new_token)
+        installer.setup(args, request=request, run=run, verify=lambda *a: verified.append(a))
+        assert "MIMIR_EXTRAS=" + ",".join(sorted(expected_extras | {"discord"})) in (deploy / "build.sh").read_text()
+        assert "DISCORD_TOKEN=new.discord.token" in (deploy / "compose.env").read_text()
+        assert json.loads((deploy / "manifest.json").read_text())["operator_alert_adapter"] == "discord"
+        args.operator_alert_adapter = "none"
+        args.discord_token_file = None
+        installer.setup(args, request=request, run=run, verify=lambda *a: verified.append(a))
+        assert "DISCORD_TOKEN=" not in (deploy / "compose.env").read_text()
+        assert "MIMIR_EXTRAS=" + ",".join(sorted(expected_extras)) in (deploy / "build.sh").read_text()
 
 
 @pytest.mark.parametrize('step', ['build', 'init', 'provision', 'up'])

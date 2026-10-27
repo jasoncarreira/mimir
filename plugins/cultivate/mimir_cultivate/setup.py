@@ -53,6 +53,20 @@ PAT_HELP = (
     "to push changes under .github/workflows/. Invite the bot as a Write collaborator on the repository "
     "and have the bot accept the invitation before continuing."
 )
+DISCORD_BOT_SETUP = """Discord bot setup:
+1. Create an application and bot in the Discord Developer Portal at https://discord.com/developers/applications.
+2. Under Bot, enable Message Content Intent (and Server Members Intent if your server requires member-role admission). The bridge also uses default message and reaction gateway intents.
+3. Copy the bot token; enter it at the hidden DISCORD_TOKEN prompt.
+4. In OAuth2, use the bot scope and View Channels, Send Messages, Read Message History, Add Reactions and Attach Files permissions. Invite via https://discord.com/oauth2/authorize?client_id=<application-id>&scope=bot&permissions=101440
+5. Enable Developer Mode in Discord, right-click the alert text channel and copy its numeric channel ID.
+"""
+SLACK_BOT_SETUP = """Slack bot setup:
+1. Create an app at https://api.slack.com/apps for your workspace.
+2. Enable Socket Mode; create an app-level token (xapp-...) with connections:write.
+3. Under OAuth & Permissions add bot scopes: chat:write, channels:history, groups:history, im:history, im:write, mpim:history, reactions:write, users:read, users:read.email, files:write. Subscribe to message.channels, message.groups, message.im, message.mpim, app_mention and reaction_added events used by the bridge.
+4. Install the app to the workspace and copy the bot token (xoxb-...).
+5. Invite the bot to the alert channel and copy its channel ID (starts with C or G).
+"""
 _PUSH_PROBE_FAILED = "CULTIVATE_PUSH_PROBE_FAILED"
 _PUSH_PROBE_HELP = (
     "Token cannot push to the target repository. Recreate the fine-grained PAT with "
@@ -69,6 +83,10 @@ _BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]*")
 _EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 _SHA = re.compile(r"[0-9a-f]{40}")
 _DEBIAN_PACKAGE = re.compile(r"[a-z0-9][a-z0-9+.-]+(?:=[0-9][A-Za-z0-9.+:~-]*)?")
+_ALERT_ENV_KEYS = frozenset({"MIMIR_OPERATOR_ALERT_CHANNEL", "DISCORD_TOKEN", "SLACK_BOT_TOKEN",
+                            "SLACK_APP_TOKEN", "MIMIR_DISCORD_ALLOWED_CHANNELS",
+                            "MIMIR_DISCORD_REQUIRE_MENTION", "MIMIR_SLACK_ALLOWED_CHANNELS",
+                            "MIMIR_SLACK_REQUIRE_MENTION"})
 
 
 class SetupError(Exception):
@@ -177,7 +195,7 @@ def _field(args: argparse.Namespace, name: str, explanation: str, *, default: st
 
 
 def _secret(args: argparse.Namespace, name: str, explanation: str, *, previous: str | None = None) -> str:
-    sources = [getattr(args, name + "_file"), getattr(args, name + "_stdin")]
+    sources = [getattr(args, name + "_file", None), getattr(args, name + "_stdin", False)]
     if sources[0] is not None and sources[1]:
         raise SetupError(f"Choose only one source for {name.replace('_', ' ')}.")
     if sources[0] is not None:
@@ -197,6 +215,50 @@ def _secret(args: argparse.Namespace, name: str, explanation: str, *, previous: 
     if not value or any(c in value for c in "\r\n\0"):
         raise SetupError(f"Invalid {name.replace('_', ' ')}; provide a single non-empty line.")
     return value
+
+
+def _alert_settings(args: argparse.Namespace, owner: str, previous: dict, prior_env: dict[str, str]):
+    from mimir.web_channels import web_channel_for_identity
+
+    adapter = getattr(args, "operator_alert_adapter", None)
+    if adapter is None:
+        adapter = previous.get("operator_alert_adapter") if isinstance(previous, dict) else None
+    if adapter is None:
+        adapter = (input("Where should operator alerts go? [web/discord/slack/none] ").strip().lower() or "none") if sys.stdin.isatty() else "none"
+    if not isinstance(adapter, str) or adapter not in {"web", "discord", "slack", "none"}:
+        raise SetupError("Invalid operator alert adapter; choose web, discord, slack or none.")
+    channel = None
+    updates = {}
+    if adapter in {"discord", "slack"}:
+        print(DISCORD_BOT_SETUP if adapter == "discord" else SLACK_BOT_SETUP)
+        channel = getattr(args, "operator_alert_channel_id", None) or (
+            previous.get("operator_alert_channel_id") if previous.get("operator_alert_adapter") == adapter else None
+        )
+        if channel is None:
+            if not sys.stdin.isatty():
+                raise SetupError("Missing operator alert channel ID; pass --operator-alert-channel-id.")
+            channel = input("Operator alert channel ID: ").strip()
+        pattern = r"[0-9]{15,22}" if adapter == "discord" else r"[CG][A-Z0-9]{8,}"
+        if not isinstance(channel, str) or not re.fullmatch(pattern, channel):
+            raise SetupError("Invalid operator alert channel ID; check the channel ID for the chosen adapter.")
+        names = ("discord_token",) if adapter == "discord" else ("slack_bot_token", "slack_app_token")
+        for name in names:
+            key = name.upper()
+            value = _secret(args, name, f"{key}: copy it from your bot setup; input is hidden.", previous=prior_env.get(key))
+            if (adapter == "discord" and any(c.isspace() for c in value)) or (
+                name == "slack_bot_token" and not re.fullmatch(r"xoxb-[A-Za-z0-9-]+", value)
+            ) or (name == "slack_app_token" and not re.fullmatch(r"xapp-[A-Za-z0-9-]+", value)):
+                raise SetupError(f"Invalid {key} format; check the bot token.")
+            updates[key] = value
+        prefix = adapter.upper()
+        updates.update({f"MIMIR_{prefix}_ALLOWED_CHANNELS": channel,
+                        f"MIMIR_{prefix}_REQUIRE_MENTION": "true"})
+        updates["MIMIR_OPERATOR_ALERT_CHANNEL"] = adapter + "-" + channel
+    elif adapter == "web":
+        updates["MIMIR_OPERATOR_ALERT_CHANNEL"] = web_channel_for_identity(owner)
+    else:
+        print("Operator alerts disabled; rerun setup with --operator-alert-adapter web, discord or slack to enable them.")
+    return adapter, channel, updates
 
 
 def _request(url: str, token: str, *, method: str = "GET") -> tuple[int, object]:
@@ -508,13 +570,17 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
     return created
 
 
-def _env(deploy: Path, updates: dict[str, str]) -> str:
+def _env(deploy: Path, updates: dict[str, str], *, manage_alerts: bool = False) -> str:
     path = deploy / "compose.env"
     existing = path.read_text() if path.exists() else ""
     lines = existing.splitlines()
     current = dict(line.split("=", 1) for line in lines if re.match(r"^[A-Z_][A-Z0-9_]*=", line))
+    if manage_alerts:
+        lines = [line for line in lines if line.split("=", 1)[0] not in _ALERT_ENV_KEYS]
     for key, value in updates.items():
-        if key not in current:
+        if key in _ALERT_ENV_KEYS and manage_alerts:
+            lines.append(f"{key}={value}")
+        elif key not in current:
             lines.append(f"{key}={value}")
         elif current[key] != value and key != "MIMIR_API_KEY":
             raise SetupError(f"Existing compose.env conflicts on {key}; resolve the operator setting before retrying.")
@@ -849,8 +915,34 @@ def _verify_opencode_model(deploy: Path, binary: str, model: str) -> None:
         raise SetupError(f"OpenCode model verification failed (opencode_model_unknown): {model}; update the agent image or choose a listed model.")
 
 
+def _verify_alert(url: str, owner_key: str, adapter: str) -> None:
+    if adapter == "none":
+        return
+    history_url = url + "/api/v1/chat/history"
+    before = _http(history_url, key=owner_key).get("data", {}).get("messages", []) if adapter == "web" else []
+    prior_ids = {m.get("message_id") for m in before}
+    try:
+        result = _http(url + "/api/v1/chat/operator-alert-check", key=owner_key, data={})
+    except urllib.error.HTTPError as exc:
+        # The server returns fixed reason codes; never relay a remote body.
+        reason = "alert_bridge_unconnected" if exc.code == 409 else "alert_send_failed"
+        raise SetupError(f"Operator alert verification failed ({reason}).") from None
+    except (OSError, ValueError):
+        raise SetupError("Operator alert verification failed (alert_send_failed).") from None
+    if not result.get("ok") or result.get("data", {}).get("sent") is not True:
+        raise SetupError("Operator alert verification failed (alert_send_failed).")
+    if adapter == "web":
+        for attempt in range(10):
+            messages = _http(history_url, key=owner_key).get("data", {}).get("messages", [])
+            if any(m.get("role") == "assistant" and m.get("text") == "Cultivate setup: operator alerts enabled"
+                   and m.get("message_id") not in prior_ids for m in messages):
+                return
+            time.sleep(1)
+        raise SetupError("Operator alert verification failed (alert_send_failed): web history missing.")
+
+
 def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, version: str,
-            system_packages: list[str] | None = None) -> None:
+             system_packages: list[str] | None = None, alert_adapter: str = "none") -> None:
     url = f"http://127.0.0.1:{port}"
     for attempt in range(60):
         try:
@@ -939,16 +1031,20 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, versi
     # POST only acknowledges enqueue. Confirm the assistant reply in history.
     history_url = url + "/api/v1/chat/history"
     prior = _http(history_url, key=owner_key).get("data", {}).get("messages", [])
+    prior_ids = {m.get("message_id") for m in prior}
     response = _http(url + "/api/v1/chat", key=owner_key, data={"content": "Reply with a short setup canary greeting."})
     if not response.get("ok"):
         raise SetupError("Canary chat was not accepted; check owner web-key roles.")
     for attempt in range(60):
         history = _http(history_url, key=owner_key)
         messages = history.get("data", {}).get("messages", [])
-        if any(m.get("role") == "assistant" and m.get("text") for m in messages[len(prior):]):
-            return
+        if any(m.get("role") == "assistant" and m.get("text") and m.get("message_id") not in prior_ids
+               for m in messages):
+            break
         time.sleep(2)
-    raise SetupError("Canary chat was accepted but no assistant reply arrived; inspect model access and logs.")
+    else:
+        raise SetupError("Canary chat was accepted but no assistant reply arrived; inspect model access and logs.")
+    _verify_alert(url, owner_key, alert_adapter)
 
 
 def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> argparse.ArgumentParser:
@@ -976,6 +1072,12 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
     for name in ("github-token", "model-key", "saga-model-key", "embedding-key"):
         setup.add_argument("--" + name + "-file", help="Read secret from a mode-600 file (never from argv).")
         setup.add_argument("--" + name + "-stdin", action="store_true", help="Read one secret line from stdin.")
+    setup.add_argument("--operator-alert-adapter", choices=("web", "discord", "slack", "none"),
+                       help="Alert destination (unattended default: none; saved on rerun).")
+    setup.add_argument("--operator-alert-channel-id", help="Discord numeric or Slack C/G alert channel ID.")
+    for name in ("discord-token", "slack-bot-token", "slack-app-token"):
+        setup.add_argument("--" + name + "-file", help="Read the bot credential from a mode-600 file.")
+        setup.add_argument("--" + name + "-stdin", action="store_true", help="Read the bot credential from stdin.")
     setup.add_argument("--accept-license", action="store_true", help="Explicitly accept the shipped Cultivate BSL 1.1 license for unattended setup.")
     setup.add_argument("--rotate-web-key", action="store_true", help="Replace the owner's existing web key intentionally.")
     setup.add_argument("--reembed", action="store_true", help="Re-embed existing Saga vectors offline when changing embeddings.")
@@ -1012,12 +1114,14 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     owner_email = _field(args, "owner_email", "Owner email: your email address, used for identity reconciliation.")
     print(PAT_HELP)
     deploy = Path(_field(args, "deploy", "Deployment directory: choose a private local directory for Docker files and web key.", default=str(Path.cwd() / "cultivate-agent"))).expanduser().resolve()
+    manifest_path = deploy / "manifest.json"
+    try:
+        previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    except (OSError, ValueError):
+        raise SetupError("Cannot read previous settings from manifest.json; reconcile it before retrying.") from None
+    if not isinstance(previous, dict):
+        raise SetupError("Invalid manifest.json; reconcile it before retrying.")
     if requested_packages is None:
-        manifest_path = deploy / "manifest.json"
-        try:
-            previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-        except (OSError, ValueError):
-            raise SetupError("Cannot read previous system packages from manifest.json; reconcile it before retrying.") from None
         packages = previous.get("system_packages", []) if isinstance(previous, dict) else None
         if not isinstance(packages, list):
             raise SetupError("Invalid system packages in manifest.json; reconcile it before retrying.")
@@ -1026,6 +1130,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         raise SetupError("Deployment directory must be a real directory; choose a new --deploy path.")
     existing_env = (deploy / "compose.env").read_text() if (deploy / "compose.env").is_file() else ""
     prior = dict(line.split("=", 1) for line in existing_env.splitlines() if re.match(r"^[A-Z_][A-Z0-9_]*=", line))
+    alert_adapter, alert_channel_id, alert_env = _alert_settings(args, owner, previous, prior)
+    print("Operator alerts: " + alert_adapter + (" (" + alert_channel_id + ")" if alert_channel_id else ""))
     token = _secret(args, "github_token", "Bot PAT: create it with the settings above; input is hidden.", previous=prior.get("GITHUB_TOKEN"))
     validate_token(token, bot, repo, request)
     spec = _field(args, "model_spec", "Model spec: choose an API-backed openai:model or anthropic:model; used for agent turns.")
@@ -1085,16 +1191,19 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     # the previous layer, including any manual edits to this file.
     _write(deploy / "Dockerfile.toolchain", render_layer(kind, version, tag,
            nextest_version=nextest_version, uv_version=uv_version, system_packages=system_packages), replace=True)
+    extras = {provider, saga_provider, "mcp", "local-embeddings"}
+    if alert_adapter in {"discord", "slack"}:
+        extras.add(alert_adapter)
     build_args = ["--build-arg MIMIR_GIT_REF=" + source_ref,
                   "--build-arg MIMIR_CONTROLLER_COMMIT=" + sha,
                   "--build-arg MIMIR_EXECUTOR_COMMIT=" + sha,
                   "--build-arg MIMIR_PLUGIN_SELECTION=cultivate",
                   "--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build",
                   "--build-arg MIMIR_ENABLE_OPENCODE=1",
-                  "--build-arg MIMIR_EXTRAS=" + ",".join(sorted({provider, saga_provider, "mcp", "local-embeddings"}))]
+                   "--build-arg MIMIR_EXTRAS=" + ",".join(sorted(extras))]
     _write(deploy / "build.sh", "#!/bin/sh\nset -eu\n"
            + "docker build -t " + tag + " " + " ".join(build_args) + " " + source_url + "#" + sha + "\n"
-           + "docker build -t " + layer_tag + " -f Dockerfile.toolchain .\n", mode=0o755)
+           + "docker build -t " + layer_tag + " -f Dockerfile.toolchain .\n", mode=0o755, replace=True)
     from mimir.scaffold_docker import render_compose_yml
 
     # Start from the existing loopback-only compose renderer; use root-image
@@ -1110,15 +1219,16 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         "MIMIR_API_KEY": secrets.token_urlsafe(32), "GITHUB_TOKEN": token, "GH_TOKEN": token,
         "GH_USER_NAME": bot, "GH_USER_EMAIL": bot_email, "MIMIR_GITHUB_SELF_LOGIN": bot,
         "GITHUB_REPOS": repo, "MIMIR_MODEL_SPEC": spec, key_name: model_key,
-         "MIMIR_WEB_HOST": "0.0.0.0", **extra_keys,
-    })
+          "MIMIR_WEB_HOST": "0.0.0.0", **extra_keys, **alert_env,
+    }, manage_alerts=alert_adapter != "none" or "operator_alert_adapter" in previous)
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
     manifest = {"slug": repo.lower(), "branch": branch, "toolchain": kind, "owner": owner, "display": display,
                   "email": owner_email, "test": test, "rotate": bool(args.rotate_web_key),
                   "force": bool(getattr(args, "force", False)),
                   "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
-                  "system_packages": system_packages}
+                   "system_packages": system_packages,
+                   "operator_alert_adapter": alert_adapter, "operator_alert_channel_id": alert_channel_id}
     _write(deploy / "manifest.json", json.dumps(manifest, indent=2) + "\n", replace=True)
     _write(deploy / "provision.py", _PROVISION)
     # The provision script and manifest are mounted read-only for a one-shot
@@ -1141,7 +1251,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
           "--build-arg", "MIMIR_CONTROLLER_COMMIT=" + sha, "--build-arg", "MIMIR_EXECUTOR_COMMIT=" + sha,
           "--build-arg", "MIMIR_PLUGIN_SELECTION=cultivate",
           "--build-arg", "CHAINLINK_ARTIFACT_STAGE=chainlink-build", "--build-arg", "MIMIR_ENABLE_OPENCODE=1",
-          "--build-arg", "MIMIR_EXTRAS=" + ",".join(sorted({provider, saga_provider, "mcp", "local-embeddings"})), source_url + "#" + sha])
+           "--build-arg", "MIMIR_EXTRAS=" + ",".join(sorted(extras)), source_url + "#" + sha])
     docker_step("build", ["docker", "build", "-t", layer_tag, "-f", "Dockerfile.toolchain", "."])
     docker_step("init", ["docker", "compose", "run", "--rm", "init"])
     provisioned = docker_step("provision", ["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",
@@ -1166,7 +1276,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         if proc.returncode:
             raise SetupError("Could not retrieve owner web key; check container home volume.")
     key_path.chmod(0o600)
-    verify(deploy, port, repo, key_path.read_text().strip(), kind, version, system_packages)
+    verify(deploy, port, repo, key_path.read_text().strip(), kind, version, system_packages,
+           alert_adapter)
     print(f"Cultivate ready: http://127.0.0.1:{port}  Owner web key: {key_path}  Next: use the key to sign in.")
     print("Issues are tracked in Chainlink in the agent home (/home/mimir/agent).")
     print('File a leaf: docker compose exec -w /home/mimir/agent agent chainlink issue create '

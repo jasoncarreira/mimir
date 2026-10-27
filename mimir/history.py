@@ -204,8 +204,11 @@ class MessageBuffer:
         self._all.append(msg)
         ch.append(msg)
 
-    async def append(self, msg: Message) -> None:
+    async def append(self, msg: Message, *, require_disk: bool = False) -> None:
         """Redact a copy, then append to disk + both deques.
+
+        With ``require_disk``, propagate write errors and populate memory only
+        after the write succeeds. Used when history itself is delivery.
 
         Redaction is write-only: legacy records are not scrubbed on read or
         rewritten. Both live prompt history and disk receive the redacted copy;
@@ -233,8 +236,12 @@ class MessageBuffer:
         bounded queue — deferred (would need bg-task tracking on the
         buffer instance plus test-side flush hooks)."""
         msg = Message.from_dict(redact_payload(msg.to_dict()))
-        self._append_in_memory(msg)
-        await asyncio.to_thread(self._append_disk, msg)
+        if require_disk:
+            await asyncio.to_thread(self._append_disk, msg, raise_errors=True)
+            self._append_in_memory(msg)
+        else:
+            self._append_in_memory(msg)
+            await asyncio.to_thread(self._append_disk, msg)
         self._line_count += 1
         if self._line_count > int(self.disk_max * 1.1):
             if self._trim_lock is None:
@@ -243,7 +250,7 @@ class MessageBuffer:
                 if self._line_count > int(self.disk_max * 1.1):
                     await asyncio.to_thread(self._trim_sync)
 
-    def _append_disk(self, msg: Message) -> None:
+    def _append_disk(self, msg: Message, *, raise_errors: bool = False) -> None:
         """Append one JSONL record. **Interleave-atomicity, not
         durability** (CR2 memory & retrieval clarification).
 
@@ -279,6 +286,8 @@ class MessageBuffer:
                     json.dumps(msg.to_dict(), ensure_ascii=True, default=str) + "\n"
                 )
         except OSError as exc:
+            if raise_errors:
+                raise
             log.warning("chat_history.jsonl append failed: %s", exc)
         finally:
             with self._io_condition:

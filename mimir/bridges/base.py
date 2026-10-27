@@ -58,6 +58,14 @@ class Bridge(ABC):
     # Short identifier for logs ("slack", "discord", "bsky", "web", "bench").
     name: ClassVar[str] = "bridge"
 
+    async def connection_state(self) -> bool | None:
+        """Public readiness probe: True/False, or None when unknown.
+
+        Implementations inspect their own transport; callers must not access
+        another bridge's private client or handler attributes.
+        """
+        return None
+
     @abstractmethod
     async def connect(self) -> None:
         """Open the bridge's long-lived connection. Idempotent."""

@@ -215,13 +215,14 @@ class WebChatBridge(Bridge):
         final: bool = True,
         reply_to_message_id: str | None = None,
         blocks: list[dict[str, Any]] | None = None,
+        message_id: str | None = None,
     ) -> SendResult:
         # chainlink #5: ``final`` is informational. The web stub fans
         # each send out as its own SSE payload, so a plan-then-result
         # turn naturally arrives as two events without further
         # gating. No typing-indicator affordance to hold.
         del final, reply_to_message_id, blocks
-        message_id = uuid.uuid4().hex[:12]
+        message_id = message_id or uuid.uuid4().hex[:12]
         legacy_payload = {
             "channel_id": channel_id,
             "text": text,
@@ -529,6 +530,50 @@ class WebChatBridge(Bridge):
         ]
         return json_success({"channel_id": channel_id, "messages": messages})
 
+    async def _handle_operator_alert_check(self, request: web.Request) -> web.Response:
+        """Owner-key-only fixed-text setup probe through the live alert tool."""
+        import time
+        from .._context import reset_current_turn, set_current_turn
+        from ..models import InformationFlowLabels, SourceLabel, TurnContext
+        from ..tools.operator_alert import _channel_registry, _config, operator_alert
+
+        identity, error = _chat_identity(request)
+        if error is not None:
+            return error.v1_response()
+        if identity is None or not identity.access.is_admin:
+            return json_error("forbidden", "admin web key required", status=403)
+        destination = (getattr(_config, "operator_alert_channel", "") or "").strip()
+        if not destination or (destination.startswith("web-") and destination != _web_channel_for(identity.canonical)):
+            return json_error("alert_bridge_unconnected", "alert destination unavailable", status=409)
+        bridge = _channel_registry.find(destination) if _channel_registry is not None else None
+        if bridge is None:
+            return json_error("alert_bridge_unconnected", "alert bridge unavailable", status=409)
+        if destination.startswith(("discord-", "slack-")):
+            try:
+                connected = await bridge.connection_state()
+            except Exception:
+                connected = None
+            if connected is not True:
+                return json_error("alert_bridge_unconnected", "alert bridge unavailable", status=409)
+        labels = InformationFlowLabels().with_source(SourceLabel(
+            principal=identity.canonical, domain="channel", resource_id=_web_channel_for(identity.canonical),
+            bridge_instance="web", sensitivity="internal",
+            authorized_principals=frozenset({identity.canonical}), source_kind="channel",
+            integrity="trusted", integrity_effect="active_ingest",
+        ))
+        turn = TurnContext(turn_id="cultivate-setup-check", session_id=_web_channel_for(identity.canonical),
+                           trigger="user_message", channel_id=_web_channel_for(identity.canonical),
+                           started_at=time.monotonic(), ifc_labels=labels)
+        token = set_current_turn(turn)
+        try:
+            await operator_alert.coroutine(text="Cultivate setup: operator alerts enabled")
+        except Exception:
+            # Do not return bridge exception text (it can include credentials).
+            return json_error("alert_send_failed", "alert send failed", status=503)
+        finally:
+            reset_current_turn(token)
+        return json_success({"sent": True})
+
     async def _handle_skills(self, request: web.Request) -> web.Response:
         identity, auth_error = _chat_identity(request)
         if auth_error is not None:
@@ -571,5 +616,7 @@ class WebChatBridge(Bridge):
             app.router.add_get("/api/v1/chat/skills", self._handle_skills)
         if ("GET", "/api/v1/chat/history") not in existing:
             app.router.add_get("/api/v1/chat/history", self._handle_history)
+        if ("POST", "/api/v1/chat/operator-alert-check") not in existing:
+            app.router.add_post("/api/v1/chat/operator-alert-check", self._handle_operator_alert_check)
         if ("GET", "/chat/stream") not in existing:
             app.router.add_get("/chat/stream", self._handle_stream)

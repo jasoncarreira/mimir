@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 import logging
+import uuid
 
 from langchain_core.tools import ToolException, tool
 
@@ -86,16 +87,51 @@ async def operator_alert(text: str) -> str:
     # Reserve the slot before awaiting delivery so parallel tool calls cannot
     # exceed the per-turn bound.
     turn.operator_alert_count = count + 1
-    try:
-        result = await _channel_registry.send(destination, text.strip(), final=False)
-    except Exception as exc:
-        turn.operator_alert_count -= 1
-        raise ToolException(f"operator_alert failed: {exc}") from exc
-    if not getattr(result, "sent", True):
-        turn.operator_alert_count -= 1
-        error = getattr(result, "error", None)
-        detail = f" ({error})" if error else ""
-        raise ToolException(f"operator_alert failed: message was not delivered{detail}")
+    # For web, history is delivery; SSE is only a best-effort live projection.
+    # Persist before fan-out so a failed write cannot cause a duplicate retry.
+    if destination.startswith("web-"):
+        from ..history import get_global_buffer
+
+        buffer = get_global_buffer()
+        if buffer is None:
+            turn.operator_alert_count -= 1
+            raise ToolException("operator_alert failed: web history is unavailable")
+        try:
+            from ..agent import _effective_persisted_integrity
+
+            integrity = (
+                _effective_persisted_integrity(turn.ifc_labels, turn.auth_context)
+                if turn.ifc_labels is not None else "untrusted"
+            )
+            record = buffer.make_message(
+                channel_id=destination, kind="assistant_message", content=text.strip(),
+                msg_id=uuid.uuid4().hex[:12],
+                source="web", integrity=integrity,
+            )
+            await buffer.append(record, require_disk=True)
+        except Exception as exc:
+            turn.operator_alert_count -= 1
+            raise ToolException("operator_alert failed: web history write failed") from exc
+        message_id = record.msg_id
+        try:
+            await _channel_registry.send(
+                destination, text.strip(), final=False, message_id=message_id,
+            )
+        except Exception:
+            # Already delivered durably: never invite a retry for SSE failure.
+            _log.warning("operator alert persisted; live web fan-out failed")
+    else:
+        try:
+            result = await _channel_registry.send(destination, text.strip(), final=False)
+        except Exception as exc:
+            turn.operator_alert_count -= 1
+            raise ToolException(f"operator_alert failed: {exc}") from exc
+        if not getattr(result, "sent", True):
+            turn.operator_alert_count -= 1
+            error = getattr(result, "error", None)
+            detail = f" ({error})" if error else ""
+            raise ToolException(f"operator_alert failed: message was not delivered{detail}")
+        message_id = getattr(result, "message_id", None)
 
     try:
         turn.delivered_channel_ids.add(destination)
@@ -103,7 +139,7 @@ async def operator_alert(text: str) -> str:
         pass
     return (
         "operator_alert ok: "
-        f"message_id={getattr(result, 'message_id', None)}"
+        f"message_id={message_id}"
     )
 
 

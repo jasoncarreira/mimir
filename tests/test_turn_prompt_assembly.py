@@ -2894,6 +2894,8 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/agent.py", "_initialize_ifc_labels", "SourceLabel"): 1,
         ("producer", "mimir/agent.py", "_propagate_ifc_labels", "SourceLabel.derived"): 1,
         ("producer", "mimir/agent.py", "_prompt_source_labels", "prompt_sources.prompt_source_label"): 1,
+        # Owner-authenticated fixed-text setup probe mints a trusted web source.
+        ("producer", "mimir/bridges/web_chat.py", "WebChatBridge._handle_operator_alert_check", "SourceLabel"): 1,
         ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "prompt_sources.prompt_source_label"): 1,
         ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "prompt_sources.prompt_source_label"): 1,
         ("producer", "mimir/poller_recovery.py", "_event_from_stash", "SourceLabel.from_record"): 1,

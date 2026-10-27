@@ -49,6 +49,41 @@ deployment directory and loopback port. It shows the required fine-grained PAT
 permissions and verifies the bot's identity, Write invitation, PR read and
 Actions read before building. The source is fetched from a pushed ref and its
 full SHA is pinned into both the controller and executor image build.
+
+Setup also asks **Where should operator alerts go? [web/discord/slack/none]**.
+`web` delivers to the owner's authenticated `web-<owner>` chat and persists
+alerts for the next visit, even when no browser is connected. `none` (the
+unattended default) leaves alerts disabled and prints a reminder. Unattended
+setup accepts `--operator-alert-adapter web|discord|slack|none` and, for bot
+adapters, `--operator-alert-channel-id` plus mode-600
+`--discord-token-file` or `--slack-bot-token-file` and
+`--slack-app-token-file` (or their `-stdin`/`MIMIR_CULTIVATE_…` forms).
+Missing credentials fail rather than prompting. Bot tokens are hidden on an
+interactive terminal. Only the choice and channel ID are saved in the
+deployment manifest; credentials are kept in mode-600 `compose.env`. Re-running
+without alert flags retains the saved choice. Verification sends the fixed
+message “Cultivate setup: operator alerts enabled” through the running agent's
+alert tool; web setup also checks the authenticated chat history.
+
+For **Discord**, create an application and bot in the
+[Developer Portal](https://discord.com/developers/applications). Enable Message
+Content Intent (and Server Members Intent when using member-role admission);
+the bridge uses messages and reactions gateway intents. Copy the bot token.
+Invite it with the `bot` scope and View Channels, Send Messages, Read Message
+History, Add Reactions and Attach Files permissions:
+`https://discord.com/oauth2/authorize?client_id=<application-id>&scope=bot&permissions=101440`.
+Enable Developer Mode and copy the numeric ID of the alert channel.
+
+For **Slack**, create an app at [api.slack.com/apps](https://api.slack.com/apps),
+enable Socket Mode and create an app-level `xapp-…` token with
+`connections:write`. Add the bot scopes `chat:write`, `channels:history`,
+`groups:history`, `im:history`, `im:write`, `mpim:history`, `reactions:write`,
+`users:read`, `users:read.email`, `files:write`; subscribe to `message.channels`,
+`message.groups`, `message.im`, `message.mpim`, `app_mention`, and
+`reaction_added`. Install the app to the workspace, copy its `xoxb-…` bot
+token, invite the bot to the alert channel and copy its C/G channel ID.
+Both bot choices build the matching image extra and limit inbound messages to
+that channel with mentions required.
 Use `--source-repo owner/name` (`MIMIR_CULTIVATE_SOURCE_REPO`) to build from
 a trusted fork or relocated source repo; the default is `jasoncarreira/mimir`.
 Setup prefers executable `tools/verify` or `scripts/verify` (including `.sh`
