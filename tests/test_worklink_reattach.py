@@ -212,6 +212,10 @@ def _remote_runner(repo: Path, calls: list, *, issue_id: int, labels: list[str])
         if args[:1] == ["git"]:
             if "config" in args:
                 return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+            if args[2] != str(repo) and "status" in args and "-z" in args:
+                return cp(args, stdout="?? changed.txt\0" if not any(
+                    isinstance(call, list) and "commit" in call for call in calls
+                ) else "")
             if "diff" in args and "--cached" in args and "--quiet" in args:
                 # chainlink #832: reattach finalize path now commits locally.
                 # exit 1 = "yes there are staged changes" (matches the contract
@@ -1241,6 +1245,10 @@ def test_run_persists_state_for_local_compute_then_clears(tmp_path: Path) -> Non
         if args[:1] == ["git"]:
             if "config" in args:
                 return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
+            if args[2] == str(worktree) and "status" in args and "-z" in args:
+                return cp(args, stdout="?? changed.txt\0" if not any(
+                    isinstance(call, list) and "commit" in call for call in calls
+                ) else "")
             if "diff" in args and "--cached" in args and "-z" in args:
                 return cp(args, stdout=b"changed.txt\0")
             if "diff" in args and "--name-only" in args:

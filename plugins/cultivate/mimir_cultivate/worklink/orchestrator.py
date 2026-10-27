@@ -1603,6 +1603,8 @@ class WorklinkRunner:
                 transcript=str(raw.transcript_path) if raw.transcript_path else None,
             )
         pr_url = None
+        gate_excluded: set[str] = set()
+        builder_paths: set[str] = set()
 
         def persist_gate_handle(handle: LaunchHandle) -> None:
             _persist_run_state(
@@ -1626,7 +1628,11 @@ class WorklinkRunner:
         # gate, no folded trusted-test job).
         async def _observe() -> EvidenceValidation:
             # The post-commit re-observation must use exactly the same inputs.
-            return await observe_evidence(
+            snapshot = None if executor_failed else _gate_checkout_snapshot(
+                lease.path, runner=runner, publication=publication,
+                protected=builder_paths if builder_paths else None,
+            )
+            observed = await observe_evidence(
                 issue=issue.issue_id,
                 attempt=attempt,
                 backend=selected_name,
@@ -1651,6 +1657,40 @@ class WorklinkRunner:
                 compute=compute,
                 on_gate_launch=persist_gate_handle,
             )
+            if snapshot is None:
+                return observed
+            after = _gate_checkout_snapshot(
+                lease.path, runner=runner, publication=publication,
+                protected=snapshot.fingerprints,
+            )
+            # Only newly untracked output is a disposable gate byproduct.
+            # Newly dirty tracked paths must block publication: excluding them
+            # would publish a different tree from the one the gate tested.
+            gate_excluded.update(after.untracked - snapshot.untracked - snapshot.fingerprints.keys())
+            changed_tracked = (
+                after.dirty - after.untracked - snapshot.dirty - snapshot.fingerprints.keys()
+            )
+            observed = replace(observed, evidence=replace(
+                observed.evidence,
+                files_changed=[p for p in observed.evidence.files_changed if p not in gate_excluded],
+                gate_byproducts_count=len(gate_excluded),
+                gate_byproducts_top_level=sorted({_top_level(p) for p in gate_excluded}),
+            ))
+            altered = sorted(changed_tracked | {
+                path for path, fingerprint in snapshot.fingerprints.items()
+                if after.fingerprints[path] != fingerprint
+            })
+            if altered or snapshot.index_diff != after.index_diff:
+                reason = "gate_changed_builder_content: " + ", ".join(altered[:10])
+                if not altered:
+                    reason = "gate_changed_builder_content: staged index changed"
+                return _publication_failed_validation(
+                    observed, step="gate integrity", error=WorklinkError(reason),
+                    issue_id=issue.issue_id, attempt=attempt,
+                )
+            if not builder_paths:
+                builder_paths.update(snapshot.dirty - gate_excluded)
+            return observed
 
         validation = await _observe()
         validation = _with_outside_checkout_detection(
@@ -1666,9 +1706,13 @@ class WorklinkRunner:
         if validation.review_ready:
             try:
                 _commit_checkout_changes(
-                    lease.path, issue, runner=runner, publication=publication
+                    lease.path, issue, runner=runner, publication=publication,
+                    paths=builder_paths, excluded=gate_excluded,
+                    max_new_untracked_files=config.defaults.max_new_untracked_files,
                 )
-                _ensure_clean_checkout(lease.path, runner=runner, publication=publication)
+                _ensure_clean_checkout(
+                    lease.path, runner=runner, publication=publication, excluded=gate_excluded,
+                )
             except Exception as exc:
                 validation = _publication_failed_validation(
                     validation,
@@ -1679,6 +1723,7 @@ class WorklinkRunner:
                 )
             else:
                 first_tests = validation.evidence.tests
+                builder_paths.update(validation.evidence.files_changed)
                 validation = await _observe()
                 if first_tests is not None and first_tests.flaky_tests:
                     tests = validation.evidence.tests
@@ -5734,19 +5779,106 @@ def _assert_staged_diff_has_no_secret(
             )
 
 
+@dataclass(frozen=True)
+class _GateCheckoutSnapshot:
+    dirty: set[str]
+    untracked: set[str]
+    fingerprints: dict[str, tuple[int, str] | None]
+    index_diff: str
+
+
+def _top_level(path: str) -> str:
+    return path.split("/", 1)[0]
+
+
+def _gate_checkout_snapshot(
+    checkout: Path, *, runner: Runner,
+    publication: ControllerGitPublication | None = None,
+    protected: Iterable[str] | None = None,
+) -> _GateCheckoutSnapshot:
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return publication.run(*args) if publication is not None else runner(
+            ["git", "-C", str(checkout), *args]
+        )
+
+    status = git("status", "--porcelain=v1", "-z", "--untracked-files=all")
+    index = git("diff", "--cached", "--binary")
+    if status.returncode != 0 or index.returncode != 0:
+        raise WorklinkError("cannot snapshot Worklink gate checkout")
+    dirty: set[str] = set()
+    untracked: set[str] = set()
+    records = status.stdout.split("\0")
+    position = 0
+    while position < len(records) and records[position]:
+        record = records[position]
+        if len(record) < 4 or record[2] != " ":
+            raise WorklinkError("invalid Worklink gate checkout status")
+        path = record[3:]
+        dirty.add(path)
+        if record[:2] == "??":
+            untracked.add(path)
+        if "R" in record[:2] or "C" in record[:2]:
+            position += 1
+            if position >= len(records) or not records[position]:
+                raise WorklinkError("invalid Worklink gate rename status")
+            dirty.add(records[position])
+        position += 1
+
+    fingerprints: dict[str, tuple[int, str] | None] = {}
+    for path in dirty if protected is None else protected:
+        target = checkout / path
+        try:
+            metadata = target.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                data = os.readlink(target).encode("utf-8", "surrogateescape")
+            elif stat.S_ISREG(metadata.st_mode):
+                data = target.read_bytes()
+            else:
+                data = b""
+        except FileNotFoundError:
+            fingerprints[path] = None
+        else:
+            fingerprints[path] = (metadata.st_mode, hashlib.sha256(data).hexdigest())
+    return _GateCheckoutSnapshot(dirty, untracked, fingerprints, index.stdout)
+
+
 def _commit_checkout_changes(
     checkout: Path,
     issue: IssueContext,
     *,
     runner: Runner,
     publication: ControllerGitPublication | None = None,
+    paths: Iterable[str] | None = None,
+    excluded: Iterable[str] = (),
+    max_new_untracked_files: int = 200,
 ) -> None:
     def run_git(*args: str) -> subprocess.CompletedProcess[str]:
         if publication is not None:
             return publication.run(*args)
         return runner(["git", "-C", str(checkout), *args])
 
-    add = run_git("add", "-A")
+    snapshot = _gate_checkout_snapshot(
+        checkout, runner=runner, publication=publication, protected=(),
+    )
+    selected = set(paths) if paths is not None else snapshot.dirty
+    selected -= set(excluded)
+    added = snapshot.untracked & selected
+    counts: dict[str, int] = {}
+    for path in added:
+        top = _top_level(path)
+        counts[top] = counts.get(top, 0) + 1
+    if len(added) > max_new_untracked_files:
+        detail = ", ".join(f"{name}: {count}" for name, count in sorted(counts.items()))
+        raise WorklinkError(
+            f"bulk new untracked files ({len(added)}, limit {max_new_untracked_files}); "
+            f"top-level directories: {detail}. Ignore build output in the repository "
+            "or raise defaults.max_new_untracked_files in worklink.yaml"
+        )
+    # Stage the entire allowed set, including tracked deletions and rename sources.
+    # Never leave already-staged gate output in the index.
+    if not selected:
+        raise WorklinkError("no Worklink changes to commit")
+    add = run_git("add", "-A", "--", *sorted(selected))
     if add.returncode != 0:
         raise WorklinkError((add.stderr or add.stdout).strip() or "git add failed")
     staged = run_git("diff", "--cached", "--quiet")
@@ -5912,17 +6044,11 @@ def _ensure_clean_checkout(
     *,
     runner: Runner,
     publication: ControllerGitPublication | None = None,
+    excluded: Iterable[str] = (),
 ) -> None:
-    status = (
-        publication.run("status", "--porcelain=v1", "--untracked-files=all")
-        if publication is not None
-        else runner([
-            "git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"
-        ])
-    )
-    if status.returncode != 0:
-        raise WorklinkError((status.stderr or status.stdout).strip() or "git status failed")
-    if status.stdout.strip():
+    if _gate_checkout_snapshot(
+        checkout, runner=runner, publication=publication, protected=(),
+    ).dirty - set(excluded):
         raise WorklinkError("checkout still dirty after Worklink commit")
 
 

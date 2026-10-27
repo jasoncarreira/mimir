@@ -445,6 +445,10 @@ def test_orchestrator_passes_configured_compute_backend_to_tool_backend(tmp_path
                 return cp(args, returncode=1)
             return cp(args, stdout=" changed.txt\n")
         if isinstance(args, list) and args[:4] == ["git", "-C", str(worktree), "status"]:
+            if "-z" in args:
+                return cp(args, stdout="?? changed.txt\0" if not any(
+                    isinstance(call, list) and "commit" in call for call in calls
+                ) else "")
             return cp(args)
         if args == "echo ok":
             return cp(args, stdout="ok\n")
@@ -11835,6 +11839,10 @@ def _commit_runner(
         text: bool = True,
     ) -> subprocess.CompletedProcess:
         tail = list(args)[3:]
+        if tail[:2] == ["status", "--porcelain=v1"] and "-z" in tail:
+            return cp(args, stdout="".join(f" M {path}\0" for path in staged_files))
+        if tail == ["diff", "--cached", "--binary"]:
+            return cp(args)
         if tail[:2] == ["add", "-A"]:
             return cp(args)
         if tail == ["diff", "--cached", "--quiet"]:
@@ -12024,7 +12032,7 @@ def test_commit_checkout_changes_fails_closed_when_scan_command_fails() -> None:
 
     issue = IssueContext(441, "worklink slice", "do it", {"worklink"})
     committed = {"ran": False}
-    runner = _commit_runner({}, committed, list_returncode=128)
+    runner = _commit_runner({"app.py": b"clean"}, committed, list_returncode=128)
 
     with pytest.raises(WorklinkError, match="cannot scan"):
         _commit_checkout_changes(Path("/tmp/wt"), issue, runner=runner)
@@ -12160,6 +12168,10 @@ def test_authorized_publication_helpers_never_use_checkout_runner(tmp_path: Path
                 return cp(args, stdout=b"clean content\n")
             if args == ("rev-parse", "--verify", "HEAD^{commit}"):
                 return cp(args, stdout="a" * 40 + "\n")
+            if args[:2] == ("status", "--porcelain=v1") and "-z" in args:
+                return cp(args, stdout=" M changed.txt\0" if not any(
+                    call[0] == "commit" for call in calls
+                ) else "")
             return cp(args)
 
         def push(self):
@@ -12216,7 +12228,7 @@ def test_authorized_publication_helpers_never_use_checkout_runner(tmp_path: Path
     )
 
     assert updated.evidence.head_sha == "a" * 40
-    assert ("add", "-A") in calls
+    assert ("add", "-A", "--", "changed.txt") in calls
     assert ("commit", "-m", "worklink: issue #1") in calls
     assert ("push",) in calls
 
