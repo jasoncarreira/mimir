@@ -68,6 +68,7 @@ _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.-]*")
 _BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]*")
 _EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 _SHA = re.compile(r"[0-9a-f]{40}")
+_DEBIAN_PACKAGE = re.compile(r"[a-z0-9][a-z0-9+.-]+(?:=[0-9][A-Za-z0-9.+:~-]*)?")
 
 
 class SetupError(Exception):
@@ -149,6 +150,17 @@ def validate(name: str, value: str) -> str:
     if not ok:
         raise SetupError(f"Invalid {name.replace('_', ' ')}; supply a valid {name.replace('_', ' ')} (see --help).")
     return value
+
+
+def validate_system_packages(packages: list[str]) -> list[str]:
+    """Validate apt arguments, including any values loaded from a previous manifest."""
+    normalized = []
+    for entry in packages:
+        package = entry.strip() if isinstance(entry, str) else entry
+        if not isinstance(package, str) or not _DEBIAN_PACKAGE.fullmatch(package):
+            raise SetupError(f"Invalid system package {entry!r}; use comma-separated Debian package names, optionally =version.")
+        normalized.append(package)
+    return normalized
 
 
 def _field(args: argparse.Namespace, name: str, explanation: str, *, default: str | None = None) -> str:
@@ -285,8 +297,10 @@ def _tool_pin(files: dict[str, str | None], tool: str, default: str) -> str:
 
 def render_layer(kind: str, version: str, root_image: str, *,
                  nextest_version: str = DEFAULT_NEXTEST_VERSION,
-                 uv_version: str = DEFAULT_UV_VERSION) -> str:
+                 uv_version: str = DEFAULT_UV_VERSION,
+                 system_packages: list[str] | None = None) -> str:
     """Keep version-pinned tools on /usr/local/bin, without changing shell policy."""
+    packages = validate_system_packages(system_packages or [])
     if kind == "rust":
         install = ("ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/workspace/.cargo\n"
                    "ENV CARGO_INSTALL_ROOT=/opt/cargo\n"
@@ -322,7 +336,9 @@ def render_layer(kind: str, version: str, root_image: str, *,
                    "sh /tmp/uv-install.sh && rm /tmp/uv-install.sh && "
                    "cp /root/.local/bin/uv /usr/local/bin/uv && cp /root/.local/bin/uvx /usr/local/bin/uvx\n"
                    f"RUN set -eu; uv python install {version} && chmod -R a+rX /opt/uv-python\n")
-    return f"FROM {root_image}\nUSER root\n{install}RUN set -eu; mkdir -p /workspace /workspace/pr-leases /workspace/worklink && chown -R 1001:1001 /workspace\nUSER root\n"
+    extra = ("RUN set -eu; apt-get update && apt-get install -y --no-install-recommends "
+             + " ".join(packages) + " && rm -rf /var/lib/apt/lists/*\n") if packages else ""
+    return f"FROM {root_image}\nUSER root\n{extra}{install}RUN set -eu; mkdir -p /workspace /workspace/pr-leases /workspace/worklink && chown -R 1001:1001 /workspace\nUSER root\n"
 
 
 def render_compose(template: str, layer_tag: str, kind: str, repo_name: str) -> str:
@@ -797,6 +813,18 @@ def _verify_toolchain(deploy: Path, kind: str, version: str) -> None:
         raise SetupError(f"Leaf toolchain verification failed ({reason}); rebuild the agent image and check its toolchain installation.")
 
 
+def _verify_system_packages(deploy: Path, packages: list[str]) -> None:
+    for package in validate_system_packages(packages):
+        name = package.split("=", 1)[0]
+        try:
+            status = _run(["docker", "compose", "exec", "-T", "-u", "worklink", "-w", "/tmp",
+                           "agent", "dpkg-query", "-W", "-f=${Status}", name], cwd=deploy)
+        except SetupError:
+            status = ""
+        if status != "install ok installed":
+            raise SetupError(f"System package verification failed (system_package_missing: {name}); rebuild the agent image and check its package installation.")
+
+
 def _verify_opencode_binary(deploy: Path) -> str:
     binary = _agent_exec(deploy, "/home/mimir/venv/bin/python", "-c", _OPENCODE_RESOLVE_PROBE)
     check = "opencode_missing"
@@ -821,7 +849,8 @@ def _verify_opencode_model(deploy: Path, binary: str, model: str) -> None:
         raise SetupError(f"OpenCode model verification failed (opencode_model_unknown): {model}; update the agent image or choose a listed model.")
 
 
-def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, version: str) -> None:
+def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, version: str,
+            system_packages: list[str] | None = None) -> None:
     url = f"http://127.0.0.1:{port}"
     for attempt in range(60):
         try:
@@ -882,6 +911,7 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, versi
     if identity_check != "ok":
         raise SetupError("Worklink base identity mismatch (base_identity_mismatch); check the base clone's local user.name/user.email and the bot identity in compose.env.")
     _verify_toolchain(deploy, kind, version)
+    _verify_system_packages(deploy, system_packages or [])
     binary = _verify_opencode_binary(deploy)
     # Run in the agent container with its actual HOME, config and compose env.
     # Only a stable reason code crosses the Docker boundary, never the bundle.
@@ -938,6 +968,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("deploy", "Absolute deployment directory (default: ./cultivate-agent)."),
         ("port", "Free loopback port (default: next free from 8090)."),
         ("test-command", "Verification command for target repo; default detected from repo."),
+        ("system-packages", "Extra Debian packages for the toolchain layer, comma-separated (optionally name=version); use none to clear, omit to preserve the saved list."),
         ("source-ref", "Pushed Mimir source ref (default: refs/heads/feature/plugins)."),
         ("source-repo", "Mimir source owner/name (default: " + DEFAULT_SOURCE_REPO + ")."),
     ):
@@ -967,6 +998,10 @@ def dispatch(args: argparse.Namespace) -> int:
 
 
 def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verify) -> None:
+    requested_packages = getattr(args, "system_packages", None)
+    if requested_packages is not None:
+        system_packages = ([] if requested_packages.strip() == "none"
+                           else validate_system_packages(requested_packages.split(",")))
     _license_gate(args)
     repo = _field(args, "repo", "Target owner/name: find it in the GitHub repository URL; used for clone and policy.")
     branch = _field(args, "branch", "Base branch: select the repository's default branch on GitHub; used for PRs.", default="main")
@@ -977,6 +1012,16 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     owner_email = _field(args, "owner_email", "Owner email: your email address, used for identity reconciliation.")
     print(PAT_HELP)
     deploy = Path(_field(args, "deploy", "Deployment directory: choose a private local directory for Docker files and web key.", default=str(Path.cwd() / "cultivate-agent"))).expanduser().resolve()
+    if requested_packages is None:
+        manifest_path = deploy / "manifest.json"
+        try:
+            previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+        except (OSError, ValueError):
+            raise SetupError("Cannot read previous system packages from manifest.json; reconcile it before retrying.") from None
+        packages = previous.get("system_packages", []) if isinstance(previous, dict) else None
+        if not isinstance(packages, list):
+            raise SetupError("Invalid system packages in manifest.json; reconcile it before retrying.")
+        system_packages = validate_system_packages(packages)
     if deploy.exists() and (not deploy.is_dir() or deploy.is_symlink()):
         raise SetupError("Deployment directory must be a real directory; choose a new --deploy path.")
     existing_env = (deploy / "compose.env").read_text() if (deploy / "compose.env").is_file() else ""
@@ -1020,6 +1065,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     nextest_version = _tool_pin(files, "nextest", DEFAULT_NEXTEST_VERSION)
     uv_version = _tool_pin(files, "uv", DEFAULT_UV_VERSION)
     print(f"Detected {kind} {version}; suggested test command: {suggestion}")
+    print("System packages: " + (", ".join(system_packages) if system_packages else "none"))
     test = _field(args, "test_command", "Test command: verify in your repo's CI/docs, then confirm this suggestion or override it.", default=suggestion)
     previous_port = None
     compose_path = deploy / "compose.yml"
@@ -1035,8 +1081,10 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     deploy.chmod(0o700)
     tag = "mimir-cultivate-root:" + sha
     layer_tag = "mimir-cultivate-agent:" + sha + "-" + kind + version.replace(".", "-")
+    # Fully generated from setup inputs: package and toolchain changes replace
+    # the previous layer, including any manual edits to this file.
     _write(deploy / "Dockerfile.toolchain", render_layer(kind, version, tag,
-           nextest_version=nextest_version, uv_version=uv_version))
+           nextest_version=nextest_version, uv_version=uv_version, system_packages=system_packages), replace=True)
     build_args = ["--build-arg MIMIR_GIT_REF=" + source_ref,
                   "--build-arg MIMIR_CONTROLLER_COMMIT=" + sha,
                   "--build-arg MIMIR_EXECUTOR_COMMIT=" + sha,
@@ -1069,7 +1117,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     manifest = {"slug": repo.lower(), "branch": branch, "toolchain": kind, "owner": owner, "display": display,
                   "email": owner_email, "test": test, "rotate": bool(args.rotate_web_key),
                   "force": bool(getattr(args, "force", False)),
-                 "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed)}
+                  "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
+                  "system_packages": system_packages}
     _write(deploy / "manifest.json", json.dumps(manifest, indent=2) + "\n", replace=True)
     _write(deploy / "provision.py", _PROVISION)
     # The provision script and manifest are mounted read-only for a one-shot
@@ -1117,7 +1166,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         if proc.returncode:
             raise SetupError("Could not retrieve owner web key; check container home volume.")
     key_path.chmod(0o600)
-    verify(deploy, port, repo, key_path.read_text().strip(), kind, version)
+    verify(deploy, port, repo, key_path.read_text().strip(), kind, version, system_packages)
     print(f"Cultivate ready: http://127.0.0.1:{port}  Owner web key: {key_path}  Next: use the key to sign in.")
     print("Issues are tracked in Chainlink in the agent home (/home/mimir/agent).")
     print('File a leaf: docker compose exec -w /home/mimir/agent agent chainlink issue create '

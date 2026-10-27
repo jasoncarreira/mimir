@@ -144,6 +144,10 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
         expected_steps = steps(original)
         actual_steps = steps((source / name).read_text())
         if name == "base.sh":
+            # Common developer tools were added after the historical extraction.
+            old = "xz-utils poppler-utils"
+            new = "xz-utils lsof file unzip less make netcat-openbsd iproute2 psmisc poppler-utils"
+            expected_steps = [step.replace(old, new) for step in expected_steps]
             expected_steps = [step.replace("opencode-ai@1.18.21", "opencode-ai@1.19.4")
                               for step in expected_steps]
         if name == "executor.sh":
