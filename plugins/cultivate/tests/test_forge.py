@@ -247,7 +247,7 @@ def test_check_url_outside_exact_repo_is_unsafe(url) -> None:
     scope = replace(_runtime().context.repo_pr_action_scope,
                     canonical_repo="squashmerge/trellis")
     check = CheckProjection("test (ubuntu-latest)", "completed", "success", None, None, url)
-    assert not forge._safe_check_projection(check, scope)
+    assert forge._safe_check_projection(check, scope, 0)["details_url"] is None
 
 
 def test_check_url_preserves_path_case_and_allows_repo_case() -> None:
@@ -255,7 +255,7 @@ def test_check_url_preserves_path_case_and_allows_repo_case() -> None:
                     canonical_repo="squashmerge/trellis")
     url = "https://github.com/SquashMerge/trellis/actions/runs/40411654556/job/123"
     check = CheckProjection("test (macos-latest)", "completed", "success", None, None, url)
-    assert forge._safe_check_projection(check, scope)
+    assert forge._safe_check_projection(check, scope, 0)["details_url"] == url
     assert check.details_url == url
 
 
@@ -278,7 +278,11 @@ def test_github_origin_repo_comparison_ignores_slug_case() -> None:
     "https://github.com/owner/repo/../other/actions/runs/1",
     "https://github.com/owner/repo/%2e%2e/other/actions/runs/1",
 ])
-def test_pr_checks_unsafe_url_downgrades_attestation(url) -> None:
+def test_pr_checks_unsafe_url_is_withheld_without_downgrading_attestation(url, monkeypatch) -> None:
+    import mimir.event_logger as event_logger
+
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *a, **kw: events.append((a, kw)))
     runtime = _runtime()
     client = _Forge()
     client.author_is_trusted = lambda *_: True
@@ -289,12 +293,79 @@ def test_pr_checks_unsafe_url_downgrades_attestation(url) -> None:
     try:
         token = access_control.begin_protected_result_capture()
         try:
-            assert forge.pr_checks.func("owner/repo", 17, runtime=runtime)[0]["details_url"] == url
+            result = forge.pr_checks.func("owner/repo", 17, runtime=runtime)
         finally:
             provenance = access_control.end_protected_result_capture(token)
     finally:
         forge.set_forge_client(None)
-    assert [source.integrity for source in provenance.sources] == ["trusted", "untrusted"]
+    assert result[0]["details_url"] is None
+    assert url not in str(result)
+    assert [source.integrity for source in provenance.sources] == ["trusted"]
+    assert events == [(("pr_checks_field_withheld",), {"field": "details_url", "check_index": 0})]
+
+
+@pytest.mark.parametrize("name", [
+    "candidate\nunsafe", "candidate:unsafe", "candidate`unsafe", "candidate<unsafe",
+    "a" * 129,
+])
+def test_pr_checks_withholds_invalid_name_without_taint(name, monkeypatch) -> None:
+    import mimir.event_logger as event_logger
+
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *a, **kw: events.append((a, kw)))
+    runtime = _runtime()
+    client = _Forge()
+    client.author_is_trusted = lambda *_: True
+    client.list_checks = lambda _: (
+        CheckProjection("valid", "completed", "success", None, None),
+        CheckProjection(name, "completed", "unexpected conclusion", None, None),
+    )
+    forge.set_forge_client(client)
+    try:
+        token = access_control.begin_protected_result_capture()
+        try:
+            result = forge.pr_checks.func("owner/repo", 17, runtime=runtime)
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        # The following write can still proceed after ingesting the checks.
+        assert forge.pr_submit_review.func(
+            "owner/repo", 17, ReviewVerdict.COMMENT, "reviewed", runtime=runtime,
+        )["body"] == "reviewed"
+    finally:
+        forge.set_forge_client(None)
+    assert result[0]["name"] == "valid"
+    assert result[1]["name"] == "<withheld-check-name>"
+    assert result[1]["conclusion"] == "unknown"
+    assert name not in str(result)
+    assert "unexpected conclusion" not in str(result)
+    assert [source.integrity for source in provenance.sources] == ["trusted"]
+    assert events == [
+        (("pr_checks_field_withheld",), {"field": "name", "check_index": 1}),
+        (("pr_checks_field_withheld",), {"field": "conclusion", "check_index": 1}),
+    ]
+
+
+def test_pr_checks_unknown_status_is_withheld(monkeypatch) -> None:
+    import mimir.event_logger as event_logger
+
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *a, **kw: events.append((a, kw)))
+    client = _Forge()
+    client.author_is_trusted = lambda *_: True
+    client.list_checks = lambda _: (CheckProjection("valid", "invalid status", None, None, None),)
+    forge.set_forge_client(client)
+    try:
+        token = access_control.begin_protected_result_capture()
+        try:
+            result = forge.pr_checks.func("owner/repo", 17, runtime=_runtime())
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+    finally:
+        forge.set_forge_client(None)
+    assert result[0]["status"] == "unknown"
+    assert "invalid status" not in str(result)
+    assert [source.integrity for source in provenance.sources] == ["trusted"]
+    assert events == [(("pr_checks_field_withheld",), {"field": "status", "check_index": 0})]
 
 
 @pytest.mark.parametrize("method,warning", [

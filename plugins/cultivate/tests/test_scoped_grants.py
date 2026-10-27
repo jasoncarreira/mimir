@@ -217,7 +217,8 @@ def test_expired_precheckout_grant_does_not_offer_checkout_remedy(tmp_path):
     assert refusal.refusal_detail is None
 
 
-def test_unrequested_collaborator_review_recovers_in_same_poller_turn(tmp_path, monkeypatch):
+@pytest.mark.parametrize("invalid_name", [None, "candidate:unsafe"])
+def test_unrequested_collaborator_review_recovers_in_same_poller_turn(tmp_path, monkeypatch, invalid_name):
     from mimir.plugins.manager import load_plugins
     from mimir.access_control import RepoBindingResolution
     from mimir_cultivate import forge
@@ -280,11 +281,14 @@ def test_unrequested_collaborator_review_recovers_in_same_poller_turn(tmp_path, 
         ),
         author_is_trusted=lambda *_: True,
         list_checks=lambda _: (
-            CheckProjection("test (ubuntu-latest)", "completed", "success", None, None,
+            CheckProjection("candidate (ubuntu-24.04, x86_64-unknown-linux-gnu, x86_64)", "completed", "success", None, None,
                             "https://github.com/SquashMerge/trellis/actions/runs/40411654556/job/1"),
-            CheckProjection("test (macos-latest)", "completed", "success", None, None,
+            CheckProjection("candidate (ubuntu-24.04-arm, aarch64-unknown-linux-gnu, aarch64)", "completed", "success", None, None,
                             "https://github.com/SquashMerge/trellis/actions/runs/40411654556/job/2"),
-        ),
+            CheckProjection("candidate (macos-15, aarch64-apple-darwin, arm64)", "completed", "success", None, None),
+            CheckProjection("a" * 128, "completed", "success", None, None),
+        ) + ((CheckProjection(invalid_name, "completed", "success", None, None),)
+             if invalid_name is not None else ()),
     )
     monkeypatch.setattr(forge, "_client_for_repository", lambda _repo: client)
     # The local fixture uses a bare file:// origin; this test exercises the
@@ -333,7 +337,15 @@ def test_unrequested_collaborator_review_recovers_in_same_poller_turn(tmp_path, 
                     scope.canonical_repo, scope.pr_number,
                     runtime=Runtime(context=auth),
                 )
-                assert len(checks) == 2
+                expected_names = [
+                    "candidate (ubuntu-24.04, x86_64-unknown-linux-gnu, x86_64)",
+                    "candidate (ubuntu-24.04-arm, aarch64-unknown-linux-gnu, aarch64)",
+                    "candidate (macos-15, aarch64-apple-darwin, arm64)",
+                    "a" * 128,
+                ]
+                if invalid_name is not None:
+                    expected_names.append("<withheld-check-name>")
+                assert [check["name"] for check in checks] == expected_names
             else:
                 publish_attestation()
             return ToolMessage(content="review evidence", tool_call_id=name)
