@@ -15,7 +15,7 @@ from mimir.chat_skills import ChatSkillError, ChatSkillInvocation, ChatSkillRegi
 from mimir.config import Config
 from mimir.plugins.defaults import plugin_default_files, seed_plugin_defaults
 from mimir.plugins.discovery import enabled_plugins
-from mimir.plugins.skills import install_skill, selected_skills
+from mimir.plugins.skills import install_skill, selected_skills, skill_inventory, skills_for_candidates
 from mimir.skill_catalog import load_skill
 
 
@@ -50,7 +50,11 @@ def test_current_repository_skill_release_hash(name):
     import hashlib
 
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    expected = releases["0.9.10-2028" if name in {"review", "github-poller"} else "0.9.10-2025"][name]["SKILL.md"]
+    version = {
+        "github-poller": "2045-framework-fire-merged",
+        "review": "0.9.10-2028",
+    }.get(name, "0.9.10-2025")
+    expected = releases[version][name]["SKILL.md"]
     actual = hashlib.sha256((SKILLS / name / "SKILL.md").read_bytes()).hexdigest()
     assert actual == expected, f"{name}/SKILL.md: actual sha256={actual}"
 
@@ -63,9 +67,20 @@ def test_current_github_poller_release_hash(relative):
     import hashlib
 
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    expected = releases["0.9.10-2028"]["github-poller"][relative]
+    expected = releases["2045-framework-fire-merged"]["github-poller"][relative]
     actual = hashlib.sha256((SKILLS / "github-poller" / relative).read_bytes()).hexdigest()
     assert actual == expected, f"{relative}: actual sha256={actual}"
+
+
+def test_current_github_poller_release_inventory_is_complete():
+    # Historical inventories are upgrade evidence, not mutable current hashes.
+    # Pin the merged release explicitly and compare the whole packaged tree so
+    # new files and changed tests cannot silently fall outside the hash guards.
+    [candidate] = enabled_plugins(enable="cultivate")
+    [skill] = [item for item in skills_for_candidates((candidate,))
+               if item.name == "github-poller"]
+    releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
+    assert skill_inventory(skill) == releases["2045-framework-fire-merged"]["github-poller"]
 
 
 # The guard scans the shipped defaults, not test fixtures or cache files.
