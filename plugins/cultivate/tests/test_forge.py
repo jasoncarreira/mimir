@@ -214,6 +214,21 @@ def test_provider_pr_metadata_bounds_body_and_preserves_merged_at(monkeypatch) -
     assert result.body and result.body.endswith("é")
 
 
+def test_non_pr_number_refusal_names_issue_remedy() -> None:
+    class Session:
+        def request(self, *args, **kwargs):
+            return SimpleNamespace(
+                status_code=404, iter_content=lambda **_: (b'{"message":"Not Found"}',),
+                close=lambda: None,
+            )
+
+    client = forge.GitHubForgeClient(token="token", session=Session())
+    with pytest.raises(forge.ForgeError) as error:
+        client._request("GET", "/repos/owner/repo/pulls/358")
+    assert "issue, not a PR" in str(error.value)
+    assert "issues aren't handled on service turns yet" in str(error.value)
+
+
 @pytest.mark.parametrize("url", [
     "https://github.com/other/trellis/actions/runs/40411654556/job/1",
     "https://github.com/SquashMerge/other/actions/runs/40411654556/job/1",

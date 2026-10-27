@@ -132,7 +132,7 @@ def test_pr_parent_lookup_failure_waits_for_attestation(
     assert budget.hard_truncated
 
 
-def test_issue_comment_is_not_suppressed_even_when_issue_is_closed(
+def test_closed_issue_comment_never_starts_turn(
     monkeypatch: pytest.MonkeyPatch,
     captured_emits: list[dict],
 ) -> None:
@@ -153,8 +153,8 @@ def test_issue_comment_is_not_suppressed_even_when_issue_is_closed(
         review_needed_pr_numbers={"42"},
     )
 
-    assert count == 1
-    assert captured_emits[0]["event_type"] == "issue_comment"
+    assert count == 0
+    assert captured_emits == []
 
 
 def test_same_poll_comment_and_synchronize_emit_one_review_turn(

@@ -52,11 +52,12 @@ def test_current_repository_skill_release_hash(name):
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     expected = releases["0.9.10-2026" if name in {"review", "github-poller"} else "0.9.10-2025"][name]["SKILL.md"]
     actual = hashlib.sha256((SKILLS / name / "SKILL.md").read_bytes()).hexdigest()
-    assert actual == expected
+    assert actual == expected, f"{name}/SKILL.md: actual sha256={actual}"
 
 
 @pytest.mark.parametrize("relative", [
     "scripts/poller.py", "tests/test_github_poller_pr_pushes.py",
+    "tests/test_github_poller_withhold.py", "tests/test_github_poller_issue_notices.py",
 ])
 def test_current_github_poller_release_hash(relative):
     import hashlib

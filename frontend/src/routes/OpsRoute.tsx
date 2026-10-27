@@ -495,7 +495,7 @@ function SignalsPanel({ data }: { data: SafeOpsDashboardData }) {
     <div className="ops-panel-stack">
       <Panel
         title="Signals"
-        subtitle={`Rendered from the same recent feedback-signals block the agent sees (${signals.windowHours}h window).`}
+        subtitle={`Recent feedback and owner-only GitHub issue notices (${signals.windowHours}h window).`}
       >
         {signals.block ? (
           <CodeBlock

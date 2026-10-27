@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """GitHub repository poller — pollers.json contract (chainlink #3).
 
-Checks each ``GITHUB_REPOS`` entry for new issues, PRs, conversation
+Checks each ``GITHUB_REPOS`` entry for new/updated issues, PRs, conversation
 comments, PR review comments (inline diff), PR reviews, and newly completed
-check failures on open PRs. Emits one JSONL event per actionable item.
+check failures on open PRs. Issues produce owner-visible signals, not turns.
 
 Differences from the open-strix port this is based on:
 
@@ -157,6 +157,7 @@ from mimir.pollers import (
     _github_author_is_trusted, _github_content_author, github_author_trust_cause,
     bounded_github_author_cause, _github_author_diagnostic_sink,
 )
+from mimir.prompt_safety import sanitize_prompt_field
 from mimir_cultivate.ci import capture_job_log, clean_log_tail, classify_cancelled_run
 from mimir_cultivate.github_trust import partition, sanitize_login, sanitize_url
 
@@ -1377,56 +1378,53 @@ def _surface_untrusted_pr_once(
 
 def _check_issues(
     repo: str, since: str, token: str, me: str,
-    *, trust_cache: dict | None = None, surfaced_outsiders: set[str] | None = None,
+    *, trust_cache: dict | None = None,
+    noticed_issues: dict[str, str] | None = None,
     tick_budget: "TickBudget | None" = None,
 ) -> int:
-    """New issues (NOT PRs — GitHub's /issues endpoint returns both;
-    we filter PRs out via the ``pull_request`` field)."""
+    """Notice new/updated issues; never start an issue service turn.
+
+    GitHub's /issues endpoint includes PRs; the payload's pull_request key
+    decides the type. The cursor keys each notice by number and updated_at.
+    """
     data = _gh_api(
-        f"repos/{repo}/issues?state=open&since={since}"
-        f"&sort=created&direction=desc",
+        f"repos/{repo}/issues?state=all&since={since}"
+        f"&sort=updated&direction=desc",
         token,
     )
     if not isinstance(data, list):
         _refused_window(tick_budget, data, "issues_window")
         return 0
     count = 0
+    noticed_issues = noticed_issues if noticed_issues is not None else {}
     for issue in data:
-        if issue.get("pull_request"):
+        if not isinstance(issue, dict):
+            continue
+        if "pull_request" in issue:
             continue  # PRs handled by _check_prs
-        if me and (issue.get("user") or {}).get("login") == me:
-            continue
-        if (issue.get("created_at", "") or "") <= since:
-            continue
-        kept, withheld = _partition_activity(
-            repo, token, [issue], "issue", me, trust_cache, tick_budget, "issues_trust",
-        )
-        if not kept:
-            if withheld and withheld[0].reason != "attestation_unavailable":
-                number = issue.get("number")
-                key = str(number)
-                if (isinstance(number, int) and not isinstance(number, bool)
-                        and surfaced_outsiders is not None and key not in surfaced_outsiders):
-                    _emit_signal(
-                        "github_outsider_issue_withheld", repo=repo, number=number,
-                        author=withheld[0].author, url=withheld[0].html_url,
-                    )
-                    surfaced_outsiders.add(key)
-                    count += 1
-            continue
-        author = (issue.get("user") or {}).get("login", "unknown")
         number = issue.get("number")
-        title = issue.get("title", "")
-        url = issue.get("html_url", "")
-        body = _truncate(issue.get("body") or "")
-        prompt_parts = [
-            f"New issue on {repo}: #{number} {title} (by @{author})",
-        ]
-        if body:
-            prompt_parts.append(body)
-        prompt_parts.append(url)
-        _emit("\n".join(prompt_parts), event_type="issue_opened",
-              repo=repo, number=number, url=url, author=author)
+        updated = issue.get("updated_at") or issue.get("created_at")
+        if (type(number) is not int or number < 1 or not isinstance(updated, str)
+                or not updated or updated <= since):
+            continue
+        key = str(number)
+        if noticed_issues.get(key) == updated:
+            continue
+        # Titles are stored only for authenticated operator views. Attest the
+        # author for the content-free channel notice; missing attestation must
+        # never enable trusted-author delivery or hold this metadata window.
+        kept, _ = _partition_activity(
+            repo, token, [issue], "issue", me, trust_cache, tick_budget,
+            "issues_trust", since_window=False,
+        )
+        _emit_signal(
+            "github_issue_notice", repo=repo, number=number,
+            title=sanitize_prompt_field(issue.get("title") or ""),
+            author_trusted=bool(kept),
+            author=sanitize_login((issue.get("user") or {}).get("login")),
+            url=sanitize_url(issue.get("html_url"), repo),
+        )
+        noticed_issues[key] = updated
         count += 1
     return count
 
@@ -1587,10 +1585,9 @@ def _check_issue_comments(
       review, not a second independent turn.
 
     Parent type comes from the authoritative issue resource's ``pull_request``
-    marker rather than the comment's presentation URL. Ordinary issue comments
-    keep the existing edge-triggered behaviour regardless of issue state. If the
-    live PR parent lookup fails, hold the watermark and retry rather than
-    admitting a potentially outsider-authored PR into a prompt.
+    marker rather than the comment's presentation URL. Issue comments produce
+    no turns; the updated issue listing supplies the owner notice. A failed
+    parent lookup holds the window rather than risking an issue turn.
     """
     data = comments
     if data is None:
@@ -1611,14 +1608,6 @@ def _check_issue_comments(
             continue
         if (comment.get("created_at", "") or "") <= since:
             continue
-        kept, _ = _partition_activity(
-            repo, token, [comment], "comment", me, trust_cache,
-            tick_budget, "issue_comments_trust",
-        )
-        if not kept:
-            continue
-        author = (comment.get("user") or {}).get("login", "unknown")
-        body = _truncate(comment.get("body") or "")
         url = comment.get("html_url", "")
         issue_url = comment.get("issue_url", "")
         issue_num = (
@@ -1633,13 +1622,22 @@ def _check_issue_comments(
             )
         parent = parent_cache[issue_num]
         is_pr_comment = isinstance(parent, dict) and bool(parent.get("pull_request"))
-        if presentation_is_pr and not isinstance(parent, dict):
-            # A failed parent lookup cannot reclassify a PR comment as an
-            # ordinary issue comment; the PR author might be an outsider.
+        if not isinstance(parent, dict):
+            # Never guess the parent type from a presentation URL or number.
             if tick_budget is not None:
                 tick_budget.hard_truncated = True
                 tick_budget.note_truncation("comment_parent_trust", 1)
             continue
+        if not is_pr_comment:
+            continue
+        kept, _ = _partition_activity(
+            repo, token, [comment], "comment", me, trust_cache,
+            tick_budget, "issue_comments_trust",
+        )
+        if not kept:
+            continue
+        author = (comment.get("user") or {}).get("login", "unknown")
+        body = _truncate(comment.get("body") or "")
         if is_pr_comment or presentation_is_pr:
             if issue_num in (review_needed_pr_numbers or set()):
                 continue
@@ -1676,10 +1674,6 @@ def _check_issue_comments(
                 url=url,
                 author=author,
             )
-        else:
-            _emit(prompt, event_type="issue_comment",
-                  repo=repo, number=issue_num, url=url, author=author)
-            emitted = True
         count += int(emitted)
     return count
 
@@ -3616,22 +3610,23 @@ def main() -> None:
     mergeability_attempt_budget = [1]
     untrusted_all: dict = cursor.get("pr_untrusted_authors", {}) or {}
     new_untrusted_all: dict[str, list[str]] = {}
-    outsider_issues_all: dict = cursor.get("github_outsider_issues", {}) or {}
-    new_outsider_issues_all: dict[str, list[str]] = {}
+    issue_notices_all: dict = cursor.get("github_issue_notices", {}) or {}
+    new_issue_notices_all: dict[str, dict[str, str]] = {}
     trust_cache: dict[tuple[str, object], object] = {}
 
     total = 0
     for repo in repos:
         print(f"Checking {repo} since {since}...", file=sys.stderr)
-        surfaced_issues = {
-            str(value) for value in (outsider_issues_all.get(repo, []) or [])
-            if isinstance(value, (str, int)) and not isinstance(value, bool)
+        noticed_issues = {
+            key: value for key, value in (issue_notices_all.get(repo) or {}).items()
+            if isinstance(key, str) and isinstance(value, str)
         }
         total += _check_issues(
             repo, since, token, me, trust_cache=trust_cache,
-            surfaced_outsiders=surfaced_issues, tick_budget=budget,
+            noticed_issues=noticed_issues,
+            tick_budget=budget,
         )
-        new_outsider_issues_all[repo] = sorted(surfaced_issues)
+        new_issue_notices_all[repo] = noticed_issues
         surfaced_untrusted = {
             str(value) for value in (untrusted_all.get(repo, []) or [])
             if isinstance(value, (str, int)) and not isinstance(value, bool)
@@ -3747,7 +3742,8 @@ def main() -> None:
     cursor["pr_mergeability"] = new_mergeability_all
     cursor["pr_ci_failures"] = new_ci_failures_all
     cursor["pr_untrusted_authors"] = new_untrusted_all
-    cursor["github_outsider_issues"] = new_outsider_issues_all
+    cursor.pop("github_outsider_issues", None)  # retired; notices dedupe by updated_at
+    cursor["github_issue_notices"] = new_issue_notices_all
     set_active_tick_budget(None)
     _save_cursor(cursor)
     print(
