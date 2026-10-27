@@ -343,11 +343,13 @@ def test_scan_and_cap_refuse(setup, case, capsys):
         commit_file(home, path, POST.replace("A public update", "ghp_" + "A" * 36))
     else:
         commit_file(home, path)
-        from datetime import datetime, timezone
         import yaml
-        now = datetime.now(timezone.utc).isoformat()
+        # cap_check delegates with an explicit --since day and no --until.
+        # Keep these refusal records above that lower bound even if UTC
+        # midnight passes before its real subprocess reads the ledger.
+        timestamp = "9999-12-31T23:59:59+00:00"
         (state / "sent_ledger-bsky.yaml").write_text(yaml.safe_dump([
-            {"action": "post", "platform": "bsky", "timestamp": now, "createdId": str(i)}
+            {"action": "post", "platform": "bsky", "timestamp": timestamp, "createdId": str(i)}
             for i in range(5)
         ]))
     module.main()
