@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -61,7 +62,12 @@ def setup(tmp_path: Path, monkeypatch, request):
     monkeypatch.delenv("MIMIR_GITHUB_SELF_LOGIN", raising=False)
     monkeypatch.setenv("GITHUB_TOKEN", "test-forge-placeholder")
     monkeypatch.delenv("GH_TOKEN", raising=False)
+    if poller == POLLERS[0]:
+        # Other optional skills also import a top-level module named poller.
+        monkeypatch.delitem(sys.modules, "poller", raising=False)
     module = importlib.import_module("poller" if poller == POLLERS[0] else "feed_poller")
+    if poller == POLLERS[0]:
+        monkeypatch.setitem(sys.modules, "poller", module)
     monkeypatch.setattr(module, "STATE_DIR", state)
     monkeypatch.setattr(module, "CURSOR_FILE", state / "emitted.json")
     monkeypatch.setattr(module, "POLLER_NAME", poller)
@@ -201,7 +207,7 @@ def test_cap_units_from_validated_schema(setup, text, expected):
     import dispatcher
 
     _, state, _, _, _ = setup
-    assert dispatcher._cap_allows(text, state, {}) == expected
+    assert dispatcher._cap_allows(text, state, {}, "2026-10-27") == expected
 
 
 @pytest.mark.parametrize("action,payload", [
@@ -228,7 +234,7 @@ def test_dispatch_revalidates_shared_schema(setup, monkeypatch):
 
     _, state, _, _, _ = setup
     monkeypatch.setattr(schema, "validate_outbox", lambda doc: ["forced rejection"])
-    assert dispatcher._cap_allows(POST, state, {}) is None
+    assert dispatcher._cap_allows(POST, state, {}, "2026-10-27") is None
 
 
 def test_stray_outbox_name_is_flagged_once_per_content_and_never_dispatched(setup, capsys):
@@ -335,24 +341,63 @@ def test_unmerged_files_never_dispatch(setup, case, capsys):
     assert "unmerged or dirty" in capsys.readouterr().err
 
 
+def freeze_dispatch_clock(monkeypatch, now: datetime) -> None:
+    import dispatcher
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    monkeypatch.setattr(dispatcher, "datetime", FrozenDatetime)
+
+
+def seed_five_posts(state: Path, timestamp: datetime) -> None:
+    import yaml
+
+    (state / "sent_ledger-bsky.yaml").write_text(yaml.safe_dump([
+        {"action": "post", "platform": "bsky", "timestamp": timestamp.isoformat(),
+         "createdId": str(i)}
+        for i in range(5)
+    ]))
+    # Keep the two cap sources in agreement so the refusal is due to the
+    # five-post limit, not the cap check's divergence guard.
+    archives = state / "outbox_archive"
+    archives.mkdir(exist_ok=True)
+    stamp = timestamp.strftime("%Y-%m-%dT%H-%M-%S-000Z")
+    (archives / f"{stamp}_outbox-bsky.yaml").write_text(yaml.safe_dump({
+        "dispatch": [{"post": {"text": f"prior post {i}"}} for i in range(5)]
+    }))
+
+
 @pytest.mark.parametrize("case", ["privacy", "cap"])
-def test_scan_and_cap_refuse(setup, case, capsys):
+def test_scan_and_cap_refuse(setup, monkeypatch, case, capsys):
     home, state, root, calls, module = setup
     path = root / "outbox-one.yaml"
     if case == "privacy":
         commit_file(home, path, POST.replace("A public update", "ghp_" + "A" * 36))
     else:
         commit_file(home, path)
-        from datetime import datetime, timezone
-        import yaml
-        now = datetime.now(timezone.utc).isoformat()
-        (state / "sent_ledger-bsky.yaml").write_text(yaml.safe_dump([
-            {"action": "post", "platform": "bsky", "timestamp": now, "createdId": str(i)}
-            for i in range(5)
-        ]))
+        now = datetime(2026, 10, 27, 23, 59, 59, tzinfo=timezone.utc)
+        freeze_dispatch_clock(monkeypatch, now)
+        seed_five_posts(state, now)
     module.main()
     assert not dispatches(calls)
     assert ("privacy scan refused" if case == "privacy" else "cap check refused") in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("prior_day,allowed", [(False, False), (True, True)])
+def test_cap_utc_midnight_boundary(setup, monkeypatch, capsys, prior_day, allowed):
+    home, state, root, calls, module = setup
+    now = datetime(2026, 10, 27, 23, 59, 59, tzinfo=timezone.utc)
+    freeze_dispatch_clock(monkeypatch, now)
+    seed_five_posts(state, now - timedelta(days=1) if prior_day else now)
+    commit_file(home, root / "outbox-one.yaml")
+
+    assert module.main() == 0
+    assert len(dispatches(calls)) == int(allowed)
+    if not allowed:
+        assert "cap check refused" in capsys.readouterr().err
 
 
 def test_crash_after_ledger_write_cannot_retry(setup, monkeypatch, capsys):
@@ -614,8 +659,8 @@ def test_dispatch_uses_verified_snapshot_when_live_file_changes(setup, monkeypat
     commit_file(home, path)
     original = dispatcher._cap_allows
 
-    def change_live(text, state, reserved):
-        allowed = original(text, state, reserved)
+    def change_live(text, state, reserved, today):
+        allowed = original(text, state, reserved, today)
         path.write_text(POST.replace("public", "changed after verification"))
         return allowed
 
