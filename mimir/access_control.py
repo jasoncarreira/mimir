@@ -6175,8 +6175,13 @@ def _tainted_write_sources(auth_context: Any, ifc_labels: Any) -> dict[str, Any]
             remaining += 1
             continue
         resource_id = source.resource_id
+        bridge = source.bridge_instance
         sources.append({
             "domain": source.domain,
+            "source_kind": source.source_kind,
+            "bridge_instance": (
+                redact_text(bridge)[:256] if isinstance(bridge, str) else None
+            ),
             "resource_id": (
                 redact_text(resource_id)[:1024] if isinstance(resource_id, str) else None
             ),
@@ -9824,7 +9829,9 @@ class ToolRegistry:
         if (plugin_tool is not None and plugin_tool.writes_code_or_state
                 and "worklink_build_tools" not in plugin_tool.memberships
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            return finish(_tainted_write_denial(tool_name))
+            return finish(_tainted_write_denial(
+                tool_name, service, auth_context=auth_context, ifc_labels=ifc_labels,
+            ))
         if (plugin_tool is not None and plugin_tool.flow in {"sink", "both"}
                 and plugin_tool.resource_scope != "channel"
                 and tool_name != "issue_comment"):
@@ -11706,7 +11713,8 @@ def _provider_pr_lease_result_is_bound(
         and scope is not None
         and isinstance(getattr(scope, "canonical_repo", None), str)
         and type(getattr(scope, "pr_number", None)) is int
-        and arguments.get("repository") == scope.canonical_repo
+        and isinstance(arguments.get("repository"), str)
+        and arguments["repository"].lower() == scope.canonical_repo.lower()
         and arguments.get("pull_request") == scope.pr_number
         and authorization.allowed and not authorization.would_block
         and authorization.decision == OperationDecision.RESOURCE_SCOPED

@@ -6171,7 +6171,10 @@ def test_repo_publish_refusal_and_event_contain_only_safe_metadata(monkeypatch: 
         assert not hasattr(decision, "ifc_labels")
         assert decision.protected_source_resources is None
         assert events[-1] == ("write_blocked_by_untrusted_ingest", {
-            "tool": tool_name, "sources": [{"domain": "github", "resource_id": "github#comment/7"}],
+            "tool": tool_name, "sources": [{
+                "domain": "github", "source_kind": "protected_tool",
+                "bridge_instance": "forge", "resource_id": "github#comment/7",
+            }],
             "remaining_sources": 0,
         })
         for marker in ("outsider-comment-marker", "private-path-marker", "secret-commit-message"):
@@ -8544,6 +8547,8 @@ async def test_ifc_shadow_denial_records_one_bounded_redacted_causing_source(
         assert hard_events == [(reason, {
             "tool": tool_name, "sources": [{
                 "domain": "recent_activity",
+                "source_kind": "protected_prompt",
+                "bridge_instance": "slack",
                 "resource_id": (
                     "slack-C2?token=[REDACTED]&padding=" + "x" * 1200
                 )[:1024],

@@ -623,15 +623,17 @@ def test_selected_push_porcelain_uses_attested_origin(tmp_path: Path, attested, 
 
 @pytest.mark.usefixtures("selected_repository_policy")
 @pytest.mark.parametrize("trusted_author", [True, False])
+@pytest.mark.parametrize("repository_argument", ["owner/repo", "Owner/Repo"])
 def test_cultivate_forge_reads_match_core_result_and_review_sink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trusted_author: bool,
+    repository_argument: str,
 ) -> None:
     from mimir.plugins.core import selected_policy_registry
 
     auth, scope, _lease, _, _ = _real_attested_lease(tmp_path)
     policy = selected_policy_registry()
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = trusted_author
-    arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    arguments = {"repository": repository_argument, "pull_request": scope.pr_number}
     principal = auth.canonical_principal
     source = SourceLabel(
         principal=principal, domain="repository",
@@ -741,7 +743,7 @@ def test_non_repository_forge_result_cannot_use_pr_read_classification(tmp_path:
     ("authorization_open", "authorization.decision == OperationDecision.RESOURCE_SCOPED"),
     ("authorization_admin_required", "authorization.decision == OperationDecision.RESOURCE_SCOPED"),
     ("authorization_unknown", "authorization.decision == OperationDecision.RESOURCE_SCOPED"),
-    ("repository_argument", 'arguments.get("repository") == scope.canonical_repo'),
+    ("repository_argument", 'arguments["repository"].lower() == scope.canonical_repo.lower()'),
 ])
 def test_selected_pr_result_binding_guards_are_discriminating(
     tmp_path, monkeypatch, boundary, guard,
