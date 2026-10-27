@@ -2,6 +2,12 @@
 from __future__ import annotations
 
 import json
+import shlex
+import sys
+
+from langchain.agents.middleware import ToolCallRequest
+from langchain_core.messages import ToolMessage
+from langgraph.runtime import Runtime
 
 import pytest
 
@@ -79,26 +85,6 @@ def _drive(monkeypatch, tmp_path, capsys, items, *, pr=None, since=SINCE):
     return [json.loads(line) for line in capsys.readouterr().out.splitlines()]
 
 
-def _scope(event, monkeypatch):
-    monkeypatch.setattr(
-        access_control, "_canonical_repo_binding_resolution",
-        lambda repo: access_control.RepoBindingResolution(
-            ("/server/repo", f"git@github.com:{REPO}.git"), ("/server/repo",), 1,
-        ),
-    )
-    with policy_scope(load_plugins(enable="cultivate").policy):
-        return access_control._repo_pr_scope(
-            provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
-            repo=event["repo"], principal=event["author"],
-            event_type=event["event_type"], review_state=event.get("state"),
-            actor=event["actor"], author_is_trusted=True,
-            pr_state=event["pr_state"], number=event["number"],
-            head_repo=event["head_repo"], head_remote=event["head_remote"],
-            head_ref=event["head_ref"], head_sha=event["head_sha"],
-            base_ref=event["base_ref"], base_sha=event["base_sha"],
-        )
-
-
 @pytest.mark.parametrize("kind", ["issue_comment", "pr_review_comment", "pr_review"])
 def test_each_trusted_feedback_routes_to_remediation(
     monkeypatch, tmp_path, capsys, kind,
@@ -113,10 +99,7 @@ def test_each_trusted_feedback_routes_to_remediation(
     assert "Fix README 101" in event["prompt"]
     assert "push the fixes to the PR branch" in event["prompt"]
     assert "reply" in event["prompt"] and "without pushing" in event["prompt"]
-    scope = _scope(event, monkeypatch)
-    assert scope is not None
-    for action in (RepoPRAction.WRITE, RepoPRAction.COMMIT, RepoPRAction.PUSH):
-        assert action.value in scope.allowed_operations
+    assert "First call repo_checkout(" in event["prompt"]
     assert not any(item.get("event_type") in poller.REVIEW_NEEDED_EVENT_TYPES
                    for item in events)
 
@@ -204,3 +187,193 @@ def test_missing_feedback_id_cannot_enter_remediation():
         "issue_comment", "fix README",
     )
     assert pending == {}
+
+
+@pytest.mark.parametrize("field,event_type", [
+    ("author", "pr_opened"), ("pr_author", "pr_synchronize"),
+])
+def test_noncomment_self_review_is_stopped_before_http(
+    monkeypatch, capsys, field, event_type,
+):
+    def unexpected_http(*args, **kwargs):
+        pytest.fail("non-comment self-review must be rejected without lookup")
+
+    monkeypatch.setattr(poller, "_gh_api", unexpected_http)
+    assert poller._emit_pr_review_needed(
+        "review this", token="token", reviewer=BOT,
+        current_head_reviewed=False, event_type=event_type,
+        repo=REPO, number=372, **{field: BOT},
+    ) is False
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["issue_comment", "pr_review_comment", "pr_review"])
+async def test_emitted_json_through_framework_attestation_and_checkout_grant(
+    monkeypatch, tmp_path, capsys, kind,
+):
+    """Real fire -> HTTP actor attestation -> ingress scope -> hard tool boundary.
+
+    Neither actor/trust helpers nor scope issuance/grant checks are replaced.
+    The local repository supplies real Git objects for the checkout lifecycle.
+    """
+    from mimir import event_logger, pollers as framework
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir_cultivate.repository import create_pr_checkout_lease
+    from tests.test_pr_checkout_lease import _repo_and_scope
+
+    monkeypatch.setattr(
+        event_logger, "_logger", event_logger.EventLogger(tmp_path / "events.jsonl", "test"),
+    )
+    source, fixture_scope = _repo_and_scope(tmp_path)
+    pr = _pr()
+    pr["head"]["ref"] = fixture_scope.destination_ref.removeprefix("refs/heads/")
+    pr["head"]["sha"] = fixture_scope.observed_head_sha
+    pr["base"]["sha"] = fixture_scope.observed_base_sha
+    emitted = _drive(monkeypatch, tmp_path, capsys, [_feedback(kind)], pr=pr)
+    [payload] = [item for item in emitted if "prompt" in item]
+    assert "First call repo_checkout(" in payload["prompt"]
+    assert payload["prompt"].index("repo_checkout(") < payload["prompt"].index("pr_comments")
+    # Poller claims are deliberately false: only GitHub's response may restore them.
+    payload["actor"] = "spoofed-actor"
+    payload["author_is_trusted"] = False
+
+    selected = load_plugins(enable="cultivate").policy
+    monkeypatch.setattr(
+        access_control, "_canonical_repo_binding_resolution",
+        lambda repo: access_control.RepoBindingResolution(
+            (str(source), fixture_scope.canonical_origin), (str(source),), 1,
+        ),
+    )
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", "")
+    api_calls = []
+    content_endpoint = {
+        "issue_comment": f"repos/{REPO}/issues/comments/101",
+        "pr_review_comment": f"repos/{REPO}/pulls/comments/101",
+        "pr_review": f"repos/{REPO}/pulls/372/reviews/101",
+    }[kind]
+
+    def http(endpoint, token, **kwargs):
+        api_calls.append(endpoint)
+        assert token == "test-server-credential"
+        if endpoint == content_endpoint:
+            return 200, {"user": {"login": "collaborator"}}
+        if endpoint == f"repos/{REPO}/collaborators/collaborator":
+            return 204, None
+        pytest.fail(f"unexpected GitHub HTTP endpoint: {endpoint}")
+
+    monkeypatch.setattr(framework, "_github_api_attestation", http)
+    authority = access_control.build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=access_control.CapabilityTier.CODE_EXECUTION,
+        capabilities=("repo_checkout", "pr_comments", "repo_commit", "repo_push"),
+        creation_path="test", policy=selected, poller_owner="cultivate",
+    )
+    script = tmp_path / "emit.py"
+    captured = []
+
+    async def enqueue(event, **kwargs):
+        captured.append(event)
+        return True
+
+    async def fire(item, directory):
+        # Replay the skill's actual JSON line through the real subprocess parser.
+        script.write_text(f"print({json.dumps(item)!r})\n", encoding="utf-8")
+        cfg = framework.PollerConfig(
+            name="github-activity", command=f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}",
+            cron="* * * * *", skill_dir=tmp_path, persist_dir=directory,
+            env={"GITHUB_TOKEN": "test-server-credential"},
+            trust_source="github", authority=authority,
+        )
+        assert await framework.run_poller(cfg, enqueue=enqueue) == 1
+        event = captured.pop()
+        [attested] = event.extra["items"]
+        assert attested["actor"] == "collaborator"
+        assert attested["author_is_trusted"] is True
+        assert all(source.integrity == "trusted" for source in event.ifc_labels.sources)
+        auth = access_control.create_auth_context(
+            event, enforce=True, policy=selected, ifc_labels=event.ifc_labels,
+        )
+        scope = auth.repo_pr_action_scope
+        assert scope is not None
+        assert scope.provenance == RepoPRScopeProvenance.POLLER_PAYLOAD
+        assert {action.value for action in (
+            RepoPRAction.WRITE, RepoPRAction.COMMIT, RepoPRAction.PUSH,
+        )} <= scope.allowed_operations
+        return auth
+
+    with policy_scope(selected):
+        auth = await fire(payload, tmp_path / "new-fire")
+        args = {"repository": REPO, "pull_request": 372}
+        registry = access_control.ToolRegistry()
+        boundary = BudgetGateMiddleware(selected)
+        executed = []
+
+        def comments(current_auth):
+            request = ToolCallRequest(
+                tool_call={"name": "pr_comments", "args": args,
+                           "id": "comments", "type": "tool_call"},
+                tool=selected.tools["pr_comments"].factory(), state=None,
+                runtime=Runtime(context=current_auth),
+            )
+            return boundary.wrap_tool_call(request, lambda request: (
+                executed.append("pr_comments")
+                or ToolMessage(content="comments admitted", tool_call_id="comments")
+            ))
+
+        # The old emitter already supplied the same snapshot. Its first action
+        # was a PR read, not checkout. A valid scope alone does not activate it.
+        if kind in {"issue_comment", "pr_review_comment"}:
+            legacy = dict(payload, prompt="New comment: Fix README 101")
+            legacy.pop("actor")
+            legacy.pop("author_is_trusted")
+            legacy_auth = await fire(legacy, tmp_path / "legacy-fire")
+            refusal = registry.authorize_tool(
+                "pr_comments", legacy_auth, arguments=args, enforce=True, policy=selected,
+            )
+            assert not refusal.allowed and refusal.reason == "repo_pr_grant_denied"
+            result = comments(legacy_auth)
+            assert result.status == "error"
+            assert "repo_pr_grant_denied" in str(result.content)
+            assert "Call repo_checkout" in str(result.content)
+            assert executed == []
+
+        scope = auth.repo_pr_action_scope
+        state = auth.repo_review_state
+        assert access_control._valid_scoped_pr_grant(
+            auth, "cultivate", RepoPRAction.CHECKOUT, selected.scoped_actions["cultivate"],
+            scope, state, tool_name="repo_checkout",
+        )
+        # Do not hide the independent ingress-to-forge gap: the framework's
+        # trusted channel source is not currently an allowed forge source.
+        # The scoped grant exists, but production checkout still fails IFC.
+        checkout = registry.authorize_tool(
+            "repo_checkout", auth, arguments=args, enforce=True, policy=selected,
+        )
+        assert not checkout.allowed and checkout.reason == "ifc_label_blocked:forge"
+        # Exercise the real post-checkout grant lifecycle separately. This is
+        # not evidence that production repo_checkout was admitted above.
+        token = access_control.consume_scoped_pr_checkout(auth, scope, "cultivate")
+        assert token is not None
+        lease = create_pr_checkout_lease(
+            scope, owner=BOT, lease_root=lease_root, review_state=state,
+        )
+        try:
+            assert access_control.observe_scoped_pr_checkout(
+                auth, scope, state, token, "cultivate", selected.scoped_actions["cultivate"],
+            )
+            admitted = registry.authorize_tool(
+                "pr_comments", auth, arguments=args, enforce=True, policy=selected,
+            )
+            assert admitted.allowed, admitted.reason
+            result = comments(auth)
+            assert result.status != "error", result.content
+            assert executed == ["pr_comments"]
+        finally:
+            lease.revoke()
+    expected_calls = [content_endpoint, f"repos/{REPO}/collaborators/collaborator"]
+    assert api_calls == expected_calls * (1 if kind == "pr_review" else 2)

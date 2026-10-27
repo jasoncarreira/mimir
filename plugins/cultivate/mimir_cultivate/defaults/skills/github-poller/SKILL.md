@@ -101,6 +101,15 @@ For each repo in `GITHUB_REPOS`:
   comments never request a review of the bot's own PR. Non-collaborator feedback
   is withheld with a content-free operator notice; the bot's own comments and
   closed/merged PR comments are ignored.
+  Remediation prompts require `repo_checkout(repository, pull_request)` before
+  `pr_comments` or any other PR read: a scope snapshot alone does not activate
+  the checkout-backed grant. This addresses the reproducible pre-checkout
+  `repo_pr_grant_denied` path, not a missing actor attestation. The framework-fire
+  regression also records a separate current limitation: with the real trusted
+  poller channel ingress labels, checkout authorization returns
+  `ifc_label_blocked:forge`. Routing alone does not fix that core IFC boundary;
+  this PR must not be treated as proof of live end-to-end remediation until it
+  is resolved. No trust or IFC rule is relaxed by the poller.
 - **PR pushes/updates** (`pr_synchronize`) — new commits pushed to an existing open PR.
   The poller calls `GET /repos/{repo}/compare/{prev}...{new}` to fetch up to 3
   commit subjects inline. If multiple commits land between polls, all are

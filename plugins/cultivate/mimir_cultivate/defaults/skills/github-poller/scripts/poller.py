@@ -1294,8 +1294,11 @@ def _emit_own_feedback(
             "Decide whether each comment needs a change. Make the requested changes, "
             f"{_verification_guidance()}, push the fixes to the PR branch, and reply "
             "on the PR. If no change is needed (for example, plain approval), "
-            "answer briefly or end the turn without pushing. Read the bound PR's "
-            "review, inline, and conversation comments before acting.\n"
+            "answer briefly or end the turn without pushing. First call "
+            f"repo_checkout(repository={repo!r}, pull_request={number}) to activate "
+            "the scoped checkout grant; PR reads such as pr_comments are refused "
+            "before checkout. Then read the bound PR's review, inline, and "
+            "conversation comments before acting.\n"
             "Trusted feedback (quoted):\n"
             + "\n".join(
                 f"@{sanitize_login(author)} {url}: {json.dumps(text, ensure_ascii=False)}"
