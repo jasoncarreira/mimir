@@ -10,6 +10,7 @@ from typing import Any, Protocol
 
 from mimir.models import NormalizedPullRequestSnapshot
 from .policy import RepoPRActionScope
+from .review_checks import approval_blocker
 
 
 class ForgeError(RuntimeError):
@@ -1106,6 +1107,25 @@ class GitHubForgeClient:
             ReviewVerdict.REQUEST_CHANGES: "REQUEST_CHANGES",
         }
         self._confirm_effect_identity(scope)
+        if verdict == ReviewVerdict.APPROVE:
+            try:
+                live = self._request("GET", f"/repos/{repository}/pulls/{number}")
+            except ForgeError as exc:
+                raise ForgeError("approval refused: reviewed PR head could not be read") from exc
+            if not isinstance(live, Mapping) or not isinstance(live.get("head"), Mapping) or live["head"].get("sha") != scope.observed_head_sha:
+                raise ForgeError("approval refused: reviewed PR head is no longer current")
+            try:
+                checks = self._request(
+                    "GET", f"/repos/{repository}/commits/{scope.observed_head_sha}/check-runs?per_page=100",
+                )
+                statuses = self._request(
+                    "GET", f"/repos/{repository}/commits/{scope.observed_head_sha}/status",
+                )
+                blocker = approval_blocker(checks, statuses)
+            except (ForgeError, requests.RequestException) as exc:
+                raise ForgeError("approval refused: CI checks could not be read") from exc
+            if blocker:
+                raise ForgeError(f"approval refused: {blocker}")
         data = self._request(
             "POST",
             f"/repos/{repository}/pulls/{number}/reviews",

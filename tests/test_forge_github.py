@@ -1030,7 +1030,10 @@ def test_live_snapshot_uses_origin_for_same_repository_head() -> None:
 
 
 def test_submit_review_uses_json_transport_and_scope_head() -> None:
-    session = Session([Response({"login": "reviewer"}), Response({
+    session = Session([Response({"login": "reviewer"}),
+                       Response({"head": {"sha": "a" * 40}}),
+                       Response({"check_runs": [{"name": "tests", "status": "completed", "conclusion": "success"}], "total_count": 1}),
+                       Response({"statuses": []}), Response({
         "id": 9, "user": {"login": "reviewer"}, "state": "APPROVED",
         "body": "body", "commit_id": "a" * 40,
     })])
@@ -1039,7 +1042,7 @@ def test_submit_review_uses_json_transport_and_scope_head() -> None:
 
     client.submit_review(_scope(), ReviewVerdict.APPROVE, 'body "quoted"\nnext')
 
-    method, url, kwargs = session.calls[1]
+    method, url, kwargs = session.calls[4]
     assert method == "POST"
     assert url.endswith("/repos/owner/repo/pulls/17/reviews")
     assert kwargs["json"] == {
@@ -1119,6 +1122,9 @@ def test_midflight_forge_identity_change_returns_execution_fault_and_latches(mon
 def test_matching_identity_is_cached_for_multiple_effects() -> None:
     session = Session([
         Response({"login": "reviewer"}),
+        Response({"head": {"sha": "a" * 40}}),
+        Response({"check_runs": [{"name": "tests", "status": "completed", "conclusion": "success"}], "total_count": 1}),
+        Response({"statuses": []}),
         Response({
             "id": 9, "user": {"login": "reviewer"}, "state": "APPROVED",
             "body": "body", "commit_id": "a" * 40,
@@ -1136,6 +1142,9 @@ def test_matching_identity_is_cached_for_multiple_effects() -> None:
 
     assert [url for method, url, _ in session.calls if method == "GET"] == [
         "https://api.github.com/user",
+        "https://api.github.com/repos/owner/repo/pulls/17",
+        "https://api.github.com/repos/owner/repo/commits/" + "a" * 40 + "/check-runs?per_page=100",
+        "https://api.github.com/repos/owner/repo/commits/" + "a" * 40 + "/status",
     ]
 
 
