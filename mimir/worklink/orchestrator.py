@@ -53,7 +53,9 @@ from .claims import (
 from .control import operator_stop_requested
 from .autonomy import chainlink_bin
 from .evidence import (
+    _gate_tmp_directory,
     _paths_from_status,
+    _run_compute_gate,
     EvidenceValidation,
     TestResult,
     WorklinkEvidence,
@@ -1166,6 +1168,7 @@ class WorklinkRunner:
         publication: ControllerGitPublication | None = None
         delete_authorized_checkout = False
         executor_report_dir: Path | None = None
+        spec = None
         try:
             lease = _create_backend_checkout(
                 self.repo,
@@ -1485,6 +1488,11 @@ class WorklinkRunner:
                         error=str(exc),
                     )
                 if executor_report_dir is not None:
+                    await _remove_executor_basetemp_best_effort(
+                        executor_report_dir, worker_uid_drop=worker_uid_drop,
+                        compute=compute, spec=spec, checkout=lease.path if lease else None,
+                        issue_id=issue.issue_id, attempt=record.attempt,
+                    )
                     _remove_executor_report_dir_best_effort(
                         executor_report_dir,
                         issue_id=issue.issue_id,
@@ -1566,11 +1574,6 @@ class WorklinkRunner:
         executor_tests: TestResult | None = None
         if executor_report_dir is not None:
             executor_tests = read_pytest_result(test_cmd or "", executor_report_dir)
-            _remove_executor_report_dir_best_effort(
-                executor_report_dir,
-                issue_id=issue.issue_id,
-                attempt=attempt,
-            )
         pr_body_section = _read_pr_body_section(lease.path)
         invocation_model = spec.backend_config.get("model")
         executor_failed = raw.exit_code != 0
@@ -4660,6 +4663,49 @@ def _log_terminal_recovery_failed(
         state_retained=state_retained,
         error="Chainlink did not confirm lock release",
     )
+
+
+async def _remove_executor_basetemp_best_effort(
+    report_dir: Path, *, worker_uid_drop: bool, compute: Any, spec: Any,
+    checkout: Path | None, issue_id: int, attempt: int,
+) -> None:
+    """Remove only the derived pytest basetemp, using the worker for private trees."""
+    tmp: Path | None = None
+    try:
+        tmp = _gate_tmp_directory(report_dir)
+        try:
+            mode = tmp.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(mode):
+            raise ValueError("executor basetemp leaf is not a directory")
+        if worker_uid_drop:
+            if spec is None or checkout is None:
+                raise ValueError("worker compute unavailable for executor basetemp cleanup")
+            # The child repeats the leaf check under the worker identity. Its
+            # shutil.rmtree also refuses a symlink substituted after lstat.
+            code = (
+                "import os, stat, shutil; "
+                f"p = {str(tmp)!r}; "
+                "s = os.lstat(p); "
+                "assert stat.S_ISDIR(s.st_mode), 'executor basetemp leaf is not a directory'; "
+                "shutil.rmtree(p)"
+            )
+            cleanup = await _run_compute_gate(
+                shlex.join(["python3", "-I", "-c", code]),
+                checkout=checkout, work_spec=replace(spec, output_root=None),
+                compute=compute, diagnostic=True,
+            )
+            if cleanup.exit_code != 0:
+                raise OSError("worker executor basetemp cleanup failed")
+        else:
+            rmtree_missing_ok(tmp)
+    except BaseException as exc:  # teardown must not change the attempt's verdict
+        _log_event(
+            "worklink_cleanup_failed", issue_id=issue_id, attempt=attempt,
+            cleanup="executor_basetemp", path=str(tmp) if tmp is not None else None,
+            error=str(exc),
+        )
 
 
 def _remove_executor_report_dir_best_effort(

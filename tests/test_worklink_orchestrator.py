@@ -6,6 +6,7 @@ from contextlib import nullcontext
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -27,7 +28,7 @@ from mimir.worklink.backends import (
     RawResult,
     WorkOrder,
 )
-from mimir.worklink.evidence import EvidenceValidation, TestResult, WorklinkEvidence
+from mimir.worklink.evidence import EvidenceValidation, TestResult, WorklinkEvidence, _gate_tmp_directory
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, ClaimResult, claim_records_from_comments
 from mimir.worklink.compute import LaunchHandle, WorkSpec
@@ -2399,6 +2400,219 @@ def test_report_cleanup_failure_cannot_skip_lock_release_or_state_clear(
     assert result.status == "completed"
     assert ["chainlink", "locks", "release", "441"] in calls
     assert load_run_state(tmp_path, 441) is None
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        ("success", "completed"), ("gate_failure", "failed"),
+        ("blocked", "blocked"), ("failed", "failed"),
+        ("backend_exception", "failed"), ("finalize_exception", "failed"),
+        ("timeout", "failed"), ("stop", "stopped"),
+        ("cancel", "cancelled"),
+    ],
+)
+def test_attempt_removes_executor_basetemp_on_every_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
+    outcome: str, expected: str,
+) -> None:
+    import mimir.worklink.orchestrator as orch
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+    report = tmp_path / "executor-report"
+    basetemp = _gate_tmp_directory(report)
+    request.addfinalizer(lambda: shutil.rmtree(basetemp) if basetemp.is_dir() else None)
+    monkeypatch.setattr(orch, "_make_executor_report_dir", lambda *a, **kw: report)
+
+    class PytestCompute(FakeCompute):
+        async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+            options = shlex.split(self.specs[0].env["PYTEST_ADDOPTS"])
+            path = Path(next(opt.split("=", 1)[1] for opt in options if opt.startswith("--basetemp=")))
+            assert path == basetemp
+            path.mkdir()
+            (path / "popen-gw0").mkdir()
+            (path / "popen-gw0" / "worker.txt").write_text("pytest data")
+            report.mkdir(exist_ok=True)
+            (report / "junit.xml").write_text(
+                '<testsuite tests="1" failures="0" errors="0" skipped="0" />'
+            )
+            if outcome == "backend_exception":
+                raise RuntimeError("backend wait failed")
+            if outcome == "cancel":
+                raise asyncio.CancelledError()
+            return ComputeResult(
+                exit_code=124 if outcome in {"timeout", "stop"} else 0,
+                stdout="ok", stderr="",
+            )
+
+    class PytestBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            if outcome == "finalize_exception":
+                raise RuntimeError("finalize failed")
+            if outcome == "blocked":
+                return RawResult(0, order.transcript_root / "fake.json", "blocked", None,
+                                 blocked_reason="waiting for operator")
+            if outcome == "failed":
+                return RawResult(1, order.transcript_root / "fake.json", "failed", "build failed")
+            if outcome == "timeout":
+                return RawResult(124, order.transcript_root / "fake.json", "failed", "timed out")
+            return await super().interpret(order, result)
+
+    def runner(args: Sequence[str] | str, **kwargs: Any) -> subprocess.CompletedProcess:
+        if isinstance(args, str) and "pytest -q" in args:
+            return cp(args, returncode=1 if outcome == "gate_failure" else 0,
+                      stdout="gate failed" if outcome == "gate_failure" else "ok")
+        return base_runner(args, **kwargs)
+
+    if outcome == "stop":
+        monkeypatch.setattr(orch, "operator_stop_requested", lambda *a: True)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(PytestBackend())
+    compute = PytestCompute(shared_filesystem=True)
+    registry.select_compute = lambda **kw: compute
+    run = WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+        441, backend_name="fake", test_command="pytest -q"
+    )
+    if outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(run)
+    else:
+        result = asyncio.run(run)
+        assert result.status == expected
+    assert compute.specs
+    if outcome != "cancel":
+        assert ["chainlink", "locks", "release", "441"] in calls
+    assert not basetemp.exists()
+    assert not report.exists()
+
+
+@pytest.mark.parametrize("leaf", ["symlink", "file"])
+def test_attempt_refuses_unsafe_executor_basetemp_leaf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, leaf: str,
+) -> None:
+    import mimir.worklink.orchestrator as orch
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    _, runner = _orchestrator_runner(repo, worktree)
+    report = tmp_path / "executor-report"
+    basetemp = _gate_tmp_directory(report)
+    target = tmp_path / "untouched"
+    target.mkdir()
+    (target / "sentinel").write_text("safe")
+    if leaf == "symlink":
+        basetemp.symlink_to(target, target_is_directory=True)
+    else:
+        basetemp.write_text("not a directory")
+    monkeypatch.setattr(orch, "_make_executor_report_dir", lambda *a, **kw: report)
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(orch, "_log_event", lambda event, **kw: events.append({"event": event, **kw}))
+    removed: list[Path] = []
+    original_remove = orch.rmtree_missing_ok
+
+    def remove(path: Path) -> None:
+        removed.append(path)
+        original_remove(path)
+
+    monkeypatch.setattr(orch, "rmtree_missing_ok", remove)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    try:
+        result = asyncio.run(WorklinkRunner(
+            home=tmp_path, repo=repo, runner=runner, registry=registry,
+        ).run(441, backend_name="fake", test_command="pytest -q"))
+        assert result.status == "completed"
+        assert basetemp.is_symlink() if leaf == "symlink" else basetemp.is_file()
+        assert (target / "sentinel").read_text() == "safe"
+        assert basetemp not in removed
+        assert any(e.get("cleanup") == "executor_basetemp" for e in events)
+    finally:
+        basetemp.unlink()
+
+
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_worker_attempt_removes_private_basetemp_via_worker_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
+    cleanup_failure: bool,
+) -> None:
+    import mimir.worklink.orchestrator as orch
+    from mimir.worklink.compute import LocalSubprocessComputeBackend
+
+    repo = tmp_path / "repo"
+    checkout = repo.parent / ".worklink" / repo.name / "441-1"
+    checkout.mkdir(parents=True)
+    calls, runner = _orchestrator_runner(repo, checkout)
+    report = tmp_path / "executor-report"
+    report.mkdir()
+    basetemp = _gate_tmp_directory(report)
+    request.addfinalizer(lambda: shutil.rmtree(basetemp) if basetemp.is_dir() else None)
+    worker_commands: list[WorkSpec] = []
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(orch, "_log_event", lambda event, **kw: events.append({"event": event, **kw}))
+    monkeypatch.setattr(orch, "_make_executor_report_dir", lambda *a, **kw: report)
+    original_remove = orch.rmtree_missing_ok
+
+    def controller_remove(path: Path) -> None:
+        assert path != basetemp, "private basetemp must be removed by the worker"
+        original_remove(path)
+
+    monkeypatch.setattr(orch, "rmtree_missing_ok", controller_remove)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setattr(orch, "get_identities", lambda: SimpleNamespace(worklink_uid=4242))
+    monkeypatch.setattr(orch, "_create_backend_checkout", lambda *a, **kw: CheckoutLease(
+        441, 1, repo, checkout, "issue/441-a1", "main", isolated_checkout=True,
+    ))
+    monkeypatch.setattr(orch.ControllerGitPublication, "capture", lambda *a, **kw: SimpleNamespace(close=lambda: None))
+
+    class WorkerCompute(FakeCompute):
+        name = "local_subprocess"
+
+        async def launch(self, spec: WorkSpec) -> LaunchHandle:
+            if spec.local_argv and spec.local_argv[0] == "/bin/sh":
+                worker_commands.append(spec)
+            return await super().launch(spec)
+
+        async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+            spec = self.specs[-1]
+            if spec in worker_commands:
+                if cleanup_failure:
+                    return ComputeResult(1, "", "cleanup denied")
+                child = subprocess.run(spec.local_argv, cwd=checkout, capture_output=True, text=True)
+                return ComputeResult(child.returncode, child.stdout, child.stderr)
+            options = shlex.split(spec.env["PYTEST_ADDOPTS"])
+            assert Path(next(o.split("=", 1)[1] for o in options if o.startswith("--basetemp="))) == basetemp
+            basetemp.mkdir(mode=0o700)
+            (basetemp / "popen-gw0").mkdir()
+            return ComputeResult(1, "", "build failed")
+
+    class WorkerBackend(FakeBackend):
+        name = "opencode"
+
+        async def invoke_with_startup_retry(self, invoke: Any, **kwargs: Any) -> ComputeResult:
+            return await invoke()
+
+        async def interpret(self, order: WorkOrder, result: ComputeResult) -> RawResult:
+            return RawResult(1, order.transcript_root / "fake.json", "failed", "build failed")
+
+    bound = WorkerCompute(shared_filesystem=True)
+    monkeypatch.setattr(orch, "OpenCodeBackend", WorkerBackend)
+    monkeypatch.setattr(LocalSubprocessComputeBackend, "for_path_checkout", classmethod(lambda cls, uid: bound))
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(WorkerBackend())
+    registry.select_compute = lambda **kw: LocalSubprocessComputeBackend()
+    result = asyncio.run(WorklinkRunner(
+        home=tmp_path, repo=repo, runner=runner, registry=registry,
+    ).run(441, backend_name="opencode", test_command="pytest -q"))
+
+    assert result.status == "failed"
+    assert ["chainlink", "locks", "release", "441"] in calls
+    assert len(worker_commands) == 1
+    assert worker_commands[0].local_argv[:2] == ("/bin/sh", "-c")
+    assert str(basetemp) in worker_commands[0].local_argv[2]
+    assert basetemp.exists() is cleanup_failure
+    assert any(e.get("cleanup") == "executor_basetemp" for e in events) is cleanup_failure
 
 
 @pytest.mark.parametrize("interruption", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
