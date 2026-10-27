@@ -154,9 +154,13 @@ def validate(name: str, value: str) -> str:
 
 def validate_system_packages(packages: list[str]) -> list[str]:
     """Validate apt arguments, including any values loaded from a previous manifest."""
-    if not all(isinstance(pkg, str) and _DEBIAN_PACKAGE.fullmatch(pkg) for pkg in packages):
-        raise SetupError("Invalid system packages; use comma-separated Debian package names, optionally =version.")
-    return packages
+    normalized = []
+    for entry in packages:
+        package = entry.strip() if isinstance(entry, str) else entry
+        if not isinstance(package, str) or not _DEBIAN_PACKAGE.fullmatch(package):
+            raise SetupError(f"Invalid system package {entry!r}; use comma-separated Debian package names, optionally =version.")
+        normalized.append(package)
+    return normalized
 
 
 def _field(args: argparse.Namespace, name: str, explanation: str, *, default: str | None = None) -> str:
@@ -965,7 +969,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("deploy", "Absolute deployment directory (default: ./cultivate-agent)."),
         ("port", "Free loopback port (default: next free from 8090)."),
         ("test-command", "Verification command for target repo; default detected from repo."),
-        ("system-packages", "Extra Debian packages for the toolchain layer, comma-separated (optionally name=version)."),
+        ("system-packages", "Extra Debian packages for the toolchain layer, comma-separated (optionally name=version); use none to clear, omit to preserve the saved list."),
         ("source-ref", "Pushed Mimir source ref (default: refs/heads/feature/plugins)."),
         ("source-repo", "Mimir source owner/name (default: " + DEFAULT_SOURCE_REPO + ")."),
     ):
@@ -997,7 +1001,8 @@ def dispatch(args: argparse.Namespace) -> int:
 def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verify) -> None:
     requested_packages = getattr(args, "system_packages", None)
     if requested_packages is not None:
-        system_packages = validate_system_packages(requested_packages.split(","))
+        system_packages = ([] if requested_packages.strip() == "none"
+                           else validate_system_packages(requested_packages.split(",")))
     _license_gate(args)
     repo = _field(args, "repo", "Target owner/name: find it in the GitHub repository URL; used for clone and policy.")
     branch = _field(args, "branch", "Base branch: select the repository's default branch on GitHub; used for PRs.", default="main")
@@ -1077,6 +1082,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     deploy.chmod(0o700)
     tag = "mimir-cultivate-root:" + sha
     layer_tag = "mimir-cultivate-agent:" + sha + "-" + kind + version.replace(".", "-")
+    # Fully generated from setup inputs: package and toolchain changes replace
+    # the previous layer, including any manual edits to this file.
     _write(deploy / "Dockerfile.toolchain", render_layer(kind, version, tag,
            nextest_version=nextest_version, uv_version=uv_version, system_packages=system_packages), replace=True)
     build_args = ["--build-arg MIMIR_GIT_REF=" + source_ref,

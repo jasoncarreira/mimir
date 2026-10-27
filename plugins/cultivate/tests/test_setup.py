@@ -200,15 +200,21 @@ def test_extra_system_packages_run_in_fail_closed_layer(kind):
 
 
 @pytest.mark.parametrize('bad', ['lsof; rm -rf /', '$(id)', 'LSOF', '', 'lsof,',
-                                 'lsof=1;id', 'a'])
+                                 'lsof=1;id', 'a', 'a,,b', 'lsof;id', 'lsof,  '])
 def test_invalid_system_packages_rejected_before_any_file_written(tmp_path, monkeypatch, bad):
     monkeypatch.setattr(installer, '_license_gate', lambda args: pytest.fail('license file written before validation'))
     deploy = tmp_path / 'deploy'
-    with pytest.raises(installer.SetupError, match='Invalid system packages'):
+    with pytest.raises(installer.SetupError, match='Invalid system package'):
         installer.setup(argparse.Namespace(system_packages=bad, deploy=str(deploy)))
     assert not list(tmp_path.iterdir())
-    with pytest.raises(installer.SetupError, match='Invalid system packages'):
+    with pytest.raises(installer.SetupError, match='Invalid system package'):
         installer.render_layer('node', '22.16.0', 'root:sha', system_packages=[bad])
+
+
+def test_system_package_whitespace_and_diagnostics():
+    assert installer.validate_system_packages('lsof, file'.split(',')) == ['lsof', 'file']
+    with pytest.raises(installer.SetupError, match="Invalid system package 'lsof;id'"):
+        installer.validate_system_packages(['file', 'lsof;id'])
 
 
 def test_base_image_installs_common_tools():
@@ -474,6 +480,25 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     with pytest.raises(installer.SetupError, match="pushed full"):
         installer.setup(args, request=unpushed, run=run, verify=lambda *a: None)
     assert len(calls) == before_calls
+
+    # Exercise real setup writes, not just the renderer: set, change, clear,
+    # and omit the flag after clearing. Both generated artifacts must agree
+    # after every transition, and the verification callback gets that list.
+    for requested, expected in [
+        ('lsof, file', ['lsof', 'file']),
+        ('unzip=6.0-28', ['unzip=6.0-28']),
+        ('none', []),
+        (None, []),
+    ]:
+        args.system_packages = requested
+        installer.setup(args, request=request, run=run, verify=lambda *a: verified.append(a))
+        assert json.loads((deploy / 'manifest.json').read_text())['system_packages'] == expected
+        layer = (deploy / 'Dockerfile.toolchain').read_text()
+        assert layer == installer.render_layer(
+            'node', '22.16.0', 'mimir-cultivate-root:' + SHA, system_packages=expected)
+        if not expected:
+            assert 'RUN set -eu; apt-get update' not in layer
+        assert verified[-1][-1] == expected
 
 
 @pytest.mark.parametrize('step', ['build', 'init', 'provision', 'up'])
