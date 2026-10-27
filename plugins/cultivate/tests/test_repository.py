@@ -321,3 +321,110 @@ async def test_provider_project_tests_run_fixed_command_in_contained_checkout(
     assert environment["GIT_CONFIG_KEY_0"] == "safe.directory"
     assert "GITHUB_TOKEN" not in environment
     assert projections == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner_kind", ["relative", "bare", "absolute"])
+async def test_repo_test_runner_executes_from_validated_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner_kind: str,
+) -> None:
+    from mimir_cultivate.contained_execution import CollectedExecutionResult
+
+    _origin, _source, _scope, state = _repo_scope_and_state(tmp_path)
+    root = state.checkout_lease.path
+    tools = root / "tools"
+    tools.mkdir()
+    script = tmp_path / "absolute-verify" if runner_kind == "absolute" else tools / "verify"
+    script.write_text('#!/bin/sh\npwd > "$1"\nprintf "%s\\n" "$@" >> "$1"\n')
+    script.chmod(0o755)
+    marker = tmp_path / "invoked"
+    if runner_kind == "bare":
+        # A bare name still uses the fixed system PATH, not tools/verify.
+        command = "git --version"
+    elif runner_kind == "absolute":
+        command = str(script)
+    else:
+        command = "./tools/verify"
+    home = tmp_path / "home"
+    _configure_worklink_test(home, f"{command} {marker} argument" if runner_kind != "bare" else command)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    calls = []
+
+    async def run(argv, capability, environment, projections, **kwargs):
+        calls.append(argv)
+        completed = subprocess.run(
+            argv, cwd=capability.path, env=environment, capture_output=True, check=False,
+        )
+        return CollectedExecutionResult(
+            completed.returncode, completed.stdout, completed.stderr, False, False, 0, 0,
+        )
+
+    def checkout(source, **kwargs):
+        return SimpleNamespace(
+            path=source, capability=SimpleNamespace(path=source), close=lambda: None,
+        )
+
+    result = await repository.RepoProjectTests(
+        state, runner=run, checkout_factory=checkout,
+    ).execute()
+    assert result.ok, result
+    assert len(calls) == 1
+    if runner_kind == "bare":
+        assert calls[0] == ("/usr/bin/git", "--version")
+        assert not marker.exists()
+    else:
+        assert calls[0] == (("./tools/verify" if runner_kind == "relative" else str(script)),
+                            str(marker), "argument")
+        assert marker.read_text().splitlines() == [str(root), str(marker), "argument"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "parent", "relative_symlink", "absolute_symlink", "directory", "nonexecutable", "missing",
+])
+async def test_repo_test_relative_runner_refuses_unresolvable_or_escaping_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    _origin, _source, _scope, state = _repo_scope_and_state(tmp_path)
+    root = state.checkout_lease.path
+    tools = root / "tools"
+    tools.mkdir()
+    marker = tmp_path / "invoked"
+    outside = root.parent / "outside-verify"
+    outside.write_text(f'#!/bin/sh\n: > "{marker}"\n')
+    outside.chmod(0o755)
+    runner_path = tools / "verify"
+    if case == "parent":
+        command = "../outside-verify"
+    else:
+        command = "./tools/verify"
+        if case == "relative_symlink":
+            runner_path.symlink_to("../../outside-verify")
+        elif case == "absolute_symlink":
+            runner_path.symlink_to(outside)
+        elif case == "directory":
+            runner_path.mkdir()
+        elif case == "nonexecutable":
+            runner_path.write_text(f'#!/bin/sh\n: > "{marker}"\n')
+            runner_path.chmod(0o644)
+    home = tmp_path / "home"
+    _configure_worklink_test(home, command)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    calls = []
+
+    async def forbidden(*args, **kwargs):
+        calls.append(args)
+        pytest.fail("refused runner must not execute")
+
+    def checkout(source, **kwargs):
+        pytest.fail("refused runner must not create a snapshot")
+
+    with pytest.raises(repository.ProjectTestRefusal) as error:
+        await repository.RepoProjectTests(
+            state, runner=forbidden, checkout_factory=checkout,
+        ).execute()
+    assert error.value.code == "test_command_unresolvable"
+    assert not error.value.execution_started
+    assert not calls and not marker.exists()

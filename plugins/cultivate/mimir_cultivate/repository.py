@@ -4057,6 +4057,7 @@ def _selector_matches(path: str, suite: RepositoryTestSuite) -> bool:
 
 def _configured_command(
     repo_slug: str, selectors: tuple[str, ...] = (), suite: str | None = None,
+    root: Path | None = None,
 ) -> tuple[tuple[str, ...], dict[str, str], str, str, bool]:
     """Resolve Worklink's deployment command into one shell-free fixed argv."""
     home = os.environ.get("MIMIR_HOME", "").strip()
@@ -4168,13 +4169,17 @@ def _configured_command(
         if "--" not in words:
             words.append("--")
     executable = Path(words[0])
+    relative_runner = not executable.is_absolute() and "/" in words[0]
     try:
-        resolved_text = (
-            str(executable.resolve(strict=True))
-            if executable.is_absolute()
-            else shutil.which(words[0], path=_PATH)
-        )
-    except OSError as exc:
+        if executable.is_absolute():
+            resolved_text = str(executable.resolve(strict=True))
+        elif relative_runner:
+            resolved_text = (
+                str((root / executable).resolve(strict=True)) if root is not None else None
+            )
+        else:
+            resolved_text = shutil.which(words[0], path=_PATH)
+    except (OSError, RuntimeError, ValueError) as exc:
         raise ProjectTestRefusal(
             "test_command_unresolvable",
             "configured test runner is unavailable",
@@ -4189,13 +4194,17 @@ def _configured_command(
     resolved = Path(resolved_text)
     try:
         resolved = resolved.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         raise ProjectTestRefusal(
             "test_command_unresolvable",
             "configured test runner is unavailable",
             execution_started=False,
         ) from exc
-    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+    if (
+        (relative_runner and (root is None or not resolved.is_relative_to(root)))
+        or not resolved.is_file()
+        or not os.access(resolved, os.X_OK)
+    ):
         raise ProjectTestRefusal(
             "test_command_unresolvable",
             "configured test runner is unavailable",
@@ -4504,7 +4513,7 @@ class RepoProjectTests:
             repository = scope.repository if retained else scope.canonical_repo
             issue = scope.issue_id if retained else scope.pr_number
             command, configured_env, command_source, suite_name, is_default = _configured_command(
-                repository, selectors, suite
+                repository, selectors, suite, root
             )
             selected = _validated_selectors(root, selectors, suite=suite_name)
         except ProjectTestRefusal as exc:
