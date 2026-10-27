@@ -118,7 +118,8 @@ def test_tainted_write_refusal_and_event_bound_source_identifiers(
     assert decision.reason == "write_blocked_by_untrusted_ingest"
     event = next(fields for name, fields in events if name == decision.reason)
     assert event["sources"] == [
-        {"domain": "filesystem" if index % 2 else "web", "resource_id": f"/source/{index}"}
+        {"domain": "filesystem" if index % 2 else "web", "source_kind": "channel",
+         "bridge_instance": None, "resource_id": f"/source/{index}"}
         for index in range(5)
     ]
     assert event["remaining_sources"] == 2

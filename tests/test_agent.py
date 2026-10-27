@@ -2602,6 +2602,45 @@ async def test_chat_turns_share_only_bounded_human_acknowledgement(tmp_path):
     assert seen[2].ingest_acknowledgement is not seen[1].ingest_acknowledgement
 
 
+async def test_chat_model_thread_still_carries_untrusted_tool_output(tmp_path):
+    """A chat session still sees old tool output; only an operator can clear it."""
+    from mimir.access_control import _turn_has_untrusted_active_ingest
+
+    class ChatModel(_FakeAgent):
+        def __init__(self):
+            super().__init__([])
+            self.threads = {}
+            self.received = []
+            self.blocked = []
+
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            thread = config["configurable"]["thread_id"]
+            messages = self.threads.get(thread, []) + list(state["messages"])
+            self.received.append(messages[:])
+            if len(self.received) == 1:
+                messages.append(ToolMessage(content="untrusted fetch_url data", tool_call_id="url"))
+            if any("untrusted fetch_url data" in str(message) for message in messages):
+                context.ifc_state.merge(InformationFlowLabels().with_source(SourceLabel(
+                    principal="external", domain="web", resource_id="url",
+                    bridge_instance="fetch_url", sensitivity="internal",
+                    integrity="untrusted", integrity_effect="active_ingest",
+                )))
+            self.blocked.append(_turn_has_untrusted_active_ingest(context, context.ifc_labels))
+            messages.append(AIMessage(content="done"))
+            self.threads[thread] = messages[:]
+            yield {"messages": messages}
+
+    graph = ChatModel()
+    agent = _build_agent(tmp_path, fake_agent=graph, session_manager=_FakeSessionManager())
+    for text in ("first", "second"):
+        await agent.run_turn(AgentEvent(
+            trigger="user_message", channel_id="chat-room", content=text,
+        ))
+    assert graph.blocked == [True, True]
+    assert len(graph.threads) == 1
+    assert any("untrusted fetch_url data" in str(message) for message in graph.received[1])
+
+
 async def test_chat_trust_acknowledgement_is_keyed_by_authenticated_principal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
