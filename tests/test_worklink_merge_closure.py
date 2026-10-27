@@ -131,7 +131,7 @@ def forge(issue_id: int, *, body: str | None = None, state: str = "closed", merg
     payload = {
         "number": 42,
         "html_url": PR_URL,
-        "body": body if body is not None else f"Closes chainlink #{issue_id}.\n\nWorklink evidence.",
+        "body": body if body is not None else f"Closes chainlink-{issue_id}.\n\nWorklink evidence.",
         "state": state,
         "merged": merged,
         "merged_at": MERGED_AT if merged else None,
@@ -458,16 +458,17 @@ def test_closed_issue_sweep_bounds_retirements_and_tracker_calls(
 
 
 @pytest.mark.parametrize("body", [
-    "Closes chainlink #1295.\n\nCloses chainlink #1295.",
-    "Closes chainlink #1295.\n\nThis is partial.",
-    "Closes chainlink #1295.\n\nDo not close yet.",
-    "> Closes chainlink #1295.",
-    "- Closes chainlink #1295.",
-    "```\nCloses chainlink #1295.\n```",
-    "Closes chainlink #1295.\n\nFixes #7",
-    "Closes chainlink #1295.\n\nRefs follow-up",
-    "Closes chainlink #1295.\x00",
-    "Closes chainlink #1295.\u200b",
+    "Closes chainlink-1295.\n\nCloses chainlink-1295.",
+    "Closes chainlink-1295.\n\nThis is partial.",
+    "Closes chainlink-1295.\n\nDo not close yet.",
+    "> Closes chainlink-1295.",
+    "- Closes chainlink-1295.",
+    "```\nCloses chainlink-1295.\n```",
+    "Closes chainlink-1295.\n\nFixes #7",
+    "Closes chainlink-1295.\n\nRefs follow-up",
+    "Closes chainlink-1295.\x00",
+    "Closes chainlink-1295.\u200b",
+    "Closes chainlink #1295.",
 ])
 def test_completion_grammar_negative_variants(body: str) -> None:
     assert not closure.parse_completion_reference(body, expected_issue_id=1295).qualifies
@@ -480,7 +481,7 @@ def test_stack_and_epic_body_language_refuses_at_reconciler_boundary(
     home, repo = configured_home(tmp_path, monkeypatch)
     evidence(home, 1295)
     tracker = Tracker(1295)
-    body = f"Closes chainlink #1295.\n\nThis {refusal_word} is ready."
+    body = f"Closes chainlink-1295.\n\nThis {refusal_word} is ready."
 
     assert closure.reconcile_merged_leaves(
         home, chainlink_runner=tracker, gh_runner=forge(1295, body=body),
@@ -620,7 +621,7 @@ def test_unrelated_open_issue_is_silently_excluded(
 @pytest.mark.parametrize("body", [
     "Completes #10.",
     "PR #10 is done.",
-    "Closes chainlink #11.",
+    "Closes chainlink-11.",
 ])
 def test_number_collision_and_inferred_sources(body: str) -> None:
     assert not closure.parse_completion_reference(body, expected_issue_id=10).qualifies
@@ -742,7 +743,7 @@ def test_foreign_pr_or_base_repository_refuses_without_tracker_mutation(
     payload = {
         "number": 42,
         "html_url": pr_url,
-        "body": f"Closes chainlink #{issue_id}.",
+        "body": f"Closes chainlink-{issue_id}.",
         "state": "closed",
         "merged": True,
         "merged_at": MERGED_AT,
@@ -1633,7 +1634,7 @@ def test_reconciler_rejects_non_integer_pr_identity_without_tracker_mutation(
     payload = {
         "number": number_value,
         "html_url": pr_url,
-        "body": f"Closes chainlink #{issue_id}.",
+        "body": f"Closes chainlink-{issue_id}.",
         "state": "closed",
         "merged": True,
         "merged_at": MERGED_AT,

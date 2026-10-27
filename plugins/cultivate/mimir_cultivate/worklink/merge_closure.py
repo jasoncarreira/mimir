@@ -36,7 +36,7 @@ _PR_URL = re.compile(
     r"https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/"
     r"pull/(?P<number>[1-9][0-9]*)/?"
 )
-_COMPLETION = re.compile(r"Closes chainlink #([1-9][0-9]*)\.", re.IGNORECASE)
+_COMPLETION = re.compile(r"Closes chainlink-([1-9][0-9]*)\.", re.IGNORECASE)
 _CLOSING_CLAUSE = re.compile(
     r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\b"
     r"(?:\s*:\s*|\s+)(?:#\d+|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+|"
