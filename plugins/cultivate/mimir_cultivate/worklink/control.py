@@ -408,6 +408,13 @@ def stop_worklink(
                 label_cleared=unlabel.returncode == 0,
                 reason="; ".join(problems) or None,
             )
+        if state.phase == "ci_wait":
+            if not process_identity_verified(state):
+                return WorklinkStopResult(issue_id, False, reason="CI waiter identity could not be verified")
+            _mark_operator_stop(home, issue_id, state.attempt)
+            # The live controller will record stopped, release its claim and
+            # leave the published draft intact. Never signal the controller.
+            return WorklinkStopResult(issue_id, True)
         if state.phase != "spawned":
             return WorklinkStopResult(issue_id, False, reason="no live run")
         if not process_identity_verified(state):

@@ -36,6 +36,8 @@ class RepositoryConfig:
     test_suites: tuple[RepositoryTestSuite, ...] = ()
     worklink_base: Path | None = None
     review_tests: str = "full"
+    worklink_gate: str = "local"
+    quick_gate_command: str | None = None
 
 
 @dataclass(frozen=True)
@@ -270,6 +272,15 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
         test_command = item.get("test_command")
         if test_command is not None and not isinstance(test_command, str):
             raise ValueError(f"{label}.test_command must be a string or null")
+        worklink_gate = item.get("worklink_gate", "local")
+        if type(worklink_gate) is not str or worklink_gate not in ("local", "ci"):
+            raise ValueError(f"{label}.worklink_gate must be 'local' or 'ci'")
+        quick_gate_command = item.get("quick_gate_command")
+        if quick_gate_command is not None and (
+            worklink_gate != "ci" or not isinstance(quick_gate_command, str)
+            or not quick_gate_command.strip()
+        ):
+            raise ValueError(f"{label}.quick_gate_command requires ci mode and a non-empty string")
         test_suites = _parse_test_suites(
             item.get("test_suites", []), f"{label}.test_suites", test_command,
         )
@@ -280,7 +291,7 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
             _parse_absolute_root(item["worklink_base"], f"{label}.worklink_base")
             if "worklink_base" in item else None
         )
-        if set(item) - {"slug", "root", "mode", "origin", "base_branch", "test_command", "test_suites", "worklink_base", "review_tests"}:
+        if set(item) - {"slug", "root", "mode", "origin", "base_branch", "test_command", "test_suites", "worklink_base", "review_tests", "worklink_gate", "quick_gate_command"}:
             raise ValueError(f"{label} contains unknown fields")
         if slug in slugs:
             raise ValueError(f"duplicate repository slug: {slug}")
@@ -299,6 +310,8 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
                 test_suites=test_suites,
                 worklink_base=worklink_base,
                 review_tests=review_tests,
+                worklink_gate=worklink_gate,
+                quick_gate_command=quick_gate_command,
             )
         )
     return tuple(repositories)
