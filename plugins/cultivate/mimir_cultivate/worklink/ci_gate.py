@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from io import BytesIO
 import json
 import re
 import subprocess
@@ -11,6 +12,7 @@ import time
 from typing import Callable, Mapping
 
 from mimir.redaction import redact_text
+from mimir_cultivate.ci import capture_job_log, clean_log_tail
 from mimir_cultivate.review_checks import approval_blocker
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -39,6 +41,34 @@ def _head(run: Runner, pr_url: str) -> str:
     if not isinstance(data, dict) or data.get("state") != "OPEN" or data.get("isDraft") is not True:
         raise RuntimeError("draft PR is no longer open and draft")
     return str(data.get("headRefOid", ""))
+
+
+def _actions_job(run: Runner, repo: str, sha: str, check: Mapping) -> int:
+    """Treat details_url only as a hint; attest job/run/head before use."""
+    url = check.get("details_url")
+    match = re.fullmatch(
+        rf"https://github\.com/{re.escape(repo)}/actions/runs/([1-9][0-9]*)/job/([1-9][0-9]*)",
+        url, re.I,
+    ) if isinstance(url, str) else None
+    if not match or check.get("head_sha") != sha or check.get("status") != "completed":
+        raise RuntimeError("unsupported Actions URL or mismatched check head")
+    run_id, job_id = map(int, match.groups())
+    job = _json(run, ["gh", "api", f"repos/{repo}/actions/jobs/{job_id}"])
+    workflow = _json(run, ["gh", "api", f"repos/{repo}/actions/runs/{run_id}"])
+    if (
+        not isinstance(job, Mapping) or not isinstance(workflow, Mapping)
+        or job.get("id") != job_id or job.get("run_id") != run_id
+        or workflow.get("id") != run_id
+        or job.get("head_sha") != sha or workflow.get("head_sha") != sha
+        or job.get("status") != "completed"
+        or job.get("conclusion") != check.get("conclusion")
+        or not isinstance(workflow.get("repository"), Mapping)
+        or not isinstance(workflow.get("head_repository"), Mapping)
+        or str(workflow["repository"].get("full_name", "")).lower() != repo.lower()
+        or str(workflow["head_repository"].get("full_name", "")).lower() != repo.lower()
+    ):
+        raise RuntimeError("Actions job/run repository or immutable head binding unavailable")
+    return job_id
 
 
 def _snapshot(run: Runner, repo: str, pr_url: str, sha: str) -> CIResult:
@@ -87,16 +117,30 @@ def _snapshot(run: Runner, repo: str, pr_url: str, sha: str) -> CIResult:
     if blocker is None:
         return CIResult("green", "CI green", names)
     failed = [row for row in checks if isinstance(row, Mapping) and row.get("conclusion") not in ("success", "neutral", "skipped")]
-    excerpt = redact_text("\n".join(
-        f"{row.get('name', '')}: {str(row.get('output', {}).get('summary', ''))[:1000]} "
-        f"{str(row.get('output', {}).get('text', ''))[:1000]}"
-        for row in failed if isinstance(row.get("output"), Mapping)
-    ))[:4000]
-    infra = [row for row in failed if row.get("conclusion") == "startup_failure" or re.search(
-        r"(?:registry.*429|toomanyrequests)", str(row.get("output", {})), re.I
-    )]
-    ids = tuple(row["id"] for row in infra if type(row.get("id")) is int and row["id"] > 0)
-    return CIResult("infrastructure" if infra else "red", blocker, names, excerpt, ids)
+    excerpts: list[str] = []
+    ids: list[int] = []
+    infrastructure = any(row.get("conclusion") == "startup_failure" for row in failed)
+    for row in failed[:3]:
+        label = redact_text(clean_log_tail(BytesIO(str(row.get("name", "")).encode()), 200).decode())
+        try:
+            job_id = _actions_job(run, repo, sha, row)
+            tail, error = capture_job_log(repo, job_id, token="", timeout=15, limit=2048)
+            text = redact_text(clean_log_tail(BytesIO(tail), 2048).decode())
+            excerpts.append(f"{label}:\n{text}" if text else f"{label}: CI log limitation: {error}")
+            if row.get("conclusion") == "startup_failure" or re.search(
+                r"(?:registry.*429|toomanyrequests)", text, re.I,
+            ):
+                infrastructure = True
+                ids.append(job_id)
+        except (RuntimeError, ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError):
+            excerpts.append(f"{label}: CI log limitation: verified Actions job evidence unavailable")
+    if len(failed) > 3:
+        excerpts.append("CI log limitation: additional failed jobs omitted")
+    if _head(run, pr_url) != sha:
+        return CIResult("moved", "PR head moved by another actor")
+    # Keep these explicitly delimited as data when inserted into a repair prompt.
+    excerpt = json.dumps("\n".join(excerpts)[:3800], ensure_ascii=False)[:4000]
+    return CIResult("infrastructure" if infrastructure else "red", blocker, names, excerpt, tuple(dict.fromkeys(ids)))
 
 
 async def wait_for_ci(
@@ -123,11 +167,23 @@ async def wait_for_ci(
 async def rerun_infrastructure(run: Runner, repo: str, pr_url: str, sha: str, ids: tuple[int, ...]) -> bool:
     if not ids or not _SLUG.fullmatch(repo) or not _SHA.fullmatch(sha):
         return False
-    for run_id in ids:
-        if await asyncio.to_thread(_head, run, pr_url) != sha:
+    for job_id in dict.fromkeys(ids):
+        if type(job_id) is not int or job_id <= 0:
             return False
-        result = await asyncio.to_thread(run, ["gh", "api", "-X", "POST", f"repos/{repo}/check-runs/{run_id}/rerequest"], timeout=30)
-        if result.returncode != 0:
+        try:
+            job = await asyncio.to_thread(_json, run, ["gh", "api", f"repos/{repo}/actions/jobs/{job_id}"])
+            if not isinstance(job, Mapping) or type(job.get("run_id")) is not int:
+                return False
+            await asyncio.to_thread(_actions_job, run, repo, sha, {
+                "details_url": f"https://github.com/{repo}/actions/runs/{job['run_id']}/job/{job_id}",
+                "head_sha": sha, "status": "completed", "conclusion": job.get("conclusion"),
+            })
+            if await asyncio.to_thread(_head, run, pr_url) != sha:
+                return False
+            result = await asyncio.to_thread(run, ["gh", "api", "-X", "POST", f"repos/{repo}/actions/jobs/{job_id}/rerun"], timeout=30)
+            if result.returncode != 0:
+                return False
+        except (RuntimeError, ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError):
             return False
     return True
 
