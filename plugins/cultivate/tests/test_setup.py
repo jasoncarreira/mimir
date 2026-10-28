@@ -717,8 +717,8 @@ def upgrade_setup(tmp_path, monkeypatch):
               'owner_email': 'owner@example.com', 'deploy': str(deploy),
               'model_spec': 'openai:model', 'saga_model_spec': 'openai:model',
               'embedding': 'openai:model', 'source_ref': 'refs/heads/feature/plugins',
-                  'source_repo': 'org/mimir', 'test_command': 'npm test',
-                  'review_tests': 'targeted', 'port': '8123'}
+              'source_repo': 'org/mimir', 'test_command': 'npm test',
+              'review_tests': 'targeted', 'port': '8123'}
     monkeypatch.setattr(installer, '_field', lambda args, name, *a, **kw: fields[name])
     monkeypatch.setattr(installer, '_secret', lambda *a, **kw: 'secret')
     monkeypatch.setattr(installer, 'validate_token', lambda *a: None)
@@ -782,7 +782,9 @@ def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrad
     assert any('compose.provision.yml' in argv for argv in calls)
     assert any(argv[-3:] == ['up', '-d', 'agent'] for argv in calls)
     import hashlib
-    hashes = json.loads((deploy / 'manifest.json').read_text())['generated_sha256']
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert manifest['review_tests'] == 'targeted'
+    hashes = manifest['generated_sha256']
     assert set(hashes) == {'compose.yml', 'provision.py', 'compose.provision.yml', '.gitignore'}
     assert all(hashes[name] == hashlib.sha256((deploy / name).read_bytes()).hexdigest() for name in hashes)
 

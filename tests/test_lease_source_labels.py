@@ -3499,7 +3499,7 @@ def test_lease_path_symlink_escape_is_untrusted(
 
 
 @pytest.mark.usefixtures("selected_repository_policy")
-def test_lease_repository_sources_only_flow_to_their_own_forge_scope(
+def test_trusted_lease_repository_sources_flow_across_forge_scopes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3542,8 +3542,7 @@ def test_lease_repository_sources_only_flow_to_their_own_forge_scope(
         "repo_push", "other/repo", labels, other, enforce=True,
         repo_pr_action_scope=other.repo_pr_action_scope,
     )
-    assert other_decision.allowed is False
-    assert other_decision.reason == "ifc_label_blocked:forge"
+    assert other_decision.allowed is True, other_decision.reason
 
     for tool_name, target in (
         ("post_message", "channel-2"),

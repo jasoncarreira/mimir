@@ -6602,6 +6602,16 @@ _REPOSITORY_RESULT_RESOURCE = re.compile(
 )
 
 
+def _trusted_forge_repository_source(source: Any) -> bool:
+    """Author-attested repository content needs no destination scope binding."""
+    return (
+        source.domain == "repository"
+        and source.domain_qualifier is None
+        and source.integrity == "trusted"
+        and source.is_complete
+    )
+
+
 def _forge_repository_scope_mismatch(
     ifc_labels: Any,
     scope: Any,
@@ -6651,6 +6661,8 @@ def _forge_repository_scope_mismatch(
         return repo, pr, component
 
     for source in getattr(ifc_labels, "sources", ()):
+        if _trusted_forge_repository_source(source):
+            continue
         if (
             getattr(source, "domain", None) != "repository"
             or getattr(source, "domain_qualifier", None) is not None
@@ -7837,8 +7849,20 @@ class SinkGate:
             and bool(sources)
             and all(
                 (
-                    source.domain == "repository"
-                    and source.domain_qualifier is None
+                    (source.domain == "repository" and source.domain_qualifier is None)
+                    or (
+                        service is not None
+                        and service.trigger == "poller"
+                        and service.authority_profile == "github"
+                        and source.domain == "channel"
+                        and source.domain_qualifier is None
+                        and source.source_kind == "service"
+                        and source.bridge_instance == "poller"
+                        and source.resource_id == triggering_channel
+                        and source.principal == f"service:{service.canonical}"
+                        and source.integrity == "trusted"
+                        and source.is_complete
+                    )
                 )
                 or (
                     _is_registered_retained_scope(repo_pr_action_scope)
@@ -7876,12 +7900,9 @@ class SinkGate:
                 ) is None
             )
         ):
-            # Repository command output may flow only back to the immutable
-            # PR/head scope from which it was produced. An interactive forge turn
-            # also carries its authenticated operator ingress. Use the resolved
-            # per-call scope: discovery need not populate the turn's scope slot.
-            # Check ingress per source, not global taint: repository reads are
-            # active ingestion, but this allowance bounds only this PR sink.
+            # Trusted GitHub poller ingress and author-attested repository results
+            # flow without source scope binding. Other repository results remain
+            # bounded by the PR/head scope; authorization of the action is separate.
             return frozenset({target})
         is_triggering_channel_reply = (
             service is not None

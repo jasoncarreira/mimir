@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import shlex
 import sys
+from dataclasses import replace
 
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
@@ -13,6 +14,7 @@ import pytest
 
 from github_poller_test_support import poller
 from mimir import access_control
+from mimir.models import SourceLabel
 from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
 from mimir_cultivate.policy import RepoPRAction, RepoPRScopeProvenance
@@ -280,7 +282,7 @@ async def test_emitted_json_through_framework_attestation_and_checkout_grant(
         captured.append(event)
         return True
 
-    async def fire(item, directory):
+    async def fire(item, directory, *, trusted=True):
         # Replay the skill's actual JSON line through the real subprocess parser.
         script.write_text(f"print({json.dumps(item)!r})\n", encoding="utf-8")
         cfg = framework.PollerConfig(
@@ -292,18 +294,23 @@ async def test_emitted_json_through_framework_attestation_and_checkout_grant(
         assert await framework.run_poller(cfg, enqueue=enqueue) == 1
         event = captured.pop()
         [attested] = event.extra["items"]
-        assert attested["actor"] == "collaborator"
-        assert attested["author_is_trusted"] is True
-        assert all(source.integrity == "trusted" for source in event.ifc_labels.sources)
+        if trusted:
+            assert attested["actor"] == "collaborator"
+            assert attested["author_is_trusted"] is True
+        else:
+            assert attested["author_is_trusted"] is False
+        assert all(source.integrity == ("trusted" if trusted else "untrusted")
+                   for source in event.ifc_labels.sources)
         auth = access_control.create_auth_context(
             event, enforce=True, policy=selected, ifc_labels=event.ifc_labels,
         )
         scope = auth.repo_pr_action_scope
-        assert scope is not None
-        assert scope.provenance == RepoPRScopeProvenance.POLLER_PAYLOAD
-        assert {action.value for action in (
-            RepoPRAction.WRITE, RepoPRAction.COMMIT, RepoPRAction.PUSH,
-        )} <= scope.allowed_operations
+        if trusted:
+            assert scope is not None
+            assert scope.provenance == RepoPRScopeProvenance.POLLER_PAYLOAD
+            assert {action.value for action in (
+                RepoPRAction.WRITE, RepoPRAction.COMMIT, RepoPRAction.PUSH,
+            )} <= scope.allowed_operations
         return auth
 
     with policy_scope(selected):
@@ -348,15 +355,32 @@ async def test_emitted_json_through_framework_attestation_and_checkout_grant(
             auth, "cultivate", RepoPRAction.CHECKOUT, selected.scoped_actions["cultivate"],
             scope, state, tool_name="repo_checkout",
         )
-        # Do not hide the independent ingress-to-forge gap: the framework's
-        # trusted channel source is not currently an allowed forge source.
-        # The scoped grant exists, but production checkout still fails IFC.
         checkout = registry.authorize_tool(
             "repo_checkout", auth, arguments=args, enforce=True, policy=selected,
         )
-        assert not checkout.allowed and checkout.reason == "ifc_label_blocked:forge"
-        # Exercise the real post-checkout grant lifecycle separately. This is
-        # not evidence that production repo_checkout was admitted above.
+        assert checkout.allowed, checkout.reason
+        # A separate, author-attested repository result from another PR (or
+        # repository) is trusted even though its source scope differs.
+        origin = auth.ifc_labels.sources[0]
+        foreign = SourceLabel(
+            principal=origin.principal, domain="repository",
+            resource_id=f"other/repo#pull/999@{'f' * 40}",
+            bridge_instance="forge", sensitivity="internal",
+            authorized_principals=origin.authorized_principals,
+            source_kind="protected_tool", integrity="trusted",
+            integrity_effect="active_ingest",
+        )
+        auth.ifc_state.merge(auth.ifc_labels.with_source(foreign).with_source(replace(
+            foreign, resource_id=f"{REPO}#pull/999@{'e' * 40}",
+        )))
+        for name in ("repo_checkout", "pr_comments", "pr_submit_review", "repo_commit", "repo_push"):
+            sink = access_control.SinkGate.check_sink_flow(
+                name, f"{REPO}#pull/372@{scope.observed_head_sha}:{scope.scope_id}",
+                auth.ifc_state.current(), auth, enforce=True,
+                repo_pr_action_scope=scope, sink_category=access_control.SinkCategory.FORGE,
+            )
+            assert sink.allowed, (name, sink.reason)
+        # Exercise the real post-checkout grant lifecycle.
         token = access_control.consume_scoped_pr_checkout(auth, scope, "cultivate")
         assert token is not None
         lease = create_pr_checkout_lease(
@@ -375,5 +399,37 @@ async def test_emitted_json_through_framework_attestation_and_checkout_grant(
             assert executed == ["pr_comments"]
         finally:
             lease.revoke()
+        # An untrusted repository result from another PR cannot piggyback on
+        # trusted poller ingress or on the preceding trusted repository result.
+        auth.ifc_state.merge(auth.ifc_labels.with_source(replace(
+            foreign, integrity="untrusted", resource_id=f"{REPO}#pull/998@{'d' * 40}",
+        )))
+        denied = access_control.SinkGate.check_sink_flow(
+            "repo_checkout", f"{REPO}#pull/372@{scope.observed_head_sha}:{scope.scope_id}",
+            auth.ifc_state.current(), auth, enforce=True, repo_pr_action_scope=scope,
+            sink_category=access_control.SinkCategory.FORGE,
+        )
+        assert not denied.allowed and denied.reason == "ifc_label_blocked:forge"
     expected_calls = [content_endpoint, f"repos/{REPO}/collaborators/collaborator"]
     assert api_calls == expected_calls * (1 if kind == "pr_review" else 2)
+    if kind == "issue_comment":
+        # Both an outsider verdict and an unavailable attestation keep the
+        # poller event's active-ingest source untrusted at the forge boundary.
+        for verdict in (404, 503):
+            def untrusted_http(endpoint, token, **kwargs):
+                if endpoint == content_endpoint:
+                    return 200, {"user": {"login": "outsider"}}
+                assert endpoint in {
+                    f"repos/{REPO}/collaborators/outsider",
+                    "orgs/owner/memberships/outsider",
+                }
+                return verdict, None
+
+            monkeypatch.setattr(framework, "_github_api_attestation", untrusted_http)
+            tainted = await fire(payload, tmp_path / f"untrusted-{verdict}", trusted=False)
+            decision = access_control.SinkGate.check_sink_flow(
+                "repo_checkout", f"{REPO}#pull/372@{scope.observed_head_sha}:{scope.scope_id}",
+                tainted.ifc_labels, tainted, enforce=True, repo_pr_action_scope=scope,
+                sink_category=access_control.SinkCategory.FORGE,
+            )
+            assert not decision.allowed and decision.reason == "ifc_label_blocked:forge"
