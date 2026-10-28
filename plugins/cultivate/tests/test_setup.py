@@ -887,43 +887,118 @@ def test_previous_provision_compose_refuses_missing_nonliteral_or_ambiguous(sour
         installer._previous_provision_compose(source, {})
 
 
-def test_upgrade_legacy_inline_provision_compose(upgrade_setup, legacy_source, monkeypatch):
-    """Synthetic integration coverage; authentic historical snapshot still required."""
+@pytest.fixture
+def historical_8af14772_deployment(upgrade_setup, monkeypatch):
+    """Seed real historical output independently of the recovery code under test."""
     import ast
+
     deploy, args, state, calls, invoke = upgrade_setup
+    previous_sha = '8af1477265c0c7066c99f1d588956a6894122d43'
+    data = Path(__file__).parent / 'data' / 'legacy-8af14772'
+    sources = {
+        'plugins/cultivate/mimir_cultivate/setup.py': (data / 'setup.py.txt').read_text(),
+        'mimir/scaffold_docker.py': (data / 'scaffold_docker.py.txt').read_text(),
+    }
+    setup_tree, scaffold_tree = (ast.parse(source) for source in sources.values())
+    # Compile only the snapshot's renderers and literal constants, never import
+    # either historical module or call _previous_generated to create its oracle.
+    namespace = {'re': re, 'yaml': yaml, 'SetupError': installer.SetupError}
+    for tree, names in [
+        (setup_tree, {'_PROVISION'}),
+        (scaffold_tree, {'_COMPOSE_YML_TEMPLATE_PYPI', '_DEFAULT_MODE', '_MODES'}),
+    ]:
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id in names:
+                        namespace[target.id] = ast.literal_eval(node.value)
+    for tree, name in [(scaffold_tree, 'render_compose_yml'), (setup_tree, 'render_compose')]:
+        function, = [node for node in tree.body
+                     if isinstance(node, ast.FunctionDef) and node.name == name]
+        module = ast.Module(body=[ast.ImportFrom(
+            module='__future__', names=[ast.alias(name='annotations')], level=0), function],
+            type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(data / name), 'exec'), namespace)
+    # This exact literal is the snapshot's inline writer, not today's constant.
+    historical_provision_compose = (
+        'services:\n  agent:\n    volumes:\n'
+        '      - ./provision.py:/opt/cultivate-provision.py:ro\n'
+        '      - ./manifest.json:/opt/cultivate-manifest.json:ro\n')
+    historical_setup, = [node for node in setup_tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == 'setup']
+    writer, = [node for node in ast.walk(historical_setup)
+               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == '_write'
+               and ast.unparse(node.args[0]) == "deploy / 'compose.provision.yml'"]
+    assert ast.literal_eval(writer.args[1]) == historical_provision_compose
+    assert not any(isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == '_PROVISION_COMPOSE'
+                           for target in node.targets) for node in setup_tree.body)
+    manifest_path = deploy / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text())
+    layer_tag = f'mimir-cultivate-agent:{previous_sha}-node22-16-0'
+    scaffold = namespace['render_compose_yml'](service_name='agent', web_port=8123, mode='pypi')
+    historical = {
+        'compose.yml': namespace['render_compose'](
+            scaffold, layer_tag, manifest['toolchain'], manifest['slug'].split('/')[1]),
+        'provision.py': namespace['_PROVISION'],
+        'compose.provision.yml': historical_provision_compose,
+        '.gitignore': '*\n',
+    }
+    for name, text in historical.items():
+        (deploy / name).write_text(text)
+    build = deploy / 'build.sh'
+    build.write_text(build.read_text().replace(SHA, previous_sha))
+    # Real pre-upgrade manifests had none of these later bookkeeping fields.
+    for key in ('generated_sha256', 'source_sha', 'layer_tag'):
+        manifest.pop(key, None)
+    manifest_path.write_text(json.dumps(manifest))
     original_content = installer._content
+    fetched = []
 
     def content(slug, branch, path, token, request):
-        source = original_content(slug, branch, path, token, request)
-        if branch == SHA and path == 'plugins/cultivate/mimir_cultivate/setup.py':
-            tree = ast.parse(source)
-            assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
-                              and any(isinstance(target, ast.Name) and target.id == '_PROVISION_COMPOSE'
-                                      for target in node.targets))
-            lines = source.splitlines(keepends=True)
-            del lines[assignment.lineno - 1:assignment.end_lineno]
-            source = ''.join(lines).replace(
-                '"compose.provision.yml": _PROVISION_COMPOSE}',
-                '"compose.provision.yml": ' + repr(installer._PROVISION_COMPOSE) + '}')
-            source = source.replace(
-                '    generated = {"compose.yml": compose,',
-                '    _write(deploy / "compose.provision.yml", ' + repr(installer._PROVISION_COMPOSE) + ')\n'
-                '    generated = {"compose.yml": compose,')
-        return source
+        if branch == previous_sha:
+            fetched.append(path)
+            return sources[path]
+        return original_content(slug, branch, path, token, request)
 
     monkeypatch.setattr(installer, '_content', content)
-    (deploy / 'provision.py').write_text(legacy_source)
-    compose = deploy / 'compose.yml'
-    compose.write_text(compose.read_text().replace('MIMIR_ACP_ENABLED: \'1\'', 'MIMIR_ACP_ENABLED: \'0\''))
-    manifest = json.loads((deploy / 'manifest.json').read_text())
-    del manifest['generated_sha256']
-    (deploy / 'manifest.json').write_text(json.dumps(manifest))
     state['sha'] = 'c' * 40
-    invoke()
+    return deploy, args, state, calls, invoke, historical, fetched
+
+
+def test_upgrade_legacy_inline_provision_compose(historical_8af14772_deployment):
+    deploy, args, state, calls, invoke, historical, fetched = historical_8af14772_deployment
+    before = {name: (deploy / name).read_text() for name in historical}
+    assert before == historical
+    assert historical['provision.py'] != installer._PROVISION
+    assert '8af1477265c0c7066c99f1d588956a6894122d43' in before['compose.yml']
     assert not args.force
+    invoke()
+    assert set(fetched) == {'plugins/cultivate/mimir_cultivate/setup.py', 'mimir/scaffold_docker.py'}
     assert state['sha'] in (deploy / 'compose.yml').read_text()
     assert (deploy / 'provision.py').read_text() == installer._PROVISION
-    assert json.loads((deploy / 'manifest.json').read_text())['generated_sha256']
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert manifest['source_sha'] == state['sha']
+    assert manifest['generated_sha256'] == {
+        name: installer._digest((deploy / name).read_text()) for name in historical}
+    assert any(argv[:2] == ['docker', 'build'] for argv in calls)
+
+
+def test_upgrade_legacy_8af14772_one_byte_provision_compose_edit_is_refused(
+        historical_8af14772_deployment):
+    deploy, args, state, calls, invoke, historical, fetched = historical_8af14772_deployment
+    path = deploy / 'compose.provision.yml'
+    path.write_bytes(path.read_bytes() + b'x')
+    before = {p.name: p.read_bytes() for p in deploy.iterdir() if p.is_file()}
+    assert len(path.read_bytes()) == len(historical['compose.provision.yml'].encode()) + 1
+    assert not args.force
+    with pytest.raises(installer.SetupError, match=r'compose\.provision\.yml already differs'):
+        invoke()
+    assert set(fetched) == {'plugins/cultivate/mimir_cultivate/setup.py', 'mimir/scaffold_docker.py'}
+    assert not calls
+    assert {p.name: p.read_bytes() for p in deploy.iterdir() if p.is_file()} == before
 
 
 def test_upgrade_legacy_unedited_generated_files(upgrade_setup, legacy_source):
