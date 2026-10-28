@@ -8,7 +8,6 @@ import json
 import os
 import re
 import subprocess
-import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,23 +35,6 @@ _PR_URL = re.compile(
     r"https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/"
     r"pull/(?P<number>[1-9][0-9]*)/?"
 )
-_COMPLETION = re.compile(r"Closes chainlink-([1-9][0-9]*)\.", re.IGNORECASE)
-_CLOSING_CLAUSE = re.compile(
-    r"\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\b"
-    r"(?:\s*:\s*|\s+)(?:#\d+|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+|"
-    r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/\d+)",
-    re.IGNORECASE,
-)
-_FORBIDDEN_WORDS = (
-    "no", "not", "never", "don't", "doesn't", "cannot", "can't", "won't",
-    "partial", "partially", "incomplete", "unfinished", "remaining",
-    "remaining-work", "follow-up", "followup", "todo", "wip", "refs",
-    "stack", "stacked", "epic",
-)
-_FORBIDDEN = re.compile(
-    r"(?<![\w-])(?:" + "|".join(re.escape(word) for word in _FORBIDDEN_WORDS) + r")(?![\w-])",
-    re.IGNORECASE,
-)
 _EVIDENCE_NAME = re.compile(r"(?P<issue>[1-9][0-9]*)-(?P<attempt>[1-9][0-9]*)\.json")
 _SHA = re.compile(r"[0-9a-fA-F]{7,64}")
 _COMPETING_LABELS = frozenset({"worklink:ready", "worklink:in-progress", "worklink:blocked"})
@@ -74,12 +56,6 @@ class IssueSnapshot:
     @property
     def is_open(self) -> bool:
         return self.status == "open"
-
-
-@dataclass(frozen=True)
-class CompletionDecision:
-    qualifies: bool
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -267,28 +243,6 @@ def parse_issue_snapshot(payload: object, *, expected_issue_id: int) -> IssueSna
     return IssueSnapshot(expected_issue_id, normalized_status, frozenset(labels), tuple(comments), parent_id)
 
 
-def parse_completion_reference(body: str, *, expected_issue_id: int) -> CompletionDecision:
-    if not isinstance(body, str):
-        return CompletionDecision(False, "missing_pr_body")
-    for character in body:
-        category = unicodedata.category(character)
-        if category == "Cf" or (category == "Cc" and not character.isspace()):
-            return CompletionDecision(False, "completion_body_contains_control_character")
-    normalized = body.replace("\r\n", "\n").replace("\r", "\n")
-    first = next((line.strip(" \t") for line in normalized.split("\n") if line.strip()), "")
-    match = _COMPLETION.fullmatch(first)
-    if match is None or int(match.group(1)) != expected_issue_id:
-        return CompletionDecision(False, "missing_exact_completion_declaration")
-    if len(re.findall(r"chainlink", normalized, flags=re.IGNORECASE)) != 1:
-        return CompletionDecision(False, "ambiguous_chainlink_reference")
-    remainder = normalized[len(normalized.split("\n", 1)[0]):]
-    if _CLOSING_CLAUSE.search(remainder):
-        return CompletionDecision(False, "conflicting_github_closing_clause")
-    if _FORBIDDEN.search(normalized):
-        return CompletionDecision(False, "completion_body_contains_refusal_language")
-    return CompletionDecision(True, "qualified")
-
-
 def _parse_pr_url(pr_url: str) -> tuple[str, int, str]:
     match = _PR_URL.fullmatch(pr_url)
     if match is None:
@@ -319,6 +273,8 @@ def read_pr_snapshot(pr_url: str, *, gh_bin: str, runner: Runner) -> PrSnapshot:
         or payload.get("html_url") != canonical_url
     ):
         raise ClosureReadError("PR snapshot identity mismatch")
+    # The PR body is display-only; even a null/missing body must not veto a
+    # merge backed by the controller's publication evidence.
     body = payload.get("body")
     state = payload.get("state")
     merged = payload.get("merged")
@@ -326,8 +282,8 @@ def read_pr_snapshot(pr_url: str, *, gh_bin: str, runner: Runner) -> PrSnapshot:
     base_repo = base.get("repo") if isinstance(base, dict) else None
     base_slug = base_repo.get("full_name") if isinstance(base_repo, dict) else None
     base_ref = base.get("ref") if isinstance(base, dict) else None
-    if not isinstance(body, str) or state not in {"open", "closed"} or not isinstance(merged, bool):
-        raise ClosureReadError("PR snapshot has invalid body/state/merged fields")
+    if state not in {"open", "closed"} or not isinstance(merged, bool):
+        raise ClosureReadError("PR snapshot has invalid state/merged fields")
     if not isinstance(base_slug, str) or not isinstance(base_ref, str) or not base_ref:
         raise ClosureReadError("PR snapshot has invalid base identity")
     merged_at = payload.get("merged_at")
@@ -345,35 +301,21 @@ def read_pr_snapshot(pr_url: str, *, gh_bin: str, runner: Runner) -> PrSnapshot:
     elif merged_at is not None:
         raise ClosureReadError("unmerged PR snapshot contains merge identity")
     return PrSnapshot(
-        canonical_url, slug, number, body, state, merged, merged_at,
+        canonical_url, slug, number, body if isinstance(body, str) else "", state, merged, merged_at,
         merge_sha.lower() if isinstance(merge_sha, str) else None,
         base_slug.lower(), base_ref,
     )
 
 
-def _comment_associations(comments: Sequence[str]) -> set[str]:
-    candidates: set[str] = set()
-    patterns = (
-        re.compile(r"\bpr_url=(https://github\.com/[^\s]+)", re.IGNORECASE),
-        re.compile(r"draft PR opened:\s*(https://github\.com/[^\s]+)", re.IGNORECASE),
-    )
-    for comment in comments:
-        for pattern in patterns:
-            for match in pattern.finditer(comment):
-                try:
-                    candidates.add(_parse_pr_url(match.group(1).rstrip(".,"))[2])
-                except ClosureReadError:
-                    raise ClosureReadError("historical comment contains an invalid PR association")
-    return candidates
-
-
 def discover_associations(home: Path, issue: IssueSnapshot) -> AssociationDecision:
     evidence_dir = home / "state" / "worklink" / "evidence"
-    urls = _comment_associations(issue.comments)
     paths: list[Path] = []
     digests: list[str] = []
     completed: list[Path] = []
     base_refs: list[str] = []
+    latest_attempt = 0
+    latest_url: str | None = None
+    latest_ready = False
     if evidence_dir.exists():
         if not evidence_dir.is_dir():
             raise ClosureReadError("evidence path is not a directory")
@@ -399,6 +341,9 @@ def discover_associations(home: Path, issue: IssueSnapshot) -> AssociationDecisi
             status = payload.get("status")
             if status not in {"completed", "blocked", "failed"}:
                 raise ClosureReadError("active evidence has invalid status")
+            ready = payload.get("review_ready")
+            if ready is not None and not isinstance(ready, bool):
+                raise ClosureReadError("active evidence has invalid review_ready")
             active_base = payload.get("base_ref")
             if active_base is not None and (not isinstance(active_base, str) or not active_base):
                 raise ClosureReadError("active evidence has invalid base_ref")
@@ -408,20 +353,24 @@ def discover_associations(home: Path, issue: IssueSnapshot) -> AssociationDecisi
             if url is not None:
                 if not isinstance(url, str):
                     raise ClosureReadError("active evidence has invalid pr_url")
-                urls.add(_parse_pr_url(url)[2])
+                url = _parse_pr_url(url)[2]
             digest = hashlib.sha256(raw).hexdigest()
             paths.append(path)
             digests.append(digest)
-            if status == "completed" and url is not None:
+            # Older publication evidence predates the explicit flag. Only the
+            # controller's review-ready publication path recorded its PR URL.
+            qualifies = status == "completed" and url is not None and ready is not False
+            if qualifies:
                 completed.append(path)
-    if len(urls) > 1:
-        return AssociationDecision(
-            None, tuple(paths), tuple(digests), tuple(completed), tuple(base_refs),
-            "conflicting_pr_associations",
-        )
+            if attempt > latest_attempt:
+                latest_attempt = attempt
+                latest_url = url
+                latest_ready = qualifies
     return AssociationDecision(
-        next(iter(urls), None), tuple(paths), tuple(digests), tuple(completed),
-        tuple(base_refs), None if urls else "missing_pr_association",
+        latest_url if latest_ready else None, tuple(paths), tuple(digests), tuple(completed),
+        tuple(base_refs), None if latest_ready else (
+            "missing_review_ready_publication" if latest_attempt else "missing_pr_association"
+        ),
     )
 
 
@@ -515,8 +464,7 @@ def _validate_qualification(
         return "repository_identity_mismatch"
     if not pr.merged:
         return "pr_open" if pr.state == "open" else "pr_closed_unmerged"
-    completion = parse_completion_reference(pr.body, expected_issue_id=issue.issue_id)
-    return None if completion.qualifies else completion.reason
+    return None
 
 
 def _archive_closed_unmerged(association: AssociationDecision) -> None:
@@ -886,6 +834,12 @@ def reconcile_merged_leaves(
                 if lifecycle_reason := _lifecycle_reason(issue):
                     raise ClosureReadError(lifecycle_reason)
                 association = discover_associations(home, issue)
+                if association.reason == "missing_pr_association":
+                    if not dry_run:
+                        resolve_merge_reconciliation_notices(
+                            state_dir, issue_id=issue_id, pr_url=None,
+                        )
+                    continue
                 if association.reason:
                     raise ClosureReadError(association.reason)
                 assert association.pr_url is not None
