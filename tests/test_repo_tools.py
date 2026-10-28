@@ -1755,7 +1755,7 @@ def test_wrapper_records_only_successful_verified_head_transition(
         resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{initial}",
         bridge_instance="forge", sensitivity="internal",
         authorized_principals=frozenset({"operator"}), source_kind="protected_tool",
-        integrity="trusted", integrity_effect="active_ingest",
+        integrity="untrusted", integrity_effect="informational",
     )
     labels = InformationFlowLabels(
         labels=frozenset({"private"}), source_channels=frozenset({"slack-C1"}),

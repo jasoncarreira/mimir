@@ -10840,7 +10840,7 @@ def test_batched_pr_results_are_bound_to_each_call_and_cannot_cross_forge_scopes
         principal=principal, domain="repository",
         resource_id=f"o/r#pull/42@{'a' * 40}", bridge_instance="forge",
         sensitivity="internal", authorized_principals=frozenset({principal}),
-        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+        source_kind="protected_tool", integrity="untrusted", integrity_effect="informational",
     ))
     second_scope = second_authorization.repo_pr_action_scope
     second_target = (
@@ -10865,7 +10865,8 @@ def test_batched_pr_results_are_bound_to_each_call_and_cannot_cross_forge_scopes
         "pr_comment", first_target, labels_from_first, auth, enforce=True,
         repo_pr_action_scope=replace(first_scope),
     )
-    assert same_pr.allowed is True
+    assert same_pr.allowed is False
+    assert same_pr.reason == "ifc_label_blocked:forge"
 
     stale_head_scope = replace(first_scope, observed_head_sha="b" * 40)
     stale_head = SinkGate.check_sink_flow(
@@ -11233,6 +11234,29 @@ def test_forge_repository_result_from_different_pull_request_is_refused() -> Non
     assert mismatch == ("owner/repo", "18", "pr_number")
 
 
+def test_trusted_repository_source_from_other_pr_needs_no_forge_source_scope() -> None:
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+    auth = _trusted_operator_write_auth(admin=True)
+    foreign = replace(
+        _repository_result_labels("other/repo", 18, "f" * 40).sources[0],
+        integrity="trusted", integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+    )
+    target = f"owner/repo#pull/17@{scope.observed_head_sha}:{scope.scope_id}"
+    trusted = auth.ifc_labels.with_source(foreign)
+    admitted = SinkGate.check_sink_flow(
+        "pr_comment", target, trusted, auth, enforce=True,
+        sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
+    )
+    assert admitted.allowed, admitted.reason
+
+    untrusted = auth.ifc_labels.with_source(replace(foreign, integrity="untrusted"))
+    denied = SinkGate.check_sink_flow(
+        "pr_comment", target, untrusted, auth, enforce=True,
+        sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
+    )
+    assert not denied.allowed and denied.reason == "ifc_label_blocked:forge"
+
+
 def test_forge_repository_result_from_different_observed_head_is_refused() -> None:
     scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
 
@@ -11251,8 +11275,7 @@ def test_verified_push_lineage_allows_exact_pr_through_sink_gate(tool_name, requ
     scope = state.action_scope
     old = scope.observed_head_sha
     labels = _trusted_operator_write_auth(admin=True).ifc_labels.with_source(
-        replace(_repository_result_labels("owner/repo", 17, old).sources[0],
-                integrity="trusted", integrity_effect=IntegrityEffect.ACTIVE_INGEST)
+        _repository_result_labels("owner/repo", 17, old).sources[0]
     )
     auth = replace(_trusted_operator_write_auth(admin=True), ifc_labels=labels,
                    repo_review_state=state, repo_pr_action_scope=scope,
@@ -11349,8 +11372,7 @@ async def test_forge_mismatch_audit_names_actual_source_before_untrusted_ingest(
     auth = _trusted_operator_write_auth(admin=True)
     other = replace(_repository_result_labels("owner/repo", 17, "a" * 40).sources[0],
                     integrity="untrusted", integrity_effect="active_ingest")
-    mismatch = replace(other, resource_id=f"owner/repo#pull/17@{'c' * 40}",
-                       integrity="trusted")
+    mismatch = replace(other, resource_id=f"owner/repo#pull/17@{'c' * 40}")
     labels = auth.ifc_labels.with_source(other).with_source(mismatch)
     auth.ifc_state.record_own_push("owner/repo", 17, "a" * 40)
     decision = SinkGate.check_sink_flow(

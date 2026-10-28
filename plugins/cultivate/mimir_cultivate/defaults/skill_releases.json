@@ -238,5 +238,27 @@
       "tests/test_github_poller_windows.py": "6137357e7d82133fe9d026f29952b994e21fe5d9ba3b6c59ce2ea274e574e604",
       "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3"
     }
+  },
+  "2046-trusted-forge-ifc": {
+    "github-poller": {
+      "SKILL.md": "5ddb2a890b4a618cd7b8407caecc14d459f5349f6ad223ff90328377e2c1e27d",
+      "pollers.json": "273c2d13e8f8fcf7f353d5d9107a729cbd522819ebd2897f0608492353e1d243",
+      "scripts/hooks.py": "2cbfc1ddc10f0ff808bb6da032e55e9bc76526012efb4779e4d235da41399335",
+      "scripts/poller.py": "38f0f6a261adb63ddb49255fdc98d2a5a2b5e84a8edd14aa456e07d234d2101c",
+      "tests/conftest.py": "06c6fdd21e3fe55ee2e29085aefb21740cf9941ad0bba4a5499056d662816de1",
+      "tests/github_poller_test_support.py": "43bba3c7a2dc4f741aa090dd4c23bb01a2457413ff7a3e4bd6d552aa57756fab",
+      "tests/test_github_poller_changes_requested.py": "bea0e7d4db2638b6e6735ddfbb9b61b64349e42b8e292ba44c4dfd3c517930f2",
+      "tests/test_github_poller_ci_failures.py": "7cc865a9de209aaf96a5f89a1c726635521cb81442dfcbff748962f5026aa8dc",
+      "tests/test_github_poller_ci_logs.py": "fdeefc12d4483cbcd658f6a460fcc5c6f4c5d41f26f56cfd16a5b6c3014d1ce9",
+      "tests/test_github_poller_event_coalescing.py": "9eb91518a4166353d8e32bb0a2eb3a40a63c47c4efdef64f16629f18cea20edf",
+      "tests/test_github_poller_issue_notices.py": "8bf270a5fc30e418c425d46ad1d9dd54b96f4e2f26681a3e8c7230152f97e61f",
+      "tests/test_github_poller_mergeability.py": "88a30924512f8df77b9ad0dd0afd5ab5d8343190d44d85b8daa533fb7031d1d1",
+      "tests/test_github_poller_own_feedback.py": "79527e58085bed6be5fc43785668cd1cdf914bdf456f98a5df4b3fb59d30f5f7",
+      "tests/test_github_poller_pr_pushes.py": "95736a6f2500e30692eafb147aeb0d060b8a9503a21215752a8c3cab77732924",
+      "tests/test_github_poller_pr_scope_snapshot.py": "eae8d2d3d866dca24560fc8dd97e59977eedf618af7e7ecd3e4ebfe5386f0c2c",
+      "tests/test_github_poller_pr_trust.py": "58fade4ccb673e234cc75e514afc7712cc9b8c0ca9dba919d44d1e80153a7af4",
+      "tests/test_github_poller_windows.py": "6137357e7d82133fe9d026f29952b994e21fe5d9ba3b6c59ce2ea274e574e604",
+      "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3"
+    }
   }
 }
