@@ -2939,6 +2939,10 @@ def test_poller_stops_after_emitting_when_later_failure_ack_errors(
     emitted: list[dict] = []
     continuation_called = False
 
+    # This test owns the failure-ack path, not the wall-clock tick budget.
+    # Under a loaded full suite the real budget can expire before the first
+    # alert is emitted, bypassing the ack failure being exercised here.
+    monkeypatch.setattr(poller, "TickBudget", lambda: SimpleNamespace(hard_exhausted=lambda: False))
     monkeypatch.setattr(poller, "pending_failure_alerts", lambda _state_dir: ({201, 202}, [first, second]))
     monkeypatch.setattr(
         poller,

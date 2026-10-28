@@ -115,29 +115,17 @@ _COMMIT_SUBJECT_MAX_BYTES = 512
 _PUBLICATION_REFERENCE_RE = re.compile(
     r"https?://(?:www\.)?github\.com/[^\s]+|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+|#\d+", re.I,
 )
+_INTERNAL_REFERENCE_RE = re.compile(r"(?i)\bchainlink(?:\s*#\s*|\s*-\s*|\s+)\d+\b")
 _HOST_PATH_RE = re.compile(r"(?<!\S)/(?:[\w.-]+/)*[\w.-]+|(?<=[`\"'])/(?:[\w.-]+/)*[\w.-]+")
 _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
 _FACTORY_CONTROLLER_ERROR_MAX_BYTES = 4000
 _EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
-# GitHub's documented closing-keyword set:
-# https://docs.github.com/en/issues/tracking-your-work-with-issues/using-issues/linking-a-pull-request-to-an-issue
-_GITHUB_CLOSING_KEYWORDS = (
-    "close",
-    "closes",
-    "closed",
-    "fix",
-    "fixes",
-    "fixed",
-    "resolve",
-    "resolves",
-    "resolved",
-)
-_GITHUB_BARE_CLOSING_REFERENCE_RE = re.compile(
-    rf"(?P<keyword>\b(?:{'|'.join(_GITHUB_CLOSING_KEYWORDS)}))"
-    r"(?P<separator>\s*:\s*|\s+)#(?P<number>[0-9]+)\b",
-    re.IGNORECASE,
-)
+
+
+def _public_text(text: str) -> str:
+    """Remove internal tracker references before publishing build-authored text."""
+    return _INTERNAL_REFERENCE_RE.sub("", text)
 #: Seconds the controller waits for the factory to publish its first status.
 #: The window must cover OpenCode's boot, config and plugin loading, one model
 #: round trip, and `factory init`. Measured on chainlink #1783 attempt 4: 74s
@@ -379,15 +367,8 @@ def _epic_prompt(issue: "IssueContext") -> str:
 
 
 def _render_chainlink_text(text: str) -> str:
-    """Give ambiguous bare closing references their originating namespace.
-
-    A bare ``#N`` cannot say whether its author meant Chainlink or GitHub. Text
-    rendered from a Chainlink work item defaults to Chainlink; an intentional
-    GitHub reference remains expressible as GitHub's explicit ``owner/repo#N``.
-    """
-    return _GITHUB_BARE_CLOSING_REFERENCE_RE.sub(
-        r"\g<keyword>\g<separator>chainlink #\g<number>", text
-    )
+    """Keep builder references as authored; tracker names are private."""
+    return text
 
 
 @dataclass(frozen=True)
@@ -1975,7 +1956,7 @@ class WorklinkRunner:
         if pr_url:
             written_path = run_bookkeeping(
                 "completed evidence write",
-                lambda: _write_evidence(self.home, validation.evidence),
+                lambda: _write_evidence(self.home, validation.evidence, review_ready=validation.review_ready),
             )
             if isinstance(written_path, Path):
                 evidence_path = written_path
@@ -5789,10 +5770,13 @@ def _leaf_publication(home: Path, issue_id: int, attempt: int) -> Iterator[_Publ
             path.unlink()
 
 
-def _write_evidence(home: Path, evidence: WorklinkEvidence) -> Path:
+def _write_evidence(home: Path, evidence: WorklinkEvidence, *, review_ready: bool | None = None) -> Path:
     path = home / "state" / "worklink" / "evidence" / f"{evidence.issue}-{evidence.attempt}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(path, _evidence_json(evidence))
+    payload = _evidence_json(evidence)
+    if review_ready is not None:
+        payload["review_ready"] = review_ready
+    atomic_write_json(path, payload)
     return path
 
 
@@ -6076,8 +6060,8 @@ def _commit_checkout_changes(
     # Fail closed before commit/push/PR if the backend staged a secret (or if
     # the scan cannot run).
     _assert_staged_diff_has_no_secret(checkout, runner=runner, publication=publication)
-    message = f"{subject}\n\nRefs: chainlink-{issue.issue_id}\n" + "".join(
-        f"{trailer}\n" for trailer in attribution[0]
+    message = _public_text(subject).strip() + "\n\n" + "".join(
+        f"{_public_text(trailer)}\n" for trailer in attribution[0]
     )
     commit = run_git("commit", "-m", message)
     if commit.returncode != 0:
@@ -6277,20 +6261,15 @@ def _open_pr(
         subject = _fallback_commit_subject(issue.title)
     if attribution is None:
         attribution = _publication_attribution(WorklinkPublication(), evidence.backend, evidence.model)
-    run_id = f"{issue.issue_id}-{evidence.attempt}"
     gate_run_id = evidence.tests.gate_run_id if evidence.tests else None
-    if gate_run_id:
-        run_id += f" ({gate_run_id})"
     evidence_block = (
-        f"Closes chainlink-{issue.issue_id}.\n\n"
         f"Worklink evidence:\n"
         f"- Base: `{base}`\n"
-        f"- Branch: `{branch}`\n"
         f"- Files changed: {len(evidence.files_changed)}\n"
         "- Tests: "
         f"`{evidence.tests.cmd if evidence.tests else '(none)'}` → "
         f"{evidence.tests.exit_code if evidence.tests else 'missing'}\n"
-        f"- Transcript run: `{run_id}`\n"
+        f"- Gate run: `{gate_run_id or '(none)'}`\n"
     )
     if evidence.gate_mode == "ci":
         evidence_block += "- Gate mode: `ci` (PR CI is authoritative)\n"
@@ -6310,17 +6289,10 @@ def _open_pr(
                 "- flaky_tests (passed in isolation; not proof of flakiness): "
                 f"{json.dumps([redact_text(node) for node in tests.flaky_tests])}\n"
             )
-    body = evidence_block
-    if pr_body_section:
-        body = (
-            f"Closes chainlink-{issue.issue_id}.\n\n"
-            f"Build summary:\n\n{pr_body_section}\n\n"
-            + evidence_block.split("\n\n", 1)[1]
-        )
-    body += f"\n{attribution[1]}\n"
-    # Preserve the builder's meaning and the exact gate command. Refusal
-    # language or extra references must remain visible to merge_closure's
-    # fail-closed check; publication must not turn partial work into completion.
+    # Scrub build-authored prose, not the evidence: commands must be published
+    # exactly as executed, even when they mention the tracker or an id form.
+    body = (f"Build summary:\n\n{_public_text(pr_body_section)}\n\n" if pr_body_section else "") + evidence_block
+    body += f"\n{_public_text(attribution[1])}\n"
     command = ["gh", "pr", "create", "--base", base, "--head", branch]
     if draft:
         command.append("--draft")
@@ -6328,7 +6300,7 @@ def _open_pr(
     if repo_slug:
         command.extend(["--repo", repo_slug])
     command.extend([
-        "--title", subject,
+        "--title", _public_text(subject).strip(),
         "--body", body,
     ])
     result = runner(command)
@@ -6349,6 +6321,11 @@ def _update_ci_pr_body(
     if not isinstance(payload, dict) or not isinstance(payload.get("body"), str):
         raise WorklinkError("cannot read draft PR evidence")
     body = payload["body"].split("\n- CI repair rounds: ", 1)[0]
+    # Draft PRs created before the publication change may still carry the old
+    # marker, branch and transcript lines. Never copy those into an edit.
+    body = re.sub(r"(?im)^\s*Closes chainlink-\d+\.\s*\n?", "", body)
+    body = re.sub(r"(?im)^- (?:Branch|Transcript run):.*\n?", "", body)
+    # Existing evidence includes literal gate commands; do not scrub it as prose.
     # Check names are untrusted and may look like extra closure references or
     # refusal language. Detailed names/conclusions belong in evidence JSON only.
     green = sum(state in {"success", "neutral", "skipped"} for _, state in checks)
@@ -6359,7 +6336,7 @@ def _update_ci_pr_body(
 
 
 def _fallback_commit_subject(title: str) -> str:
-    clean = _PUBLICATION_REFERENCE_RE.sub("", title)
+    clean = _PUBLICATION_REFERENCE_RE.sub("", _public_text(title))
     clean = _HOST_PATH_RE.sub("", clean)
     clean = " ".join(clean.split())
     clean = "".join(char for char in clean if char.isprintable())
@@ -6397,7 +6374,7 @@ def _read_commit_subject(checkout: Path, title: str) -> str:
         or subject != subject.strip()
     ):
         return fallback
-    return subject
+    return _public_text(subject).strip() or fallback
 
 
 def _publication_attribution(
@@ -6407,7 +6384,7 @@ def _publication_attribution(
     # before interpolating into a public commit message or PR body.
     def label(value: object) -> str:
         text = str(value) if value else "unknown"
-        text = _PUBLICATION_REFERENCE_RE.sub("", text)
+        text = _PUBLICATION_REFERENCE_RE.sub("", _public_text(text))
         text = _HOST_PATH_RE.sub("", text)
         return "".join(c for c in text if c.isprintable() and c not in "`\\")[0:80] or "unknown"
 
@@ -6455,8 +6432,7 @@ def _read_pr_body_section(checkout: Path) -> str | None:
     text = redact_text(text).strip()
     # A build-authored lookalike must not precede the canonical parser anchor.
     text = _EVIDENCE_HEADING_RE.sub("[Build-authored evidence heading removed]", text)
-    text = re.sub(r"(?im)^\s*Closes chainlink-\d+\.\s*$", "[Build-authored completion removed]", text)
-    text = _render_chainlink_text(text)
+    text = _public_text(text)
     encoded = text.encode("utf-8")
     truncated = len(raw) > _PR_BODY_SECTION_MAX_BYTES or len(encoded) > _PR_BODY_SECTION_MAX_BYTES
     if truncated:
