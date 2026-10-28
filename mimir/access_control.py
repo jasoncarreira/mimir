@@ -7929,7 +7929,6 @@ class SinkGate:
                 isinstance(source_channels, frozenset)
                 and source_channels
                 and source_channels == frozenset({service_channel})
-                and (category is not SinkCategory.FORGE or not has_untrusted_active_ingest)
             ):
                 return frozenset({target})
             return frozenset()

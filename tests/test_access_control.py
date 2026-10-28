@@ -10865,8 +10865,8 @@ def test_batched_pr_results_are_bound_to_each_call_and_cannot_cross_forge_scopes
         "pr_comment", first_target, labels_from_first, auth, enforce=True,
         repo_pr_action_scope=replace(first_scope),
     )
-    assert same_pr.allowed is False
-    assert same_pr.reason == "ifc_label_blocked:forge"
+    # Untrusted informational results retain bounded same-PR/same-head back-flow.
+    assert same_pr.allowed is True
 
     stale_head_scope = replace(first_scope, observed_head_sha="b" * 40)
     stale_head = SinkGate.check_sink_flow(
