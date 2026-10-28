@@ -547,6 +547,10 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
         calls.append(argv)
         if argv[-3:] == ["ps", "-q", "agent"]:
             return "b" * 64
+        if argv[-3:] == ["mimir", "worklink", "status"]:
+            return "No Worklink leaf runs or labeled issues."
+        if argv[-1] == installer._PR_LEASE_PROBE:
+            return "[]"
         if "compose.provision.yml" in argv:
             return "SETUP_CHANGED=1" if sum("compose.provision.yml" in c for c in calls) == 1 else "SETUP_CHANGED=0"
         return ""
@@ -648,11 +652,11 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
     assert compose["services"]["agent"]["depends_on"]["init"]["condition"] == "service_completed_successfully"
     assert set(compose["volumes"]) == {"home", "cache", "workspace", "pr-leases", "worklink"}
     assert any("MIMIR_CONTROLLER_COMMIT=" + SHA in part for argv in calls for part in argv)
-    assert sum("docker" == argv[0] and "exec" in argv for argv in calls) == 0
+    assert sum("docker" == argv[0] and "exec" in argv for argv in calls) == 2  # idle probes on the rerun
     assert sum("-f" in argv and "compose.provision.yml" in argv for argv in calls) == 2
     assert all(argv[argv.index('--user') + 1] == '1001:1001' for argv in calls
                if 'compose.provision.yml' in argv)
-    assert sum(argv[-2:] == ["restart", "agent"] for argv in calls) == 1
+    assert sum(argv[-2:] == ["restart", "agent"] for argv in calls) == 0
 
     def unpushed(url, token):
         if "/git/ref/" in url:
@@ -703,6 +707,196 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
         assert "MIMIR_EXTRAS=" + ",".join(sorted(expected_extras)) in (deploy / "build.sh").read_text()
 
 
+@pytest.fixture
+def upgrade_setup(tmp_path, monkeypatch):
+    """A saved deployment with a pinned source and fake Docker/Git boundaries."""
+    monkeypatch.setattr(installer, '_license_gate', lambda args: None)
+    deploy = tmp_path / 'deploy'
+    fields = {'repo': 'org/repo', 'branch': 'main', 'bot_login': 'bot',
+              'bot_email': 'bot@example.com', 'owner': 'owner', 'display_name': 'Owner',
+              'owner_email': 'owner@example.com', 'deploy': str(deploy),
+              'model_spec': 'openai:model', 'saga_model_spec': 'openai:model',
+              'embedding': 'openai:model', 'source_ref': 'refs/heads/feature/plugins',
+              'source_repo': 'org/mimir', 'test_command': 'npm test', 'port': '8123'}
+    monkeypatch.setattr(installer, '_field', lambda args, name, *a, **kw: fields[name])
+    monkeypatch.setattr(installer, '_secret', lambda *a, **kw: 'secret')
+    monkeypatch.setattr(installer, 'validate_token', lambda *a: None)
+    monkeypatch.setattr(installer, '_alert_settings', lambda *a: ('none', None, {}))
+    monkeypatch.setattr(installer, '_content', lambda *a: '{"engines":{"node":"22.16.0"}}' if a[2] == 'package.json' else None)
+    monkeypatch.setattr(installer, '_verify_script', lambda *a: None)
+    def docker_exec(argv, **kw):
+        kw['stdout'].write(b'owner-key\n')
+        return subprocess.CompletedProcess(argv, 0)
+    monkeypatch.setattr(installer.subprocess, 'run', docker_exec)
+    state = {'sha': SHA, 'running': False, 'status': 'No Worklink leaf runs or labeled issues.', 'leases': '[]'}
+    calls = []
+
+    def request(url, token):
+        return 200, {'object': {'sha': state['sha']}}
+
+    def run(argv, *, cwd):
+        assert cwd == deploy
+        calls.append(argv)
+        if argv[-3:] == ['ps', '-q', 'agent']:
+            return 'b' * 64 if state['running'] else ''
+        if argv[-3:] == ['mimir', 'worklink', 'status']:
+            return state['status']
+        if argv[-1] == installer._PR_LEASE_PROBE:
+            return state['leases']
+        if argv[-3:] == ['up', '-d', 'agent']:
+            state['running'] = True
+        return 'SETUP_CHANGED=0' if 'compose.provision.yml' in argv else ''
+
+    args = argparse.Namespace(rotate_web_key=False, reembed=False, force=False, system_packages=None)
+    def invoke():
+        installer.setup(args, request=request, run=run, verify=lambda *a: None)
+
+    invoke()
+    state['running'] = True
+    calls.clear()
+    return deploy, args, state, calls, invoke
+
+
+def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrade_setup, capsys):
+    deploy, args, state, calls, invoke = upgrade_setup
+    old = SHA
+    state['sha'] = 'c' * 40
+    env = (deploy / 'compose.env').read_bytes()
+    key = (deploy / 'owner-web-key').read_bytes()
+    (deploy / 'persisted-volume-marker').write_text('untouched')
+    invoke()
+    output = capsys.readouterr().out
+    assert f'Upgrading {old} -> {state["sha"]}' in output
+    assert f'Previous agent image retained: mimir-cultivate-agent:{old}-node22-16-0' in output
+    assert 'docker compose -f compose.yml -f <(printf' in output
+    assert f'image: mimir-cultivate-agent:{old}-node22-16-0' in output
+    assert yaml.safe_load((deploy / 'compose.yml').read_text())['services']['agent']['image'] == (
+        f'mimir-cultivate-agent:{state["sha"]}-node22-16-0')
+    assert (deploy / 'compose.env').read_bytes() == env
+    assert (deploy / 'owner-web-key').read_bytes() == key
+    assert (deploy / 'persisted-volume-marker').read_text() == 'untouched'
+    assert not any('down' in argv or 'volume' in argv or '-v' in argv for argv in calls)
+    assert sum(argv[:2] == ['docker', 'build'] for argv in calls) == 2
+    assert any(argv[-2:] == ['--rm', 'init'] for argv in calls)
+    assert any('compose.provision.yml' in argv for argv in calls)
+    assert any(argv[-3:] == ['up', '-d', 'agent'] for argv in calls)
+    import hashlib
+    hashes = json.loads((deploy / 'manifest.json').read_text())['generated_sha256']
+    assert set(hashes) == {'compose.yml', 'provision.py', 'compose.provision.yml', '.gitignore'}
+    assert all(hashes[name] == hashlib.sha256((deploy / name).read_bytes()).hexdigest() for name in hashes)
+
+
+@pytest.mark.parametrize('name', ['compose.yml', 'provision.py', 'compose.provision.yml', '.gitignore'])
+def test_upgrade_refuses_operator_edits_until_forced(upgrade_setup, name):
+    deploy, args, state, calls, invoke = upgrade_setup
+    path = deploy / name
+    path.write_text(path.read_text() + '\n# operator edit\n')
+    state['sha'] = 'c' * 40
+    with pytest.raises(installer.SetupError, match=re.escape(f'{path} already differs')):
+        invoke()
+    assert not calls and '# operator edit' in path.read_text()
+    args.force = True
+    invoke()
+    assert '# operator edit' not in path.read_text()
+
+
+def test_upgrade_legacy_unedited_generated_files(upgrade_setup):
+    deploy, args, state, calls, invoke = upgrade_setup
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    for key in ('generated_sha256', 'source_sha', 'layer_tag'):
+        del manifest[key]
+    (deploy / 'manifest.json').write_text(json.dumps(manifest))
+    state['sha'] = 'c' * 40
+    invoke()
+    assert state['sha'] in (deploy / 'compose.yml').read_text()
+
+
+def test_upgrade_legacy_operator_edit_is_refused(upgrade_setup):
+    deploy, args, state, calls, invoke = upgrade_setup
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    del manifest['generated_sha256']
+    (deploy / 'manifest.json').write_text(json.dumps(manifest))
+    compose = deploy / 'compose.yml'
+    compose.write_text(compose.read_text() + '\n# operator edit\n')
+    state['sha'] = 'c' * 40
+    with pytest.raises(installer.SetupError, match='compose.yml already differs'):
+        invoke()
+    assert not calls and '# operator edit' in compose.read_text()
+
+
+@pytest.mark.parametrize('activity,detail', [('worklink', 'Worklink #42 (running)'),
+                                          ('lease', 'PR checkout lease org/repo#17')])
+def test_upgrade_refuses_in_flight_before_stop(upgrade_setup, activity, detail):
+    deploy, args, state, calls, invoke = upgrade_setup
+    state['sha'] = 'c' * 40
+    args.reembed = True  # A rerun that would explicitly stop the old agent.
+    if activity == 'worklink':
+        state['status'] = ('ISSUE  STATE       ATTEMPT  BACKEND           BRANCH                    CHECKOUT  ELAPSED\n'
+                           '42     running     1        opencode          main                      -         1m')
+    else:
+        state['leases'] = '["org/repo#17"]'
+    with pytest.raises(installer.SetupError, match=re.escape(detail)):
+        invoke()
+    assert not any(argv[-2:] == ['stop', 'agent'] for argv in calls)
+    assert not any(argv[:2] == ['docker', 'build'] for argv in calls)
+    assert SHA in (deploy / 'compose.yml').read_text()
+    args.force = True
+    invoke()
+    assert any(argv[-2:] == ['stop', 'agent'] for argv in calls)
+
+
+@pytest.mark.parametrize('probe,output', [
+    pytest.param('status', 'ISSUE  STATE       ATTEMPT\n42', id='short-status-row'),
+    pytest.param('status', 'ISSUE  STATE       ATTEMPT\nunknown clean 1', id='nonnumeric-status-row'),
+    pytest.param('status', 'Error: Worklink status unavailable', id='unexpected-status-output'),
+    pytest.param('status', '', id='empty-status-output'),
+    pytest.param('leases', 'Error: lease registry unavailable', id='non-json-leases'),
+    pytest.param('leases', '', id='empty-lease-output'),
+])
+def test_upgrade_refuses_unreadable_activity_before_mutation_until_forced(upgrade_setup, probe, output):
+    deploy, args, state, calls, invoke = upgrade_setup
+    state['sha'] = 'c' * 40
+    state[probe] = output
+    args.reembed = True  # A successful upgrade would stop the running agent.
+    before = {path.name: path.read_bytes() for path in deploy.iterdir() if path.is_file()}
+    detail = 'Cannot read Worklink status' if probe == 'status' else 'Cannot read PR checkout leases'
+
+    with pytest.raises(installer.SetupError, match=detail):
+        invoke()
+
+    # Only read-only probes may run: no stop, up, restart, build or provision.
+    expected_calls = [
+        ['docker', 'compose', 'ps', '-q', 'agent'],
+        ['docker', 'compose', 'exec', '-T', '-u', 'mimir', 'agent', 'mimir', 'worklink', 'status'],
+    ]
+    if probe == 'leases':
+        expected_calls.append([
+            'docker', 'compose', 'exec', '-T', '-u', 'mimir', 'agent', 'python', '-c', installer._PR_LEASE_PROBE,
+        ])
+    assert calls == expected_calls
+    assert {path.name: path.read_bytes() for path in deploy.iterdir() if path.is_file()} == before
+
+    # The explicit override must really complete, not merely avoid the refusal.
+    calls.clear()
+    args.force = True
+    invoke()
+    assert any(argv == ['docker', 'compose', 'stop', 'agent'] for argv in calls)
+    assert sum(argv[:2] == ['docker', 'build'] for argv in calls) == 2
+    assert any(argv == ['docker', 'compose', 'up', '-d', 'agent'] for argv in calls)
+    assert not any(argv[-3:] == ['mimir', 'worklink', 'status'] for argv in calls)
+    assert not any(argv[-1] == installer._PR_LEASE_PROBE for argv in calls)
+    assert state['sha'] in (deploy / 'compose.yml').read_text()
+    assert json.loads((deploy / 'manifest.json').read_text())['source_sha'] == state['sha']
+
+
+def test_same_commit_rerun_with_system_packages(upgrade_setup):
+    deploy, args, state, calls, invoke = upgrade_setup
+    args.system_packages = 'lsof'
+    invoke()
+    assert 'lsof' in (deploy / 'Dockerfile.toolchain').read_text()
+    assert json.loads((deploy / 'manifest.json').read_text())['system_packages'] == ['lsof']
+
+
 @pytest.mark.parametrize('step', ['build', 'init', 'provision', 'up'])
 def test_docker_failure_names_step_without_secrets(tmp_path, monkeypatch, step):
     monkeypatch.setattr(installer, '_license_gate', lambda args: None)
@@ -711,7 +905,7 @@ def test_docker_failure_names_step_without_secrets(tmp_path, monkeypatch, step):
               'owner_email': 'owner@example.com', 'deploy': str(tmp_path / 'deploy'),
               'model_spec': 'openai:model', 'saga_model_spec': 'openai:model',
               'embedding': 'openai:model', 'source_ref': 'refs/heads/feature/plugins',
-              'source_repo': 'org/mimir', 'test_command': 'npm test', 'port': '8123'}
+              'source_repo': 'org/mimir', 'test_command': 'npm test', 'review_tests': 'targeted', 'port': '8123'}
     monkeypatch.setattr(installer, '_field', lambda args, name, *a, **kw: fields[name])
     monkeypatch.setattr(installer, '_secret', lambda *a, **kw: 'secret-from-compose-env')
     monkeypatch.setattr(installer, 'validate_token', lambda *a: None)
@@ -1457,7 +1651,8 @@ def test_existing_env_never_overwrites_operator_secrets(tmp_path):
     assert (tmp_path / "compose.env").read_bytes() == before
 
 
-def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monkeypatch, capsys, caplog):
+@pytest.mark.parametrize('review_tests', ['targeted', 'full', 'none'])
+def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monkeypatch, capsys, caplog, review_tests):
     monkeypatch.setenv("HOME", "/home/mimir")
     monkeypatch.setenv("XDG_CACHE_HOME", "/home/mimir/.cache")
     home = tmp_path / "home"
@@ -1469,7 +1664,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"slug": "org/repo", "branch": "main", "toolchain": "rust", "owner": "owner",
                                      "display": "Owner", "email": "owner@example.com",
-                                     "test": "npm run verify", "rotate": False,
+                                     "test": "npm run verify", "review_tests": review_tests, "rotate": False,
                                      "saga_model_spec": "openai:gpt-5.4-nano", "embedding": "local", "reembed": False}))
     script = (installer._PROVISION
               .replace("/opt/cultivate-manifest.json", str(manifest))
@@ -1528,6 +1723,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert inventory["repositories"][0]["root"] == str(repo)
     assert inventory["repositories"][0]["worklink_base"] == str(tmp_path / 'worklink/base/repo')
     assert inventory["repositories"][0]["origin"] == "https://github.com/org/repo.git"
+    assert inventory["repositories"][0]["review_tests"] == review_tests
     assert len(inventory["repositories"]) == 1
     assert base_identity == {'user.name': 'trellisbot-squashmerge', 'user.email': 'trellisbot@example.com'}
     assert {r["root"] for r in inventory["allowed_roots"]} == {"/workspace/pr-leases", "/workspace/worklink"}
@@ -1568,6 +1764,34 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
     assert (home / 'repositories.yaml').read_bytes() == prior_inventory
     assert (home / 'worklink.yaml').read_bytes() == prior_worklink
+    # Upgrade deployed entries with only test_command (no configured suites),
+    # including older entries that also predate worklink_base. Exercise the real
+    # provisioning writer and its changed/idempotent output, not a copied merge.
+    for missing in [('review_tests',), ('worklink_base', 'review_tests')]:
+        legacy = yaml.safe_load(prior_inventory)
+        for field in missing:
+            del legacy['repositories'][0][field]
+        (home / 'repositories.yaml').write_text(yaml.safe_dump(legacy, sort_keys=False))
+        capsys.readouterr()
+        exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+        assert capsys.readouterr().out == 'SETUP_CHANGED=1\n'
+        assert yaml.safe_load((home / 'repositories.yaml').read_text()) == inventory
+        assert (home / 'worklink.yaml').read_bytes() == prior_worklink
+        exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+        assert capsys.readouterr().out == 'SETUP_CHANGED=0\n'
+    # Explicit operator policy conflicts remain refusals, even if a legacy
+    # declaration is also missing the Worklink base. No inventory is written.
+    for missing_base in [False, True]:
+        conflict = yaml.safe_load(prior_inventory)
+        conflict['repositories'][0]['review_tests'] = 'none' if review_tests != 'none' else 'full'
+        if missing_base:
+            del conflict['repositories'][0]['worklink_base']
+        (home / 'repositories.yaml').write_text(yaml.safe_dump(conflict, sort_keys=False))
+        before = (home / 'repositories.yaml').read_bytes()
+        with pytest.raises(RuntimeError, match='existing repository declaration differs'):
+            exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+        assert (home / 'repositories.yaml').read_bytes() == before
+        assert (home / 'worklink.yaml').read_bytes() == prior_worklink
     explicit = yaml.safe_load(prior_inventory)
     explicit['repositories'][0]['worklink_base'] = str(tmp_path / 'operator-base')
     (home / 'repositories.yaml').write_text(yaml.safe_dump(explicit, sort_keys=False))

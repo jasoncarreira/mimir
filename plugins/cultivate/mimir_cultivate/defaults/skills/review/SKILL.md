@@ -43,8 +43,11 @@ diff (`gh pr diff` or the file-list fallback).
   authorized submission tool for the turn.
 - Verdict is one of APPROVE / REQUEST_CHANGES / COMMENT — never left unsubmitted.
 - Every blocking finding is anchored to a specific file + line in the diff.
-- Full test suite passes (or a clean explanation of why failures are pre-existing
-  and tracked) before APPROVE is submitted.
+- Read `pr_checks` on the exact reviewed head before approval; approval requires
+  every check green. When `review_tests` is `targeted` or `none`, CI is the
+  full-suite evidence. With `targeted`, use `repo_test` with diff-related selectors
+  or a named suite for local reasoning; with `none`, do not run `repo_test`.
+  With `full`, the configured full local suite remains available.
 
 **Does not**: Merge PRs; modify source code directly; auto-resolve conversations;
 review PRs it authored (when `$MIMIR_GITHUB_SELF_LOGIN` matches the PR author,

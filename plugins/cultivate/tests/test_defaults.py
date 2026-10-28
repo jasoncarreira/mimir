@@ -52,7 +52,7 @@ def test_current_repository_skill_release_hash(name):
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     version = {
         "github-poller": "2046-trusted-forge-ifc",
-        "review": "0.9.10-2028",
+        "review": "2049-review-tests",
     }.get(name, "0.9.10-2025")
     expected = releases[version][name]["SKILL.md"]
     actual = hashlib.sha256((SKILLS / name / "SKILL.md").read_bytes()).hexdigest()
@@ -74,7 +74,7 @@ def test_current_github_poller_release_hash(relative):
 
 def test_current_github_poller_release_inventory_is_complete():
     # Historical inventories are upgrade evidence, not mutable current hashes.
-    # Pin the merged release explicitly and compare the whole packaged tree so
+    # Pin the current release explicitly and compare the whole packaged tree so
     # new files and changed tests cannot silently fall outside the hash guards.
     [candidate] = enabled_plugins(enable="cultivate")
     [skill] = [item for item in skills_for_candidates((candidate,))
@@ -211,6 +211,8 @@ def test_selected_home_github_poller_emits_resolvable_review_guidance(
     assert guidance.index("pr_metadata") < guidance.index("pr_submit_review")
     assert "/cultivate-review SKILL.md (pre-loaded)" in emitted["prompt"]
     assert "submit via" in emitted["prompt"]
+    assert "CI checks on the exact reviewed head are full-suite" in emitted["prompt"]
+    assert "diff-related selectors" in emitted["prompt"]
     assert "/review skill spells out" not in emitted["prompt"]
     frontmatter = (SKILLS / "github-poller/SKILL.md").read_text(encoding="utf-8")
     assert "<home>/skills/cultivate-review/SKILL.md" in frontmatter
@@ -219,6 +221,9 @@ def test_selected_home_github_poller_emits_resolvable_review_guidance(
 
 def test_service_review_skill_checks_out_before_every_pr_read():
     skill = (SKILLS / "review/SKILL.md").read_text(encoding="utf-8")
+    assert "Full test suite passes" not in skill
+    assert "CI is the" in skill and "full-suite evidence" in skill
+    assert "diff-related selectors" in skill and "pr_checks" in skill
     steps = skill.split("### Service turns: checkout", 1)[1].split("### 1. Get PR context", 1)[0]
     assert steps.index("repo_checkout(repository, pull_request)") < steps.index("pr_metadata")
     assert steps.index("pr_metadata") < steps.index("pr_diff") < steps.index("pr_submit_review")
