@@ -845,6 +845,50 @@ def test_upgrade_refuses_in_flight_before_stop(upgrade_setup, activity, detail):
     assert any(argv[-2:] == ['stop', 'agent'] for argv in calls)
 
 
+@pytest.mark.parametrize('probe,output', [
+    pytest.param('status', 'ISSUE  STATE       ATTEMPT\n42', id='short-status-row'),
+    pytest.param('status', 'ISSUE  STATE       ATTEMPT\nunknown clean 1', id='nonnumeric-status-row'),
+    pytest.param('status', 'Error: Worklink status unavailable', id='unexpected-status-output'),
+    pytest.param('status', '', id='empty-status-output'),
+    pytest.param('leases', 'Error: lease registry unavailable', id='non-json-leases'),
+    pytest.param('leases', '', id='empty-lease-output'),
+])
+def test_upgrade_refuses_unreadable_activity_before_mutation_until_forced(upgrade_setup, probe, output):
+    deploy, args, state, calls, invoke = upgrade_setup
+    state['sha'] = 'c' * 40
+    state[probe] = output
+    args.reembed = True  # A successful upgrade would stop the running agent.
+    before = {path.name: path.read_bytes() for path in deploy.iterdir() if path.is_file()}
+    detail = 'Cannot read Worklink status' if probe == 'status' else 'Cannot read PR checkout leases'
+
+    with pytest.raises(installer.SetupError, match=detail):
+        invoke()
+
+    # Only read-only probes may run: no stop, up, restart, build or provision.
+    expected_calls = [
+        ['docker', 'compose', 'ps', '-q', 'agent'],
+        ['docker', 'compose', 'exec', '-T', '-u', 'mimir', 'agent', 'mimir', 'worklink', 'status'],
+    ]
+    if probe == 'leases':
+        expected_calls.append([
+            'docker', 'compose', 'exec', '-T', '-u', 'mimir', 'agent', 'python', '-c', installer._PR_LEASE_PROBE,
+        ])
+    assert calls == expected_calls
+    assert {path.name: path.read_bytes() for path in deploy.iterdir() if path.is_file()} == before
+
+    # The explicit override must really complete, not merely avoid the refusal.
+    calls.clear()
+    args.force = True
+    invoke()
+    assert any(argv == ['docker', 'compose', 'stop', 'agent'] for argv in calls)
+    assert sum(argv[:2] == ['docker', 'build'] for argv in calls) == 2
+    assert any(argv == ['docker', 'compose', 'up', '-d', 'agent'] for argv in calls)
+    assert not any(argv[-3:] == ['mimir', 'worklink', 'status'] for argv in calls)
+    assert not any(argv[-1] == installer._PR_LEASE_PROBE for argv in calls)
+    assert state['sha'] in (deploy / 'compose.yml').read_text()
+    assert json.loads((deploy / 'manifest.json').read_text())['source_sha'] == state['sha']
+
+
 def test_same_commit_rerun_with_system_packages(upgrade_setup):
     deploy, args, state, calls, invoke = upgrade_setup
     args.system_packages = 'lsof'
