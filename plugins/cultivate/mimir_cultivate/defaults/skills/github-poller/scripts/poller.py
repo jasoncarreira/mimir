@@ -1259,6 +1259,7 @@ def _pr_scope_fields(
         "head_sha": head.get("sha"),
         "base_ref": base.get("ref"),
         "base_sha": base.get("sha"),
+        "pr_draft": pr.get("draft"),
     }
 
 
@@ -2106,6 +2107,7 @@ def _check_pr_pushes(
                             base_ref=(pr.get("base") or {}).get("ref"),
                             base_sha=(pr.get("base") or {}).get("sha"),
                             related_comment=review_context.get(key, ""),
+                            pr_draft=pr.get("draft"),
                         )
                         if not emitted:
                             continue
@@ -2290,6 +2292,10 @@ def _emit_pr_review_needed(
             extras["number"] = pr.get("number")
             extras["pr_state"] = pr.get("state")
             extras.update(_pr_scope_fields(pr, repo, token=token, me=reviewer))
+    # A Worklink CI-gated PR is published as a draft while its checks are
+    # pending. No review turn should begin until Worklink marks it ready.
+    if extras.get("pr_draft") is True or isinstance(pr, dict) and pr.get("draft") is True:
+        return False
     if reviewed is None and reviewer:
         head_sha = extras.get("head_sha") or extras.get("new_head")
         if not head_sha and isinstance(repo, str) and number is not None:

@@ -115,6 +115,9 @@ class WorklinkEvidence:
     # chainlink #817: in-attempt gate-repair rounds this evidence reflects
     # (0 = the gate passed/failed without repair).
     repair_rounds: int = 0
+    gate_mode: str = "local"
+    ci_repair_rounds: int = 0
+    ci_checks: tuple[tuple[str, str], ...] = ()
     # Commit pushed for this completed attempt. Recovery uses it to detect PR
     # branch updates made after Worklink finished.
     head_sha: str | None = None
@@ -200,7 +203,9 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
 
     tests_ok = False
     if evidence.tests is None:
-        if status == "completed":
+        if status == "completed" and evidence.gate_mode == "ci":
+            tests_ok = True  # CI is the authoritative gate after draft publication.
+        elif status == "completed":
             reasons.append("tests_missing")
             status = "failed"
     elif not evidence.tests.observed:
@@ -254,6 +259,7 @@ async def observe_evidence(
     base_ref: str,
     backend_status: str,
     test_command: str | None,
+    gate_mode: str = "local",
     safe_git: EvidenceGit | None = None,
     head_ref: str = "HEAD",
     checkout_ref: str | None = None,
@@ -283,6 +289,7 @@ async def observe_evidence(
         head_ref=head_ref,
         backend_status=backend_status,
         test_command=test_command,
+        gate_mode=gate_mode,
         safe_git=safe_git,
         work_spec=work_spec,
         compute=compute,
@@ -628,6 +635,7 @@ async def _observe_evidence_from_ref(
     head_ref: str,
     backend_status: str,
     test_command: str | None,
+    gate_mode: str = "local",
     safe_git: EvidenceGit | None,
     work_spec: WorkSpec | None,
     compute: ComputeBackend | None,
@@ -923,6 +931,7 @@ async def _observe_evidence_from_ref(
         tests=tests,
         pr_url=pr_url,
         status=_common_status(backend_status),
+        gate_mode=gate_mode,
         base_ref=work_spec.base_ref if work_spec is not None else base_ref,
         model=model,
         failure_reason=failure_reason,

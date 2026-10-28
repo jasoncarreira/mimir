@@ -717,7 +717,8 @@ def upgrade_setup(tmp_path, monkeypatch):
               'owner_email': 'owner@example.com', 'deploy': str(deploy),
               'model_spec': 'openai:model', 'saga_model_spec': 'openai:model',
               'embedding': 'openai:model', 'source_ref': 'refs/heads/feature/plugins',
-              'source_repo': 'org/mimir', 'test_command': 'npm test', 'port': '8123'}
+                  'source_repo': 'org/mimir', 'test_command': 'npm test',
+                  'review_tests': 'targeted', 'port': '8123'}
     monkeypatch.setattr(installer, '_field', lambda args, name, *a, **kw: fields[name])
     monkeypatch.setattr(installer, '_secret', lambda *a, **kw: 'secret')
     monkeypatch.setattr(installer, 'validate_token', lambda *a: None)

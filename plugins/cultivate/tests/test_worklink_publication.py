@@ -130,11 +130,11 @@ async def test_stopped_attempt_does_not_fence_next_publication(
     {"pr_url": None},
     "not an object",
     "{not json",
-    {"status": "stopped", "pr_url": "https://example.test/pr/1"},
     {"status": "stopped", "pr_url": ""},
     {"status": "completed", "pr_url": "https://example.test/pr/1"},
     {"status": "failed", "pr_url": "https://example.test/pr/1"},
     {"status": "blocked", "pr_url": "https://example.test/pr/1"},
+    {"status": "blocked", "pr_url": "https://github.com/o/r/pull/1"},
 ])
 def test_publication_fails_closed_on_prior_evidence(tmp_path: Path, payload: object) -> None:
     path = _evidence_dir(tmp_path) / f"{ISSUE}-1.json"
@@ -153,3 +153,11 @@ def test_publication_fails_closed_on_existing_intent(tmp_path: Path) -> None:
         with orchestrator._leaf_publication(tmp_path, ISSUE, 2):
             pytest.fail("existing intent was overwritten")
     assert intent.read_text() == "{}"
+
+
+def test_stopped_draft_does_not_fence_later_attempt(tmp_path: Path) -> None:
+    path = _evidence_dir(tmp_path) / f"{ISSUE}-1.json"
+    path.write_text(json.dumps({"status": "stopped", "pr_url": "https://github.com/o/r/pull/1"}))
+    with orchestrator._leaf_publication(tmp_path, ISSUE, 2) as intent:
+        intent.completed = True
+    assert not (tmp_path / f"state/worklink/publications/{ISSUE}.json").exists()
