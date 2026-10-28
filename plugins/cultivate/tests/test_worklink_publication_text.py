@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 import os
 from pathlib import Path
 import re
@@ -22,6 +23,8 @@ def _git(repo: Path, *args: str) -> str:
 
 @pytest.mark.parametrize(("supplied", "title", "expected"), [
     ("Describe the changed behavior", "Fallback title", "Describe the changed behavior"),
+    ("Fix mimir/tools/chainlink.py", "Fallback title", "Fix mimir/tools/chainlink.py"),
+    (None, "Fix chainlink #12 behavior", "Fix behavior"),
     (None, "Fallback for #12 and org/repo#34", "Fallback for and"),
     ("x" * 73, "Fallback title", "Fallback title"),
     ("Contains #12", "Fallback title", "Fallback title"),
@@ -118,7 +121,10 @@ def test_publication_text_from_real_commit_and_pr(
         f"- Gate run: `gate-77`\n\n{footer}\n"
     )
     assert "/home/mimir" not in body
-    assert "chainlink" not in (body + expected + _git(repo, "log", "-1", "--format=%B")).lower()
+    assert not re.search(
+        r"(?i)\bchainlink(?:\s*#\s*|\s*-\s*|\s+)\d+\b",
+        body + expected + _git(repo, "log", "-1", "--format=%B"),
+    )
     assert "2042-3" not in body + _git(repo, "log", "-1", "--format=%B")
     assert not re.search(r"#\d+", body + expected + _git(repo, "log", "-1", "--format=%B"))
 
@@ -126,10 +132,16 @@ def test_publication_text_from_real_commit_and_pr(
 @pytest.mark.parametrize(("summary", "expected"), [
     ("This is a partial fix: TODO follow-up.", "This is a partial fix: TODO follow-up."),
     ("Related work: chainlink #12 and example/repo#7.", "Related work:  and example/repo#7."),
+    ("Related work: chainlink-12 and chainlink 34.", "Related work:  and ."),
+    ("Shipped on 2026-10-28; see release 10-2 notes", "Shipped on 2026-10-28; see release 10-2 notes"),
+    ("Edits mimir/tools/chainlink.py; gate: pytest -k chainlink", "Edits mimir/tools/chainlink.py; gate: pytest -k chainlink"),
     ("Fixes #7", "Fixes #7"),
     ("Implemented the retry path.", "Implemented the retry path."),
 ])
-@pytest.mark.parametrize("gate_command", ["./tools/verify", "/usr/bin/python -m pytest -q"])
+@pytest.mark.parametrize("gate_command", [
+    "./tools/verify", "/usr/bin/python -m pytest -q", "pytest -k chainlink",
+    "pytest -k 'chainlink 10'", "./verify --range 10-2",
+])
 def test_pr_preserves_summary_and_gate_without_internal_references(
     tmp_path: Path, summary: str, expected: str, gate_command: str,
 ) -> None:
@@ -143,7 +155,7 @@ def test_pr_preserves_summary_and_gate_without_internal_references(
         return subprocess.CompletedProcess(args, 0, "https://github.com/example/repo/pull/4\n", "")
 
     evidence = WorklinkEvidence(
-        issue=2042, attempt=3, backend="opencode", branch="issue/2042-a3",
+        issue=10, attempt=2, backend="opencode", branch="issue/10-a2",
         checkout=str(tmp_path), started_at=datetime.now(UTC).isoformat(),
         finished_at=datetime.now(UTC).isoformat(), files_changed=["change.txt"],
         diff_stat="1 file changed", commands=[],
@@ -152,7 +164,7 @@ def test_pr_preserves_summary_and_gate_without_internal_references(
         transcript="/home/mimir/agent/state/worklink/transcripts/secret.json",
     )
     orchestrator._open_pr(
-        tmp_path, orchestrator.IssueContext(2042, "Fix the parser crash", "", set()),
+        tmp_path, orchestrator.IssueContext(10, "Fix the parser crash", "", set()),
         evidence.branch, evidence, base="feature/plugins", runner=runner,
         pr_body_section=section,
     )
@@ -163,7 +175,24 @@ def test_pr_preserves_summary_and_gate_without_internal_references(
     assert f"- Tests: `{gate_command}` → 0\n" in body
     assert "- Gate run: `gate-77`" in body
     assert evidence.transcript not in body
-    assert "chainlink" not in body.lower() and "2042-3" not in body
+    assert "issue/10-a2" not in body
+
+    # CI-body refresh must preserve the same commands and builder prose too.
+    edit_calls: list[list[str]] = []
+
+    def ci_runner(args: list[str]):
+        if args[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"body": body}), "")
+        edit_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    orchestrator._update_ci_pr_body(
+        ci_runner, "https://github.com/example/repo/pull/4", (("tests", "success"),), 1, "a" * 40,
+    )
+    updated_body = edit_calls[0][edit_calls[0].index("--body") + 1]
+    assert updated_body.startswith(body.rstrip() + "\n")
+    assert f"- Tests: `{gate_command}` → 0\n" in updated_body
+    assert f"Build summary:\n\n{expected}\n\n" in updated_body
 
 
 @pytest.mark.parametrize("value", [

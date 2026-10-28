@@ -115,7 +115,7 @@ _COMMIT_SUBJECT_MAX_BYTES = 512
 _PUBLICATION_REFERENCE_RE = re.compile(
     r"https?://(?:www\.)?github\.com/[^\s]+|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+|#\d+", re.I,
 )
-_INTERNAL_REFERENCE_RE = re.compile(r"(?i)\bchainlink(?:\s*#\s*|\s*-\s*|\s+)\d+\b|\bchainlink\b")
+_INTERNAL_REFERENCE_RE = re.compile(r"(?i)\bchainlink(?:\s*#\s*|\s*-\s*|\s+)\d+\b")
 _HOST_PATH_RE = re.compile(r"(?<!\S)/(?:[\w.-]+/)*[\w.-]+|(?<=[`\"'])/(?:[\w.-]+/)*[\w.-]+")
 _PR_BODY_SECTION_MAX_BYTES = 4000
 _PR_BODY_SECTION_TRUNCATED = "\n\n[Build summary truncated by Worklink.]"
@@ -6289,9 +6289,10 @@ def _open_pr(
                 "- flaky_tests (passed in isolation; not proof of flakiness): "
                 f"{json.dumps([redact_text(node) for node in tests.flaky_tests])}\n"
             )
-    body = (f"Build summary:\n\n{pr_body_section}\n\n" if pr_body_section else "") + evidence_block
-    body += f"\n{attribution[1]}\n"
-    body = _public_text(body).replace(f"{issue.issue_id}-{evidence.attempt}", "")
+    # Scrub build-authored prose, not the evidence: commands must be published
+    # exactly as executed, even when they mention the tracker or an id form.
+    body = (f"Build summary:\n\n{_public_text(pr_body_section)}\n\n" if pr_body_section else "") + evidence_block
+    body += f"\n{_public_text(attribution[1])}\n"
     command = ["gh", "pr", "create", "--base", base, "--head", branch]
     if draft:
         command.append("--draft")
@@ -6324,7 +6325,7 @@ def _update_ci_pr_body(
     # marker, branch and transcript lines. Never copy those into an edit.
     body = re.sub(r"(?im)^\s*Closes chainlink-\d+\.\s*\n?", "", body)
     body = re.sub(r"(?im)^- (?:Branch|Transcript run):.*\n?", "", body)
-    body = _public_text(body)
+    # Existing evidence includes literal gate commands; do not scrub it as prose.
     # Check names are untrusted and may look like extra closure references or
     # refusal language. Detailed names/conclusions belong in evidence JSON only.
     green = sum(state in {"success", "neutral", "skipped"} for _, state in checks)
