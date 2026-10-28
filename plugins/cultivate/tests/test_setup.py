@@ -786,6 +786,30 @@ def upgrade_setup(setup_environment):
     return deploy, args, state, calls, invoke
 
 
+@pytest.fixture
+def legacy_source(monkeypatch):
+    """Serve a pinned historical source with a provision template changed since then."""
+    source = Path(installer.__file__).read_text()
+    old_source = source.replace("_PROVISION = '''from pathlib import Path",
+                                "_PROVISION = '''# previous commit\nfrom pathlib import Path")
+    old_source = old_source.replace('environment["WORKLINK_REPO"] = "/workspace/worklink/base/" + repo_name',
+                                    'environment["MIMIR_ACP_ENABLED"] = "0"\n'
+                                    '        environment["WORKLINK_REPO"] = "/workspace/worklink/base/" + repo_name')
+    assert old_source != source
+    scaffold = Path(installer.__file__).resolve().parents[3] / 'mimir/scaffold_docker.py'
+    original_content = installer._content
+
+    def content(slug, branch, path, token, request):
+        if branch == SHA and path == 'plugins/cultivate/mimir_cultivate/setup.py':
+            return old_source
+        if branch == SHA and path == 'mimir/scaffold_docker.py':
+            return scaffold.read_text()
+        return original_content(slug, branch, path, token, request)
+
+    monkeypatch.setattr(installer, '_content', content)
+    return '# previous commit\n' + installer._PROVISION
+
+
 def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrade_setup, capsys):
     deploy, args, state, calls, invoke = upgrade_setup
     old = SHA
@@ -831,8 +855,15 @@ def test_upgrade_refuses_operator_edits_until_forced(upgrade_setup, name):
     assert '# operator edit' not in path.read_text()
 
 
-def test_upgrade_legacy_unedited_generated_files(upgrade_setup):
+def test_upgrade_legacy_unedited_generated_files(upgrade_setup, legacy_source):
     deploy, args, state, calls, invoke = upgrade_setup
+    assert legacy_source != installer._PROVISION
+    (deploy / 'provision.py').write_text(legacy_source)
+    compose_path = deploy / 'compose.yml'
+    original_compose = compose_path.read_text()
+    historical_compose = original_compose.replace('MIMIR_ACP_ENABLED: \'1\'', 'MIMIR_ACP_ENABLED: \'0\'')
+    assert historical_compose != original_compose
+    compose_path.write_text(historical_compose)
     manifest = json.loads((deploy / 'manifest.json').read_text())
     for key in ('generated_sha256', 'source_sha', 'layer_tag'):
         del manifest[key]
@@ -840,19 +871,36 @@ def test_upgrade_legacy_unedited_generated_files(upgrade_setup):
     state['sha'] = 'c' * 40
     invoke()
     assert state['sha'] in (deploy / 'compose.yml').read_text()
+    assert yaml.safe_load(compose_path.read_text())['services']['agent']['environment']['MIMIR_ACP_ENABLED'] == '1'
+    assert (deploy / 'provision.py').read_text() == installer._PROVISION
+    hashes = json.loads((deploy / 'manifest.json').read_text())['generated_sha256']
+    assert hashes['provision.py'] == installer._digest(installer._PROVISION)
 
 
-def test_upgrade_legacy_operator_edit_is_refused(upgrade_setup):
+def test_upgrade_legacy_operator_edit_is_refused(upgrade_setup, legacy_source):
+    deploy, args, state, calls, invoke = upgrade_setup
+    compose = deploy / 'compose.yml'
+    compose.write_text(compose.read_text().replace('MIMIR_ACP_ENABLED: \'1\'', 'MIMIR_ACP_ENABLED: \'0\''))
+    provision = deploy / 'provision.py'
+    provision.write_text(legacy_source + 'x')
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    del manifest['generated_sha256']
+    (deploy / 'manifest.json').write_text(json.dumps(manifest))
+    state['sha'] = 'c' * 40
+    with pytest.raises(installer.SetupError, match='provision.py already differs'):
+        invoke()
+    assert not calls and provision.read_text() == legacy_source + 'x'
+
+
+def test_upgrade_legacy_unrecoverable_source_is_refused(upgrade_setup):
     deploy, args, state, calls, invoke = upgrade_setup
     manifest = json.loads((deploy / 'manifest.json').read_text())
     del manifest['generated_sha256']
     (deploy / 'manifest.json').write_text(json.dumps(manifest))
-    compose = deploy / 'compose.yml'
-    compose.write_text(compose.read_text() + '\n# operator edit\n')
     state['sha'] = 'c' * 40
-    with pytest.raises(installer.SetupError, match='compose.yml already differs'):
+    with pytest.raises(installer.SetupError, match='Cannot recover previous generated templates'):
         invoke()
-    assert not calls and '# operator edit' in compose.read_text()
+    assert not calls and SHA in (deploy / 'compose.yml').read_text()
 
 
 @pytest.mark.parametrize('activity,detail', [('worklink', 'Worklink #42 (running)'),
