@@ -459,6 +459,110 @@ def _write(path: Path, text: str, *, mode: int = 0o644, replace: bool = False) -
     return True
 
 
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _previous_image(deploy: Path, previous: dict) -> tuple[str, str] | None:
+    """Recover the original image from the saved build, including legacy installs."""
+    build = deploy / "build.sh"
+    if not build.is_file() or build.is_symlink():
+        return None
+    text = build.read_text()
+    root = re.search(r"(?m)^docker build -t mimir-cultivate-root:([0-9a-f]{40}) ", text)
+    layer = re.search(r"(?m)^docker build -t (mimir-cultivate-agent:([0-9a-f]{40})-[a-z0-9-]+) -f Dockerfile\.toolchain \.\s*$", text)
+    if not root or not layer or root.group(1) != layer.group(2):
+        return None
+    sha, tag = root.group(1), layer.group(1)
+    if (previous.get("source_sha", sha) != sha or previous.get("layer_tag", tag) != tag):
+        return None
+    return sha, tag
+
+
+def _check_generated(deploy: Path, generated: dict[str, str], previous: dict,
+                     old_image: tuple[str, str] | None, *, force: bool) -> None:
+    """Validate *all* owned files before replacing any of them."""
+    hashes = previous.get("generated_sha256")
+    if hashes is not None and (not isinstance(hashes, dict) or
+                               any(not isinstance(hashes.get(name), str) or
+                                   not re.fullmatch(r"[0-9a-f]{64}", hashes[name]) for name in generated)):
+        raise SetupError("Invalid generated file hashes in manifest.json; reconcile it before retrying.")
+    legacy = {}
+    if hashes is None and (deploy / "compose.yml").exists() and not force:
+        if old_image is None:
+            raise SetupError("Cannot verify previous generated files; reconcile build.sh before retrying.")
+        from mimir.scaffold_docker import render_compose_yml
+        compose_path = deploy / "compose.yml"
+        content = compose_path.read_text()
+        match = re.search(r"127\.0\.0\.1:(\d+):8080", content)
+        if not match:
+            raise SetupError(f"{compose_path} already differs; reconcile it manually before retrying.")
+        legacy = {
+            "compose.yml": render_compose(render_compose_yml(service_name="agent", web_port=int(match.group(1)), mode="pypi"),
+                                          old_image[1], previous["toolchain"], previous["slug"].split("/")[1]),
+            "provision.py": _PROVISION,
+            "compose.provision.yml": _PROVISION_COMPOSE,
+            ".gitignore": "*\n",
+        }
+    for name, text in generated.items():
+        path = deploy / name
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise SetupError(f"Refusing non-regular deployment file {path}; move it aside and retry.")
+        if path.exists() and not force:
+            content = path.read_text()
+            trusted = (_digest(content) == hashes[name] if hashes is not None else
+                       content == legacy.get(name) if legacy else True)
+            if not trusted:
+                raise SetupError(f"{path} already differs; reconcile it manually before retrying.")
+        elif hashes is not None and not force:
+            raise SetupError(f"{path} already differs; reconcile it manually before retrying.")
+
+
+_PR_LEASE_PROBE = """\
+import json
+from mimir_cultivate.repository import configured_pr_checkout_lease_root, active_pr_checkout_lease_for_path
+root = configured_pr_checkout_lease_root()
+leases = []
+for path in root.iterdir():
+ if path.is_dir():
+  lease = active_pr_checkout_lease_for_path(path)
+  if lease is not None:
+   leases.append(f'{lease.canonical_repo}#{lease.pr_number}')
+print(json.dumps(sorted(leases)))
+"""
+
+
+def _check_in_flight(deploy: Path, run) -> None:
+    """A running agent must be idle before setup can recreate or restart it."""
+    status = run(["docker", "compose", "exec", "-T", "-u", "mimir", "agent",
+                  "mimir", "worklink", "status"], cwd=deploy)
+    rows = status.splitlines()
+    if rows == ["No Worklink leaf runs or labeled issues."]:
+        active = []
+    elif rows and rows[0].startswith("ISSUE  STATE "):
+        active = []
+        for row in rows[1:]:
+            fields = row.split()
+            if row.startswith("  disagreement:"):
+                continue
+            if len(fields) < 2 or not fields[0].isdigit():
+                raise SetupError("Cannot read Worklink status; retry after inspecting the agent.")
+            if fields[1] != "clean":
+                active.append(f"Worklink #{fields[0]} ({fields[1]})")
+    else:
+        raise SetupError("Cannot read Worklink status; retry after inspecting the agent.")
+    try:
+        leases = json.loads(run(["docker", "compose", "exec", "-T", "-u", "mimir", "agent",
+                                 "python", "-c", _PR_LEASE_PROBE], cwd=deploy))
+    except ValueError:
+        raise SetupError("Cannot read PR checkout leases; retry after inspecting the agent.") from None
+    if not isinstance(leases, list) or any(not isinstance(lease, str) for lease in leases):
+        raise SetupError("Cannot read PR checkout leases; retry after inspecting the agent.")
+    active.extend(f"PR checkout lease {lease}" for lease in leases)
+    if active:
+        raise SetupError("Agent is busy: " + ", ".join(active) + "; retry when idle or use --force.")
+
+
 def toolchain_test_env(kind: str) -> dict[str, str]:
     """Settings persisted for both the leaf build and its evidence gate."""
     from .worklink.backends.opencode import validate_test_env
@@ -1081,7 +1185,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
     setup.add_argument("--accept-license", action="store_true", help="Explicitly accept the shipped Cultivate BSL 1.1 license for unattended setup.")
     setup.add_argument("--rotate-web-key", action="store_true", help="Replace the owner's existing web key intentionally.")
     setup.add_argument("--reembed", action="store_true", help="Re-embed existing Saga vectors offline when changing embeddings.")
-    setup.add_argument("--force", action="store_true", help="Replace an operator-edited worklink.yaml intentionally.")
+    setup.add_argument("--force", action="store_true", help="Override generated-file edits and in-flight checks; also replace an edited worklink.yaml.")
     return parser
 
 
@@ -1183,14 +1287,11 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         raise SetupError("Deployment directory is not an existing Cultivate setup; choose an empty --deploy directory.")
     if compose_path.is_file():
         print("Existing deployment found; checking and preserving operator secrets and provisioned state.")
-    deploy.mkdir(parents=True, exist_ok=True)
-    deploy.chmod(0o700)
+    old_image = _previous_image(deploy, previous) if compose_path.is_file() else None
+    if compose_path.is_file() and old_image is None:
+        raise SetupError("Cannot identify previous agent image from build.sh; reconcile it before retrying.")
     tag = "mimir-cultivate-root:" + sha
     layer_tag = "mimir-cultivate-agent:" + sha + "-" + kind + version.replace(".", "-")
-    # Fully generated from setup inputs: package and toolchain changes replace
-    # the previous layer, including any manual edits to this file.
-    _write(deploy / "Dockerfile.toolchain", render_layer(kind, version, tag,
-           nextest_version=nextest_version, uv_version=uv_version, system_packages=system_packages), replace=True)
     extras = {provider, saga_provider, "mcp", "local-embeddings"}
     if alert_adapter in {"discord", "slack"}:
         extras.add(alert_adapter)
@@ -1201,17 +1302,32 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   "--build-arg CHAINLINK_ARTIFACT_STAGE=chainlink-build",
                   "--build-arg MIMIR_ENABLE_OPENCODE=1",
                    "--build-arg MIMIR_EXTRAS=" + ",".join(sorted(extras))]
-    _write(deploy / "build.sh", "#!/bin/sh\nset -eu\n"
-           + "docker build -t " + tag + " " + " ".join(build_args) + " " + source_url + "#" + sha + "\n"
-           + "docker build -t " + layer_tag + " -f Dockerfile.toolchain .\n", mode=0o755, replace=True)
+    build_script = ("#!/bin/sh\nset -eu\n"
+                    + "docker build -t " + tag + " " + " ".join(build_args) + " " + source_url + "#" + sha + "\n"
+                    + "docker build -t " + layer_tag + " -f Dockerfile.toolchain .\n")
     from mimir.scaffold_docker import render_compose_yml
 
     # Start from the existing loopback-only compose renderer; use root-image
     # service/volumes rather than its pypi installation build path.
     compose = render_compose_yml(service_name="agent", web_port=port, mode="pypi")
     compose = render_compose(compose, layer_tag, kind, repo.lower().split('/')[1])
-    _write(compose_path, compose)
-    _write(deploy / ".gitignore", "*\n")
+    generated = {"compose.yml": compose, ".gitignore": "*\n",
+                 "provision.py": _PROVISION, "compose.provision.yml": _PROVISION_COMPOSE}
+    _check_generated(deploy, generated, previous, old_image, force=bool(getattr(args, "force", False)))
+    # Query the old running container before publishing the new Compose image.
+    was_running = bool(run(["docker", "compose", "ps", "-q", "agent"], cwd=deploy)) if old_image else False
+    if was_running and not getattr(args, "force", False):
+        _check_in_flight(deploy, run)
+    if old_image and old_image[0] != sha:
+        print(f"Upgrading {old_image[0]} -> {sha}")
+    deploy.mkdir(parents=True, exist_ok=True)
+    deploy.chmod(0o700)
+    # The layer and build script are wholly generated from setup inputs.
+    _write(deploy / "Dockerfile.toolchain", render_layer(kind, version, tag,
+           nextest_version=nextest_version, uv_version=uv_version, system_packages=system_packages), replace=True)
+    _write(deploy / "build.sh", build_script, mode=0o755, replace=True)
+    for name, text in generated.items():
+        _write(deploy / name, text, replace=True)
     # The toolchain layer has no COPY instructions. Docker still sends the
     # context to the daemon: exclude compose.env and the web key by default.
     _write(deploy / ".dockerignore", "*\n!Dockerfile.toolchain\n")
@@ -1228,13 +1344,12 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                   "force": bool(getattr(args, "force", False)),
                   "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
                    "system_packages": system_packages,
-                   "operator_alert_adapter": alert_adapter, "operator_alert_channel_id": alert_channel_id}
+                   "operator_alert_adapter": alert_adapter, "operator_alert_channel_id": alert_channel_id,
+                   "source_sha": sha, "layer_tag": layer_tag,
+                   "generated_sha256": {name: _digest(text) for name, text in generated.items()}}
     _write(deploy / "manifest.json", json.dumps(manifest, indent=2) + "\n", replace=True)
-    _write(deploy / "provision.py", _PROVISION)
     # The provision script and manifest are mounted read-only for a one-shot
     # non-root container, never into the long-running agent.
-    _write(deploy / "compose.provision.yml", "services:\n  agent:\n    volumes:\n      - ./provision.py:/opt/cultivate-provision.py:ro\n      - ./manifest.json:/opt/cultivate-manifest.json:ro\n")
-    was_running = bool(run(["docker", "compose", "ps", "-q", "agent"], cwd=deploy))
     if args.reembed and was_running:
         run(["docker", "compose", "stop", "agent"], cwd=deploy)
     def docker_step(step: str, argv: list[str]) -> str:
@@ -1257,6 +1372,10 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     provisioned = docker_step("provision", ["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",
                                       "--user", "1001:1001", "--entrypoint", "python", "agent", "/opt/cultivate-provision.py"])
     docker_step("up", ["docker", "compose", "up", "-d", "agent"])
+    if old_image and old_image[1] != layer_tag:
+        print("Previous agent image retained: " + old_image[1])
+        print("Rollback (from " + str(deploy) + "): docker compose -f compose.yml -f <(printf 'services:\\n  agent:\\n    image: "
+              + old_image[1] + "\\n') up -d --force-recreate --no-deps agent")
     if was_running and "SETUP_CHANGED=1" in provisioned.splitlines():
         run(["docker", "compose", "restart", "agent"], cwd=deploy)
         print("Restarted the existing agent once to load provisioned repositories, identities and pollers.")
@@ -1283,6 +1402,9 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     print('File a leaf: docker compose exec -w /home/mimir/agent agent chainlink issue create '
           '"<title>" --description "<acceptance and review criteria>" --priority medium')
     print('Arm it: docker compose exec -w /home/mimir/agent agent chainlink issue label <issue-id> worklink:ready')
+
+
+_PROVISION_COMPOSE = "services:\n  agent:\n    volumes:\n      - ./provision.py:/opt/cultivate-provision.py:ro\n      - ./manifest.json:/opt/cultivate-manifest.json:ro\n"
 
 
 _PROVISION = '''from pathlib import Path
