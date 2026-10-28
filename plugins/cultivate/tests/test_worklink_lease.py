@@ -347,18 +347,6 @@ def test_provider_continuation_delivers_after_receipt_only_once(tmp_path: Path) 
     assert len(comments) == 1
 
 
-def test_merge_closure_rejects_ambiguous_completion() -> None:
-    assert merge_closure.parse_completion_reference(
-        "Closes chainlink-1949.\n\nImplemented.", expected_issue_id=1949,
-    ).qualifies
-    assert not merge_closure.parse_completion_reference(
-        "Closes chainlink-1949.\n\nStill incomplete.", expected_issue_id=1949,
-    ).qualifies
-    assert not merge_closure.parse_completion_reference(
-        "Closes chainlink-1950.\n\nImplemented.", expected_issue_id=1949,
-    ).qualifies
-
-
 def test_merge_reconciliation_audits_before_closing_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

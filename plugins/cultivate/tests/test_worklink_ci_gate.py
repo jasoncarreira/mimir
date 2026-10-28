@@ -348,14 +348,13 @@ def test_stop_ci_wait_real_process_identity(tmp_path: Path) -> None:
     assert control.operator_stop_requested(tmp_path, 2050, 1)
 
 
-def test_ci_body_check_names_cannot_break_merge_closure() -> None:
-    from mimir_cultivate.worklink.merge_closure import parse_completion_reference
-
+def test_ci_body_update_removes_legacy_internal_references() -> None:
     forge = Forge({A: [check("success")]})
-    assert parse_completion_reference(forge.body, expected_issue_id=2050).qualifies
+    forge.body += "- Branch: `issue/2050-a1`\n- Transcript run: `2050-1 (gate-77)`\n"
     checks = tuple((name, "success") for name in ("chainlink-cli-audit", "lint (no std)", "test #12"))
     orchestrator._update_ci_pr_body(forge, PR, checks, 2, A)
-    assert parse_completion_reference(forge.body, expected_issue_id=2050).qualifies
+    assert "chainlink" not in forge.body.lower() and "2050-1" not in forge.body
+    assert "issue/2050-a1" not in forge.body
     assert f"3/3 checks green on {A}" in forge.body
     assert "CI repair rounds: 2" in forge.body
     assert all(name not in forge.body for name, _ in checks)
@@ -421,4 +420,3 @@ def test_log_failure_has_explicit_limitation(monkeypatch) -> None:
     result = ci_gate._snapshot(Forge({A: [check("failure")]}), "acme/widget", PR, A)
     assert result.outcome == "red"
     assert "HTTP 403" in result.excerpt
-

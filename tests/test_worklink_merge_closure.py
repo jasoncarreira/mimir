@@ -147,17 +147,20 @@ def forge(issue_id: int, *, body: str | None = None, state: str = "closed", merg
 
 
 def evidence(home: Path, issue_id: int, *, url: str = PR_URL, attempt: int = 1,
-             status: str = "completed", base_ref: str = "main") -> Path:
+             status: str = "completed", base_ref: str = "main", review_ready: bool | None = None) -> Path:
     directory = home / "state" / "worklink" / "evidence"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{issue_id}-{attempt}.json"
-    path.write_text(json.dumps({
+    payload = {
         "issue": issue_id,
         "attempt": attempt,
         "status": status,
         "pr_url": url,
         "base_ref": base_ref,
-    }), encoding="utf-8")
+    }
+    if review_ready is not None:
+        payload["review_ready"] = review_ready
+    path.write_text(json.dumps(payload), encoding="utf-8")
     return path
 
 
@@ -457,64 +460,78 @@ def test_closed_issue_sweep_bounds_retirements_and_tracker_calls(
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("body", [
-    "Closes chainlink-1295.\n\nCloses chainlink-1295.",
-    "Closes chainlink-1295.\n\nThis is partial.",
-    "Closes chainlink-1295.\n\nDo not close yet.",
-    "> Closes chainlink-1295.",
-    "- Closes chainlink-1295.",
-    "```\nCloses chainlink-1295.\n```",
-    "Closes chainlink-1295.\n\nFixes #7",
-    "Closes chainlink-1295.\n\nRefs follow-up",
-    "Closes chainlink-1295.\x00",
-    "Closes chainlink-1295.\u200b",
-    "Closes chainlink #1295.",
-])
-def test_completion_grammar_negative_variants(body: str) -> None:
-    assert not closure.parse_completion_reference(body, expected_issue_id=1295).qualifies
-
-
-@pytest.mark.parametrize("refusal_word", ["stack", "stacked", "epic"])
-def test_stack_and_epic_body_language_refuses_at_reconciler_boundary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal_word: str,
+@pytest.mark.parametrize("body", ["", "Closes chainlink-1295.\n\nLegacy body.", "Partial work remains. Fixes #7"])
+def test_body_is_not_closure_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str,
 ) -> None:
     home, repo = configured_home(tmp_path, monkeypatch)
-    evidence(home, 1295)
+    evidence(home, 1295, review_ready=True)
     tracker = Tracker(1295)
-    body = f"Closes chainlink-1295.\n\nThis {refusal_word} is ready."
-
-    assert closure.reconcile_merged_leaves(
+    assert [item.issue_id for item in closure.reconcile_merged_leaves(
         home, chainlink_runner=tracker, gh_runner=forge(1295, body=body),
         git_runner=git_runner(repo),
+    )] == [1295]
+
+
+def test_null_body_closes_from_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 1295, review_ready=True)
+    tracker = Tracker(1295)
+    base_forge = forge(1295, body="")
+
+    def null_body_forge(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        payload = json.loads(base_forge(args).stdout)
+        payload["body"] = None
+        return cp(stdout=json.dumps(payload))
+
+    assert [item.issue_id for item in closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=null_body_forge, git_runner=git_runner(repo),
+    )] == [1295]
+
+
+@pytest.mark.parametrize(("status", "ready"), [("failed", False), ("failed", True), ("completed", False)])
+def test_unready_latest_attempt_cannot_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str, ready: bool,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 1295, attempt=1, review_ready=True)
+    evidence(home, 1295, attempt=2, status=status, review_ready=ready)
+    tracker = Tracker(1295)
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(1295, body=""), git_runner=git_runner(repo),
     ) == []
-
-    assert not [
-        call for call in tracker.calls
-        if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])
-    ]
-    notices = load_failure_state(
-        dispatch_failure_state_dir(home)
-    )["merge_reconciliations"]["notices"]
-    assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
-        "completion_body_contains_refusal_language"
-    ]
+    assert tracker.status == "open"
 
 
-@pytest.mark.parametrize("issue_id", HISTORICAL_IDS)
-def test_historical_ids_have_separate_noncompleting_variants(issue_id: int) -> None:
-    decision = closure.parse_completion_reference(
-        f"Refs chainlink #{issue_id}; remaining work follows.", expected_issue_id=issue_id,
-    )
-    assert not decision.qualifies
+def test_publication_url_is_authoritative(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 1295, url="https://github.com/example/project/pull/43", review_ready=True)
+    tracker = Tracker(1295, comments=[f"draft PR opened: {PR_URL}"])
+    issue = closure.IssueSnapshot(1295, "open", frozenset({"worklink:review"}), tuple(tracker.comments), None)
+    association = closure.discover_associations(home, issue)
+    pr = closure.read_pr_snapshot(PR_URL, gh_bin="gh", runner=forge(1295, body=""))
+    repository = closure.resolve_completion_repository(home, runner=git_runner(repo))
+    assert closure._validate_qualification(
+        issue=issue, pr=pr, association=association, repository=repository,
+    ) == "association_changed"
+    assert tracker.status == "open"
 
 
-def test_evidence_association_inventory_refuses_conflict(tmp_path: Path) -> None:
+def test_evidence_association_selects_latest_publication(tmp_path: Path) -> None:
     issue = closure.IssueSnapshot(7, "open", frozenset({"worklink:review"}), (), None)
     evidence(tmp_path, 7, url=PR_URL, attempt=1)
     evidence(tmp_path, 7, url="https://github.com/example/project/pull/43", attempt=2)
     association = closure.discover_associations(tmp_path, issue)
-    assert association.reason == "conflicting_pr_associations"
-    assert association.pr_url is None
+    assert association.reason is None
+    assert association.pr_url == "https://github.com/example/project/pull/43"
+
+
+def test_latest_attempt_uses_number_not_filename_order(tmp_path: Path) -> None:
+    issue = closure.IssueSnapshot(7, "open", frozenset({"worklink:review"}), (), None)
+    evidence(tmp_path, 7, attempt=2, url=PR_URL, review_ready=True)
+    latest = "https://github.com/example/project/pull/43"
+    evidence(tmp_path, 7, attempt=10, url=latest, review_ready=True)
+    assert closure.discover_associations(tmp_path, issue).pr_url == latest
 
 
 @pytest.mark.parametrize("defect", [
@@ -581,7 +598,7 @@ def test_duplicate_active_evidence_with_same_url_remains_qualifying(
     ] == ["comment", "close", "unlabel"]
 
 
-def test_comment_associations_are_discovery_not_authority(
+def test_comment_associations_are_not_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home, repo = configured_home(tmp_path, monkeypatch)
@@ -594,7 +611,7 @@ def test_comment_associations_are_discovery_not_authority(
     assert outcomes == []
     assert tracker.status == "open"
     notices = load_failure_state(dispatch_failure_state_dir(home))["merge_reconciliations"]["notices"]
-    assert any("missing_exact_completion_declaration" in entry["detail"] for entry in notices.values())
+    assert not notices
 
 
 def test_unrelated_open_issue_is_silently_excluded(
@@ -616,15 +633,6 @@ def test_unrelated_open_issue_is_silently_excluded(
     assert not called
     state = load_failure_state(dispatch_failure_state_dir(home))
     assert state["merge_reconciliations"]["notices"] == {}
-
-
-@pytest.mark.parametrize("body", [
-    "Completes #10.",
-    "PR #10 is done.",
-    "Closes chainlink-11.",
-])
-def test_number_collision_and_inferred_sources(body: str) -> None:
-    assert not closure.parse_completion_reference(body, expected_issue_id=10).qualifies
 
 
 def test_open_pr_is_pending_without_notice(
