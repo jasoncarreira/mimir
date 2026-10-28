@@ -159,7 +159,9 @@ def validate(name: str, value: str) -> str:
         ok = value == "local" or bool(re.fullmatch(r"(openai|voyage):[A-Za-z0-9_.-]+", value))
     elif name == "review_tests":
         ok = value in {"targeted", "full", "none"}
-    elif name == "test_command":
+    elif name == "worklink_gate":
+        ok = value in {"local", "ci"}
+    elif name in {"test_command", "quick_gate_command"}:
         ok = bool(value) and "\n" not in value and "\r" not in value
     elif name == "port":
         ok = value.isdigit() and 1 <= int(value) <= 65535
@@ -1171,6 +1173,8 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("port", "Free loopback port (default: next free from 8090)."),
         ("test-command", "Verification command for target repo; default detected from repo."),
         ("review-tests", "Review test policy: targeted (default), full, or none; CI supplies full-suite evidence."),
+        ("worklink-gate", "Worklink gate mode: local (default) or ci; omit to preserve the saved mode."),
+        ("quick-gate-command", "Optional quick verification command for ci mode; omit to preserve the saved command."),
         ("system-packages", "Extra Debian packages for the toolchain layer, comma-separated (optionally name=version); use none to clear, omit to preserve the saved list."),
         ("source-ref", "Pushed Mimir source ref (default: refs/heads/feature/plugins)."),
         ("source-repo", "Mimir source owner/name (default: " + DEFAULT_SOURCE_REPO + ")."),
@@ -1188,6 +1192,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
     setup.add_argument("--accept-license", action="store_true", help="Explicitly accept the shipped Cultivate BSL 1.1 license for unattended setup.")
     setup.add_argument("--rotate-web-key", action="store_true", help="Replace the owner's existing web key intentionally.")
     setup.add_argument("--reembed", action="store_true", help="Re-embed existing Saga vectors offline when changing embeddings.")
+    setup.add_argument("--no-start", action="store_true", help="Build and provision but leave the agent stopped; start it later from the deployment directory.")
     setup.add_argument("--force", action="store_true", help="Override generated-file edits and in-flight checks; also replace an edited worklink.yaml.")
     return parser
 
@@ -1211,6 +1216,12 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     if requested_packages is not None:
         system_packages = ([] if requested_packages.strip() == "none"
                            else validate_system_packages(requested_packages.split(",")))
+    if getattr(args, "worklink_gate", None) is not None:
+        validate("worklink_gate", args.worklink_gate)
+    if getattr(args, "quick_gate_command", None) is not None:
+        validate("quick_gate_command", args.quick_gate_command)
+        if getattr(args, "worklink_gate", None) == "local":
+            raise SetupError("--quick-gate-command is only valid with --worklink-gate ci.")
     _license_gate(args)
     repo = _field(args, "repo", "Target owner/name: find it in the GitHub repository URL; used for clone and policy.")
     branch = _field(args, "branch", "Base branch: select the repository's default branch on GitHub; used for PRs.", default="main")
@@ -1233,6 +1244,19 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         if not isinstance(packages, list):
             raise SetupError("Invalid system packages in manifest.json; reconcile it before retrying.")
         system_packages = validate_system_packages(packages)
+    gate = getattr(args, "worklink_gate", None)
+    gate = previous.get("worklink_gate", "local") if gate is None else gate
+    if not isinstance(gate, str):
+        raise SetupError("Invalid worklink gate in manifest.json; reconcile it before retrying.")
+    gate = validate("worklink_gate", gate)
+    quick_gate_command = getattr(args, "quick_gate_command", None)
+    quick_gate_command = previous.get("quick_gate_command") if quick_gate_command is None else quick_gate_command
+    if quick_gate_command is not None:
+        if not isinstance(quick_gate_command, str):
+            raise SetupError("Invalid quick gate command in manifest.json; reconcile it before retrying.")
+        quick_gate_command = validate("quick_gate_command", quick_gate_command)
+        if gate != "ci":
+            raise SetupError("--quick-gate-command is only valid with --worklink-gate ci.")
     if deploy.exists() and (not deploy.is_dir() or deploy.is_symlink()):
         raise SetupError("Deployment directory must be a real directory; choose a new --deploy path.")
     existing_env = (deploy / "compose.env").read_text() if (deploy / "compose.env").is_file() else ""
@@ -1344,7 +1368,9 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
     manifest = {"slug": repo.lower(), "branch": branch, "toolchain": kind, "owner": owner, "display": display,
-                   "email": owner_email, "test": test, "review_tests": review_tests, "rotate": bool(args.rotate_web_key),
+                   "email": owner_email, "test": test, "review_tests": review_tests,
+                   "worklink_gate": gate, "quick_gate_command": quick_gate_command,
+                   "rotate": bool(args.rotate_web_key),
                   "force": bool(getattr(args, "force", False)),
                   "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
                    "system_packages": system_packages,
@@ -1354,7 +1380,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     _write(deploy / "manifest.json", json.dumps(manifest, indent=2) + "\n", replace=True)
     # The provision script and manifest are mounted read-only for a one-shot
     # non-root container, never into the long-running agent.
-    if args.reembed and was_running:
+    no_start = bool(getattr(args, "no_start", False))
+    if (args.reembed or no_start) and was_running:
         run(["docker", "compose", "stop", "agent"], cwd=deploy)
     def docker_step(step: str, argv: list[str]) -> str:
         try:
@@ -1375,14 +1402,18 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     docker_step("init", ["docker", "compose", "run", "--rm", "init"])
     provisioned = docker_step("provision", ["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",
                                       "--user", "1001:1001", "--entrypoint", "python", "agent", "/opt/cultivate-provision.py"])
-    docker_step("up", ["docker", "compose", "up", "-d", "agent"])
+    if not no_start:
+        docker_step("up", ["docker", "compose", "up", "-d", "agent"])
     if old_image and old_image[1] != layer_tag:
         print("Previous agent image retained: " + old_image[1])
         print("Rollback (from " + str(deploy) + "): docker compose -f compose.yml -f <(printf 'services:\\n  agent:\\n    image: "
               + old_image[1] + "\\n') up -d --force-recreate --no-deps agent")
-    if was_running and "SETUP_CHANGED=1" in provisioned.splitlines():
+    if not no_start and was_running and "SETUP_CHANGED=1" in provisioned.splitlines():
         run(["docker", "compose", "restart", "agent"], cwd=deploy)
         print("Restarted the existing agent once to load provisioned repositories, identities and pollers.")
+    if no_start:
+        print(f"Build and provisioning complete. To start the agent later, from {deploy} run: docker compose up -d agent")
+        return
     # docker cp writes into a pre-created mode-600 path, without putting key in
     # stdout, argv or the subprocess exception path.
     key_path = deploy / "owner-web-key"
@@ -1466,23 +1497,23 @@ config = yaml.safe_load(inventory.read_text()) if inventory.exists() else {}
 config = config or {}
 base = Path('/workspace/worklink/base') / repo.name
 entry = {'slug': m['slug'], 'root': str(repo), 'mode': 'rw', 'origin': origin,
-          'base_branch': m['branch'], 'test_command': m['test'], 'review_tests': m['review_tests'],
-          'worklink_base': str(base)}
+           'base_branch': m['branch'], 'test_command': m['test'], 'review_tests': m['review_tests'],
+           'worklink_gate': m.get('worklink_gate', 'local'), 'quick_gate_command': m.get('quick_gate_command'),
+           'worklink_base': str(base)}
 rows = config.setdefault('repositories', [])
 old = next((r for r in rows if r.get('slug') == m['slug']), None)
-# Upgrade only an otherwise identical pre-Worklink declaration; never replace
-# an operator's explicitly selected alternate base.
-if old is not None and old in ({k: v for k, v in entry.items() if k != 'worklink_base'},
-                               {k: v for k, v in entry.items() if k not in ('worklink_base', 'review_tests')}):
-    old['worklink_base'] = str(base)
-    changed = True
-# Adopt the requested review policy only for an otherwise identical legacy
-# declaration. An explicit, different policy remains an operator conflict.
-if old is not None and old == {k: v for k, v in entry.items() if k != 'review_tests'}:
-    old['review_tests'] = entry['review_tests']
-    changed = True
-if old is not None and old != entry:
+# Back-fill only fields absent from an otherwise identical legacy declaration.
+# Explicit values (including the gate mode) are never silently replaced.
+optional = {'worklink_base', 'review_tests', 'worklink_gate', 'quick_gate_command'}
+if old is not None and set(entry) - set(old) <= optional and all(entry.get(k) == v for k, v in old.items()):
+    missing = {k: v for k, v in entry.items() if k not in old}
+    old.update(missing)
+    changed = bool(missing) or changed
+if old is not None and old != entry and not m.get('force', False):
     raise RuntimeError('existing repository declaration differs; reconcile manually')
+if old is not None and old != entry:
+    rows[rows.index(old)] = entry
+    changed = True
 if old is None:
     rows.append(entry)
     changed = True

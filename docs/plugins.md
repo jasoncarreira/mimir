@@ -57,6 +57,11 @@ previously generated contents). An edited generated file or an active Worklink
 run or PR checkout lease prevents the upgrade unless `--force` is supplied.
 On an image change, setup prints the previous image tag and a Compose rollback
 command. Wait for running work to finish before upgrading.
+Use `--no-start` to rebuild and provision without starting the agent. If it was
+running, setup checks for in-flight work and stops it before the build; if it was
+already stopped, it remains stopped. Live health and web-key checks run when you
+start normally on a later setup run. Setup prints the command to start it from
+the deployment directory: `docker compose up -d agent`.
 
 Setup also asks **Where should operator alerts go? [web/discord/slack/none]**.
 `web` delivers to the owner's authenticated `web-<owner>` chat and persists
@@ -109,6 +114,13 @@ sets `worklink_base: /workspace/worklink/base/<repo-name>` on that repository's
 checks recognize only that exact alternate path, and only beneath a declared
 `rw` allowed root. Omitting `worklink_base` preserves working-checkout-only
 selection; directory names alone never confer trust.
+Select `--worklink-gate local|ci` (default `local`) to set the repository's
+Worklink gate mode. In `ci` mode, `--quick-gate-command "<cmd>"` optionally
+configures the quick verification command; it is invalid in `local` mode.
+Both settings are saved in the deployment manifest and repository inventory;
+omitting the flags on a rerun preserves the saved values. Existing declarations
+missing these fields are back-filled if otherwise identical. Explicit conflicting
+values require reconciliation or `--force`.
 
 `--embedding local` (the default) selects `voyageai/voyage-4-nano` at 1024
 dimensions on CPU. Its query and document vectors share Voyage 4's embedding

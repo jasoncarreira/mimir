@@ -135,6 +135,24 @@ def test_validation_and_github_permissions():
         installer.validate_token("secret", "bot", "org/repo", no_actions)
 
 
+def test_worklink_gate_flags_validate_before_license_or_deployment(tmp_path, monkeypatch):
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers(dest='command'))
+    monkeypatch.setattr(installer, '_license_gate', lambda args: pytest.fail('invalid flags reached license gate'))
+    for flags, message in [
+        (['--worklink-gate', 'remote'], 'Invalid worklink gate'),
+        (['--quick-gate-command', '  '], 'Invalid quick gate command'),
+        (['--quick-gate-command', 'npm test\nother'], 'Invalid quick gate command'),
+        (['--worklink-gate', 'local', '--quick-gate-command', 'npm test'], 'only valid'),
+    ]:
+        args = parser.parse_args(['cultivate', 'setup', '--deploy', str(tmp_path / 'deploy'), *flags])
+        with pytest.raises(installer.SetupError, match=message):
+            installer.setup(args)
+    assert not list(tmp_path.iterdir())
+    assert installer.validate('worklink_gate', 'ci') == 'ci'
+    assert installer.validate('quick_gate_command', ' npm test ') == 'npm test'
+
+
 def test_pat_help_describes_owner_permissions_and_approval():
     help_text = installer.PAT_HELP
     assert "resource owner = the owner of the target repository" in help_text
@@ -746,6 +764,8 @@ def upgrade_setup(tmp_path, monkeypatch):
             return state['leases']
         if argv[-3:] == ['up', '-d', 'agent']:
             state['running'] = True
+        if argv[-2:] == ['stop', 'agent']:
+            state['running'] = False
         return 'SETUP_CHANGED=0' if 'compose.provision.yml' in argv else ''
 
     args = argparse.Namespace(rotate_web_key=False, reembed=False, force=False, system_packages=None)
@@ -828,11 +848,12 @@ def test_upgrade_legacy_operator_edit_is_refused(upgrade_setup):
 
 
 @pytest.mark.parametrize('activity,detail', [('worklink', 'Worklink #42 (running)'),
-                                          ('lease', 'PR checkout lease org/repo#17')])
-def test_upgrade_refuses_in_flight_before_stop(upgrade_setup, activity, detail):
+                                           ('lease', 'PR checkout lease org/repo#17')])
+@pytest.mark.parametrize('mode', ['reembed', 'no_start'])
+def test_upgrade_refuses_in_flight_before_stop(upgrade_setup, activity, detail, mode):
     deploy, args, state, calls, invoke = upgrade_setup
     state['sha'] = 'c' * 40
-    args.reembed = True  # A rerun that would explicitly stop the old agent.
+    setattr(args, mode, True)  # A rerun that would explicitly stop the old agent.
     if activity == 'worklink':
         state['status'] = ('ISSUE  STATE       ATTEMPT  BACKEND           BRANCH                    CHECKOUT  ELAPSED\n'
                            '42     running     1        opencode          main                      -         1m')
@@ -898,6 +919,51 @@ def test_same_commit_rerun_with_system_packages(upgrade_setup):
     invoke()
     assert 'lsof' in (deploy / 'Dockerfile.toolchain').read_text()
     assert json.loads((deploy / 'manifest.json').read_text())['system_packages'] == ['lsof']
+
+
+def test_gate_settings_manifest_default_override_and_omission(upgrade_setup):
+    deploy, args, state, calls, invoke = upgrade_setup
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert manifest['worklink_gate'] == 'local'
+    assert manifest['quick_gate_command'] is None
+    args.worklink_gate = 'ci'
+    args.quick_gate_command = 'npm run smoke'
+    invoke()
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert (manifest['worklink_gate'], manifest['quick_gate_command']) == ('ci', 'npm run smoke')
+    args.worklink_gate = None
+    args.quick_gate_command = None
+    invoke()
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert (manifest['worklink_gate'], manifest['quick_gate_command']) == ('ci', 'npm run smoke')
+    args.worklink_gate = 'local'
+    with pytest.raises(installer.SetupError, match='only valid'):
+        invoke()
+
+
+@pytest.mark.parametrize('running', [False, True])
+def test_no_start_provisions_and_leaves_agent_stopped(upgrade_setup, capsys, running):
+    deploy, args, state, calls, invoke = upgrade_setup
+    state['running'] = running
+    args.no_start = True
+    (deploy / 'owner-web-key').unlink()
+    invoke()
+    assert state['running'] is False
+    assert any(argv[-2:] == ['--rm', 'init'] for argv in calls)
+    assert any('compose.provision.yml' in argv for argv in calls)
+    assert sum(argv[:2] == ['docker', 'build'] for argv in calls) == 2
+    assert (['docker', 'compose', 'stop', 'agent'] in calls) == running
+    assert not any(argv[2] in {'up', 'restart', 'start'} for argv in calls if argv[:2] == ['docker', 'compose'])
+    assert not (deploy / 'owner-web-key').exists()
+    assert f'from {deploy} run: docker compose up -d agent' in capsys.readouterr().out
+
+
+def test_default_setup_still_starts_agent(upgrade_setup):
+    deploy, args, state, calls, invoke = upgrade_setup
+    state['running'] = False
+    invoke()
+    assert ['docker', 'compose', 'up', '-d', 'agent'] in calls
+    assert state['running'] is True
 
 
 @pytest.mark.parametrize('step', ['build', 'init', 'provision', 'up'])
@@ -1666,9 +1732,10 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     (state / "identities.yaml").write_text(yaml.safe_dump(existing))
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"slug": "org/repo", "branch": "main", "toolchain": "rust", "owner": "owner",
-                                     "display": "Owner", "email": "owner@example.com",
-                                     "test": "npm run verify", "review_tests": review_tests, "rotate": False,
-                                     "saga_model_spec": "openai:gpt-5.4-nano", "embedding": "local", "reembed": False}))
+                                      "display": "Owner", "email": "owner@example.com",
+                                      "test": "npm run verify", "review_tests": review_tests, "rotate": False,
+                                      "worklink_gate": "ci", "quick_gate_command": "npm run smoke",
+                                      "saga_model_spec": "openai:gpt-5.4-nano", "embedding": "local", "reembed": False}))
     script = (installer._PROVISION
               .replace("/opt/cultivate-manifest.json", str(manifest))
               .replace("/home/mimir/agent", str(home))
@@ -1727,6 +1794,8 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert inventory["repositories"][0]["worklink_base"] == str(tmp_path / 'worklink/base/repo')
     assert inventory["repositories"][0]["origin"] == "https://github.com/org/repo.git"
     assert inventory["repositories"][0]["review_tests"] == review_tests
+    assert inventory["repositories"][0]["worklink_gate"] == 'ci'
+    assert inventory["repositories"][0]["quick_gate_command"] == 'npm run smoke'
     assert len(inventory["repositories"]) == 1
     assert base_identity == {'user.name': 'trellisbot-squashmerge', 'user.email': 'trellisbot@example.com'}
     assert {r["root"] for r in inventory["allowed_roots"]} == {"/workspace/pr-leases", "/workspace/worklink"}
@@ -1770,7 +1839,9 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     # Upgrade deployed entries with only test_command (no configured suites),
     # including older entries that also predate worklink_base. Exercise the real
     # provisioning writer and its changed/idempotent output, not a copied merge.
-    for missing in [('review_tests',), ('worklink_base', 'review_tests')]:
+    for missing in [('review_tests',), ('worklink_base', 'review_tests'),
+                    ('worklink_gate', 'quick_gate_command'),
+                    ('worklink_base', 'review_tests', 'worklink_gate', 'quick_gate_command')]:
         legacy = yaml.safe_load(prior_inventory)
         for field in missing:
             del legacy['repositories'][0][field]
@@ -1801,6 +1872,21 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     with pytest.raises(RuntimeError, match='existing repository declaration differs'):
         exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
     assert yaml.safe_load((home / 'repositories.yaml').read_text()) == explicit
+    for field, value in [('worklink_gate', 'local'), ('quick_gate_command', 'npm run different')]:
+        conflict = yaml.safe_load(prior_inventory)
+        conflict['repositories'][0][field] = value
+        (home / 'repositories.yaml').write_text(yaml.safe_dump(conflict, sort_keys=False))
+        before = (home / 'repositories.yaml').read_bytes()
+        with pytest.raises(RuntimeError, match='existing repository declaration differs; reconcile manually'):
+            exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+        assert (home / 'repositories.yaml').read_bytes() == before
+        forced = json.loads(manifest.read_text())
+        forced['force'] = True
+        manifest.write_text(json.dumps(forced))
+        exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+        assert yaml.safe_load((home / 'repositories.yaml').read_text()) == inventory
+        forced.pop('force')
+        manifest.write_text(json.dumps(forced))
     (home / 'repositories.yaml').write_bytes(prior_inventory)
     (repo / ".git").rmdir()
     with pytest.raises(subprocess.CalledProcessError):
