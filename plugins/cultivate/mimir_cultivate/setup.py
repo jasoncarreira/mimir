@@ -1354,7 +1354,12 @@ if old is not None and old in ({k: v for k, v in entry.items() if k != 'worklink
                                {k: v for k, v in entry.items() if k not in ('worklink_base', 'review_tests')}):
     old['worklink_base'] = str(base)
     changed = True
-if old is not None and old != entry and old != {k: v for k, v in entry.items() if k != 'review_tests'}:
+# Adopt the requested review policy only for an otherwise identical legacy
+# declaration. An explicit, different policy remains an operator conflict.
+if old is not None and old == {k: v for k, v in entry.items() if k != 'review_tests'}:
+    old['review_tests'] = entry['review_tests']
+    changed = True
+if old is not None and old != entry:
     raise RuntimeError('existing repository declaration differs; reconcile manually')
 if old is None:
     rows.append(entry)
