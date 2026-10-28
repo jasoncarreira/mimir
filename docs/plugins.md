@@ -49,6 +49,14 @@ deployment directory and loopback port. It shows the required fine-grained PAT
 permissions and verifies the bot's identity, Write invitation, PR read and
 Actions read before building. The source is fetched from a pushed ref and its
 full SHA is pinned into both the controller and executor image build.
+Re-run setup against the same deployment directory to upgrade to a newer
+`--source-ref` commit in place. It retains `compose.env`, the owner web key and
+all named volumes; generated files are replaced only if they still match the
+hashes saved in `manifest.json` (older deployments are checked against their
+previously generated contents). An edited generated file or an active Worklink
+run or PR checkout lease prevents the upgrade unless `--force` is supplied.
+On an image change, setup prints the previous image tag and a Compose rollback
+command. Wait for running work to finish before upgrading.
 
 Setup also asks **Where should operator alerts go? [web/discord/slack/none]**.
 `web` delivers to the owner's authenticated `web-<owner>` chat and persists
