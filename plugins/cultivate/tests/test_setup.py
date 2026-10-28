@@ -855,6 +855,77 @@ def test_upgrade_refuses_operator_edits_until_forced(upgrade_setup, name):
     assert '# operator edit' not in path.read_text()
 
 
+def test_previous_provision_compose_constant_precedes_inline():
+    source = 'def setup():\n    _write(deploy / "compose.provision.yml", "inline")\n'
+    assert installer._previous_provision_compose(source, {"_PROVISION_COMPOSE": "constant"}) == "constant"
+    with pytest.raises(ValueError, match="Invalid provision Compose constant"):
+        installer._previous_provision_compose(source, {"_PROVISION_COMPOSE": None})
+
+
+def test_previous_provision_compose_extracts_literal_without_execution():
+    source = '''
+raise RuntimeError("must not execute")
+def setup():
+    _write(deploy / "unrelated.yml", "wrong")
+    _write(deploy / "compose.provision.yml", "services:\\n" "  agent: {}\\n", replace=True)
+'''
+    assert installer._previous_provision_compose(source, {}) == "services:\n  agent: {}\n"
+
+
+@pytest.mark.parametrize("source", [
+    'def setup():\n    _write(deploy / "other.yml", "wrong")\n',
+    'def setup():\n    _write(other / "compose.provision.yml", "wrong")\n',
+    'def setup():\n    other_write(deploy / "compose.provision.yml", "wrong")\n',
+    'def unrelated():\n    _write(deploy / "compose.provision.yml", "wrong")\n',
+    'def setup():\n    _write(deploy / "compose.provision.yml", current_template)\n',
+    'def setup():\n    _write(deploy / "compose.provision.yml", 42)\n',
+    'def setup():\n    _write(deploy / "compose.provision.yml", "one")\n'
+    '    _write(deploy / "compose.provision.yml", "two")\n',
+])
+def test_previous_provision_compose_refuses_missing_nonliteral_or_ambiguous(source):
+    with pytest.raises(ValueError):
+        installer._previous_provision_compose(source, {})
+
+
+def test_upgrade_legacy_inline_provision_compose(upgrade_setup, legacy_source, monkeypatch):
+    """Synthetic integration coverage; authentic historical snapshot still required."""
+    import ast
+    deploy, args, state, calls, invoke = upgrade_setup
+    original_content = installer._content
+
+    def content(slug, branch, path, token, request):
+        source = original_content(slug, branch, path, token, request)
+        if branch == SHA and path == 'plugins/cultivate/mimir_cultivate/setup.py':
+            tree = ast.parse(source)
+            assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
+                              and any(isinstance(target, ast.Name) and target.id == '_PROVISION_COMPOSE'
+                                      for target in node.targets))
+            lines = source.splitlines(keepends=True)
+            del lines[assignment.lineno - 1:assignment.end_lineno]
+            source = ''.join(lines).replace(
+                '"compose.provision.yml": _PROVISION_COMPOSE}',
+                '"compose.provision.yml": ' + repr(installer._PROVISION_COMPOSE) + '}')
+            source = source.replace(
+                '    generated = {"compose.yml": compose,',
+                '    _write(deploy / "compose.provision.yml", ' + repr(installer._PROVISION_COMPOSE) + ')\n'
+                '    generated = {"compose.yml": compose,')
+        return source
+
+    monkeypatch.setattr(installer, '_content', content)
+    (deploy / 'provision.py').write_text(legacy_source)
+    compose = deploy / 'compose.yml'
+    compose.write_text(compose.read_text().replace('MIMIR_ACP_ENABLED: \'1\'', 'MIMIR_ACP_ENABLED: \'0\''))
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    del manifest['generated_sha256']
+    (deploy / 'manifest.json').write_text(json.dumps(manifest))
+    state['sha'] = 'c' * 40
+    invoke()
+    assert not args.force
+    assert state['sha'] in (deploy / 'compose.yml').read_text()
+    assert (deploy / 'provision.py').read_text() == installer._PROVISION
+    assert json.loads((deploy / 'manifest.json').read_text())['generated_sha256']
+
+
 def test_upgrade_legacy_unedited_generated_files(upgrade_setup, legacy_source):
     deploy, args, state, calls, invoke = upgrade_setup
     assert legacy_source != installer._PROVISION

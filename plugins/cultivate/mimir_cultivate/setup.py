@@ -484,6 +484,39 @@ def _previous_image(deploy: Path, previous: dict) -> tuple[str, str] | None:
     return sha, tag
 
 
+def _previous_provision_compose(source: str, constants: dict[str, object]) -> str:
+    """Recover the pinned provision override without executing historical setup."""
+    if "_PROVISION_COMPOSE" in constants:
+        value = constants["_PROVISION_COMPOSE"]
+        if not isinstance(value, str):
+            raise ValueError("Invalid provision Compose constant")
+        return value
+
+    # Before the constant existed, setup wrote this literal inline. Match the
+    # exact writer and destination, not a coincidentally named string elsewhere.
+    values = []
+    for function in ast.parse(source).body:
+        if not isinstance(function, ast.FunctionDef) or function.name != "setup":
+            continue
+        for node in ast.walk(function):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "_write" and len(node.args) >= 2):
+                continue
+            destination = node.args[0]
+            if not (isinstance(destination, ast.BinOp) and isinstance(destination.op, ast.Div)
+                    and isinstance(destination.left, ast.Name) and destination.left.id == "deploy"
+                    and isinstance(destination.right, ast.Constant)
+                    and destination.right.value == "compose.provision.yml"):
+                continue
+            value = ast.literal_eval(node.args[1])
+            if not isinstance(value, str):
+                raise ValueError("Invalid inline provision Compose template")
+            values.append(value)
+    if len(values) != 1:
+        raise ValueError("Missing or ambiguous inline provision Compose template")
+    return values[0]
+
+
 def _previous_generated(source_repo: str, token: str, old_image: tuple[str, str],
                         previous: dict, port: int, request) -> dict[str, str]:
     """Render legacy files with the pinned source that originally produced them."""
@@ -516,7 +549,7 @@ def _previous_generated(source_repo: str, token: str, old_image: tuple[str, str]
         scaffold_constants, scaffold_functions = extract(scaffold_source, {
             "_COMPOSE_YML_TEMPLATE_PYPI", "_DEFAULT_MODE", "_MODES", "render_compose_yml"})
         provision = setup_constants["_PROVISION"]
-        provision_compose = setup_constants["_PROVISION_COMPOSE"]
+        provision_compose = _previous_provision_compose(setup_source, setup_constants)
         template = scaffold_constants["_COMPOSE_YML_TEMPLATE_PYPI"]
         if not all(isinstance(value, str) for value in (provision, provision_compose, template)):
             raise ValueError
