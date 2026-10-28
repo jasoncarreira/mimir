@@ -40,6 +40,8 @@ from .model_registry import DEFAULT_MODEL_SPEC
 
 log = logging.getLogger(__name__)
 
+DEFAULT_TURN_TIMEOUT_SECONDS = 3600
+
 _SCOPE_KEYS = (
     "ALLOWED_CHANNELS", "IGNORED_CHANNELS", "REQUIRE_MENTION",
     "FREE_RESPONSE_CHANNELS", "ALLOW_BOTS", "ALLOWED_BOT_IDS",
@@ -1567,7 +1569,7 @@ class Config:
                 "MIMIR_CHAT_STREAM_MAX_SUBSCRIBERS", 8
             ),
             allow_unauthenticated=_env_bool("MIMIR_ALLOW_UNAUTHENTICATED", False),
-            turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", 3600),
+            turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", DEFAULT_TURN_TIMEOUT_SECONDS),
             post_turn_timeout_seconds=_env_int("MIMIR_POST_TURN_TIMEOUT_SECONDS", 180),
             drain_timeout_seconds=_env_int("MIMIR_DRAIN_TIMEOUT_SECONDS", 30),
             http_shutdown_timeout_seconds=_env_positive_float(
