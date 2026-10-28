@@ -17,10 +17,12 @@ from langchain_core.tools import ToolException
 
 from mimir.access_control import (
     ScopedPRGrants, _SCOPED_PR_ISSUER, _valid_scoped_pr_grant,
+    ToolFlowDirection, authorize_repo_pr_tool,
     create_auth_context, consume_scoped_pr_checkout, observe_scoped_pr_checkout,
     ToolRegistry, CapabilityTier, build_trigger_service_principal,
     publish_protected_result,
 )
+from mimir.config import DEFAULT_TURN_TIMEOUT_SECONDS
 from mimir.models import (
     AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState,
     SourceLabel, TurnInteractivity,
@@ -82,6 +84,120 @@ def _auth(policy, state, enforce, *, discovered=False):
         repo_pr_scope_registry=None if discovered else RepoPRScopeRegistry((state,)),
         server_discovered_pr_states=cache if discovered else None,
     )
+
+
+def test_scoped_grants_survive_long_test_but_expire_at_turn_ceiling(
+    tmp_path, monkeypatch,
+):
+    from mimir import access_control
+    from mimir.plugins.manager import load_plugins
+
+    clock = [100.0]
+    monkeypatch.setattr(access_control, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.delenv("MIMIR_TURN_TIMEOUT_SECONDS", raising=False)
+    policy = load_plugins(enable="cultivate").policy
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    protocol = policy.scoped_actions["cultivate"]
+    grants = auth.scoped_pr_grants
+    assert grants.expires_at == clock[0] + DEFAULT_TURN_TIMEOUT_SECONDS
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    clock[0] += 420.0
+    actions = {"pr_submit_review": RepoPRAction.PR_REVIEW,
+               "pr_reviews": RepoPRAction.INSPECT,
+               "repo_cleanup": RepoPRAction.CHECKOUT}
+
+    def decide(name, action):
+        return authorize_repo_pr_tool(
+            name, scope, service_principal=None, enforce=True,
+            flow_direction=ToolFlowDirection.UNKNOWN, required_actions=(action.value,),
+            registered_plugin=True, auth_context=auth, owner="cultivate",
+            action=action, protocol=protocol, review_state=state,
+        )
+
+    for name, action in actions.items():
+        decision = decide(name, action)
+        assert decision.allowed, (name, decision.reason)
+    assert all(grant.expires_at == grants.expires_at for grant in grants._follow[("cultivate", scope.scope_id)].values())
+
+    # The exact ceiling applies to follow-on grants, including cleanup.
+    clock[0] = grants.expires_at
+    for name, action in actions.items():
+        decision = decide(name, action)
+        assert not decision.allowed and decision.reason == "repo_pr_grant_denied"
+    lease.revoke()
+
+
+def test_scoped_grant_ceiling_tracks_configured_turn_timeout(tmp_path, monkeypatch, policy):
+    from mimir import access_control
+
+    clock = [10.0]
+    monkeypatch.setattr(access_control, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    for configured, expected in ((0, DEFAULT_TURN_TIMEOUT_SECONDS),
+                                 (DEFAULT_TURN_TIMEOUT_SECONDS * 2, DEFAULT_TURN_TIMEOUT_SECONDS * 2)):
+        monkeypatch.setenv("MIMIR_TURN_TIMEOUT_SECONDS", str(configured))
+        grants = _auth(policy, state, True).scoped_pr_grants
+        assert grants.expires_at == clock[0] + expected
+        clock[0] = grants.expires_at
+        assert grants.consume_checkout("cultivate", scope) is None
+        clock[0] += 1
+
+
+def test_long_running_turn_still_checks_nonce_head_and_lease(policy, tmp_path, monkeypatch):
+    from mimir import access_control
+    from mimir_cultivate import forge
+
+    clock = [100.0]
+    monkeypatch.setattr(access_control, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    _repo, scope = _repo_and_scope(tmp_path)
+    state = RepoReviewState(scope)
+    root = tmp_path / "leases"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    auth = _auth(policy, state, True)
+    protocol = policy.scoped_actions["cultivate"]
+    token = consume_scoped_pr_checkout(auth, scope, "cultivate")
+    lease = create_pr_checkout_lease(scope, owner=scope.principal, lease_root=root, review_state=state)
+    assert observe_scoped_pr_checkout(auth, scope, state, token, "cultivate", protocol)
+    clock[0] += 420
+    action = RepoPRAction.PR_REVIEW
+    key = ("cultivate", scope.scope_id)
+    grant = auth.scoped_pr_grants._follow[key][action.value]
+
+    def valid(context=auth):
+        return _valid_scoped_pr_grant(context, "cultivate", action, protocol, scope, state,
+                                      tool_name="pr_submit_review")
+
+    assert valid()
+    new_auth = _auth(policy, state, True)
+    new_auth.scoped_pr_grants._follow[key] = {action.value: grant}
+    assert not valid(new_auth)  # Even a copied old grant cannot cross the turn nonce.
+    assert not valid(replace(auth, scoped_pr_grants=None))
+    monkeypatch.setattr(forge, "_client_for_repository", lambda _repo: SimpleNamespace(
+        get_pull_request_snapshot=lambda *_args: SimpleNamespace(
+            repo=scope.canonical_repo, number=scope.pr_number, state="open",
+            head_sha="f" * 40,
+        ),
+    ))
+    with pytest.raises(ToolException, match="pull request head advanced after scope issuance"):
+        forge.revalidate_review_head_for_context(auth, scope.canonical_repo, scope.pr_number)
+    auth.scoped_pr_grants._follow[key][action.value] = replace(grant, head="f" * 40)
+    assert not valid()
+    auth.scoped_pr_grants._follow[key][action.value] = grant
+    auth.scoped_pr_grants._follow[key][action.value] = replace(grant, lease_identity=(str(lease.path), "different"))
+    assert not valid()
+    auth.scoped_pr_grants._follow[key][action.value] = grant
+    state.attach_checkout_lease(replace(lease, recovery_id="different"))
+    assert not valid()
+    lease.revoke()
 
 
 def test_checkout_action_follow_on_is_bound_to_designated_tool_and_live_lease(
