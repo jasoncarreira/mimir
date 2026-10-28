@@ -711,7 +711,7 @@ def test_docker_failure_names_step_without_secrets(tmp_path, monkeypatch, step):
               'owner_email': 'owner@example.com', 'deploy': str(tmp_path / 'deploy'),
               'model_spec': 'openai:model', 'saga_model_spec': 'openai:model',
               'embedding': 'openai:model', 'source_ref': 'refs/heads/feature/plugins',
-              'source_repo': 'org/mimir', 'test_command': 'npm test', 'port': '8123'}
+              'source_repo': 'org/mimir', 'test_command': 'npm test', 'review_tests': 'targeted', 'port': '8123'}
     monkeypatch.setattr(installer, '_field', lambda args, name, *a, **kw: fields[name])
     monkeypatch.setattr(installer, '_secret', lambda *a, **kw: 'secret-from-compose-env')
     monkeypatch.setattr(installer, 'validate_token', lambda *a: None)
@@ -1469,7 +1469,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"slug": "org/repo", "branch": "main", "toolchain": "rust", "owner": "owner",
                                      "display": "Owner", "email": "owner@example.com",
-                                     "test": "npm run verify", "rotate": False,
+                                      "test": "npm run verify", "review_tests": "targeted", "rotate": False,
                                      "saga_model_spec": "openai:gpt-5.4-nano", "embedding": "local", "reembed": False}))
     script = (installer._PROVISION
               .replace("/opt/cultivate-manifest.json", str(manifest))
@@ -1528,6 +1528,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert inventory["repositories"][0]["root"] == str(repo)
     assert inventory["repositories"][0]["worklink_base"] == str(tmp_path / 'worklink/base/repo')
     assert inventory["repositories"][0]["origin"] == "https://github.com/org/repo.git"
+    assert inventory["repositories"][0]["review_tests"] == "targeted"
     assert len(inventory["repositories"]) == 1
     assert base_identity == {'user.name': 'trellisbot-squashmerge', 'user.email': 'trellisbot@example.com'}
     assert {r["root"] for r in inventory["allowed_roots"]} == {"/workspace/pr-leases", "/workspace/worklink"}

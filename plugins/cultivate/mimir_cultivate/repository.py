@@ -35,6 +35,7 @@ class RepositoryConfig:
     test_command: str | None = None
     test_suites: tuple[RepositoryTestSuite, ...] = ()
     worklink_base: Path | None = None
+    review_tests: str = "full"
 
 
 @dataclass(frozen=True)
@@ -272,11 +273,14 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
         test_suites = _parse_test_suites(
             item.get("test_suites", []), f"{label}.test_suites", test_command,
         )
+        review_tests = item.get("review_tests", "targeted" if test_suites else "full")
+        if review_tests not in ("targeted", "full", "none") or not isinstance(review_tests, str):
+            raise ValueError(f"{label}.review_tests must be 'targeted', 'full' or 'none'")
         worklink_base = (
             _parse_absolute_root(item["worklink_base"], f"{label}.worklink_base")
             if "worklink_base" in item else None
         )
-        if set(item) - {"slug", "root", "mode", "origin", "base_branch", "test_command", "test_suites", "worklink_base"}:
+        if set(item) - {"slug", "root", "mode", "origin", "base_branch", "test_command", "test_suites", "worklink_base", "review_tests"}:
             raise ValueError(f"{label} contains unknown fields")
         if slug in slugs:
             raise ValueError(f"duplicate repository slug: {slug}")
@@ -294,6 +298,7 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
                 test_command=test_command,
                 test_suites=test_suites,
                 worklink_base=worklink_base,
+                review_tests=review_tests,
             )
         )
     return tuple(repositories)
@@ -4492,6 +4497,25 @@ class RepoProjectTests:
         retained = isinstance(scope, RetainedFactoryScope)
         if not retained and RepoPRAction.TEST.value not in scope.allowed_operations:
             raise ProjectTestRefusal("scope_action_denied", "scope does not grant repo.test", execution_started=False)
+        if (not retained and RepoPRAction.PR_REVIEW.value in scope.allowed_operations
+                and RepoPRAction.PUSH.value not in scope.allowed_operations):
+            home = os.environ.get("MIMIR_HOME", "").strip()
+            if home:
+                inventory = RepositoryInventory.load(Path(home) / "repositories.yaml")
+                record = inventory.repository(scope.canonical_repo)
+                policy = record.review_tests if record is not None else "full"
+                if policy == "none":
+                    raise ProjectTestRefusal(
+                        "review_test_policy", "review_tests: none; CI is the validation surface for reviews",
+                        execution_started=False,
+                    )
+                if policy == "targeted" and not selectors and (suite is None or suite == "default"):
+                    raise ProjectTestRefusal(
+                        "review_test_policy",
+                        "review_tests: targeted; unscoped full repo_test runs are refused for reviews; "
+                        "use diff-related selectors or a named suite and read pr_checks for full-suite CI evidence",
+                        execution_started=False,
+                    )
         git_tools: RepoGitTools | None = None
         try:
             git_tools = (

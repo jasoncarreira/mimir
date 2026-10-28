@@ -157,6 +157,8 @@ def validate(name: str, value: str) -> str:
                 raise SetupError(f"Invalid saga model spec: {exc}") from None
     elif name == "embedding":
         ok = value == "local" or bool(re.fullmatch(r"(openai|voyage):[A-Za-z0-9_.-]+", value))
+    elif name == "review_tests":
+        ok = value in {"targeted", "full", "none"}
     elif name == "test_command":
         ok = bool(value) and "\n" not in value and "\r" not in value
     elif name == "port":
@@ -1064,6 +1066,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("deploy", "Absolute deployment directory (default: ./cultivate-agent)."),
         ("port", "Free loopback port (default: next free from 8090)."),
         ("test-command", "Verification command for target repo; default detected from repo."),
+        ("review-tests", "Review test policy: targeted (default), full, or none; CI supplies full-suite evidence."),
         ("system-packages", "Extra Debian packages for the toolchain layer, comma-separated (optionally name=version); use none to clear, omit to preserve the saved list."),
         ("source-ref", "Pushed Mimir source ref (default: refs/heads/feature/plugins)."),
         ("source-repo", "Mimir source owner/name (default: " + DEFAULT_SOURCE_REPO + ")."),
@@ -1173,6 +1176,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     print(f"Detected {kind} {version}; suggested test command: {suggestion}")
     print("System packages: " + (", ".join(system_packages) if system_packages else "none"))
     test = _field(args, "test_command", "Test command: verify in your repo's CI/docs, then confirm this suggestion or override it.", default=suggestion)
+    review_tests = _field(args, "review_tests", "Review tests (targeted/full/none): CI supplies full-suite evidence when targeted or none.", default="targeted")
     previous_port = None
     compose_path = deploy / "compose.yml"
     if compose_path.is_file():
@@ -1224,7 +1228,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
     manifest = {"slug": repo.lower(), "branch": branch, "toolchain": kind, "owner": owner, "display": display,
-                  "email": owner_email, "test": test, "rotate": bool(args.rotate_web_key),
+                   "email": owner_email, "test": test, "review_tests": review_tests, "rotate": bool(args.rotate_web_key),
                   "force": bool(getattr(args, "force", False)),
                   "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
                    "system_packages": system_packages,
@@ -1340,15 +1344,17 @@ config = yaml.safe_load(inventory.read_text()) if inventory.exists() else {}
 config = config or {}
 base = Path('/workspace/worklink/base') / repo.name
 entry = {'slug': m['slug'], 'root': str(repo), 'mode': 'rw', 'origin': origin,
-         'base_branch': m['branch'], 'test_command': m['test'], 'worklink_base': str(base)}
+          'base_branch': m['branch'], 'test_command': m['test'], 'review_tests': m['review_tests'],
+          'worklink_base': str(base)}
 rows = config.setdefault('repositories', [])
 old = next((r for r in rows if r.get('slug') == m['slug']), None)
 # Upgrade only an otherwise identical pre-Worklink declaration; never replace
 # an operator's explicitly selected alternate base.
-if old is not None and old == {k: v for k, v in entry.items() if k != 'worklink_base'}:
+if old is not None and old in ({k: v for k, v in entry.items() if k != 'worklink_base'},
+                               {k: v for k, v in entry.items() if k not in ('worklink_base', 'review_tests')}):
     old['worklink_base'] = str(base)
     changed = True
-if old is not None and old != entry:
+if old is not None and old != entry and old != {k: v for k, v in entry.items() if k != 'review_tests'}:
     raise RuntimeError('existing repository declaration differs; reconcile manually')
 if old is None:
     rows.append(entry)
