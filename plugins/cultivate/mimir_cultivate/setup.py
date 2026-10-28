@@ -1413,6 +1413,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         print("Restarted the existing agent once to load provisioned repositories, identities and pollers.")
     if no_start:
         print(f"Build and provisioning complete. To start the agent later, from {deploy} run: docker compose up -d agent")
+        print("Then re-run mimir cultivate setup with the same deployment and settings, without --no-start, "
+              "to retrieve the owner web key and verify the deployment. Live verification has not run.")
         return
     # docker cp writes into a pre-created mode-600 path, without putting key in
     # stdout, argv or the subprocess exception path.
@@ -1505,14 +1507,17 @@ old = next((r for r in rows if r.get('slug') == m['slug']), None)
 # Back-fill only fields absent from an otherwise identical legacy declaration.
 # Explicit values (including the gate mode) are never silently replaced.
 optional = {'worklink_base', 'review_tests', 'worklink_gate', 'quick_gate_command'}
-if old is not None and set(entry) - set(old) <= optional and all(entry.get(k) == v for k, v in old.items()):
+if old is not None and set(entry) - set(old) <= optional and all(old[k] == entry[k] for k in old.keys() & entry.keys()):
     missing = {k: v for k, v in entry.items() if k not in old}
     old.update(missing)
     changed = bool(missing) or changed
-if old is not None and old != entry and not m.get('force', False):
+# Compare and override only setup-owned fields; operator-only policy survives
+# both forced reconciliation and subsequent ordinary/idempotent setup runs.
+differs = old is not None and any(k not in old or old[k] != v for k, v in entry.items())
+if differs and not m.get('force', False):
     raise RuntimeError('existing repository declaration differs; reconcile manually')
-if old is not None and old != entry:
-    rows[rows.index(old)] = entry
+if differs:
+    old.update(entry)
     changed = True
 if old is None:
     rows.append(entry)

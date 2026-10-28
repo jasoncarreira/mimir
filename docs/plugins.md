@@ -61,7 +61,11 @@ Use `--no-start` to rebuild and provision without starting the agent. If it was
 running, setup checks for in-flight work and stops it before the build; if it was
 already stopped, it remains stopped. Live health and web-key checks run when you
 start normally on a later setup run. Setup prints the command to start it from
-the deployment directory: `docker compose up -d agent`.
+the deployment directory: `docker compose up -d agent`. This also supports a
+fresh install, but does not retrieve the owner's web key or verify the live
+deployment. After starting, re-run `mimir cultivate setup` with the same
+deployment and settings **without `--no-start`** to retrieve `owner-web-key`
+and run verification.
 
 Setup also asks **Where should operator alerts go? [web/discord/slack/none]**.
 `web` delivers to the owner's authenticated `web-<owner>` chat and persists

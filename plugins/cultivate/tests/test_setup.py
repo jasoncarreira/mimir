@@ -726,8 +726,8 @@ def test_setup_is_idempotent_and_keeps_secrets_out_of_output(tmp_path, monkeypat
 
 
 @pytest.fixture
-def upgrade_setup(tmp_path, monkeypatch):
-    """A saved deployment with a pinned source and fake Docker/Git boundaries."""
+def setup_environment(tmp_path, monkeypatch):
+    """A fresh deployment path with pinned source and fake Docker/Git boundaries."""
     monkeypatch.setattr(installer, '_license_gate', lambda args: None)
     deploy = tmp_path / 'deploy'
     fields = {'repo': 'org/repo', 'branch': 'main', 'bot_login': 'bot',
@@ -769,9 +769,17 @@ def upgrade_setup(tmp_path, monkeypatch):
         return 'SETUP_CHANGED=0' if 'compose.provision.yml' in argv else ''
 
     args = argparse.Namespace(rotate_web_key=False, reembed=False, force=False, system_packages=None)
+    state['verified'] = []
     def invoke():
-        installer.setup(args, request=request, run=run, verify=lambda *a: None)
+        installer.setup(args, request=request, run=run, verify=lambda *a: state['verified'].append(a))
 
+    return deploy, args, state, calls, invoke
+
+
+@pytest.fixture
+def upgrade_setup(setup_environment):
+    """A saved deployment with a pinned source and fake Docker/Git boundaries."""
+    deploy, args, state, calls, invoke = setup_environment
     invoke()
     state['running'] = True
     calls.clear()
@@ -956,6 +964,30 @@ def test_no_start_provisions_and_leaves_agent_stopped(upgrade_setup, capsys, run
     assert not any(argv[2] in {'up', 'restart', 'start'} for argv in calls if argv[:2] == ['docker', 'compose'])
     assert not (deploy / 'owner-web-key').exists()
     assert f'from {deploy} run: docker compose up -d agent' in capsys.readouterr().out
+
+
+def test_fresh_no_start_explains_web_key_and_verification_follow_up(setup_environment, capsys):
+    deploy, args, state, calls, invoke = setup_environment
+    assert not deploy.exists()
+    args.no_start = True
+    invoke()
+    output = capsys.readouterr().out
+    assert not state['running']
+    assert not (deploy / 'owner-web-key').exists()
+    assert not state['verified']
+    assert any('compose.provision.yml' in argv for argv in calls)
+    assert not any(argv[2] in {'up', 'restart', 'start'} for argv in calls
+                   if argv[:2] == ['docker', 'compose'])
+    assert f'from {deploy} run: docker compose up -d agent' in output
+    assert 're-run mimir cultivate setup with the same deployment and settings, without --no-start' in output
+    assert 'to retrieve the owner web key and verify the deployment' in output
+    assert 'Live verification has not run.' in output
+    # The documented follow-up must actually hand over the key and verify.
+    args.no_start = False
+    invoke()
+    assert state['running']
+    assert (deploy / 'owner-web-key').read_text() == 'owner-key\n'
+    assert len(state['verified']) == 1
 
 
 def test_default_setup_still_starts_agent(upgrade_setup):
@@ -1887,6 +1919,34 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
         assert yaml.safe_load((home / 'repositories.yaml').read_text()) == inventory
         forced.pop('force')
         manifest.write_text(json.dumps(forced))
+    # Force may override setup-owned fields, never operator-only policy. Run
+    # the real writer with a conflicting gate, then prove ordinary reruns and
+    # legacy back-fill also retain the suites and unrelated repository entry.
+    operator_inventory = yaml.safe_load(prior_inventory)
+    suites = [{'name': 'python', 'command': 'uv run pytest', 'selector_prefixes': ['src/']}]
+    operator_inventory['repositories'][0]['test_suites'] = suites
+    unrelated = {'slug': 'org/other', 'root': '/workspace/other', 'mode': 'ro'}
+    operator_inventory['repositories'].append(unrelated)
+    conflict = yaml.safe_load(yaml.safe_dump(operator_inventory))
+    conflict['repositories'][0]['worklink_gate'] = 'local'
+    (home / 'repositories.yaml').write_text(yaml.safe_dump(conflict, sort_keys=False))
+    forced = json.loads(manifest.read_text())
+    forced['force'] = True
+    manifest.write_text(json.dumps(forced))
+    capsys.readouterr()
+    exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+    assert capsys.readouterr().out == 'SETUP_CHANGED=1\n'
+    assert yaml.safe_load((home / 'repositories.yaml').read_text()) == operator_inventory
+    forced.pop('force')
+    manifest.write_text(json.dumps(forced))
+    exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+    assert capsys.readouterr().out == 'SETUP_CHANGED=0\n'
+    legacy = yaml.safe_load((home / 'repositories.yaml').read_text())
+    del legacy['repositories'][0]['quick_gate_command']
+    (home / 'repositories.yaml').write_text(yaml.safe_dump(legacy, sort_keys=False))
+    exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+    assert capsys.readouterr().out == 'SETUP_CHANGED=1\n'
+    assert yaml.safe_load((home / 'repositories.yaml').read_text()) == operator_inventory
     (home / 'repositories.yaml').write_bytes(prior_inventory)
     (repo / ".git").rmdir()
     with pytest.raises(subprocess.CalledProcessError):
