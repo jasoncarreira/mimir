@@ -9080,7 +9080,6 @@ class ToolAuthorization:
 
 
 _SCOPED_PR_ISSUER = object()
-_SCOPED_PR_LIFETIME = 300.0
 
 
 @dataclass(frozen=True)
@@ -9107,6 +9106,17 @@ class ScopedPRGrants:
             raise ValueError("scoped PR grants require the trusted ingress issuer")
         self.principal = principal
         self.nonce = secrets.token_hex(16)
+        # The turn owns the grants. Use its configured model-stream bound as a
+        # defense-in-depth ceiling, with the shipped 60-minute bound as a floor
+        # (repo_test alone can run for 30 minutes, then submission needs time).
+        # A disabled/shortened turn timeout must not shorten tool authority.
+        from .config import DEFAULT_TURN_TIMEOUT_SECONDS, _env_int
+
+        lifetime = max(
+            _env_int("MIMIR_TURN_TIMEOUT_SECONDS", DEFAULT_TURN_TIMEOUT_SECONDS),
+            DEFAULT_TURN_TIMEOUT_SECONDS,
+        )
+        self.expires_at = time.monotonic() + lifetime
         self._lock = threading.Lock()
         self._protocols = dict(protocols or {})
         self._prelease: dict[tuple[str, str], ScopedPRGrant] = {}
@@ -9132,7 +9142,7 @@ class ScopedPRGrants:
         return ScopedPRGrant(
             owner, self.principal, scope.scope_id, scope.canonical_repo,
             scope.pr_number, scope.observed_head_sha, action, self.nonce,
-            time.monotonic() + _SCOPED_PR_LIFETIME,
+            self.expires_at,
             (str(lease.path), lease.recovery_id) if lease is not None else None,
             _SCOPED_PR_ISSUER,
         )

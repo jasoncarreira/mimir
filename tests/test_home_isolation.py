@@ -40,12 +40,42 @@ def probe_identity(monkeypatch):
         SimpleNamespace(pw_uid=1002, pw_gid=1002),
     ])
     real_stat = os.fstat
+    identity = SimpleNamespace(uid=0, mode=None)
 
     def owned_stat(fd):
-        result = real_stat(fd)
-        return SimpleNamespace(st_uid=0, st_mode=result.st_mode)
+        # fstat is process-global: pytest/capture and pathlib also consume it.
+        # Preserve the complete stat_result contract, overriding only probe data.
+        fields = list(real_stat(fd))
+        fields[4] = identity.uid
+        if identity.mode is not None:
+            fields[0] = identity.mode
+        return os.stat_result(fields)
 
     monkeypatch.setattr(os, "fstat", owned_stat)
+    return identity
+
+
+def test_probe_identity_preserves_fstat_contract(tmp_path, probe_identity):
+    marker = b"complete-stat-result"
+    path = tmp_path / "stat-control"
+    path.write_bytes(marker)
+    with path.open("rb") as stream:
+        result = os.fstat(stream.fileno())
+        assert isinstance(result, os.stat_result)
+        assert result.st_size == len(marker)
+        assert result.st_uid == 0
+        assert stat.S_ISREG(result.st_mode)
+        assert result[stat.ST_SIZE] == result.st_size
+        assert stream.read() == marker
+
+    probe_identity.uid = 1002
+    probe_identity.mode = 0o644
+    with path.open("rb") as stream:
+        result = os.fstat(stream.fileno())
+        assert result.st_uid == 1002
+        assert result.st_mode == 0o644
+        assert result.st_size == len(marker)
+        assert stream.read() == marker
 
 
 @pytest.mark.parametrize("readable,verdict,level", [
@@ -106,10 +136,8 @@ def test_unavailable_probe_is_unknown(tmp_path, monkeypatch, caplog, probe_ident
     elif failure == "readonly":
         monkeypatch.setattr(home_isolation.tempfile, "mkstemp", unavailable)
     elif failure in ("ownership", "mode"):
-        monkeypatch.setattr(os, "fstat", lambda fd: SimpleNamespace(
-            st_uid=1002 if failure == "ownership" else 0,
-            st_mode=0o644 if failure == "mode" else 0o600,
-        ))
+        probe_identity.uid = 1002 if failure == "ownership" else 0
+        probe_identity.mode = 0o644 if failure == "mode" else 0o600
         monkeypatch.setattr(subprocess, "run", lambda *a, **kw: pytest.fail("invalid probe ran"))
     elif failure == "launch":
         monkeypatch.setattr(subprocess, "run", unavailable)
