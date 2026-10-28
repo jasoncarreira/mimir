@@ -352,6 +352,26 @@ def test_repository_test_suites_empty_without_synthesis(tmp_path: Path, fields) 
     assert _load_test_suite_inventory(tmp_path, **fields).test_suites == ()
 
 
+@pytest.mark.parametrize("value", ["targeted", "full", "none"])
+def test_repository_review_tests_explicit(tmp_path: Path, value: str) -> None:
+    assert _load_test_suite_inventory(tmp_path, review_tests=value).review_tests == value
+
+
+def test_repository_review_tests_default_depends_on_configured_suites(tmp_path: Path) -> None:
+    assert _load_test_suite_inventory(tmp_path).review_tests == "full"
+    assert _load_test_suite_inventory(tmp_path, test_command="pytest").review_tests == "full"
+    assert _load_test_suite_inventory(tmp_path, test_suites=[]).review_tests == "full"
+    assert _load_test_suite_inventory(tmp_path, test_suites=[
+        {"name": "unit", "command": "pytest"},
+    ]).review_tests == "targeted"
+
+
+@pytest.mark.parametrize("value", ["invalid", "", None, 0, False, [], {}])
+def test_repository_review_tests_rejects_unknown_value(tmp_path: Path, value: object) -> None:
+    with pytest.raises(ValueError, match=r"repositories\[0\]\.review_tests must be 'targeted', 'full' or 'none'"):
+        _load_test_suite_inventory(tmp_path, review_tests=value)
+
+
 @pytest.mark.parametrize("default", [False, True])
 def test_default_suite_name_allowed_without_legacy_command(tmp_path: Path, default) -> None:
     repo = _load_test_suite_inventory(

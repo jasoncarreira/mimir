@@ -331,6 +331,7 @@ def _repo_scope_and_state(
     tmp_path: Path, *, event_type: str = "pr_changes_requested_stale",
     commit_count: int = 1, pull_request_author: str | None = None,
     base_ref: str = "main",
+    allowed_operations: frozenset[str] | None = None,
 ) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState]:
     origin = tmp_path / "origin.git"
     git_env = _fixture_git_env()
@@ -365,7 +366,7 @@ def _repo_scope_and_state(
         canonical_origin=str(origin.resolve()),
         principal="mimir-bot",
         event_type=event_type,
-        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        allowed_operations=allowed_operations if allowed_operations is not None else frozenset(action.value for action in RepoPRAction),
         pr_number=7,
         head_repo="owner/repo",
         head_remote="origin",
@@ -2727,6 +2728,83 @@ def _configure_test_suites(home: Path, state: RepoReviewState, **overrides) -> N
     }
     record.update(overrides)
     (home / "repositories.yaml").write_text(yaml.safe_dump({"repositories": [record]}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["none", "targeted", "full"])
+async def test_repo_test_review_policy_is_enforced_before_execution(tmp_path, monkeypatch, policy):
+    from mimir_cultivate import repository as repo_module
+
+    review_actions = frozenset({RepoPRAction.CHECKOUT.value, RepoPRAction.TEST.value, RepoPRAction.PR_REVIEW.value})
+    _, _, scope, state = _repo_scope_and_state(
+        tmp_path, event_type="pr_opened", allowed_operations=review_actions,
+    )
+    home = tmp_path / "home"
+    _configure_test_suites(home, state, review_tests=policy, test_suites=[
+        {"name": "unit", "command": "/usr/bin/true", "default": True,
+         "selector_prefixes": ["tests/"]},
+    ])
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr(repo_module, "_state", lambda *args: state)
+    (state.checkout_lease.path / "tests").mkdir()
+    (state.checkout_lease.path / "tests/test_changed.py").write_text("def test_changed(): pass\n")
+    calls = []
+
+    async def runner(argv, *args, **kwargs):
+        calls.append(argv)
+        return CollectedExecutionResult(0, b"ok", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(repo_module, "RepoProjectTests", lambda state: RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+
+    async def invoke(selectors=(), suite=None):
+        return await repo_module.repo_test.coroutine(scope.canonical_repo, scope.pr_number,
+                                                     selectors, suite=suite)
+
+    if policy != "full":
+        with pytest.raises(ToolPolicyRefusal, match="review_test_policy") as refusal:
+            await invoke()
+        assert "CI" in str(refusal.value)
+        assert policy in str(refusal.value)
+        assert not calls
+    else:
+        assert (await invoke())["ok"]
+        assert len(calls) == 1
+
+    if policy == "none":
+        with pytest.raises(ToolPolicyRefusal, match="CI is the validation surface"):
+            await invoke(("tests/test_changed.py",))
+        assert not calls
+    else:
+        assert (await invoke(("tests/test_changed.py",)))["ok"]
+        assert calls[-1][-1] == "tests/test_changed.py"
+        assert (await invoke(suite="unit"))["ok"]
+
+
+@pytest.mark.asyncio
+async def test_repo_test_remediation_scope_ignores_review_policy(tmp_path, monkeypatch):
+    from mimir_cultivate import repository as repo_module
+
+    actions = frozenset({RepoPRAction.CHECKOUT.value, RepoPRAction.TEST.value, RepoPRAction.PUSH.value})
+    _, _, scope, state = _repo_scope_and_state(
+        tmp_path, allowed_operations=actions,
+    )
+    home = tmp_path / "home"
+    _configure_test_suites(home, state, review_tests="none")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr(repo_module, "_state", lambda *args: state)
+    calls = []
+
+    async def runner(argv, *args, **kwargs):
+        calls.append(argv)
+        return CollectedExecutionResult(0, b"ok", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(repo_module, "RepoProjectTests", lambda state: RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ))
+    result = await repo_module.repo_test.coroutine(scope.canonical_repo, scope.pr_number)
+    assert result["ok"] and len(calls) == 1
 
 
 @pytest.fixture

@@ -905,7 +905,7 @@ def test_docker_failure_names_step_without_secrets(tmp_path, monkeypatch, step):
               'owner_email': 'owner@example.com', 'deploy': str(tmp_path / 'deploy'),
               'model_spec': 'openai:model', 'saga_model_spec': 'openai:model',
               'embedding': 'openai:model', 'source_ref': 'refs/heads/feature/plugins',
-              'source_repo': 'org/mimir', 'test_command': 'npm test', 'port': '8123'}
+              'source_repo': 'org/mimir', 'test_command': 'npm test', 'review_tests': 'targeted', 'port': '8123'}
     monkeypatch.setattr(installer, '_field', lambda args, name, *a, **kw: fields[name])
     monkeypatch.setattr(installer, '_secret', lambda *a, **kw: 'secret-from-compose-env')
     monkeypatch.setattr(installer, 'validate_token', lambda *a: None)
@@ -1651,7 +1651,8 @@ def test_existing_env_never_overwrites_operator_secrets(tmp_path):
     assert (tmp_path / "compose.env").read_bytes() == before
 
 
-def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monkeypatch, capsys, caplog):
+@pytest.mark.parametrize('review_tests', ['targeted', 'full', 'none'])
+def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monkeypatch, capsys, caplog, review_tests):
     monkeypatch.setenv("HOME", "/home/mimir")
     monkeypatch.setenv("XDG_CACHE_HOME", "/home/mimir/.cache")
     home = tmp_path / "home"
@@ -1663,7 +1664,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"slug": "org/repo", "branch": "main", "toolchain": "rust", "owner": "owner",
                                      "display": "Owner", "email": "owner@example.com",
-                                     "test": "npm run verify", "rotate": False,
+                                     "test": "npm run verify", "review_tests": review_tests, "rotate": False,
                                      "saga_model_spec": "openai:gpt-5.4-nano", "embedding": "local", "reembed": False}))
     script = (installer._PROVISION
               .replace("/opt/cultivate-manifest.json", str(manifest))
@@ -1722,6 +1723,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert inventory["repositories"][0]["root"] == str(repo)
     assert inventory["repositories"][0]["worklink_base"] == str(tmp_path / 'worklink/base/repo')
     assert inventory["repositories"][0]["origin"] == "https://github.com/org/repo.git"
+    assert inventory["repositories"][0]["review_tests"] == review_tests
     assert len(inventory["repositories"]) == 1
     assert base_identity == {'user.name': 'trellisbot-squashmerge', 'user.email': 'trellisbot@example.com'}
     assert {r["root"] for r in inventory["allowed_roots"]} == {"/workspace/pr-leases", "/workspace/worklink"}
@@ -1762,6 +1764,34 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
     assert (home / 'repositories.yaml').read_bytes() == prior_inventory
     assert (home / 'worklink.yaml').read_bytes() == prior_worklink
+    # Upgrade deployed entries with only test_command (no configured suites),
+    # including older entries that also predate worklink_base. Exercise the real
+    # provisioning writer and its changed/idempotent output, not a copied merge.
+    for missing in [('review_tests',), ('worklink_base', 'review_tests')]:
+        legacy = yaml.safe_load(prior_inventory)
+        for field in missing:
+            del legacy['repositories'][0][field]
+        (home / 'repositories.yaml').write_text(yaml.safe_dump(legacy, sort_keys=False))
+        capsys.readouterr()
+        exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+        assert capsys.readouterr().out == 'SETUP_CHANGED=1\n'
+        assert yaml.safe_load((home / 'repositories.yaml').read_text()) == inventory
+        assert (home / 'worklink.yaml').read_bytes() == prior_worklink
+        exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+        assert capsys.readouterr().out == 'SETUP_CHANGED=0\n'
+    # Explicit operator policy conflicts remain refusals, even if a legacy
+    # declaration is also missing the Worklink base. No inventory is written.
+    for missing_base in [False, True]:
+        conflict = yaml.safe_load(prior_inventory)
+        conflict['repositories'][0]['review_tests'] = 'none' if review_tests != 'none' else 'full'
+        if missing_base:
+            del conflict['repositories'][0]['worklink_base']
+        (home / 'repositories.yaml').write_text(yaml.safe_dump(conflict, sort_keys=False))
+        before = (home / 'repositories.yaml').read_bytes()
+        with pytest.raises(RuntimeError, match='existing repository declaration differs'):
+            exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+        assert (home / 'repositories.yaml').read_bytes() == before
+        assert (home / 'worklink.yaml').read_bytes() == prior_worklink
     explicit = yaml.safe_load(prior_inventory)
     explicit['repositories'][0]['worklink_base'] = str(tmp_path / 'operator-base')
     (home / 'repositories.yaml').write_text(yaml.safe_dump(explicit, sort_keys=False))
