@@ -97,6 +97,9 @@ def test_safe_url_accepts_plain_https_issue_urls():
     ("https://example.atlassian.net/browse/PROJ%2045", "PROJ-45"),
     ("https://example.atlassian.net/browse/PROJ-45\n", "PROJ-45"),
     ("https://example.atlassian.net/" + "a" * 300 + "/PROJ-45", "PROJ-45"),
+    ("https://ex_ample.com/browse/PROJ-45", "PROJ-45"),
+    # >300 chars from short, individually valid parts: only the length bound rejects it
+    ("https://" + "h" * 100 + ".example.com/" + "/".join(["a" * 30] * 6) + "/PROJ-45", "PROJ-45"),
     ("https://example.atlassian.net/browse/PROJ-45", "PROJ 45"),
     ("https://example.atlassian.net/browse/PROJ-45", None),
     (None, "PROJ-45"),
