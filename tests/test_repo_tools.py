@@ -3088,8 +3088,8 @@ def _run_synthetic_pytest(tmp_path: Path, test_source: str) -> subprocess.Comple
             "-s",
             "-p",
             "no:anyio",
-            "-o",
-            "asyncio_default_fixture_loop_scope=function",
+            # The synthetic test uses no anyio fixtures; exclude its optional
+            # plugin, whose import emits a deprecation under pytest 9.2.
             str(test_path),
             "-o",
             "faulthandler_timeout=0.1",

@@ -349,7 +349,7 @@ async def test_default_gate_bounds_checkout_environment(tmp_path, monkeypatch, b
     # plugin (whose import warns before pytest processes -W under pytest 9.2).
     monkeypatch.setenv(
         "PYTEST_ADDOPTS",
-        "-p no:anyio -W error -o asyncio_default_fixture_loop_scope=function",
+        "-p no:anyio -W error",
     )
     repo = _init_gate_repo(
         tmp_path,

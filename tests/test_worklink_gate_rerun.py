@@ -122,9 +122,10 @@ def test_passes():
     path = Path("passing-visits")
     path.write_text(str(int(path.read_text()) + 1) if path.exists() else "1")
 ''')
+    # No anyio fixtures are used here; its optional plugin imports deprecated
+    # pytest internals under pytest 9.2, before the gate warning is exercised.
     (repo / "pytest.ini").write_text(
         "[pytest]\naddopts = -p no:anyio -W error -n 2\n"
-        "asyncio_default_fixture_loop_scope = function\n"
     )
     monkeypatch.setenv("PYTEST_ADDOPTS", "-n 2")
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "false")
