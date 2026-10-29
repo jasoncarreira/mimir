@@ -131,12 +131,17 @@ def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:
         "max_retries",
         "pr_draft",
     }
+    # `verify` queues on the host's shared heavy-run lock through scripts/heavy_run.sh,
+    # which runs the suite unwrapped where the lock tools are absent (Linux containers, CI).
+    assert data["verify"] == "sh scripts/heavy_run.sh uv run pytest -q --tb=short"
     # `verify_timeout_ms` is declared because the factory default of 900000 (15 min) is
     # shorter than this suite. A canonical run reached ~79% of 8937 tests before the
     # factory sent SIGTERM, and that surfaces as a numeric test failure rather than a
-    # timeout -- which then blocks relaunching the run on the same SHA. The suite takes
-    # 8.5-15 min here, so 30 min is headroom rather than a guess at the current runtime.
-    assert data["verify_timeout_ms"] == 1800000
+    # timeout -- which then blocks relaunching the run on the same SHA. The factory's
+    # timeout also covers the time a verify spends queued on the heavy-run lock, which
+    # another host workload can hold for over an hour, so it sits above the wrapper's
+    # 7200 s hang backstop rather than above the suite's own runtime.
+    assert data["verify_timeout_ms"] == 7500000
     assert (
         isinstance(data["max_retries"], int)
         and not isinstance(data["max_retries"], bool)

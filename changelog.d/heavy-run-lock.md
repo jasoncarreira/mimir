@@ -1,0 +1,1 @@
+- The factory's repository verify now runs through `scripts/heavy_run.sh`, which queues it on the host's shared heavy-run lock (`lockf` under a `gtimeout` backstop) when both tools are present, and runs it directly elsewhere. `verify_timeout_ms` is raised to cover time spent waiting for the lock.
