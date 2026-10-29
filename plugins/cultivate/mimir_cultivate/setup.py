@@ -79,7 +79,27 @@ _PUSH_PROBE_UNREACHABLE = "CULTIVATE_PUSH_PROBE_UNREACHABLE"
 _PUSH_PROBE_UNREACHABLE_HELP = (
     "Push probe could not reach the remote (network or GitHub error); retry setup."
 )
-_CULTIVATE_DEFAULT_SKILLS = ("github-poller", "github-ci-watch", "github", "review")
+_CULTIVATE_DEFAULT_SKILLS = ("github-poller", "github-ci-watch", "github", "review", "tracker-poller")
+_TRACKER_CHOICES = ("github-issues", "linear", "jira")
+_TRACKER_ADAPTERS = {"github-issues": "github_issues", "linear": "linear", "jira": "jira"}
+_JIRA_PROJECT_KEY = re.compile(r"[A-Z][A-Z0-9_]{1,9}")
+_JIRA_SITE = re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+")
+_JIRA_PERMISSION_HELP = (
+    "Jira service account id (accountId). The service account needs Browse Projects on each "
+    "--jira-project, Add Comments, and Transition Issues when transitions or close_on_merge are set. "
+    "The adapter also calls the user, group and project-role endpoints, GET /rest/api/3/user, "
+    "GET /rest/api/3/user/groups (for --jira-trusted-group), GET /rest/api/3/project/{key}/role and "
+    "GET /rest/api/3/project/{key}/role/{id} (for --jira-trusted-role), alongside "
+    "POST /rest/api/3/search/jql, GET /rest/api/3/issue/{key}, POST /rest/api/3/issue/{key}/comment and "
+    "GET/POST /rest/api/3/issue/{key}/transitions. Grant the service account read access to the "
+    "configured groups and roles (Jira may require the \"Browse users and groups\" global permission or "
+    "project administration) and verify that each endpoint returns 200 for it. A 401 or 403 fails closed: "
+    "no Jira issue is delivered, and the poller writes the stderr code adapter_unavailable:jira:http_403."
+)
+_LINEAR_KEY_HELP = (
+    "Read the Linear access token from a mode-600 file (never from argv). Use the access token of a Linear "
+    "OAuth app installed with actor=app and the app:assignable scope; the bot is set as the issue's delegate."
+)
 _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.-]*")
 _BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]*")
 _EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
@@ -176,6 +196,71 @@ def validate(name: str, value: str) -> str:
     if not ok:
         raise SetupError(f"Invalid {name.replace('_', ' ')}; supply a valid {name.replace('_', ' ')} (see --help).")
     return value
+
+
+def _tracker_settings(args: argparse.Namespace, previous: dict) -> tuple[list[str], dict[str, object]]:
+    """Resolve the tracker set and its non-secret settings; flags override, saved values persist."""
+    requested = getattr(args, "tracker", None)
+    if requested is None:
+        saved = previous.get("trackers", [])
+        if not isinstance(saved, list) or any(t not in _TRACKER_CHOICES for t in saved):
+            raise SetupError("Invalid trackers in manifest.json; reconcile it before retrying.")
+        trackers = sorted(set(saved))
+    elif "none" in requested:
+        if set(requested) != {"none"}:
+            raise SetupError("--tracker none cannot be combined with another tracker.")
+        trackers = []
+    else:
+        trackers = sorted(set(requested))
+    saved_settings = previous.get("tracker_settings", {})
+    if not isinstance(saved_settings, dict):
+        raise SetupError("Invalid tracker settings in manifest.json; reconcile it before retrying.")
+    settings: dict[str, object] = {}
+    for key in ("jira_site", "jira_account_id"):
+        value = getattr(args, key, None)
+        value = saved_settings.get(key) if value is None else value
+        if value is not None:
+            if not isinstance(value, str):
+                raise SetupError(f"Invalid {key.replace('_', ' ')} in manifest.json; reconcile it before retrying.")
+            settings[key] = value.strip()
+    for key in ("jira_projects", "jira_trusted_groups", "jira_trusted_roles"):
+        value = getattr(args, key, None)
+        value = saved_settings.get(key, []) if value is None else value
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise SetupError(f"Invalid {key.replace('_', ' ')} in manifest.json; reconcile it before retrying.")
+        settings[key] = sorted({v.strip() for v in value})
+    if "jira" in trackers:
+        site = settings.get("jira_site")
+        if not site or not _JIRA_SITE.fullmatch(site):
+            raise SetupError("Invalid Jira site; pass --jira-site as a host without scheme, such as example.atlassian.net.")
+        account = settings.get("jira_account_id")
+        if not account or not account.isprintable() or any(c.isspace() for c in account):
+            raise SetupError("Invalid Jira account id; pass --jira-account-id (see --help for the required permissions).")
+        if not settings["jira_projects"] or any(not _JIRA_PROJECT_KEY.fullmatch(k) for k in settings["jira_projects"]):
+            raise SetupError("Invalid Jira projects; pass at least one --jira-project key such as PROJ.")
+        trusted = settings["jira_trusted_groups"] + settings["jira_trusted_roles"]
+        if not trusted or any(not v or not v.isprintable() for v in trusted):
+            raise SetupError("Invalid Jira trust settings; pass --jira-trusted-group or --jira-trusted-role.")
+    return trackers, settings
+
+
+def _tracker_config(trackers: list[str], settings: dict[str, object]) -> dict[str, object] | None:
+    """The setup-owned ``tracker:`` section of worklink.yaml, or None when no tracker is selected."""
+    if not trackers:
+        return None
+    adapters: dict[str, object] = {}
+    for name in trackers:
+        if name == "jira":
+            adapter: dict[str, object] = {"account_id": settings["jira_account_id"],
+                                          "projects": settings["jira_projects"]}
+            if settings["jira_trusted_groups"]:
+                adapter["trusted_groups"] = settings["jira_trusted_groups"]
+            if settings["jira_trusted_roles"]:
+                adapter["trusted_project_roles"] = settings["jira_trusted_roles"]
+            adapters["jira"] = adapter
+        else:
+            adapters[_TRACKER_ADAPTERS[name]] = {}
+    return {"close_on_merge": False, "adapters": adapters}
 
 
 def validate_system_packages(packages: list[str]) -> list[str]:
@@ -660,7 +745,7 @@ def toolchain_test_env(kind: str) -> dict[str, str]:
 
 def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
                         git_auth: list[str], force: bool = False,
-                        toolchain: str | None = None) -> bool:
+                        toolchain: str | None = None, tracker: dict | None = None) -> bool:
     """Reconcile the dedicated, controller-owned base and Worklink settings."""
     from .worklink.backends.registry import BackendRegistry, WorklinkConfig, _derive_bash_allowlist
 
@@ -726,6 +811,8 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         allowlist = ['git *', entry['test_command']]
     config['backends'] = {'opencode': {'bash_allowlist': allowlist,
                                      'test_env': toolchain_test_env(toolchain) if toolchain else {}}}
+    if tracker:
+        config['tracker'] = tracker
     text = yaml.safe_dump(config, sort_keys=False)
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise RuntimeError(f"Worklink config {path} must be a regular file; move it aside")
@@ -1136,7 +1223,8 @@ def _verify_alert(url: str, owner_key: str, adapter: str) -> None:
 
 
 def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, version: str,
-             system_packages: list[str] | None = None, alert_adapter: str = "none") -> None:
+             system_packages: list[str] | None = None, alert_adapter: str = "none",
+             *, trackers: tuple[str, ...] = ()) -> None:
     url = f"http://127.0.0.1:{port}"
     for attempt in range(60):
         try:
@@ -1219,7 +1307,8 @@ def _verify(deploy: Path, port: int, slug: str, owner_key: str, kind: str, versi
     schedule = _http(url + "/api/v1/scheduler", key=owner_key)
     pollers = {row.get("name") for row in schedule.get("data", {}).get("pollers", [])
                if row.get("next_run_at")}
-    for poller in ("github-activity", "github-ci-watch", "worklink-ready-queue"):
+    for poller in ("github-activity", "github-ci-watch", "worklink-ready-queue",
+                   *(("tracker-poller",) if trackers else ())):
         if poller not in pollers:
             raise SetupError(f"{poller} was not scheduled; inspect poller configuration and restart.")
     # POST only acknowledges enqueue. Confirm the assistant reply in history.
@@ -1270,6 +1359,22 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
     for name in ("github-token", "model-key", "saga-model-key", "embedding-key"):
         setup.add_argument("--" + name + "-file", help="Read secret from a mode-600 file (never from argv).")
         setup.add_argument("--" + name + "-stdin", action="store_true", help="Read one secret line from stdin.")
+    setup.add_argument("--tracker", action="append", choices=_TRACKER_CHOICES + ("none",),
+                       help="Triage issues assigned to the bot from this tracker (repeatable: github-issues, linear, jira); "
+                            "installs the tracker-poller skill and writes the tracker: section of worklink.yaml. "
+                            "none clears the saved set; omit to preserve it. Edits to tracker: made by hand need --force on a rerun.")
+    setup.add_argument("--jira-site", help="Jira Cloud host without scheme, such as example.atlassian.net (written to JIRA_SITE).")
+    setup.add_argument("--jira-account-id", help=_JIRA_PERMISSION_HELP)
+    setup.add_argument("--jira-project", dest="jira_projects", action="append", help="Jira project key to poll (repeatable).")
+    setup.add_argument("--jira-trusted-group", dest="jira_trusted_groups", action="append",
+                       help="Jira group whose members are trusted (repeatable).")
+    setup.add_argument("--jira-trusted-role", dest="jira_trusted_roles", action="append",
+                       help="Jira project role whose members are trusted (repeatable).")
+    setup.add_argument("--linear-api-key-file", help=_LINEAR_KEY_HELP)
+    setup.add_argument("--linear-api-key-stdin", action="store_true", help="Read the Linear access token from one stdin line.")
+    for name, what in (("jira-email", "Jira service account email"), ("jira-api-token", "Jira service account API token")):
+        setup.add_argument("--" + name + "-file", help=f"Read the {what} from a mode-600 file (never from argv).")
+        setup.add_argument("--" + name + "-stdin", action="store_true", help=f"Read the {what} from one stdin line.")
     setup.add_argument("--operator-alert-adapter", choices=("web", "discord", "slack", "none"),
                        help="Alert destination (unattended default: none; saved on rerun).")
     setup.add_argument("--operator-alert-channel-id", help="Discord numeric or Slack C/G alert channel ID.")
@@ -1328,6 +1433,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         raise SetupError("Cannot read previous settings from manifest.json; reconcile it before retrying.") from None
     if not isinstance(previous, dict):
         raise SetupError("Invalid manifest.json; reconcile it before retrying.")
+    trackers, tracker_settings = _tracker_settings(args, previous)
     if getattr(args, "auto_review", None) is None and "auto_review" in previous:
         if not isinstance(previous["auto_review"], str):
             raise SetupError("Invalid auto review in manifest.json; reconcile it before retrying.")
@@ -1360,6 +1466,16 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     print("Operator alerts: " + alert_adapter + (" (" + alert_channel_id + ")" if alert_channel_id else ""))
     token = _secret(args, "github_token", "Bot PAT: create it with the settings above; input is hidden.", previous=prior.get("GITHUB_TOKEN"))
     validate_token(token, bot, repo, request)
+    tracker_env: dict[str, str] = {}
+    if "linear" in trackers:
+        tracker_env["LINEAR_API_KEY"] = _secret(args, "linear_api_key", "Linear access token (input hidden).",
+                                                previous=prior.get("LINEAR_API_KEY"))
+    if "jira" in trackers:
+        tracker_env["JIRA_SITE"] = str(tracker_settings["jira_site"])
+        tracker_env["JIRA_EMAIL"] = _secret(args, "jira_email", "Jira service account email (input hidden).",
+                                            previous=prior.get("JIRA_EMAIL"))
+        tracker_env["JIRA_API_TOKEN"] = _secret(args, "jira_api_token", "Jira service account API token (input hidden).",
+                                                previous=prior.get("JIRA_API_TOKEN"))
     spec = _field(args, "model_spec", "Model spec: choose an API-backed openai:model or anthropic:model; used for agent turns.")
     provider = spec.split(":", 1)[0]
     key_name = provider.upper() + "_API_KEY"
@@ -1459,7 +1575,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         "MIMIR_API_KEY": secrets.token_urlsafe(32), "GITHUB_TOKEN": token, "GH_TOKEN": token,
         "GH_USER_NAME": bot, "GH_USER_EMAIL": bot_email, "MIMIR_GITHUB_SELF_LOGIN": bot,
         "GITHUB_REPOS": repo, "MIMIR_MODEL_SPEC": spec, key_name: model_key,
-          "MIMIR_WEB_HOST": "0.0.0.0", **extra_keys, **alert_env,
+          "MIMIR_WEB_HOST": "0.0.0.0", **extra_keys, **alert_env, **tracker_env,
     }, manage_alerts=alert_adapter != "none" or "operator_alert_adapter" in previous)
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
@@ -1467,6 +1583,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                    "email": owner_email, "test": test, "review_tests": review_tests,
                    "auto_review": auto_review,
                    "worklink_gate": gate, "quick_gate_command": quick_gate_command,
+                   "trackers": trackers, "tracker_settings": tracker_settings,
+                   "tracker_config": _tracker_config(trackers, tracker_settings),
                    "rotate": bool(args.rotate_web_key),
                   "force": bool(getattr(args, "force", False)),
                   "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
@@ -1543,7 +1661,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
             raise SetupError("Could not retrieve owner web key; check container home volume.")
     key_path.chmod(0o600)
     verify(deploy, port, repo, key_path.read_text().strip(), kind, version, system_packages,
-           alert_adapter)
+           alert_adapter, **({"trackers": tuple(trackers)} if trackers else {}))
     print(f"Cultivate ready: http://127.0.0.1:{port}  Owner web key: {key_path}  Next: use the key to sign in.")
     print("Issues are tracked in Chainlink in the agent home (/home/mimir/agent).")
     print('File a leaf: docker compose exec -w /home/mimir/agent agent chainlink issue create '
@@ -1646,9 +1764,10 @@ if not inventory.exists() or inventory.read_text() != text:
     changed = True
 changed = _provision_worklink(home, entry, base=base,
                             checkout=repo, git_auth=git_auth, force=m.get('force', False),
-                            toolchain=m.get('toolchain')) or changed
+                            toolchain=m.get('toolchain'),
+                            tracker=m.get('tracker_config')) or changed
 skills = []
-for name in ('github-poller', 'github-ci-watch', 'github', 'review'):
+for name in ('github-poller', 'github-ci-watch', 'github', 'review') + (('tracker-poller',) if m.get('trackers') else ()):
     skill = resolve_skill('cultivate:' + name, set())
     if skill is None:
         raise RuntimeError('missing optional Cultivate skill: ' + name)

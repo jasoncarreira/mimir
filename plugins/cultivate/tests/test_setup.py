@@ -781,7 +781,8 @@ def setup_environment(tmp_path, monkeypatch):
     args = argparse.Namespace(rotate_web_key=False, reembed=False, force=False, system_packages=None)
     state['verified'] = []
     def invoke():
-        installer.setup(args, request=request, run=run, verify=lambda *a: state['verified'].append(a))
+        installer.setup(args, request=request, run=run,
+                        verify=lambda *a, **kw: state['verified'].append(a + ((kw,) if kw else ())))
 
     return deploy, args, state, calls, invoke
 
@@ -1498,8 +1499,8 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
 
     monkeypatch.setattr(installer, "_http", http)
     monkeypatch.setattr(installer, "_run", run)
-    def verify():
-        installer._verify(tmp_path, 8123, "org/repo", "owner-key", 'rust', '1.99.1')
+    def verify(**kwargs):
+        installer._verify(tmp_path, 8123, "org/repo", "owner-key", 'rust', '1.99.1', **kwargs)
 
     verify()
     assert len(exec_calls) == 11
@@ -1568,6 +1569,12 @@ def test_verification_requires_current_binding_pollers_and_new_reply(tmp_path, m
     with pytest.raises(installer.SetupError, match="worklink-ready-queue"):
         verify()
     pending["pollers"] = ["github-activity", "github-ci-watch", "worklink-ready-queue"]
+    with pytest.raises(installer.SetupError, match="tracker-poller was not scheduled"):
+        verify(trackers=("linear",))
+    pending["pollers"].append("tracker-poller")
+    reads.clear()
+    verify(trackers=("linear",))
+    pending["pollers"].remove("tracker-poller")
     pending["reply"] = False
     with pytest.raises(installer.SetupError, match="no assistant reply"):
         verify()
@@ -3189,3 +3196,221 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok,
     captured = capsys.readouterr()
     assert "fixture-token" not in captured.out + captured.err
     assert "secret remote output" not in captured.out + captured.err
+
+
+_REAL_SECRET = installer._secret
+_TRACKER_SECRETS = {"linear_api_key", "jira_email", "jira_api_token"}
+_JIRA_FLAGS = {"jira_site": "example.atlassian.net", "jira_account_id": "5b10ac8d82e05b22cc7d4ef5",
+               "jira_projects": ["PROJ"], "jira_trusted_groups": ["engineering"]}
+
+
+def _tracker_secret_files(tmp_path, monkeypatch, **values):
+    """Real tracker secret loading; every other secret stays the fixture's stub."""
+    for name, value in values.items():
+        path = tmp_path / (name + ".secret")
+        path.write_text(value + "\n")
+        path.chmod(0o600)
+        yield name, str(path)
+    monkeypatch.setattr(installer, "_secret", lambda args, name, *a, **kw: (
+        _REAL_SECRET(args, name, *a, **kw) if name in _TRACKER_SECRETS else "secret"))
+
+
+def _use_tracker_secrets(args, tmp_path, monkeypatch, **values):
+    for name, path in _tracker_secret_files(tmp_path, monkeypatch, **values):
+        setattr(args, name + "_file", path)
+
+
+def _compose_env(deploy):
+    return dict(line.split("=", 1) for line in (deploy / "compose.env").read_text().splitlines() if "=" in line)
+
+
+def test_setup_help_names_tracker_flags_jira_endpoints_and_linear_identity():
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers())
+    sub = parser._subparsers._group_actions[0].choices["cultivate"]._subparsers._group_actions[0].choices["setup"]
+    text = " ".join(sub.format_help().split())
+    for required in (
+        "--tracker", "github-issues", "--linear-api-key-file", "--jira-email-file", "--jira-api-token-stdin",
+        "actor=app", "app:assignable", "delegate", "Browse Projects", "Add Comments", "Transition Issues",
+        "GET /rest/api/3/user", "GET /rest/api/3/user/groups", "GET /rest/api/3/project/{key}/role",
+        "GET /rest/api/3/project/{key}/role/{id}", "POST /rest/api/3/search/jql",
+        "GET /rest/api/3/issue/{key}", "POST /rest/api/3/issue/{key}/comment",
+        "GET/POST /rest/api/3/issue/{key}/transitions", "Browse users and groups",
+        "returns 200", "fails closed", "http_403", "--force",
+    ):
+        assert required in text, required
+
+
+def test_setup_without_tracker_is_unchanged(upgrade_setup):
+    deploy, args, state, calls, invoke = upgrade_setup
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["trackers"] == [] and manifest["tracker_config"] is None
+    assert not {"LINEAR_API_KEY", "JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN"} & set(_compose_env(deploy))
+    assert state["verified"] and all(len(call) == 8 for call in state["verified"])
+
+
+def test_tracker_flags_persist_override_and_clear(upgrade_setup, tmp_path, monkeypatch):
+    deploy, args, state, calls, invoke = upgrade_setup
+    _use_tracker_secrets(args, tmp_path, monkeypatch, linear_api_key="lin-secret-value")
+    args.tracker = ["linear", "github-issues", "linear"]
+    invoke()
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["trackers"] == ["github-issues", "linear"]
+    assert manifest["tracker_config"] == {"close_on_merge": False,
+                                          "adapters": {"github_issues": {}, "linear": {}}}
+    assert _compose_env(deploy)["LINEAR_API_KEY"] == "lin-secret-value"
+    assert state["verified"][-1][-1] == {"trackers": ("github-issues", "linear")}
+    args.tracker = None
+    args.linear_api_key_file = None
+    state["sha"] = "c" * 40
+    invoke()
+    assert json.loads((deploy / "manifest.json").read_text())["trackers"] == ["github-issues", "linear"]
+    args.tracker = ["jira"]
+    for key, value in _JIRA_FLAGS.items():
+        setattr(args, key, value)
+    _use_tracker_secrets(args, tmp_path, monkeypatch, jira_email="bot@example.com", jira_api_token="jira-token-value")
+    invoke()
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["trackers"] == ["jira"]
+    assert manifest["tracker_config"]["adapters"] == {"jira": {
+        "account_id": _JIRA_FLAGS["jira_account_id"], "projects": ["PROJ"], "trusted_groups": ["engineering"]}}
+    env = _compose_env(deploy)
+    assert (env["JIRA_SITE"], env["JIRA_EMAIL"], env["JIRA_API_TOKEN"]) == (
+        "example.atlassian.net", "bot@example.com", "jira-token-value")
+    args.tracker = None
+    for key in _JIRA_FLAGS:
+        setattr(args, key, None)
+    invoke()
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["trackers"] == ["jira"] and manifest["tracker_settings"]["jira_projects"] == ["PROJ"]
+    args.tracker = ["none"]
+    invoke()
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["trackers"] == [] and manifest["tracker_config"] is None
+    args.tracker = ["none", "linear"]
+    with pytest.raises(installer.SetupError, match="cannot be combined"):
+        invoke()
+
+
+def test_tracker_secrets_never_reach_argv_output_or_logs(setup_environment, tmp_path, monkeypatch, capsys, caplog):
+    deploy, args, state, calls, invoke = setup_environment
+    secrets_ = {"linear_api_key": "lin-secret-value", "jira_email": "svc-secret@example.com",
+                "jira_api_token": "jira-token-value"}
+    _use_tracker_secrets(args, tmp_path, monkeypatch, **secrets_)
+    args.tracker = ["linear", "jira"]
+    for key, value in _JIRA_FLAGS.items():
+        setattr(args, key, value)
+    caplog.set_level(logging.DEBUG)
+    invoke()
+    captured = capsys.readouterr()
+    haystack = captured.out + captured.err + caplog.text + " ".join(" ".join(c) for c in calls)
+    haystack += json.dumps(state["verified"], default=str) + (deploy / "manifest.json").read_text()
+    for value in secrets_.values():
+        assert value not in haystack
+    assert (deploy / "compose.env").stat().st_mode & 0o777 == 0o600
+
+
+def test_tracker_secret_conflicts_with_differing_compose_env(upgrade_setup, tmp_path, monkeypatch):
+    deploy, args, state, calls, invoke = upgrade_setup
+    _use_tracker_secrets(args, tmp_path, monkeypatch, linear_api_key="lin-secret-value")
+    args.tracker = ["linear"]
+    invoke()
+    args.linear_api_key_file = str(tmp_path / "other.secret")
+    (tmp_path / "other.secret").write_text("different\n")
+    (tmp_path / "other.secret").chmod(0o600)
+    before = (deploy / "compose.env").read_text()
+    with pytest.raises(installer.SetupError, match="conflicts on LINEAR_API_KEY"):
+        invoke()
+    assert (deploy / "compose.env").read_text() == before
+    args.jira_site = None
+    args.tracker = ["jira"]
+    for key, value in _JIRA_FLAGS.items():
+        setattr(args, key, value)
+    args.jira_site = "other.atlassian.net"
+    _use_tracker_secrets(args, tmp_path, monkeypatch, jira_email="bot@example.com", jira_api_token="jira-token-value")
+    invoke()
+    args.jira_site = "changed.atlassian.net"
+    with pytest.raises(installer.SetupError, match="conflicts on JIRA_SITE"):
+        invoke()
+
+
+@pytest.mark.parametrize("overrides, message", [
+    ({"jira_site": "https://example.atlassian.net"}, "Invalid Jira site"),
+    ({"jira_site": None}, "Invalid Jira site"),
+    ({"jira_account_id": None}, "Invalid Jira account id"),
+    ({"jira_projects": []}, "Invalid Jira projects"),
+    ({"jira_projects": ["proj"]}, "Invalid Jira projects"),
+    ({"jira_trusted_groups": []}, "Invalid Jira trust settings"),
+])
+def test_invalid_jira_settings_fail_before_any_file_is_written(setup_environment, overrides, message):
+    deploy, args, state, calls, invoke = setup_environment
+    args.tracker = ["jira"]
+    for key, value in {**_JIRA_FLAGS, **overrides}.items():
+        setattr(args, key, value)
+    with pytest.raises(installer.SetupError, match=message):
+        invoke()
+    assert not deploy.exists() and not calls
+
+
+def test_tracker_skill_is_installed_only_when_selected(provisioned_skills, monkeypatch):
+    home, manifest, defaults, run = provisioned_skills
+    seen = []
+    monkeypatch.setattr(installer, "_provision_worklink", lambda *a, **kw: seen.append(kw.get("tracker")) or False)
+    run()
+    assert not (home / "skills/cultivate-tracker-poller").exists()
+    assert (home / "skills/cultivate-github-poller").is_dir()
+    assert seen == [None]
+    config = {"close_on_merge": False, "adapters": {"linear": {}}}
+    data = json.loads(manifest.read_text())
+    manifest.write_text(json.dumps({**data, "trackers": ["linear"], "tracker_config": config}))
+    run()
+    assert (home / "skills/cultivate-tracker-poller/SKILL.md").is_file()
+    assert seen[-1] == config
+
+
+def test_worklink_yaml_gets_tracker_section_only_when_selected(tmp_path, monkeypatch):
+    original_run = subprocess.run
+    origin = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    original_run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+    original_run(["git", "init", "-b", "integration", str(seed)], check=True, capture_output=True)
+    (seed / "README").write_text("seed\n")
+    original_run(["git", "-C", str(seed), "add", "README"], check=True, capture_output=True)
+    original_run(["git", "-C", str(seed), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                  "commit", "-m", "seed"], check=True, capture_output=True)
+    original_run(["git", "-C", str(seed), "push", str(origin), "HEAD:refs/heads/integration"],
+                 check=True, capture_output=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    base = tmp_path / "worklink/base/repo"
+    entry = {"slug": "org/repo", "origin": str(origin), "base_branch": "integration", "test_command": "./tools/verify"}
+
+    def run(argv, **kw):
+        if argv[0] == "chainlink":
+            if argv == ["chainlink", "init", "-q"]:
+                (home / ".chainlink").mkdir()
+            else:
+                (home / ".chainlink/agent.json").write_text("{}")
+            return subprocess.CompletedProcess(argv, 0)
+        return original_run(argv, **kw)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    auth = ["git", "-c", "credential.helper=", "-c", "credential.https://github.com.helper=!f() { :; }; f"]
+    kwargs = dict(base=base, checkout=tmp_path / "repo", git_auth=auth)
+    path = home / "worklink.yaml"
+    installer._provision_worklink(home, entry, **kwargs)
+    plain = path.read_bytes()
+    assert b"tracker" not in plain
+    tracker = {"close_on_merge": False, "adapters": {"jira": {
+        "account_id": "abc", "projects": ["PROJ"], "trusted_groups": ["eng"]}, "linear": {}}}
+    with pytest.raises(RuntimeError, match="--force"):
+        installer._provision_worklink(home, entry, tracker=tracker, **kwargs)
+    assert path.read_bytes() == plain
+    assert installer._provision_worklink(home, entry, tracker=tracker, force=True, **kwargs)
+    from mimir_cultivate.worklink.backends.registry import WorklinkConfig
+    loaded = WorklinkConfig.load(path)
+    assert set(loaded.tracker.adapters) == {"jira", "linear"}
+    assert loaded.tracker.adapters["jira"].projects == ("PROJ",)
+    assert not installer._provision_worklink(home, entry, tracker=tracker, **kwargs)
+    assert installer._provision_worklink(home, entry, tracker=None, force=True, **kwargs)
+    assert path.read_bytes() == plain
