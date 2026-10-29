@@ -3199,6 +3199,113 @@ def test_push_probe_controls_agent_start(tmp_path, monkeypatch, capsys, push_ok,
     assert "secret remote output" not in captured.out + captured.err
 
 
+def test_digestless_deployment_adds_tracker_after_failed_provision_then_reruns_without_force(tmp_path, monkeypatch):
+    """A failed tracker-adding run leaves the saved selection ahead of a tracker-less worklink.yaml."""
+    from mimir.saga.embeddings import LocalProvider
+
+    monkeypatch.setattr(LocalProvider, "_load_model", lambda self: None)
+    monkeypatch.setenv("HOME", "/home/mimir")
+    monkeypatch.setenv("XDG_CACHE_HOME", "/home/mimir/.cache")
+    monkeypatch.setattr(installer, "_installed_license", lambda: (b"license", "1.0"))
+    monkeypatch.setenv("MIMIR_CULTIVATE_GITHUB_TOKEN", "fixture-token")
+    monkeypatch.setenv("MIMIR_CULTIVATE_MODEL_KEY", "fixture-model-key")
+    monkeypatch.setenv("MIMIR_CULTIVATE_LINEAR_API_KEY", "lin-secret-value")
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers(dest="command"))
+    deploy = tmp_path / "deploy"
+    base_argv = [
+        "cultivate", "setup", "--accept-license", "--repo", "org/repo", "--bot-login", "bot",
+        "--bot-email", "bot@example.com", "--owner", "owner", "--display-name", "Owner",
+        "--owner-email", "owner@example.com", "--model-spec", "openai:gpt-test",
+        "--saga-model-spec", "openai:gpt-5.4-nano", "--embedding", "local",
+        "--deploy", str(deploy), "--port", "8123",
+    ]
+
+    def request(url, token):
+        if url.endswith("/user"):
+            return 200, {"login": "bot"}
+        if url.endswith("/repos/org/repo"):
+            return 200, {"permissions": {"push": True}}
+        if "/git/ref/" in url:
+            return 200, {"object": {"sha": SHA}}
+        if "package.json" in url:
+            return 200, {"encoding": "base64", "content": base64.b64encode(
+                b'{"engines":{"node":"22.16.0"}}').decode()}
+        if "/contents/" in url:
+            return 404, {}
+        if "/git/trees/" in url:
+            return 200, {"tree": []}
+        return 200, {}
+
+    import mimir.plugins.skills as skills
+    monkeypatch.setattr(skills, "resolve_skill", lambda name, core_names: SimpleNamespace(dirname=name.split(":")[1]))
+    monkeypatch.setattr(skills, "skill_state", lambda home, skill: "current")
+    monkeypatch.setattr(skills, "install_skill", lambda home, skill: ((home / "skills" / skill.dirname).mkdir(parents=True, exist_ok=True), None))
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    push = {"ok": True}
+
+    def subprocess_run(argv, **kwargs):
+        if argv[0] == 'chainlink':
+            if argv[1:] == ['init', '-q']:
+                (home / '.chainlink').mkdir()
+            else:
+                (home / '.chainlink/agent.json').write_text('{"id":"cultivate-worklink"}')
+            return subprocess.CompletedProcess(argv, 0)
+        if argv[0] == "git":
+            if "clone" in argv:
+                (Path(argv[-1]) / ".git").mkdir(parents=True)
+            if "push" in argv:
+                return subprocess.CompletedProcess(argv, 0 if push["ok"] else 128, stdout=b"",
+                                                   stderr=b"The requested URL returned error: 403")
+            if 'symbolic-ref' in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout='main\n')
+            if 'status' in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout='')
+            return subprocess.CompletedProcess(argv, 0, stdout="https://github.com/org/repo.git\n")
+        if argv[:2] == ["docker", "exec"]:
+            kwargs["stdout"].write(b"owner-key\n")
+            return subprocess.CompletedProcess(argv, 0)
+        if "compose.provision.yml" in argv:
+            home.mkdir(exist_ok=True)
+            script = ((deploy / "provision.py").read_text()
+                      .replace("/opt/cultivate-manifest.json", str(deploy / "manifest.json"))
+                      .replace("/home/mimir/agent", str(home))
+                      .replace("Path('/workspace')", "Path(" + repr(str(tmp_path)) + ")")
+                      .replace("Path('/workspace/worklink/base')", "Path(" + repr(str(tmp_path / 'worklink/base')) + ")"))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                try:
+                    exec(compile(script, "provision.py", "exec"), {"__name__": "__main__"})
+                except SystemExit as exc:
+                    return subprocess.CompletedProcess(argv, exc.code, stdout=output.getvalue(), stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout=output.getvalue(), stderr="")
+        if argv[-3:] == ["ps", "-q", "agent"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="" if (deploy / "owner-web-key").exists() else "b" * 64, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(installer.subprocess, "run", subprocess_run)
+
+    def setup(*extra):
+        installer.setup(parser.parse_args(base_argv + list(extra)), request=request, verify=lambda *a, **kw: None)
+
+    setup()
+    path = home / "worklink.yaml"
+    plain = path.read_bytes()
+    assert b"tracker" not in plain
+    (home / ".mimir/worklink-setup.sha256").unlink()
+    push["ok"] = False
+    with pytest.raises(installer.SetupError) as caught:
+        setup("--tracker", "linear")
+    assert str(caught.value) == installer._PUSH_PROBE_HELP
+    assert path.read_bytes() == plain
+    push["ok"] = True
+    setup("--tracker", "linear")
+    assert b"tracker" in path.read_bytes()
+    digest = (home / ".mimir/worklink-setup.sha256").read_text().strip()
+    assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 _REAL_SECRET = installer._secret
 _TRACKER_SECRETS = {"linear_api_key", "jira_email", "jira_api_token"}
 _JIRA_FLAGS = {"jira_site": "example.atlassian.net", "jira_account_id": "5b10ac8d82e05b22cc7d4ef5",
@@ -3449,9 +3556,21 @@ def test_worklink_yaml_gets_tracker_section_only_when_selected(tmp_path, monkeyp
     assert installer._provision_worklink(home, entry, tracker=None, previous_tracker=tracker, **kwargs)
     assert path.read_bytes() == plain
     assert digest.read_text().strip() == hashlib.sha256(plain).hexdigest()
+    # A digest-less deployment holds the tracker-less file; a failed run has
+    # already saved the new selection as the previous one.
     digest.unlink()
-    with pytest.raises(RuntimeError, match="--force"):
-        installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=tracker, **kwargs)
+    assert path.read_bytes() == plain
+    assert installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=tracker, **kwargs)
+    assert path.read_bytes() == written
+    assert digest.read_text().strip() == hashlib.sha256(written).hexdigest()
+    for edited in (plain.replace(b"max_concurrent: 2", b"max_concurrent: 7"),
+                   plain + b"# hand edit\n",
+                   written.replace(b"PROJ", b"HAND")):
+        path.write_bytes(edited)
+        digest.unlink(missing_ok=True)
+        with pytest.raises(RuntimeError, match="--force"):
+            installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=tracker, **kwargs)
+        assert path.read_bytes() == edited
     installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=None, force=True, **kwargs)
     for edited in (path.read_bytes().replace(b"PROJ", b"HAND"), path.read_bytes().replace(b"max_concurrent: 2", b"max_concurrent: 7")):
         assert edited != path.read_bytes()

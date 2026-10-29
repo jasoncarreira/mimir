@@ -835,9 +835,10 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         current = path.read_bytes()
         recorded = digest_path.read_text().strip() if digest_path.is_file() else None
         # Deployments that predate the digest are unedited when the file is
-        # exactly the rendering of the previously saved tracker selection.
+        # exactly the rendering of the previously saved tracker selection, or
+        # the tracker-less rendering that setup wrote before trackers existed.
         unedited = (hashlib.sha256(current).hexdigest() == recorded if recorded
-                    else current == render(previous_tracker).encode())
+                    else current in (render(previous_tracker).encode(), render(None).encode()))
         if not unedited:
             print(_WORKLINK_EDITED, flush=True)
             raise RuntimeError(f"Worklink config {path} differs; preserve operator edits or rerun with --force")
