@@ -981,14 +981,28 @@ async def _attest_tracker_batch(
             log.warning("poller %r: tracker attestation failed (%s)", poller.name,
                         type(exc).__name__)
         budget.seconds -= time.monotonic() - started
-    if attestation is None or attestation.trusted is None:
-        return await withhold("attestation_unavailable")
-    if attestation.trusted is not True:
-        return await withhold("attestation_refused")
-    if attestation.prompt is None or redact(attestation.prompt.strip()) != item["prompt"]:
-        return await withhold("prompt_mismatch")
+    reason: str | None = None
+    actor: str | None = None
+    try:
+        if attestation is None or attestation.trusted is None:
+            reason = "attestation_unavailable"
+        elif attestation.trusted is not True:
+            reason = "attestation_refused"
+        elif (
+            attestation.prompt is None
+            or redact(attestation.prompt.strip()) != item["prompt"]
+        ):
+            reason = "prompt_mismatch"
+        else:
+            actor = safe_actor(attestation.actor)
+    except Exception as exc:  # noqa: BLE001 - a malformed verdict fails closed
+        log.warning("poller %r: tracker attestation malformed (%s)", poller.name,
+                    type(exc).__name__)
+        reason = "attestation_refused"
+    if reason is not None:
+        return await withhold(reason)
     item["extras"] = extras | {
-        "actor": safe_actor(attestation.actor) or None,
+        "actor": actor or None,
         "author_is_trusted": True,
         "tracker_attested": True,
     }

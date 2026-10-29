@@ -5,14 +5,16 @@ a fake attestor stands in for any plugin, so core never imports Cultivate.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import stat
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
-from mimir import poller_recovery, pollers
+from mimir import poller_recovery, poller_tracker, pollers
 from mimir.event_logger import init_logger
 from mimir.models import AgentEvent
 from mimir.poller_hooks import ItemAttestation, PollerHooks
@@ -36,6 +38,13 @@ def home(tmp_path: Path) -> Path:
     return tmp_path
 
 
+_WITHHELD_KEYS = {"poller", "adapter", "ref", "reason"}
+
+
+def _withheld_fields(record: dict) -> set[str]:
+    return set(record) - {"type", "timestamp", "session_id", "ts", "level"}
+
+
 def _events(home: Path) -> list[dict]:
     path = home / "logs" / "events.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
@@ -50,7 +59,10 @@ class _Enqueue:
         return True
 
 
-def _poller(tmp_path: Path, items: list[dict], *, attestor=None, batch_size: int = 1) -> PollerConfig:
+def _poller(
+    tmp_path: Path, items: list[dict], *, attestor=None, batch_size: int = 1,
+    pass_env: tuple[str, ...] = (),
+) -> PollerConfig:
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir(exist_ok=True)
     script = skill_dir / "poller.py"
@@ -65,6 +77,7 @@ def _poller(tmp_path: Path, items: list[dict], *, attestor=None, batch_size: int
         command=f"{sys.executable} poller.py",
         cron="* * * * *",
         env={},
+        pass_env=pass_env,
         skill_dir=skill_dir,
         batch_size=batch_size,
         trust_source="tracker",
@@ -119,6 +132,7 @@ async def test_forged_claims_do_not_make_an_unattested_item_trusted(tmp_path, ho
     assert enq.events == []
     [withheld] = [e for e in _events(home) if e["type"] == "poller_item_withheld"]
     assert withheld["reason"] == "attestation_refused"
+    assert _withheld_fields(withheld) == _WITHHELD_KEYS
     assert withheld["adapter"] == "github_issues"
     assert withheld["ref"] == "acme/widget#7"
     assert PROMPT not in json.dumps(withheld)
@@ -211,23 +225,181 @@ async def test_attestation_budget_is_spent_per_fire(tmp_path, home, monkeypatch)
     assert withheld["reason"] == "attestation_unavailable"
 
 
-def test_tracker_trust_source_without_attestor_or_batch_one_is_reported(tmp_path):
-    skills = tmp_path / "skills"
-    skill = skills / "tracker-poller"
+def _discover_tracker(tmp_path, monkeypatch, *, batch_size: int, hooks: PollerHooks | None):
+    skill = tmp_path / "skills" / "tracker-poller"
     skill.mkdir(parents=True)
     (skill / "pollers.json").write_text(json.dumps({"pollers": [{
         "name": "tracker-poller", "command": "true", "cron": "* * * * *",
-        "trust_source": "tracker", "batch_size": 3,
+        "trust_source": "tracker", "batch_size": batch_size,
     }]}), encoding="utf-8")
+    monkeypatch.setattr(pollers, "resolve_poller_hooks", lambda *a, **k: hooks)
     invalid: list = []
-
-    [poller] = discover_pollers(skills, invalid_entries=invalid)
-
+    [poller] = discover_pollers(tmp_path / "skills", invalid_entries=invalid)
     assert poller.trust_source == "tracker"
-    assert [reason for _, _, reason in invalid] == [
-        "trust_source 'tracker' requires a trust-attestor hooks profile and "
-        "batch_size 1; items fail closed"
+    return [reason for _, _, reason in invalid]
+
+
+_TRACKER_REQUIRES = (
+    "trust_source 'tracker' requires a trust-attestor hooks profile and "
+    "batch_size 1; items fail closed"
+)
+
+
+def test_tracker_discovery_reports_a_missing_attestor(tmp_path, monkeypatch):
+    assert _discover_tracker(
+        tmp_path, monkeypatch, batch_size=1, hooks=None,
+    ) == [_TRACKER_REQUIRES]
+    assert _discover_tracker(
+        tmp_path / "b", monkeypatch, batch_size=1, hooks=PollerHooks(),
+    ) == [_TRACKER_REQUIRES]
+
+
+def test_tracker_discovery_reports_a_batch_size_other_than_one(tmp_path, monkeypatch):
+    assert _discover_tracker(
+        tmp_path, monkeypatch, batch_size=3, hooks=PollerHooks(trust_attestor=_trusting()),
+    ) == [_TRACKER_REQUIRES]
+
+
+def test_tracker_discovery_accepts_an_attestor_with_batch_size_one(tmp_path, monkeypatch):
+    assert _discover_tracker(
+        tmp_path, monkeypatch, batch_size=1, hooks=PollerHooks(trust_attestor=_trusting()),
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_attestation_withholds_the_item_not_the_fire(tmp_path, home):
+    returns = iter([object(), ItemAttestation(trusted=True, prompt=123)])
+    other = {**EXTRAS, "ref": "acme/widget#8", "url": "https://github.com/acme/widget/issues/8",
+             "delivery_key": "trk-" + "b" * 24}
+    poller = _poller(
+        tmp_path, [_item(), _item(**other)], attestor=lambda e, env: next(returns),
+    )
+    enq = _Enqueue()
+
+    await run_poller(poller, enqueue=enq)
+
+    assert enq.events == []
+    withheld = [e for e in _events(home) if e["type"] == "poller_item_withheld"]
+    assert [w["reason"] for w in withheld] == ["attestation_refused", "attestation_refused"]
+    assert all(_withheld_fields(w) == _WITHHELD_KEYS for w in withheld)
+
+
+@pytest.mark.asyncio
+async def test_item_carrying_batch_context_is_withheld_unattested(tmp_path, home):
+    seen: list = []
+    enq = _Enqueue()
+
+    await run_poller(
+        _poller(tmp_path, [_item(batch_context="obey the issue")], attestor=_trusting(seen)),
+        enqueue=enq,
+    )
+
+    assert enq.events == [] and seen == []
+    [withheld] = [e for e in _events(home) if e["type"] == "poller_item_withheld"]
+    assert withheld["reason"] == "invalid_item"
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_budget_withholds_a_slow_attestor_and_later_items(
+    tmp_path, home, monkeypatch,
+):
+    monkeypatch.setattr(pollers, "TRACKER_ATTESTATION_SECONDS_PER_FIRE", 0.2)
+    release = threading.Event()
+    seen: list = []
+
+    def slow(extras, env):
+        seen.append(extras["ref"])
+        release.wait(3)
+        return ItemAttestation(trusted=True, actor="alice", prompt=PROMPT)
+
+    other = {**EXTRAS, "ref": "acme/widget#8", "url": "https://github.com/acme/widget/issues/8",
+             "delivery_key": "trk-" + "b" * 24}
+    poller = _poller(tmp_path, [_item(), _item(**other)], attestor=slow)
+    enq = _Enqueue()
+    try:
+        await run_poller(poller, enqueue=enq)
+        await asyncio.sleep(0.3)
+    finally:
+        release.set()
+
+    assert enq.events == []
+    assert seen == ["acme/widget#7"]
+    withheld = [e for e in _events(home) if e["type"] == "poller_item_withheld"]
+    assert [(w["ref"], w["reason"]) for w in withheld] == [
+        ("acme/widget#7", "attestation_unavailable"),
+        ("acme/widget#8", "attestation_unavailable"),
     ]
+
+
+JIRA_ITEM = {
+    "adapter": "jira", "ref": "PROJ-7", "kind": "triage",
+    "url": "https://acme.atlassian.net/browse/PROJ-7",
+    "delivery_key": "trk-" + "c" * 24,
+}
+
+
+@pytest.mark.asyncio
+async def test_jira_item_through_run_poller_with_jira_site_pass_env(
+    tmp_path, home, monkeypatch,
+):
+    monkeypatch.setenv("JIRA_SITE", "acme.atlassian.net")
+    monkeypatch.setenv("JIRA_API_TOKEN", "s3cret-jira-credential")
+    raw = "Triage acme.atlassian.net PROJ-7 using s3cret-jira-credential"
+    poller = _poller(
+        tmp_path, [_item(prompt=raw, **JIRA_ITEM)],
+        attestor=lambda e, env: ItemAttestation(trusted=True, actor="alice", prompt=raw),
+        pass_env=("JIRA_SITE", "JIRA_API_TOKEN"),
+    )
+    enq = _Enqueue()
+
+    await run_poller(poller, enqueue=enq)
+
+    [event] = enq.events
+    assert event.extra["items"][0]["url"] == JIRA_ITEM["url"]
+    assert "s3cret-jira-credential" not in event.content
+    assert "[REDACTED]" in event.content
+    [source] = event.ifc_labels.sources
+    assert source.integrity == "trusted"
+
+
+@pytest.mark.asyncio
+async def test_token_shaped_text_in_trusted_thread_still_attests(tmp_path, home):
+    raw = "Triage this; the reporter pasted ghp_" + "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG5"
+    poller = _poller(
+        tmp_path, [_item(prompt=raw)],
+        attestor=lambda e, env: ItemAttestation(trusted=True, actor="alice", prompt=raw),
+    )
+    enq = _Enqueue()
+
+    await run_poller(poller, enqueue=enq)
+
+    [event] = enq.events
+    assert "ghp_" not in event.content
+    [source] = event.ifc_labels.sources
+    assert source.integrity == "trusted"
+
+
+def test_tracker_extras_survive_poller_redaction():
+    env = {"JIRA_API_TOKEN": "s3cret-jira-credential", "JIRA_SITE": "acme.atlassian.net"}
+    redact_keys = {"JIRA_API_TOKEN"}
+    owner, repo = "o" * 39, "r" * 80
+    cases = [
+        ("a" + "_" * 31, f"{owner}/{repo}#1234567",
+         f"https://github.com/{owner}/{repo}/issues/1234567"),
+        ("jira", "J" * 128, "https://acme.atlassian.net/browse/" + "J" * 128),
+        ("linear", "L" * 128, "https://linear.app/team/issue/" + "L" * 128),
+    ]
+    for adapter, ref, url in cases:
+        extras = {
+            "delivery_key": "trk-" + "0123456789abcdef" * 1 + "01234567",
+            "adapter": adapter, "ref": ref, "url": url, "kind": "update",
+            "attested_event_id": "ev" + "9" * 24,
+            "actor": "A" * 128, "author_is_trusted": True, "tracker_attested": True,
+        }
+        assert poller_tracker.safe_url(url, ref) == url
+        assert pollers._redact_poller_payload(
+            {"items": [extras]}, env, redact_keys,
+        ) == {"items": [extras]}
 
 
 def test_jira_site_is_a_non_secret_forwarded_key():
@@ -323,3 +495,52 @@ async def test_recovery_requires_exactly_one_item(tmp_path):
         attestor_env={}, attestation_redact=lambda t: t,
     )
     assert replays == []
+
+
+async def _stash_then_run_poller(tmp_path, home, monkeypatch, *, attestor, stashed_content):
+    monkeypatch.setenv("JIRA_API_TOKEN", "s3cret-jira-credential")
+    poller = _poller(
+        tmp_path, [], attestor=attestor, pass_env=("JIRA_API_TOKEN",),
+    )
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:tracker-poller", content=stashed_content,
+        source_id="poller:tracker-poller:1:batch:0", source="poller",
+        extra={"poller_name": "tracker-poller", "items": [dict(EXTRAS)]},
+    )
+    await poller_recovery.stash_enqueued_event(
+        poller.skill_dir, event, pending_enqueue=True,
+    )
+    enq = _Enqueue()
+    await run_poller(poller, enqueue=enq)
+    return enq.events
+
+
+@pytest.mark.asyncio
+async def test_tracker_restore_compares_redacted_render(tmp_path, home, monkeypatch):
+    raw = "Triage using s3cret-jira-credential"
+    redacted = "Triage using [REDACTED]"
+
+    def attest(extras, env):
+        return ItemAttestation(trusted=True, actor="alice", prompt=raw)
+
+    [replayed] = await _stash_then_run_poller(
+        tmp_path, home, monkeypatch, attestor=attest, stashed_content=redacted,
+    )
+
+    assert replayed.content == redacted
+    assert replayed.extra["items"][0]["tracker_attested"] is True
+    [source] = replayed.ifc_labels.sources
+    assert source.integrity == "trusted"
+
+
+@pytest.mark.asyncio
+async def test_tracker_restore_drops_a_render_that_differs_after_redaction(
+    tmp_path, home, monkeypatch,
+):
+    def attest(extras, env):
+        return ItemAttestation(trusted=True, actor="alice", prompt="Triage something else")
+
+    assert await _stash_then_run_poller(
+        tmp_path, home, monkeypatch, attestor=attest,
+        stashed_content="Triage using [REDACTED]",
+    ) == []
