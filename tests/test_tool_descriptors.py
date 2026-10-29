@@ -49,7 +49,7 @@ _OLD_SINK_CATEGORIES = {
         "pr_submit_review", "pr_inline_review_comment", "pr_comment",
         "pr_edit_body", "issue_comment", "pr_rerequest_review",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
-        "repo_test", "repo_stage", "repo_commit", "repo_merge",
+        "repo_test", "repo_restore_file", "repo_stage", "repo_commit", "repo_merge",
         "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
         "repo_revert_abort", "repo_push",
     },
@@ -88,7 +88,7 @@ _OLD_SINK_DESTINATIONS = {
     "bound_pull_request": {
         "pr_submit_review", "pr_inline_review_comment", "pr_comment",
         "pr_edit_body", "pr_rerequest_review", "unsupported_operation",
-        "repo_checkout", "repo_cleanup", "repo_fetch", "repo_test", "repo_stage",
+        "repo_checkout", "repo_cleanup", "repo_fetch", "repo_test", "repo_restore_file", "repo_stage",
         "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase",
         "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push",
     },
@@ -105,12 +105,12 @@ _OLD_NON_INGESTING = {
     "remove_schedule", "set_poller_overrides", "reload_pollers",
     "commitment_complete", "commitment_snooze", "commitment_dismiss",
     "request_mimir_update", "pr_rerequest_review", "unsupported_operation",
-    "repo_cleanup", "repo_stage", "write_todos", "write_file", "edit_file", "replace_file", "task",
+    "repo_cleanup", "repo_restore_file", "repo_stage", "write_todos", "write_file", "edit_file", "replace_file", "task",
 }
 _OLD_REPOSITORY_RESULTS = {
     "pr_job_log", "ci_run_jobs", "ci_run", "ci_recent_runs", "pr_metadata", "pr_list", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
     "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
-    "repo_status", "repo_test", "repo_diff", "repo_unmerged", "pr_submit_review",
+    "repo_status", "repo_test", "repo_diff", "repo_file_at_revision", "repo_unmerged", "pr_submit_review",
     "pr_inline_review_comment", "pr_comment", "pr_edit_body", "repo_commit",
     "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
     "repo_revert", "repo_revert_abort", "repo_push",
@@ -120,7 +120,7 @@ _OLD_EXTERNAL_RESULTS = {
     "pr_reviews", "pr_comments", "pr_review_requests",
 }
 _OLD_GIT_RESULTS = {
-    "repo_fetch", "repo_status", "repo_diff", "repo_unmerged", "repo_stage",
+    "repo_fetch", "repo_status", "repo_diff", "repo_file_at_revision", "repo_unmerged", "repo_stage",
     "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase",
     "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push",
 }
@@ -165,7 +165,7 @@ _OLD_SPECIAL_EXTRACTORS = {
         for name in {
             "pr_submit_review", "pr_inline_review_comment", "pr_comment",
             "pr_edit_body", "pr_rerequest_review", "unsupported_operation",
-            "repo_checkout", "repo_cleanup", "repo_fetch", "repo_test", "repo_stage",
+            "repo_checkout", "repo_cleanup", "repo_fetch", "repo_test", "repo_restore_file", "repo_stage",
             "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase",
             "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push",
         }

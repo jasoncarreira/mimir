@@ -312,6 +312,8 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "repo_status": ToolFlowDirection.SOURCE,
     "repo_test": ToolFlowDirection.BOTH,
     "repo_diff": ToolFlowDirection.SOURCE,
+    "repo_file_at_revision": ToolFlowDirection.SOURCE,
+    "repo_restore_file": ToolFlowDirection.SINK,
     "repo_unmerged": ToolFlowDirection.SOURCE,
     "repo_stage": ToolFlowDirection.SINK,
     "repo_commit": ToolFlowDirection.SINK,
@@ -492,6 +494,8 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "repo_test": CapabilityTier.CODE_EXECUTION,
     "repo_status": CapabilityTier.SCOPE_CONTAINED,
     "repo_diff": CapabilityTier.SCOPE_CONTAINED,
+    "repo_file_at_revision": CapabilityTier.SCOPE_CONTAINED,
+    "repo_restore_file": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "repo_unmerged": CapabilityTier.SCOPE_CONTAINED,
     "repo_stage": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "repo_commit": CapabilityTier.SCOPED_WITH_PROVENANCE,
@@ -561,7 +565,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_edit_body", "pr_review_others", "pr_job_log", "ci_run_jobs", "ci_run", "ci_recent_runs",
         "issue_comment",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
-        "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
+        "repo_status", "repo_test", "repo_diff", "repo_file_at_revision", "repo_restore_file", "repo_unmerged", "repo_stage", "repo_commit",
         "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
         "repo_revert", "repo_revert_abort", "repo_push",
     }),
@@ -583,7 +587,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
         "pr_edit_body",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
-        "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
+        "repo_status", "repo_test", "repo_diff", "repo_file_at_revision", "repo_restore_file", "repo_unmerged", "repo_stage", "repo_commit",
         "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
         "repo_revert", "repo_revert_abort", "repo_push",
     }),
@@ -1236,6 +1240,8 @@ _REPO_TOOL_ACTIONS: dict[str, str] = {
     "repo_status": RepoPRAction.INSPECT.value,
     "repo_test": RepoPRAction.TEST.value,
     "repo_diff": RepoPRAction.INSPECT.value,
+    "repo_file_at_revision": RepoPRAction.INSPECT.value,
+    "repo_restore_file": RepoPRAction.WRITE.value,
     "repo_unmerged": RepoPRAction.INSPECT.value,
     "repo_stage": RepoPRAction.WRITE.value,
     "repo_commit": RepoPRAction.COMMIT.value,
@@ -4866,6 +4872,8 @@ def parse_service_shell_argv_with_diagnostics(
         except ValueError:
             refused_argv = []
         guidance = _service_shell_typed_tool_guidance(refused_argv, destination)
+        if destination == "repo_review" and refused_argv[:2] == ["git", "show"] and ">" in found:
+            guidance += " Use repo_restore_file for byte-exact historical files in the scoped checkout."
         return None, (
             f"the command contains shell metacharacters ({rendered}), which the "
             f"{destination!r} trusted-service shell profile never admits. "
@@ -6412,7 +6420,7 @@ _REPO_PUBLISH_INGEST_REFUSAL = (
 
 
 _TAINTED_TURN_WRITE_TOOLS = frozenset({
-    "repo_stage", "repo_commit", "repo_merge", "repo_rebase", "repo_revert",
+    "repo_restore_file", "repo_stage", "repo_commit", "repo_merge", "repo_rebase", "repo_revert",
     "repo_push", "repo_test", "hands_edit", "hands_shell", "hands_python",
     "memory_store", "saga_feedback", "saga_mark_contributions", "saga_end_session",
     "saga_forget", "saga_record_skill_learning",
@@ -10579,6 +10587,7 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "repo_status": "repository",
     "repo_test": "repository",
     "repo_diff": "repository",
+    "repo_file_at_revision": "repository",
     "repo_unmerged": "repository",
     "hands_read": "client_provider",
     # Bytes returned from the client host are content the agent did not author,
@@ -10646,6 +10655,7 @@ _READ_BACKEND_RESULT_TOOLS = frozenset({
     "repo_status",
     "repo_test",
     "repo_diff",
+    "repo_file_at_revision",
     "repo_unmerged",
     "hands_read",
 })

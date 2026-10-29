@@ -41,13 +41,13 @@ def test_offline_canary_covers_all_scenarios_and_has_observed_primary_evidence()
     }
     assert report["cutover_blocked"] is False
     assert report["counts"] == {
-        "operations_total": 14,
-        "operations_matched": 14,
+        "operations_total": 18,
+        "operations_matched": 18,
         "operations_mismatched": 0,
         "scenarios_total": 8,
         "scenarios_matched": 8,
         "scenarios_mismatched": 0,
-        "primary_observed_effects": 8,
+        "primary_observed_effects": 9,
         "shadow_observed_effects": 0,
     }
     writes = [row for row in report["operations"] if row["legacy"]["effects"]]
@@ -70,6 +70,7 @@ def test_offline_canary_covers_all_scenarios_and_has_observed_primary_evidence()
         ({"operation": "pr_submit_review"}, "refuse", "scope_action_denied"),
         ({"workflow": "review", "operation": "pr_rerequest_review"}, "refuse", "scope_action_denied"),
         ({"workflow": "review", "operation": "pr_edit_body"}, "refuse", "scope_action_denied"),
+        ({"workflow": "review", "operation": "repo_restore_file"}, "refuse", "scope_action_denied"),
         ({"operation": "pr_resolve_thread", "supported": False}, "escalate", "unsupported_operation"),
         ({"operation": "repo_stage", "conflict_paths": ("conflict.py",), "requested_paths": ("other.py",)}, "refuse", "unproven_conflict_path"),
     ],
@@ -169,9 +170,10 @@ def test_report_is_written_as_durable_local_artifact(tmp_path: Path) -> None:
 
 
 def test_checked_in_evidence_matches_original_offline_canary() -> None:
-    # The recorded #1049 artifact predates the #1561 body-edit probes.
+    # The recorded #1049 artifact predates the body-edit and history-file probes.
     expected = run_parity(tuple(
-        probe for probe in offline_canary_probes() if probe.operation != "pr_edit_body"
+        probe for probe in offline_canary_probes()
+        if probe.operation not in {"pr_edit_body", "repo_file_at_revision", "repo_restore_file"}
     ))
     path = Path(__file__).parents[1] / "evidence" / "repo-pr-parity.json"
     assert json.loads(path.read_text(encoding="utf-8")) == expected

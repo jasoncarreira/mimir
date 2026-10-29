@@ -6,6 +6,7 @@ import base64
 from dataclasses import asdict, replace
 import json
 import functools
+import hashlib
 import grp
 import os
 from pathlib import Path
@@ -121,6 +122,18 @@ def test_repo_merge_description_is_default_base_update_path():
         "every staged path (the merge stages auto-merged files too), then repo_push."
         in description
     )
+
+
+def test_history_tool_descriptions_and_redirect_refusal() -> None:
+    from mimir.access_control import parse_service_shell_argv_with_diagnostics
+    from mimir.tools.repo import repo_file_at_revision, repo_restore_file
+
+    assert "byte-exact fixtures or restores" in repo_restore_file.description
+    assert "Read old versions" in repo_file_at_revision.description
+    argv, reason, _ = parse_service_shell_argv_with_diagnostics(
+        "git show 0123456789abcdef:fixture.bin > copy.bin", "repo_review",
+    )
+    assert argv is None and "repo_restore_file" in reason
 
 
 @pytest.mark.parametrize("error", [PermissionError, ProcessLookupError, OSError],
@@ -261,6 +274,10 @@ def _repo_scope_and_state(
     tmp_path: Path, *, event_type: str = "pr_changes_requested_stale",
     commit_count: int = 1, pull_request_author: str | None = None,
     base_ref: str = "main",
+    base_files: dict[str, bytes] | None = None,
+    base_modes: dict[str, int] | None = None,
+    history_entries: bool = False,
+    allowed_operations: frozenset[str] | None = None,
 ) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState]:
     origin = tmp_path / "origin.git"
     git_env = _fixture_git_env()
@@ -272,8 +289,20 @@ def _repo_scope_and_state(
     _git(source, "config", "user.email", "test@example.com")
     _git(source, "config", "commit.gpgsign", "false")
     (source / "tracked.txt").write_text("base\n", encoding="utf-8")
-    _git(source, "add", "tracked.txt")
+    for name, data in (base_files or {}).items():
+        target = source / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod((base_modes or {}).get(name, 0o644))
+    if history_entries:
+        (source / "tree").mkdir()
+        (source / "tree" / "child").write_text("child")
+        (source / "link").symlink_to("tracked.txt")
+    _git(source, "add", ".")
     _git(source, "commit", "-q", "-m", "base")
+    if history_entries:
+        _git(source, "update-index", "--add", "--cacheinfo", "160000," + _git(source, "rev-parse", "HEAD") + ",submodule")
+        _git(source, "commit", "-q", "-m", "submodule entry")
     base = _git(source, "rev-parse", "HEAD")
     _git(source, "push", "-q", "origin", "HEAD:main")
     if base_ref != "main":
@@ -295,7 +324,7 @@ def _repo_scope_and_state(
         canonical_origin=str(origin.resolve()),
         principal="mimir-bot",
         event_type=event_type,
-        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        allowed_operations=allowed_operations or frozenset(action.value for action in RepoPRAction),
         pr_number=7,
         head_repo="owner/repo",
         head_remote="origin",
@@ -330,6 +359,199 @@ def _repo_scope_and_state(
             f"scope={scope.observed_head_sha}"
         )
     return origin, source, scope, state
+
+
+def test_historical_restore_and_binary_paging(tmp_path: Path) -> None:
+    from mimir.tools.repo import repo_file_at_revision, repo_restore_file
+    from mimir.models import RepoPRScopeRegistry
+
+    data = (b"\xff\x00\xfe historical\n" * 85000)  # > the normal Git tool-result cap
+    _, _, scope, state = _repo_scope_and_state(tmp_path, base_files={"fixture.bin": data})
+    runtime = SimpleNamespace(context=replace(
+        _lineage_turn(scope, state), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    ))
+    restored = repo_restore_file.func("owner/repo", 7, scope.observed_base_sha,
+                                      "fixture.bin", "testdata/copy.bin", runtime=runtime)
+    assert restored == {
+        "destination": "testdata/copy.bin", "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(), "mode": "100644",
+    }
+    assert (state.checkout_lease.path / "testdata/copy.bin").read_bytes() == data
+    pages = bytearray()
+    offset = 0
+    while True:
+        page = repo_file_at_revision.func("owner/repo", 7, scope.observed_base_sha,
+                                          "fixture.bin", offset=offset, limit=8192, runtime=runtime)
+        assert page["total_bytes"] == len(data)
+        assert page["encoding"] == "base64"
+        pages.extend(base64.b64decode(page["content"], validate=True))
+        if page["next_offset"] is None:
+            break
+        assert page["next_offset"] > offset
+        offset = page["next_offset"]
+    assert bytes(pages) == data
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o755])
+def test_historical_restore_preserves_mode(tmp_path: Path, mode: int) -> None:
+    import stat
+    from mimir.tools.repo import repo_restore_file
+    from mimir.models import RepoPRScopeRegistry
+
+    data = b"#!/bin/sh\nprintf 'verified\\n'\n"
+    _, _, scope, state = _repo_scope_and_state(
+        tmp_path, base_files={"tools/verify": data}, base_modes={"tools/verify": mode},
+    )
+    runtime = SimpleNamespace(context=replace(
+        _lineage_turn(scope, state), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    ))
+    root = state.checkout_lease.path
+    target = root / "tools/verify"
+    # The committed mode, not an existing file's mode or the process umask,
+    # must control the result (including removal of an obsolete exec bit).
+    target.chmod(0o644 if mode == 0o755 else 0o755)
+    target.write_bytes(b"changed\n")
+    old_umask = os.umask(0o077)
+    try:
+        result = repo_restore_file.func(
+            "owner/repo", 7, scope.observed_base_sha,
+            "tools/verify", "tools/verify", runtime=runtime,
+        )
+    finally:
+        os.umask(old_umask)
+    assert result["mode"] == f"100{mode:o}"
+    assert target.read_bytes() == data
+    assert stat.S_IMODE(target.stat().st_mode) == mode
+    assert _git(root, "diff", "--exit-code", scope.observed_base_sha, "--", "tools/verify") == ""
+
+
+@pytest.mark.parametrize("limit", [1, 2, 5, 8192])
+def test_historical_utf8_paging(tmp_path: Path, limit: int) -> None:
+    from mimir.tools.repo import repo_file_at_revision
+    from mimir.models import RepoPRScopeRegistry
+
+    data = "ASCII\né € 😀 café\n".encode("utf-8")
+    _, _, scope, state = _repo_scope_and_state(tmp_path, base_files={"unicode.txt": data})
+    runtime = SimpleNamespace(context=replace(
+        _lineage_turn(scope, state), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    ))
+    offset = 0
+    pages = bytearray()
+    encodings = set()
+    while True:
+        page = repo_file_at_revision.func(
+            "owner/repo", 7, scope.observed_base_sha, "unicode.txt",
+            offset=offset, limit=limit, runtime=runtime,
+        )
+        end = min(offset + limit, len(data))
+        expected = data[offset:end]
+        try:
+            text = expected.decode("utf-8")
+        except UnicodeDecodeError:
+            assert page["encoding"] == "base64"
+            decoded = base64.b64decode(page["content"], validate=True)
+        else:
+            assert page["encoding"] == "utf-8"
+            assert page["content"] == text
+            decoded = page["content"].encode("utf-8")
+        encodings.add(page["encoding"])
+        assert decoded == expected
+        assert page["offset"] == offset
+        assert page["total_bytes"] == len(data)
+        assert page["next_offset"] == (end if end < len(data) else None)
+        pages.extend(decoded)
+        if page["next_offset"] is None:
+            break
+        offset = page["next_offset"]
+    assert bytes(pages) == data
+    assert encodings == ({"utf-8"} if limit == 8192 else {"utf-8", "base64"})
+    eof = repo_file_at_revision.func(
+        "owner/repo", 7, scope.observed_base_sha, "unicode.txt",
+        offset=len(data), limit=limit, runtime=runtime,
+    )
+    assert eof["encoding"] == "utf-8" and eof["content"] == ""
+    assert eof["next_offset"] is None
+
+
+def test_historical_file_refusals(tmp_path: Path) -> None:
+    from mimir.tools.repo import repo_file_at_revision, repo_restore_file
+    from mimir.models import RepoPRScopeRegistry
+
+    origin, source, scope, state = _repo_scope_and_state(
+        tmp_path, base_files={"small": b"\x00\xff", "large": b"a" * (2 * 1024 * 1024 + 1)},
+        history_entries=True,
+    )
+    runtime = SimpleNamespace(context=replace(
+        _lineage_turn(scope, state), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    ))
+    root = state.checkout_lease.path
+    def restore(revision=scope.observed_base_sha, source_path="small", destination_path="copy"):
+        return repo_restore_file.func("owner/repo", 7, revision, source_path,
+                                      destination_path, runtime=runtime)
+
+    with pytest.raises(ToolException):
+        restore(revision="HEAD")
+    for offset, limit in ((-1, 10), (0, 8193), (0, 0), (3, 10)):
+        with pytest.raises(ToolException):
+            repo_file_at_revision.func("owner/repo", 7, scope.observed_base_sha,
+                                        "small", offset=offset, limit=limit, runtime=runtime)
+    for source_path in ("tree", "link", "submodule", "large"):
+        with pytest.raises(ToolException):
+            restore(source_path=source_path)
+        with pytest.raises(ToolException):
+            repo_file_at_revision.func("owner/repo", 7, scope.observed_base_sha,
+                                        source_path, runtime=runtime)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+    for target in ("../escape", str(outside / "escape"), "linked/escape", ".git/config", "config.py"):
+        with pytest.raises(ToolException):
+            restore(destination_path=target)
+    assert not (outside / "escape").exists()
+    assert not (root.parent / "escape").exists()
+    (root / "inside").mkdir()
+    (root / "inner-link").symlink_to("inside", target_is_directory=True)
+    with pytest.raises(ToolException):
+        restore(destination_path="inner-link/copy")
+    (root / "existing").write_bytes(b"old")
+    assert restore(destination_path="existing")["bytes"] == 2
+    assert (root / "existing").read_bytes() == b"\x00\xff"
+    for target in ("tree-dir", "link-file"):
+        if target == "tree-dir":
+            (root / target).mkdir()
+        else:
+            (root / target).symlink_to("existing")
+        with pytest.raises(ToolException):
+            restore(destination_path=target)
+
+    _git(source, "checkout", "-q", "-b", "unrelated", "main")
+    (source / "unrelated").write_text("not in PR history")
+    _git(source, "add", "unrelated")
+    _git(source, "commit", "-q", "-m", "unrelated")
+    arbitrary = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:unrelated")
+    _git(root, "fetch", "-q", str(origin), "unrelated")
+    with pytest.raises(ToolException, match="outside base and head history"):
+        restore(revision=arbitrary, source_path="unrelated")
+    assert not (root / "copy").exists()
+
+    review_dir = tmp_path / "review"
+    review_dir.mkdir()
+    _, _, review_scope, review_state = _repo_scope_and_state(
+        review_dir, allowed_operations=frozenset({RepoPRAction.INSPECT.value, RepoPRAction.CHECKOUT.value}),
+    )
+    runtime.context = replace(_lineage_turn(review_scope, review_state),
+                              repo_pr_scope_registry=RepoPRScopeRegistry((review_state,)))
+    page = repo_file_at_revision.func("owner/repo", 7, review_scope.observed_base_sha,
+                                      "tracked.txt", runtime=runtime)
+    assert page["encoding"] == "utf-8"
+    assert page["content"] == "base\n"
+    with pytest.raises(ToolException):
+        restore(revision=review_scope.observed_base_sha, source_path="tracked.txt")
+    runtime.context = replace(_lineage_turn(scope, state, tainted=True),
+                              repo_pr_scope_registry=RepoPRScopeRegistry((state,)))
+    with pytest.raises(ToolException, match="untrusted ingest"):
+        restore()
 
 
 def _lineage_turn(scope, state, *, tainted=False):

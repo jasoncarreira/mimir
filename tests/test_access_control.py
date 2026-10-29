@@ -18556,6 +18556,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
     }
 
     expected[SinkCategory.SAGA].add("commitment_propose_closure")
+    expected[SinkCategory.FORGE].add("repo_restore_file")
     assert actual == expected
     categorized = {
         name for name, descriptor in access_control.TOOL_DESCRIPTORS.items()
@@ -18617,7 +18618,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
                         "saga_mark_contributions", "saga_forget", "saga_end_session",
                         "write_file", "edit_file", "replace_file", "repo_stage",
                         "repo_commit", "repo_merge", "repo_rebase", "repo_revert",
-                        "repo_push", "repo_test"}
+                        "repo_push", "repo_test", "repo_restore_file"}
             else (False, "saga_mutation_blocked_by_tainted_turn")
             if name in saga_tools
             else (False, "egress_destination_not_approved")
@@ -18677,6 +18678,8 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
     flows[access_control.ToolFlowDirection.SINK].add("memory_propose")
     flows[access_control.ToolFlowDirection.SINK].add("replace_file")
     flows[access_control.ToolFlowDirection.SINK].add("set_schedule_cron")
+    flows[access_control.ToolFlowDirection.SOURCE].add("repo_file_at_revision")
+    flows[access_control.ToolFlowDirection.SINK].add("repo_restore_file")
     decisions = {
         OperationDecision.OPEN: {"commitment_list", "memory_query", "memory_get", "web_search", "fetch_url", "write_todos", "defer_injected_message", "request_operator_approval", "commitment_complete", "commitment_snooze", "commitment_dismiss"},
         OperationDecision.RESOURCE_SCOPED: {"send_message", "react", "fetch_channel_history", "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn", "write_file", "edit_file", "worklink_run", "worklink_resume", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body", "pr_rerequest_review", "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
@@ -18699,6 +18702,7 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
     admin_catalog.add("memory_propose")
     decisions[OperationDecision.ADMIN_REQUIRED].add("memory_propose")
     decisions[OperationDecision.RESOURCE_SCOPED].add("replace_file")
+    decisions[OperationDecision.RESOURCE_SCOPED].update({"repo_file_at_revision", "repo_restore_file"})
     decisions[OperationDecision.ADMIN_REQUIRED].add("set_schedule_cron")
     admin_catalog.add("set_schedule_cron")
     protected_builtins = {
@@ -18708,9 +18712,11 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
     readable = {
         "list_channels": "channel_metadata", "list_schedules": "schedule_metadata", "bash_jobs_list": "shell_jobs", "bash_job_output": "shell_jobs", "read_file": "filesystem", "aread": "filesystem", "ls": "filesystem", "als": "filesystem", "glob": "filesystem", "aglob": "filesystem", "grep": "filesystem", "agrep": "filesystem", "file_search": "filesystem", "get_turn": "turn_history", "mimir_get_turn": "turn_history", "memory_query": "saga", "memory_get": "saga", "pr_metadata": "repository", "pr_files": "repository", "pr_diff": "repository", "pr_checks": "repository", "pr_reviews": "repository", "pr_comments": "repository", "pr_review_requests": "repository", "repo_checkout": "repository", "repo_fetch": "repository", "repo_status": "repository", "repo_test": "repository", "repo_diff": "repository", "repo_unmerged": "repository",
     }
+    readable["repo_file_at_revision"] = "repository"
     protected = {
         "fetch_channel_history": "channel_history", "list_channels": "channel_metadata", "list_schedules": "schedule_metadata", "bash_jobs_list": "shell_jobs", "bash_job_output": "shell_jobs", "read_file": "filesystem", "aread": "filesystem", "ls": "filesystem", "als": "filesystem", "glob": "filesystem", "aglob": "filesystem", "grep": "filesystem", "agrep": "filesystem", "download_files": "filesystem", "adownload_files": "filesystem", "Read": "filesystem", "Glob": "filesystem", "Grep": "filesystem", "file_search": "filesystem", "get_turn": "turn_history", "mimir_get_turn": "turn_history", "memory_query": "saga", "memory_get": "saga", "saga_forget": "saga", "commitment_list": "commitments", "shell_exec": "shell", "execute": "shell", "web_search": "web", "worklink_run": "worklink", "worklink_resume": "worklink", "spawn_open_code": "coding_worker", "pr_metadata": "repository", "pr_files": "repository", "pr_diff": "repository", "pr_checks": "repository", "pr_reviews": "repository", "pr_comments": "repository", "pr_review_requests": "repository", "repo_checkout": "repository", "repo_fetch": "repository", "repo_status": "repository", "repo_test": "repository", "repo_diff": "repository", "repo_unmerged": "repository", "pr_submit_review": "repository", "pr_inline_review_comment": "repository", "pr_comment": "repository", "pr_edit_body": "repository", "issue_comment": "repository", "repo_commit": "repository", "repo_merge": "repository", "repo_merge_abort": "repository", "repo_rebase": "repository", "repo_rebase_abort": "repository", "repo_revert": "repository", "repo_revert_abort": "repository", "repo_push": "repository",
     }
+    protected["repo_file_at_revision"] = "repository"
     destination_groups = {
         "filesystem": {"write_file", "edit_file", "rebuild_index", "request_mimir_update", "download_files", "adownload_files", "Write", "Edit"},
         "shell_process": {"shell_exec", "bash_async", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell"},
@@ -18728,6 +18734,7 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
         "bound_pull_request": {"pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body", "pr_rerequest_review", "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch", "repo_test", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
         "configured_repository_issue": {"issue_comment"},
     }
+    destination_groups["bound_pull_request"].add("repo_restore_file")
     destinations = {
         name: destination
         for destination, names in destination_groups.items()
