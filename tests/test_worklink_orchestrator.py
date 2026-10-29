@@ -2001,6 +2001,113 @@ def test_epic_run_requests_tracker_transitions_in_order(tmp_path, monkeypatch) -
     assert requested == ["build_started", "supervised", "verified", "pr_opened"]
 
 
+def test_leaf_run_commit_subject_and_pr_title_carry_no_chainlink_id(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    issue_json = ISSUE_JSON.replace("worklink slice", "worklink task 441 slice")
+    calls, runner = _orchestrator_runner(repo, worktree, issue_json=issue_json)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed", result.reason
+    commit = next(
+        c for c in calls
+        if isinstance(c, list) and c[:4] == ["git", "-C", str(worktree), "commit"]
+    )
+    subject = commit[commit.index("-m") + 1].splitlines()[0]
+    pr_call = next(c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"])
+    title = pr_call[pr_call.index("--title") + 1]
+    for text in (subject, title):
+        assert "441" not in text
+        assert text.startswith("worklink ") and text.endswith(" slice")
+
+
+def _lifecycle_leaf_home(tmp_path: Path) -> tuple[Path, Path, str]:
+    (tmp_path / "worklink.yaml").write_text(
+        "tracker:\n  adapters:\n    linear:\n      transitions:\n"
+        "        build_started: In Progress\n        pr_opened: In Review\n",
+        encoding="utf-8",
+    )
+    repo = tmp_path / "repo"
+    record = "External: linear:ENG-1 https://linear.app/a/issue/ENG-1"
+    issue_json = ISSUE_JSON.replace(
+        "Suggested test command: echo ok", f"Suggested test command: echo ok\\n\\n{record}"
+    )
+    return repo, repo.parent / ".worklink" / repo.name / "441-1", issue_json
+
+
+def test_leaf_pr_create_failure_requests_no_pr_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    requested: list[str] = []
+    monkeypatch.setattr(
+        orchestrator, "request_transition",
+        lambda home, description, event, **kw: requested.append(event) or True,
+    )
+    repo, worktree, issue_json = _lifecycle_leaf_home(tmp_path)
+    _, base_runner = _orchestrator_runner(repo, worktree, issue_json=issue_json)
+
+    def runner(args: Sequence[str] | str, **kwargs: Any) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args[:3] == ["gh", "pr", "create"]:
+            return cp(args, returncode=1, stderr="publication failed")
+        return base_runner(args, **kwargs)
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.pr_url is None
+    assert requested == ["build_started"]
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [ClaimResult(False, attempts_exhausted=True), ClaimResult(False, reason="lock held")],
+)
+@pytest.mark.parametrize("epic", [False, True])
+def test_refused_claim_requests_no_build_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, claim: ClaimResult, epic: bool
+) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    requested: list[str] = []
+    monkeypatch.setattr(
+        orchestrator, "request_transition",
+        lambda home, description, event, **kw: requested.append(event) or True,
+    )
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", lambda *a, **k: claim)
+    repo, worktree, issue_json = _lifecycle_leaf_home(tmp_path)
+    issue = json.loads(issue_json)
+    if epic:
+        issue["labels"].append("worklink:epic")
+    _, runner = _orchestrator_runner(repo, worktree, issue_json=json.dumps(issue))
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    wl = WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry)
+
+    if epic:
+        result = asyncio.run(wl.run_epic(441))
+    else:
+        result = asyncio.run(wl.run(441, backend_name="fake", test_command="echo ok"))
+
+    assert result.status in {"blocked", "refused", "failed"}
+    assert result.attempt is None
+    assert requested == []
+
+
 def test_leaf_run_has_no_factory_next(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
