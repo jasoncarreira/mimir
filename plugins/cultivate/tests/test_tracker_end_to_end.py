@@ -292,6 +292,48 @@ async def test_item_attests_through_run_poller(
     rig.finish()
 
 
+class _LinearDown:
+    """Routes GitHub to a recorded replay and fails every Linear request."""
+
+    def __init__(self, github: ReplayTransport) -> None:
+        self.github = github
+        self.linear_requests = 0
+
+    def request(self, method: str, url: str, **kwargs: Any):
+        if "linear.app" in url:
+            self.linear_requests += 1
+            raise tracker_transport.TrackerUnavailable("transport")
+        return self.github.request(method, url, **kwargs)
+
+
+def test_linear_outage_does_not_withhold_the_github_items(
+    capsys_rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rig = capsys_rig("github_issues")
+    section = {"adapters": {
+        "github_issues": CASES["github_issues"]["section"], "linear": CASES["linear"]["section"],
+    }}
+    (rig.home / "worklink.yaml").write_text(
+        yaml.safe_dump({"repository": "example/project", "tracker": section}), encoding="utf-8"
+    )
+    read = exchanges("github_issues", "attest_trusted")
+    github = ReplayTransport([*listing("github_issues"), *read])
+    routed = _LinearDown(github)
+    rig.transports.append(routed)
+    rig.queue(read)
+
+    capsys.readouterr()
+    rig.module.main()
+    captured = capsys.readouterr()
+    stderr = captured.err
+    [item] = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+    assert (item["adapter"], item["ref"]) == ("github_issues", GITHUB_REF)
+    assert routed.linear_requests >= 1
+    assert (rig.state / "cursor.json").exists()
+    assert "adapter_unavailable:linear:transport" in stderr
+    assert not any("fatal" in line for line in stderr.splitlines())
+
+
 def _leaf_description() -> str:
     return LEAF_TEMPLATE_MARKDOWN
 

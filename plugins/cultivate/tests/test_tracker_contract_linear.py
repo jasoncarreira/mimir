@@ -124,10 +124,46 @@ def test_build_refuses_without_credential(env: dict[str, str]) -> None:
         build_adapter("linear", CONFIG, env, StubTransport(VIEWER))
 
 
+class _Failing:
+    def __init__(self) -> None:
+        self.requests = 0
+
+    def request(self, method: str, url: str, **kwargs: Any):
+        self.requests += 1
+        raise TrackerUnavailable("transport")
+
+
 @pytest.mark.parametrize("viewer", [{"viewer": {"id": None}}, {"viewer": {"id": ""}}, {"viewer": {}}, {"viewer": None}, {}])
-def test_build_refuses_without_bot_identity(viewer: dict[str, Any]) -> None:
-    with pytest.raises((ValueError, TrackerUnavailable)):
-        _build(StubTransport(viewer))
+def test_first_use_without_bot_identity_fails_closed(viewer: dict[str, Any]) -> None:
+    adapter = _build(StubTransport(viewer))
+    with pytest.raises(TrackerUnavailable):
+        adapter.list_assigned()
+
+
+def test_build_performs_no_network_io() -> None:
+    transport = _Failing()
+    _build(transport)
+    assert transport.requests == 0
+
+
+def test_first_use_with_a_failing_viewer_lookup_is_unavailable_and_not_memoized() -> None:
+    transport = _Failing()
+    adapter = _build(transport)
+    for expected in (1, 2):
+        with pytest.raises(TrackerUnavailable):
+            adapter.list_assigned()
+        assert transport.requests == expected
+
+
+def test_viewer_is_queried_once_across_calls() -> None:
+    empty = {"issues": {"nodes": [], "pageInfo": {"hasNextPage": False}}}
+    transport = StubTransport(VIEWER, empty, empty)
+    adapter = _build(transport)
+    adapter.list_assigned()
+    adapter.list_assigned()
+    queries = [body["query"] for _, body in transport.requests]
+    assert sum("viewer" in query for query in queries) == 1
+    assert len(queries) == 3
 
 
 def test_requests_carry_the_bearer_credential() -> None:
