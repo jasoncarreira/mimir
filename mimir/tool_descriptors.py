@@ -354,6 +354,8 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "repo_cleanup": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
     "repo_commit": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=_argument_payload("message")),
     "repo_diff": _D(result_origin=_R, git_operation_result=True),
+    "repo_file_at_revision": _D(result_origin=_R, git_operation_result=True),
+    "repo_restore_file": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
     "repo_fetch": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
     "repo_merge": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
     "repo_merge_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),

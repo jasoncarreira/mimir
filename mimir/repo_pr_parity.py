@@ -28,11 +28,13 @@ _HEAD_SHA = re.compile(r"[0-9a-f]{40}")
 _WRITE_OPERATIONS = frozenset({
     "pr_submit_review", "pr_comment", "pr_rerequest_review",
     "pr_edit_body",
-    "repo_stage", "repo_commit", "repo_push", "unsupported_operation",
+    "repo_restore_file", "repo_stage", "repo_commit", "repo_push", "unsupported_operation",
 })
 _OPERATION_ACTION = {
     "pr_metadata": RepoPRAction.INSPECT.value,
     "repo_status": RepoPRAction.INSPECT.value,
+    "repo_file_at_revision": RepoPRAction.INSPECT.value,
+    "repo_restore_file": RepoPRAction.WRITE.value,
     "repo_test": RepoPRAction.TEST.value,
     "pr_submit_review": RepoPRAction.PR_REVIEW.value,
     "pr_comment": RepoPRAction.PR_COMMENT.value,
@@ -123,6 +125,7 @@ def _effect_result(operation: str) -> str:
         "pr_edit_body": "body_updated",
         "pr_rerequest_review": "review_rerequested",
         "repo_stage": "staged",
+        "repo_restore_file": "restored",
         "repo_commit": "committed",
         "repo_push": "pushed",
     }.get(operation, "ok")
@@ -288,12 +291,20 @@ def offline_canary_probes() -> tuple[ParityProbe, ...]:
     return (
         ParityProbe("ordinary_review", "pr_metadata", "review", _scope("ordinary_review"), head,
                     LegacyObservation("allow", "ok")),
+        ParityProbe("ordinary_review", "repo_file_at_revision", "review", _scope("ordinary_review"), head,
+                    LegacyObservation("allow", "ok")),
+        ParityProbe("ordinary_review", "repo_restore_file", "review", _scope("ordinary_review"), head,
+                    LegacyObservation("refuse", "scope_action_denied")),
         ParityProbe("ordinary_review", "pr_submit_review", "review", _scope("ordinary_review"), head,
                     LegacyObservation("allow", "review_submitted", effect("ordinary_review", "pr_submit_review"), audit("ordinary_review", "pr_submit_review"))),
         ParityProbe("ordinary_review", "pr_edit_body", "review", _scope("ordinary_review"), head,
                     LegacyObservation("refuse", "scope_action_denied")),
         ParityProbe("own_pr_remediation", "pr_comment", "remediation", _scope("own_pr_remediation"), head,
                     LegacyObservation("allow", "comment_created", effect("own_pr_remediation", "pr_comment"), audit("own_pr_remediation", "pr_comment"))),
+        ParityProbe("own_pr_remediation", "repo_file_at_revision", "remediation", _scope("own_pr_remediation"), head,
+                    LegacyObservation("allow", "ok")),
+        ParityProbe("own_pr_remediation", "repo_restore_file", "remediation", _scope("own_pr_remediation"), head,
+                    LegacyObservation("allow", "restored", effect("own_pr_remediation", "repo_restore_file"), audit("own_pr_remediation", "repo_restore_file"))),
         ParityProbe("own_pr_remediation", "pr_edit_body", "remediation", _scope("own_pr_remediation"), head,
                     LegacyObservation("allow", "body_updated", effect("own_pr_remediation", "pr_edit_body"), audit("own_pr_remediation", "pr_edit_body"))),
         ParityProbe("own_pr_remediation", "pr_rerequest_review", "remediation", _scope("own_pr_remediation"), head,
