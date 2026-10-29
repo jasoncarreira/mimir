@@ -413,7 +413,9 @@ def test_drain_created_notices_carry_a_canonical_url(
     _transition(tmp_path)
     adapter.close_result = ActionResult("unavailable", "merged_state_required")
     adapter.transition_result = ActionResult("unavailable", "state_not_found")
-    _run(tmp_path, _config(transitions={"build_started": "In Progress"}))
+    config = _config(transitions={"build_started": "In Progress"})
+    _run(tmp_path, config)
+    _run(tmp_path, config)
     notices = _evidence(tmp_path)["notices"]
     assert {n["lifecycle_event"] for n in notices} == {"merged", "build_started"}
     assert all(safe_url(n["url"], "ENG-1") == LINEAR_URL for n in notices)
@@ -450,25 +452,147 @@ def test_github_and_jira_notice_urls_are_built_without_a_tracker_read(
     assert not [c for c in adapter.calls if c[0] == "read"]
 
 
-def test_notice_waits_when_the_canonical_url_cannot_be_read(
+def _actions(adapter: FakeAdapter) -> list[tuple[str, ...]]:
+    return [c for c in adapter.calls if c[0] != "read"]
+
+
+def test_unreadable_url_never_extends_a_transition(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _transition(tmp_path)
+    adapter.transition_result = ActionResult("unavailable", "state_not_found")
+    adapter.read_raises = True
+    config = _config(transitions={"build_started": "In Progress"})
+    for _ in range(drain_module.MAX_ATTEMPTS + 2):
+        _, emitted = _run(tmp_path, config)
+        assert emitted == []
+    data = _evidence(tmp_path)
+    entry = data["items"][EXT]["transitions"]["build_started"]
+    assert entry["stage"] == "done" and entry["result"] == "unavailable"
+    assert len(_actions(adapter)) <= drain_module.MAX_ATTEMPTS
+    assert [n["url"] for n in data["notices"]] == [""]
+
+
+def test_always_unavailable_transition_exhausts_attempts(
+    tmp_path: Path, adapter: FakeAdapter
+) -> None:
+    _transition(tmp_path)
+    adapter.raises = [TrackerUnavailable("timeout")] * 20
+    adapter.read_raises = True
+    config = _config(transitions={"build_started": "In Progress"})
+    for _ in range(drain_module.MAX_ATTEMPTS + 2):
+        _run(tmp_path, config)
+    entry = _evidence(tmp_path)["items"][EXT]["transitions"]["build_started"]
+    assert (entry["stage"], entry["result"]) == ("done", "failed")
+    assert len(_actions(adapter)) == drain_module.MAX_ATTEMPTS
+
+
+def test_refused_transition_is_a_single_call_with_unreadable_url(
+    tmp_path: Path, adapter: FakeAdapter
+) -> None:
+    _transition(tmp_path)
+    adapter.transition_result = ActionResult("refused", "nope")
+    adapter.read_raises = True
+    config = _config(transitions={"build_started": "In Progress"})
+    for _ in range(drain_module.MAX_ATTEMPTS + 2):
+        _run(tmp_path, config)
+    assert len(_actions(adapter)) == 1
+    assert _evidence(tmp_path)["items"][EXT]["transitions"]["build_started"]["stage"] == "done"
+
+
+def test_failing_pr_read_is_bounded_with_unreadable_url(
+    tmp_path: Path, adapter: FakeAdapter
+) -> None:
+    _closure(tmp_path)
+    adapter.read_raises = True
+
+    class Failing(Gh):
+        def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            self.calls += 1
+            return subprocess.CompletedProcess([], 1, "", "boom")
+
+    gh = Failing()
+    for _ in range(drain_module.MAX_ATTEMPTS + 2):
+        _run(tmp_path, _config(), gh)
+    assert gh.calls == drain_module.MAX_ATTEMPTS
+    assert _evidence(tmp_path)["items"][EXT]["closure"]["stage"] == "done"
+    assert _actions(adapter) == []
+
+
+@pytest.mark.parametrize("section", ["closure", "transitions"])
+def test_started_at_cap_with_unreadable_url_makes_no_call(
+    tmp_path: Path, adapter: FakeAdapter, section: str
+) -> None:
+    adapter.read_raises = True
+    if section == "closure":
+        _closure(tmp_path, stage="started", attempts=drain_module.MAX_ATTEMPTS)
+    else:
+        _transition(tmp_path, stage="started", attempts=drain_module.MAX_ATTEMPTS)
+    gh = Gh()
+    for _ in range(drain_module.MAX_ATTEMPTS + 2):
+        _run(tmp_path, _config(transitions={"build_started": "In Progress"}), gh)
+    assert _actions(adapter) == [] and gh.calls <= 1
+    item = _evidence(tmp_path)["items"][EXT]
+    entry = item["closure"] if section == "closure" else item["transitions"]["build_started"]
+    assert entry["stage"] == "done"
+
+
+def test_stuck_entries_do_not_starve_a_later_closure(
+    tmp_path: Path, adapter: FakeAdapter
+) -> None:
+    adapter.read_raises = True
+    adapter.transition_result = ActionResult("unavailable", "state_not_found")
+    with evidence_transaction(tmp_path) as data:
+        for n in range(10):
+            data["items"][f"linear:AAA-{n:02d}"] = {
+                "transitions": {
+                    "build_started": {
+                        "stage": "requested", "state": "X", "result": None, "reason": None,
+                        "attempts": 0, "requested_at": "t", "recorded_at": None,
+                    }
+                }
+            }
+    _closure(tmp_path)
+    config = _config(transitions={"build_started": "In Progress"})
+    gh = Gh()
+    for _ in range(drain_module.MAX_ATTEMPTS + 2):
+        _run(tmp_path, config, gh)
+    assert gh.calls >= 1
+    assert _evidence(tmp_path)["items"][EXT]["closure"]["stage"] == "done"
+
+
+def test_empty_url_notice_is_emitted_only_once_resolvable(
     tmp_path: Path, adapter: FakeAdapter
 ) -> None:
     _transition(tmp_path)
     adapter.transition_result = ActionResult("unavailable", "state_not_found")
     adapter.read_raises = True
     config = _config(transitions={"build_started": "In Progress"})
-    _run(tmp_path, config)
-    data = _evidence(tmp_path)
-    entry = data["items"][EXT]["transitions"]["build_started"]
-    assert data["notices"] == []
-    assert (entry["stage"], entry["reason"], entry["attempts"]) == (
-        "requested", "notice_url_unavailable", 0,
-    )
+    emitted_all: list[dict] = []
+    for _ in range(3):
+        emitted_all += _run(tmp_path, config)[1]
+    assert emitted_all == []
+    assert [n["url"] for n in _evidence(tmp_path)["notices"]] == [""]
     adapter.read_raises = False
-    _run(tmp_path, config)
-    data = _evidence(tmp_path)
-    assert data["items"][EXT]["transitions"]["build_started"]["stage"] == "done"
-    assert [n["url"] for n in data["notices"]] == [LINEAR_URL]
+    _, emitted = _run(tmp_path, config)
+    assert [e["url"] for e in emitted] == [LINEAR_URL]
+    assert [n["url"] for n in _evidence(tmp_path)["notices"]] == [LINEAR_URL]
+    calls = len(adapter.calls)
+    _, again = _run(tmp_path, config)
+    assert len(again) == 1 and len(adapter.calls) == calls
+
+
+def test_url_resolution_does_not_spend_the_action_budget(
+    tmp_path: Path, adapter: FakeAdapter
+) -> None:
+    with evidence_transaction(tmp_path) as data:
+        data["notices"].append(
+            {
+                "delivery_key": "trk-" + "a" * 24, "adapter": "linear", "ref": "ENG-1",
+                "url": "", "lifecycle_event": "merged", "reason": "x",
+                "created_at": "t", "notified": False,
+            }
+        )
+    count, emitted = _run(tmp_path, _config())
+    assert count == 0 and len(emitted) == 1
 
 
 def test_pr_read_failure_capped_with_one_notice(tmp_path: Path, adapter: FakeAdapter) -> None:

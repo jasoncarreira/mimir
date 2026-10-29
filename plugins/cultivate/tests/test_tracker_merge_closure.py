@@ -241,3 +241,21 @@ def test_epic_dry_run_queues_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyP
         git_runner=git_runner(repo),
     )
     assert not evidence_path(home).exists()
+
+
+def test_off_epic_makes_no_forge_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, repo = _home(tmp_path, monkeypatch, close=False)
+    evidence(home, 39)
+    inner = forge(39)
+    reads: list[object] = []
+
+    def counting(args, *rest, **kwargs):
+        reads.append(args)
+        return inner(args, *rest, **kwargs)
+
+    tracker = _epic(39)
+    closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=counting, git_runner=git_runner(repo),
+    )
+    epic_reads = [r for r in reads if "pulls" in " ".join(map(str, r))]
+    assert epic_reads == [] and not evidence_path(home).exists()

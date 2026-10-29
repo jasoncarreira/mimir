@@ -28,7 +28,6 @@ from .transport import TrackerTransport, TrackerUnavailable
 MAX_ACTIONS = 10
 MAX_ATTEMPTS = 3
 ADAPTER_UNAVAILABLE = "adapter_unavailable"
-URL_UNAVAILABLE = "notice_url_unavailable"
 NOTICE_KIND = "tracker_transition_unavailable"
 _OPEN_STAGES = ("requested", "started")
 
@@ -97,11 +96,8 @@ class _Drain:
         self.actions += 1
         return True
 
-    def notice_url(self, ext_ref: str) -> str | None:
-        """Return the canonical issue URL for a notice, or None when it cannot be established.
-
-        Reads the tracker for Linear, so it must be called outside the evidence lock.
-        """
+    def static_url(self, ext_ref: str) -> str:
+        """Build the canonical issue URL from the reference alone; "" when that is not possible."""
 
         adapter_name, ref = _split(ext_ref)
         url: str | None = None
@@ -112,29 +108,30 @@ class _Drain:
             site = self.env.get("JIRA_SITE", "").strip()
             if site:
                 url = f"https://{site}/browse/{ref}"
-        elif adapter_name == "linear":
-            adapter = self.adapter(adapter_name)
-            if adapter is not None:
-                try:
-                    url = adapter.read(ref).url
-                except TrackerUnavailable:
-                    url = None
-        return safe_url(url, ref)
+        return safe_url(url, ref) or ""
 
-    def _defer(self, ext_ref: str, section: str, key: str | None) -> None:
-        """Put a request back in line without spending an attempt; its notice needs a URL first."""
+    def resolve_url(self, ext_ref: str) -> str:
+        """Resolve a notice URL read-only, without spending the action budget; "" when unavailable.
 
-        with evidence_transaction(self.home) as data:
-            entry = self._entry(data, ext_ref, section, key)
-            if entry is not None:
-                entry.update(
-                    stage="requested", reason=URL_UNAVAILABLE, attempts=max(entry["attempts"] - 1, 0)
-                )
+        Reads the tracker for Linear, so it must be called outside the evidence lock.
+        """
+
+        url = self.static_url(ext_ref)
+        adapter_name, ref = _split(ext_ref)
+        if url or adapter_name != "linear":
+            return url
+        adapter = self.adapter(adapter_name)
+        if adapter is None:
+            return ""
+        try:
+            return safe_url(adapter.read(ref).url, ref) or ""
+        except TrackerUnavailable:
+            return ""
 
     def _adapter_missing(self, ext_ref: str, event: str) -> None:
-        url = self.notice_url(ext_ref)
-        if url is None:
-            return
+        """Record one notice; a missing Linear adapter or Jira without JIRA_SITE yields no deliverable notice."""
+
+        url = self.static_url(ext_ref)
         with evidence_transaction(self.home) as data:
             adapter, ref = _split(ext_ref)
             if any(
@@ -164,15 +161,30 @@ class _Drain:
         )
 
     def notices(self) -> None:
+        """Emit deliverable notices, resolving empty URLs lazily.
+
+        Resolution is one read-only call per unresolved Linear notice per fire. It is outside
+        the evidence lock and never touches the action budget, so it cannot starve actions.
+        """
+
         pending = [n for n in read_evidence(self.home)["notices"] if not n.get("notified")]
         if not pending:
             return
+        resolved: dict[str, str] = {}
+        for notice in pending:
+            if not notice["url"]:
+                url = self.resolve_url(f"{notice['adapter']}:{notice['ref']}")
+                if url:
+                    resolved[notice["delivery_key"]] = url
         state_dir = poller_state_dir(self.home)
         delivered: set[str] = set()
         for notice in pending:
             key = notice["delivery_key"]
+            url = notice["url"] or resolved.get(key, "")
             if delivery_receipt_exists(state_dir, key):
                 delivered.add(key)
+                continue
+            if not url:
                 continue
             self.emit(
                 {
@@ -180,16 +192,18 @@ class _Drain:
                     "delivery_key": key,
                     "adapter": notice["adapter"],
                     "ref": notice["ref"],
-                    "url": notice["url"],
+                    "url": url,
                     "lifecycle_event": notice["lifecycle_event"],
                     "reason": notice["reason"],
                 }
             )
-        if delivered:
+        if delivered or resolved:
             with evidence_transaction(self.home) as data:
                 for notice in data["notices"]:
                     if notice["delivery_key"] in delivered:
                         notice["notified"] = True
+                    if not notice["url"] and notice["delivery_key"] in resolved:
+                        notice["url"] = resolved[notice["delivery_key"]]
 
     def _finish(
         self,
@@ -202,12 +216,6 @@ class _Drain:
         notice: str | None = None,
         **extra: Any,
     ) -> None:
-        url = None
-        if notice is not None:
-            url = self.notice_url(ext_ref)
-            if url is None:
-                self._defer(ext_ref, section, key)
-                return
         with evidence_transaction(self.home) as data:
             entry = self._entry(data, ext_ref, section, key)
             if entry is None:
@@ -215,8 +223,10 @@ class _Drain:
             entry.update(
                 stage="done", result=result, reason=reason, recorded_at=self.clock(), **extra
             )
-            if notice is not None and url is not None:
-                self._add_notice(data, ext_ref, notice, reason or result, url)
+            if notice is not None:
+                self._add_notice(
+                    data, ext_ref, notice, reason or result, self.static_url(ext_ref)
+                )
 
     def _retry(
         self,
@@ -394,25 +404,17 @@ class _Drain:
         return outcome, "already_closed" if outcome.status == "already" else "closed"
 
     def _read_failed(self, ext_ref: str) -> None:
-        current = self._entry(read_evidence(self.home), ext_ref, "closure", None)
-        url = None
-        if current is not None and current["attempts"] + 1 >= MAX_ATTEMPTS:
-            url = self.notice_url(ext_ref)
-            if url is None:
-                return
         with evidence_transaction(self.home) as data:
             entry = self._entry(data, ext_ref, "closure", None)
             if entry is None:
                 return
             entry["attempts"] += 1
             entry["reason"] = "pr_read_failed"
-            if entry["attempts"] >= MAX_ATTEMPTS and url is not None:
-                entry.update(
-                    stage="done",
-                    result="failed",
-                    recorded_at=self.clock(),
+            if entry["attempts"] >= MAX_ATTEMPTS:
+                entry.update(stage="done", result="failed", recorded_at=self.clock())
+                self._add_notice(
+                    data, ext_ref, "merged", "pr_read_failed", self.static_url(ext_ref)
                 )
-                self._add_notice(data, ext_ref, "merged", "pr_read_failed", url)
 
 
 def drain(
