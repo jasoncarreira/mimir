@@ -1397,9 +1397,14 @@ def test_shipped_full_corpus_poller_grants_are_explicit_and_enumerated() -> None
         "gmail-inbox",
         "social-cli-feed",
         "social-cli-notifications",
+        "tracker-poller",
         "worklink-ready-queue",
         "worklink-tool-pins",
     }
+    # tracker-poller is the one shipped poller without the grant: it only lists
+    # tracker issues and needs no Saga corpus access, and the narrowest authority
+    # suits a poller that handles text written by untrusted people.
+    ungranted = {"tracker-poller"}
     entries = [
         entry
         for manifest_path in (*manifests.glob("*/pollers.json"), *cultivate.glob("*/pollers.json"))
@@ -1411,7 +1416,7 @@ def test_shipped_full_corpus_poller_grants_are_explicit_and_enumerated() -> None
         entry["name"]
         for entry in entries
         if entry["authority"].get("saga_full_corpus_read") is True
-    } == expected
+    } == expected - ungranted
 
 
 def test_session_boundary_poller_can_end_session_without_companions(tmp_path: Path) -> None:

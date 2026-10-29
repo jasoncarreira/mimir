@@ -464,7 +464,7 @@ def test_setup_home_populates_optional_report(tmp_path, monkeypatch, capsys, sel
     home = tmp_path / "agent"
     status = setup_home(home)
     expected = {f"cultivate:{name}" for name in (
-        "github-poller", "github-ci-watch", "github", "review",
+        "github-poller", "github-ci-watch", "github", "review", "tracker-poller",
     )} if selected else set()
     assert set(status["plugin_optional"]) == expected
     _print_setup_report(status)

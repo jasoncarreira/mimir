@@ -57,12 +57,17 @@ def test_workspace_metadata_and_manifest() -> None:
         "defaults/skills/chainlink-orchestrator", "defaults/skills/worklink-tool-pins",
     }
     optional = manifest["optional"]["skills"]
-    assert len(optional) == 4
+    assert len(optional) == 5
     assert {entry["path"] for entry in optional} == {
         f"defaults/skills/{name}"
-        for name in ("github-poller", "github-ci-watch", "github", "review")
+        for name in ("github-poller", "github-ci-watch", "github", "review", "tracker-poller")
     }
-    assert all(set(entry) == {"path", "forge"} and entry["forge"] == "github" for entry in optional)
+    by_name = {Path(entry["path"]).name: entry for entry in optional}
+    assert set(by_name["tracker-poller"]) == {"path"}
+    assert all(
+        set(entry) == {"path", "forge"} and entry["forge"] == "github"
+        for name, entry in by_name.items() if name != "tracker-poller"
+    )
     assert (PLUGIN / "brand/LICENSE").read_bytes() == (ROOT / "brand/LICENSE").read_bytes()
 
 
@@ -87,7 +92,7 @@ def test_built_distribution_boundaries(built_packages: dict[str, Path]) -> None:
                     assert archive.read(packaged) == (PLUGIN / source).read_bytes()
                 assert "mimir_cultivate/registration.py" in members
                 for skill in ("github-poller", "github-ci-watch", "chainlink-orchestrator",
-                              "worklink-tool-pins", "github", "review"):
+                              "worklink-tool-pins", "github", "review", "tracker-poller"):
                     resource = f"mimir_cultivate/defaults/skills/{skill}/SKILL.md"
                     assert archive.read(resource) == (
                         PLUGIN / resource
