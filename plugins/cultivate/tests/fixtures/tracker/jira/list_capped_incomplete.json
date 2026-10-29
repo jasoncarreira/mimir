@@ -1,0 +1,41 @@
+{
+  "source": "Jira Cloud platform REST API v3, Issue search: POST /rest/api/3/search/jql (nextPageToken)",
+  "exchanges": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://acme.atlassian.net/rest/api/3/search/jql",
+        "json": {
+          "jql": "assignee = \"acct-bot\" AND statusCategory != Done AND project in (PROJ) ORDER BY updated DESC",
+          "maxResults": 50,
+          "fields": [
+            "updated"
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "issues": [
+            {
+              "id": "10046",
+              "key": "PROJ-46",
+              "fields": {
+                "updated": "2026-10-01T13:00:00.000+0000"
+              }
+            },
+            {
+              "id": "10045",
+              "key": "PROJ-45",
+              "fields": {
+                "updated": "2026-10-01T12:00:00.000+0000"
+              }
+            }
+          ],
+          "isLast": false,
+          "nextPageToken": "tok-2"
+        }
+      }
+    }
+  ]
+}
