@@ -1,0 +1,71 @@
+{
+  "source": "Linear GraphQL API reference https://linear.app/developers/graphql and schema https://studio.apollographql.com/public/Linear-API/variant/current/schema/reference: Query.issues (IssueFilter.delegate, IssueFilter.state.type), Issue.id/identifier/url/updatedAt, IssueConnection.pageInfo (the url carries a title slug)",
+  "exchanges": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.linear.app/graphql",
+        "json": {
+          "query": "query Viewer { viewer { id } }",
+          "variables": {}
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "data": {
+            "viewer": {
+              "id": "usr-bot"
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.linear.app/graphql",
+        "json": {
+          "query": "query AssignedIssues($filter: IssueFilter) { issues(filter: $filter, first: 50, orderBy: updatedAt) { nodes { id identifier url updatedAt } pageInfo { hasNextPage } } }",
+          "variables": {
+            "filter": {
+              "delegate": {
+                "id": {
+                  "eq": "usr-bot"
+                }
+              },
+              "state": {
+                "type": {
+                  "nin": [
+                    "completed",
+                    "canceled"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "data": {
+            "issues": {
+              "nodes": [
+                {
+                  "id": "iss-123",
+                  "identifier": "ENG-123",
+                  "url": "https://linear.app/acme/issue/ENG-123/fix-login-crash",
+                  "updatedAt": "2026-10-20T13:00:00.000Z"
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
