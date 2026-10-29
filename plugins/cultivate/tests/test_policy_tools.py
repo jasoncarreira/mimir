@@ -15,7 +15,7 @@ from mimir.plugins.core import policy_scope
 from mimir.plugins.manager import load_plugins
 from mimir.tool_descriptors import _PAYLOAD_EXTRACTOR_UNDECLARED, _TARGET_EXTRACTOR_UNDECLARED
 from mimir.tools.registry import all_mimir_tools
-from mimir_cultivate.policy import CODING_TOOLS
+from mimir_cultivate.policy import CODING_TOOLS, CULTIVATE_TOOL_NAMES, TRACKER_TOOL_NAMES
 from tests.test_plugin_policy_parity import (
     CODING_WRITES_CODE_OR_STATE, _canonical, _extractor, _extractor_results, _prepare_inputs,
 )
@@ -91,7 +91,7 @@ def test_selected_registration_uses_immutable_provider_metadata_not_core_invento
 
     monkeypatch.setattr(core, "core_policy_registry", missing_core_inventory)
     selected = load_plugins(enable="cultivate").policy
-    assert {name for name, tool in selected.tools.items() if tool.owner == "cultivate"} == CODING_TOOLS
+    assert {name for name, tool in selected.tools.items() if tool.owner == "cultivate"} == CULTIVATE_TOOL_NAMES
     with pytest.raises(TypeError):
         provider_policy._TOOL_DECLARATIONS["repo_status"] = None
 
@@ -104,7 +104,7 @@ from mimir.tools.registry import all_mimir_tools
 p = load_plugins(enable='').policy
 assert not any(k.startswith('mimir_cultivate') for k in sys.modules)
 names = {tool.name for tool in all_mimir_tools('openai:test', policy=p)}
-assert not names & {'repo_status', 'pr_job_log', 'spawn_open_code'}
+assert not names & {'repo_status', 'pr_job_log', 'spawn_open_code', 'tracker_file_work', 'tracker_comment', 'tracker_set_state'}
 """
     process = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True)
     assert process.returncode == 0, process.stderr

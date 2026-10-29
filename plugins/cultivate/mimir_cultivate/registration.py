@@ -305,6 +305,9 @@ class CultivateProvider:
             "poller:github-ci-watch", PollerProperties(github_ci_watch=True),
         )
         registrar.register_poller_properties(
+            "poller:tracker-poller", PollerProperties(tracker_issues=True),
+        )
+        registrar.register_poller_properties(
             "poller:worklink-ready-queue", PollerProperties(worklink_retained_checkout=True),
         )
         from . import commands

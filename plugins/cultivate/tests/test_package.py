@@ -119,6 +119,7 @@ def test_selected_provider_registers_its_coding_resources() -> None:
     from mimir.plugins.manager import load_plugins
     from mimir.plugins.core import core_policy_registry, core_runtime_names
     from mimir_cultivate.forge import FORGE_TOOLS
+    from mimir_cultivate.policy import TRACKER_TOOL_NAMES
     from mimir_cultivate.repository import REPO_TOOLS
 
     manager = load_plugins(enable="cultivate")
@@ -132,9 +133,11 @@ def test_selected_provider_registers_its_coding_resources() -> None:
         core_runtime_names("coding")
     coding = {"spawn_open_code", "worklink_run", "worklink_resume"} | repository | forge
     assert len(coding) == 40
-    assert {name for name, tool in manager.policy.tools.items() if tool.owner == "cultivate"} == coding
-    assert coding.isdisjoint(core_policy_registry().tools)
-    assert all(manager.policy.tools[name].factory is not None for name in coding)
+    owned = coding | TRACKER_TOOL_NAMES
+    assert len(TRACKER_TOOL_NAMES) == 3
+    assert {name for name, tool in manager.policy.tools.items() if tool.owner == "cultivate"} == owned
+    assert owned.isdisjoint(core_policy_registry().tools)
+    assert all(manager.policy.tools[name].factory is not None for name in owned)
 
 
 @pytest.mark.asyncio
