@@ -58,6 +58,7 @@ class ServicePrincipal:
     github_activity: bool = False
     worklink_retained_checkout: bool = False
     github_ci_watch: bool = False
+    tracker_issues: bool = False
 
     def can_read_domain(self, domain: str) -> bool:
         return domain in self.readable_domains
@@ -183,12 +184,14 @@ class PollerProperties:
     github_activity: bool = False
     worklink_retained_checkout: bool = False
     github_ci_watch: bool = False
+    tracker_issues: bool = False
 
     def principal_fields(self) -> dict[str, bool]:
         return {
             "github_activity": self.github_activity,
             "worklink_retained_checkout": self.worklink_retained_checkout,
             "github_ci_watch": self.github_ci_watch,
+            "tracker_issues": self.tracker_issues,
         }
 
 

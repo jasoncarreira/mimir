@@ -19464,3 +19464,185 @@ async def test_admin_hands_successful_pipeline_order_is_exact(
     for name in required:
         positions.append(order.index(name, positions[-1] + 1 if positions else 0))
     assert positions == sorted(positions)
+
+
+_TRACKER_ITEM = {
+    "adapter": "jira", "ref": "PROJ-45",
+    "url": "https://example.atlassian.net/browse/PROJ-45", "tracker_attested": True,
+}
+
+
+def _tracker_target(tool_name, arguments, context):
+    ref = arguments.get("external_ref")
+    for adapter, target_ref, _url in context.tracker_issue_targets:
+        if ref == f"{adapter}:{target_ref}":
+            return (f"tracker:{ref}",)
+    return (None,)
+
+
+def _any_tracker_target(tool_name, arguments, context):
+    return ("tracker:any",)
+
+
+def _tracker_policy(*, tracker_issues=True, extractor=_tracker_target):
+    from mimir.plugins.core import PollerProperties, register_core_tools
+    from mimir.plugins.registry import PolicyRegistry
+    from mimir.tool_descriptors import ResultOriginKind, _argument_payload
+
+    entry_point = SimpleNamespace(
+        group="mimir.plugins", name="cultivate", value="mimir_cultivate:provider",
+        dist=SimpleNamespace(metadata={"Name": "mimir-cultivate"}),
+    )
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((SimpleNamespace(
+        name="cultivate", distribution="mimir-cultivate", entry_point=entry_point,
+        manifest=SimpleNamespace(config={}), enabled=True, diagnostic=None,
+    ),))
+    register_core_tools(registry, selected_owners=frozenset({"cultivate"}))
+    registrar = registry.registrar("cultivate")
+    registrar.register_tool(
+        name="fake_tracker_comment", factory=lambda: object(), flow="sink",
+        tier="scoped-with-provenance", operation_class="resource_scoped",
+        resource_scope="tracker_issue", result_domain=None,
+        result_origin=ResultOriginKind.NON_INGESTING,
+        sink_category=SinkCategory.FORGE, sink_destination="bound_tracker_issue",
+        sink_target_extractor=extractor,
+        sink_payload_extractor=_argument_payload("body"),
+        writes_code_or_state=True, profiles=("fake_tracker",), read_backend=False,
+    )
+    registrar.register_capability("fake_tracker_comment")
+    registrar.register_authority_profile("fake_tracker", capabilities=("fake_tracker_comment",))
+    registrar.register_poller_properties(
+        "poller:tracker-poller", PollerProperties(tracker_issues=tracker_issues),
+    )
+    return registry.freeze()
+
+
+def _tracker_context(
+    policy, *, items=None, capabilities=("fake_tracker_comment",), enforce=True,
+    trigger="poller", source="poller", event_ingress=None, extra=None,
+    ifc_labels=None, tracker_authority=True,
+):
+    from mimir.plugins.core import policy_scope
+
+    with policy_scope(policy):
+        authority = build_trigger_service_principal(
+            canonical="poller:tracker-poller", trigger="poller", profile="fake_tracker",
+            tier=CapabilityTier.SCOPED_WITH_PROVENANCE, capabilities=capabilities,
+            creation_path="mimir.pollers.run_poller", policy=policy,
+            poller_owner="cultivate",
+        )
+        return create_auth_context(AgentEvent(
+            trigger=trigger, channel_id="poller:tracker-poller", source=source,
+            service_principal=authority.canonical, service_authority=authority,
+            extra={"poller_name": "tracker-poller",
+                   "items": items if items is not None else [dict(_TRACKER_ITEM)],
+                   **(extra or {})},
+        ), enforce=enforce, event_ingress=event_ingress,
+            ifc_labels=ifc_labels or InformationFlowLabels())
+
+
+def _tracker_authorize(policy, context, external_ref, *, enforce):
+    from mimir.plugins.core import policy_scope
+
+    with policy_scope(policy):
+        return access_control.get_tool_registry().authorize_tool(
+            "fake_tracker_comment", context, enforce=enforce,
+            arguments={"external_ref": external_ref, "body": "hello"}, policy=policy,
+        )
+
+
+def test_tracker_targets_derivation() -> None:
+    policy = _tracker_policy()
+    context = _tracker_context(policy)
+    assert context.tracker_issue_targets == frozenset({
+        ("jira", "PROJ-45", "https://example.atlassian.net/browse/PROJ-45"),
+    })
+    assert _tracker_context(policy, items=[dict(
+        _TRACKER_ITEM, extra_key="ignored", title="never carried",
+    )]).tracker_issue_targets == context.tracker_issue_targets
+
+
+@pytest.mark.parametrize("variant", [
+    pytest.param({"trigger": "user_message"}, id="not-a-poller-trigger"),
+    pytest.param({"source": "channel"}, id="not-a-poller-source"),
+    pytest.param({"event_ingress": "http"}, id="explicit-http-ingress"),
+    pytest.param({"extra": {HTTP_EVENT_INGRESS_EXTRA_KEY: "http"}}, id="http-ingress-extra"),
+    pytest.param({"items": []}, id="no-items"),
+    pytest.param({"items": [dict(_TRACKER_ITEM), dict(_TRACKER_ITEM, ref="PROJ-46",
+        url="https://example.atlassian.net/browse/PROJ-46")]}, id="two-items"),
+    pytest.param({"items": [dict(_TRACKER_ITEM, tracker_attested=False)]}, id="not-attested"),
+    pytest.param({"items": [dict(_TRACKER_ITEM, tracker_attested="yes")]}, id="attested-not-true"),
+    pytest.param({"items": [{k: v for k, v in _TRACKER_ITEM.items() if k != "tracker_attested"}]},
+                 id="attestation-absent"),
+    pytest.param({"items": [dict(_TRACKER_ITEM, adapter="Jira Cloud")]}, id="invalid-adapter"),
+    pytest.param({"items": [dict(_TRACKER_ITEM, ref="PROJ 45")]}, id="invalid-ref"),
+    pytest.param({"items": [dict(_TRACKER_ITEM, url="https://example.atlassian.net/browse/PROJ-99")]},
+                 id="url-names-another-issue"),
+    pytest.param({"items": [dict(_TRACKER_ITEM, url="http://example.atlassian.net/browse/PROJ-45")]},
+                 id="url-not-https"),
+    pytest.param({"items": ["not a dict"]}, id="item-not-a-dict"),
+])
+def test_tracker_targets_derivation_guards_are_independent(variant) -> None:
+    policy = _tracker_policy()
+    assert _tracker_context(policy).tracker_issue_targets
+    assert _tracker_context(policy, **variant).tracker_issue_targets == frozenset()
+
+
+def test_tracker_targets_require_the_tracker_issues_property() -> None:
+    policy = _tracker_policy(tracker_issues=False)
+    assert _tracker_context(policy).tracker_issue_targets == frozenset()
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+def test_tracker_sink_in_scope_trusted_turn_is_allowed(enforce: bool) -> None:
+    policy = _tracker_policy()
+    context = _tracker_context(policy, enforce=enforce)
+    authorization = _tracker_authorize(policy, context, "jira:PROJ-45", enforce=enforce)
+    assert authorization.allowed
+    assert authorization.reason is None
+    assert not authorization.would_block
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+@pytest.mark.parametrize("case", ["capability_missing", "scope_ignored_by_target_hook"])
+def test_tracker_scope_denied(enforce: bool, case: str) -> None:
+    if case == "capability_missing":
+        policy = _tracker_policy()
+        context = _tracker_context(policy, enforce=enforce, capabilities=())
+        external_ref = "jira:PROJ-45"
+    else:
+        policy = _tracker_policy(extractor=_any_tracker_target)
+        context = _tracker_context(policy, enforce=enforce)
+        external_ref = "jira:PROJ-46"
+    authorization = _tracker_authorize(policy, context, external_ref, enforce=enforce)
+    assert authorization.reason == "tracker_scope_denied"
+    assert authorization.would_block
+    assert authorization.allowed is (not enforce)
+    assert authorization.is_shadow_decision is (not enforce)
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+def test_tracker_sink_without_a_target_is_refused(enforce: bool) -> None:
+    policy = _tracker_policy()
+    context = _tracker_context(policy, enforce=enforce)
+    authorization = _tracker_authorize(policy, context, "jira:PROJ-46", enforce=enforce)
+    assert authorization.reason == "sink_target_required"
+    assert authorization.would_block
+    assert authorization.allowed is (not enforce)
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+def test_tracker_sink_refused_on_untrusted_labelled_turn(enforce: bool) -> None:
+    policy = _tracker_policy()
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="poller:tracker-poller", domain="tracker", resource_id="tracker:jira:PROJ-45",
+        bridge_instance="tracker", sensitivity="public",
+        authorized_principals=frozenset({"poller:tracker-poller"}), source_kind="channel",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+    assert labels.has_untrusted_active_ingest
+    context = _tracker_context(policy, enforce=enforce, ifc_labels=labels)
+    authorization = _tracker_authorize(policy, context, "jira:PROJ-45", enforce=enforce)
+    assert not authorization.allowed
+    assert authorization.reason == "write_blocked_by_untrusted_ingest"

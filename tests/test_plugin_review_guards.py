@@ -209,7 +209,7 @@ def test_plugin_principal_cannot_mint_special_grants(field_name, value):
     assert not registry.service_principals
 
 
-@pytest.mark.parametrize("flag", ["github_activity", "worklink_retained_checkout", "github_ci_watch"])
+@pytest.mark.parametrize("flag", ["github_activity", "worklink_retained_checkout", "github_ci_watch", "tracker_issues"])
 def test_new_core_only_service_flags_cannot_be_set_by_plugins(flag):
     # Exercise the real authority fields; a missing field is a regression, not a skip.
     registry, plugin = worker_registry()
@@ -819,6 +819,7 @@ _POLLER_PROPERTY_GRANTS = (
     {"github_activity": True},
     {"github_ci_watch": True},
     {"worklink_retained_checkout": True},
+    {"tracker_issues": True},
 )
 
 

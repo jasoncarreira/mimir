@@ -1256,6 +1256,8 @@ class AuthContext(_AuthContextAuthoritySlot):
     # Exact CI selectors from the server-delivered github-ci-watch record.
     ci_run_targets: frozenset[tuple[str, int]] = frozenset()
     ci_branch_targets: frozenset[tuple[str, str, int | None]] = frozenset()
+    # (adapter, ref, url) of the one attested tracker issue behind a tracker poller turn.
+    tracker_issue_targets: frozenset[tuple[str, str, str]] = frozenset()
     # Standing review authority is resolved lazily from a live server fetch.
     # This cache is per turn and stores only immutable server-issued scopes.
     server_discovered_pr_states: Any = field(default=None, repr=False, compare=False)
@@ -1351,7 +1353,7 @@ class AuthContext(_AuthContextAuthoritySlot):
             "repo_pr_scope_registry", "repo_review_state", "repo_pr_action_scope",
             "server_discovered_pr_states", "server_discovered_pr_scope_store",
             "retained_factory_scope", "retained_factory_scope_refusal",
-            "ci_run_targets", "ci_branch_targets",
+            "ci_run_targets", "ci_branch_targets", "tracker_issue_targets",
         }:
             policy = object.__getattribute__(self, "_plugin_slot_policy")
             if policy is None or not policy.state_slots:
@@ -1368,11 +1370,14 @@ class AuthContext(_AuthContextAuthoritySlot):
                     fields = slot_type.__dataclass_fields__
                     if type(state) is not slot_type or any(
                         (getattr(state, key) != object.__getattribute__(self, key)
-                         if key in {"ci_run_targets", "ci_branch_targets", "retained_factory_scope_refusal"}
+                         if key in {"ci_run_targets", "ci_branch_targets", "tracker_issue_targets",
+                                    "retained_factory_scope_refusal"}
                          else getattr(state, key) is not object.__getattribute__(self, key))
                         for key in fields
                     ):
-                        return frozenset() if name in {"ci_run_targets", "ci_branch_targets"} else None
+                        return frozenset() if name in {
+                            "ci_run_targets", "ci_branch_targets", "tracker_issue_targets",
+                        } else None
                     return getattr(state, name)
         hidden = {
             "audience_provider": "_audience_provider",
