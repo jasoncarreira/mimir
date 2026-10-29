@@ -13,8 +13,8 @@ env:
       description: "Comma-separated bot logins whose activity counts as trusted (github_issues adapter)."
       example: "dependabot[bot]"
     - name: LINEAR_API_KEY
-      description: "Linear personal API key of the bot user (linear adapter)."
-      example: "lin_api_..."
+      description: "Access token of the Linear OAuth app installed with actor=app and the app:assignable scope; the bot is set as the issue's delegate (linear adapter)."
+      example: "<oauth access token>"
     - name: JIRA_SITE
       description: "Jira Cloud host, without scheme (jira adapter)."
       example: "example.atlassian.net"
@@ -32,7 +32,7 @@ This poller ships in `mimir-cultivate`, not core. When selected with
 `MIMIR_PLUGINS=cultivate` it is installed from
 `plugins/cultivate/mimir_cultivate/defaults/skills/tracker-poller/` into
 `<home>/skills/cultivate-tracker-poller/` with `mimir skills install cultivate:tracker-poller`.
-`mimir-cultivate setup --tracker ...` does both steps and writes the configuration below.
+`mimir cultivate setup --tracker ...` does both steps and writes the configuration below.
 
 ## Configuration
 
@@ -60,12 +60,13 @@ tracker:
 `transitions` and `project_transitions` map a lifecycle event (`filed`, `build_started`,
 `pr_opened`, `merged`) to a workflow state name. GitHub issues have no workflow states.
 Changes to `tracker:` made by hand are applied to a setup-managed home only by rerunning
-`mimir-cultivate setup` with `--force`.
+`mimir cultivate setup` with `--force`.
 
 ## What the poller does each fire
 
 1. Applies queued tracker transitions and backstop closures, and reports notices.
-2. Lists the open issues assigned to the bot (at most 50 per adapter).
+2. Lists the open issues assigned to the bot (at most 50 per adapter): the assignee on GitHub
+   and Jira, the delegate on Linear.
 3. For each issue whose update time changed, reads the full thread (at most 10 reads per
    fire) and decides whether it may reach the agent.
 4. Emits at most 5 items per fire. One item is one issue; the agent gets only the tracker

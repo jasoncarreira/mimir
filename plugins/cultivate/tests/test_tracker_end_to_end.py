@@ -220,6 +220,43 @@ def capsys_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return make
 
 
+def test_manifest_authority_is_tracker_tools_only(capsys_rig) -> None:
+    from mimir_cultivate.policy import TRACKER_TOOL_NAMES
+
+    rig = capsys_rig("github_issues")
+    invalid_entries: list[tuple[Path, str, str]] = []
+    invalid_manifests: list[tuple[Path, str]] = []
+    discovered = [
+        p for p in discover_pollers(
+            rig.home / "skills", state_root=rig.home / "state" / "pollers",
+            policy=rig.selected.policy, invalid_entries=invalid_entries,
+            invalid_manifests=invalid_manifests,
+        ) if p.name == "tracker-poller"
+    ]
+    [poller] = discovered
+    assert invalid_entries == [] and invalid_manifests == []
+    authority = poller.authority
+    assert authority is not None
+    assert set(authority.capabilities) == set(TRACKER_TOOL_NAMES)
+    assert len(authority.capabilities) == len(TRACKER_TOOL_NAMES)
+    assert poller.batch_size == 1
+    assert poller.trust_source == "tracker"
+    assert poller.hooks is not None and poller.hooks.trust_attestor is not None
+    declared = next(
+        entry for entry in json.loads(poller.manifest_path.read_text(encoding="utf-8"))["pollers"]
+        if entry["name"] == "tracker-poller"
+    )
+    assert declared["authority"]["scoped_roots"] == ["state"]
+    assert not {"write_file", "edit_file", "replace_file"} & set(authority.capabilities)
+    assert authority.sink_policies == ()
+    assert authority.saga_full_corpus_read is False
+    assert poller.pass_env == (
+        "GITHUB_TOKEN", "MIMIR_GITHUB_SELF_LOGIN", "MIMIR_GITHUB_TRUSTED_BOT_LOGINS",
+        "LINEAR_API_KEY", "JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN",
+        "MIMIR_HOME", "MIMIR_SOURCE_DIR", "CHAINLINK_BIN",
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("adapter", sorted(CASES))
 async def test_item_attests_through_run_poller(

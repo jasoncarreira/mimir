@@ -397,6 +397,8 @@ class _Fire:
             if not ids:
                 return
             shown = [self.work.show(issue_id) for issue_id in ids]
+            if len(ids) > 1:
+                _diag("adoption_ambiguous")
             if len(ids) == 1 and self.work.never_armed(shown[0]):
                 self.work.arm(ids[0])
         except WorkUnavailable:

@@ -257,3 +257,13 @@ def test_adoption_records_the_filed_transition_request(rig: Rig, monkeypatch) ->
     monkeypatch.setattr(poller, "request_transition", lambda home, d, event: seen.append((d, event)))
     rig.fire()
     assert [event for _, event in seen] == ["filed"]
+
+
+def test_ambiguous_adoption_is_diagnosed_and_never_arms(rig: Rig, capsys) -> None:
+    seeded(rig)
+    rig.chainlink.add(external_description())
+    rig.chainlink.add(external_description())
+    rig.fire()
+    assert capsys.readouterr().err.splitlines() == ["adoption_ambiguous"]
+    assert rig.chainlink.labels_calls() == []
+    assert rig.entry()["triage"]["state"] == "filed"

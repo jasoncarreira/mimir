@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from dataclasses import replace
 from datetime import timedelta
 
@@ -185,3 +187,40 @@ def test_main_does_nothing_without_configured_adapters(tmp_path, monkeypatch, ca
     poller.main()
     out = capsys.readouterr()
     assert out.out == "" and not (tmp_path / "state" / "cursor.json").exists()
+
+
+def test_delivered_title_never_reaches_the_cursor(rig: Rig) -> None:
+    rig.adapter.put(issue(title="SECRET TITLE"))
+    [item] = items(rig.fire())
+    assert item["kind"] == "triage"
+    assert "SECRET TITLE" not in (rig.state / "cursor.json").read_text()
+
+
+def test_adapter_error_codes_are_the_only_stderr(rig: Rig, capsys) -> None:
+    rig.adapter.put(issue(title="SECRET TITLE"))
+    rig.adapter.read_error = "http_403"
+    rig.fire()
+    rig.adapter.list_error = "timeout"
+    rig.fire()
+    lines = capsys.readouterr().err.splitlines()
+    assert lines == ["adapter_unavailable:github_issues:http_403",
+                     "adapter_unavailable:github_issues:timeout"]
+    assert all(poller.TRACKER_STDERR_CODE_RE.fullmatch(line) for line in lines)
+
+
+def test_top_level_handler_emits_only_a_code(tmp_path, monkeypatch) -> None:
+    script = tmp_path / "tracker_main.py"
+    script.write_text(
+        "import sys\nsys.argv = [sys.argv[0]]\n"
+        "from mimir_cultivate.worklink.backends import registry\n"
+        "def boom(*a, **k):\n    raise RuntimeError('SECRET TITLE with free text')\n"
+        "registry.WorklinkConfig.load = boom\n"
+        "import runpy\nrunpy.run_path(%r, run_name='__main__')\n" % str(poller.__file__),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("STATE_DIR", str(tmp_path / "state"))
+    done = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
+    assert done.returncode == 1
+    assert done.stderr.splitlines() == ["fatal:runtimeerror"]
+    assert "SECRET" not in done.stdout
