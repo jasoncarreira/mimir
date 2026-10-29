@@ -3341,6 +3341,9 @@ def test_tracker_secret_conflicts_with_differing_compose_env(upgrade_setup, tmp_
     ({"jira_projects": []}, "Invalid Jira projects"),
     ({"jira_projects": ["proj"]}, "Invalid Jira projects"),
     ({"jira_trusted_groups": []}, "Invalid Jira trust settings"),
+    ({"jira_site": "a" * 250 + ".net"}, "Invalid Jira site"),
+    ({"jira_account_id": "acct.with.dots"}, "Invalid Jira account id"),
+    ({"jira_account_id": "a" * 129}, "Invalid Jira account id"),
 ])
 def test_invalid_jira_settings_fail_before_any_file_is_written(setup_environment, overrides, message):
     deploy, args, state, calls, invoke = setup_environment
@@ -3350,6 +3353,17 @@ def test_invalid_jira_settings_fail_before_any_file_is_written(setup_environment
     with pytest.raises(installer.SetupError, match=message):
         invoke()
     assert not deploy.exists() and not calls
+
+
+def test_jira_site_is_lowercased_to_the_adapter_format(setup_environment, tmp_path, monkeypatch):
+    deploy, args, state, calls, invoke = setup_environment
+    _use_tracker_secrets(args, tmp_path, monkeypatch, jira_email="bot@example.com", jira_api_token="jira-token-value")
+    args.tracker = ["jira"]
+    for key, value in {**_JIRA_FLAGS, "jira_site": "Example.Atlassian.NET"}.items():
+        setattr(args, key, value)
+    invoke()
+    assert _compose_env(deploy)["JIRA_SITE"] == "example.atlassian.net"
+    assert json.loads((deploy / "manifest.json").read_text())["tracker_settings"]["jira_site"] == "example.atlassian.net"
 
 
 def test_tracker_skill_is_installed_only_when_selected(provisioned_skills, monkeypatch):
@@ -3403,14 +3417,91 @@ def test_worklink_yaml_gets_tracker_section_only_when_selected(tmp_path, monkeyp
     assert b"tracker" not in plain
     tracker = {"close_on_merge": False, "adapters": {"jira": {
         "account_id": "abc", "projects": ["PROJ"], "trusted_groups": ["eng"]}, "linear": {}}}
-    with pytest.raises(RuntimeError, match="--force"):
-        installer._provision_worklink(home, entry, tracker=tracker, **kwargs)
-    assert path.read_bytes() == plain
-    assert installer._provision_worklink(home, entry, tracker=tracker, force=True, **kwargs)
+    assert installer._provision_worklink(home, entry, tracker=tracker, **kwargs)
     from mimir_cultivate.worklink.backends.registry import WorklinkConfig
     loaded = WorklinkConfig.load(path)
     assert set(loaded.tracker.adapters) == {"jira", "linear"}
     assert loaded.tracker.adapters["jira"].projects == ("PROJ",)
-    assert not installer._provision_worklink(home, entry, tracker=tracker, **kwargs)
-    assert installer._provision_worklink(home, entry, tracker=None, force=True, **kwargs)
+    assert not installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=tracker, **kwargs)
+    switched = {"close_on_merge": False, "adapters": {"jira": {
+        "account_id": "abc", "projects": ["OTHER"], "trusted_groups": ["eng"]}}}
+    assert installer._provision_worklink(home, entry, tracker=switched, previous_tracker=tracker, **kwargs)
+    assert WorklinkConfig.load(path).tracker.adapters["jira"].projects == ("OTHER",)
+    assert installer._provision_worklink(home, entry, tracker=None, previous_tracker=switched, **kwargs)
     assert path.read_bytes() == plain
+    installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=None, **kwargs)
+    edited = path.read_bytes().replace(b"PROJ", b"HAND")
+    path.write_bytes(edited)
+    with pytest.raises(RuntimeError, match="--force"):
+        installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=tracker, **kwargs)
+    with pytest.raises(RuntimeError, match="--force"):
+        installer._provision_worklink(home, entry, tracker=None, previous_tracker=tracker, **kwargs)
+    assert path.read_bytes() == edited
+    assert installer._provision_worklink(home, entry, tracker=None, previous_tracker=tracker, force=True, **kwargs)
+    assert path.read_bytes() == plain
+
+
+def test_hand_edited_worklink_refusal_names_the_file_and_force(monkeypatch):
+    marker = installer._WORKLINK_EDITED
+    result = subprocess.CompletedProcess(["docker"], 1, stdout=marker + "\n", stderr="")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: result)
+    with pytest.raises(installer.SetupError, match=r"worklink\.yaml.*--force"):
+        installer._run(["docker", "exec"])
+
+
+def test_setup_persists_previous_tracker_config_in_manifest(upgrade_setup, tmp_path, monkeypatch):
+    deploy, args, state, calls, invoke = upgrade_setup
+    invoke()
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["previous_tracker_config"] is None
+    _use_tracker_secrets(args, tmp_path, monkeypatch, linear_api_key="lin-secret-value")
+    args.tracker = ["linear"]
+    invoke()
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["previous_tracker_config"] is None and manifest["tracker_config"]["adapters"] == {"linear": {}}
+    args.tracker = ["none"]
+    invoke()
+    manifest = json.loads((deploy / "manifest.json").read_text())
+    assert manifest["previous_tracker_config"] == {"close_on_merge": False, "adapters": {"linear": {}}}
+    assert manifest["tracker_config"] is None
+
+
+def test_jira_trusted_roles_land_sorted_and_satisfy_trust(setup_environment, tmp_path, monkeypatch):
+    from mimir_cultivate.worklink.backends.registry import WorklinkConfig
+    deploy, args, state, calls, invoke = setup_environment
+    _use_tracker_secrets(args, tmp_path, monkeypatch, jira_email="bot@example.com", jira_api_token="jira-token-value")
+    args.tracker = ["jira"]
+    for key, value in {**_JIRA_FLAGS, "jira_trusted_groups": None, "jira_trusted_roles": ["Maintainer", "Developer"]}.items():
+        setattr(args, key, value)
+    invoke()
+    adapter = json.loads((deploy / "manifest.json").read_text())["tracker_config"]["adapters"]["jira"]
+    assert adapter["trusted_project_roles"] == ["Developer", "Maintainer"] and "trusted_groups" not in adapter
+    path = tmp_path / "worklink.yaml"
+    path.write_text(yaml.safe_dump({"repository": "org/repo", "defaults": {"backend": "opencode"},
+                                    "tracker": {"close_on_merge": False, "adapters": {"jira": adapter}}}))
+    assert WorklinkConfig.load(path).tracker.adapters["jira"].trusted_project_roles == ("Developer", "Maintainer")
+    args.jira_trusted_groups = ["engineering"]
+    invoke()
+    adapter = json.loads((deploy / "manifest.json").read_text())["tracker_config"]["adapters"]["jira"]
+    assert adapter["trusted_groups"] == ["engineering"]
+    assert adapter["trusted_project_roles"] == ["Developer", "Maintainer"]
+
+
+def test_plain_jira_email_flag_is_validated_and_kept_out_of_output(setup_environment, tmp_path, monkeypatch, capsys, caplog):
+    deploy, args, state, calls, invoke = setup_environment
+    _use_tracker_secrets(args, tmp_path, monkeypatch, jira_api_token="jira-token-value")
+    args.tracker = ["jira"]
+    for key, value in _JIRA_FLAGS.items():
+        setattr(args, key, value)
+    args.jira_email = "not-an-email"
+    with pytest.raises(installer.SetupError, match="Invalid jira email"):
+        invoke()
+    assert not deploy.exists()
+    args.jira_email = "svc-plain@example.com"
+    caplog.set_level(logging.DEBUG)
+    invoke()
+    assert _compose_env(deploy)["JIRA_EMAIL"] == "svc-plain@example.com"
+    captured = capsys.readouterr()
+    haystack = captured.out + captured.err + caplog.text + json.dumps(state["verified"], default=str)
+    haystack += (deploy / "manifest.json").read_text()
+    assert "svc-plain@example.com" not in haystack

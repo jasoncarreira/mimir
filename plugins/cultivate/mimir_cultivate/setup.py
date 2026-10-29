@@ -83,7 +83,10 @@ _CULTIVATE_DEFAULT_SKILLS = ("github-poller", "github-ci-watch", "github", "revi
 _TRACKER_CHOICES = ("github-issues", "linear", "jira")
 _TRACKER_ADAPTERS = {"github-issues": "github_issues", "linear": "linear", "jira": "jira"}
 _JIRA_PROJECT_KEY = re.compile(r"[A-Z][A-Z0-9_]{1,9}")
-_JIRA_SITE = re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+")
+_JIRA_SITE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+")
+_JIRA_SITE_ADAPTER = re.compile(r"[a-z0-9.-]{1,253}")
+_JIRA_ACCOUNT_ID = re.compile(r"[A-Za-z0-9:_-]{1,128}")
+_WORKLINK_EDITED = "CULTIVATE_WORKLINK_EDITED"
 _JIRA_PERMISSION_HELP = (
     "Jira service account id (accountId). The service account needs Browse Projects on each "
     "--jira-project, Add Comments, and Transition Issues when transitions or close_on_merge are set. "
@@ -222,7 +225,7 @@ def _tracker_settings(args: argparse.Namespace, previous: dict) -> tuple[list[st
         if value is not None:
             if not isinstance(value, str):
                 raise SetupError(f"Invalid {key.replace('_', ' ')} in manifest.json; reconcile it before retrying.")
-            settings[key] = value.strip()
+            settings[key] = value.strip().lower() if key == "jira_site" else value.strip()
     for key in ("jira_projects", "jira_trusted_groups", "jira_trusted_roles"):
         value = getattr(args, key, None)
         value = saved_settings.get(key, []) if value is None else value
@@ -231,10 +234,10 @@ def _tracker_settings(args: argparse.Namespace, previous: dict) -> tuple[list[st
         settings[key] = sorted({v.strip() for v in value})
     if "jira" in trackers:
         site = settings.get("jira_site")
-        if not site or not _JIRA_SITE.fullmatch(site):
+        if not site or not (_JIRA_SITE_ADAPTER.fullmatch(site) and _JIRA_SITE.fullmatch(site)):
             raise SetupError("Invalid Jira site; pass --jira-site as a host without scheme, such as example.atlassian.net.")
         account = settings.get("jira_account_id")
-        if not account or not account.isprintable() or any(c.isspace() for c in account):
+        if not account or not _JIRA_ACCOUNT_ID.fullmatch(account):
             raise SetupError("Invalid Jira account id; pass --jira-account-id (see --help for the required permissions).")
         if not settings["jira_projects"] or any(not _JIRA_PROJECT_KEY.fullmatch(k) for k in settings["jira_projects"]):
             raise SetupError("Invalid Jira projects; pass at least one --jira-project key such as PROJ.")
@@ -745,7 +748,8 @@ def toolchain_test_env(kind: str) -> dict[str, str]:
 
 def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
                         git_auth: list[str], force: bool = False,
-                        toolchain: str | None = None, tracker: dict | None = None) -> bool:
+                        toolchain: str | None = None, tracker: dict | None = None,
+                        previous_tracker: dict | None = None) -> bool:
     """Reconcile the dedicated, controller-owned base and Worklink settings."""
     from .worklink.backends.registry import BackendRegistry, WorklinkConfig, _derive_bash_allowlist
 
@@ -811,12 +815,18 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         allowlist = ['git *', entry['test_command']]
     config['backends'] = {'opencode': {'bash_allowlist': allowlist,
                                      'test_env': toolchain_test_env(toolchain) if toolchain else {}}}
-    if tracker:
-        config['tracker'] = tracker
-    text = yaml.safe_dump(config, sort_keys=False)
+    def render(section: dict | None) -> str:
+        rendered = dict(config)
+        if section:
+            rendered['tracker'] = section
+        return yaml.safe_dump(rendered, sort_keys=False)
+
+    text = render(tracker)
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise RuntimeError(f"Worklink config {path} must be a regular file; move it aside")
-    if path.exists() and path.read_text() != text and not force:
+    if (path.exists() and path.read_text() != text and not force
+            and path.read_text() != render(previous_tracker)):
+        print(_WORKLINK_EDITED, flush=True)
         raise RuntimeError(f"Worklink config {path} differs; preserve operator edits or rerun with --force")
     if not path.exists() or path.read_text() != text:
         path.write_text(text)
@@ -976,6 +986,9 @@ def _run(args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None
             raise SetupError(_PUSH_PROBE_HELP)
         if _PUSH_PROBE_UNREACHABLE in result.stdout.splitlines():
             raise SetupError(_PUSH_PROBE_UNREACHABLE_HELP)
+        if _WORKLINK_EDITED in result.stdout.splitlines():
+            raise SetupError("worklink.yaml was edited by hand and differs from what setup would write; "
+                             "review it, or rerun setup with --force to replace it.")
         for name in _CULTIVATE_DEFAULT_SKILLS:
             if "CULTIVATE_SKILL_MODIFIED:" + name in result.stdout.splitlines():
                 raise SetupError(f"Modified Cultivate skill cultivate:{name}; reconcile it or run "
@@ -1362,7 +1375,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
     setup.add_argument("--tracker", action="append", choices=_TRACKER_CHOICES + ("none",),
                        help="Triage issues assigned to the bot from this tracker (repeatable: github-issues, linear, jira); "
                             "installs the tracker-poller skill and writes the tracker: section of worklink.yaml. "
-                            "none clears the saved set; omit to preserve it. Edits to tracker: made by hand need --force on a rerun.")
+                            "none clears the saved set; omit to preserve it. A hand-edited worklink.yaml needs --force on a rerun.")
     setup.add_argument("--jira-site", help="Jira Cloud host without scheme, such as example.atlassian.net (written to JIRA_SITE).")
     setup.add_argument("--jira-account-id", help=_JIRA_PERMISSION_HELP)
     setup.add_argument("--jira-project", dest="jira_projects", action="append", help="Jira project key to poll (repeatable).")
@@ -1372,6 +1385,8 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
                        help="Jira project role whose members are trusted (repeatable).")
     setup.add_argument("--linear-api-key-file", help=_LINEAR_KEY_HELP)
     setup.add_argument("--linear-api-key-stdin", action="store_true", help="Read the Linear access token from one stdin line.")
+    setup.add_argument("--jira-email", help="Jira service account email (basic-auth username, written to JIRA_EMAIL); "
+                                            "--jira-email-file or --jira-email-stdin keep it out of argv.")
     for name, what in (("jira-email", "Jira service account email"), ("jira-api-token", "Jira service account API token")):
         setup.add_argument("--" + name + "-file", help=f"Read the {what} from a mode-600 file (never from argv).")
         setup.add_argument("--" + name + "-stdin", action="store_true", help=f"Read the {what} from one stdin line.")
@@ -1472,8 +1487,17 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                                                 previous=prior.get("LINEAR_API_KEY"))
     if "jira" in trackers:
         tracker_env["JIRA_SITE"] = str(tracker_settings["jira_site"])
-        tracker_env["JIRA_EMAIL"] = _secret(args, "jira_email", "Jira service account email (input hidden).",
-                                            previous=prior.get("JIRA_EMAIL"))
+        email = getattr(args, "jira_email", None)
+        if email is not None:
+            if getattr(args, "jira_email_file", None) is not None or getattr(args, "jira_email_stdin", False):
+                raise SetupError("Choose only one source for jira email.")
+            if not _EMAIL.fullmatch(email.strip()):
+                raise SetupError("Invalid jira email; supply a valid jira email (see --help).")
+            email = email.strip()
+        else:
+            email = _secret(args, "jira_email", "Jira service account email (input hidden).",
+                            previous=prior.get("JIRA_EMAIL"))
+        tracker_env["JIRA_EMAIL"] = email
         tracker_env["JIRA_API_TOKEN"] = _secret(args, "jira_api_token", "Jira service account API token (input hidden).",
                                                 previous=prior.get("JIRA_API_TOKEN"))
     spec = _field(args, "model_spec", "Model spec: choose an API-backed openai:model or anthropic:model; used for agent turns.")
@@ -1585,6 +1609,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                    "worklink_gate": gate, "quick_gate_command": quick_gate_command,
                    "trackers": trackers, "tracker_settings": tracker_settings,
                    "tracker_config": _tracker_config(trackers, tracker_settings),
+                   "previous_tracker_config": previous.get("tracker_config"),
                    "rotate": bool(args.rotate_web_key),
                   "force": bool(getattr(args, "force", False)),
                   "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
@@ -1765,7 +1790,8 @@ if not inventory.exists() or inventory.read_text() != text:
 changed = _provision_worklink(home, entry, base=base,
                             checkout=repo, git_auth=git_auth, force=m.get('force', False),
                             toolchain=m.get('toolchain'),
-                            tracker=m.get('tracker_config')) or changed
+                            tracker=m.get('tracker_config'),
+                            previous_tracker=m.get('previous_tracker_config')) or changed
 skills = []
 for name in ('github-poller', 'github-ci-watch', 'github', 'review') + (('tracker-poller',) if m.get('trackers') else ()):
     skill = resolve_skill('cultivate:' + name, set())
