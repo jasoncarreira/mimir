@@ -11,6 +11,7 @@
         "json": [
           {
             "id": 9042,
+            "updated_at": "2026-10-01T12:00:00Z",
             "number": 42,
             "title": "Issue 42",
             "state": "open",
@@ -21,6 +22,7 @@
           },
           {
             "id": 9043,
+            "updated_at": "2026-10-01T12:00:00Z",
             "number": 43,
             "title": "Issue 43",
             "state": "open",
@@ -34,6 +36,7 @@
           },
           {
             "id": 9044,
+            "updated_at": "2026-10-01T12:00:00Z",
             "number": 44,
             "title": "Issue 44",
             "state": "open",

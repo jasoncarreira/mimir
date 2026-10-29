@@ -11,7 +11,7 @@ from mimir_cultivate.tracker.adapters import build_adapter
 from mimir_cultivate.tracker.adapters.base import TrackerAdapter
 from mimir_cultivate.tracker.adapters.github_issues import build
 from mimir_cultivate.tracker.config import TrackerAdapterConfig
-from mimir_cultivate.tracker.thread import delivery_decision
+from mimir_cultivate.tracker.thread import activity_id, delivery_decision
 from mimir_cultivate.tracker.transport import TrackerUnavailable
 from tracker_replay import (
     ReplayTransport,
@@ -89,6 +89,23 @@ def test_listing_builds_canonical_urls_and_skips_pull_requests() -> None:
         ("acme/widgets#44", "9044", "https://github.com/acme/widgets/issues/44"),
     ]
     assert scenario.name == "list_assigned"
+    assert [i.updated_at for i in issues] == ["2026-10-01T12:00:00+00:00"] * 2
+
+
+@pytest.mark.parametrize("value", [None, "", "yesterday", "2026-10-01T12:00:00", 5])
+def test_listing_omits_an_item_without_a_valid_updated_at(value: Any) -> None:
+    exchanges = copy.deepcopy(load_fixture(ADAPTER, "list_assigned")["exchanges"])
+    exchanges[0]["response"]["json"][0]["updated_at"] = value
+    issues, complete = inline(exchanges)[1].list_assigned()
+    assert [i.ref for i in issues] == ["acme/widgets#44"]
+    assert complete is False
+
+
+def test_listing_without_updated_at_key_is_incomplete() -> None:
+    exchanges = copy.deepcopy(load_fixture(ADAPTER, "list_assigned")["exchanges"])
+    del exchanges[0]["response"]["json"][0]["updated_at"]
+    issues, complete = inline(exchanges)[1].list_assigned()
+    assert [i.ref for i in issues] == ["acme/widgets#44"] and complete is False
 
 
 def test_listing_omits_a_malformed_item_and_is_incomplete() -> None:
@@ -110,7 +127,7 @@ def test_listing_that_is_not_a_list_is_unavailable() -> None:
 def test_read_normalizes_the_thread() -> None:
     transport = ReplayTransport.from_fixture(ADAPTER, "attest_trusted")
     issue = make(transport).read(REF)
-    assert (issue.ref, issue.stable_id, issue.project) == (REF, "4242", None)
+    assert (issue.ref, issue.stable_id, issue.project) == (REF, "9042", None)
     assert issue.url == "https://github.com/acme/widgets/issues/42"
     assert issue.bot_id == "mimirbot"
     assert issue.author_id == "alice"
@@ -344,3 +361,66 @@ def test_a_url_that_is_not_a_safe_issue_url_is_never_emitted() -> None:
     with pytest.raises(TrackerUnavailable) as caught:
         adapter.read(ref)
     assert caught.value.code == "malformed_payload"
+
+
+def test_edit_activity_ids_use_the_edit_prefixed_formula() -> None:
+    issue = make(ReplayTransport.from_fixture(ADAPTER, "attest_untrusted_body_edit_masked")).read(REF)
+    edits = [a.id for a in issue.activities if a.kind == "body_edit"]
+    assert edits == [activity_id(ADAPTER, "edit:UCE_1"), activity_id(ADAPTER, "edit:UCE_2")]
+    issue = make(
+        ReplayTransport.from_fixture(ADAPTER, "attest_untrusted_comment_edit_masked")
+    ).read(REF)
+    ids = [a.id for a in issue.activities if a.kind == "comment_edit"]
+    assert len(ids) == 2 and all(i != activity_id(ADAPTER, i) for i in ids)
+    assert activity_id(ADAPTER, "edit:UCE_1") not in {a.id for a in issue.activities if a.kind != "comment_edit"}
+
+
+def test_bot_actors_carry_the_bot_suffix_and_trust_is_asked_about_it(
+    stub_trust: list[tuple[Any, ...]],
+) -> None:
+    def edit(issue: dict[str, Any]) -> None:
+        comment = issue["timelineItems"]["nodes"][1]
+        comment["author"] = {"__typename": "Bot", "login": "Helper"}
+        issue["author"] = {"__typename": "User", "login": "Helper"}
+
+    adapter = edited_read(edit)[1]
+    issue = adapter.read(REF)
+    assert issue.activities[1].actor_id == "helper[bot]"
+    assert issue.author_id == "helper"
+    delivery_decision(issue, adapter.trust)
+    asked = [call[1] for call in stub_trust]
+    assert "helper[bot]" in asked and "helper" not in asked
+
+
+@pytest.mark.parametrize("login", ["has space", "a" * 40, "bad_name", "x/y", "a[bot]b"])
+def test_actor_logins_outside_the_terms_form_are_unattributable(login: str) -> None:
+    def edit(issue: dict[str, Any]) -> None:
+        issue["timelineItems"]["nodes"][1]["author"] = {"__typename": "User", "login": login}
+
+    assert edited_read(edit)[1].read(REF).activities[1].actor_id is None
+
+
+def test_assignment_of_someone_else_is_not_an_assignment_activity() -> None:
+    def edit(issue: dict[str, Any]) -> None:
+        issue["timelineItems"]["nodes"][0]["assignee"]["login"] = "carol"
+        issue["timelineItems"]["nodes"][1]["author"]["login"] = "mallory"
+
+    issue = edited_read(edit)[1].read(REF)
+    assert [a.kind for a in issue.activities] == ["comment"]
+    decision = delivery_decision(issue, lambda actor, _: TRUSTED.get(actor))
+    assert decision.kind == "withhold"
+
+
+def test_bot_not_among_the_assignees_is_skipped() -> None:
+    def edit(issue: dict[str, Any]) -> None:
+        issue["assignees"]["nodes"][0]["login"] = "carol"
+
+    issue = edited_read(edit)[1].read(REF)
+    assert issue.assigned_to_bot is False
+    assert delivery_decision(issue, lambda actor, _: True).kind == "skip"
+
+
+def test_closed_issue_is_skipped() -> None:
+    issue = edited_read(lambda i: i.update(state="CLOSED"))[1].read(REF)
+    assert issue.is_open is False
+    assert delivery_decision(issue, lambda actor, _: True).kind == "skip"

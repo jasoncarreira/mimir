@@ -8,6 +8,7 @@ they compare equal to the bot identity.
 
 from __future__ import annotations
 
+import re
 import urllib.parse
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -23,17 +24,18 @@ from .base import REQUEST_TIMEOUT_SECONDS, ActionResult, TrackerAdapter
 ADAPTER = "github_issues"
 API = "https://api.github.com"
 LIST_PAGE_SIZE = 50
+_ACTOR_ID = re.compile(r"[a-z0-9-]{1,39}(\[bot\])?")
 
-_EDITS = "userContentEdits(first:100){totalCount pageInfo{hasNextPage} nodes{id editedAt editor{login}}}"
+_EDITS = "userContentEdits(first:100){totalCount pageInfo{hasNextPage} nodes{id editedAt editor{__typename login}}}"
 _QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
-    "{issue(number:$number){id databaseId number title body state createdAt author{login} "
-    f"lastEditedAt {_EDITS} assignees(first:20){{nodes{{login}}}} "
+    "{issue(number:$number){id databaseId number title body state createdAt author{__typename login} "
+    f"lastEditedAt {_EDITS} assignees(first:20){{nodes{{__typename login}}}} "
     "timelineItems(first:100, itemTypes:[ASSIGNED_EVENT, ISSUE_COMMENT, RENAMED_TITLE_EVENT])"
     "{totalCount pageInfo{hasNextPage} nodes{__typename "
-    "... on AssignedEvent{id createdAt actor{login} assignee{... on User{login} ... on Bot{login}}} "
-    f"... on IssueComment{{id createdAt author{{login}} body lastEditedAt {_EDITS}}} "
-    "... on RenamedTitleEvent{id createdAt actor{login}}}}}}}"
+    "... on AssignedEvent{id createdAt actor{__typename login} assignee{... on User{__typename login} ... on Bot{__typename login}}} "
+    f"... on IssueComment{{id createdAt author{{__typename login}} body lastEditedAt {_EDITS}}} "
+    "... on RenamedTitleEvent{id createdAt actor{__typename login}}}}}}}"
 )
 
 
@@ -196,13 +198,25 @@ class GithubIssuesAdapter:
         return repo.casefold(), int(number)
 
     def _actor(self, node: object) -> str | None:
+        """Return the casefolded actor id; Bots carry ``[bot]``, ghosts and odd logins are None."""
+
         if node is None:
             return None
         login = node["login"] if isinstance(node, Mapping) else None
         if not isinstance(login, str) or not login:
             raise ValueError("actor has no login")
         folded = login.casefold()
-        return None if folded == "ghost" else folded
+        if node.get("__typename") == "Bot" and not folded.endswith("[bot]"):
+            folded += "[bot]"
+        if folded == "ghost" or _ACTOR_ID.fullmatch(folded) is None:
+            return None
+        return folded
+
+    def _actor_or_none(self, node: object) -> str | None:
+        try:
+            return self._actor(node)
+        except (ValueError, KeyError):
+            return None
 
     def _listed(self, repo: str, item: Mapping[str, Any]) -> TrackerIssue | None:
         number, database_id, title = item.get("number"), item.get("id"), item.get("title")
@@ -212,6 +226,10 @@ class GithubIssuesAdapter:
             or not isinstance(title, str)
         ):
             return None
+        try:
+            updated_at = parse_timestamp(item.get("updated_at")).isoformat()
+        except ValueError:
+            return None
         ref = f"{repo}#{number}"
         url = _canonical_url(repo, number, ref)
         if url is None:
@@ -220,6 +238,7 @@ class GithubIssuesAdapter:
             adapter=ADAPTER, stable_id=str(database_id), ref=ref, url=url, project=None,
             title=title, body="", author_id=None, is_open=True, assigned_to_bot=True,
             activities=(), comments=(), truncated=False, bot_id=self._bot_id,
+            updated_at=updated_at,
         )
 
     def _parse(self, repo: str, number: int, node: Any) -> TrackerIssue:
@@ -248,10 +267,7 @@ class GithubIssuesAdapter:
             at = parse_timestamp(entry["createdAt"])
             if kind == "AssignedEvent":
                 assignee = entry["assignee"]
-                if (
-                    isinstance(assignee, Mapping)
-                    and str(assignee.get("login", "")).casefold() == self._bot_id
-                ):
+                if self._actor_or_none(assignee) == self._bot_id:
                     activities.append(
                         Activity(
                             "assigned", activity_id(ADAPTER, entry["id"]), at,
@@ -288,10 +304,7 @@ class GithubIssuesAdapter:
             body=body,
             author_id=self._actor(node["author"]),
             is_open=state == "OPEN",
-            assigned_to_bot=any(
-                isinstance(a, Mapping) and str(a.get("login", "")).casefold() == self._bot_id
-                for a in assignees
-            ),
+            assigned_to_bot=any(self._actor_or_none(a) == self._bot_id for a in assignees),
             activities=tuple(activities),
             comments=tuple(comments),
             truncated=truncated,
@@ -301,7 +314,7 @@ class GithubIssuesAdapter:
     def _edit_activities(self, kind: Any, node: Mapping[str, Any]) -> list[Activity]:
         return [
             Activity(
-                kind, activity_id(ADAPTER, edit["id"]), parse_timestamp(edit["editedAt"]),
+                kind, activity_id(ADAPTER, f"edit:{edit['id']}"), parse_timestamp(edit["editedAt"]),
                 self._actor(edit["editor"]),
             )
             for edit in node["userContentEdits"]["nodes"]
