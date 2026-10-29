@@ -7,10 +7,12 @@ import json
 import re
 import subprocess
 from collections.abc import Sequence
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
 import pytest
+from mimir.poller_tracker import safe_url
 
 from mimir_cultivate.tracker import drain as drain_module
 from mimir_cultivate.tracker.adapters.base import ActionResult
@@ -23,6 +25,7 @@ from mimir_cultivate.tracker.evidence import evidence_path, evidence_transaction
 from mimir_cultivate.tracker.transport import TrackerUnavailable
 
 EXT = "linear:ENG-1"
+LINEAR_URL = "https://linear.app/acme/issue/ENG-1"
 PR = "https://github.com/acme/app/pull/5"
 SHA = "abcdef1234567890"
 
@@ -34,10 +37,17 @@ class FakeAdapter:
         self.close_result = ActionResult("applied")
         self.transition_result = ActionResult("applied")
         self.raises: list[TrackerUnavailable] = []
+        self.read_raises = False
 
     def _maybe_raise(self) -> None:
         if self.raises:
             raise self.raises.pop(0)
+
+    def read(self, ref: str) -> SimpleNamespace:
+        self.calls.append(("read", ref))
+        if self.read_raises:
+            raise TrackerUnavailable("timeout")
+        return SimpleNamespace(url=f"https://linear.app/acme/issue/{ref}")
 
     def current_state(self, ref: str) -> str | None:
         self.calls.append(("current_state", ref))
@@ -336,7 +346,8 @@ def test_notices_emit_until_receipt_then_marked(tmp_path: Path, adapter: FakeAda
     assert emitted == [
         {
             "kind": "tracker_transition_unavailable", "delivery_key": key,
-            "adapter": "linear", "ref": "ENG-1", "lifecycle_event": "build_started",
+            "adapter": "linear", "ref": "ENG-1", "url": LINEAR_URL,
+            "lifecycle_event": "build_started",
             "reason": "state_not_found",
         }
     ]
@@ -374,3 +385,176 @@ def test_drain_writes_carry_no_text(tmp_path: Path, adapter: FakeAdapter) -> Non
     _run(tmp_path, _config(transitions={"build_started": "In Progress"}))
     writes = [c for c in adapter.calls if c[0] in ("transition", "close")]
     assert writes == [("transition", "ENG-1", "In Progress"), ("close", "ENG-1")]
+
+
+def _seed_notice(home: Path, url: str) -> str:
+    key = "trk-" + "0" * 24
+    with evidence_transaction(home) as data:
+        data["notices"].append(
+            {
+                "delivery_key": key, "adapter": "linear", "ref": "ENG-1", "url": url,
+                "lifecycle_event": "build_started", "reason": "state_not_found",
+                "created_at": "t", "notified": False,
+            }
+        )
+    return key
+
+
+def test_emitted_notice_carries_the_stored_url(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _seed_notice(tmp_path, "https://linear.app/acme/issue/ENG-1")
+    _, emitted = _run(tmp_path, _config())
+    assert [e["url"] for e in emitted] == ["https://linear.app/acme/issue/ENG-1"]
+
+
+def test_drain_created_notices_carry_a_canonical_url(
+    tmp_path: Path, adapter: FakeAdapter
+) -> None:
+    _closure(tmp_path)
+    _transition(tmp_path)
+    adapter.close_result = ActionResult("unavailable", "merged_state_required")
+    adapter.transition_result = ActionResult("unavailable", "state_not_found")
+    _run(tmp_path, _config(transitions={"build_started": "In Progress"}))
+    notices = _evidence(tmp_path)["notices"]
+    assert {n["lifecycle_event"] for n in notices} == {"merged", "build_started"}
+    assert all(safe_url(n["url"], "ENG-1") == LINEAR_URL for n in notices)
+
+
+@pytest.mark.parametrize(
+    ("ext", "env", "expected"),
+    [
+        ("github_issues:acme/app#9", {}, "https://github.com/acme/app/issues/9"),
+        ("jira:PROJ-12", {"JIRA_SITE": "acme.atlassian.net"}, "https://acme.atlassian.net/browse/PROJ-12"),
+    ],
+)
+def test_github_and_jira_notice_urls_are_built_without_a_tracker_read(
+    tmp_path: Path, adapter: FakeAdapter, ext: str, env: dict[str, str], expected: str
+) -> None:
+    name, _, ref = ext.partition(":")
+    with evidence_transaction(tmp_path) as data:
+        data["items"][ext] = {
+            "transitions": {
+                "build_started": {
+                    "stage": "requested", "state": "X", "result": None, "reason": None,
+                    "attempts": 0, "requested_at": "t", "recorded_at": None,
+                }
+            }
+        }
+    adapter.transition_result = ActionResult("refused", "nope")
+    config = TrackerConfig(
+        close_on_merge=True,
+        adapters={name: TrackerAdapterConfig(name=name, transitions={"build_started": "X"})},
+    )
+    drain(tmp_path, config, env, object(), Gh(), lambda s: None)  # type: ignore[arg-type]
+    (notice,) = _evidence(tmp_path)["notices"]
+    assert notice["url"] == expected and safe_url(expected, ref) == expected
+    assert not [c for c in adapter.calls if c[0] == "read"]
+
+
+def test_notice_waits_when_the_canonical_url_cannot_be_read(
+    tmp_path: Path, adapter: FakeAdapter
+) -> None:
+    _transition(tmp_path)
+    adapter.transition_result = ActionResult("unavailable", "state_not_found")
+    adapter.read_raises = True
+    config = _config(transitions={"build_started": "In Progress"})
+    _run(tmp_path, config)
+    data = _evidence(tmp_path)
+    entry = data["items"][EXT]["transitions"]["build_started"]
+    assert data["notices"] == []
+    assert (entry["stage"], entry["reason"], entry["attempts"]) == (
+        "requested", "notice_url_unavailable", 0,
+    )
+    adapter.read_raises = False
+    _run(tmp_path, config)
+    data = _evidence(tmp_path)
+    assert data["items"][EXT]["transitions"]["build_started"]["stage"] == "done"
+    assert [n["url"] for n in data["notices"]] == [LINEAR_URL]
+
+
+def test_pr_read_failure_capped_with_one_notice(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+
+    class Failing(Gh):
+        def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+            self.calls += 1
+            return subprocess.CompletedProcess([], 1, "", "boom")
+
+    gh = Failing()
+    for _ in range(3):
+        _run(tmp_path, _config(), gh)
+    data = _evidence(tmp_path)
+    closure = data["items"][EXT]["closure"]
+    assert (closure["stage"], closure["result"], closure["reason"]) == (
+        "done", "failed", "pr_read_failed",
+    )
+    assert [(n["lifecycle_event"], n["reason"]) for n in data["notices"]] == [
+        ("merged", "pr_read_failed")
+    ]
+    assert gh.calls == 3
+    _run(tmp_path, _config(), gh)
+    assert gh.calls == 3 and len(_evidence(tmp_path)["notices"]) == 1
+
+
+@pytest.mark.parametrize("section", ["closure", "transition"])
+def test_started_entry_at_the_attempt_cap_fails_without_a_call(
+    tmp_path: Path, adapter: FakeAdapter, section: str
+) -> None:
+    if section == "closure":
+        _closure(tmp_path, stage="started", attempts=drain_module.MAX_ATTEMPTS)
+    else:
+        _transition(tmp_path, stage="started", attempts=drain_module.MAX_ATTEMPTS)
+    _run(tmp_path, _config(transitions={"build_started": "In Progress"}))
+    data = _evidence(tmp_path)
+    item = data["items"][EXT]
+    entry = item["closure"] if section == "closure" else item["transitions"]["build_started"]
+    assert (entry["stage"], entry["result"], entry["attempts"]) == (
+        "done", "failed", drain_module.MAX_ATTEMPTS,
+    )
+    assert len(data["notices"]) == 1
+    assert [c for c in adapter.calls if c[0] != "read"] == []
+
+
+def test_missing_adapter_records_one_notice(tmp_path: Path, adapter: FakeAdapter) -> None:
+    ext = "github_issues:acme/app#9"
+    with evidence_transaction(tmp_path) as data:
+        data["items"][ext] = {
+            "closure": {
+                "stage": "requested", "chainlink_issue": 7, "pr_url": PR, "result": None,
+                "reason": None, "attempts": 0, "merge_commit_sha": None, "base_ref": None,
+                "requested_at": "t", "recorded_at": None,
+            }
+        }
+    gh = Gh()
+    for _ in range(3):
+        drain(tmp_path, _config(), {}, object(), gh, lambda s: None)  # type: ignore[arg-type]
+    notices = _evidence(tmp_path)["notices"]
+    assert [(n["adapter"], n["reason"], n["url"]) for n in notices] == [
+        ("github_issues", "adapter_unavailable", "https://github.com/acme/app/issues/9")
+    ]
+    assert gh.calls == 0
+
+
+def test_adapter_build_failure_records_one_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError("unavailable")
+
+    monkeypatch.setattr(drain_module, "build_adapter", broken)
+    ext = "jira:PROJ-12"
+    with evidence_transaction(tmp_path) as data:
+        data["items"][ext] = {
+            "transitions": {
+                "build_started": {
+                    "stage": "requested", "state": "X", "result": None, "reason": None,
+                    "attempts": 0, "requested_at": "t", "recorded_at": None,
+                }
+            }
+        }
+    config = TrackerConfig(
+        close_on_merge=True,
+        adapters={"jira": TrackerAdapterConfig(name="jira", transitions={"build_started": "X"})},
+    )
+    for _ in range(2):
+        drain(tmp_path, config, {"JIRA_SITE": "acme.atlassian.net"}, object(), Gh(), lambda s: None)  # type: ignore[arg-type]
+    assert [n["reason"] for n in _evidence(tmp_path)["notices"]] == ["adapter_unavailable"]

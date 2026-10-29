@@ -14,12 +14,15 @@ from mimir_cultivate.tracker.config import TrackerAdapterConfig, TrackerConfig
 from mimir_cultivate.tracker.drain import drain
 from mimir_cultivate.tracker.evidence import evidence_path, read_evidence
 from mimir_cultivate.worklink import merge_closure as closure
+from mimir_cultivate.worklink.evidence import TestResult, WorklinkEvidence
+from mimir_cultivate.worklink.orchestrator import _write_evidence
 from tests.test_worklink_merge_closure import (  # noqa: F401  (autouse fixture)
     PR_URL,
     Tracker,
     configured_home,
     evidence,
     forge,
+    unresolved_reasons,
     git_runner,
     selected_repository_provider,
 )
@@ -141,8 +144,6 @@ def test_on_epic_queues_only_once_merged_and_keeps_notice(
     assert not evidence_path(home).exists()
     assert _reconcile(home, repo, _epic(37), 37) == []
     assert _requests(home)[EXT]["closure"]["pr_url"] == PR_URL
-    from tests.test_worklink_merge_closure import unresolved_reasons
-
     assert unresolved_reasons(home) == ["epic_not_leaf"]
 
 
@@ -160,7 +161,16 @@ class _Adapter:
 
 def test_on_epic_closes_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     home, repo = _home(tmp_path, monkeypatch, close=True)
-    evidence(home, 38)
+    _write_evidence(
+        home,
+        WorklinkEvidence(
+            issue=38, attempt=1, backend="codex", branch="issue/38-a1",
+            checkout=str(tmp_path / "checkout"), started_at="2026-09-20T10:00:00+00:00",
+            finished_at="2026-09-20T10:05:00+00:00", files_changed=["mimir/example.py"],
+            diff_stat="1 file changed", commands=[], tests=TestResult(cmd="pytest", exit_code=0),
+            pr_url=PR_URL, status="completed",
+        ),
+    )
     _reconcile(home, repo, _epic(38), 38)
     _reconcile(home, repo, _epic(38), 38)
     adapter = _Adapter()
@@ -195,3 +205,39 @@ def test_on_leaf_closes_once_via_reconcile_and_drain(
     drain(home, config, {}, object(), gh, lambda s: None)  # type: ignore[arg-type]
     assert adapter.calls == [("close", "ENG-1")] and len(seen) == 1
     assert _requests(home)[EXT]["closure"]["base_ref"] == "feature/plugins"
+
+
+@pytest.mark.parametrize("error", [closure.ClosureReadError("pr_read_failed"), OSError("disk")])
+def test_epic_hook_failure_keeps_the_epic_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    home, repo = _home(tmp_path, monkeypatch, close=True)
+    evidence(home, 40)
+
+    def boom(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(closure, "discover_associations", boom)
+    assert _reconcile(home, repo, _epic(40), 40) == []
+    assert unresolved_reasons(home) == ["epic_not_leaf"]
+    assert not evidence_path(home).exists()
+
+
+def test_epic_on_a_foreign_base_repository_queues_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, repo = _home(tmp_path, monkeypatch, close=True)
+    evidence(home, 41)
+    _reconcile(home, repo, _epic(41), 41, slug="other/project")
+    assert not evidence_path(home).exists()
+    assert unresolved_reasons(home) == ["epic_not_leaf"]
+
+
+def test_epic_dry_run_queues_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home, repo = _home(tmp_path, monkeypatch, close=True)
+    evidence(home, 42)
+    closure.reconcile_merged_leaves(
+        home, dry_run=True, chainlink_runner=_epic(42), gh_runner=forge(42),
+        git_runner=git_runner(repo),
+    )
+    assert not evidence_path(home).exists()

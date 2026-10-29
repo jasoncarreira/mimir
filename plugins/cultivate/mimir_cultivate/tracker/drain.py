@@ -14,6 +14,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from mimir.poller_tracker import safe_url
+
 from ..worklink.dispatch_failures import delivery_receipt_exists
 from ..worklink.merge_closure import ClosureReadError, Runner, read_pr_snapshot
 from .adapters import build_adapter
@@ -25,6 +27,8 @@ from .transport import TrackerTransport, TrackerUnavailable
 
 MAX_ACTIONS = 10
 MAX_ATTEMPTS = 3
+ADAPTER_UNAVAILABLE = "adapter_unavailable"
+URL_UNAVAILABLE = "notice_url_unavailable"
 NOTICE_KIND = "tracker_transition_unavailable"
 _OPEN_STAGES = ("requested", "started")
 
@@ -93,8 +97,56 @@ class _Drain:
         self.actions += 1
         return True
 
+    def notice_url(self, ext_ref: str) -> str | None:
+        """Return the canonical issue URL for a notice, or None when it cannot be established.
+
+        Reads the tracker for Linear, so it must be called outside the evidence lock.
+        """
+
+        adapter_name, ref = _split(ext_ref)
+        url: str | None = None
+        if adapter_name == "github_issues":
+            repo, _, number = ref.partition("#")
+            url = f"https://github.com/{repo}/issues/{number}"
+        elif adapter_name == "jira":
+            site = self.env.get("JIRA_SITE", "").strip()
+            if site:
+                url = f"https://{site}/browse/{ref}"
+        elif adapter_name == "linear":
+            adapter = self.adapter(adapter_name)
+            if adapter is not None:
+                try:
+                    url = adapter.read(ref).url
+                except TrackerUnavailable:
+                    url = None
+        return safe_url(url, ref)
+
+    def _defer(self, ext_ref: str, section: str, key: str | None) -> None:
+        """Put a request back in line without spending an attempt; its notice needs a URL first."""
+
+        with evidence_transaction(self.home) as data:
+            entry = self._entry(data, ext_ref, section, key)
+            if entry is not None:
+                entry.update(
+                    stage="requested", reason=URL_UNAVAILABLE, attempts=max(entry["attempts"] - 1, 0)
+                )
+
+    def _adapter_missing(self, ext_ref: str, event: str) -> None:
+        url = self.notice_url(ext_ref)
+        if url is None:
+            return
+        with evidence_transaction(self.home) as data:
+            adapter, ref = _split(ext_ref)
+            if any(
+                (n["adapter"], n["ref"], n["lifecycle_event"], n["reason"])
+                == (adapter, ref, event, ADAPTER_UNAVAILABLE)
+                for n in data["notices"]
+            ):
+                return
+            self._add_notice(data, ext_ref, event, ADAPTER_UNAVAILABLE, url)
+
     def _add_notice(
-        self, data: dict[str, Any], ext_ref: str, event: str, reason: str
+        self, data: dict[str, Any], ext_ref: str, event: str, reason: str, url: str
     ) -> None:
         created_at = self.clock()
         adapter, ref = _split(ext_ref)
@@ -103,7 +155,7 @@ class _Drain:
                 "delivery_key": _notice_key(ext_ref, event, reason, created_at),
                 "adapter": adapter,
                 "ref": ref,
-                "url": "",
+                "url": url,
                 "lifecycle_event": event,
                 "reason": reason,
                 "created_at": created_at,
@@ -128,6 +180,7 @@ class _Drain:
                     "delivery_key": key,
                     "adapter": notice["adapter"],
                     "ref": notice["ref"],
+                    "url": notice["url"],
                     "lifecycle_event": notice["lifecycle_event"],
                     "reason": notice["reason"],
                 }
@@ -149,6 +202,12 @@ class _Drain:
         notice: str | None = None,
         **extra: Any,
     ) -> None:
+        url = None
+        if notice is not None:
+            url = self.notice_url(ext_ref)
+            if url is None:
+                self._defer(ext_ref, section, key)
+                return
         with evidence_transaction(self.home) as data:
             entry = self._entry(data, ext_ref, section, key)
             if entry is None:
@@ -156,8 +215,8 @@ class _Drain:
             entry.update(
                 stage="done", result=result, reason=reason, recorded_at=self.clock(), **extra
             )
-            if notice is not None:
-                self._add_notice(data, ext_ref, notice, reason or result)
+            if notice is not None and url is not None:
+                self._add_notice(data, ext_ref, notice, reason or result, url)
 
     def _retry(
         self,
@@ -191,8 +250,16 @@ class _Drain:
         return item.get(section, {}).get(key)
 
     def _start(
-        self, ext_ref: str, section: str, key: str | None, **fields: Any
+        self, ext_ref: str, section: str, key: str | None, event: str, **fields: Any
     ) -> int | None:
+        current = self._entry(read_evidence(self.home), ext_ref, section, key)
+        if current is not None and current["attempts"] >= MAX_ATTEMPTS:
+            if current["stage"] in _OPEN_STAGES:
+                self._finish(
+                    ext_ref, section, key,
+                    result="failed", reason="attempts_exhausted", notice=event,
+                )
+            return None
         with evidence_transaction(self.home) as data:
             entry = self._entry(data, ext_ref, section, key)
             if entry is None or entry["stage"] not in _OPEN_STAGES:
@@ -216,9 +283,12 @@ class _Drain:
             self._finish(ext_ref, "transitions", event, result="unset", reason=None)
             return
         adapter = self.adapter(adapter_name)
-        if adapter is None or not self.spend():
+        if adapter is None:
+            self._adapter_missing(ext_ref, event)
             return
-        attempts = self._start(ext_ref, "transitions", event, state=state)
+        if not self.spend():
+            return
+        attempts = self._start(ext_ref, "transitions", event, event, state=state)
         if attempts is None:
             return
         try:
@@ -262,7 +332,10 @@ class _Drain:
     def _close(self, ext_ref: str, pr_url: str) -> None:
         adapter_name, ref = _split(ext_ref)
         adapter = self.adapter(adapter_name)
-        if adapter is None or not self.spend():
+        if adapter is None:
+            self._adapter_missing(ext_ref, "merged")
+            return
+        if not self.spend():
             return
         try:
             pr = read_pr_snapshot(pr_url, gh_bin="gh", runner=self.gh_runner)
@@ -279,6 +352,7 @@ class _Drain:
             ext_ref,
             "closure",
             None,
+            "merged",
             merge_commit_sha=pr.merge_commit_sha,
             base_ref=pr.base_ref,
         )
@@ -320,19 +394,25 @@ class _Drain:
         return outcome, "already_closed" if outcome.status == "already" else "closed"
 
     def _read_failed(self, ext_ref: str) -> None:
+        current = self._entry(read_evidence(self.home), ext_ref, "closure", None)
+        url = None
+        if current is not None and current["attempts"] + 1 >= MAX_ATTEMPTS:
+            url = self.notice_url(ext_ref)
+            if url is None:
+                return
         with evidence_transaction(self.home) as data:
             entry = self._entry(data, ext_ref, "closure", None)
             if entry is None:
                 return
             entry["attempts"] += 1
             entry["reason"] = "pr_read_failed"
-            if entry["attempts"] >= MAX_ATTEMPTS:
+            if entry["attempts"] >= MAX_ATTEMPTS and url is not None:
                 entry.update(
                     stage="done",
                     result="failed",
                     recorded_at=self.clock(),
                 )
-                self._add_notice(data, ext_ref, "merged", "pr_read_failed")
+                self._add_notice(data, ext_ref, "merged", "pr_read_failed", url)
 
 
 def drain(
