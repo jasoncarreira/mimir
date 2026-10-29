@@ -8,6 +8,7 @@ because tracker responses can hold attacker-written prose.
 
 from __future__ import annotations
 
+import http.client
 import json as _json
 import re
 import urllib.error
@@ -93,6 +94,8 @@ class UrllibTransport:
         except urllib.error.HTTPError as exc:
             try:
                 body = _parse(exc.read(_MAX_RESPONSE_BYTES))
+            except (http.client.HTTPException, OSError):
+                raise TrackerUnavailable("transport") from None
             finally:
                 exc.close()
             return HttpResponse(exc.code, None if body is _UNPARSED else body)
@@ -102,7 +105,7 @@ class UrllibTransport:
             raise TrackerUnavailable(
                 "timeout" if isinstance(exc.reason, TimeoutError) else "transport"
             ) from None
-        except (OSError, ValueError):
+        except (OSError, ValueError, http.client.HTTPException):
             raise TrackerUnavailable("transport") from None
 
 

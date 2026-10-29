@@ -148,6 +148,22 @@ def test_same_timestamp_untrusted_activity_withholds() -> None:
     assert decision == Decision("withhold", "untrusted_latest_activity")
 
 
+@pytest.mark.parametrize(("assign_id", "comment_id"), [("ev-1", "ev-9"), ("ev-9", "ev-1")])
+def test_untrusted_comment_tied_with_trusted_assignment_withholds(
+    assign_id: str, comment_id: str
+) -> None:
+    decision = decide(act("assigned", assign_id, 2, "alice"), act("comment", comment_id, 2, "mallory"))
+
+    assert decision == Decision("withhold", "untrusted_latest_activity")
+
+
+@pytest.mark.parametrize("verdict", [1, "yes", [True], object()])
+def test_truthy_non_bool_verdict_does_not_attest(verdict: object) -> None:
+    decision = delivery_decision(make_issue(ASSIGN), lambda actor_id, issue: verdict)  # type: ignore[arg-type,return-value]
+
+    assert decision == Decision("withhold", "untrusted_latest_activity")
+
+
 def test_same_timestamp_group_cutoff_is_the_greatest_id() -> None:
     low = act("assigned", "ev-1", 2, "alice")
     high = act("comment", "ev-9", 2, "carol")

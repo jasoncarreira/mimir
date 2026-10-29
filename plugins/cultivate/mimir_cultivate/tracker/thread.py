@@ -103,7 +103,8 @@ def delivery_decision(issue: TrackerIssue, trust: Trust) -> Decision:
             return False
         if actor_id not in verdicts:
             try:
-                verdicts[actor_id] = trust(actor_id, issue)
+                answer = trust(actor_id, issue)
+                verdicts[actor_id] = None if answer is None else answer is True
             except TrackerUnavailable:
                 verdicts[actor_id] = None
         return verdicts[actor_id]

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +127,7 @@ def test_error_status_with_non_json_body_keeps_the_status(opener) -> None:
         (urllib.error.URLError(TimeoutError("secret text")), "timeout"),
         (urllib.error.URLError("secret text"), "transport"),
         (ConnectionResetError("secret text"), "transport"),
+        (http.client.BadStatusLine("secret text"), "transport"),
     ],
 )
 def test_network_failures_carry_only_a_code(opener, failure: BaseException, code: str) -> None:
@@ -134,7 +137,44 @@ def test_network_failures_carry_only_a_code(opener, failure: BaseException, code
         call()
 
     assert caught.value.code == code
-    assert "secret" not in str(caught.value) and caught.value.__cause__ is None
+    assert "secret" not in str(caught.value) and caught.value.__suppress_context__ is True
+
+
+class BrokenBody:
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
+
+    def read(self, limit: int = -1) -> bytes:
+        raise http.client.IncompleteRead(b"secret text")
+
+    def __enter__(self) -> "BrokenBody":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def test_incomplete_success_body_carries_only_a_code(opener) -> None:
+    opener(BrokenBody())
+
+    with pytest.raises(TrackerUnavailable) as caught:
+        call()
+
+    assert caught.value.code == "transport"
+    assert "secret" not in str(caught.value) and caught.value.__suppress_context__ is True
+
+
+def test_unreadable_error_body_carries_only_a_code(opener) -> None:
+    opener(urllib.error.HTTPError(URL, 502, "bad", {}, BrokenBody()))  # type: ignore[arg-type]
+
+    with pytest.raises(TrackerUnavailable) as caught:
+        call()
+
+    assert caught.value.code == "transport"
+    assert "secret" not in str(caught.value) and caught.value.__suppress_context__ is True
 
 
 def test_plain_http_is_refused_without_a_request(opener) -> None:
@@ -150,6 +190,36 @@ def test_redirects_are_not_followed() -> None:
     handler = transport._NoRedirect()
 
     assert handler.redirect_request(object(), object(), 302, "Found", {}, "https://evil/") is None
+
+
+def test_opener_refuses_to_follow_a_redirect(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+
+    class Redirecting(http.client.HTTPSConnection):
+        def request(self, method: str, url: str, *args: Any, **kwargs: Any) -> None:
+            seen.append(url)
+
+        def getresponse(self) -> Any:
+            raw = b"HTTP/1.1 302 Found\r\nLocation: https://evil.test/next\r\nContent-Length: 0\r\n\r\n"
+
+            class Sock:
+                def makefile(self, *args: Any, **kwargs: Any) -> io.BytesIO:
+                    return io.BytesIO(raw)
+
+            response = http.client.HTTPResponse(Sock())  # type: ignore[arg-type]
+            response.begin()
+            return response
+
+        def connect(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(urllib.request.HTTPSHandler, "https_open", lambda self, req: self.do_open(Redirecting, req))
+
+    assert call() == HttpResponse(302, None)
+    assert len(seen) == 1
 
 
 def test_default_transport_is_urllib() -> None:
