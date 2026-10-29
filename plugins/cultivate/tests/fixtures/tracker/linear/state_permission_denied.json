@@ -1,0 +1,99 @@
+{
+  "source": "Linear GraphQL API reference https://linear.app/developers/graphql and schema https://studio.apollographql.com/public/Linear-API/variant/current/schema/reference: Query.issue(id:) with Issue.id, Issue.state.name/type, Issue.team.states(WorkflowStateConnection).id/name/type; Mutation.issueUpdate answers errors[].extensions.code FORBIDDEN",
+  "exchanges": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.linear.app/graphql",
+        "json": {
+          "query": "query Viewer { viewer { id } }",
+          "variables": {}
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "data": {
+            "viewer": {
+              "id": "usr-bot"
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.linear.app/graphql",
+        "json": {
+          "query": "query IssueWorkflow($id: String!) { issue(id: $id) { id state { name type } team { states(first: 250) { nodes { id name type } } } } }",
+          "variables": {
+            "id": "ENG-123"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "data": {
+            "issue": {
+              "id": "iss-123",
+              "state": {
+                "name": "In Progress",
+                "type": "started"
+              },
+              "team": {
+                "states": {
+                  "nodes": [
+                    {
+                      "id": "st-todo",
+                      "name": "Todo",
+                      "type": "unstarted"
+                    },
+                    {
+                      "id": "st-prog",
+                      "name": "In Progress",
+                      "type": "started"
+                    },
+                    {
+                      "id": "st-done",
+                      "name": "Done",
+                      "type": "completed"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.linear.app/graphql",
+        "json": {
+          "query": "mutation SetState($id: String!, $stateId: String!) { issueUpdate(id: $id, input: {stateId: $stateId}) { success } }",
+          "variables": {
+            "id": "ENG-123",
+            "stateId": "st-done"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "errors": [
+            {
+              "message": "forbidden",
+              "extensions": {
+                "code": "FORBIDDEN",
+                "type": "forbidden"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
