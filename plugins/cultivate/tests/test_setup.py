@@ -6,6 +6,7 @@ import argparse
 import base64
 from contextlib import redirect_stdout
 import io
+import hashlib
 import json
 import logging
 import os
@@ -3344,6 +3345,7 @@ def test_tracker_secret_conflicts_with_differing_compose_env(upgrade_setup, tmp_
     ({"jira_site": "a" * 250 + ".net"}, "Invalid Jira site"),
     ({"jira_account_id": "acct.with.dots"}, "Invalid Jira account id"),
     ({"jira_account_id": "a" * 129}, "Invalid Jira account id"),
+    ({"jira_account_id": "acct with space"}, "Invalid Jira account id"),
 ])
 def test_invalid_jira_settings_fail_before_any_file_is_written(setup_environment, overrides, message):
     deploy, args, state, calls, invoke = setup_environment
@@ -3369,20 +3371,22 @@ def test_jira_site_is_lowercased_to_the_adapter_format(setup_environment, tmp_pa
 def test_tracker_skill_is_installed_only_when_selected(provisioned_skills, monkeypatch):
     home, manifest, defaults, run = provisioned_skills
     seen = []
-    monkeypatch.setattr(installer, "_provision_worklink", lambda *a, **kw: seen.append(kw.get("tracker")) or False)
+    monkeypatch.setattr(installer, "_provision_worklink", lambda *a, **kw: seen.append((kw.get("tracker"), kw.get("previous_tracker"))) or False)
     run()
     assert not (home / "skills/cultivate-tracker-poller").exists()
     assert (home / "skills/cultivate-github-poller").is_dir()
-    assert seen == [None]
+    assert seen == [(None, None)]
     config = {"close_on_merge": False, "adapters": {"linear": {}}}
     data = json.loads(manifest.read_text())
-    manifest.write_text(json.dumps({**data, "trackers": ["linear"], "tracker_config": config}))
+    previous = {"close_on_merge": False, "adapters": {"jira": {}}}
+    manifest.write_text(json.dumps({**data, "trackers": ["linear"], "tracker_config": config,
+                                    "previous_tracker_config": previous}))
     run()
     assert (home / "skills/cultivate-tracker-poller/SKILL.md").is_file()
-    assert seen[-1] == config
+    assert seen[-1] == (config, previous)
 
 
-def test_worklink_yaml_gets_tracker_section_only_when_selected(tmp_path, monkeypatch):
+def test_worklink_yaml_gets_tracker_section_only_when_selected(tmp_path, monkeypatch, capsys):
     original_run = subprocess.run
     origin = tmp_path / "remote.git"
     seed = tmp_path / "seed"
@@ -3430,15 +3434,48 @@ def test_worklink_yaml_gets_tracker_section_only_when_selected(tmp_path, monkeyp
     assert installer._provision_worklink(home, entry, tracker=None, previous_tracker=switched, **kwargs)
     assert path.read_bytes() == plain
     installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=None, **kwargs)
-    edited = path.read_bytes().replace(b"PROJ", b"HAND")
-    path.write_bytes(edited)
+    digest = home / ".mimir/worklink-setup.sha256"
+    assert digest.read_text().strip() == hashlib.sha256(path.read_bytes()).hexdigest()
+    written = path.read_bytes()
+    # A rerun after provisioning failed before this step: the saved manifest
+    # already names the new selection, so only the recorded digest proves the
+    # file is still what setup wrote.
+    assert installer._provision_worklink(home, entry, tracker=None, previous_tracker=None, **kwargs)
+    assert path.read_bytes() == plain
+    assert installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=tracker, **kwargs)
+    assert path.read_bytes() == written
+    # A deployment that predates the digest reconciles from the previous rendering.
+    digest.unlink()
+    assert installer._provision_worklink(home, entry, tracker=None, previous_tracker=tracker, **kwargs)
+    assert path.read_bytes() == plain
+    assert digest.read_text().strip() == hashlib.sha256(plain).hexdigest()
+    digest.unlink()
     with pytest.raises(RuntimeError, match="--force"):
         installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=tracker, **kwargs)
-    with pytest.raises(RuntimeError, match="--force"):
-        installer._provision_worklink(home, entry, tracker=None, previous_tracker=tracker, **kwargs)
-    assert path.read_bytes() == edited
+    installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=None, force=True, **kwargs)
+    for edited in (path.read_bytes().replace(b"PROJ", b"HAND"), path.read_bytes().replace(b"max_concurrent: 2", b"max_concurrent: 7")):
+        assert edited != path.read_bytes()
+        good = path.read_bytes()
+        path.write_bytes(edited)
+        capsys.readouterr()
+        with pytest.raises(RuntimeError, match="--force"):
+            installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=tracker, **kwargs)
+        assert installer._WORKLINK_EDITED in capsys.readouterr().out.splitlines()
+        with pytest.raises(RuntimeError, match="--force"):
+            installer._provision_worklink(home, entry, tracker=None, previous_tracker=tracker, **kwargs)
+        assert path.read_bytes() == edited
+        assert installer._provision_worklink(home, entry, tracker=tracker, previous_tracker=None, force=True, **kwargs)
+        assert path.read_bytes() == good
     assert installer._provision_worklink(home, entry, tracker=None, previous_tracker=tracker, force=True, **kwargs)
     assert path.read_bytes() == plain
+
+
+def test_setup_relays_the_worklink_edited_error_to_the_operator(setup_environment):
+    deploy, args, state, calls, invoke = setup_environment
+    state["provision_failure"] = installer._WORKLINK_EDITED_HELP
+    with pytest.raises(installer.SetupError) as caught:
+        invoke()
+    assert "worklink.yaml" in str(caught.value) and "--force" in str(caught.value)
 
 
 def test_hand_edited_worklink_refusal_names_the_file_and_force(monkeypatch):
@@ -3505,3 +3542,29 @@ def test_plain_jira_email_flag_is_validated_and_kept_out_of_output(setup_environ
     haystack = captured.out + captured.err + caplog.text + json.dumps(state["verified"], default=str)
     haystack += (deploy / "manifest.json").read_text()
     assert "svc-plain@example.com" not in haystack
+
+
+@pytest.mark.parametrize("other", [{"jira_email_file": "x.secret"}, {"jira_email_stdin": True}])
+def test_plain_jira_email_is_exclusive_with_file_and_stdin(setup_environment, tmp_path, monkeypatch, other):
+    deploy, args, state, calls, invoke = setup_environment
+    _use_tracker_secrets(args, tmp_path, monkeypatch, jira_api_token="jira-token-value")
+    args.tracker = ["jira"]
+    for key, value in _JIRA_FLAGS.items():
+        setattr(args, key, value)
+    args.jira_email = "svc-plain@example.com"
+    for key, value in other.items():
+        setattr(args, key, value)
+    with pytest.raises(installer.SetupError, match="Choose only one source for jira email"):
+        invoke()
+    assert not deploy.exists()
+
+
+def test_plain_jira_email_is_stripped(setup_environment, tmp_path, monkeypatch):
+    deploy, args, state, calls, invoke = setup_environment
+    _use_tracker_secrets(args, tmp_path, monkeypatch, jira_api_token="jira-token-value")
+    args.tracker = ["jira"]
+    for key, value in _JIRA_FLAGS.items():
+        setattr(args, key, value)
+    args.jira_email = "  svc-plain@example.com \n"
+    invoke()
+    assert _compose_env(deploy)["JIRA_EMAIL"] == "svc-plain@example.com"

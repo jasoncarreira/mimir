@@ -87,6 +87,8 @@ _JIRA_SITE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-
 _JIRA_SITE_ADAPTER = re.compile(r"[a-z0-9.-]{1,253}")
 _JIRA_ACCOUNT_ID = re.compile(r"[A-Za-z0-9:_-]{1,128}")
 _WORKLINK_EDITED = "CULTIVATE_WORKLINK_EDITED"
+_WORKLINK_EDITED_HELP = ("worklink.yaml was edited by hand and differs from what setup would write; "
+                         "review it, or rerun setup with --force to replace it.")
 _JIRA_PERMISSION_HELP = (
     "Jira service account id (accountId). The service account needs Browse Projects on each "
     "--jira-project, Add Comments, and Transition Issues when transitions or close_on_merge are set. "
@@ -822,15 +824,30 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
         return yaml.safe_dump(rendered, sort_keys=False)
 
     text = render(tracker)
+    data = text.encode()
+    # Setup records the digest of the exact bytes it last wrote. Runtime state
+    # under .mimir is not operator-edited configuration, so a file matching the
+    # digest is provably unedited even when provisioning stopped before this step.
+    digest_path = home / '.mimir' / 'worklink-setup.sha256'
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise RuntimeError(f"Worklink config {path} must be a regular file; move it aside")
-    if (path.exists() and path.read_text() != text and not force
-            and path.read_text() != render(previous_tracker)):
-        print(_WORKLINK_EDITED, flush=True)
-        raise RuntimeError(f"Worklink config {path} differs; preserve operator edits or rerun with --force")
-    if not path.exists() or path.read_text() != text:
-        path.write_text(text)
+    if path.exists() and path.read_bytes() != data and not force:
+        current = path.read_bytes()
+        recorded = digest_path.read_text().strip() if digest_path.is_file() else None
+        # Deployments that predate the digest are unedited when the file is
+        # exactly the rendering of the previously saved tracker selection.
+        unedited = (hashlib.sha256(current).hexdigest() == recorded if recorded
+                    else current == render(previous_tracker).encode())
+        if not unedited:
+            print(_WORKLINK_EDITED, flush=True)
+            raise RuntimeError(f"Worklink config {path} differs; preserve operator edits or rerun with --force")
+    if not path.exists() or path.read_bytes() != data:
+        path.write_bytes(data)
         created = True
+    digest = hashlib.sha256(data).hexdigest()
+    if not digest_path.is_file() or digest_path.read_text().strip() != digest:
+        digest_path.parent.mkdir(parents=True, exist_ok=True)
+        digest_path.write_text(digest + '\n')
     BackendRegistry(WorklinkConfig.load(path))
     store = home / '.chainlink'
     if store.is_symlink() or (store.exists() and not store.is_dir()):
@@ -987,8 +1004,7 @@ def _run(args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None
         if _PUSH_PROBE_UNREACHABLE in result.stdout.splitlines():
             raise SetupError(_PUSH_PROBE_UNREACHABLE_HELP)
         if _WORKLINK_EDITED in result.stdout.splitlines():
-            raise SetupError("worklink.yaml was edited by hand and differs from what setup would write; "
-                             "review it, or rerun setup with --force to replace it.")
+            raise SetupError(_WORKLINK_EDITED_HELP)
         for name in _CULTIVATE_DEFAULT_SKILLS:
             if "CULTIVATE_SKILL_MODIFIED:" + name in result.stdout.splitlines():
                 raise SetupError(f"Modified Cultivate skill cultivate:{name}; reconcile it or run "
@@ -1625,7 +1641,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         try:
             return run(argv, cwd=deploy)
         except SetupError as exc:
-            if str(exc) in {_PUSH_PROBE_HELP, _PUSH_PROBE_UNREACHABLE_HELP} or str(exc).startswith("Modified Cultivate skill cultivate:"):
+            if str(exc) in {_PUSH_PROBE_HELP, _PUSH_PROBE_UNREACHABLE_HELP, _WORKLINK_EDITED_HELP} or str(exc).startswith("Modified Cultivate skill cultivate:"):
                 raise
             # Do not interpolate subprocess output (including compose.env values).
             raise SetupError(f"Docker {step} failed; inspect the deployment and docker compose logs.") from None
