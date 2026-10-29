@@ -6,13 +6,15 @@ from typing import Any
 
 import pytest
 
+from mimir.poller_tracker import safe_event_id
 from mimir_cultivate.tracker.adapters import build_adapter
 from mimir_cultivate.tracker.adapters.jira import JiraAdapter
 from mimir_cultivate.tracker.config import TrackerAdapterConfig
-from mimir_cultivate.tracker.thread import delivery_decision
+from mimir_cultivate.tracker.thread import activity_id, delivery_decision
 from mimir_cultivate.tracker.transport import TrackerUnavailable
 from tracker_replay import (
     ReplayTransport,
+    forbid_default_transport,  # noqa: F401  (opt-in fixture)
     assert_fixture_inventory,
     assert_outcome,
     run_contract,
@@ -26,6 +28,10 @@ API = f"https://{SITE}/rest/api/3/"
 READ = (
     API + f"issue/{REF}?expand=changelog"
     "&fields=summary,description,status,assignee,project,creator,comment,updated"
+)
+JQL = (
+    'assignee = "acct-bot" AND statusCategory != Done '
+    'AND project in ("PROJ") ORDER BY updated DESC'
 )
 
 
@@ -76,6 +82,11 @@ ASSIGNED = {
     "created": "2026-10-01T09:00:00.000+0000",
     "items": [{"field": "assignee", "to": "acct-bot"}],
 }
+
+
+@pytest.fixture(autouse=True)
+def _no_default_transport(forbid_default_transport) -> None:  # noqa: F811
+    return None
 
 
 def test_fixture_inventory_matches_scenarios() -> None:
@@ -132,9 +143,12 @@ def test_read_url_is_canonical_and_ref_must_be_configured() -> None:
         adapter_over(ReplayTransport([])).read("PROJ-45/../x")
 
 
+UPDATED = "2026-10-01T12:00:00.000+0000"
+
+
 def test_listed_issue_url_is_canonical() -> None:
-    body = {"issues": [{"id": "1", "key": "PROJ-1"}, {"id": "2", "key": "OTHER-2"}], "isLast": True}
-    jql = 'assignee = "acct-bot" AND statusCategory != Done AND project in (PROJ) ORDER BY updated DESC'
+    body = {"issues": [{"id": "1", "key": "PROJ-1", "fields": {"updated": UPDATED}}, {"id": "2", "key": "OTHER-2"}], "isLast": True}
+    jql = JQL
     transport = ReplayTransport(
         [exchange("POST", API + "search/jql", 200, body, {"jql": jql, "maxResults": 50, "fields": ["updated"]})]
     )
@@ -281,3 +295,164 @@ def test_only_assignments_to_the_bot_are_assigned_activities() -> None:
     transport = ReplayTransport([exchange("GET", READ, 200, issue_payload([ASSIGNED, elsewhere], []))])
     issue = adapter_over(transport).read(REF)
     assert [a.kind for a in issue.activities] == ["assigned"]
+
+
+def comment_payload(**overrides: Any) -> dict[str, Any]:
+    return {
+        "id": "7",
+        "author": {"accountId": "acct-alice"},
+        "body": None,
+        "created": "2026-10-01T10:00:00.000+0000",
+        "updated": "2026-10-01T10:00:00.000+0000",
+        **overrides,
+    }
+
+
+def test_activity_ids_follow_the_documented_formulas() -> None:
+    edited_text = "2026-10-01T10:05:00.000+0000"
+    unedited = comment_payload(id="8")
+    edited = comment_payload(updated=edited_text)
+    history = {
+        "id": "5",
+        "author": {"accountId": "acct-alice"},
+        "created": "2026-10-01T11:00:00.000+0000",
+        "items": [{"field": "summary"}, {"field": "description"}],
+    }
+    transport = ReplayTransport(
+        [exchange("GET", READ, 200, issue_payload([ASSIGNED, history], [unedited, edited]))]
+    )
+    issue = adapter_over(transport).read(REF)
+    ids = {(a.kind, a.id) for a in issue.activities}
+    assert ids == {
+        ("assigned", activity_id("jira", "1:assigned")),
+        ("title_edit", activity_id("jira", "5:title_edit")),
+        ("body_edit", activity_id("jira", "5:body_edit")),
+        ("comment", activity_id("jira", "7")),
+        ("comment", activity_id("jira", "8")),
+        ("comment_edit", activity_id("jira", f"7:edited:{edited_text}")),
+    }
+
+
+def test_delivered_cutoff_id_is_a_safe_event_id() -> None:
+    scenario = next(s for s in scenarios_for("jira") if s.name == "attest_trusted")
+    transport = ReplayTransport.from_fixture("jira", scenario.name)
+    adapter = adapter_over(transport, config())
+    issue = adapter.read(REF)
+    decision = delivery_decision(issue, adapter.trust)
+    assert decision.kind == "deliver" and decision.cutoff is not None
+    assert safe_event_id(decision.cutoff.id) == decision.cutoff.id
+
+
+def read_with(payload: dict[str, Any]) -> Any:
+    return adapter_over(ReplayTransport([exchange("GET", READ, 200, payload)])).read(REF)
+
+
+def test_closed_issue_is_skipped_and_open_control_is_not() -> None:
+    closed = issue_payload([ASSIGNED], [])
+    closed["fields"]["status"] = {"name": "Done", "statusCategory": {"key": "done"}}
+    issue = read_with(closed)
+    assert issue.is_open is False
+    assert delivery_decision(issue, lambda *_: True).kind == "skip"
+    control = read_with(issue_payload([ASSIGNED], []))
+    assert control.is_open is True
+    assert delivery_decision(control, lambda *_: True).kind == "deliver"
+
+
+def test_truncated_comments_withhold_even_with_a_complete_changelog() -> None:
+    payload = issue_payload([ASSIGNED], [comment_payload()])
+    payload["fields"]["comment"]["total"] = 2
+    issue = read_with(payload)
+    decision = delivery_decision(issue, lambda *_: True)
+    assert (decision.kind, decision.reason) == ("withhold", "thread_too_long")
+    assert delivery_decision(read_with(issue_payload([ASSIGNED], [comment_payload()])), lambda *_: True).kind == (
+        "deliver"
+    )
+
+
+def test_malformed_account_id_has_no_actor_and_is_never_looked_up() -> None:
+    bad = {**ASSIGNED, "author": {"accountId": "bad id!"}}
+    issue = read_with(issue_payload([bad], []))
+    assert [a.actor_id for a in issue.activities] == [None]
+    lookups: list[str] = []
+
+    def trust(actor_id: str, _issue: Any) -> bool:
+        lookups.append(actor_id)
+        return True
+
+    decision = delivery_decision(issue, trust)
+    assert (decision.kind, decision.reason) == ("withhold", "untrusted_latest_activity")
+    assert lookups == []
+
+
+def test_close_per_project_transition_overrides_the_global_one() -> None:
+    cfg = config(transitions={"merged": "Done"}, project_transitions={"PROJ": {"merged": "Shipped"}})
+    status = exchange("GET", API + f"issue/{REF}?fields=status", 200, {"fields": {"status": {"name": "Open"}}})
+    listing = exchange(
+        "GET",
+        API + f"issue/{REF}/transitions",
+        200,
+        {"transitions": [{"id": "1", "to": {"name": "Done"}}, {"id": "2", "to": {"name": "Shipped"}}]},
+    )
+    post = exchange("POST", API + f"issue/{REF}/transitions", 204, None, {"transition": {"id": "2"}})
+    transport = ReplayTransport([status, listing, post])
+    assert adapter_over(transport, cfg).close(REF).status == "applied"
+    transport.finish()
+
+
+def test_transition_status_preread_403_is_permission_denied() -> None:
+    cfg = config(transitions={"merged": "Done"})
+    for act in (lambda a: a.close(REF), lambda a: a.transition(REF, "Done")):
+        transport = ReplayTransport([exchange("GET", API + f"issue/{REF}?fields=status", 403)])
+        result = act(adapter_over(transport, cfg))
+        assert (result.status, result.reason) == ("unavailable", "permission_denied")
+        transport.finish()
+
+
+def test_listed_issues_carry_the_parsed_utc_update_time() -> None:
+    transport = ReplayTransport.from_fixture("jira", "list_assigned")
+    issues, complete = adapter_over(transport).list_assigned()
+    assert complete is True
+    assert [(i.ref, i.updated_at) for i in issues] == [
+        ("PROJ-46", "2026-10-01T13:00:00+00:00"),
+        ("PROJ-45", "2026-10-01T12:00:00+00:00"),
+    ]
+    zoned = {"issues": [{"id": "1", "key": "PROJ-1", "fields": {"updated": "2026-10-01T14:00:00.000+0200"}}], "isLast": True}
+    body = {"jql": JQL, "maxResults": 50, "fields": ["updated"]}
+    transport = ReplayTransport([exchange("POST", API + "search/jql", 200, zoned, body)])
+    (issue,), _ = adapter_over(transport).list_assigned()
+    assert issue.updated_at == "2026-10-01T12:00:00+00:00"
+
+
+@pytest.mark.parametrize("fields", [{}, {"updated": None}, {"updated": "yesterday"}, {"updated": "2026-10-01T12:00:00"}])
+def test_listed_issue_without_a_valid_update_time_is_omitted_and_incomplete(fields: dict[str, Any]) -> None:
+    body = {
+        "issues": [{"id": "1", "key": "PROJ-1", "fields": fields}, {"id": "2", "key": "PROJ-2", "fields": {"updated": UPDATED}}],
+        "isLast": True,
+    }
+    request = {"jql": JQL, "maxResults": 50, "fields": ["updated"]}
+    transport = ReplayTransport([exchange("POST", API + "search/jql", 200, body, request)])
+    issues, complete = adapter_over(transport).list_assigned()
+    assert [i.ref for i in issues] == ["PROJ-2"]
+    assert complete is False
+
+
+def test_project_keys_are_quoted_in_the_jql() -> None:
+    cfg = config(projects=("PROJ", "IN", "OR"))
+    jql = (
+        'assignee = "acct-bot" AND statusCategory != Done '
+        'AND project in ("PROJ", "IN", "OR") ORDER BY updated DESC'
+    )
+    request = {"jql": jql, "maxResults": 50, "fields": ["updated"]}
+    transport = ReplayTransport([exchange("POST", API + "search/jql", 200, {"issues": [], "isLast": True}, request)])
+    assert adapter_over(transport, cfg).list_assigned() == ([], True)
+    transport.finish()
+
+
+def test_equal_instants_in_different_zones_are_not_a_comment_edit() -> None:
+    same_instant = comment_payload(updated="2026-10-01T11:00:00.000+0100")
+    issue = read_with(issue_payload([ASSIGNED], [same_instant]))
+    assert [a.kind for a in issue.activities if a.kind == "comment_edit"] == []
+    edited = comment_payload(updated="2026-10-01T11:01:00.000+0100")
+    assert [a.kind for a in read_with(issue_payload([ASSIGNED], [edited])).activities if a.kind == "comment_edit"] == [
+        "comment_edit"
+    ]

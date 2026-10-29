@@ -6,7 +6,7 @@
         "method": "POST",
         "url": "https://acme.atlassian.net/rest/api/3/search/jql",
         "json": {
-          "jql": "assignee = \"acct-bot\" AND statusCategory != Done AND project in (PROJ) ORDER BY updated DESC",
+          "jql": "assignee = \"acct-bot\" AND statusCategory != Done AND project in (\"PROJ\") ORDER BY updated DESC",
           "maxResults": 50,
           "fields": [
             "updated"

@@ -96,7 +96,7 @@ class JiraAdapter:
         return _KEY_RE.fullmatch(ref) is not None and ref.rsplit("-", 1)[0] in self._config.projects
 
     def list_assigned(self) -> tuple[list[TrackerIssue], bool]:
-        projects = ", ".join(self._config.projects)
+        projects = ", ".join(_jql_string(project) for project in self._config.projects)
         jql = (
             f'assignee = "{self._bot_id}" AND statusCategory != Done '
             f"AND project in ({projects}) ORDER BY updated DESC"
@@ -131,6 +131,10 @@ class JiraAdapter:
         url = self._canonical_url(key)
         if url is None:
             return None
+        try:
+            updated_at = parse_timestamp(_mapping(row.get("fields")).get("updated")).isoformat()
+        except ValueError:
+            return None
         return TrackerIssue(
             adapter=ADAPTER,
             stable_id=raw_id,
@@ -146,6 +150,7 @@ class JiraAdapter:
             comments=(),
             truncated=False,
             bot_id=self._bot_id,
+            updated_at=updated_at,
         )
 
     def read(self, ref: str) -> TrackerIssue:
@@ -190,7 +195,7 @@ class JiraAdapter:
             is_open=category != "done",
             assigned_to_bot=_account(fields.get("assignee")) == self._bot_id,
             activities=tuple(activities)
-            + tuple(Activity("comment", c.id, c.at, c.author_id) for c in comments)
+            + tuple(Activity("comment", activity_id(ADAPTER, c.id), c.at, c.author_id) for c in comments)
             + tuple(edits),
             comments=tuple(comments),
             truncated=_total(changelog, histories) or _total(comment_block, raw_comments),
@@ -322,9 +327,7 @@ class JiraAdapter:
     def transition(self, ref: str, state: str) -> ActionResult:
         if not self._valid_ref(ref):
             return ActionResult("refused", "project_not_configured")
-        if self.current_state(ref) == state:
-            return ActionResult("already")
-        return self._apply(ref, state)
+        return self._move(ref, state)
 
     def _apply(self, ref: str, state: str) -> ActionResult:
         response = self._call("GET", f"issue/{ref}/transitions")
@@ -354,9 +357,22 @@ class JiraAdapter:
         ) or self._config.transitions.get("merged")
         if not target:
             return ActionResult("unavailable", "merged_state_required")
-        if self.current_state(ref) == target:
+        return self._move(ref, target)
+
+    def _move(self, ref: str, state: str) -> ActionResult:
+        try:
+            current = self.current_state(ref)
+        except TrackerUnavailable as error:
+            if error.code == "http_403":
+                return ActionResult("unavailable", "permission_denied")
+            raise
+        if current == state:
             return ActionResult("already")
-        return self._apply(ref, target)
+        return self._apply(ref, state)
+
+
+def _jql_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _failed(response: HttpResponse) -> ActionResult:
