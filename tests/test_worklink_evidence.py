@@ -347,9 +347,13 @@ async def test_default_gate_bounds_checkout_environment(tmp_path, monkeypatch, b
         monkeypatch.setenv(name, "gate-secret-sentinel")
     # This checkout test needs warning-errors, but not anyio's optional pytest
     # plugin (whose import warns before pytest processes -W under pytest 9.2).
+    # With pytest 9.2.0 / pytest-asyncio 1.4.0, the nested run otherwise dies
+    # in pytest_configure with PytestDeprecationWarning: configuration option
+    # "asyncio_default_fixture_loop_scope" is unset. Configure the scope rather
+    # than filtering that warning; all test warnings must still be errors.
     monkeypatch.setenv(
         "PYTEST_ADDOPTS",
-        "-p no:anyio -W error",
+        "-p no:anyio -W error -o asyncio_default_fixture_loop_scope=function",
     )
     repo = _init_gate_repo(
         tmp_path,
