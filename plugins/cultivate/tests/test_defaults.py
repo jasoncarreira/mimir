@@ -51,7 +51,7 @@ def test_current_repository_skill_release_hash(name):
 
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     version = {
-        "github-poller": "2057-auto-review",
+        "github-poller": "2060-requested-comments",
         "review": "2049-review-tests",
     }.get(name, "0.9.10-2025")
     expected = releases[version][name]["SKILL.md"]
@@ -60,14 +60,15 @@ def test_current_repository_skill_release_hash(name):
 
 
 @pytest.mark.parametrize("relative", [
-    "scripts/poller.py", "tests/test_github_poller_pr_pushes.py",
+    "scripts/poller.py", "tests/test_github_poller_auto_review.py",
+    "tests/test_github_poller_pr_pushes.py",
     "tests/test_github_poller_withhold.py", "tests/test_github_poller_issue_notices.py",
 ])
 def test_current_github_poller_release_hash(relative):
     import hashlib
 
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    expected = releases["2057-auto-review"]["github-poller"][relative]
+    expected = releases["2060-requested-comments"]["github-poller"][relative]
     actual = hashlib.sha256((SKILLS / "github-poller" / relative).read_bytes()).hexdigest()
     assert actual == expected, f"{relative}: actual sha256={actual}"
 
@@ -80,7 +81,7 @@ def test_current_github_poller_release_inventory_is_complete():
     [skill] = [item for item in skills_for_candidates((candidate,))
                if item.name == "github-poller"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    assert skill_inventory(skill) == releases["2057-auto-review"]["github-poller"]
+    assert skill_inventory(skill) == releases["2060-requested-comments"]["github-poller"]
 
 
 # The guard scans the shipped defaults, not test fixtures or cache files.
