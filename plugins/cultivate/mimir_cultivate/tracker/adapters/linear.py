@@ -75,6 +75,13 @@ class _Denied(TrackerUnavailable):
         super().__init__("http_403")
 
 
+class _NotFound(TrackerUnavailable):
+    """Every error in the response says the requested entity does not exist."""
+
+    def __init__(self) -> None:
+        super().__init__("malformed_payload")
+
+
 def _malformed() -> TrackerUnavailable:
     return TrackerUnavailable("malformed_payload")
 
@@ -175,6 +182,10 @@ class LinearAdapter:
         if errors:
             if isinstance(errors, list) and any(_is_forbidden(error) for error in errors):
                 raise _Denied()
+            if isinstance(errors, list) and any(_is_rate_limited(error) for error in errors):
+                raise TrackerUnavailable("rate_limited")
+            if isinstance(errors, list) and all(_is_not_found(error) for error in errors):
+                raise _NotFound()
             raise _malformed()
         return _mapping(body.get("data"))
 
@@ -209,18 +220,20 @@ class LinearAdapter:
             if url is None:
                 complete = False
                 continue
+            try:
+                updated = parse_timestamp(node.get("updatedAt"))
+            except ValueError:
+                complete = False
+                continue
             if not self._in_scope(identifier):
                 continue
             listed.append(
-                (
-                    _timestamp(node.get("updatedAt")),
-                    self._shell(stable_id, identifier, url),
-                )
+                (updated, self._shell(stable_id, identifier, url, updated.isoformat()))
             )
         listed.sort(key=lambda pair: pair[0], reverse=True)
         return [issue for _, issue in listed], complete
 
-    def _shell(self, stable_id: str, identifier: str, url: str) -> TrackerIssue:
+    def _shell(self, stable_id: str, identifier: str, url: str, updated_at: str) -> TrackerIssue:
         return TrackerIssue(
             adapter=ADAPTER,
             stable_id=stable_id,
@@ -236,6 +249,7 @@ class LinearAdapter:
             comments=(),
             truncated=False,
             bot_id=self._bot_id,
+            updated_at=updated_at,
         )
 
     def read(self, ref: str) -> TrackerIssue:
@@ -325,7 +339,10 @@ class LinearAdapter:
         if _ID_RE.fullmatch(actor_id) is None:
             return False
         if actor_id not in self._trust_cache:
-            user = _mapping(self._graphql(USER_QUERY, {"id": actor_id})).get("user")
+            try:
+                user = _mapping(self._graphql(USER_QUERY, {"id": actor_id})).get("user")
+            except _NotFound:
+                user = None
             if user is None:
                 verdict = False
             else:
@@ -351,7 +368,7 @@ class LinearAdapter:
         except _Denied:
             return ActionResult("unavailable", "permission_denied")
         created = _mapping(data.get("commentCreate")).get("success") is True
-        return ActionResult("posted") if created else ActionResult("unavailable", "rejected")
+        return ActionResult("posted") if created else ActionResult("unavailable", "api_error")
 
     def transition(self, ref: str, state: str) -> ActionResult:
         try:
@@ -359,7 +376,9 @@ class LinearAdapter:
             states = _states(issue)
             current = _mapping(issue.get("state")).get("name")
             matches = [s for s in states if s.get("name") == state]
-            if len(matches) != 1:
+            if len(matches) > 1:
+                return ActionResult("unavailable", "ambiguous_state")
+            if not matches:
                 return ActionResult("unavailable", "state_not_found")
             if current == state:
                 return ActionResult("already")
@@ -385,7 +404,9 @@ class LinearAdapter:
                 if current.get("name") == target_name:
                     return ActionResult("already")
                 targets = [s for s in states if s.get("name") == target_name]
-                if len(targets) != 1:
+                if len(targets) > 1:
+                    return ActionResult("unavailable", "ambiguous_state")
+                if not targets:
                     return ActionResult("unavailable", "state_not_found")
             return self._set_state(ref, targets[0])
         except _Denied:
@@ -401,7 +422,7 @@ class LinearAdapter:
             raise _malformed()
         data = self._graphql(STATE_MUTATION, {"id": ref, "stateId": state_id})
         applied = _mapping(data.get("issueUpdate")).get("success") is True
-        return ActionResult("applied") if applied else ActionResult("unavailable", "rejected")
+        return ActionResult("applied") if applied else ActionResult("unavailable", "api_error")
 
     def current_state(self, ref: str) -> str | None:
         name = _mapping(self._workflow(ref).get("state")).get("name")
@@ -413,6 +434,20 @@ def _is_forbidden(error: object) -> bool:
         return False
     extensions = error.get("extensions")
     return isinstance(extensions, dict) and extensions.get("code") in _FORBIDDEN_CODES
+
+
+def _is_rate_limited(error: object) -> bool:
+    if not isinstance(error, dict):
+        return False
+    extensions = error.get("extensions")
+    return isinstance(extensions, dict) and extensions.get("code") == "RATELIMITED"
+
+
+def _is_not_found(error: object) -> bool:
+    if not isinstance(error, dict):
+        return False
+    message = error.get("message")
+    return isinstance(message, str) and message.startswith("Entity not found")
 
 
 def _states(issue: Mapping[str, Any]) -> list[dict[str, Any]]:

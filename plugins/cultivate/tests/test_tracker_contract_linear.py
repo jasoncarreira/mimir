@@ -5,11 +5,11 @@ from typing import Any
 
 import pytest
 
-from mimir.poller_tracker import safe_url
+from mimir.poller_tracker import NOTICE_REASONS, safe_event_id, safe_url
 from mimir_cultivate.tracker.adapters import build_adapter
 from mimir_cultivate.tracker.adapters import linear as linear_adapter
 from mimir_cultivate.tracker.config import TrackerAdapterConfig
-from mimir_cultivate.tracker.thread import delivery_decision
+from mimir_cultivate.tracker.thread import activity_id, delivery_decision
 from mimir_cultivate.tracker.transport import HttpResponse, TrackerUnavailable
 from tracker_replay import (
     ReplayTransport,
@@ -294,15 +294,149 @@ def test_close_already_in_the_mapped_state() -> None:
     assert adapter.close(REF).status == "already"
 
 
+def test_close_with_duplicate_mapped_state_is_ambiguous() -> None:
+    config = TrackerAdapterConfig(name="linear", transitions={"merged": "Done"})
+    duplicated = _STATES + [{"id": "s4", "name": "Done", "type": "completed"}]
+    adapter = _build(StubTransport(VIEWER, _workflow({"name": "In Progress", "type": "started"}, duplicated)), config)
+    result = adapter.close(REF)
+    assert (result.status, result.reason) == ("unavailable", "ambiguous_state")
+
+
+def test_rejected_writes_report_api_error() -> None:
+    started = _workflow({"name": "In Progress", "type": "started"})
+    comment = _build(StubTransport(VIEWER, started, {"commentCreate": {"success": False}})).comment(REF, "x")
+    state = _build(StubTransport(VIEWER, started, {"issueUpdate": {"success": False}})).transition(REF, "Done")
+    for result in (comment, state):
+        assert (result.status, result.reason) == ("unavailable", "api_error")
+        assert result.reason in NOTICE_REASONS
+
+
 def test_transition_to_the_current_state_is_already_and_duplicate_names_are_not_found() -> None:
     adapter = _build(StubTransport(VIEWER, _workflow({"name": "Done", "type": "completed"})))
     assert adapter.transition(REF, "Done").status == "already"
     duplicated = _STATES + [{"id": "s4", "name": "Done", "type": "completed"}]
     adapter = _build(StubTransport(VIEWER, _workflow({"name": "In Progress", "type": "started"}, duplicated)))
     result = adapter.transition(REF, "Done")
+    assert (result.status, result.reason) == ("unavailable", "ambiguous_state")
+    adapter = _build(StubTransport(VIEWER, _workflow({"name": "In Progress", "type": "started"})))
+    result = adapter.transition(REF, "Missing")
     assert (result.status, result.reason) == ("unavailable", "state_not_found")
 
 
 def test_current_state_returns_the_state_name() -> None:
     adapter = _build(StubTransport(VIEWER, _workflow({"name": "In Progress", "type": "started"})))
     assert adapter.current_state(REF) == "In Progress"
+
+
+def _comments(*nodes: dict[str, Any], more: bool = False) -> dict[str, Any]:
+    return {"pageInfo": {"hasNextPage": more}, "nodes": list(nodes)}
+
+
+def test_more_comment_pages_withhold_as_thread_too_long() -> None:
+    entries = _history(_entry("h1", 10, "usr-alice", toDelegate={"id": "usr-bot"}))
+    adapter = _build(StubTransport(VIEWER, _issue(history=entries, comments=_comments(more=True))))
+    issue = adapter.read(REF)
+    assert issue.truncated
+    decision = delivery_decision(issue, adapter.trust)
+    assert (decision.kind, decision.reason) == ("withhold", "thread_too_long")
+
+
+def test_issue_delegated_to_another_user_is_skipped() -> None:
+    adapter = _build(StubTransport(VIEWER, _issue(delegate={"id": "usr-other"})))
+    issue = adapter.read(REF)
+    assert issue.assigned_to_bot is False
+    assert delivery_decision(issue, adapter.trust).kind == "skip"
+
+
+@pytest.mark.parametrize("state_type", ["completed", "canceled"])
+def test_closed_state_types_are_skipped_while_still_delegated(state_type: str) -> None:
+    adapter = _build(StubTransport(VIEWER, _issue(state={"type": state_type})))
+    issue = adapter.read(REF)
+    assert issue.assigned_to_bot and not issue.is_open
+    assert delivery_decision(issue, adapter.trust).kind == "skip"
+
+
+def test_activity_ids_are_pinned_to_the_documented_raw_ids() -> None:
+    entries = _history(
+        _entry("h1", 10, "usr-alice", toDelegate={"id": "usr-bot"}, fromTitle="a", toTitle="b", updatedDescription=True)
+    )
+    edited = "2026-10-20T10:30:00.000Z"
+    comments = _comments(
+        {"id": "c1", "createdAt": "2026-10-20T10:00:00.000Z", "editedAt": edited, "body": "x", "user": {"id": "usr-alice"}}
+    )
+    issue = _build(StubTransport(VIEWER, _issue(history=entries, comments=comments))).read(REF)
+    assert {a.kind: a.id for a in issue.activities} == {
+        "assigned": activity_id("linear", "h1:assigned"),
+        "title_edit": activity_id("linear", "h1:title_edit"),
+        "body_edit": activity_id("linear", "h1:body_edit"),
+        "comment": activity_id("linear", "c1"),
+        "comment_edit": activity_id("linear", f"c1:edited:{edited}"),
+    }
+
+
+@pytest.mark.parametrize(
+    "scenario", [s for s in scenarios_for("linear") if s.operation == "attest"], ids=lambda s: s.name
+)
+def test_delivered_cutoff_ids_are_safe_event_ids(scenario, forbid_default_transport) -> None:  # noqa: F811
+    adapter = _build(ReplayTransport.from_fixture("linear", scenario.name))
+    try:
+        decision = delivery_decision(adapter.read(REF), adapter.trust)
+    except TrackerUnavailable:
+        return
+    if decision.kind == "deliver":
+        assert safe_event_id(decision.cutoff.id) == decision.cutoff.id
+
+
+def test_delivered_scenarios_exist() -> None:
+    delivered = [s.name for s in scenarios_for("linear") if s.expectation("linear").get("decision") == "deliver"]
+    assert delivered == ["attest_trusted"]
+
+
+def test_listing_populates_updated_at_in_utc() -> None:
+    issues, _ = _build(ReplayTransport.from_fixture("linear", "list_assigned")).list_assigned()
+    assert {i.ref: i.updated_at for i in issues} == {
+        "ENG-2": "2026-10-20T12:00:00+00:00",
+        "ENG-1": "2026-10-20T11:00:00+00:00",
+    }
+
+
+def test_listing_normalizes_offsets_to_utc() -> None:
+    node = {"id": "i1", "identifier": "ENG-1", "url": "https://linear.app/acme/issue/ENG-1/a", "updatedAt": "2026-10-20T14:00:00+02:00"}
+    issues, complete = _build(StubTransport(VIEWER, {"issues": _comments(node)})).list_assigned()
+    assert complete and issues[0].updated_at == "2026-10-20T12:00:00+00:00"
+
+
+@pytest.mark.parametrize("updated", [None, "", "yesterday", 7, "2026-10-20T10:00:00"])
+def test_listing_omits_items_without_a_valid_updated_at(updated: object) -> None:
+    good = {"id": "i1", "identifier": "ENG-1", "url": "https://linear.app/acme/issue/ENG-1/a", "updatedAt": "2026-10-20T10:00:00.000Z"}
+    bad = {"id": "i2", "identifier": "ENG-2", "url": "https://linear.app/acme/issue/ENG-2/a", "updatedAt": updated}
+    issues, complete = _build(StubTransport(VIEWER, {"issues": _comments(good, bad)})).list_assigned()
+    assert [i.ref for i in issues] == ["ENG-1"]
+    assert complete is False
+
+
+def test_trust_of_an_entity_not_found_user_is_false_not_unavailable() -> None:
+    error = {"errors": [{"message": "Entity not found: User", "extensions": {"type": "invalid input"}}]}
+    adapter = _build(StubTransport(VIEWER, HttpResponse(200, error)))
+    assert adapter.trust("usr-gone", None) is False
+
+
+def test_other_graphql_errors_on_trust_lookup_stay_unavailable() -> None:
+    mixed = {"errors": [{"message": "Entity not found: User"}, {"message": "boom"}]}
+    with pytest.raises(TrackerUnavailable):
+        _build(StubTransport(VIEWER, HttpResponse(200, mixed))).trust("usr-a", None)
+
+
+def test_ratelimited_graphql_error_maps_to_rate_limited() -> None:
+    body = {"errors": [{"message": "slow down", "extensions": {"code": "RATELIMITED"}}]}
+    with pytest.raises(TrackerUnavailable) as raised:
+        _build(StubTransport(VIEWER, HttpResponse(200, body))).read(REF)
+    assert raised.value.code == "rate_limited"
+
+
+@pytest.mark.parametrize("odd", ["bad id!", "x" * 65, "", 7, ["usr-a"]])
+def test_odd_shaped_actor_id_is_none(odd: object) -> None:
+    entry = _entry("h1", 10, "usr-alice", toDelegate={"id": "usr-bot"})
+    entry["actor"] = {"id": odd}
+    issue = _build(StubTransport(VIEWER, _issue(history=_history(entry)))).read(REF)
+    assert [a.actor_id for a in issue.activities] == [None]

@@ -1,5 +1,5 @@
 {
-  "source": "Linear GraphQL API reference https://linear.app/developers/graphql and schema https://studio.apollographql.com/public/Linear-API/variant/current/schema/reference: Query.issues (IssueFilter.delegate, IssueFilter.state.type), Issue.id/identifier/url/updatedAt, IssueConnection.pageInfo (wrong host and mismatched identifier segment) and Query.issue(id:), Issue.id/identifier/url/title/description/createdAt/creator/delegate/state.type/team.key, Issue.history(IssueHistoryConnection) with IssueHistory.id/createdAt/actor/toDelegate/fromTitle/toTitle/updatedDescription, Issue.comments with Comment.id/createdAt/editedAt/body/user, Connection.pageInfo.hasNextPage",
+  "source": "Linear GraphQL API reference https://linear.app/developers/graphql and schema https://studio.apollographql.com/public/Linear-API/variant/current/schema/reference: Query.issues (IssueFilter.delegate, IssueFilter.state.type), Issue.id/identifier/url/updatedAt, IssueConnection.pageInfo (wrong host and mismatched identifier segment on the list, mismatched identifier segment on the read) and Query.issue(id:), Issue.id/identifier/url/title/description/createdAt/creator/delegate/state.type/team.key, Issue.history(IssueHistoryConnection) with IssueHistory.id/createdAt/actor/toDelegate/fromTitle/toTitle/updatedDescription, Issue.comments with Comment.id/createdAt/editedAt/body/user, Connection.pageInfo.hasNextPage",
   "exchanges": [
     {
       "request": {
@@ -91,7 +91,7 @@
             "issue": {
               "id": "iss-123",
               "identifier": "ENG-123",
-              "url": "https://evil.example/acme/issue/ENG-123/fix-login-crash",
+              "url": "https://linear.app/acme/issue/ENG-999/fix-login-crash",
               "title": "Fix login crash",
               "description": "Login crashes on submit.",
               "createdAt": "2026-10-20T09:00:00.000Z",
