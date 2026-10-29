@@ -76,6 +76,25 @@ def test_runs_unwrapped_when_lock_already_held(tmp_path: Path) -> None:
     assert calls == []
 
 
+@pytest.mark.parametrize("lock_file", [None, ""])
+def test_runs_unwrapped_when_no_lock_is_configured(tmp_path: Path, lock_file: str | None) -> None:
+    log = tmp_path / "calls.log"
+    env = {
+        "PATH": os.environ["PATH"],
+        "MIMIR_HEAVY_LOCKF": str(_stub(tmp_path / "lockf", log)),
+        "MIMIR_HEAVY_GTIMEOUT": str(_stub(tmp_path / "gtimeout", log)),
+    }
+    if lock_file is not None:
+        env["MIMIR_HEAVY_LOCK_FILE"] = lock_file
+    proc = subprocess.run(
+        ["sh", str(SCRIPT), "sh", "-c", 'echo "held=${MIMIR_HEAVY_LOCK_HELD:-}"'],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == "held="
+    assert not log.exists()
+
+
 @pytest.mark.parametrize("missing", ["MIMIR_HEAVY_LOCKF", "MIMIR_HEAVY_GTIMEOUT"])
 def test_runs_unwrapped_when_tools_are_missing(tmp_path: Path, missing: str) -> None:
     proc, calls = _run(
