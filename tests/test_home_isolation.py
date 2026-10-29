@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from mimir import home_isolation
+from tests.stat_helpers import stat_with
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +44,7 @@ def probe_identity(monkeypatch):
 
     def owned_stat(fd):
         result = real_stat(fd)
-        return SimpleNamespace(st_uid=0, st_mode=result.st_mode)
+        return stat_with(result, st_uid=0)
 
     monkeypatch.setattr(os, "fstat", owned_stat)
 
@@ -106,7 +107,9 @@ def test_unavailable_probe_is_unknown(tmp_path, monkeypatch, caplog, probe_ident
     elif failure == "readonly":
         monkeypatch.setattr(home_isolation.tempfile, "mkstemp", unavailable)
     elif failure in ("ownership", "mode"):
-        monkeypatch.setattr(os, "fstat", lambda fd: SimpleNamespace(
+        real_stat = os.fstat
+        monkeypatch.setattr(os, "fstat", lambda fd: stat_with(
+            real_stat(fd),
             st_uid=1002 if failure == "ownership" else 0,
             st_mode=0o644 if failure == "mode" else 0o600,
         ))

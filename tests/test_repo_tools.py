@@ -3308,6 +3308,15 @@ def _run_synthetic_pytest(tmp_path: Path, test_source: str) -> subprocess.Comple
             "pytest",
             "-q",
             "-s",
+            "-p",
+            "no:anyio",
+            # The synthetic test uses no anyio fixtures; exclude its optional
+            # plugin, whose import emits a deprecation under pytest 9.2.
+            "-o",
+            "asyncio_default_fixture_loop_scope=function",
+            # pytest 9.2.0 / pytest-asyncio 1.4.0 emits PytestDeprecationWarning
+            # from pytest_configure when this is unset, polluting stderr even
+            # for the fast-test quietness control. Configure, don't filter it.
             str(test_path),
             "-o",
             "faulthandler_timeout=0.1",
