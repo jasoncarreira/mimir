@@ -977,6 +977,7 @@ class Scheduler:
         home: Path | None = None,
         scheduler_tz: str = "UTC",
         operator_notice: Callable[[str], Awaitable[None]] | None = None,
+        operator_live_notice: Callable[[str, str], Awaitable[None]] | None = None,
         policy: PolicyRegistry | None = None,
     ) -> None:
         # APScheduler interprets cron expressions in the scheduler's
@@ -1008,6 +1009,7 @@ class Scheduler:
         self._home = home
         self._policy = policy
         self._operator_notice = operator_notice
+        self._operator_live_notice = operator_live_notice
         # Named-callable registry. Populated by ``register_callable``
         # at startup (server.py wires each non-LLM cron). The yaml
         # is the override surface — entries naming a registered
@@ -2791,6 +2793,8 @@ class Scheduler:
                         timeout=timeout,
                         **({"operator_notice": self._operator_notice}
                            if self._operator_notice is not None else {}),
+                        **({"operator_live_notice": self._operator_live_notice}
+                           if self._operator_live_notice is not None else {}),
                     )
             except TimeoutError:
                 if not deadline.expired():

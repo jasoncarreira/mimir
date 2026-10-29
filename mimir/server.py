@@ -18,6 +18,7 @@ import os
 import re
 import signal
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -139,6 +140,39 @@ def _skill_auto_update_event(result: Any) -> tuple[str, dict[str, Any]] | None:
     }
     event_kind = "skills_auto_update_failed" if result.failed else "skills_auto_update"
     return event_kind, fields
+
+
+def _operator_notice_callbacks(
+    config: Config, channels: ChannelRegistry,
+) -> tuple[
+    Callable[[str], Awaitable[None]],
+    Callable[[str, str], Awaitable[None]],
+]:
+    """Build the operator alert senders for the scheduler.
+
+    ``operator_notice`` posts one text to the alert channel. The live variant
+    takes a titled and a title-free rendering: only the web chat bridge, whose
+    ``send`` is SSE fan-out with no history record when no ``message_id`` is
+    passed, may carry the titled text. Every other bridge persists posts in
+    platform history that agents can read, so it gets the title-free text.
+    """
+
+    async def operator_notice(text: str) -> None:
+        channel = (config.operator_alert_channel or "").strip()
+        if channel:
+            await channels.send(channel, text, final=True)
+
+    async def operator_live_notice(live: str, title_free: str) -> None:
+        channel = (config.operator_alert_channel or "").strip()
+        if not channel:
+            return
+        bridge = channels.find(channel)
+        if bridge is None:
+            return
+        text = live if isinstance(bridge, WebChatBridge) else title_free
+        await channels.send(channel, text, final=True)
+
+    return operator_notice, operator_live_notice
 
 
 class _PairingNotifier:
@@ -1288,10 +1322,7 @@ def build_app(config: Config) -> web.Application:
     pairing_notifier = _PairingNotifier(config, channels)
 
     dispatcher = Dispatcher(config, resolver=identity_resolver)
-    async def operator_notice(text: str) -> None:
-        channel = (config.operator_alert_channel or "").strip()
-        if channel:
-            await channels.send(channel, text, final=True)
+    operator_notice, operator_live_notice = _operator_notice_callbacks(config, channels)
 
     scheduler = Scheduler(
         scheduler_yaml=config.home / "scheduler.yaml",
@@ -1299,6 +1330,7 @@ def build_app(config: Config) -> web.Application:
         home=config.home,
         scheduler_tz=config.scheduler_tz,
         operator_notice=operator_notice,
+        operator_live_notice=operator_live_notice,
         policy=config.plugin_manager.policy,
     )
     set_on_channel_drained = getattr(dispatcher, "set_on_channel_drained", None)
