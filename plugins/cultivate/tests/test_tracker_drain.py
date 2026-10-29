@@ -110,14 +110,16 @@ def _closure(home: Path, **fields: Any) -> None:
         data["items"].setdefault(EXT, {})["closure"] = entry
 
 
-def _transition(home: Path, event: str = "build_started", **fields: Any) -> None:
+def _transition(
+    home: Path, event: str = "build_started", *, ext: str = EXT, **fields: Any
+) -> None:
     entry = {
         "stage": "requested", "state": "In Progress", "result": None, "reason": None,
         "attempts": 0, "requested_at": "t", "recorded_at": None,
     }
     entry.update(fields)
     with evidence_transaction(home) as data:
-        data["items"].setdefault(EXT, {}).setdefault("transitions", {})[event] = entry
+        data["items"].setdefault(ext, {}).setdefault("transitions", {})[event] = entry
 
 
 def _run(home: Path, config: TrackerConfig, gh: Gh | None = None) -> tuple[int, list[dict]]:
@@ -328,11 +330,63 @@ def test_unavailable_transition_is_notice_not_failure(
 
 
 def test_action_budget_is_bounded(tmp_path: Path, adapter: FakeAdapter) -> None:
-    for event in ("build_started", "pr_opened", "filed"):
-        _transition(tmp_path, event)
-    config = _config(transitions={"build_started": "A", "pr_opened": "B", "filed": "C"})
+    for ref in ("ENG-1", "ENG-2", "ENG-3"):
+        _transition(tmp_path, ext=f"linear:{ref}")
+    config = _config(transitions={"build_started": "In Progress"})
     count = drain(tmp_path, config, {}, object(), Gh(), lambda s: None, max_actions=2)  # type: ignore[arg-type]
     assert count == 2
+
+
+def _transition_calls(adapter: FakeAdapter) -> list[str]:
+    return [call[2] for call in adapter.calls if call[0] == "transition"]
+
+
+def test_batched_milestones_apply_only_the_latest_state(
+    tmp_path: Path, adapter: FakeAdapter
+) -> None:
+    for event in ("build_started", "filed"):
+        _transition(tmp_path, event, state={"filed": "Todo", "build_started": "In Progress"}[event])
+    config = _config(transitions={"filed": "Todo", "build_started": "In Progress"})
+    assert _run(tmp_path, config)[0] == 1
+    assert _transition_calls(adapter) == ["In Progress"]
+    queued = _evidence(tmp_path)["items"][EXT]["transitions"]
+    assert (queued["filed"]["stage"], queued["filed"]["result"]) == ("done", "superseded")
+    assert (queued["build_started"]["stage"], queued["build_started"]["result"]) == ("done", "applied")
+    assert _evidence(tmp_path)["notices"] == []
+
+
+def test_milestones_queued_across_fires_apply_in_lifecycle_order(
+    tmp_path: Path, adapter: FakeAdapter
+) -> None:
+    config = _config(transitions={"filed": "Todo", "build_started": "In Progress", "merged": "Done"})
+    for event, state in (("filed", "Todo"), ("build_started", "In Progress"), ("merged", "Done")):
+        _transition(tmp_path, event, state=state)
+        _run(tmp_path, config)
+    assert _transition_calls(adapter) == ["Todo", "In Progress", "Done"]
+
+
+def test_older_retry_never_overwrites_a_later_applied_milestone(
+    tmp_path: Path, adapter: FakeAdapter
+) -> None:
+    config = _config(transitions={"filed": "Todo", "build_started": "In Progress"})
+    _transition(tmp_path, "filed", state="Todo")
+    adapter.raises = [TrackerUnavailable("timeout")]
+    _run(tmp_path, config)
+    assert _evidence(tmp_path)["items"][EXT]["transitions"]["filed"]["stage"] == "requested"
+    _transition(tmp_path, "build_started", state="In Progress")
+    for _ in range(drain_module.MAX_ATTEMPTS + 1):
+        _run(tmp_path, config)
+    assert _transition_calls(adapter) == ["Todo", "In Progress"]
+    queued = _evidence(tmp_path)["items"][EXT]["transitions"]
+    assert queued["filed"]["result"] == "superseded"
+    assert queued["build_started"]["result"] == "applied"
+
+
+def test_a_later_unset_milestone_does_not_supersede(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _transition(tmp_path, "filed", state="Todo")
+    _transition(tmp_path, "build_started", stage="done", result="unset")
+    _run(tmp_path, _config(transitions={"filed": "Todo"}))
+    assert _transition_calls(adapter) == ["Todo"]
 
 
 def test_notices_emit_until_receipt_then_marked(tmp_path: Path, adapter: FakeAdapter) -> None:

@@ -20,7 +20,7 @@ from ..worklink.dispatch_failures import delivery_receipt_exists
 from ..worklink.merge_closure import ClosureReadError, Runner, read_pr_snapshot
 from .adapters import build_adapter
 from .adapters.base import ActionResult, TrackerAdapter
-from .config import TrackerConfig, resolve_transition
+from .config import TRANSITION_EVENTS, TrackerConfig, resolve_transition
 from .evidence import evidence_transaction, read_evidence
 from .record import ExternalRecord
 from .transport import TrackerTransport, TrackerUnavailable
@@ -30,10 +30,22 @@ MAX_ATTEMPTS = 3
 ADAPTER_UNAVAILABLE = "adapter_unavailable"
 NOTICE_KIND = "tracker_transition_unavailable"
 _OPEN_STAGES = ("requested", "started")
+_RANK = {event: rank for rank, event in enumerate(TRANSITION_EVENTS)}
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _latest_milestone(queued: Mapping[str, Mapping[str, Any]]) -> int:
+    """Rank of the latest lifecycle event that is pending or reached a state; -1 when none."""
+
+    ranks = [
+        _RANK[event]
+        for event, entry in queued.items()
+        if event in _RANK and (entry["stage"] in _OPEN_STAGES or entry["result"] != "unset")
+    ]
+    return max(ranks, default=-1)
 
 
 def poller_state_dir(home: Path) -> Path:
@@ -281,8 +293,17 @@ class _Drain:
     def transitions(self) -> None:
         items = read_evidence(self.home)["items"]
         for ext_ref, item in sorted(items.items()):
-            for event, entry in sorted(item.get("transitions", {}).items()):
-                if entry["stage"] not in _OPEN_STAGES or self.actions >= self.budget:
+            queued = item.get("transitions", {})
+            latest = _latest_milestone(queued)
+            for event in TRANSITION_EVENTS:
+                entry = queued.get(event)
+                if entry is None or entry["stage"] not in _OPEN_STAGES:
+                    continue
+                if _RANK[event] < latest:
+                    # A later milestone already happened, so this older state would roll the issue back.
+                    self._finish(ext_ref, "transitions", event, result="superseded", reason=None)
+                    continue
+                if self.actions >= self.budget:
                     continue
                 self._transition(ext_ref, event)
 
