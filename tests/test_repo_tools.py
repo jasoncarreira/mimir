@@ -275,6 +275,7 @@ def _repo_scope_and_state(
     commit_count: int = 1, pull_request_author: str | None = None,
     base_ref: str = "main",
     base_files: dict[str, bytes] | None = None,
+    base_modes: dict[str, int] | None = None,
     history_entries: bool = False,
     allowed_operations: frozenset[str] | None = None,
 ) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState]:
@@ -292,6 +293,7 @@ def _repo_scope_and_state(
         target = source / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
+        target.chmod((base_modes or {}).get(name, 0o644))
     if history_entries:
         (source / "tree").mkdir()
         (source / "tree" / "child").write_text("child")
@@ -372,7 +374,7 @@ def test_historical_restore_and_binary_paging(tmp_path: Path) -> None:
                                       "fixture.bin", "testdata/copy.bin", runtime=runtime)
     assert restored == {
         "destination": "testdata/copy.bin", "bytes": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
+        "sha256": hashlib.sha256(data).hexdigest(), "mode": "100644",
     }
     assert (state.checkout_lease.path / "testdata/copy.bin").read_bytes() == data
     pages = bytearray()
@@ -381,12 +383,94 @@ def test_historical_restore_and_binary_paging(tmp_path: Path) -> None:
         page = repo_file_at_revision.func("owner/repo", 7, scope.observed_base_sha,
                                           "fixture.bin", offset=offset, limit=8192, runtime=runtime)
         assert page["total_bytes"] == len(data)
-        pages.extend(base64.b64decode(page["content_base64"], validate=True))
+        assert page["encoding"] == "base64"
+        pages.extend(base64.b64decode(page["content"], validate=True))
         if page["next_offset"] is None:
             break
         assert page["next_offset"] > offset
         offset = page["next_offset"]
     assert bytes(pages) == data
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o755])
+def test_historical_restore_preserves_mode(tmp_path: Path, mode: int) -> None:
+    import stat
+    from mimir.tools.repo import repo_restore_file
+    from mimir.models import RepoPRScopeRegistry
+
+    data = b"#!/bin/sh\nprintf 'verified\\n'\n"
+    _, _, scope, state = _repo_scope_and_state(
+        tmp_path, base_files={"tools/verify": data}, base_modes={"tools/verify": mode},
+    )
+    runtime = SimpleNamespace(context=replace(
+        _lineage_turn(scope, state), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    ))
+    root = state.checkout_lease.path
+    target = root / "tools/verify"
+    # The committed mode, not an existing file's mode or the process umask,
+    # must control the result (including removal of an obsolete exec bit).
+    target.chmod(0o644 if mode == 0o755 else 0o755)
+    target.write_bytes(b"changed\n")
+    old_umask = os.umask(0o077)
+    try:
+        result = repo_restore_file.func(
+            "owner/repo", 7, scope.observed_base_sha,
+            "tools/verify", "tools/verify", runtime=runtime,
+        )
+    finally:
+        os.umask(old_umask)
+    assert result["mode"] == f"100{mode:o}"
+    assert target.read_bytes() == data
+    assert stat.S_IMODE(target.stat().st_mode) == mode
+    assert _git(root, "diff", "--exit-code", scope.observed_base_sha, "--", "tools/verify") == ""
+
+
+@pytest.mark.parametrize("limit", [1, 2, 5, 8192])
+def test_historical_utf8_paging(tmp_path: Path, limit: int) -> None:
+    from mimir.tools.repo import repo_file_at_revision
+    from mimir.models import RepoPRScopeRegistry
+
+    data = "ASCII\né € 😀 café\n".encode("utf-8")
+    _, _, scope, state = _repo_scope_and_state(tmp_path, base_files={"unicode.txt": data})
+    runtime = SimpleNamespace(context=replace(
+        _lineage_turn(scope, state), repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    ))
+    offset = 0
+    pages = bytearray()
+    encodings = set()
+    while True:
+        page = repo_file_at_revision.func(
+            "owner/repo", 7, scope.observed_base_sha, "unicode.txt",
+            offset=offset, limit=limit, runtime=runtime,
+        )
+        end = min(offset + limit, len(data))
+        expected = data[offset:end]
+        try:
+            text = expected.decode("utf-8")
+        except UnicodeDecodeError:
+            assert page["encoding"] == "base64"
+            decoded = base64.b64decode(page["content"], validate=True)
+        else:
+            assert page["encoding"] == "utf-8"
+            assert page["content"] == text
+            decoded = page["content"].encode("utf-8")
+        encodings.add(page["encoding"])
+        assert decoded == expected
+        assert page["offset"] == offset
+        assert page["total_bytes"] == len(data)
+        assert page["next_offset"] == (end if end < len(data) else None)
+        pages.extend(decoded)
+        if page["next_offset"] is None:
+            break
+        offset = page["next_offset"]
+    assert bytes(pages) == data
+    assert encodings == ({"utf-8"} if limit == 8192 else {"utf-8", "base64"})
+    eof = repo_file_at_revision.func(
+        "owner/repo", 7, scope.observed_base_sha, "unicode.txt",
+        offset=len(data), limit=limit, runtime=runtime,
+    )
+    assert eof["encoding"] == "utf-8" and eof["content"] == ""
+    assert eof["next_offset"] is None
 
 
 def test_historical_file_refusals(tmp_path: Path) -> None:
@@ -460,7 +544,8 @@ def test_historical_file_refusals(tmp_path: Path) -> None:
                               repo_pr_scope_registry=RepoPRScopeRegistry((review_state,)))
     page = repo_file_at_revision.func("owner/repo", 7, review_scope.observed_base_sha,
                                       "tracked.txt", runtime=runtime)
-    assert base64.b64decode(page["content_base64"]) == b"base\n"
+    assert page["encoding"] == "utf-8"
+    assert page["content"] == "base\n"
     with pytest.raises(ToolException):
         restore(revision=review_scope.observed_base_sha, source_path="tracked.txt")
     runtime.context = replace(_lineage_turn(scope, state, tainted=True),
