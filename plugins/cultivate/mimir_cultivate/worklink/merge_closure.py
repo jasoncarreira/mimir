@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -17,6 +18,7 @@ import yaml
 
 from mimir.redaction import redact_text
 from ..repository import RepositoryConfig, RepositoryInventory
+from ..tracker.lifecycle import request_merge_closure
 from .backends.registry import WorklinkConfig
 from .checkout import _default_runner
 from .dispatch_failures import (
@@ -30,6 +32,8 @@ from .dispatch_failures import (
 )
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+
+_LOGGER = logging.getLogger(__name__)
 
 _PR_URL = re.compile(
     r"https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/"
@@ -52,6 +56,7 @@ class IssueSnapshot:
     labels: frozenset[str]
     comments: tuple[str, ...]
     parent_id: int | None
+    description: str = ""
 
     @property
     def is_open(self) -> bool:
@@ -240,7 +245,11 @@ def parse_issue_snapshot(payload: object, *, expected_issue_id: int) -> IssueSna
     parent_id = None if parent_raw is None else _positive_int(parent_raw, "parent_id")
     if parent_id == expected_issue_id:
         raise ClosureReadError("issue cannot be its own parent")
-    return IssueSnapshot(expected_issue_id, normalized_status, frozenset(labels), tuple(comments), parent_id)
+    description = payload.get("description")
+    return IssueSnapshot(
+        expected_issue_id, normalized_status, frozenset(labels), tuple(comments), parent_id,
+        description if isinstance(description, str) else "",
+    )
 
 
 def _parse_pr_url(pr_url: str) -> tuple[str, int, str]:
@@ -438,6 +447,36 @@ def _audit_text(key: str, issue_id: int, pr: PrSnapshot, base: str) -> str:
         f"Chainlink #{issue_id} complete via PR {pr.url}.\n"
         f"Merged at {pr.merged_at}; merge commit {pr.merge_commit_sha}; completion base {base}."
     )
+
+
+def _queue_tracker_closure(home: Path, issue: IssueSnapshot, pr_url: str) -> None:
+    """Queue a backstop closure request; local writes only, never blocks reconciliation."""
+    try:
+        request_merge_closure(
+            home, description=issue.description,
+            chainlink_issue_id=issue.issue_id, pr_url=pr_url,
+        )
+    except Exception as exc:
+        _LOGGER.warning("tracker_closure_request_failed %s", type(exc).__name__)
+
+
+def _request_epic_closure(
+    home: Path, issue: IssueSnapshot, *, repository: RepositoryConfig,
+    gh_bin: str, gh_runner: Runner,
+) -> None:
+    try:
+        if "External:" not in issue.description or not (
+            WorklinkConfig.load(home / "worklink.yaml").tracker.close_on_merge
+        ):
+            return
+        association = discover_associations(home, issue)
+        if association.reason or association.pr_url is None:
+            return
+        pr = read_pr_snapshot(association.pr_url, gh_bin=gh_bin, runner=gh_runner)
+        if pr.merged and pr.slug == repository.slug and pr.base_slug == repository.slug:
+            _queue_tracker_closure(home, issue, pr.url)
+    except Exception as exc:
+        _LOGGER.warning("tracker_closure_request_failed %s", type(exc).__name__)
 
 
 def _notice(
@@ -740,6 +779,7 @@ def _process_intent(
             resolve_failure_if_current(
                 state_dir, issue_id, captured_incident[0], captured_incident[1],
             )
+        _queue_tracker_closure(home, issue, pr.url)
         _update_intent(state_dir, key, stage="finalized", result_finalized=True)
         resolve_merge_reconciliation_notices(state_dir, issue_id=issue_id, pr_url=pr_url)
         return ClosureOutcome(issue_id, pr.url, str(pr.merged_at), str(pr.merge_commit_sha))
@@ -832,6 +872,11 @@ def reconcile_merged_leaves(
                         continue
                     raise ClosureReadError("review_lifecycle_required")
                 if lifecycle_reason := _lifecycle_reason(issue):
+                    if lifecycle_reason == "epic_not_leaf" and not dry_run:
+                        _request_epic_closure(
+                            home, issue, repository=repository,
+                            gh_bin=gh_bin, gh_runner=gh_runner,
+                        )
                     raise ClosureReadError(lifecycle_reason)
                 association = discover_associations(home, issue)
                 if association.reason == "missing_pr_association":

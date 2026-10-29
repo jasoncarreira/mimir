@@ -1869,3 +1869,15 @@ def test_close_recovery_fallback_association_failure_is_visible_without_replay(
     unresolved = [entry for entry in notices.values() if not entry["resolved"]]
     assert len(unresolved) == 1
     assert unresolved[0]["reason"] == "close_recovery_read_failed"
+
+
+def test_issue_snapshot_carries_description_for_the_backstop() -> None:
+    payload = {
+        "id": 5, "status": "open", "labels": [], "comments": [], "parent_id": None,
+        "description": "Goal: x",
+    }
+    assert closure.parse_issue_snapshot(payload, expected_issue_id=5).description == "Goal: x"
+    del payload["description"]
+    assert closure.parse_issue_snapshot(payload, expected_issue_id=5).description == ""
+    payload["description"] = 7
+    assert closure.parse_issue_snapshot(payload, expected_issue_id=5).description == ""
