@@ -1,0 +1,376 @@
+"""Tracker drain: queued transitions and backstop closures, applied once from tracker evidence."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import subprocess
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from mimir_cultivate.tracker import drain as drain_module
+from mimir_cultivate.tracker.adapters.base import ActionResult
+from mimir_cultivate.tracker.config import (
+    TrackerAdapterConfig,
+    TrackerConfig,
+)
+from mimir_cultivate.tracker.drain import drain, poller_state_dir
+from mimir_cultivate.tracker.evidence import evidence_path, evidence_transaction, read_evidence
+from mimir_cultivate.tracker.transport import TrackerUnavailable
+
+EXT = "linear:ENG-1"
+PR = "https://github.com/acme/app/pull/5"
+SHA = "abcdef1234567890"
+
+
+class FakeAdapter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self.state: str | None = "Todo"
+        self.close_result = ActionResult("applied")
+        self.transition_result = ActionResult("applied")
+        self.raises: list[TrackerUnavailable] = []
+
+    def _maybe_raise(self) -> None:
+        if self.raises:
+            raise self.raises.pop(0)
+
+    def current_state(self, ref: str) -> str | None:
+        self.calls.append(("current_state", ref))
+        return self.state
+
+    def transition(self, ref: str, state: str) -> ActionResult:
+        self.calls.append(("transition", ref, state))
+        self._maybe_raise()
+        return self.transition_result
+
+    def close(self, ref: str) -> ActionResult:
+        self.calls.append(("close", ref))
+        self._maybe_raise()
+        return self.close_result
+
+
+class Gh:
+    def __init__(self, *, merged: bool = True, state: str = "closed") -> None:
+        self.merged = merged
+        self.state = state
+        self.calls = 0
+
+    def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        self.calls += 1
+        payload = {
+            "number": 5,
+            "html_url": PR,
+            "body": "",
+            "state": self.state,
+            "merged": self.merged,
+            "merged_at": "2026-10-29T00:00:00Z" if self.merged else None,
+            "merge_commit_sha": SHA if self.merged else None,
+            "base": {"repo": {"full_name": "acme/app"}, "ref": "release/next"},
+        }
+        return subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+
+
+@pytest.fixture
+def adapter(monkeypatch: pytest.MonkeyPatch) -> FakeAdapter:
+    fake = FakeAdapter()
+    monkeypatch.setattr(drain_module, "build_adapter", lambda *a, **k: fake)
+    return fake
+
+
+def _config(*, close: bool = True, transitions: dict[str, str] | None = None) -> TrackerConfig:
+    return TrackerConfig(
+        close_on_merge=close,
+        adapters={"linear": TrackerAdapterConfig(name="linear", transitions=transitions or {})},
+    )
+
+
+def _closure(home: Path, **fields: Any) -> None:
+    entry = {
+        "stage": "requested", "chainlink_issue": 7, "pr_url": PR, "result": None,
+        "reason": None, "attempts": 0, "merge_commit_sha": None, "base_ref": None,
+        "requested_at": "t", "recorded_at": None,
+    }
+    entry.update(fields)
+    with evidence_transaction(home) as data:
+        data["items"].setdefault(EXT, {})["closure"] = entry
+
+
+def _transition(home: Path, event: str = "build_started", **fields: Any) -> None:
+    entry = {
+        "stage": "requested", "state": "In Progress", "result": None, "reason": None,
+        "attempts": 0, "requested_at": "t", "recorded_at": None,
+    }
+    entry.update(fields)
+    with evidence_transaction(home) as data:
+        data["items"].setdefault(EXT, {}).setdefault("transitions", {})[event] = entry
+
+
+def _run(home: Path, config: TrackerConfig, gh: Gh | None = None) -> tuple[int, list[dict]]:
+    emitted: list[dict] = []
+    count = drain(home, config, {}, object(), gh or Gh(), emitted.append)  # type: ignore[arg-type]
+    return count, emitted
+
+
+def _evidence(home: Path) -> dict:
+    return read_evidence(home)
+
+
+def test_on_leaf_closes_once_records_result(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+    count, _ = _run(tmp_path, _config())
+    assert count == 1
+    closure = _evidence(tmp_path)["items"][EXT]["closure"]
+    assert (closure["stage"], closure["result"], closure["attempts"]) == ("done", "closed", 1)
+    assert (closure["merge_commit_sha"], closure["base_ref"]) == (SHA, "release/next")
+    assert ("close", "ENG-1") in adapter.calls
+    adapter.calls.clear()
+    gh = Gh()
+    for _ in range(2):
+        assert _run(tmp_path, _config(), gh)[0] == 0
+    assert adapter.calls == [] and gh.calls == 0
+
+
+def test_drain_noop_when_disabled_after_request(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+    before = evidence_path(tmp_path).read_text()
+    gh = Gh()
+    assert _run(tmp_path, _config(close=False), gh)[0] == 0
+    assert adapter.calls == [] and gh.calls == 0
+    assert evidence_path(tmp_path).read_text() == before
+
+
+def test_off_with_merged_mapping_zero_calls(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+    _run(tmp_path, _config(close=False, transitions={"merged": "Done"}))
+    assert adapter.calls == []
+
+
+def test_closure_requires_forge_merge_state(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+    gh = Gh(merged=False, state="open")
+    _run(tmp_path, _config(), gh)
+    assert gh.calls == 1 and adapter.calls == []
+    assert _evidence(tmp_path)["items"][EXT]["closure"]["stage"] == "requested"
+
+
+def test_closed_unmerged_pr_deletes_request(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+    _run(tmp_path, _config(), Gh(merged=False, state="closed"))
+    assert adapter.calls == [] and _evidence(tmp_path)["items"] == {}
+
+
+def test_already_closed_by_github(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+    adapter.state = "closed"
+    _run(tmp_path, _config())
+    assert _evidence(tmp_path)["items"][EXT]["closure"]["result"] == "already_closed"
+    assert ("close", "ENG-1") not in adapter.calls
+
+
+def test_close_reporting_already_is_recorded(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+    adapter.close_result = ActionResult("already")
+    _run(tmp_path, _config())
+    assert _evidence(tmp_path)["items"][EXT]["closure"]["result"] == "already_closed"
+
+
+def test_merged_mapping_is_applied_instead_of_close(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+    _run(tmp_path, _config(transitions={"merged": "Done"}))
+    assert ("transition", "ENG-1", "Done") in adapter.calls
+    assert not [c for c in adapter.calls if c[0] == "close"]
+    assert _evidence(tmp_path)["items"][EXT]["closure"]["result"] == "transitioned"
+
+
+def test_merged_mapping_already_in_state(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+    adapter.state = "Done"
+    _run(tmp_path, _config(transitions={"merged": "Done"}))
+    assert _evidence(tmp_path)["items"][EXT]["closure"]["result"] == "already_in_state"
+    assert not [c for c in adapter.calls if c[0] == "transition"]
+
+
+def test_unavailable_closure_records_notice_not_failure(
+    tmp_path: Path, adapter: FakeAdapter
+) -> None:
+    _closure(tmp_path)
+    adapter.close_result = ActionResult("unavailable", "merged_state_required")
+    _run(tmp_path, _config())
+    data = _evidence(tmp_path)
+    closure = data["items"][EXT]["closure"]
+    assert (closure["stage"], closure["result"], closure["reason"]) == (
+        "done", "unavailable", "merged_state_required",
+    )
+    assert [(n["lifecycle_event"], n["reason"]) for n in data["notices"]] == [
+        ("merged", "merged_state_required")
+    ]
+
+
+def test_closure_attempts_capped_then_notice(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+    adapter.raises = [TrackerUnavailable("timeout") for _ in range(5)]
+    stages = []
+    for _ in range(4):
+        _run(tmp_path, _config())
+        stages.append(_evidence(tmp_path)["items"][EXT]["closure"]["stage"])
+    assert stages == ["requested", "requested", "done", "done"]
+    data = _evidence(tmp_path)
+    assert data["items"][EXT]["closure"]["result"] == "failed"
+    assert data["items"][EXT]["closure"]["attempts"] == 3
+    assert len(data["notices"]) == 1
+
+
+def test_no_external_call_inside_evidence_lock(
+    tmp_path: Path, adapter: FakeAdapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fcntl
+
+    _closure(tmp_path)
+    _transition(tmp_path)
+    held: list[bool] = []
+
+    def probe() -> None:
+        lock = (evidence_path(tmp_path).parent / "evidence.lock").open("a")
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held.append(False)
+        except BlockingIOError:
+            held.append(True)
+        finally:
+            lock.close()
+
+    for name in ("current_state", "transition", "close"):
+        original = getattr(adapter, name)
+
+        def wrapped(*args: Any, _original=original) -> Any:
+            probe()
+            return _original(*args)
+
+        monkeypatch.setattr(adapter, name, wrapped)
+    _run(tmp_path, _config(transitions={"build_started": "In Progress"}))
+    assert held and not any(held)
+
+
+def test_started_stage_is_persisted_before_the_call(
+    tmp_path: Path, adapter: FakeAdapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _closure(tmp_path)
+    seen: list[str] = []
+    original = adapter.close
+
+    def close(ref: str) -> ActionResult:
+        seen.append(_evidence(tmp_path)["items"][EXT]["closure"]["stage"])
+        return original(ref)
+
+    monkeypatch.setattr(adapter, "close", close)
+    _run(tmp_path, _config())
+    assert seen == ["started"]
+
+
+def test_transition_started_is_persisted_before_the_call(
+    tmp_path: Path, adapter: FakeAdapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _transition(tmp_path)
+    seen: list[str] = []
+    original = adapter.transition
+
+    def transition(ref: str, state: str) -> ActionResult:
+        seen.append(_evidence(tmp_path)["items"][EXT]["transitions"]["build_started"]["stage"])
+        return original(ref, state)
+
+    monkeypatch.setattr(adapter, "transition", transition)
+    _run(tmp_path, _config(transitions={"build_started": "In Progress"}))
+    assert seen == ["started"]
+
+
+def test_transition_applied_once(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _transition(tmp_path)
+    config = _config(transitions={"build_started": "In Progress"})
+    assert _run(tmp_path, config)[0] == 1
+    assert _run(tmp_path, config)[0] == 0
+    entry = _evidence(tmp_path)["items"][EXT]["transitions"]["build_started"]
+    assert (entry["stage"], entry["result"]) == ("done", "applied")
+    assert adapter.calls == [("transition", "ENG-1", "In Progress")]
+
+
+def test_transition_now_unset_makes_no_call(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _transition(tmp_path)
+    _run(tmp_path, _config())
+    entry = _evidence(tmp_path)["items"][EXT]["transitions"]["build_started"]
+    assert entry["result"] == "unset" and adapter.calls == []
+
+
+def test_unavailable_transition_is_notice_not_failure(
+    tmp_path: Path, adapter: FakeAdapter
+) -> None:
+    _transition(tmp_path)
+    adapter.transition_result = ActionResult("unavailable", "state_not_found")
+    count, _ = _run(tmp_path, _config(transitions={"build_started": "In Progress"}))
+    data = _evidence(tmp_path)
+    assert count == 1
+    assert data["items"][EXT]["transitions"]["build_started"]["result"] == "unavailable"
+    assert [n["lifecycle_event"] for n in data["notices"]] == ["build_started"]
+
+
+def test_action_budget_is_bounded(tmp_path: Path, adapter: FakeAdapter) -> None:
+    for event in ("build_started", "pr_opened", "filed"):
+        _transition(tmp_path, event)
+    config = _config(transitions={"build_started": "A", "pr_opened": "B", "filed": "C"})
+    count = drain(tmp_path, config, {}, object(), Gh(), lambda s: None, max_actions=2)  # type: ignore[arg-type]
+    assert count == 2
+
+
+def test_notices_emit_until_receipt_then_marked(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _transition(tmp_path)
+    adapter.transition_result = ActionResult("unavailable", "state_not_found")
+    config = _config(transitions={"build_started": "In Progress"})
+    _run(tmp_path, config)
+    _, emitted = _run(tmp_path, config)
+    key = _evidence(tmp_path)["notices"][0]["delivery_key"]
+    assert key.startswith("trk-") and len(key) == 28
+    assert emitted == [
+        {
+            "kind": "tracker_transition_unavailable", "delivery_key": key,
+            "adapter": "linear", "ref": "ENG-1", "lifecycle_event": "build_started",
+            "reason": "state_not_found",
+        }
+    ]
+    _, again = _run(tmp_path, config)
+    assert len(again) == 1
+    receipts = poller_state_dir(tmp_path) / ".delivery-receipts"
+    receipts.mkdir(parents=True)
+    (receipts / hashlib.sha256(key.encode()).hexdigest()).write_text("")
+    _, final = _run(tmp_path, config)
+    assert final == [] and _evidence(tmp_path)["notices"][0]["notified"] is True
+
+
+def test_evidence_has_no_tracker_text(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+    _transition(tmp_path)
+    adapter.transition_result = ActionResult("unavailable", "state_not_found")
+    _run(tmp_path, _config(transitions={"build_started": "In Progress"}))
+
+    def strings(node: Any) -> list[str]:
+        if isinstance(node, str):
+            return [node]
+        if isinstance(node, dict):
+            return [s for v in node.values() for s in strings(v)]
+        if isinstance(node, list):
+            return [s for v in node for s in strings(v)]
+        return []
+
+    token = re.compile(r"[A-Za-z0-9_:/.#+\- ]*")
+    assert all(token.fullmatch(text) for text in strings(_evidence(tmp_path)))
+
+
+def test_drain_writes_carry_no_text(tmp_path: Path, adapter: FakeAdapter) -> None:
+    _closure(tmp_path)
+    _transition(tmp_path)
+    _run(tmp_path, _config(transitions={"build_started": "In Progress"}))
+    writes = [c for c in adapter.calls if c[0] in ("transition", "close")]
+    assert writes == [("transition", "ENG-1", "In Progress"), ("close", "ENG-1")]
