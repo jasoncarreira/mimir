@@ -1,0 +1,1 @@
+- The factory's repository verify now runs through `scripts/heavy_run.sh`. When a host sets `MIMIR_HEAVY_LOCK_FILE` and has `lockf` and `gtimeout`, the verify queues on that shared heavy-run lock, under a `gtimeout` backstop. Otherwise it runs directly. `verify_timeout_ms` is raised to cover time spent waiting for the lock.
