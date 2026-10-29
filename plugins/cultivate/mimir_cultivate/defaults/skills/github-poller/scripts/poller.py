@@ -161,6 +161,7 @@ from mimir.prompt_safety import sanitize_prompt_field
 from mimir_cultivate.ci import capture_job_log, clean_log_tail, classify_cancelled_run
 from mimir_cultivate.github_trust import partition, sanitize_login, sanitize_url
 from mimir_cultivate.review_checks import approval_blocker
+from mimir_cultivate.repository import RepositoryInventory
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "cursor.json"
@@ -1223,6 +1224,11 @@ def _review_requested(pr: dict, me: str) -> bool:
     )
 
 
+def _auto_review_mode(inventory: RepositoryInventory, repo: str) -> str:
+    record = inventory.repository(repo)
+    return record.auto_review if record is not None else "all"
+
+
 def _pr_scope_fields(
     pr: dict, repo: str, *, token: str = "", me: str = "",
     trust_cache: dict | None = None, tick_budget: TickBudget | None = None,
@@ -1518,6 +1524,7 @@ def _check_prs(
     review_needed_pr_numbers: set[str] | None = None,
     review_context: dict[str, str] | None = None,
     tick_budget: "TickBudget | None" = None,
+    auto_review: str = "all",
 ) -> int:
     """New pull requests."""
     data = _gh_api(
@@ -1561,6 +1568,8 @@ def _check_prs(
             count += _surface_untrusted_pr_once(
                 repo, number, url, surfaced_untrusted, attested_author,
             )
+            continue
+        if auto_review == "requested-only":
             continue
         body = _truncate(pr.get("body") or "")
         prompt_parts = [f"New PR on {repo}: #{number} {title} (by @{author})"]
@@ -1858,6 +1867,7 @@ def _check_pr_pushes(
     review_needed_pr_numbers: set[str] | None = None,
     review_context: dict[str, str] | None = None,
     tick_budget: "TickBudget | None" = None,
+    auto_review: str = "all",
 ) -> tuple[int, dict[str, str], dict[str, int]]:
     """Detect new commits pushed to existing open PRs AND new
     review-requests addressed to ``me`` on those same PRs.
@@ -1985,10 +1995,12 @@ def _check_pr_pushes(
                 # First sighting — record, do not emit.
                 new_heads[key] = current_sha
             elif prev_sha != current_sha:
-                emitted = _emit_pr_synchronize(
-                    repo, number, title, url, prev_sha, current_sha, token, me,
-                    pr=pr, related_comment=review_context.get(key, ""),
-                    trust_cache=trust_cache, tick_budget=tick_budget,
+                emitted = (
+                    _emit_pr_synchronize(
+                        repo, number, title, url, prev_sha, current_sha, token, me,
+                        pr=pr, related_comment=review_context.get(key, ""),
+                        trust_cache=trust_cache, tick_budget=tick_budget,
+                    ) if auto_review == "all" or explicitly_requested else False
                 )
                 if emitted:
                     count += 1
@@ -3787,6 +3799,9 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    inventory = RepositoryInventory.load(Path(home) / "repositories.yaml") if home else RepositoryInventory()
+
     cursor = _load_cursor()
     new_cursor_ts = _utc_now_iso()
     since = cursor.get("last_checked")
@@ -3860,6 +3875,7 @@ def main() -> None:
             review_needed_pr_numbers=review_needed_pr_numbers,
             review_context=review_context,
             tick_budget=budget,
+            auto_review=_auto_review_mode(inventory, repo),
         )
         total += pr_opened_count
         total += _check_pr_review_comments(
@@ -3879,6 +3895,7 @@ def main() -> None:
             review_needed_pr_numbers=review_needed_pr_numbers,
             review_context=review_context,
             tick_budget=budget,
+            auto_review=_auto_review_mode(inventory, repo),
         )
         total += push_count
         total += _check_issue_comments(
