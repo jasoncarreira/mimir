@@ -149,7 +149,7 @@ class PromptBlockProvider:
 _FLOW = frozenset({"source", "sink", "both", "neither"})
 _TIERS = frozenset({"scope-contained", "scoped-with-provenance", "code-execution", "unbounded"})
 _OPERATIONS = frozenset({"open", "resource_scoped", "admin_required"})
-_SCOPES = frozenset({"channel", "repo_pr", "worklink", "ci_run", "ci_branch"})
+_SCOPES = frozenset({"channel", "repo_pr", "worklink", "ci_run", "ci_branch", "tracker_issue"})
 _PROMPT_SECTIONS = frozenset({
     "channel_memory", "feedback", "core_proposals", "session_summaries",
     "usage", "upcoming", "commitments", "self_state",
@@ -718,7 +718,7 @@ class PolicyRegistry:
             )
         if resource_scope is not None and resource_scope not in _SCOPES:
             raise PolicyRegistrationError(f"{name}: unknown resource scope {resource_scope!r}")
-        if resource_scope in {"worklink", "ci_run", "ci_branch"} and not self._selected_first_party(owner):
+        if resource_scope in {"worklink", "ci_run", "ci_branch", "tracker_issue"} and not self._selected_first_party(owner):
             raise PolicyRegistrationError(f"{owner}: selected first-party resource scope required")
         if owner != "core" and (operation_class == "resource_scoped") != (resource_scope is not None):
             raise PolicyRegistrationError(f"{name}: resource_scoped requires an explicit resource scope")
@@ -934,7 +934,7 @@ class PolicyRegistry:
                     raise PolicyRegistrationError(f"{owner}: plugin principal cannot declare {field_name}")
             for field_name in (
                 "saga_full_corpus_read", "github_activity",
-                "worklink_retained_checkout", "github_ci_watch",
+                "worklink_retained_checkout", "github_ci_watch", "tracker_issues",
             ):
                 if getattr(principal, field_name, False) is not False:
                     raise PolicyRegistrationError(f"{owner}: plugin principal cannot declare {field_name}")
@@ -984,6 +984,8 @@ class PolicyRegistry:
         for name, companions in self._capability_companions.items():
             if not companions <= self._capabilities.keys():
                 raise PolicyRegistrationError(f"{name}: unknown companion capability")
+        from mimir.tool_descriptors import ResultOriginKind
+
         for name, tool in self._tools.items():
             if tool.resource_scope == "worklink" and "worklink_build_tools" not in tool.memberships:
                 raise PolicyRegistrationError(f"{name}: worklink scope requires host-projected build membership")
@@ -991,6 +993,11 @@ class PolicyRegistry:
                 tool.result_domain != "repository" or not tool.read_backend or tool.flow != "source"
             ):
                 raise PolicyRegistrationError(f"{name}: CI scope requires repository read metadata")
+            if tool.resource_scope == "tracker_issue" and (
+                tool.flow != "sink" or tool.descriptor is None
+                or not tool.descriptor.result_origin & ResultOriginKind.NON_INGESTING
+            ):
+                raise PolicyRegistrationError(f"{name}: tracker issue scope requires a non-ingesting sink")
             if tool.owner != "core":
                 category = tool.descriptor.sink_category if tool.descriptor else None
                 if tool.profiles and category in {SinkCategory.EXTERNAL_MCP, SinkCategory.PROPOSAL}:

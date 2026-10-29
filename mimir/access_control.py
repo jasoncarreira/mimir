@@ -53,6 +53,7 @@ from .models import (
     NormalizedPullRequestSnapshot,
     SourceKind,
 )
+from .poller_tracker import safe_adapter, safe_ref, safe_url
 from .read_policy import (
     READ_RESOURCE_OPERATIONS,
     framework_large_tool_results_root,
@@ -10335,6 +10336,28 @@ class ToolRegistry:
                         is_shadow_decision=not enforce and not in_scope,
                         would_block=not in_scope, flow_direction=flow_direction,
                     ))
+                elif scope_kind == "tracker_issue":
+                    external_ref = (arguments or {}).get("external_ref")
+                    in_scope = (
+                        isinstance(external_ref, str)
+                        and any(
+                            external_ref == f"{adapter}:{ref}"
+                            for adapter, ref, _url in getattr(
+                                auth_context, "tracker_issue_targets", frozenset(),
+                            )
+                        )
+                        and service_principal is not None
+                        and service_principal.has_capability(tool_name)
+                    )
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=decision,
+                        allowed=in_scope or not enforce,
+                        reason=None if in_scope else "tracker_scope_denied",
+                        required_tier=AccessTier.USER,
+                        enforcement_enabled=enforce,
+                        is_shadow_decision=not enforce and not in_scope,
+                        would_block=not in_scope, flow_direction=flow_direction,
+                    ))
                 elif scope_kind == "repo_pr" and _is_registered_retained_scope(repo_pr_action_scope):
                     return finish(authorize_repo_pr_tool(
                         tool_name, repo_pr_action_scope,
@@ -13341,6 +13364,27 @@ def create_auth_context(
                 for item in valid_items
             )
 
+    tracker_issue_targets: frozenset[tuple[str, str, str]] = frozenset()
+    if (
+        event.trigger == "poller"
+        and event.source == "poller"
+        and event_ingress is None
+        and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical
+        and registered_service.tracker_issues
+    ):
+        items = extra.get("items")
+        if isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict):
+            item = items[0]
+            adapter, ref = safe_adapter(item.get("adapter")), safe_ref(item.get("ref"))
+            url = safe_url(item.get("url"), ref)
+            if (
+                item.get("tracker_attested") is True
+                and adapter is not None and ref is not None and url is not None
+            ):
+                tracker_issue_targets = frozenset({(adapter, ref, url)})
+
     return AuthContext(
         principal=author,
         canonical_principal=canonical,
@@ -13358,6 +13402,7 @@ def create_auth_context(
         scoped_pr_grants=scoped_pr_grants,
         ci_run_targets=ci_run_targets,
         ci_branch_targets=ci_branch_targets,
+        tracker_issue_targets=tracker_issue_targets,
         retained_factory_scope=retained_resolution.scope,
         retained_factory_scope_refusal=retained_resolution.refusal_reason,
         enforcement_enabled=enforce,

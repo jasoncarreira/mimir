@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, dataclass
+from dataclasses import FrozenInstanceError, dataclass, replace
 from enum import StrEnum
 from types import SimpleNamespace
 
@@ -487,6 +487,55 @@ def test_freeze_rejects_unknown_references_and_resource_scopes():
         registry.registrar("example").register_tool(**tool_fields(
             operation_class="resource_scoped", resource_scope="repo_pr",
         ))
+        registry.freeze()
+
+
+def tracker_tool_fields(**overrides):
+    fields = tool_fields(
+        name="tracker_sample", flow="sink", tier="scoped-with-provenance",
+        operation_class="resource_scoped", resource_scope="tracker_issue",
+        result_origin=ResultOriginKind.NON_INGESTING,
+        sink_category=SinkCategory.FORGE, sink_destination="bound_tracker_issue",
+        sink_target_extractor=lambda *_: ("tracker:x",),
+        sink_payload_extractor=lambda *_: ("body",),
+        writes_code_or_state=True,
+    )
+    fields.update(overrides)
+    return fields
+
+
+def test_tracker_issue_scope_is_first_party_only():
+    registry = PolicyRegistry()
+    with pytest.raises(PolicyRegistrationError, match="selected first-party resource scope required"):
+        registry.registrar("example").register_tool(**tracker_tool_fields())
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((selected_candidate(),))
+    registry.registrar("cultivate").register_tool(**tracker_tool_fields())
+    assert registry.freeze().tools["tracker_sample"].resource_scope == "tracker_issue"
+
+
+@pytest.mark.parametrize("override", [
+    pytest.param({"flow": "both"}, id="not-sink-only"),
+    pytest.param({"flow": "source"}, id="source-flow"),
+    pytest.param({"result_origin": ResultOriginKind.NONE}, id="ingesting-result"),
+    pytest.param({"result_origin": ResultOriginKind.EXTERNAL}, id="external-result"),
+])
+def test_tracker_issue_scope_requires_a_non_ingesting_sink(override):
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((selected_candidate(),))
+    with pytest.raises(PolicyRegistrationError):
+        registry.registrar("cultivate").register_tool(**tracker_tool_fields(**override))
+        registry.freeze()
+    assert not registry.frozen
+
+
+def test_tracker_issue_scope_freeze_check_rejects_a_bypassed_registration():
+    registry = PolicyRegistry()
+    registry.select_plugin_candidates((selected_candidate(),))
+    registry.registrar("cultivate").register_tool(**tracker_tool_fields())
+    tool = registry._tools["tracker_sample"]
+    registry._tools["tracker_sample"] = replace(tool, flow="both")
+    with pytest.raises(PolicyRegistrationError, match="tracker issue scope requires a non-ingesting sink"):
         registry.freeze()
 
 
