@@ -1,0 +1,34 @@
+{
+  "source": "Jira Cloud platform REST API v3, Issue comments: POST /rest/api/3/issue/{issueIdOrKey}/comment",
+  "exchanges": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://acme.atlassian.net/rest/api/3/issue/PROJ-45/comment",
+        "json": {
+          "body": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+              {
+                "type": "paragraph",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Thanks, filed."
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "response": {
+        "status": 201,
+        "json": {
+          "id": "10200"
+        }
+      }
+    }
+  ]
+}

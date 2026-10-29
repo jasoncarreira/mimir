@@ -1,0 +1,23 @@
+{
+  "source": "Jira Cloud platform REST API v3, Issues: GET/POST /rest/api/3/issue/{issueIdOrKey}/transitions; GET issue (fields=status)",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "url": "https://acme.atlassian.net/rest/api/3/issue/PROJ-45?fields=status"
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "id": "10045",
+          "key": "PROJ-45",
+          "fields": {
+            "status": {
+              "name": "Done"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

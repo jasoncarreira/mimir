@@ -1,0 +1,14 @@
+{
+  "source": "Jira Cloud platform REST API v3, Issues: GET /rest/api/3/issue/{issueIdOrKey} (expand=changelog, fields)",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "url": "https://acme.atlassian.net/rest/api/3/issue/PROJ-45?expand=changelog&fields=summary,description,status,assignee,project,creator,comment,updated"
+      },
+      "response": {
+        "status": 503
+      }
+    }
+  ]
+}
