@@ -7,6 +7,7 @@ The Docker and GitHub boundaries are deliberately injectable for offline tests.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 from datetime import datetime, timezone
 import getpass
@@ -483,8 +484,92 @@ def _previous_image(deploy: Path, previous: dict) -> tuple[str, str] | None:
     return sha, tag
 
 
+def _previous_provision_compose(source: str, constants: dict[str, object]) -> str:
+    """Recover the pinned provision override without executing historical setup."""
+    if "_PROVISION_COMPOSE" in constants:
+        value = constants["_PROVISION_COMPOSE"]
+        if not isinstance(value, str):
+            raise ValueError("Invalid provision Compose constant")
+        return value
+
+    # Before the constant existed, setup wrote this literal inline. Match the
+    # exact writer and destination, not a coincidentally named string elsewhere.
+    values = []
+    for function in ast.parse(source).body:
+        if not isinstance(function, ast.FunctionDef) or function.name != "setup":
+            continue
+        for node in ast.walk(function):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "_write" and len(node.args) >= 2):
+                continue
+            destination = node.args[0]
+            if not (isinstance(destination, ast.BinOp) and isinstance(destination.op, ast.Div)
+                    and isinstance(destination.left, ast.Name) and destination.left.id == "deploy"
+                    and isinstance(destination.right, ast.Constant)
+                    and destination.right.value == "compose.provision.yml"):
+                continue
+            value = ast.literal_eval(node.args[1])
+            if not isinstance(value, str):
+                raise ValueError("Invalid inline provision Compose template")
+            values.append(value)
+    if len(values) != 1:
+        raise ValueError("Missing or ambiguous inline provision Compose template")
+    return values[0]
+
+
+def _previous_generated(source_repo: str, token: str, old_image: tuple[str, str],
+                        previous: dict, port: int, request) -> dict[str, str]:
+    """Render legacy files with the pinned source that originally produced them."""
+    sha, layer_tag = old_image
+    error = (f"Cannot recover previous generated templates for {sha}; "
+             "restore that source commit or reconcile the deployment before retrying.")
+    try:
+        setup_source = _content(source_repo, sha, "plugins/cultivate/mimir_cultivate/setup.py", token, request)
+        scaffold_source = _content(source_repo, sha, "mimir/scaffold_docker.py", token, request)
+    except SetupError:
+        raise SetupError(error) from None
+    if setup_source is None or scaffold_source is None:
+        raise SetupError(error)
+
+    try:
+        def extract(source: str, names: set[str]) -> tuple[dict[str, object], dict[str, ast.FunctionDef]]:
+            constants = {}
+            functions = {}
+            for node in ast.parse(source).body:
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    for target in targets:
+                        if isinstance(target, ast.Name) and target.id in names:
+                            constants[target.id] = ast.literal_eval(node.value)
+                elif isinstance(node, ast.FunctionDef) and node.name in names:
+                    functions[node.name] = node
+            return constants, functions
+
+        setup_constants, setup_functions = extract(setup_source, {"_PROVISION", "_PROVISION_COMPOSE", "render_compose"})
+        scaffold_constants, scaffold_functions = extract(scaffold_source, {
+            "_COMPOSE_YML_TEMPLATE_PYPI", "_DEFAULT_MODE", "_MODES", "render_compose_yml"})
+        provision = setup_constants["_PROVISION"]
+        provision_compose = _previous_provision_compose(setup_source, setup_constants)
+        template = scaffold_constants["_COMPOSE_YML_TEMPLATE_PYPI"]
+        if not all(isinstance(value, str) for value in (provision, provision_compose, template)):
+            raise ValueError
+        # Compile only the two pinned renderers, never the modules' top-level code.
+        namespace = {"re": re, "yaml": yaml, "SetupError": SetupError, **scaffold_constants}
+        for function in (setup_functions["render_compose"], scaffold_functions["render_compose_yml"]):
+            module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                                      function], type_ignores=[])
+            exec(compile(ast.fix_missing_locations(module), f"{sha}:renderer", "exec"), namespace)
+        compose = namespace["render_compose_yml"](service_name="agent", web_port=port, mode="pypi")
+        compose = namespace["render_compose"](compose, layer_tag, previous["toolchain"], previous["slug"].split("/")[1])
+        return {"compose.yml": compose, "provision.py": provision,
+                "compose.provision.yml": provision_compose, ".gitignore": "*\n"}
+    except (KeyError, IndexError, NameError, SyntaxError, TypeError, ValueError, SetupError):
+        raise SetupError(error) from None
+
+
 def _check_generated(deploy: Path, generated: dict[str, str], previous: dict,
-                     old_image: tuple[str, str] | None, *, force: bool) -> None:
+                     old_image: tuple[str, str] | None, *, force: bool,
+                     source_repo: str, token: str, request) -> None:
     """Validate *all* owned files before replacing any of them."""
     hashes = previous.get("generated_sha256")
     if hashes is not None and (not isinstance(hashes, dict) or
@@ -495,19 +580,12 @@ def _check_generated(deploy: Path, generated: dict[str, str], previous: dict,
     if hashes is None and (deploy / "compose.yml").exists() and not force:
         if old_image is None:
             raise SetupError("Cannot verify previous generated files; reconcile build.sh before retrying.")
-        from mimir.scaffold_docker import render_compose_yml
         compose_path = deploy / "compose.yml"
         content = compose_path.read_text()
         match = re.search(r"127\.0\.0\.1:(\d+):8080", content)
         if not match:
             raise SetupError(f"{compose_path} already differs; reconcile it manually before retrying.")
-        legacy = {
-            "compose.yml": render_compose(render_compose_yml(service_name="agent", web_port=int(match.group(1)), mode="pypi"),
-                                          old_image[1], previous["toolchain"], previous["slug"].split("/")[1]),
-            "provision.py": _PROVISION,
-            "compose.provision.yml": _PROVISION_COMPOSE,
-            ".gitignore": "*\n",
-        }
+        legacy = _previous_generated(source_repo, token, old_image, previous, int(match.group(1)), request)
     for name, text in generated.items():
         path = deploy / name
         if path.is_symlink() or (path.exists() and not path.is_file()):
@@ -1341,7 +1419,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     compose = render_compose(compose, layer_tag, kind, repo.lower().split('/')[1])
     generated = {"compose.yml": compose, ".gitignore": "*\n",
                  "provision.py": _PROVISION, "compose.provision.yml": _PROVISION_COMPOSE}
-    _check_generated(deploy, generated, previous, old_image, force=bool(getattr(args, "force", False)))
+    _check_generated(deploy, generated, previous, old_image, force=bool(getattr(args, "force", False)),
+                     source_repo=source_repo, token=token, request=request)
     # Query the old running container before publishing the new Compose image.
     was_running = bool(run(["docker", "compose", "ps", "-q", "agent"], cwd=deploy)) if old_image else False
     if was_running and not getattr(args, "force", False):
