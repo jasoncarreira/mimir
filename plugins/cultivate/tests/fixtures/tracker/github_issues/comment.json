@@ -1,0 +1,21 @@
+{
+  "source": "GitHub REST API reference, Issues: https://docs.github.com/en/rest/issues/issues and https://docs.github.com/en/rest/issues/comments",
+  "exchanges": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.github.com/repos/acme/widgets/issues/42/comments",
+        "json": {
+          "body": "Thanks, filed."
+        }
+      },
+      "response": {
+        "status": 201,
+        "json": {
+          "id": 1,
+          "body": "Thanks, filed."
+        }
+      }
+    }
+  ]
+}

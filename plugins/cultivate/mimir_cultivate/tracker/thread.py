@@ -43,6 +43,7 @@ class TrackerIssue:
 
     ``bot_id`` is the adapter's own identity in the same normalized form as the
     ``actor_id`` values; activities by it are skipped by the delivery rule.
+    ``updated_at`` is the listing's ISO 8601 UTC update time; a full read may leave it None.
     """
 
     adapter: str
@@ -59,6 +60,7 @@ class TrackerIssue:
     comments: tuple[Comment, ...]
     truncated: bool
     bot_id: str
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True)
