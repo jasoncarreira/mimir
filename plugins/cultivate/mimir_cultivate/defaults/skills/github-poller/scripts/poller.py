@@ -1267,6 +1267,8 @@ def _mentions_login(body: str, me: str) -> bool:
 
 def _requested_only_comment_allowed(
     repo: str, token: str, pr: dict, item: dict, me: str,
+    *, tick_budget: "TickBudget | None" = None,
+    reply_root_cache: dict | None = None,
 ) -> bool:
     """Allow only own, requested, mentioned, or verified own-thread replies."""
     if not me:
@@ -1279,8 +1281,21 @@ def _requested_only_comment_allowed(
     number = pr.get("number")
     if type(reply_id) is not int or reply_id < 1 or type(number) is not int:
         return False
-    root = _gh_api(f"repos/{repo}/pulls/comments/{reply_id}", token)
-    return (isinstance(root, dict) and root.get("id") == reply_id
+    cache = reply_root_cache if reply_root_cache is not None else {}
+    key = (repo, reply_id)
+    if key not in cache:
+        if _hard_stop(tick_budget, "review_comment_reply_root"):
+            return False
+        cache[key] = _gh_api(f"repos/{repo}/pulls/comments/{reply_id}", token)
+    root = cache[key]
+    if not isinstance(root, dict):
+        # Unknown is not a negative scope decision. Hold the since window so
+        # a transient error or budget refusal cannot permanently lose a reply.
+        if tick_budget is not None:
+            tick_budget.hard_truncated = True
+            tick_budget.note_truncation("review_comment_reply_root", 1)
+        return False
+    return (root.get("id") == reply_id
             and (root.get("user") or {}).get("login") == me
             and root.get("pull_request_url") == f"https://api.github.com/repos/{repo}/pulls/{number}")
 
@@ -1724,6 +1739,7 @@ def _check_issue_comments(
     own_feedback: dict[str, dict] | None = None,
     feedback_seen: set[str] | None = None,
     auto_review: str = "all",
+    reply_root_cache: dict | None = None,
 ) -> int:
     """New issue + PR conversation comments.
 
@@ -1754,6 +1770,8 @@ def _check_issue_comments(
     count = 0
     pending = own_feedback if own_feedback is not None else {}
     seen = feedback_seen if feedback_seen is not None else set()
+    if reply_root_cache is None:
+        reply_root_cache = {}
     parent_cache: dict[str, dict | None] = {}
     for comment in data:
         if _hard_stop(tick_budget, "issue_comments"):
@@ -1811,7 +1829,8 @@ def _check_issue_comments(
         ):
             continue
         if auto_review == "requested-only" and not _requested_only_comment_allowed(
-            repo, token, pr, comment, me,
+            repo, token, pr, comment, me, tick_budget=tick_budget,
+            reply_root_cache=reply_root_cache,
         ):
             continue
         if me and (pr.get("user") or {}).get("login") == me:
@@ -1850,6 +1869,7 @@ def _check_pr_review_comments(
     own_feedback: dict[str, dict] | None = None,
     feedback_seen: set[str] | None = None,
     auto_review: str = "all",
+    reply_root_cache: dict | None = None,
 ) -> int:
     """New PR review comments — these are INLINE diff comments,
     distinct from issue/PR conversation comments. The bulk of code
@@ -1866,6 +1886,8 @@ def _check_pr_review_comments(
     count = 0
     pending = own_feedback if own_feedback is not None else {}
     seen = feedback_seen if feedback_seen is not None else set()
+    if reply_root_cache is None:
+        reply_root_cache = {}
     for comment in data:
         if me and (comment.get("user") or {}).get("login") == me:
             continue
@@ -1897,7 +1919,8 @@ def _check_pr_review_comments(
         ):
             continue
         if auto_review == "requested-only" and not _requested_only_comment_allowed(
-            repo, token, parent, comment, me,
+            repo, token, parent, comment, me, tick_budget=tick_budget,
+            reply_root_cache=reply_root_cache,
         ):
             continue
         path = comment.get("path", "")
@@ -3717,6 +3740,7 @@ def _check_pr_reviews(
     own_feedback: dict[str, dict] | None = None,
     feedback_seen: set[str] | None = None,
     auto_review: str = "all",
+    reply_root_cache: dict | None = None,
 ) -> int:
     """New PR reviews (approve / changes-requested / commented).
     No ``since=`` query on reviews endpoint — walk open PRs + filter
@@ -3735,6 +3759,8 @@ def _check_pr_reviews(
     count = 0
     pending = own_feedback if own_feedback is not None else {}
     seen = feedback_seen if feedback_seen is not None else set()
+    if reply_root_cache is None:
+        reply_root_cache = {}
     for pr in prs:
         pr_number = pr.get("number")
         if not pr_number:
@@ -3766,7 +3792,8 @@ def _check_pr_reviews(
                     _notice_own_withheld(repo, pr_number, withheld)
                 continue
             if auto_review == "requested-only" and not _requested_only_comment_allowed(
-                repo, token, pr, review, me,
+                repo, token, pr, review, me, tick_budget=tick_budget,
+                reply_root_cache=reply_root_cache,
             ):
                 continue
             reviewer_login = (review.get("user") or {}).get("login", "unknown")
@@ -3920,6 +3947,8 @@ def main() -> None:
     trust_cache: dict[tuple[str, object], object] = {}
     feedback_all: dict = cursor.get("pr_feedback_seen", {}) or {}
     new_feedback_all: dict[str, list[str]] = {}
+    # Shared only within this tick, including failed lookups; retry next tick.
+    reply_root_cache: dict = {}
 
     total = 0
     for repo in repos:
@@ -3958,11 +3987,13 @@ def main() -> None:
             repo, since, token, me, trust_cache=trust_cache, tick_budget=budget,
             own_feedback=pending_feedback, feedback_seen=feedback_seen,
             auto_review=_auto_review_mode(inventory, repo),
+            reply_root_cache=reply_root_cache,
         )
         total += _check_pr_reviews(
             repo, since, token, me, trust_cache=trust_cache, tick_budget=budget,
             own_feedback=pending_feedback, feedback_seen=feedback_seen,
             auto_review=_auto_review_mode(inventory, repo),
+            reply_root_cache=reply_root_cache,
         )
         repo_heads = pr_heads_all.get(repo, {}) or {}
         repo_rr = _coerce_review_requests(rr_all.get(repo))
@@ -3988,6 +4019,7 @@ def main() -> None:
             tick_budget=budget,
             own_feedback=pending_feedback, feedback_seen=feedback_seen,
             auto_review=_auto_review_mode(inventory, repo),
+            reply_root_cache=reply_root_cache,
         )
         total += _emit_own_feedback(repo, me, pending_feedback, feedback_seen)
         new_feedback_all[repo] = sorted(feedback_seen)

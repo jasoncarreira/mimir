@@ -28,7 +28,8 @@ def _pr(author="alice", *, requested=False, sha="new"):
 
 
 def _drive(monkeypatch, tmp_path, capsys, *, mode, pr, heads=None, comment=False,
-           ci_failure=False, item=None, kind=None, reply_root=None):
+           ci_failure=False, item=None, kind=None, reply_root=None,
+           reply_items=None, root_calls=None):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     inventory_path = home / "repositories.yaml"
@@ -62,9 +63,13 @@ def _drive(monkeypatch, tmp_path, capsys, *, mode, pr, heads=None, comment=False
         if endpoint.endswith("/pulls/42/reviews"):
             return [item] if kind == "pr_review" else []
         if endpoint == f"repos/{REPO}/pulls/comments/901":
+            if root_calls is not None:
+                root_calls.append(endpoint)
             return reply_root
         if "/pulls/comments?" in endpoint:
-            return [item] if kind == "pr_review_comment" else []
+            if kind == "pr_review_comment":
+                return reply_items if reply_items is not None else [item]
+            return []
         if "/issues/comments?" in endpoint:
             return ([item] if kind == "issue_comment" else
                     [{"id": 123, "user": {"login": "alice"},
@@ -231,7 +236,6 @@ def test_code_and_partial_mentions_do_not_wake_bot(monkeypatch, tmp_path, capsys
 
 @pytest.mark.parametrize("kind", ["issue_comment", "pr_review_comment", "pr_review"])
 @pytest.mark.parametrize("root", [
-    None,
     {"id": 902, "user": {"login": BOT},
      "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42"},
     {"id": 901, "user": {"login": "alice"},
@@ -244,10 +248,73 @@ def test_reply_must_reference_own_thread_on_same_pr(monkeypatch, tmp_path, capsy
     pr["created_at"] = SINCE
     item = _activity(kind, "Please fix")
     item["in_reply_to_id"] = 901
-    events, _ = _drive(monkeypatch, tmp_path, capsys, mode="requested-only",
-                       pr=pr, heads={"42": "new"}, kind=kind, item=item,
-                       reply_root=root)
+    events, cursor = _drive(monkeypatch, tmp_path, capsys, mode="requested-only",
+                            pr=pr, heads={"42": "new"}, kind=kind, item=item,
+                            reply_root=root)
     assert events == []
+    assert cursor["last_checked"] != SINCE
+
+
+@pytest.mark.parametrize("root", [None, poller._GH_API_BUDGET_REFUSED, []],
+                         ids=["api-error", "budget-refused", "malformed"])
+def test_reply_root_unavailable_holds_cursor_and_retries(monkeypatch, tmp_path, capsys, root):
+    pr = _pr()
+    pr["created_at"] = SINCE
+    item = _activity("pr_review_comment", "Please fix")
+    item["in_reply_to_id"] = 901
+    calls = []
+    events, cursor = _drive(monkeypatch, tmp_path, capsys, mode="requested-only",
+                            pr=pr, heads={"42": "new"}, kind="pr_review_comment",
+                            item=item, reply_root=root, root_calls=calls)
+    assert not [event for event in events if "event_type" in event]
+    assert cursor["last_checked"] == SINCE
+    assert len(calls) == 1
+    assert any(event.get("truncated", {}).get("review_comment_reply_root") == 1
+               for event in events)
+    root = {"id": 901, "user": {"login": BOT},
+            "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42"}
+    events, cursor = _drive(monkeypatch, tmp_path, capsys, mode="requested-only",
+                            pr=pr, heads={"42": "new"}, kind="pr_review_comment",
+                            item=item, reply_root=root, root_calls=calls)
+    assert [event["event_type"] for event in events] == ["pr_review_comment"]
+    assert cursor["last_checked"] != SINCE
+    assert len(calls) == 2  # No negative cache survives into the next tick.
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_reply_root_is_cached_for_tick(monkeypatch, tmp_path, capsys, available):
+    pr = _pr()
+    pr["created_at"] = SINCE
+    items = []
+    for comment_id in (123, 124, 125):
+        item = _activity("pr_review_comment", "Please fix")
+        item.update(id=comment_id, in_reply_to_id=901)
+        items.append(item)
+    root = {"id": 901, "user": {"login": BOT},
+            "pull_request_url": f"https://api.github.com/repos/{REPO}/pulls/42"}
+    calls = []
+    events, cursor = _drive(monkeypatch, tmp_path, capsys, mode="requested-only",
+                            pr=pr, heads={"42": "new"}, kind="pr_review_comment",
+                            reply_items=items, reply_root=root if available else None,
+                            root_calls=calls)
+    assert len(calls) == 1
+    turns = [event for event in events if "event_type" in event]
+    assert len(turns) == (3 if available else 0)
+    assert (cursor["last_checked"] != SINCE) is available
+
+
+def test_reply_root_lookup_obeys_passed_tick_budget(monkeypatch):
+    pr = _pr()
+    item = _activity("pr_review_comment", "Please fix")
+    item["in_reply_to_id"] = 901
+    budget = poller.TickBudget(hard_deadline_seconds=0)
+    calls = []
+    monkeypatch.setattr(poller, "_gh_api", lambda *args: calls.append(args))
+    assert not poller._requested_only_comment_allowed(
+        REPO, "token", pr, item, BOT, tick_budget=budget, reply_root_cache={})
+    assert calls == []
+    assert budget.hard_truncated
+    assert budget.truncated == {"review_comment_reply_root": 1}
 
 
 def test_missing_login_and_invalid_reply_id_fail_closed(monkeypatch):

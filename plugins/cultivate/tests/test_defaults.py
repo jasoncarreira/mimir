@@ -60,7 +60,8 @@ def test_current_repository_skill_release_hash(name):
 
 
 @pytest.mark.parametrize("relative", [
-    "scripts/poller.py", "tests/test_github_poller_pr_pushes.py",
+    "scripts/poller.py", "tests/test_github_poller_auto_review.py",
+    "tests/test_github_poller_pr_pushes.py",
     "tests/test_github_poller_withhold.py", "tests/test_github_poller_issue_notices.py",
 ])
 def test_current_github_poller_release_hash(relative):
