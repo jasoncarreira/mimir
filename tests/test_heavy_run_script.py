@@ -122,22 +122,28 @@ def _wait_for(path: Path, deadline: float = 10.0) -> None:
 @_real_tools
 def test_real_lock_serializes_a_second_wrapper(tmp_path: Path) -> None:
     lock, release, entered = tmp_path / "heavy.lock", tmp_path / "release", tmp_path / "second-entered"
-    first = subprocess.Popen(
-        ["sh", str(SCRIPT), "sh", "-c", f'touch "{tmp_path}/first-held"; while [ ! -e "{release}" ]; do sleep 0.05; done'],
-        env=_real_env(lock),
-    )
+    children: list[subprocess.Popen] = []
     try:
+        children.append(subprocess.Popen(
+            ["sh", str(SCRIPT), "sh", "-c", f'touch "{tmp_path}/first-held"; while [ ! -e "{release}" ]; do sleep 0.05; done'],
+            env=_real_env(lock),
+        ))
         _wait_for(tmp_path / "first-held")
-        second = subprocess.Popen(["sh", str(SCRIPT), "touch", str(entered)], env=_real_env(lock))
+        children.append(subprocess.Popen(["sh", str(SCRIPT), "touch", str(entered)], env=_real_env(lock)))
         time.sleep(1.0)
         assert not entered.exists(), "second wrapper ran its payload while the lock was held"
         release.touch()
+        first, second = children
         assert first.wait(timeout=20) == 0
         assert second.wait(timeout=20) == 0
         assert entered.exists()
     finally:
         release.touch()
-        first.kill()
+        # Reap every wrapper on any failure path; the wrapper's own backstop is hours.
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=10)
 
 
 @_real_tools
