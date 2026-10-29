@@ -79,6 +79,7 @@ _PUSH_PROBE_UNREACHABLE = "CULTIVATE_PUSH_PROBE_UNREACHABLE"
 _PUSH_PROBE_UNREACHABLE_HELP = (
     "Push probe could not reach the remote (network or GitHub error); retry setup."
 )
+_CULTIVATE_DEFAULT_SKILLS = ("github-poller", "github-ci-watch", "github", "review")
 _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.-]*")
 _BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]*")
 _EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
@@ -888,6 +889,11 @@ def _run(args: list[str], *, cwd: Path | None = None, env: dict[str, str] | None
             raise SetupError(_PUSH_PROBE_HELP)
         if _PUSH_PROBE_UNREACHABLE in result.stdout.splitlines():
             raise SetupError(_PUSH_PROBE_UNREACHABLE_HELP)
+        for name in _CULTIVATE_DEFAULT_SKILLS:
+            if "CULTIVATE_SKILL_MODIFIED:" + name in result.stdout.splitlines():
+                raise SetupError(f"Modified Cultivate skill cultivate:{name}; reconcile it or run "
+                                 f"mimir skills install cultivate:{name} --restore "
+                                 "(or rerun setup with --force to back up and restore it).")
         raise SetupError(f"{args[0]} operation failed (exit {result.returncode}); inspect the deployment without publishing secrets.")
     return result.stdout.strip()
 
@@ -1274,7 +1280,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
     setup.add_argument("--rotate-web-key", action="store_true", help="Replace the owner's existing web key intentionally.")
     setup.add_argument("--reembed", action="store_true", help="Re-embed existing Saga vectors offline when changing embeddings.")
     setup.add_argument("--no-start", action="store_true", help="Build and provision but leave the agent stopped; start it later from the deployment directory.")
-    setup.add_argument("--force", action="store_true", help="Override generated-file edits and in-flight checks; also replace an edited worklink.yaml.")
+    setup.add_argument("--force", action="store_true", help="Override generated-file edits and in-flight checks; replace an edited worklink.yaml and back up/restore modified Cultivate skills.")
     return parser
 
 
@@ -1472,13 +1478,11 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     # The provision script and manifest are mounted read-only for a one-shot
     # non-root container, never into the long-running agent.
     no_start = bool(getattr(args, "no_start", False))
-    if (args.reembed or no_start) and was_running:
-        run(["docker", "compose", "stop", "agent"], cwd=deploy)
     def docker_step(step: str, argv: list[str]) -> str:
         try:
             return run(argv, cwd=deploy)
         except SetupError as exc:
-            if str(exc) in {_PUSH_PROBE_HELP, _PUSH_PROBE_UNREACHABLE_HELP}:
+            if str(exc) in {_PUSH_PROBE_HELP, _PUSH_PROBE_UNREACHABLE_HELP} or str(exc).startswith("Modified Cultivate skill cultivate:"):
                 raise
             # Do not interpolate subprocess output (including compose.env values).
             raise SetupError(f"Docker {step} failed; inspect the deployment and docker compose logs.") from None
@@ -1491,17 +1495,32 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
            "--build-arg", "MIMIR_EXTRAS=" + ",".join(sorted(extras)), source_url + "#" + sha])
     docker_step("build", ["docker", "build", "-t", layer_tag, "-f", "Dockerfile.toolchain", "."])
     docker_step("init", ["docker", "compose", "run", "--rm", "init"])
-    provisioned = docker_step("provision", ["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",
-                                      "--user", "1001:1001", "--entrypoint", "python", "agent", "/opt/cultivate-provision.py"])
+    if was_running:
+        docker_step("stop", ["docker", "compose", "stop", "agent"])
+    try:
+        provisioned = docker_step("provision", ["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",
+                                           "--user", "1001:1001", "--entrypoint", "python", "agent", "/opt/cultivate-provision.py"])
+    except Exception:
+        if was_running:
+            # Start the existing container, not the newly configured image.
+            # A refused upgrade must not leave a healthy deployment stopped.
+            try:
+                docker_step("start", ["docker", "compose", "start", "agent"])
+            except Exception:
+                print("Provisioning failed and the previous agent could not be restarted; "
+                      "run docker compose start agent from the deployment directory.")
+            else:
+                print("Provisioning failed; agent restarted on its previous image.")
+        raise
+    for line in provisioned.splitlines():
+        if line.startswith("Upgraded skill cultivate:"):
+            print(line)
     if not no_start:
         docker_step("up", ["docker", "compose", "up", "-d", "agent"])
     if old_image and old_image[1] != layer_tag:
         print("Previous agent image retained: " + old_image[1])
         print("Rollback (from " + str(deploy) + "): docker compose -f compose.yml -f <(printf 'services:\\n  agent:\\n    image: "
               + old_image[1] + "\\n') up -d --force-recreate --no-deps agent")
-    if not no_start and was_running and "SETUP_CHANGED=1" in provisioned.splitlines():
-        run(["docker", "compose", "restart", "agent"], cwd=deploy)
-        print("Restarted the existing agent once to load provisioned repositories, identities and pollers.")
     if no_start:
         print(f"Build and provisioning complete. To start the agent later, from {deploy} run: docker compose up -d agent")
         print("Then re-run mimir cultivate setup with the same deployment and settings, without --no-start, "
@@ -1544,7 +1563,9 @@ import uuid
 import yaml
 from mimir.identities_populator import add_identity_alias, issue_web_key
 from mimir.identities import hash_web_key
-from mimir.plugins.skills import resolve_skill, install_skill
+from mimir.plugins.skills import (resolve_skill, install_skill, skill_state, skill_inventory,
+                                  previous_skill_inventories, upgrade_command)
+from mimir.skill_install import _file_hashes
 from mimir_cultivate.setup import _provision_saga, _provision_worklink
 
 m = json.loads(Path('/opt/cultivate-manifest.json').read_text())
@@ -1626,12 +1647,44 @@ if not inventory.exists() or inventory.read_text() != text:
 changed = _provision_worklink(home, entry, base=base,
                             checkout=repo, git_auth=git_auth, force=m.get('force', False),
                             toolchain=m.get('toolchain')) or changed
+skills = []
 for name in ('github-poller', 'github-ci-watch', 'github', 'review'):
     skill = resolve_skill('cultivate:' + name, set())
     if skill is None:
         raise RuntimeError('missing optional Cultivate skill: ' + name)
-    if not (home / 'skills' / skill.dirname).exists():
+    skills.append((skill, skill_state(home, skill)))
+# Refuse before changing any skill, so a modified tree cannot leave a partial upgrade.
+for skill, state in skills:
+    if state == 'modified' and not m.get('force', False):
+        print('CULTIVATE_SKILL_MODIFIED:' + skill.name, flush=True)
+        raise RuntimeError('modified Cultivate skill ' + skill.label +
+                           '; reconcile it or run ' + upgrade_command(skill) +
+                           ' (or rerun setup with --force to back up and restore it)')
+# Resolve all display metadata before the first install/restore. A metadata
+# error must not interrupt the loop after earlier skills have been replaced.
+upgrades = {}
+for skill, state in skills:
+    if state in ('upgrade available', 'modified'):
+        releases = previous_skill_inventories(skill)
+        old_release = 'modified'
+        if state == 'upgrade available':
+            # This walker is only for display, not upgrade authorization. Its
+            # exclusions can differ from skill_state's strict tree comparison.
+            actual = _file_hashes(home / 'skills' / skill.dirname)
+            old_release = next((version for version, files in releases.items()
+                                if files == actual), 'recorded release')
+        inventory = skill_inventory(skill)
+        new_release = next((version for version, files in releases.items()
+                            if files == inventory), 'packaged')
+        upgrades[skill.name] = (old_release, new_release)
+for skill, state in skills:
+    if state == 'not installed':
         install_skill(home, skill)
+        changed = True
+    elif state in ('upgrade available', 'modified'):
+        old_release, new_release = upgrades[skill.name]
+        install_skill(home, skill, restore=True)
+        print('Upgraded skill ' + skill.label + ' (' + old_release + ' -> ' + new_release + ')')
         changed = True
 identities = home / 'state' / 'identities.yaml'
 doc = yaml.safe_load(identities.read_text()) if identities.exists() else {}

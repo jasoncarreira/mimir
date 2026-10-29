@@ -768,7 +768,15 @@ def setup_environment(tmp_path, monkeypatch):
             state['running'] = True
         if argv[-2:] == ['stop', 'agent']:
             state['running'] = False
-        return 'SETUP_CHANGED=0' if 'compose.provision.yml' in argv else ''
+        if argv[-2:] == ['start', 'agent']:
+            if state.get('start_failure'):
+                raise installer.SetupError(state['start_failure'])
+            state['running'] = True
+        if 'compose.provision.yml' in argv:
+            if state.get('provision_failure'):
+                raise installer.SetupError(state['provision_failure'])
+            return state.get('provision_output', 'SETUP_CHANGED=0')
+        return ''
 
     args = argparse.Namespace(rotate_web_key=False, reembed=False, force=False, system_packages=None)
     state['verified'] = []
@@ -841,6 +849,78 @@ def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrad
     hashes = manifest['generated_sha256']
     assert set(hashes) == {'compose.yml', 'provision.py', 'compose.provision.yml', '.gitignore'}
     assert all(hashes[name] == hashlib.sha256((deploy / name).read_bytes()).hexdigest() for name in hashes)
+
+
+def test_setup_stops_agent_for_provision_and_reports_skill_upgrade(upgrade_setup, capsys):
+    deploy, args, state, calls, invoke = upgrade_setup
+    state['provision_output'] = ('Upgraded skill cultivate:github-poller '
+                                 '(0.9.10-2026 -> 2057-auto-review)\nSETUP_CHANGED=1')
+    invoke()
+    output = capsys.readouterr().out
+    assert output.count('Upgraded skill cultivate:github-poller (0.9.10-2026 -> 2057-auto-review)') == 1
+    stop = calls.index(['docker', 'compose', 'stop', 'agent'])
+    provision = next(i for i, argv in enumerate(calls) if 'compose.provision.yml' in argv)
+    up = calls.index(['docker', 'compose', 'up', '-d', 'agent'])
+    assert stop < provision < up
+    assert not any(argv[-2:] == ['restart', 'agent'] for argv in calls)
+
+
+@pytest.mark.parametrize('was_running', [True, False])
+@pytest.mark.parametrize('no_start', [True, False])
+@pytest.mark.parametrize('failure', [
+    'Modified Cultivate skill cultivate:review; reconcile it or run '
+    'mimir skills install cultivate:review --restore.',
+    'unclassified provision failure',
+])
+def test_setup_restores_previous_running_state_on_provision_failure(
+        upgrade_setup, capsys, was_running, no_start, failure):
+    deploy, args, state, calls, invoke = upgrade_setup
+    capsys.readouterr()
+    state['running'] = was_running
+    state['provision_failure'] = failure
+    state['sha'] = 'c' * 40
+    args.no_start = no_start
+    expected = failure if failure.startswith('Modified Cultivate skill') else 'Docker provision failed'
+    with pytest.raises(installer.SetupError, match=re.escape(expected)):
+        invoke()
+    assert state['running'] is was_running
+    assert not any(argv[-3:] == ['up', '-d', 'agent'] for argv in calls)
+    assert not any(argv[-2:] == ['restart', 'agent'] for argv in calls)
+    provision = next(i for i, argv in enumerate(calls) if 'compose.provision.yml' in argv)
+    if was_running:
+        assert calls.index(['docker', 'compose', 'stop', 'agent']) < provision
+        assert calls.index(['docker', 'compose', 'start', 'agent']) > provision
+        assert 'agent restarted on its previous image' in capsys.readouterr().out
+    else:
+        assert ['docker', 'compose', 'stop', 'agent'] not in calls
+        assert ['docker', 'compose', 'start', 'agent'] not in calls
+        assert 'agent restarted' not in capsys.readouterr().out
+
+
+def test_setup_preserves_provision_error_when_previous_agent_cannot_start(upgrade_setup, capsys):
+    deploy, args, state, calls, invoke = upgrade_setup
+    state['provision_failure'] = 'Modified Cultivate skill cultivate:review; reconcile it.'
+    state['start_failure'] = 'private subprocess output'
+    with pytest.raises(installer.SetupError, match='Modified Cultivate skill cultivate:review'):
+        invoke()
+    assert ['docker', 'compose', 'start', 'agent'] in calls
+    assert state['running'] is False
+    output = capsys.readouterr().out
+    assert 'previous agent could not be restarted' in output
+    assert 'private subprocess output' not in output
+
+
+def test_failed_provision_reports_only_known_modified_skill(monkeypatch):
+    def result(stdout):
+        monkeypatch.setattr(installer.subprocess, 'run', lambda *a, **kw: subprocess.CompletedProcess(
+            a[0], 1, stdout=stdout, stderr='private-token-in-stderr'))
+        with pytest.raises(installer.SetupError) as exc:
+            installer._run(['docker', 'compose', 'run'])
+        assert 'private-token-in-stderr' not in str(exc.value)
+        return str(exc.value)
+
+    assert 'mimir skills install cultivate:github-poller --restore' in result('CULTIVATE_SKILL_MODIFIED:github-poller\n')
+    assert 'mimir skills install' not in result('CULTIVATE_SKILL_MODIFIED:untrusted\n')
 
 
 @pytest.mark.parametrize('name', ['compose.yml', 'provision.py', 'compose.provision.yml', '.gitignore'])
@@ -1976,6 +2056,186 @@ def test_existing_env_never_overwrites_operator_secrets(tmp_path):
     assert (tmp_path / "compose.env").read_bytes() == before
 
 
+@pytest.fixture
+def provisioned_skills(tmp_path, monkeypatch):
+    """Execute the actual one-shot provision program with a seeded home and fake Git."""
+    from mimir.plugins import skills
+
+    monkeypatch.setenv('MIMIR_PLUGINS', 'cultivate')
+    monkeypatch.setenv('HOME', '/home/mimir')
+    monkeypatch.setenv('XDG_CACHE_HOME', '/home/mimir/.cache')
+    home = tmp_path / 'home'
+    (home / 'state').mkdir(parents=True)
+    repo = tmp_path / 'repo'
+    (repo / '.git').mkdir(parents=True)
+    manifest = tmp_path / 'manifest.json'
+    manifest.write_text(json.dumps({
+        'slug': 'org/repo', 'branch': 'main', 'toolchain': 'node', 'owner': 'owner',
+        'display': 'Owner', 'email': 'owner@example.com', 'test': 'npm test',
+        'review_tests': 'targeted', 'auto_review': 'requested-only', 'rotate': False,
+        'saga_model_spec': 'openai:model', 'embedding': 'local', 'reembed': False,
+    }))
+    script = (installer._PROVISION
+              .replace('/opt/cultivate-manifest.json', str(manifest))
+              .replace('/home/mimir/agent', str(home))
+              .replace("Path('/workspace')", 'Path(' + repr(str(tmp_path)) + ')')
+              .replace("Path('/workspace/worklink/base')", 'Path(' + repr(str(tmp_path / 'worklink/base')) + ')'))
+    monkeypatch.setattr(installer, '_provision_saga', lambda *a, **kw: False)
+    monkeypatch.setattr(installer, '_provision_worklink', lambda *a, **kw: False)
+
+    def git(argv, **kwargs):
+        if 'remote.origin.url' in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout='https://github.com/org/repo.git\n')
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, 'run', git)
+    selected = {skill.name: skill for skill in skills.selected_skills()}
+    defaults = {name: selected[name] for name in ('github-poller', 'github-ci-watch', 'github', 'review')}
+
+    def run():
+        exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
+
+    return home, manifest, defaults, run
+
+
+def test_provision_upgrades_recorded_poller_and_backs_up_tree(provisioned_skills, monkeypatch, capsys):
+    import mimir.plugins.skills as skills
+    from mimir.skill_install import _file_hashes
+
+    home, manifest, defaults, run = provisioned_skills
+    for skill in defaults.values():
+        skills.install_skill(home, skill)
+    poller = home / 'skills/cultivate-github-poller/scripts/poller.py'
+    assert _file_hashes(poller.parents[1]) == skills.skill_inventory(defaults['github-poller'])
+    assert skills.skill_state(home, defaults['github-poller']) == 'installed'
+    poller.write_text('# historical poller without _auto_review_mode\n')
+    old_tree = _file_hashes(poller.parents[1])
+    recorded = skills.previous_skill_inventories
+    def inventories(skill):
+        return {'fixture-older-release': old_tree, **recorded(skill)} if skill.name == 'github-poller' else recorded(skill)
+    monkeypatch.setattr(skills, 'previous_skill_inventories', inventories)
+    assert skills.skill_state(home, defaults['github-poller']) == 'upgrade available'
+
+    run()
+    output = capsys.readouterr().out
+    assert re.search(r'Upgraded skill cultivate:github-poller \(fixture-older-release -> [^)]+\)', output)
+    assert output.count('Upgraded skill ') == 1
+    assert 'SETUP_CHANGED=1' in output
+    assert skills.skill_state(home, defaults['github-poller']) == 'installed'
+    assert '_auto_review_mode' in poller.read_text()
+    backups = list((home / '.mimir/plugin-skill-backups').glob('cultivate-github-poller-*'))
+    assert len(backups) == 1
+    assert _file_hashes(backups[0]) == old_tree
+    run()
+    assert capsys.readouterr().out == 'SETUP_CHANGED=0\n'
+    assert len(list((home / '.mimir/plugin-skill-backups').iterdir())) == 1
+
+
+@pytest.mark.parametrize('metadata_failure', [False, True])
+def test_provision_resolves_release_metadata_before_mutation(
+        provisioned_skills, monkeypatch, capsys, metadata_failure):
+    from mimir.plugins import skills
+    import mimir.skill_install as skill_install
+
+    home, _, defaults, run = provisioned_skills
+    # Leave the first skill missing: metadata failure on the last skill must
+    # prevent even that earlier installation, not merely an earlier restore.
+    for name, skill in defaults.items():
+        if name != 'github-poller':
+            skills.install_skill(home, skill)
+    review = home / 'skills/cultivate-review/SKILL.md'
+    review.write_text('historical recorded review\n')
+    old_tree = skill_install._file_hashes(review.parent)
+    recorded = skills.previous_skill_inventories
+
+    def inventories(skill):
+        return ({'fixture-review': old_tree, **recorded(skill)}
+                if skill.name == 'review' else recorded(skill))
+
+    monkeypatch.setattr(skills, 'previous_skill_inventories', inventories)
+    assert skills.skill_state(home, defaults['review']) == 'upgrade available'
+    installs = []
+    real_install = skills.install_skill
+
+    def install(home, skill, **kwargs):
+        installs.append(skill.name)
+        return real_install(home, skill, **kwargs)
+
+    monkeypatch.setattr(skills, 'install_skill', install)
+
+    def display_hashes(path):
+        if metadata_failure:
+            raise OSError('display metadata unavailable')
+        return {'different-walker-exclusion': 'not-the-recorded-inventory'}
+
+    monkeypatch.setattr(skill_install, '_file_hashes', display_hashes)
+    if metadata_failure:
+        with pytest.raises(OSError, match='display metadata unavailable'):
+            run()
+        assert installs == []
+        assert not (home / 'skills/cultivate-github-poller').exists()
+        assert review.read_text() == 'historical recorded review\n'
+        assert not (home / '.mimir/plugin-skill-backups').exists()
+    else:
+        run()
+        assert installs == ['github-poller', 'review']
+        assert 'Upgraded skill cultivate:review (recorded release -> ' in capsys.readouterr().out
+        assert skills.skill_state(home, defaults['review']) == 'installed'
+        backups = list((home / '.mimir/plugin-skill-backups').iterdir())
+        assert len(backups) == 1
+        assert (backups[0] / 'SKILL.md').read_text() == 'historical recorded review\n'
+
+
+def test_provision_refuses_modified_skill_until_forced(provisioned_skills, capsys):
+    from mimir.plugins import skills
+
+    home, manifest, defaults, run = provisioned_skills
+    for skill in defaults.values():
+        skills.install_skill(home, skill)
+    review = home / 'skills/cultivate-review/SKILL.md'
+    review.write_text(review.read_text() + '\noperator edit\n')
+    poller = home / 'skills/cultivate-github-poller/scripts/poller.py'
+    poller.write_text('unrecorded poller\n')
+    with pytest.raises(RuntimeError, match=r'modified Cultivate skill cultivate:github-poller.*mimir skills install cultivate:github-poller --restore'):
+        run()
+    assert poller.read_text() == 'unrecorded poller\n'
+    assert 'operator edit' in review.read_text()
+    assert not (home / '.mimir/plugin-skill-backups').exists()
+    assert skills.skill_state(home, defaults['review']) == 'modified'
+
+    data = json.loads(manifest.read_text())
+    data['force'] = True
+    manifest.write_text(json.dumps(data))
+    run()
+    output = capsys.readouterr().out
+    assert 'Upgraded skill cultivate:github-poller (modified -> ' in output
+    assert 'Upgraded skill cultivate:review (modified -> ' in output
+    assert skills.skill_state(home, defaults['github-poller']) == 'installed'
+    assert skills.skill_state(home, defaults['review']) == 'installed'
+    backups = list((home / '.mimir/plugin-skill-backups').iterdir())
+    assert len(backups) == 2
+    assert next(b for b in backups if b.name.startswith('cultivate-github-poller-')).joinpath('scripts/poller.py').read_text() == 'unrecorded poller\n'
+    assert 'operator edit' in next(b for b in backups if b.name.startswith('cultivate-review-')).joinpath('SKILL.md').read_text()
+
+
+def test_provision_keeps_current_skill_and_installs_missing(provisioned_skills, capsys):
+    from mimir.plugins import skills
+
+    home, _, defaults, run = provisioned_skills
+    for name, skill in defaults.items():
+        if name != 'review':
+            skills.install_skill(home, skill)
+    poller = home / 'skills/cultivate-github-poller/scripts/poller.py'
+    before = poller.stat().st_mtime_ns
+    run()
+    assert capsys.readouterr().out == 'SETUP_CHANGED=1\n'
+    assert poller.stat().st_mtime_ns == before
+    assert skills.skill_state(home, defaults['review']) == 'installed'
+    assert not (home / '.mimir/plugin-skill-backups').exists()
+    run()
+    assert capsys.readouterr().out == 'SETUP_CHANGED=0\n'
+
+
 @pytest.mark.parametrize('review_tests', ['targeted', 'full', 'none'])
 def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monkeypatch, capsys, caplog, review_tests):
     monkeypatch.setenv("HOME", "/home/mimir")
@@ -2000,8 +2260,11 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     import mimir.plugins.skills as skills
 
     monkeypatch.setattr(skills, "resolve_skill", lambda name, core_names: SimpleNamespace(dirname=name.split(":")[1]))
+    monkeypatch.setattr(skills, "skill_state", lambda home, skill: (
+        'installed' if (home / 'skills' / skill.dirname).exists() else 'not installed'))
 
-    def install_skill(home, skill):
+    def install_skill(home, skill, *, restore=False):
+        assert not restore
         dest = home / "skills" / skill.dirname
         dest.mkdir(parents=True)
         return dest, None
