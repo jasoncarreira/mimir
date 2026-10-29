@@ -122,7 +122,16 @@ def test_passes():
     path = Path("passing-visits")
     path.write_text(str(int(path.read_text()) + 1) if path.exists() else "1")
 ''')
-    (repo / "pytest.ini").write_text("[pytest]\naddopts = -W error -n 2\n")
+    # No anyio fixtures are used here; its optional plugin imports deprecated
+    # pytest internals under pytest 9.2, before the gate warning is exercised.
+    # pytest 9.2.0 / pytest-asyncio 1.4.0 also raises PytestDeprecationWarning
+    # in pytest_configure when asyncio_default_fixture_loop_scope is unset.
+    # Set that option explicitly so -W error still reaches the UserWarning
+    # below, on both the initial run and the targeted rerun.
+    (repo / "pytest.ini").write_text(
+        "[pytest]\naddopts = -p no:anyio -W error -n 2\n"
+        "asyncio_default_fixture_loop_scope = function\n"
+    )
     monkeypatch.setenv("PYTEST_ADDOPTS", "-n 2")
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "false")
     result = await observe_evidence(
@@ -133,6 +142,7 @@ def test_passes():
     )
 
     tests = result.evidence.tests
+    assert tests.initial_run is not None, tests.summary
     assert result.status == "failed"
     assert result.review_ready is False
     assert tests.initial_run.exit_code == tests.rerun.exit_code == tests.exit_code == 1
