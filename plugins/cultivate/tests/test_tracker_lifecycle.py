@@ -171,3 +171,52 @@ def test_evidence_holds_no_tracker_text(tmp_path: Path) -> None:
     request_transition(tmp_path, secret, "filed")
     request_merge_closure(tmp_path, description=secret, chainlink_issue_id=9, pr_url=PR)
     assert "SECRET-PROSE" not in evidence_path(tmp_path).read_text(encoding="utf-8")
+
+
+def _evidence_bytes(home: Path) -> bytes | None:
+    path = evidence_path(home)
+    return path.read_bytes() if path.exists() else None
+
+
+def test_unchanged_transaction_leaves_evidence_untouched(tmp_path: Path) -> None:
+    with evidence_transaction(tmp_path):
+        pass
+    assert not evidence_path(tmp_path).exists()
+    with evidence_transaction(tmp_path) as data:
+        data["notices"].append({"delivery_key": "k"})
+    before = evidence_path(tmp_path).stat().st_mtime_ns
+    with evidence_transaction(tmp_path):
+        pass
+    assert evidence_path(tmp_path).stat().st_mtime_ns == before
+
+
+def test_repeat_transition_request_rewrites_nothing(tmp_path: Path) -> None:
+    _config(tmp_path, transitions={"filed": "Triaged"})
+    assert request_transition(tmp_path, DESCRIPTION, "filed", clock=lambda: CLOCK)
+    path = evidence_path(tmp_path)
+    before_bytes, before_mtime = path.read_bytes(), path.stat().st_mtime_ns
+    assert not request_transition(tmp_path, DESCRIPTION, "filed")
+    assert path.read_bytes() == before_bytes
+    assert path.stat().st_mtime_ns == before_mtime
+
+
+def test_repeat_closure_request_rewrites_nothing(tmp_path: Path) -> None:
+    _config(tmp_path, close=True)
+    assert request_merge_closure(
+        tmp_path, description=DESCRIPTION, chainlink_issue_id=9, pr_url=PR, clock=lambda: CLOCK
+    )
+    path = evidence_path(tmp_path)
+    before_bytes, before_mtime = path.read_bytes(), path.stat().st_mtime_ns
+    assert not request_merge_closure(
+        tmp_path, description=DESCRIPTION, chainlink_issue_id=10, pr_url=PR + "6"
+    )
+    assert path.read_bytes() == before_bytes
+    assert path.stat().st_mtime_ns == before_mtime
+
+
+def test_noop_requests_leave_absent_evidence_absent(tmp_path: Path) -> None:
+    _config(tmp_path, close=False)
+    assert not request_merge_closure(
+        tmp_path, description=DESCRIPTION, chainlink_issue_id=9, pr_url=PR
+    )
+    assert _evidence_bytes(tmp_path) is None

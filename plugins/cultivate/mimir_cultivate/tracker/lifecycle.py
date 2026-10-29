@@ -46,10 +46,10 @@ def request_transition(
     if state is None:
         return False
     with evidence_transaction(home) as data:
+        if event in data["items"].get(record.external_ref(), {}).get("transitions", {}):
+            return False
         item = data["items"].setdefault(record.external_ref(), {})
         transitions = item.setdefault("transitions", {})
-        if event in transitions:
-            return False
         transitions[event] = {
             "stage": "requested",
             "state": state,
@@ -76,9 +76,9 @@ def request_merge_closure(
     if record is None or not _config(home).close_on_merge:
         return False
     with evidence_transaction(home) as data:
-        item = data["items"].setdefault(record.external_ref(), {})
-        if "closure" in item:
+        if "closure" in data["items"].get(record.external_ref(), {}):
             return False
+        item = data["items"].setdefault(record.external_ref(), {})
         item["closure"] = {
             "stage": "requested",
             "chainlink_issue": chainlink_issue_id,

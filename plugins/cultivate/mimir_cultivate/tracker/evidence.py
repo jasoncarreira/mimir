@@ -67,7 +67,7 @@ def read_evidence(home: Path) -> dict[str, Any]:
 
 @contextmanager
 def evidence_transaction(home: Path) -> Iterator[dict[str, Any]]:
-    """Hold the evidence lock; the mutated document is persisted on a clean exit."""
+    """Hold the evidence lock; the mutated document is persisted on a clean exit when it changed."""
 
     directory = tracker_dir(home)
     directory.mkdir(parents=True, exist_ok=True)
@@ -75,7 +75,10 @@ def evidence_transaction(home: Path) -> Iterator[dict[str, Any]]:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             data = _load(evidence_path(home))
+            before = json.dumps(data, sort_keys=True)
             yield data
+            if json.dumps(data, sort_keys=True) == before:
+                return
             fd, tmp_name = tempfile.mkstemp(dir=directory, prefix="evidence.", suffix=".tmp")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:

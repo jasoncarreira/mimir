@@ -174,3 +174,31 @@ def test_never_armed_false_when_claim_record_exists() -> None:
 )
 def test_never_armed_false_for_malformed_snapshot(item: dict) -> None:
     assert _work(FakeChainlink()).never_armed(item) is False
+
+
+def _search_returns(fake: FakeChainlink, stdout: str, *, show: tuple[int, str] | None = None):
+    def runner(argv):
+        result = fake(argv)
+        if argv[2] == "search":
+            result.returncode, result.stdout = 0, stdout
+        elif argv[2] == "show" and show is not None:
+            result.returncode, result.stdout = show
+        return result
+
+    return runner
+
+
+@pytest.mark.parametrize("stdout", ["{not json", "", "{}", "null", '"text"'])
+def test_find_unusable_search_output_raises_not_empty(stdout: str) -> None:
+    runner = _search_returns(FakeChainlink(), stdout)
+    with pytest.raises(WorkUnavailable):
+        ChainlinkWork("chainlink", None, runner).find(REC.external_ref())
+
+
+@pytest.mark.parametrize("show", [(1, ""), (0, "[]"), (0, "{bad")])
+def test_find_show_fallback_failure_raises_not_empty(show: tuple[int, str]) -> None:
+    fake = FakeChainlink()
+    issue_id = fake.add(_described(REC))
+    runner = _search_returns(fake, f'[{{"id": {issue_id}, "title": "t"}}]', show=show)
+    with pytest.raises(WorkUnavailable):
+        ChainlinkWork("chainlink", None, runner).find(REC.external_ref())
