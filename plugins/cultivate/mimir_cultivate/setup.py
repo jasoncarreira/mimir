@@ -1497,8 +1497,21 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     docker_step("init", ["docker", "compose", "run", "--rm", "init"])
     if was_running:
         docker_step("stop", ["docker", "compose", "stop", "agent"])
-    provisioned = docker_step("provision", ["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",
-                                       "--user", "1001:1001", "--entrypoint", "python", "agent", "/opt/cultivate-provision.py"])
+    try:
+        provisioned = docker_step("provision", ["docker", "compose", "-f", "compose.yml", "-f", "compose.provision.yml", "run", "--rm", "--no-deps",
+                                           "--user", "1001:1001", "--entrypoint", "python", "agent", "/opt/cultivate-provision.py"])
+    except Exception:
+        if was_running:
+            # Start the existing container, not the newly configured image.
+            # A refused upgrade must not leave a healthy deployment stopped.
+            try:
+                docker_step("start", ["docker", "compose", "start", "agent"])
+            except Exception:
+                print("Provisioning failed and the previous agent could not be restarted; "
+                      "run docker compose start agent from the deployment directory.")
+            else:
+                print("Provisioning failed; agent restarted on its previous image.")
+        raise
     for line in provisioned.splitlines():
         if line.startswith("Upgraded skill cultivate:"):
             print(line)
@@ -1647,21 +1660,29 @@ for skill, state in skills:
         raise RuntimeError('modified Cultivate skill ' + skill.label +
                            '; reconcile it or run ' + upgrade_command(skill) +
                            ' (or rerun setup with --force to back up and restore it)')
+# Resolve all display metadata before the first install/restore. A metadata
+# error must not interrupt the loop after earlier skills have been replaced.
+upgrades = {}
+for skill, state in skills:
+    if state in ('upgrade available', 'modified'):
+        releases = previous_skill_inventories(skill)
+        old_release = 'modified'
+        if state == 'upgrade available':
+            # This walker is only for display, not upgrade authorization. Its
+            # exclusions can differ from skill_state's strict tree comparison.
+            actual = _file_hashes(home / 'skills' / skill.dirname)
+            old_release = next((version for version, files in releases.items()
+                                if files == actual), 'recorded release')
+        inventory = skill_inventory(skill)
+        new_release = next((version for version, files in releases.items()
+                            if files == inventory), 'packaged')
+        upgrades[skill.name] = (old_release, new_release)
 for skill, state in skills:
     if state == 'not installed':
         install_skill(home, skill)
         changed = True
     elif state in ('upgrade available', 'modified'):
-        old_release = 'modified'
-        if state == 'upgrade available':
-            # skill_state already verified the whole tree against a recorded release.
-            # Use the shared file-hash helper only to name that release in the output.
-            actual = _file_hashes(home / 'skills' / skill.dirname)
-            old_release = next(version for version, files in previous_skill_inventories(skill).items()
-                               if files == actual)
-        inventory = skill_inventory(skill)
-        new_release = next((version for version, files in previous_skill_inventories(skill).items()
-                            if files == inventory), 'packaged')
+        old_release, new_release = upgrades[skill.name]
         install_skill(home, skill, restore=True)
         print('Upgraded skill ' + skill.label + ' (' + old_release + ' -> ' + new_release + ')')
         changed = True

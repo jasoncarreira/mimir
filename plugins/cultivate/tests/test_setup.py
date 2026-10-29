@@ -768,6 +768,10 @@ def setup_environment(tmp_path, monkeypatch):
             state['running'] = True
         if argv[-2:] == ['stop', 'agent']:
             state['running'] = False
+        if argv[-2:] == ['start', 'agent']:
+            if state.get('start_failure'):
+                raise installer.SetupError(state['start_failure'])
+            state['running'] = True
         if 'compose.provision.yml' in argv:
             if state.get('provision_failure'):
                 raise installer.SetupError(state['provision_failure'])
@@ -861,14 +865,49 @@ def test_setup_stops_agent_for_provision_and_reports_skill_upgrade(upgrade_setup
     assert not any(argv[-2:] == ['restart', 'agent'] for argv in calls)
 
 
-def test_setup_preserves_modified_skill_diagnostic(upgrade_setup):
+@pytest.mark.parametrize('was_running', [True, False])
+@pytest.mark.parametrize('no_start', [True, False])
+@pytest.mark.parametrize('failure', [
+    'Modified Cultivate skill cultivate:review; reconcile it or run '
+    'mimir skills install cultivate:review --restore.',
+    'unclassified provision failure',
+])
+def test_setup_restores_previous_running_state_on_provision_failure(
+        upgrade_setup, capsys, was_running, no_start, failure):
     deploy, args, state, calls, invoke = upgrade_setup
-    state['provision_failure'] = ('Modified Cultivate skill cultivate:review; reconcile it or run '
-                                  'mimir skills install cultivate:review --restore.')
-    with pytest.raises(installer.SetupError, match='mimir skills install cultivate:review --restore'):
+    capsys.readouterr()
+    state['running'] = was_running
+    state['provision_failure'] = failure
+    state['sha'] = 'c' * 40
+    args.no_start = no_start
+    expected = failure if failure.startswith('Modified Cultivate skill') else 'Docker provision failed'
+    with pytest.raises(installer.SetupError, match=re.escape(expected)):
         invoke()
-    assert ['docker', 'compose', 'stop', 'agent'] in calls
+    assert state['running'] is was_running
     assert not any(argv[-3:] == ['up', '-d', 'agent'] for argv in calls)
+    assert not any(argv[-2:] == ['restart', 'agent'] for argv in calls)
+    provision = next(i for i, argv in enumerate(calls) if 'compose.provision.yml' in argv)
+    if was_running:
+        assert calls.index(['docker', 'compose', 'stop', 'agent']) < provision
+        assert calls.index(['docker', 'compose', 'start', 'agent']) > provision
+        assert 'agent restarted on its previous image' in capsys.readouterr().out
+    else:
+        assert ['docker', 'compose', 'stop', 'agent'] not in calls
+        assert ['docker', 'compose', 'start', 'agent'] not in calls
+        assert 'agent restarted' not in capsys.readouterr().out
+
+
+def test_setup_preserves_provision_error_when_previous_agent_cannot_start(upgrade_setup, capsys):
+    deploy, args, state, calls, invoke = upgrade_setup
+    state['provision_failure'] = 'Modified Cultivate skill cultivate:review; reconcile it.'
+    state['start_failure'] = 'private subprocess output'
+    with pytest.raises(installer.SetupError, match='Modified Cultivate skill cultivate:review'):
+        invoke()
+    assert ['docker', 'compose', 'start', 'agent'] in calls
+    assert state['running'] is False
+    output = capsys.readouterr().out
+    assert 'previous agent could not be restarted' in output
+    assert 'private subprocess output' not in output
 
 
 def test_failed_provision_reports_only_known_modified_skill(monkeypatch):
@@ -2090,6 +2129,61 @@ def test_provision_upgrades_recorded_poller_and_backs_up_tree(provisioned_skills
     run()
     assert capsys.readouterr().out == 'SETUP_CHANGED=0\n'
     assert len(list((home / '.mimir/plugin-skill-backups').iterdir())) == 1
+
+
+@pytest.mark.parametrize('metadata_failure', [False, True])
+def test_provision_resolves_release_metadata_before_mutation(
+        provisioned_skills, monkeypatch, capsys, metadata_failure):
+    from mimir.plugins import skills
+    import mimir.skill_install as skill_install
+
+    home, _, defaults, run = provisioned_skills
+    # Leave the first skill missing: metadata failure on the last skill must
+    # prevent even that earlier installation, not merely an earlier restore.
+    for name, skill in defaults.items():
+        if name != 'github-poller':
+            skills.install_skill(home, skill)
+    review = home / 'skills/cultivate-review/SKILL.md'
+    review.write_text('historical recorded review\n')
+    old_tree = skill_install._file_hashes(review.parent)
+    recorded = skills.previous_skill_inventories
+
+    def inventories(skill):
+        return ({'fixture-review': old_tree, **recorded(skill)}
+                if skill.name == 'review' else recorded(skill))
+
+    monkeypatch.setattr(skills, 'previous_skill_inventories', inventories)
+    assert skills.skill_state(home, defaults['review']) == 'upgrade available'
+    installs = []
+    real_install = skills.install_skill
+
+    def install(home, skill, **kwargs):
+        installs.append(skill.name)
+        return real_install(home, skill, **kwargs)
+
+    monkeypatch.setattr(skills, 'install_skill', install)
+
+    def display_hashes(path):
+        if metadata_failure:
+            raise OSError('display metadata unavailable')
+        return {'different-walker-exclusion': 'not-the-recorded-inventory'}
+
+    monkeypatch.setattr(skill_install, '_file_hashes', display_hashes)
+    if metadata_failure:
+        with pytest.raises(OSError, match='display metadata unavailable'):
+            run()
+        assert installs == []
+        assert not (home / 'skills/cultivate-github-poller').exists()
+        assert review.read_text() == 'historical recorded review\n'
+        assert not (home / '.mimir/plugin-skill-backups').exists()
+    else:
+        run()
+        assert installs == ['github-poller', 'review']
+        assert 'Upgraded skill cultivate:review (recorded release -> ' in capsys.readouterr().out
+        assert skills.skill_state(home, defaults['review']) == 'installed'
+        backups = list((home / '.mimir/plugin-skill-backups').iterdir())
+        assert len(backups) == 1
+        assert (backups[0] / 'SKILL.md').read_text() == 'historical recorded review\n'
 
 
 def test_provision_refuses_modified_skill_until_forced(provisioned_skills, capsys):
