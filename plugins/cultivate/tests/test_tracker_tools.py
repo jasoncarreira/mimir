@@ -143,6 +143,16 @@ def test_file_leaf_creates_armed_issue_with_record_and_requests_filed(home, chai
     assert transitions["filed"]["state"] == "Todo"
 
 
+def test_unset_filed_mapping_writes_no_filed_request(home, chainlink) -> None:
+    (home / "worklink.yaml").write_text(yaml.safe_dump(
+        {"tracker": {"adapters": {"linear": {"transitions": {"merged": "Done"}}}}}
+    ), encoding="utf-8")
+    result = _file(_runtime(LINEAR))
+    assert result["status"] == "created"
+    item = read_evidence(home)["items"].get(LINEAR.external_ref(), {})
+    assert "filed" not in item.get("transitions", {})
+
+
 def test_file_epic_is_labelled_epic(home, chainlink) -> None:
     result = _file(_runtime(LINEAR), kind="epic", description=EPIC_TEMPLATE_MARKDOWN)
     assert result["status"] == "created" and result["kind"] == "epic"
@@ -360,6 +370,7 @@ def test_set_state_unavailable_records_an_agent_notice_once(home, adapter) -> No
     assert notices[0]["lifecycle_event"] == "agent" and notices[0]["notified"] is False
     assert (notices[0]["adapter"], notices[0]["ref"]) == ("linear", "ENG-1")
     assert notices[0]["delivery_key"].startswith("trk-")
+    assert notices[0]["reason"] == "api_error"
 
 
 def test_set_state_network_error_is_unavailable_with_notice(home, adapter) -> None:
@@ -368,7 +379,16 @@ def test_set_state_network_error_is_unavailable_with_notice(home, adapter) -> No
         external_ref=LINEAR.external_ref(), state="Done", runtime=_runtime(LINEAR),
     )
     assert result == {"status": "unavailable", "reason": "timeout"}
-    assert len(read_evidence(home)["notices"]) == 1
+    notices = read_evidence(home)["notices"]
+    assert len(notices) == 1 and notices[0]["reason"] == "api_error"
+
+
+def test_adapter_reason_in_the_notice_enum_is_stored_as_is(home, adapter) -> None:
+    adapter.result = ActionResult("unavailable", "permission_denied")
+    tools.tracker_set_state.func(
+        external_ref=LINEAR.external_ref(), state="Done", runtime=_runtime(LINEAR),
+    )
+    assert read_evidence(home)["notices"][0]["reason"] == "permission_denied"
 
 
 def test_credentials_come_from_the_process_environment(monkeypatch) -> None:

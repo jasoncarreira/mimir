@@ -51,7 +51,7 @@ CODING_TOOLS = frozenset("""spawn_open_code pr_list pr_metadata pr_spec pr_files
     worklink_resume""".split())
 # Tracker tools are owned by the same provider but were never in the frozen
 # pre-extraction baseline, so they are pinned beside it, not inside it.
-TRACKER_TOOLS = frozenset("tracker_file_work tracker_comment tracker_set_state".split())
+PLUGIN_ONLY_TOOLS = frozenset("tracker_file_work tracker_comment tracker_set_state".split())
 # This flag is a separate declaration from the target-aware tainted-write
 # membership: both must survive migration to the selected plugin registry.
 CODING_WRITES_CODE_OR_STATE = frozenset("""spawn_open_code worklink_run
@@ -401,7 +401,7 @@ def test_original_core_policy_matches_frozen_oracle(
     assert expected["baseline_sha"] == BASELINE
     assert len(expected["descriptors"]) == 103
     assert _canonical(expected, home) == fixture_bytes
-    retired = CODING_TOOLS | {"pr_review_others"}
+    retired = CODING_TOOLS | PLUGIN_ONLY_TOOLS | {"pr_review_others"}
 
     def without_retired(value):
         if isinstance(value, dict):

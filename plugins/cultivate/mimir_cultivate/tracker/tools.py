@@ -21,6 +21,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
 from mimir.models import AuthContext
+from mimir.poller_tracker import NOTICE_REASONS
 from mimir.tools.refusals import ToolPolicyRefusal
 
 from ..forge import _bind_injected_runtime
@@ -229,6 +230,8 @@ def tracker_comment(
 
 
 def _record_agent_notice(home: Path, record: ExternalRecord, reason: str) -> None:
+    if reason not in NOTICE_REASONS:
+        reason = "api_error"
     created_at = datetime.now(UTC).isoformat()
     ext_ref = record.external_ref()
     key = "trk-" + hashlib.sha256(

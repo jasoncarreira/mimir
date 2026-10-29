@@ -296,6 +296,9 @@ class CultivateProvider:
         from .scheduler import worklink_poller_hooks
 
         registrar.register_poller_hook("worklink", worklink_poller_hooks)
+        from .tracker.attest import tracker_poller_hooks
+
+        registrar.register_poller_hook("tracker", tracker_poller_hooks)
         from mimir.plugins.core import PollerProperties
 
         registrar.register_poller_properties(

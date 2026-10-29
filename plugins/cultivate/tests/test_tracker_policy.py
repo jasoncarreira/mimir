@@ -84,3 +84,13 @@ def test_module_routing_materializes_the_real_tools() -> None:
     assert {tool.name for tool in TRACKER_TOOLS} == policy.TRACKER_TOOL_NAMES
     for name in TRACKER:
         assert policy._factory("mimir_cultivate.tracker.tools", name)().name == name
+
+
+def test_tracker_poller_hook_is_registered_by_cultivate_only() -> None:
+    from mimir_cultivate.tracker.attest import attest_item
+
+    policy_on = load_plugins(enable="cultivate").policy
+    owner, factory = policy_on.poller_hooks["tracker"][:2]
+    assert owner == "cultivate"
+    assert factory().trust_attestor is attest_item
+    assert "tracker" not in load_plugins(enable="").policy.poller_hooks

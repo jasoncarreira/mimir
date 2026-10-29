@@ -160,7 +160,7 @@ def test_default_surface_does_not_import_coding_modules(selection: str | None) -
     pytest.importorskip(
         "mimir_cultivate", reason="the provider must be installed for its absence to mean anything",
     )
-    from tests.test_plugin_policy_parity import CODING_TOOLS, TRACKER_TOOLS
+    from tests.test_plugin_policy_parity import CODING_TOOLS, PLUGIN_ONLY_TOOLS
 
     script = """\
 import importlib.util
@@ -189,7 +189,7 @@ else:
     if selection is not None:
         env["MIMIR_PLUGINS"] = selection
     result = subprocess.run(
-        [sys.executable, "-c", script, *sorted(CODING_TOOLS | TRACKER_TOOLS)],
+        [sys.executable, "-c", script, *sorted(CODING_TOOLS | PLUGIN_ONLY_TOOLS)],
         env=env, capture_output=True, text=True, check=False, timeout=60,
     )
     assert result.returncode == 0, result.stderr
