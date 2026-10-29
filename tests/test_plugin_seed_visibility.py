@@ -23,6 +23,7 @@ _SEEDED_SKILLS = (
     "cultivate-github-ci-watch",
     "cultivate-github-poller",
     "cultivate-review",
+    "cultivate-tracker-poller",
     "cultivate-worklink-tool-pins",
 )
 

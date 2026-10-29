@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[3]
 SKILLS = ROOT / "plugins/cultivate/mimir_cultivate/defaults/skills"
 NAMES = {
     "github-poller", "github-ci-watch", "chainlink-orchestrator",
-    "worklink-tool-pins", "github", "review",
+    "worklink-tool-pins", "github", "review", "tracker-poller",
 }
 DEFAULTS = {"chainlink-orchestrator", "worklink-tool-pins"}
 
@@ -45,7 +45,9 @@ def test_shipped_repository_guard_rejects_mutation(tmp_path, monkeypatch, litera
         test_shipped_skills_do_not_pin_repository_or_identity()
 
 
-@pytest.mark.parametrize("name", ["review", "github-poller", "github", "github-ci-watch"])
+@pytest.mark.parametrize(
+    "name", ["review", "github-poller", "github", "github-ci-watch", "tracker-poller"]
+)
 def test_current_repository_skill_release_hash(name):
     import hashlib
 
@@ -53,6 +55,7 @@ def test_current_repository_skill_release_hash(name):
     version = {
         "github-poller": "2060-requested-comments",
         "review": "2049-review-tests",
+        "tracker-poller": "tracker-poller-initial",
     }.get(name, "0.9.10-2025")
     expected = releases[version][name]["SKILL.md"]
     actual = hashlib.sha256((SKILLS / name / "SKILL.md").read_bytes()).hexdigest()
@@ -82,6 +85,15 @@ def test_current_github_poller_release_inventory_is_complete():
                if item.name == "github-poller"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     assert skill_inventory(skill) == releases["2060-requested-comments"]["github-poller"]
+
+
+def test_current_tracker_poller_release_inventory_is_complete():
+    [candidate] = enabled_plugins(enable="cultivate")
+    [skill] = [item for item in skills_for_candidates((candidate,))
+               if item.name == "tracker-poller"]
+    releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
+    assert skill_inventory(skill) == releases["tracker-poller-initial"]["tracker-poller"]
+    assert list(releases)[-1] == "tracker-poller-initial"
 
 
 # The guard scans the shipped defaults, not test fixtures or cache files.

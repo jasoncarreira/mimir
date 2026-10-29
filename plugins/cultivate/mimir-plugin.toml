@@ -27,4 +27,5 @@ skills = [
   { path = "defaults/skills/github-ci-watch", forge = "github" },
   { path = "defaults/skills/github", forge = "github" },
   { path = "defaults/skills/review", forge = "github" },
+  { path = "defaults/skills/tracker-poller" },
 ]

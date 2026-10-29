@@ -1,0 +1,30 @@
+{
+  "pollers": [
+    {
+      "name": "tracker-poller",
+      "command": "python3 scripts/poller.py",
+      "cron": "*/15 * * * *",
+      "batch_size": 1,
+      "hooks": "tracker",
+      "trust_source": "tracker",
+      "authority": {
+        "profile": "github",
+        "tier": "scoped-with-provenance",
+        "capabilities": ["tracker_file_work", "tracker_comment", "tracker_set_state"],
+        "scoped_roots": ["state"]
+      },
+      "pass_env": [
+        "GITHUB_TOKEN",
+        "MIMIR_GITHUB_SELF_LOGIN",
+        "MIMIR_GITHUB_TRUSTED_BOT_LOGINS",
+        "LINEAR_API_KEY",
+        "JIRA_SITE",
+        "JIRA_EMAIL",
+        "JIRA_API_TOKEN",
+        "MIMIR_HOME",
+        "MIMIR_SOURCE_DIR",
+        "CHAINLINK_BIN"
+      ]
+    }
+  ]
+}

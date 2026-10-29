@@ -152,6 +152,12 @@ def test_bundled_script_write_sites_match_reviewed_inventory() -> None:
             ("_claim_delivery", "os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 384)"),
             ("_seed_state_gitignore", "gi.write_text(_STATE_GITIGNORE, encoding='utf-8')"),
         ],
+        "tracker-poller/scripts/poller.py": [
+            ("_save_cursor", "tmp.open('w', encoding='utf-8')"),
+            ("_save_cursor", "os.replace(tmp, CURSOR_FILE)"),
+            ("_save_cursor", "os.open(STATE_DIR, os.O_RDONLY)"),
+            ("_seed_state_gitignore", "gi.write_text(_STATE_GITIGNORE, encoding='utf-8')"),
+        ],
         "gmail-poller/scripts/poller.py": [
             ("_save_cursor", "tmp.write_text(json.dumps(ids), encoding='utf-8')"),
             ("_save_cursor", "tmp.replace(CURSOR_FILE)"),

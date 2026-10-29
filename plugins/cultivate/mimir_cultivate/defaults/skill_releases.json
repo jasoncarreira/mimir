@@ -377,5 +377,16 @@
       "tests/test_github_poller_withhold.py": "7e7d22ceaaa63cf2b5c06a78b7ffa6209abf6b558e644b99dc26c20e260676f3",
       "tests/test_worklink_draft.py": "23db1719e128a7886d320d5af5125c23e1ca35a95a7d5ec089902cbacf33af44"
     }
+  },
+  "tracker-poller-initial": {
+    "tracker-poller": {
+      "SKILL.md": "b60e1f2af35242b44484f8c0cb31fa39c03e6f0735b9f1e95e1464a985d4b879",
+      "pollers.json": "302a6f52658c593083ae6c78a13ed04f3fe39b0e5500713a43b17bbe2e6de403",
+      "scripts/poller.py": "4dbfe2ec38ec060d56cff740feb613975d8c84c0913187c60983600bcbadc356",
+      "tests/conftest.py": "5963113dc49b4b9df59427b3bf845254ed7275a8a10cb6bb77da1842aa23d6a4",
+      "tests/test_tracker_poller_cursor.py": "31fd1ffffca2b1561d708e4aeb57b925a8f5e3fa9d7748d88ec280c28cce090a",
+      "tests/test_tracker_poller_gates.py": "aa71e424d5647608d7e2b9793818255a9181f76ccbda0bac6a06845a533ed312",
+      "tests/tracker_poller_test_support.py": "453047e9f0be74fc7f52b2eb759a97dee145be81e99eb2b67618a71cd2d541fb"
+    }
   }
 }
