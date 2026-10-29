@@ -17,6 +17,24 @@ Worklink notes:
 - Out of scope: <nearby work not included in this leaf>
 - Suggested test command: <advisory validation command for the backend to consider>"""
 
+EPIC_TEMPLATE_MARKDOWN = """Goal:
+<what the epic delivers and why>
+
+Acceptance criteria:
+- [ ] <observable, testable outcome>
+
+Worklink notes:
+- Scope: <subsystems the epic spans>
+- Out of scope: <nearby work not included in this epic>"""
+
+_EPIC_REQUIRED_SECTIONS = (
+    "Goal:",
+    "Acceptance criteria:",
+    "Worklink notes:",
+    "- Scope:",
+    "- Out of scope:",
+)
+
 _REQUIRED_SECTIONS = (
     "Acceptance criteria:",
     "Review criteria:",
@@ -51,6 +69,18 @@ def missing_leaf_template_parts(description: str) -> list[str]:
 
     missing: list[str] = []
     for section in _REQUIRED_SECTIONS:
+        if section.lower() not in description.lower():
+            missing.append(section.rstrip(":"))
+    if not re.search(r"(?m)^- \[[ xX]\] ", description):
+        missing.append("acceptance checklist item")
+    return missing
+
+
+def missing_epic_template_parts(description: str) -> list[str]:
+    """Return epic-template parts absent from a candidate Worklink epic."""
+
+    missing: list[str] = []
+    for section in _EPIC_REQUIRED_SECTIONS:
         if section.lower() not in description.lower():
             missing.append(section.rstrip(":"))
     if not re.search(r"(?m)^- \[[ xX]\] ", description):

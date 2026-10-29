@@ -12,6 +12,7 @@ from typing import Any, Mapping
 
 import yaml
 
+from ...tracker.config import TrackerConfig, parse_tracker_config
 from ..tool_pins import ToolPin
 from ..claims import DEFAULT_MAX_CLAIM_ATTEMPTS
 from ..compute import (
@@ -265,6 +266,7 @@ class WorklinkConfig:
     compute_backend_settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     tool_pins: tuple[ToolPin, ...] = ()
     publication: WorklinkPublication = field(default_factory=WorklinkPublication)
+    tracker: TrackerConfig = field(default_factory=TrackerConfig)
 
     @classmethod
     def load(cls, path: Path) -> "WorklinkConfig":
@@ -369,6 +371,7 @@ class WorklinkConfig:
             raise ValueError("worklink repository must be owner/repository")
         if repository is not None:
             repository = repository.lower()
+        tracker = parse_tracker_config(data.get("tracker"), repository)
         routes = tuple(_parse_route(route) for route in data.get("routes") or ())
         tool_pins = _parse_tool_pins(data.get("tool_pins") or [])
         raw_backends = data.get("backends") or {}
@@ -435,6 +438,7 @@ class WorklinkConfig:
             },
             tool_pins=tool_pins,
             publication=publication,
+            tracker=tracker,
         )
 
     def select_compute_backend_name(

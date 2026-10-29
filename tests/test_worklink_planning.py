@@ -6,6 +6,8 @@ pytest.importorskip("mimir_cultivate", reason="Worklink planning belongs to Cult
 
 from mimir_cultivate.worklink.planning import (
     _REQUIRED_SECTIONS,
+    EPIC_TEMPLATE_MARKDOWN,
+    missing_epic_template_parts,
     missing_leaf_template_parts,
     target_branch_from_description,
 )
@@ -72,3 +74,34 @@ def test_target_branch_rejects_values_that_are_not_branch_names(branch: str) -> 
 
     with pytest.raises(ValueError, match="target branch"):
         target_branch_from_description(description)
+
+
+EPIC = """Goal:
+Ship the thing.
+
+Acceptance criteria:
+- [ ] It works.
+
+Worklink notes:
+- Scope: everything
+- Out of scope: nothing"""
+
+
+def test_epic_template_is_complete() -> None:
+    assert missing_epic_template_parts(EPIC) == []
+    assert missing_epic_template_parts(EPIC_TEMPLATE_MARKDOWN) == []
+
+
+@pytest.mark.parametrize(
+    ("needle", "missing"),
+    [
+        ("Goal:", "Goal"),
+        ("Acceptance criteria:", "Acceptance criteria"),
+        ("Worklink notes:", "Worklink notes"),
+        ("- Scope:", "- Scope"),
+        ("- Out of scope:", "- Out of scope"),
+        ("- [ ] ", "acceptance checklist item"),
+    ],
+)
+def test_epic_template_reports_each_missing_part(needle: str, missing: str) -> None:
+    assert missing in missing_epic_template_parts(EPIC.replace(needle, "x "))
