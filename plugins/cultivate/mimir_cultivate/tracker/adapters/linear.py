@@ -154,11 +154,23 @@ class LinearAdapter:
         self._headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
         self._transport = transport
         self._trust_cache: dict[str, bool] = {}
-        viewer = _mapping(_mapping(self._graphql(VIEWER_QUERY, {})).get("viewer"))
-        bot_id = _actor(viewer)
-        if bot_id is None:
-            raise ValueError("linear viewer has no usable id")
-        self._bot_id = bot_id
+        self._viewer_id: str | None = None
+
+    def _viewer(self) -> str:
+        """The viewer id, fetched on first use so building never touches the network.
+
+        ``_graphql`` resolves it before any other query, so the viewer query stays the
+        first request an adapter makes. An unusable answer fails closed as ``TrackerUnavailable`` (every caller handles
+        it per adapter) and is not memoized, so a later call asks again.
+        """
+
+        if self._viewer_id is None:
+            viewer = _mapping(_mapping(self._graphql(VIEWER_QUERY, {})).get("viewer"))
+            bot_id = _actor(viewer)
+            if bot_id is None:
+                raise _malformed()
+            self._viewer_id = bot_id
+        return self._viewer_id
 
     def _send(self, query: str, variables: Mapping[str, Any]) -> HttpResponse:
         return self._transport.request(
@@ -172,6 +184,8 @@ class LinearAdapter:
     def _graphql(self, query: str, variables: Mapping[str, Any]) -> dict[str, Any]:
         """Run one query and return its ``data``; any error body fails closed."""
 
+        if query is not VIEWER_QUERY:
+            self._viewer()
         response = self._send(query, variables)
         if response.status in (401, 403):
             raise _Denied()
@@ -195,7 +209,7 @@ class LinearAdapter:
 
     def list_assigned(self) -> tuple[list[TrackerIssue], bool]:
         filter_: dict[str, Any] = {
-            "delegate": {"id": {"eq": self._bot_id}},
+            "delegate": {"id": {"eq": self._viewer()}},
             "state": {"type": {"nin": list(CLOSED_STATE_TYPES)}},
         }
         if self._config.team_keys:
@@ -248,7 +262,7 @@ class LinearAdapter:
             activities=(),
             comments=(),
             truncated=False,
-            bot_id=self._bot_id,
+            bot_id=self._viewer(),
             updated_at=updated_at,
         )
 
@@ -307,11 +321,11 @@ class LinearAdapter:
             body=_text(issue.get("description")),
             author_id=_actor(issue.get("creator")),
             is_open=isinstance(state_type, str) and state_type not in CLOSED_STATE_TYPES,
-            assigned_to_bot=_actor(issue.get("delegate")) == self._bot_id,
+            assigned_to_bot=_actor(issue.get("delegate")) == self._viewer(),
             activities=tuple(sorted(activities, key=lambda a: (a.at, a.id))),
             comments=tuple(comments),
             truncated=history_more or comments_more,
-            bot_id=self._bot_id,
+            bot_id=self._viewer(),
         )
 
     def _history_activities(self, entry: Mapping[str, Any]) -> list[Activity]:
@@ -321,7 +335,7 @@ class LinearAdapter:
         at = _timestamp(entry.get("createdAt"))
         actor = _actor(entry.get("actor"))
         found: list[Activity] = []
-        if _actor(entry.get("toDelegate")) == self._bot_id:
+        if _actor(entry.get("toDelegate")) == self._viewer():
             found.append(Activity("assigned", activity_id(ADAPTER, f"{history_id}:assigned"), at, actor))
         if entry.get("fromTitle") is not None or entry.get("toTitle") is not None:
             found.append(
@@ -460,7 +474,7 @@ def _states(issue: Mapping[str, Any]) -> list[dict[str, Any]]:
 def build(
     config: TrackerAdapterConfig, env: Mapping[str, str], transport: TrackerTransport
 ) -> TrackerAdapter:
-    """Build the adapter; it refuses to exist without a credential and a bot identity."""
+    """Build the adapter; it refuses to exist without a credential and does no network I/O."""
 
     api_key = env.get("LINEAR_API_KEY", "").strip()
     if not api_key:

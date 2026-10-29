@@ -397,3 +397,36 @@ def test_credentials_come_from_the_process_environment(monkeypatch) -> None:
     monkeypatch.setenv("LINEAR_API_KEY", "k")
     monkeypatch.setenv("UNRELATED_SECRET", "x")
     assert tools._env() == {"LINEAR_API_KEY": "k"}
+
+
+class _DownTransport:
+    def __init__(self) -> None:
+        self.requests = 0
+
+    def request(self, method, url, **kwargs):
+        self.requests += 1
+        raise TrackerUnavailable("transport")
+
+
+@pytest.fixture
+def linear_down(home, monkeypatch: pytest.MonkeyPatch) -> _DownTransport:
+    down = _DownTransport()
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_test")
+    monkeypatch.setattr(tools.transport, "default_transport", lambda: down)
+    return down
+
+
+def test_comment_with_linear_unavailable_returns_the_fixed_error(home, linear_down) -> None:
+    result = tools.tracker_comment.func(
+        external_ref=LINEAR.external_ref(), body="hi", runtime=_runtime(LINEAR),
+    )
+    assert result == {"status": "error", "reason": "transport"}
+    assert linear_down.requests == 1
+
+
+def test_set_state_with_linear_unavailable_returns_the_fixed_result(home, linear_down) -> None:
+    result = tools.tracker_set_state.func(
+        external_ref=LINEAR.external_ref(), state="Done", runtime=_runtime(LINEAR),
+    )
+    assert result == {"status": "unavailable", "reason": "transport"}
+    assert linear_down.requests == 1
