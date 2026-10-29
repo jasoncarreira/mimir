@@ -1932,6 +1932,75 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
 
 
+def test_leaf_run_requests_tracker_transitions_at_both_points(tmp_path: Path) -> None:
+    record = "External: linear:ENG-1 https://linear.app/a/issue/ENG-1"
+    (tmp_path / "worklink.yaml").write_text(
+        "tracker:\n  adapters:\n    linear:\n      transitions:\n"
+        "        build_started: In Progress\n        pr_opened: In Review\n",
+        encoding="utf-8",
+    )
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    issue_json = ISSUE_JSON.replace(
+        "Suggested test command: echo ok", f"Suggested test command: echo ok\\n\\n{record}"
+    )
+    calls, runner = _orchestrator_runner(repo, worktree, issue_json=issue_json)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed", result.reason
+    from mimir_cultivate.tracker.evidence import read_evidence
+
+    transitions = read_evidence(tmp_path)["items"]["linear:ENG-1"]["transitions"]
+    assert {event: row["state"] for event, row in transitions.items()} == {
+        "build_started": "In Progress", "pr_opened": "In Review",
+    }
+    pr_call = next(c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"])
+    assert pr_call[pr_call.index("--body") + 1].startswith("Fixes ENG-1\n\n")
+
+
+def test_epic_run_requests_tracker_transitions_in_order(tmp_path, monkeypatch) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    requested: list[str] = []
+    monkeypatch.setattr(
+        orchestrator, "request_transition",
+        lambda home, description, event, **kw: requested.append(event) or True,
+    )
+
+    async def verify(**kwargs):
+        requested.append("verified")
+        return tmp_path / "evidence.json", "https://github.com/owner/repo/pull/42"
+
+    monkeypatch.setattr(orchestrator, "_verify_factory_completion", verify)
+
+    async def terminal(_supervisor, **kwargs):
+        current = kwargs["factory_record"]
+        kwargs["factory_record"] = current.observed(
+            replace(
+                _factory_lifecycle_status(Path(current.sandbox), status="completed"),
+                run_id=current.run_id, branch=current.branch,
+            ),
+            datetime.now(UTC).isoformat(),
+        )
+        kwargs.pop("autonomous")
+        requested.append("supervised")
+        return await _supervisor._finish_factory_070(**kwargs)
+
+    result, _, _, _ = _run_factory_preflight_case(
+        tmp_path, monkeypatch, credentials={"GITHUB_TOKEN": "github-token"},
+        outcome="completed", terminal=terminal,
+    )
+    assert result.status == "review_ready", result.reason
+    assert requested == ["build_started", "supervised", "verified", "pr_opened"]
+
+
 def test_leaf_run_has_no_factory_next(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
