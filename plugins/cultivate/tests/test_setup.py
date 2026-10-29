@@ -141,6 +141,7 @@ def test_worklink_gate_flags_validate_before_license_or_deployment(tmp_path, mon
     monkeypatch.setattr(installer, '_license_gate', lambda args: pytest.fail('invalid flags reached license gate'))
     for flags, message in [
         (['--worklink-gate', 'remote'], 'Invalid worklink gate'),
+        (['--auto-review', 'sometimes'], 'Invalid auto review'),
         (['--quick-gate-command', '  '], 'Invalid quick gate command'),
         (['--quick-gate-command', 'npm test\nother'], 'Invalid quick gate command'),
         (['--worklink-gate', 'local', '--quick-gate-command', 'npm test'], 'only valid'),
@@ -150,6 +151,7 @@ def test_worklink_gate_flags_validate_before_license_or_deployment(tmp_path, mon
             installer.setup(args)
     assert not list(tmp_path.iterdir())
     assert installer.validate('worklink_gate', 'ci') == 'ci'
+    assert installer.validate('auto_review', 'requested-only') == 'requested-only'
     assert installer.validate('quick_gate_command', ' npm test ') == 'npm test'
 
 
@@ -736,8 +738,8 @@ def setup_environment(tmp_path, monkeypatch):
               'model_spec': 'openai:model', 'saga_model_spec': 'openai:model',
               'embedding': 'openai:model', 'source_ref': 'refs/heads/feature/plugins',
               'source_repo': 'org/mimir', 'test_command': 'npm test',
-              'review_tests': 'targeted', 'port': '8123'}
-    monkeypatch.setattr(installer, '_field', lambda args, name, *a, **kw: fields[name])
+              'review_tests': 'targeted', 'auto_review': 'all', 'port': '8123'}
+    monkeypatch.setattr(installer, '_field', lambda args, name, *a, **kw: getattr(args, name, None) or fields[name])
     monkeypatch.setattr(installer, '_secret', lambda *a, **kw: 'secret')
     monkeypatch.setattr(installer, 'validate_token', lambda *a: None)
     monkeypatch.setattr(installer, '_alert_settings', lambda *a: ('none', None, {}))
@@ -1143,6 +1145,33 @@ def test_gate_settings_manifest_default_override_and_omission(upgrade_setup):
         invoke()
 
 
+def test_auto_review_manifest_upgrade_preserves_choice(upgrade_setup):
+    deploy, args, state, calls, invoke = upgrade_setup
+    manifest = deploy / 'manifest.json'
+    assert json.loads(manifest.read_text())['auto_review'] == 'all'
+    args.auto_review = 'requested-only'
+    invoke()
+    assert json.loads(manifest.read_text())['auto_review'] == 'requested-only'
+    args.auto_review = None
+    state['sha'] = 'c' * 40
+    invoke()
+    assert json.loads(manifest.read_text())['auto_review'] == 'requested-only'
+    args.auto_review = 'invalid'
+    with pytest.raises(installer.SetupError, match='Invalid auto review'):
+        invoke()
+    assert json.loads(manifest.read_text())['auto_review'] == 'requested-only'
+
+
+def test_auto_review_first_run_prompts_and_validates(monkeypatch):
+    args = argparse.Namespace(auto_review=None)
+    monkeypatch.delenv('MIMIR_CULTIVATE_AUTO_REVIEW', raising=False)
+    monkeypatch.setattr(installer.sys.stdin, 'isatty', lambda: True)
+    prompts = []
+    monkeypatch.setattr('builtins.input', lambda prompt: prompts.append(prompt) or 'requested-only')
+    assert installer._field(args, 'auto_review', 'Automatic PR reviews', default='all') == 'requested-only'
+    assert prompts == ['Auto Review [all]: ']
+
+
 @pytest.mark.parametrize('running', [False, True])
 def test_no_start_provisions_and_leaves_agent_stopped(upgrade_setup, capsys, running):
     deploy, args, state, calls, invoke = upgrade_setup
@@ -1200,7 +1229,8 @@ def test_docker_failure_names_step_without_secrets(tmp_path, monkeypatch, step):
               'owner_email': 'owner@example.com', 'deploy': str(tmp_path / 'deploy'),
               'model_spec': 'openai:model', 'saga_model_spec': 'openai:model',
               'embedding': 'openai:model', 'source_ref': 'refs/heads/feature/plugins',
-              'source_repo': 'org/mimir', 'test_command': 'npm test', 'review_tests': 'targeted', 'port': '8123'}
+              'source_repo': 'org/mimir', 'test_command': 'npm test', 'review_tests': 'targeted',
+              'auto_review': 'all', 'port': '8123'}
     monkeypatch.setattr(installer, '_field', lambda args, name, *a, **kw: fields[name])
     monkeypatch.setattr(installer, '_secret', lambda *a, **kw: 'secret-from-compose-env')
     monkeypatch.setattr(installer, 'validate_token', lambda *a: None)
@@ -1959,7 +1989,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"slug": "org/repo", "branch": "main", "toolchain": "rust", "owner": "owner",
                                       "display": "Owner", "email": "owner@example.com",
-                                      "test": "npm run verify", "review_tests": review_tests, "rotate": False,
+                                      "test": "npm run verify", "review_tests": review_tests, "auto_review": "requested-only", "rotate": False,
                                       "worklink_gate": "ci", "quick_gate_command": "npm run smoke",
                                       "saga_model_spec": "openai:gpt-5.4-nano", "embedding": "local", "reembed": False}))
     script = (installer._PROVISION
@@ -2020,6 +2050,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     assert inventory["repositories"][0]["worklink_base"] == str(tmp_path / 'worklink/base/repo')
     assert inventory["repositories"][0]["origin"] == "https://github.com/org/repo.git"
     assert inventory["repositories"][0]["review_tests"] == review_tests
+    assert inventory["repositories"][0]["auto_review"] == 'requested-only'
     assert inventory["repositories"][0]["worklink_gate"] == 'ci'
     assert inventory["repositories"][0]["quick_gate_command"] == 'npm run smoke'
     assert len(inventory["repositories"]) == 1
@@ -2065,7 +2096,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     # Upgrade deployed entries with only test_command (no configured suites),
     # including older entries that also predate worklink_base. Exercise the real
     # provisioning writer and its changed/idempotent output, not a copied merge.
-    for missing in [('review_tests',), ('worklink_base', 'review_tests'),
+    for missing in [('auto_review',), ('review_tests',), ('worklink_base', 'review_tests'),
                     ('worklink_gate', 'quick_gate_command'),
                     ('worklink_base', 'review_tests', 'worklink_gate', 'quick_gate_command')]:
         legacy = yaml.safe_load(prior_inventory)
@@ -2098,7 +2129,7 @@ def test_provision_clones_before_declaring_and_preserves_identity(tmp_path, monk
     with pytest.raises(RuntimeError, match='existing repository declaration differs'):
         exec(compile(script, 'provision.py', 'exec'), {'__name__': '__main__'})
     assert yaml.safe_load((home / 'repositories.yaml').read_text()) == explicit
-    for field, value in [('worklink_gate', 'local'), ('quick_gate_command', 'npm run different')]:
+    for field, value in [('auto_review', 'all'), ('worklink_gate', 'local'), ('quick_gate_command', 'npm run different')]:
         conflict = yaml.safe_load(prior_inventory)
         conflict['repositories'][0][field] = value
         (home / 'repositories.yaml').write_text(yaml.safe_dump(conflict, sort_keys=False))

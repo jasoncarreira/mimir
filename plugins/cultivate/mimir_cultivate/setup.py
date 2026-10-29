@@ -160,6 +160,8 @@ def validate(name: str, value: str) -> str:
         ok = value == "local" or bool(re.fullmatch(r"(openai|voyage):[A-Za-z0-9_.-]+", value))
     elif name == "review_tests":
         ok = value in {"targeted", "full", "none"}
+    elif name == "auto_review":
+        ok = value in {"all", "requested-only"}
     elif name == "worklink_gate":
         ok = value in {"local", "ci"}
     elif name in {"test_command", "quick_gate_command"}:
@@ -1251,6 +1253,7 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("port", "Free loopback port (default: next free from 8090)."),
         ("test-command", "Verification command for target repo; default detected from repo."),
         ("review-tests", "Review test policy: targeted (default), full, or none; CI supplies full-suite evidence."),
+        ("auto-review", "Automatic PR reviews: all (default) or requested-only; omit to preserve the saved mode."),
         ("worklink-gate", "Worklink gate mode: local (default) or ci; omit to preserve the saved mode."),
         ("quick-gate-command", "Optional quick verification command for ci mode; omit to preserve the saved command."),
         ("system-packages", "Extra Debian packages for the toolchain layer, comma-separated (optionally name=version); use none to clear, omit to preserve the saved list."),
@@ -1296,6 +1299,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                            else validate_system_packages(requested_packages.split(",")))
     if getattr(args, "worklink_gate", None) is not None:
         validate("worklink_gate", args.worklink_gate)
+    if getattr(args, "auto_review", None) is not None:
+        validate("auto_review", args.auto_review)
     if getattr(args, "quick_gate_command", None) is not None:
         validate("quick_gate_command", args.quick_gate_command)
         if getattr(args, "worklink_gate", None) == "local":
@@ -1317,6 +1322,12 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         raise SetupError("Cannot read previous settings from manifest.json; reconcile it before retrying.") from None
     if not isinstance(previous, dict):
         raise SetupError("Invalid manifest.json; reconcile it before retrying.")
+    if getattr(args, "auto_review", None) is None and "auto_review" in previous:
+        if not isinstance(previous["auto_review"], str):
+            raise SetupError("Invalid auto review in manifest.json; reconcile it before retrying.")
+        auto_review = validate("auto_review", previous["auto_review"])
+    else:
+        auto_review = _field(args, "auto_review", "Automatic PR reviews (all/requested-only): review collaborator PRs only when requested in requested-only mode.", default="all")
     if requested_packages is None:
         packages = previous.get("system_packages", []) if isinstance(previous, dict) else None
         if not isinstance(packages, list):
@@ -1448,6 +1459,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     # pinned image; values are passed through compose.env or a non-secret manifest.
     manifest = {"slug": repo.lower(), "branch": branch, "toolchain": kind, "owner": owner, "display": display,
                    "email": owner_email, "test": test, "review_tests": review_tests,
+                   "auto_review": auto_review,
                    "worklink_gate": gate, "quick_gate_command": quick_gate_command,
                    "rotate": bool(args.rotate_web_key),
                   "force": bool(getattr(args, "force", False)),
@@ -1579,13 +1591,14 @@ config = config or {}
 base = Path('/workspace/worklink/base') / repo.name
 entry = {'slug': m['slug'], 'root': str(repo), 'mode': 'rw', 'origin': origin,
            'base_branch': m['branch'], 'test_command': m['test'], 'review_tests': m['review_tests'],
+           'auto_review': m.get('auto_review', 'all'),
            'worklink_gate': m.get('worklink_gate', 'local'), 'quick_gate_command': m.get('quick_gate_command'),
            'worklink_base': str(base)}
 rows = config.setdefault('repositories', [])
 old = next((r for r in rows if r.get('slug') == m['slug']), None)
 # Back-fill only fields absent from an otherwise identical legacy declaration.
 # Explicit values (including the gate mode) are never silently replaced.
-optional = {'worklink_base', 'review_tests', 'worklink_gate', 'quick_gate_command'}
+optional = {'worklink_base', 'review_tests', 'auto_review', 'worklink_gate', 'quick_gate_command'}
 if old is not None and set(entry) - set(old) <= optional and all(old[k] == entry[k] for k in old.keys() & entry.keys()):
     missing = {k: v for k, v in entry.items() if k not in old}
     old.update(missing)

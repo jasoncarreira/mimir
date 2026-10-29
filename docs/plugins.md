@@ -125,6 +125,15 @@ Both settings are saved in the deployment manifest and repository inventory;
 omitting the flags on a rerun preserves the saved values. Existing declarations
 missing these fields are back-filled if otherwise identical. Explicit conflicting
 values require reconciliation or `--force`.
+Select `--auto-review all|requested-only` (default `all`) to control automatic
+reviews of collaborator PRs. In `requested-only` mode, the bot reviews a PR
+when its GitHub login is a requested reviewer, including later pushes while
+the request remains; mentions, issue notices and remediation of its own PRs
+continue normally. Setup prompts for this choice on a first interactive run,
+saves it in the manifest and `repositories.yaml`, and preserves it on upgrade.
+An existing repository declaration without `auto_review` defaults to `all`;
+setup back-fills the field. Explicit conflicting values require `--force` or
+manual reconciliation.
 
 `--embedding local` (the default) selects `voyageai/voyage-4-nano` at 1024
 dimensions on CPU. Its query and document vectors share Voyage 4's embedding

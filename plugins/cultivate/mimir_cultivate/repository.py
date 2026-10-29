@@ -36,6 +36,7 @@ class RepositoryConfig:
     test_suites: tuple[RepositoryTestSuite, ...] = ()
     worklink_base: Path | None = None
     review_tests: str = "full"
+    auto_review: str = "all"
     worklink_gate: str = "local"
     quick_gate_command: str | None = None
 
@@ -287,11 +288,14 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
         review_tests = item.get("review_tests", "targeted" if test_suites else "full")
         if review_tests not in ("targeted", "full", "none") or not isinstance(review_tests, str):
             raise ValueError(f"{label}.review_tests must be 'targeted', 'full' or 'none'")
+        auto_review = item.get("auto_review", "all")
+        if type(auto_review) is not str or auto_review not in ("all", "requested-only"):
+            raise ValueError(f"{label}.auto_review must be 'all' or 'requested-only'")
         worklink_base = (
             _parse_absolute_root(item["worklink_base"], f"{label}.worklink_base")
             if "worklink_base" in item else None
         )
-        if set(item) - {"slug", "root", "mode", "origin", "base_branch", "test_command", "test_suites", "worklink_base", "review_tests", "worklink_gate", "quick_gate_command"}:
+        if set(item) - {"slug", "root", "mode", "origin", "base_branch", "test_command", "test_suites", "worklink_base", "review_tests", "auto_review", "worklink_gate", "quick_gate_command"}:
             raise ValueError(f"{label} contains unknown fields")
         if slug in slugs:
             raise ValueError(f"duplicate repository slug: {slug}")
@@ -310,6 +314,7 @@ def _parse_repositories(value: Any) -> tuple[RepositoryConfig, ...]:
                 test_suites=test_suites,
                 worklink_base=worklink_base,
                 review_tests=review_tests,
+                auto_review=auto_review,
                 worklink_gate=worklink_gate,
                 quick_gate_command=quick_gate_command,
             )
