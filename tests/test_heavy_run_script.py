@@ -9,8 +9,12 @@ replaced with recording stubs, so these tests take no lock on the host.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import time
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "heavy_run.sh"
 
@@ -72,10 +76,11 @@ def test_runs_unwrapped_when_lock_already_held(tmp_path: Path) -> None:
     assert calls == []
 
 
-def test_runs_unwrapped_when_tools_are_missing(tmp_path: Path) -> None:
+@pytest.mark.parametrize("missing", ["MIMIR_HEAVY_LOCKF", "MIMIR_HEAVY_GTIMEOUT"])
+def test_runs_unwrapped_when_tools_are_missing(tmp_path: Path, missing: str) -> None:
     proc, calls = _run(
         tmp_path, "sh", "-c", 'echo "held=${MIMIR_HEAVY_LOCK_HELD:-}"',
-        MIMIR_HEAVY_LOCKF=str(tmp_path / "absent-lockf"),
+        **{missing: str(tmp_path / "absent-tool")},
     )
     assert proc.returncode == 0
     assert proc.stdout.strip() == "held="
@@ -87,3 +92,64 @@ def test_requires_a_command(tmp_path: Path) -> None:
     assert proc.returncode == 64
     assert "usage" in proc.stderr
     assert calls == []
+
+
+_REAL_LOCKF = "/usr/bin/lockf"
+_REAL_GTIMEOUT = shutil.which("gtimeout") or "/opt/homebrew/bin/gtimeout"
+_real_tools = pytest.mark.skipif(
+    not (os.access(_REAL_LOCKF, os.X_OK) and os.access(_REAL_GTIMEOUT, os.X_OK)),
+    reason="host lockf/gtimeout not available",
+)
+
+
+def _real_env(lock: Path, **extra: str) -> dict[str, str]:
+    # A private lock file: these tests never touch the host's shared lock.
+    env = {k: v for k, v in os.environ.items() if k != "MIMIR_HEAVY_LOCK_HELD"}
+    env.update(
+        MIMIR_HEAVY_LOCKF=_REAL_LOCKF, MIMIR_HEAVY_GTIMEOUT=_REAL_GTIMEOUT,
+        MIMIR_HEAVY_LOCK_FILE=str(lock), **extra,
+    )
+    return env
+
+
+def _wait_for(path: Path, deadline: float = 10.0) -> None:
+    end = time.monotonic() + deadline
+    while not path.exists():
+        assert time.monotonic() < end, f"{path} never appeared"
+        time.sleep(0.05)
+
+
+@_real_tools
+def test_real_lock_serializes_a_second_wrapper(tmp_path: Path) -> None:
+    lock, release, entered = tmp_path / "heavy.lock", tmp_path / "release", tmp_path / "second-entered"
+    first = subprocess.Popen(
+        ["sh", str(SCRIPT), "sh", "-c", f'touch "{tmp_path}/first-held"; while [ ! -e "{release}" ]; do sleep 0.05; done'],
+        env=_real_env(lock),
+    )
+    try:
+        _wait_for(tmp_path / "first-held")
+        second = subprocess.Popen(["sh", str(SCRIPT), "touch", str(entered)], env=_real_env(lock))
+        time.sleep(1.0)
+        assert not entered.exists(), "second wrapper ran its payload while the lock was held"
+        release.touch()
+        assert first.wait(timeout=20) == 0
+        assert second.wait(timeout=20) == 0
+        assert entered.exists()
+    finally:
+        release.touch()
+        first.kill()
+
+
+@_real_tools
+def test_real_timeout_releases_the_lock(tmp_path: Path) -> None:
+    lock, entered = tmp_path / "heavy.lock", tmp_path / "after-timeout"
+    holder = subprocess.run(
+        ["sh", str(SCRIPT), "sleep", "30"], env=_real_env(lock, MIMIR_HEAVY_LOCK_TIMEOUT="1"),
+        timeout=30,
+    )
+    assert holder.returncode == 124  # gtimeout's timed-out status
+    after = subprocess.run(
+        ["sh", str(SCRIPT), "touch", str(entered)], env=_real_env(lock, MIMIR_HEAVY_LOCK_TIMEOUT="10"),
+        timeout=30,
+    )
+    assert after.returncode == 0 and entered.exists()
