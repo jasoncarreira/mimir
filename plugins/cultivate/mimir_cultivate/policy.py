@@ -478,6 +478,7 @@ class CultivateState:
     retained_factory_scope_refusal: str | None = None
     ci_run_targets: frozenset[tuple[str, int]] = frozenset()
     ci_branch_targets: frozenset[tuple[str, str, int | None]] = frozenset()
+    tracker_issue_targets: frozenset[tuple[str, str, str]] = frozenset()
 
     @classmethod
     def project_trusted_auth(cls, auth: object) -> CultivateState | None:
@@ -497,6 +498,7 @@ class CultivateState:
             and values["retained_factory_scope"] is None
             and not values["ci_run_targets"]
             and not values["ci_branch_targets"]
+            and not values["tracker_issue_targets"]
         ):
             return None
         return cls(**values)
@@ -683,6 +685,8 @@ _REPO = _names("""repo_checkout repo_cleanup repo_fetch repo_status repo_test
     repo_diff repo_unmerged repo_stage repo_commit repo_merge repo_merge_abort
     repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push""")
 CODING_TOOLS = _FORGE | _REPO | frozenset(_BUILDS) | {"spawn_open_code"}
+TRACKER_TOOL_NAMES = _names("tracker_file_work tracker_comment tracker_set_state")
+CULTIVATE_TOOL_NAMES = CODING_TOOLS | TRACKER_TOOL_NAMES
 
 
 def _spawn_target(_name: str, arguments: dict, _context: object) -> tuple[str | None, ...]:
@@ -724,6 +728,14 @@ def _repo_pr_target(tool_name: str, arguments: dict, context: object) -> tuple[s
     scope = state.action_scope
     return (f"{scope.canonical_repo}#pull/{scope.pr_number}"
             f"@{scope.observed_head_sha}:{scope.scope_id}",)
+
+
+def _tracker_target(_name: str, arguments: dict, context: object) -> tuple[str | None, ...]:
+    external_ref = arguments.get("external_ref")
+    for adapter, ref, _url in getattr(context, "tracker_issue_targets", frozenset()):
+        if external_ref == f"{adapter}:{ref}":
+            return (f"tracker:{external_ref}",)
+    return (None,)
 
 
 _D = ToolDescriptor
@@ -768,6 +780,9 @@ _DESCRIPTORS = MappingProxyType({
     "repo_test": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
     "repo_unmerged": _D(result_origin=_R, git_operation_result=True),
     "spawn_open_code": _D(SinkCategory.SPAWN, _spawn_target, "spawn_process", ifc_delegation=True),
+    "tracker_comment": _D(SinkCategory.FORGE, _tracker_target, "bound_tracker_issue", result_origin=_N, sink_payload_extractor=_argument_payload("body")),
+    "tracker_file_work": _D(SinkCategory.FORGE, _tracker_target, "bound_tracker_issue", result_origin=_N, sink_payload_extractor=_argument_payload("description")),
+    "tracker_set_state": _D(SinkCategory.FORGE, _tracker_target, "bound_tracker_issue", result_origin=_N, sink_payload_extractor=_argument_payload("state")),
     "unsupported_operation": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
     "worklink_resume": _D(SinkCategory.SPAWN, _worklink_target, "worklink"),
     "worklink_run": _D(SinkCategory.SPAWN, _worklink_target, "worklink"),
@@ -780,7 +795,8 @@ _FLOW = MappingProxyType({
     "both": _names("worklink_run worklink_resume spawn_open_code repo_checkout repo_fetch repo_test"),
     "sink": _names("""pr_submit_review pr_inline_review_comment pr_comment pr_edit_body issue_comment
         pr_rerequest_review unsupported_operation repo_cleanup repo_stage repo_commit repo_merge
-        repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push"""),
+        repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push
+        tracker_file_work tracker_comment tracker_set_state"""),
 })
 _TIER = MappingProxyType({
     "scope-contained": _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content
@@ -790,7 +806,7 @@ _TIER = MappingProxyType({
     "scoped-with-provenance": _names("""pr_submit_review pr_inline_review_comment pr_comment
         pr_edit_body issue_comment pr_rerequest_review unsupported_operation repo_checkout repo_cleanup
         repo_fetch repo_stage repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort
-        repo_revert repo_revert_abort repo_push"""),
+        repo_revert repo_revert_abort repo_push tracker_file_work tracker_comment tracker_set_state"""),
 })
 _RESULT_DOMAIN = MappingProxyType({
     "worklink": frozenset(_BUILDS), "coding_worker": _names("spawn_open_code"),
@@ -814,7 +830,8 @@ _HEARTBEAT = _names("""worklink_run pr_list pr_metadata pr_spec pr_files pr_diff
 _WRITES = _names("""spawn_open_code worklink_run worklink_resume repo_checkout repo_cleanup
     repo_fetch repo_test repo_stage repo_commit repo_merge repo_merge_abort repo_rebase
     repo_rebase_abort repo_revert repo_revert_abort repo_push pr_submit_review
-    pr_inline_review_comment pr_comment pr_edit_body issue_comment pr_rerequest_review""")
+    pr_inline_review_comment pr_comment pr_edit_body issue_comment pr_rerequest_review
+    tracker_file_work tracker_comment tracker_set_state""")
 _MEMBERSHIPS = MappingProxyType({
     "write_resource_operations": frozenset(_BUILDS),
     "tainted_writes": _names("repo_stage repo_commit repo_merge repo_rebase repo_revert repo_push repo_test"),
@@ -869,7 +886,7 @@ def _declaration(name: str, descriptor: ToolDescriptor) -> _ToolDeclaration:
         result_domain=next((domain for domain, names in _RESULT_DOMAIN.items() if name in names), None),
         readable_domain="repository" if name in _READABLE_REPOSITORY else None,
         profiles=frozenset(profile for profile, names in {
-            "github": CODING_TOOLS - {"spawn_open_code"},
+            "github": CULTIVATE_TOOL_NAMES - {"spawn_open_code"},
             "custom": CODING_TOOLS - {"issue_comment"},
             "heartbeat": _HEARTBEAT,
         }.items() if name in names),
@@ -883,9 +900,9 @@ def _declaration(name: str, descriptor: ToolDescriptor) -> _ToolDeclaration:
 _TOOL_DECLARATIONS = MappingProxyType({
     name: _declaration(name, descriptor) for name, descriptor in _DESCRIPTORS.items()
 })
-if set(_TOOL_DECLARATIONS) != CODING_TOOLS or any(
+if set(_TOOL_DECLARATIONS) != CULTIVATE_TOOL_NAMES or any(
     sum(name in group for group in table.values()) != 1
-    for name in CODING_TOOLS for table in (_FLOW, _TIER)
+    for name in CULTIVATE_TOOL_NAMES for table in (_FLOW, _TIER)
 ):
     raise RuntimeError("incomplete Cultivate tool policy")
 
@@ -899,7 +916,10 @@ def _factory(module: str, name: str) -> Callable[[], object]:
             return source.spawn_open_code
         if name in _BUILDS:
             return getattr(source, name)
-        collection = source.FORGE_TOOLS if module.endswith("forge") else source.REPO_TOOLS
+        if module.endswith("tracker.tools"):
+            collection = source.TRACKER_TOOLS
+        else:
+            collection = source.FORGE_TOOLS if module.endswith("forge") else source.REPO_TOOLS
         return next(tool for tool in collection if tool.name == name)
 
     return materialize
@@ -979,6 +999,7 @@ def register_tools(registrar: PolicyRegistrar) -> None:
             "mimir_cultivate.forge" if name.startswith(("pr_", "ci_", "issue_"))
             or name == "unsupported_operation" else
             "mimir_cultivate.repository" if name.startswith("repo_") else
+            "mimir_cultivate.tracker.tools" if name in TRACKER_TOOL_NAMES else
             "mimir_cultivate.registration" if name in _BUILDS else
             "mimir_cultivate.opencode"
         )
@@ -993,6 +1014,7 @@ def register_tools(registrar: PolicyRegistrar) -> None:
             tier=declaration.tier, operation_class=declaration.operation_class,
             resource_scope=(
                 "worklink" if name in _BUILDS else
+                "tracker_issue" if name in TRACKER_TOOL_NAMES else
                 "ci_branch" if name == "ci_recent_runs" else
                 "ci_run" if name in {"ci_run", "ci_run_jobs"} else
                 "repo_pr" if declaration.operation_class == "resource_scoped" and action is not None

@@ -30,7 +30,7 @@ UNSELECTED_PROVIDER = ("mimir_cultivate",)
 def test_disabled_plugin_has_no_coding_tools_in_runtime_or_policy_tables() -> None:
     # Run in a fresh interpreter: collection of unrelated tests can import the
     # provider, and the retired flag must not be able to reactivate it.
-    from tests.test_plugin_policy_parity import CODING_TOOLS
+    from tests.test_plugin_policy_parity import CODING_TOOLS, PLUGIN_ONLY_TOOLS
 
     script = """
 import sys
@@ -40,7 +40,7 @@ from mimir.tools.registry import all_mimir_tools
 from mimir import access_control
 
 coding = set(sys.argv[1:])
-assert len(coding) == 40
+assert len(coding) == 43
 selected = load_plugins(enable='')
 assert not selected.plugins
 assert coding.isdisjoint(selected.policy.tools)
@@ -57,7 +57,7 @@ assert not any(name == 'mimir_cultivate' or name.startswith('mimir_cultivate.')
                for name in sys.modules)
 """
     result = subprocess.run(
-        [sys.executable, "-c", script, *sorted(CODING_TOOLS)],
+        [sys.executable, "-c", script, *sorted(CODING_TOOLS | PLUGIN_ONLY_TOOLS)],
         env={**os.environ, "MIMIR_PLUGINS": "", "MIMIR_CODING_ENABLED": "true"},
         capture_output=True, text=True, timeout=60,
     )
