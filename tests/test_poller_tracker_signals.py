@@ -478,3 +478,60 @@ async def test_tracker_signals_absent_from_feedback_block(tmp_path, home):
 
     assert "tracker_issue_withheld" not in block
     assert "tracker_transition_unavailable" not in block
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [["x"], {"k": "v"}], ids=["list", "dict"])
+async def test_non_string_enum_fields_map_to_defaults(tmp_path, home, bad):
+    prompt = f"Triage {MARKER}"
+    poller = _poller(
+        tmp_path,
+        [
+            json.dumps(dict(WITHHELD, reason=bad)),
+            json.dumps(dict(TRANSITION, reason=bad, lifecycle_event=bad)),
+            _item(prompt),
+        ],
+        attestor=_attested(prompt),
+    )
+    enqueue = _Enqueue()
+
+    await run_poller(poller, enqueue=enqueue)
+
+    [withheld] = _of_type(home, "tracker_issue_withheld")
+    assert withheld["reason"] == "withheld"
+    [transition] = _of_type(home, "tracker_transition_unavailable")
+    assert transition["reason"] == "failed"
+    assert transition["lifecycle_event"] is None
+    assert len(enqueue.events) == 1
+
+
+def _usage_line(source: str) -> str:
+    return json.dumps({
+        "signal": "poller_usage", "poller": "tracker-poller", "source": source,
+        "api_calls": 1, "api_bytes": 10, "estimated_cost_usd": 0,
+    })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trust_source", "source", "kept"),
+    [
+        ("tracker", f"Boom {MARKER}", False),
+        ("tracker", "rate_limit:github.v3", True),
+        ("external", f"Boom {MARKER}", True),
+    ],
+    ids=["tracker-text-dropped", "tracker-code-kept", "non-tracker-unchanged"],
+)
+async def test_poller_usage_source_tracker_code_shape(
+    tmp_path, home, trust_source, source, kept,
+):
+    poller = _poller(tmp_path, [_usage_line(source)], trust_source=trust_source)
+
+    await run_poller(poller, enqueue=_Enqueue())
+
+    [record] = _of_type(home, "poller_usage")
+    if kept:
+        assert record["source"] == source
+    else:
+        assert "source" not in record
+        assert MARKER not in (home / "logs" / "events.jsonl").read_text()

@@ -34,6 +34,13 @@ def _config(channel: str | None) -> SimpleNamespace:
 
 @pytest.mark.asyncio
 async def test_web_alert_channel_gets_title_live_only(tmp_path: Path):
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from mimir.history import MessageBuffer, set_global_buffer
+
+    buffer = MessageBuffer(tmp_path / "chat_history.jsonl")
+    set_global_buffer(buffer)
     bridge = WebChatBridge(enqueue=lambda e: asyncio.sleep(0, result=True), home=tmp_path)
     queue: asyncio.Queue = asyncio.Queue()
     bridge._subscribers.append(_Subscriber(queue=queue))
@@ -41,14 +48,35 @@ async def test_web_alert_channel_gets_title_live_only(tmp_path: Path):
     channels.register(bridge)
     _, live_notice = _operator_notice_callbacks(_config("web-ops"), channels)
 
-    await live_notice(LIVE, FREE)
+    @web.middleware
+    async def authenticate(request, handler):
+        request["auth_identity"] = SimpleNamespace(
+            canonical="owner", access=SimpleNamespace(is_admin=True),
+        )
+        return await handler(request)
 
-    payload = queue.get_nowait()
-    assert payload["text"] == LIVE
-    assert not [
-        p for p in tmp_path.rglob("*")
-        if p.is_file() and "TITLE" in p.read_text(errors="replace")
-    ]
+    app = web.Application(middlewares=[authenticate])
+    bridge.register_routes(app)
+    client = TestClient(TestServer(app))
+    try:
+        await live_notice(LIVE, FREE)
+
+        payload = queue.get_nowait()
+        assert payload["text"] == LIVE
+        assert buffer.channel_count("web-ops") == 0
+        assert not [r for r in buffer.recent_for_channel("web-ops", 10) if "TITLE" in r.content]
+        assert not [
+            p for p in tmp_path.rglob("*")
+            if p.is_file() and "TITLE" in p.read_text(errors="replace")
+        ]
+        await client.start_server()
+        response = await client.get("/api/v1/chat/history")
+        assert response.status == 200
+        messages = (await response.json())["data"]["messages"]
+        assert not [m for m in messages if "TITLE" in m["text"]]
+    finally:
+        await client.close()
+        set_global_buffer(None)
 
 
 @pytest.mark.asyncio

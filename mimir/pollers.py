@@ -3453,6 +3453,11 @@ async def run_poller(
                     if isinstance(v, str) else v
                     for k, v in payload.items()
                 }
+                if poller.trust_source == "tracker" and not (
+                    isinstance(payload.get("source"), str)
+                    and TRACKER_STDERR_CODE_RE.fullmatch(payload["source"])
+                ):
+                    payload.pop("source", None)
             else:
                 payload = {
                     k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
@@ -3476,7 +3481,11 @@ async def run_poller(
                         "adapter": tracker_adapter,
                         "ref": tracker_ref,
                         "url": tracker_url,
-                        "reason": raw_reason if raw_reason in WITHHELD_REASONS else "withheld",
+                        "reason": (
+                            raw_reason
+                            if isinstance(raw_reason, str) and raw_reason in WITHHELD_REASONS
+                            else "withheld"
+                        ),
                     }
                 else:
                     lifecycle = payload.get("lifecycle_event")
@@ -3484,8 +3493,16 @@ async def run_poller(
                         "adapter": tracker_adapter,
                         "ref": tracker_ref,
                         "url": tracker_url,
-                        "lifecycle_event": lifecycle if lifecycle in LIFECYCLE_EVENTS else None,
-                        "reason": raw_reason if raw_reason in NOTICE_REASONS else "failed",
+                        "lifecycle_event": (
+                            lifecycle
+                            if isinstance(lifecycle, str) and lifecycle in LIFECYCLE_EVENTS
+                            else None
+                        ),
+                        "reason": (
+                            raw_reason
+                            if isinstance(raw_reason, str) and raw_reason in NOTICE_REASONS
+                            else "failed"
+                        ),
                     }
                 tracker_fields = payload
             if signal_name in {

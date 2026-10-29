@@ -1023,6 +1023,7 @@ def _controlled_server_app(
     class Scheduler:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             control.hit("scheduler")
+            self.init_kwargs = kwargs
             self.policy = kwargs["policy"]
             self._started = False
             self._scheduler = SimpleNamespace(running=False)
@@ -4897,3 +4898,24 @@ async def test_failed_startup_compensation_preserves_ownership_for_cleanup_retry
     assert app["acp_daemon"] is None
     assert app["agent_runtime"] is None
     assert control.bundle.closed is True
+
+
+def test_build_app_passes_operator_live_notice_to_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.server import _operator_notice_callbacks as real
+
+    created: list[Any] = []
+
+    def spy(config: Any, channels: Any) -> Any:
+        callbacks = real(config, channels)
+        created.append(callbacks)
+        return callbacks
+
+    monkeypatch.setattr("mimir.server._operator_notice_callbacks", spy)
+    _, control = _controlled_server_app(tmp_path, monkeypatch)
+
+    [(operator_notice, operator_live_notice)] = created
+    kwargs = control.scheduler.init_kwargs
+    assert kwargs["operator_notice"] is operator_notice
+    assert kwargs["operator_live_notice"] is operator_live_notice
