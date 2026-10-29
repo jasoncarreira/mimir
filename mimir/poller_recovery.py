@@ -59,7 +59,7 @@ import random
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
 from ._atomic import atomic_write_json
 from ._jsonl_tail import tail_jsonl_records
@@ -69,6 +69,8 @@ from .access_control import (
 )
 from .event_logger import log_event
 from .models import AgentEvent, InformationFlowLabels, SourceLabel
+from .poller_hooks import TrustAttestor
+from .poller_tracker import TRACKER_EXTRA_KEYS, safe_actor
 
 log = logging.getLogger(__name__)
 
@@ -549,6 +551,40 @@ def _read_last_unclean_restart(events_path: Path, since_dt: datetime) -> str:
     return ""
 
 
+async def _reattest_tracker_event(
+    event: AgentEvent,
+    trust_attestor: TrustAttestor | None,
+    attestor_env: Mapping[str, str] | None,
+    attestation_redact: Callable[[str], str] | None,
+) -> bool:
+    """Re-attest a stashed tracker event; stashed trust claims are never authority.
+
+    Transient attestor unavailability also refuses: holding the stash would need
+    a new stash state, and a later attestation of stale content would not match.
+    """
+    items = event.extra.get("items") if isinstance(event.extra, dict) else None
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        return False
+    item = items[0]
+    reduced = {key: item[key] for key in TRACKER_EXTRA_KEYS if key in item}
+    items[0] = reduced
+    reduced.update(actor=None, author_is_trusted=False, tracker_attested=False)
+    if trust_attestor is None or attestation_redact is None:
+        return False
+    attestable = {key: reduced[key] for key in TRACKER_EXTRA_KEYS if key in reduced}
+    try:
+        att = await asyncio.to_thread(trust_attestor, attestable, dict(attestor_env or {}))
+        prompt = att.prompt.strip() if att.trusted is True and att.prompt is not None else None
+        if prompt is None or attestation_redact(prompt) != event.content:
+            return False
+        actor = safe_actor(att.actor)
+    except Exception as exc:  # noqa: BLE001 - attestation fails closed
+        log.warning("poller recovery: tracker attestation failed (%s)", type(exc).__name__)
+        return False
+    reduced.update(actor=actor, author_is_trusted=True, tracker_attested=True)
+    return True
+
+
 async def _restore_event(
     entry: dict,
     *,
@@ -559,6 +595,9 @@ async def _restore_event(
     trust_source: str,
     github_token: str,
     github_self_login: str,
+    trust_attestor: TrustAttestor | None = None,
+    attestor_env: Mapping[str, str] | None = None,
+    attestation_redact: Callable[[str], str] | None = None,
 ) -> AgentEvent | None:
     """Rebuild a stashed event and re-attest its service integrity from live state."""
     event = _event_from_stash(entry.get("event"))
@@ -576,6 +615,12 @@ async def _restore_event(
     event.continuation_auth_context = None
     event.source_session_acl = None
     trusted = trust_source == "trusted_system"
+    if trust_source == "tracker":
+        trusted = await _reattest_tracker_event(
+            event, trust_attestor, attestor_env, attestation_redact,
+        )
+        if not trusted:
+            return None
     if trust_source == "github":
         from .pollers import (
             _GITHUB_ACTOR_EVENT_TYPES,
@@ -693,6 +738,9 @@ async def reconcile_failed_turns(
     trust_source: str = "external",
     github_token: str = "",
     github_self_login: str = "",
+    trust_attestor: TrustAttestor | None = None,
+    attestor_env: Mapping[str, str] | None = None,
+    attestation_redact: Callable[[str], str] | None = None,
     recover_failed_turns: bool = True,
     relevance_check: RelevanceFn | None = None,
     max_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS,
@@ -901,6 +949,9 @@ async def reconcile_failed_turns(
                     trust_source=trust_source,
                     github_token=github_token,
                     github_self_login=github_self_login,
+                    trust_attestor=trust_attestor,
+                    attestor_env=attestor_env,
+                    attestation_redact=attestation_redact,
                 )
                 if event is not None and await _is_stale(event, relevance_check):
                     del inflight[source_id]
@@ -999,6 +1050,8 @@ async def reconcile_failed_turns(
             service_principal=service_principal, service_authority=service_authority,
             trust_source=trust_source, github_token=github_token,
             github_self_login=github_self_login,
+            trust_attestor=trust_attestor, attestor_env=attestor_env,
+            attestation_redact=attestation_redact,
         )
         if event is None or await _is_stale(event, relevance_check):
             del inflight[source_id]
@@ -1073,6 +1126,9 @@ async def reconcile_failed_turns(
                 trust_source=trust_source,
                 github_token=github_token,
                 github_self_login=github_self_login,
+                trust_attestor=trust_attestor,
+                attestor_env=attestor_env,
+                attestation_redact=attestation_redact,
             )
             if event is not None and await _is_stale(event, relevance_check):
                 del inflight[source_id]
