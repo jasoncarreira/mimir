@@ -1,0 +1,22 @@
+{
+  "source": "GitHub GraphQL API reference: Issue, IssueComment, AssignedEvent, RenamedTitleEvent, UserContentEdit, IssueTimelineItemsConnection (https://docs.github.com/en/graphql/reference/objects#issue) via POST https://api.github.com/graphql",
+  "exchanges": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.github.com/graphql",
+        "json": {
+          "query": "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){id databaseId number title body state createdAt author{login} lastEditedAt userContentEdits(first:100){totalCount pageInfo{hasNextPage} nodes{id editedAt editor{login}}} assignees(first:20){nodes{login}} timelineItems(first:100, itemTypes:[ASSIGNED_EVENT, ISSUE_COMMENT, RENAMED_TITLE_EVENT]){totalCount pageInfo{hasNextPage} nodes{__typename ... on AssignedEvent{id createdAt actor{login} assignee{... on User{login} ... on Bot{login}}} ... on IssueComment{id createdAt author{login} body lastEditedAt userContentEdits(first:100){totalCount pageInfo{hasNextPage} nodes{id editedAt editor{login}}}} ... on RenamedTitleEvent{id createdAt actor{login}}}}}}}",
+          "variables": {
+            "owner": "acme",
+            "name": "widgets",
+            "number": 42
+          }
+        }
+      },
+      "response": {
+        "status": 502
+      }
+    }
+  ]
+}

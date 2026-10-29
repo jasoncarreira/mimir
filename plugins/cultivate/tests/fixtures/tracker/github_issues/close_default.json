@@ -1,0 +1,35 @@
+{
+  "source": "GitHub REST API reference, Issues: https://docs.github.com/en/rest/issues/issues and https://docs.github.com/en/rest/issues/comments",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "url": "https://api.github.com/repos/acme/widgets/issues/42"
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "number": 42,
+          "state": "open"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "PATCH",
+        "url": "https://api.github.com/repos/acme/widgets/issues/42",
+        "json": {
+          "state": "closed",
+          "state_reason": "completed"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "number": 42,
+          "state": "closed"
+        }
+      }
+    }
+  ]
+}

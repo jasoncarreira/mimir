@@ -1,0 +1,792 @@
+{
+  "source": "GitHub GraphQL API reference: Issue, IssueComment, AssignedEvent, RenamedTitleEvent, UserContentEdit, IssueTimelineItemsConnection (https://docs.github.com/en/graphql/reference/objects#issue) via POST https://api.github.com/graphql",
+  "exchanges": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.github.com/graphql",
+        "json": {
+          "query": "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){id databaseId number title body state createdAt author{login} lastEditedAt userContentEdits(first:100){totalCount pageInfo{hasNextPage} nodes{id editedAt editor{login}}} assignees(first:20){nodes{login}} timelineItems(first:100, itemTypes:[ASSIGNED_EVENT, ISSUE_COMMENT, RENAMED_TITLE_EVENT]){totalCount pageInfo{hasNextPage} nodes{__typename ... on AssignedEvent{id createdAt actor{login} assignee{... on User{login} ... on Bot{login}}} ... on IssueComment{id createdAt author{login} body lastEditedAt userContentEdits(first:100){totalCount pageInfo{hasNextPage} nodes{id editedAt editor{login}}}} ... on RenamedTitleEvent{id createdAt actor{login}}}}}}}",
+          "variables": {
+            "owner": "acme",
+            "name": "widgets",
+            "number": 42
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "data": {
+            "repository": {
+              "issue": {
+                "id": "I_kwDOAAA",
+                "databaseId": 4242,
+                "number": 42,
+                "title": "Login crash",
+                "body": "It crashes.",
+                "state": "OPEN",
+                "createdAt": "2026-10-01T09:00:00Z",
+                "author": {
+                  "login": "alice"
+                },
+                "lastEditedAt": null,
+                "userContentEdits": {
+                  "totalCount": 0,
+                  "pageInfo": {
+                    "hasNextPage": false
+                  },
+                  "nodes": []
+                },
+                "assignees": {
+                  "nodes": [
+                    {
+                      "login": "MimirBot"
+                    }
+                  ]
+                },
+                "timelineItems": {
+                  "totalCount": 2,
+                  "pageInfo": {
+                    "hasNextPage": false
+                  },
+                  "nodes": [
+                    {
+                      "__typename": "AssignedEvent",
+                      "id": "AE_1",
+                      "createdAt": "2026-10-01T10:00:00Z",
+                      "actor": {
+                        "login": "alice"
+                      },
+                      "assignee": {
+                        "login": "mimirbot"
+                      }
+                    },
+                    {
+                      "__typename": "IssueComment",
+                      "id": "IC_1",
+                      "createdAt": "2026-10-01T11:00:00Z",
+                      "author": {
+                        "login": "alice"
+                      },
+                      "body": "ok",
+                      "lastEditedAt": "2026-10-01T15:00:00Z",
+                      "userContentEdits": {
+                        "totalCount": 100,
+                        "pageInfo": {
+                          "hasNextPage": true
+                        },
+                        "nodes": [
+                          {
+                            "id": "UCE_0",
+                            "editedAt": "2026-10-01T12:00:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_1",
+                            "editedAt": "2026-10-01T12:01:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_2",
+                            "editedAt": "2026-10-01T12:02:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_3",
+                            "editedAt": "2026-10-01T12:03:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_4",
+                            "editedAt": "2026-10-01T12:04:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_5",
+                            "editedAt": "2026-10-01T12:05:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_6",
+                            "editedAt": "2026-10-01T12:06:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_7",
+                            "editedAt": "2026-10-01T12:07:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_8",
+                            "editedAt": "2026-10-01T12:08:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_9",
+                            "editedAt": "2026-10-01T12:09:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_10",
+                            "editedAt": "2026-10-01T12:10:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_11",
+                            "editedAt": "2026-10-01T12:11:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_12",
+                            "editedAt": "2026-10-01T12:12:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_13",
+                            "editedAt": "2026-10-01T12:13:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_14",
+                            "editedAt": "2026-10-01T12:14:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_15",
+                            "editedAt": "2026-10-01T12:15:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_16",
+                            "editedAt": "2026-10-01T12:16:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_17",
+                            "editedAt": "2026-10-01T12:17:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_18",
+                            "editedAt": "2026-10-01T12:18:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_19",
+                            "editedAt": "2026-10-01T12:19:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_20",
+                            "editedAt": "2026-10-01T12:20:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_21",
+                            "editedAt": "2026-10-01T12:21:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_22",
+                            "editedAt": "2026-10-01T12:22:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_23",
+                            "editedAt": "2026-10-01T12:23:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_24",
+                            "editedAt": "2026-10-01T12:24:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_25",
+                            "editedAt": "2026-10-01T12:25:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_26",
+                            "editedAt": "2026-10-01T12:26:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_27",
+                            "editedAt": "2026-10-01T12:27:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_28",
+                            "editedAt": "2026-10-01T12:28:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_29",
+                            "editedAt": "2026-10-01T12:29:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_30",
+                            "editedAt": "2026-10-01T12:30:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_31",
+                            "editedAt": "2026-10-01T12:31:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_32",
+                            "editedAt": "2026-10-01T12:32:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_33",
+                            "editedAt": "2026-10-01T12:33:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_34",
+                            "editedAt": "2026-10-01T12:34:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_35",
+                            "editedAt": "2026-10-01T12:35:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_36",
+                            "editedAt": "2026-10-01T12:36:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_37",
+                            "editedAt": "2026-10-01T12:37:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_38",
+                            "editedAt": "2026-10-01T12:38:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_39",
+                            "editedAt": "2026-10-01T12:39:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_40",
+                            "editedAt": "2026-10-01T12:40:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_41",
+                            "editedAt": "2026-10-01T12:41:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_42",
+                            "editedAt": "2026-10-01T12:42:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_43",
+                            "editedAt": "2026-10-01T12:43:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_44",
+                            "editedAt": "2026-10-01T12:44:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_45",
+                            "editedAt": "2026-10-01T12:45:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_46",
+                            "editedAt": "2026-10-01T12:46:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_47",
+                            "editedAt": "2026-10-01T12:47:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_48",
+                            "editedAt": "2026-10-01T12:48:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_49",
+                            "editedAt": "2026-10-01T12:49:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_50",
+                            "editedAt": "2026-10-01T12:50:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_51",
+                            "editedAt": "2026-10-01T12:51:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_52",
+                            "editedAt": "2026-10-01T12:52:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_53",
+                            "editedAt": "2026-10-01T12:53:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_54",
+                            "editedAt": "2026-10-01T12:54:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_55",
+                            "editedAt": "2026-10-01T12:55:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_56",
+                            "editedAt": "2026-10-01T12:56:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_57",
+                            "editedAt": "2026-10-01T12:57:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_58",
+                            "editedAt": "2026-10-01T12:58:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_59",
+                            "editedAt": "2026-10-01T12:59:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_60",
+                            "editedAt": "2026-10-01T13:00:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_61",
+                            "editedAt": "2026-10-01T13:01:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_62",
+                            "editedAt": "2026-10-01T13:02:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_63",
+                            "editedAt": "2026-10-01T13:03:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_64",
+                            "editedAt": "2026-10-01T13:04:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_65",
+                            "editedAt": "2026-10-01T13:05:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_66",
+                            "editedAt": "2026-10-01T13:06:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_67",
+                            "editedAt": "2026-10-01T13:07:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_68",
+                            "editedAt": "2026-10-01T13:08:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_69",
+                            "editedAt": "2026-10-01T13:09:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_70",
+                            "editedAt": "2026-10-01T13:10:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_71",
+                            "editedAt": "2026-10-01T13:11:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_72",
+                            "editedAt": "2026-10-01T13:12:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_73",
+                            "editedAt": "2026-10-01T13:13:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_74",
+                            "editedAt": "2026-10-01T13:14:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_75",
+                            "editedAt": "2026-10-01T13:15:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_76",
+                            "editedAt": "2026-10-01T13:16:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_77",
+                            "editedAt": "2026-10-01T13:17:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_78",
+                            "editedAt": "2026-10-01T13:18:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_79",
+                            "editedAt": "2026-10-01T13:19:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_80",
+                            "editedAt": "2026-10-01T13:20:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_81",
+                            "editedAt": "2026-10-01T13:21:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_82",
+                            "editedAt": "2026-10-01T13:22:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_83",
+                            "editedAt": "2026-10-01T13:23:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_84",
+                            "editedAt": "2026-10-01T13:24:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_85",
+                            "editedAt": "2026-10-01T13:25:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_86",
+                            "editedAt": "2026-10-01T13:26:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_87",
+                            "editedAt": "2026-10-01T13:27:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_88",
+                            "editedAt": "2026-10-01T13:28:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_89",
+                            "editedAt": "2026-10-01T13:29:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_90",
+                            "editedAt": "2026-10-01T13:30:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_91",
+                            "editedAt": "2026-10-01T13:31:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_92",
+                            "editedAt": "2026-10-01T13:32:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_93",
+                            "editedAt": "2026-10-01T13:33:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_94",
+                            "editedAt": "2026-10-01T13:34:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_95",
+                            "editedAt": "2026-10-01T13:35:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_96",
+                            "editedAt": "2026-10-01T13:36:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_97",
+                            "editedAt": "2026-10-01T13:37:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_98",
+                            "editedAt": "2026-10-01T13:38:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          },
+                          {
+                            "id": "UCE_99",
+                            "editedAt": "2026-10-01T13:39:00Z",
+                            "editor": {
+                              "login": "alice"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

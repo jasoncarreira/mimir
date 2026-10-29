@@ -1,0 +1,49 @@
+{
+  "source": "GitHub REST API reference, Issues: https://docs.github.com/en/rest/issues/issues and https://docs.github.com/en/rest/issues/comments",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "url": "https://api.github.com/repos/acme/widgets/issues?assignee=MimirBot&state=open&per_page=50&sort=updated&direction=desc"
+      },
+      "response": {
+        "status": 200,
+        "json": [
+          {
+            "id": 9042,
+            "number": 42,
+            "title": "Issue 42",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/42"
+          },
+          {
+            "id": 9043,
+            "number": 43,
+            "title": "Issue 43",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "pull_request": {
+              "url": "https://api.github.com/repos/acme/widgets/pulls/43"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/43"
+          },
+          {
+            "id": 9044,
+            "number": 44,
+            "title": "Issue 44",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/44"
+          }
+        ]
+      }
+    }
+  ]
+}

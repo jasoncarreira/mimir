@@ -1,0 +1,516 @@
+{
+  "source": "GitHub REST API reference, Issues: https://docs.github.com/en/rest/issues/issues and https://docs.github.com/en/rest/issues/comments",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "url": "https://api.github.com/repos/acme/widgets/issues?assignee=MimirBot&state=open&per_page=50&sort=updated&direction=desc"
+      },
+      "response": {
+        "status": 200,
+        "json": [
+          {
+            "id": 9001,
+            "number": 1,
+            "title": "Issue 1",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/1"
+          },
+          {
+            "id": 9002,
+            "number": 2,
+            "title": "Issue 2",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/2"
+          },
+          {
+            "id": 9003,
+            "number": 3,
+            "title": "Issue 3",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/3"
+          },
+          {
+            "id": 9004,
+            "number": 4,
+            "title": "Issue 4",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/4"
+          },
+          {
+            "id": 9005,
+            "number": 5,
+            "title": "Issue 5",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/5"
+          },
+          {
+            "id": 9006,
+            "number": 6,
+            "title": "Issue 6",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/6"
+          },
+          {
+            "id": 9007,
+            "number": 7,
+            "title": "Issue 7",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/7"
+          },
+          {
+            "id": 9008,
+            "number": 8,
+            "title": "Issue 8",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/8"
+          },
+          {
+            "id": 9009,
+            "number": 9,
+            "title": "Issue 9",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/9"
+          },
+          {
+            "id": 9010,
+            "number": 10,
+            "title": "Issue 10",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/10"
+          },
+          {
+            "id": 9011,
+            "number": 11,
+            "title": "Issue 11",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/11"
+          },
+          {
+            "id": 9012,
+            "number": 12,
+            "title": "Issue 12",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/12"
+          },
+          {
+            "id": 9013,
+            "number": 13,
+            "title": "Issue 13",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/13"
+          },
+          {
+            "id": 9014,
+            "number": 14,
+            "title": "Issue 14",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/14"
+          },
+          {
+            "id": 9015,
+            "number": 15,
+            "title": "Issue 15",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/15"
+          },
+          {
+            "id": 9016,
+            "number": 16,
+            "title": "Issue 16",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/16"
+          },
+          {
+            "id": 9017,
+            "number": 17,
+            "title": "Issue 17",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/17"
+          },
+          {
+            "id": 9018,
+            "number": 18,
+            "title": "Issue 18",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/18"
+          },
+          {
+            "id": 9019,
+            "number": 19,
+            "title": "Issue 19",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/19"
+          },
+          {
+            "id": 9020,
+            "number": 20,
+            "title": "Issue 20",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/20"
+          },
+          {
+            "id": 9021,
+            "number": 21,
+            "title": "Issue 21",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/21"
+          },
+          {
+            "id": 9022,
+            "number": 22,
+            "title": "Issue 22",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/22"
+          },
+          {
+            "id": 9023,
+            "number": 23,
+            "title": "Issue 23",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/23"
+          },
+          {
+            "id": 9024,
+            "number": 24,
+            "title": "Issue 24",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/24"
+          },
+          {
+            "id": 9025,
+            "number": 25,
+            "title": "Issue 25",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/25"
+          },
+          {
+            "id": 9026,
+            "number": 26,
+            "title": "Issue 26",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/26"
+          },
+          {
+            "id": 9027,
+            "number": 27,
+            "title": "Issue 27",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/27"
+          },
+          {
+            "id": 9028,
+            "number": 28,
+            "title": "Issue 28",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/28"
+          },
+          {
+            "id": 9029,
+            "number": 29,
+            "title": "Issue 29",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/29"
+          },
+          {
+            "id": 9030,
+            "number": 30,
+            "title": "Issue 30",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/30"
+          },
+          {
+            "id": 9031,
+            "number": 31,
+            "title": "Issue 31",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/31"
+          },
+          {
+            "id": 9032,
+            "number": 32,
+            "title": "Issue 32",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/32"
+          },
+          {
+            "id": 9033,
+            "number": 33,
+            "title": "Issue 33",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/33"
+          },
+          {
+            "id": 9034,
+            "number": 34,
+            "title": "Issue 34",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/34"
+          },
+          {
+            "id": 9035,
+            "number": 35,
+            "title": "Issue 35",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/35"
+          },
+          {
+            "id": 9036,
+            "number": 36,
+            "title": "Issue 36",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/36"
+          },
+          {
+            "id": 9037,
+            "number": 37,
+            "title": "Issue 37",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/37"
+          },
+          {
+            "id": 9038,
+            "number": 38,
+            "title": "Issue 38",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/38"
+          },
+          {
+            "id": 9039,
+            "number": 39,
+            "title": "Issue 39",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/39"
+          },
+          {
+            "id": 9040,
+            "number": 40,
+            "title": "Issue 40",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/40"
+          },
+          {
+            "id": 9041,
+            "number": 41,
+            "title": "Issue 41",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/41"
+          },
+          {
+            "id": 9042,
+            "number": 42,
+            "title": "Issue 42",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/42"
+          },
+          {
+            "id": 9043,
+            "number": 43,
+            "title": "Issue 43",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/43"
+          },
+          {
+            "id": 9044,
+            "number": 44,
+            "title": "Issue 44",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/44"
+          },
+          {
+            "id": 9045,
+            "number": 45,
+            "title": "Issue 45",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/45"
+          },
+          {
+            "id": 9046,
+            "number": 46,
+            "title": "Issue 46",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/46"
+          },
+          {
+            "id": 9047,
+            "number": 47,
+            "title": "Issue 47",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/47"
+          },
+          {
+            "id": 9048,
+            "number": 48,
+            "title": "Issue 48",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/48"
+          },
+          {
+            "id": 9049,
+            "number": 49,
+            "title": "Issue 49",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/49"
+          },
+          {
+            "id": 9050,
+            "number": 50,
+            "title": "Issue 50",
+            "state": "open",
+            "assignee": {
+              "login": "mimirbot"
+            },
+            "html_url": "https://github.example.net/acme/widgets/issues/50"
+          }
+        ]
+      }
+    }
+  ]
+}
