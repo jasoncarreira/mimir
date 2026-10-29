@@ -1244,6 +1244,7 @@ class GitHubForgeClient:
         )
 
 from .github_trust import WithheldItem, placeholder, sanitize_login, sanitize_url
+from .tracker.record import strip_external_record
 from .ci import LOG_EXCERPT_BYTES, capture_job_log, clean_log_tail
 
 import asyncio
@@ -2550,7 +2551,9 @@ def pr_spec(
             return {"error": "spec_not_armed"}
         if not all(isinstance(payload.get(key), str) for key in ("title", "status", "description")):
             return {"error": "spec_read_failed"}
-        return {key: payload[key] for key in ("id", "title", "status", "labels", "description")}
+        spec = {key: payload[key] for key in ("id", "title", "status", "labels")}
+        spec["description"] = strip_external_record(payload["description"])
+        return spec
     except (OSError, subprocess.SubprocessError, ValueError, UnicodeError):
         return {"error": "spec_read_failed"}
 

@@ -171,7 +171,8 @@ def test_pr_preserves_summary_and_gate_without_internal_references(
     command = next(call for call in calls if call[:3] == ["gh", "pr", "create"])
     assert command[command.index("--title") + 1] == "Fix the parser crash"
     body = command[command.index("--body") + 1]
-    assert f"Build summary:\n\n{expected}\n\n" in body
+    published = expected.replace("Fixes #7", "Refs #7")
+    assert f"Build summary:\n\n{published}\n\n" in body
     assert f"- Tests: `{gate_command}` → 0\n" in body
     assert "- Gate run: `gate-77`" in body
     assert evidence.transcript not in body
@@ -192,7 +193,7 @@ def test_pr_preserves_summary_and_gate_without_internal_references(
     updated_body = edit_calls[0][edit_calls[0].index("--body") + 1]
     assert updated_body.startswith(body.rstrip() + "\n")
     assert f"- Tests: `{gate_command}` → 0\n" in updated_body
-    assert f"Build summary:\n\n{expected}\n\n" in updated_body
+    assert f"Build summary:\n\n{published}\n\n" in updated_body
 
 
 @pytest.mark.parametrize("value", [
