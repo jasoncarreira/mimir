@@ -377,6 +377,25 @@ async def test_withheld_durable_notice_is_title_free(tmp_path, home):
 
 
 @pytest.mark.asyncio
+async def test_transition_without_url_renders_one_title_free_line(tmp_path, home):
+    notices = _Notices()
+    poller = _poller(tmp_path, [json.dumps(dict(TRANSITION, url="", title=MARKER))])
+
+    await run_poller(
+        poller, enqueue=_Enqueue(), operator_notice=notices.notice,
+        operator_live_notice=notices.live_notice,
+    )
+
+    assert notices.durable == [
+        "Tracker transition unavailable: linear ENG-123 pr_opened (state_not_found) (no URL)"
+    ]
+    assert notices.live == []
+    [record] = _of_type(home, "tracker_transition_unavailable")
+    assert record["url"] == ""
+    assert MARKER not in _tree_text(tmp_path)
+
+
+@pytest.mark.asyncio
 async def test_withheld_title_never_persisted(tmp_path, home, caplog):
     notices = _Notices()
     poller = _poller(tmp_path, [json.dumps(dict(WITHHELD, delivery_barrier=True))])
@@ -463,6 +482,60 @@ async def test_invalid_url_sends_no_notice(tmp_path, home):
 
     assert notices.durable == [] and notices.live == []
     assert len(_of_type(home, "tracker_issue_withheld")) == 1
+
+
+@pytest.mark.asyncio
+async def test_empty_url_does_not_change_withheld_issue_validation(tmp_path, home):
+    notices = _Notices()
+    poller = _poller(tmp_path, [json.dumps(dict(WITHHELD, url=""))])
+
+    await run_poller(poller, enqueue=_Enqueue(), operator_notice=notices.notice)
+
+    assert notices.durable == []
+    [record] = _of_type(home, "tracker_issue_withheld")
+    assert record["url"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [None, "http://evil.example/ENG-123", "(no URL)", " ", 42])
+async def test_malformed_transition_url_cannot_take_no_url_path(tmp_path, home, url):
+    notices = _Notices()
+    poller = _poller(tmp_path, [json.dumps(dict(TRANSITION, url=url))])
+
+    await run_poller(poller, enqueue=_Enqueue(), operator_notice=notices.notice)
+
+    assert notices.durable == []
+    [record] = _of_type(home, "tracker_transition_unavailable")
+    assert record["url"] is None
+
+
+@pytest.mark.asyncio
+async def test_missing_transition_url_cannot_take_no_url_path(tmp_path, home):
+    notices = _Notices()
+    transition = {key: value for key, value in TRANSITION.items() if key != "url"}
+    poller = _poller(tmp_path, [json.dumps(transition)])
+
+    await run_poller(poller, enqueue=_Enqueue(), operator_notice=notices.notice)
+
+    assert notices.durable == []
+    [record] = _of_type(home, "tracker_transition_unavailable")
+    assert record["url"] is None
+
+
+@pytest.mark.asyncio
+async def test_no_url_transition_still_requires_validated_identifiers(tmp_path, home):
+    notices = _Notices()
+    poller = _poller(tmp_path, [
+        json.dumps(dict(TRANSITION, url="", ref="ENG-123\n")),
+        json.dumps(dict(TRANSITION, url="", adapter="bad adapter")),
+    ])
+
+    await run_poller(poller, enqueue=_Enqueue(), operator_notice=notices.notice)
+
+    assert notices.durable == []
+    records = _of_type(home, "tracker_transition_unavailable")
+    assert [record["ref"] for record in records] == [None, "ENG-123"]
+    assert [record["adapter"] for record in records] == ["linear", None]
 
 
 @pytest.mark.asyncio

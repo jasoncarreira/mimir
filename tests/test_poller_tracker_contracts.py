@@ -130,6 +130,9 @@ def test_notice_lines_carry_validated_fields_and_a_bounded_title():
     assert transition_line("jira", "PROJ-45", JIRA_URL, "merged", "state_not_found") == (
         f"Tracker transition unavailable: jira PROJ-45 merged (state_not_found) {JIRA_URL}"
     )
+    assert transition_line("jira", "PROJ-45", "", "merged", "failed") == (
+        "Tracker transition unavailable: jira PROJ-45 merged (failed) (no URL)"
+    )
 
 
 def test_withheld_title_is_sanitized_in_the_live_line():
