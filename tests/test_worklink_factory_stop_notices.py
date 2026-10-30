@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 import inspect
 import hashlib
+import json
 import textwrap
 from pathlib import Path
 
@@ -173,11 +174,16 @@ def test_every_factory_ending_has_one_terminal_agent_notice(tmp_path, monkeypatc
         return tmp_path / "evidence.json", "https://github.com/owner/repo/pull/42"
 
     monkeypatch.setattr(orchestrator, "_verify_factory_completion", verify)
+    def runner(args):
+        if args == ["gh", "api", "repos/owner/repo/pulls/42"]:
+            return cp(args, stdout=json.dumps({"title": "Build", "body": "Done."}))
+        return cp(args)
+
     result = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
         issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
         claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
         claims=Claims(), backend=object(), compute=object(), factory_record=record,
-        test_cmd="pytest -q", runner=lambda args: cp(args), started_at=datetime.now(UTC),
+        test_cmd="pytest -q", runner=runner, started_at=datetime.now(UTC),
     ))
     if ending == "success":
         orchestrator._record_factory_milestone(

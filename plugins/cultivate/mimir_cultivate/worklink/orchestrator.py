@@ -6401,8 +6401,8 @@ _PR_BODY_TRUNCATED = "\n\n[Pull request body truncated by Worklink.]"
 
 def _factory_pr_publication(
     issue: IssueContext, issue_key: str | None, repo_slug: str, title: str, body: str
-) -> tuple[str, str] | None:
-    """Return the epic PR title and body under the leaf publication contract, or None if untracked.
+) -> tuple[str, str]:
+    """Return the epic PR title and body under the leaf publication contract.
 
     The factory decorates both with its issue key (``<key> :``), which for an epic names the
     Chainlink issue, so that decoration goes first. Unlike a leaf PR, whose evidence block is
@@ -6411,30 +6411,28 @@ def _factory_pr_publication(
     The result is a fixed point, so enforcing the contract again leaves the PR unchanged.
     """
     record = _tracker_record(issue)
-    if record is None:
-        return None
     title = title.replace("\r\n", "\n").strip()
     body = body.replace("\r\n", "\n").strip()
     if issue_key:
         decoration = re.escape(issue_key)
         title = re.sub(rf"^{decoration} : ", "", title)
         body = re.sub(rf"^{decoration} :(?:\n\n|$)", "", body)
-    prefix = title_prefix(record)
+    prefix = title_prefix(record) if record is not None else ""
     if prefix and title.startswith(prefix):
         title = title[len(prefix):]
-    tag = tagging_line(record, repo_slug)
-    if body == tag or body.startswith(f"{tag}\n\n"):
+    tag = tagging_line(record, repo_slug) if record is not None else ""
+    if tag and (body == tag or body.startswith(f"{tag}\n\n")):
         body = body[len(tag):].lstrip("\n")
     title = prefix + _publishable_text(title, issue.issue_id).strip()
     text = _publishable_text(body, issue.issue_id).rstrip()
-    room = _PR_BODY_MAX_CHARS - len(tag) - 2
+    room = _PR_BODY_MAX_CHARS - (len(tag) + 2 if tag else 0)
     if len(text) > room:
         # Cut on whitespace so no number is split into the id, then scrub what is kept again.
         limit = room - len(_PR_BODY_TRUNCATED)
         cut = max(text.rfind(char, 0, limit) for char in " \n\t")
         kept = _publishable_text(text[: cut if cut > 0 else limit], issue.issue_id).rstrip()
         text = kept[:limit].rstrip() + _PR_BODY_TRUNCATED
-    return title, f"{tag}\n\n{text}".rstrip()
+    return title, f"{tag}\n\n{text}".rstrip() if tag else text
 
 
 def _enforce_factory_pr_publication(
@@ -6442,12 +6440,12 @@ def _enforce_factory_pr_publication(
 ) -> str | None:
     """Bring the factory-written epic PR under the leaf contract.
 
-    The factory child publishes epic PRs itself, so the controller applies the tagging line,
-    the Chainlink-id scrub and the closing-keyword defang after the PR exists. Any failure is
-    returned as a reason for an operator notice; it never stops the run.
+    The factory child publishes epic PRs itself, so the controller applies the optional
+    tracker tag, the Chainlink-id scrub and the closing-keyword defang after the PR exists.
+    Any failure is returned as a reason for an operator notice; it never stops the run.
     """
     match = _CANONICAL_PR_URL.fullmatch(pr_url)
-    if match is None or _tracker_record(issue) is None:
+    if match is None:
         return None
     endpoint = f"repos/{repository}/pulls/{match.group(3)}"
     try:
@@ -6460,7 +6458,7 @@ def _enforce_factory_pr_publication(
         body = raw_body if isinstance(raw_body, str) else ""
         published = _factory_pr_publication(issue, issue_key, repository, title, body)
         current = (title.replace("\r\n", "\n").strip(), body.replace("\r\n", "\n").strip())
-        if published is None or published == current:
+        if published == current:
             return None
         # The body travels in a file: an argv string is capped well below GitHub's body limit.
         with tempfile.TemporaryDirectory(prefix="worklink-epic-pr-") as scratch:
@@ -6473,7 +6471,10 @@ def _enforce_factory_pr_publication(
             )
     except Exception as exc:  # publication housekeeping must not fail a verified completion
         return _factory_controller_error(exc)
-    _log_event("worklink_factory_pr_tracker_tagged", issue_id=issue.issue_id, pr_url=pr_url)
+    _log_event(
+        "worklink_factory_pr_tracker_tagged" if _tracker_record(issue) else "worklink_factory_pr_published",
+        issue_id=issue.issue_id, pr_url=pr_url,
+    )
     return None
 
 
