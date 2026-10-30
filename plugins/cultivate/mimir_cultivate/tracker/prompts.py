@@ -40,6 +40,11 @@ A trusted person assigned this tracker issue to you. Decide exactly one outcome:
 3. One leaf: call tracker_file_work with kind "leaf" and a description in this template.
 4. One epic: call tracker_file_work with kind "epic" and a description in this template.
 Never file child leaves; an epic is a single issue.
+Acceptance criteria describe the change and its tests, never PR publication. Worklink
+commits, pushes and opens the PR after its gate, and adds the tracker closing line
+(`Closes #N` / `Fixes KEY`) itself. Put reviewer or PR-description requests from the
+tracker issue in Worklink notes, or specify content for `.worklink-pr-body.md`, not
+as acceptance checklist items.
 
 {_COMMON_RULES}
 

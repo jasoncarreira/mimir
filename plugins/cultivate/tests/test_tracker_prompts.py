@@ -72,6 +72,18 @@ def test_triage_header_lists_outcomes_templates_and_identity_only() -> None:
     assert "{" not in text.split(BEGIN_MARKER)[0]
 
 
+def test_triage_header_keeps_publication_out_of_acceptance_criteria() -> None:
+    header = render_prompt("triage", make_issue()).split(BEGIN_MARKER)[0]
+
+    assert "Acceptance criteria describe the change and its tests, never PR publication" in header
+    assert "Worklink\ncommits, pushes and opens the PR after its gate" in header
+    assert "adds the tracker closing line" in header
+    assert "`Closes #N` / `Fixes KEY`" in header
+    assert "reviewer or PR-description requests" in header
+    assert "Worklink notes" in header and "`.worklink-pr-body.md`" in header
+    assert "not\nas acceptance checklist items" in header
+
+
 def test_update_header_says_work_is_filed() -> None:
     text = render_prompt("update", make_issue())
 
