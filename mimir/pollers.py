@@ -3473,6 +3473,8 @@ async def run_poller(
                 tracker_adapter = safe_adapter(payload.get("adapter"))
                 tracker_ref = safe_ref(payload.get("ref"))
                 tracker_url = safe_url(payload.get("url"), tracker_ref)
+                if signal_name == "tracker_transition_unavailable" and payload.get("url") == "":
+                    tracker_url = ""
                 raw_reason = payload.get("reason")
                 if signal_name == "tracker_issue_withheld":
                     raw_title = payload.get("title")
@@ -3546,7 +3548,7 @@ async def run_poller(
                     and poller.trust_source == "tracker"
                     and tracker_fields["adapter"]
                     and tracker_fields["ref"]
-                    and tracker_fields["url"]
+                    and tracker_fields["url"] is not None
                 ):
                     if signal_name == "tracker_issue_withheld":
                         tracker_live_notices.append(withheld_lines(
