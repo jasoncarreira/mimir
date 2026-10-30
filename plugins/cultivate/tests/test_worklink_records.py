@@ -60,6 +60,22 @@ def test_factory_record_round_trips_v2_and_reads_v1(tmp_path: Path) -> None:
     assert path.is_file()
 
 
+def test_factory_record_keeps_pre_prompt_change_v2_schema(tmp_path: Path) -> None:
+    record = _factory_record(tmp_path)
+    payload = record.to_json()
+    # Pin the existing strict reader's accepted keys independently of the writer.
+    assert payload["version"] == 2
+    assert set(payload) == {
+        "version", "run_id", "issue_id", "attempt", "repository", "base_ref",
+        "branch", "launcher", "sandbox", "session", "handle", "status",
+        "observed_at", "controller_phase", "controller_error", "transcript",
+        "children_reaped",
+    }
+    assert FactoryRunRecord.from_json(payload) == record
+    with pytest.raises(FactoryRecordError, match="fields are invalid"):
+        FactoryRunRecord.from_json({**payload, "issue_title": "Display only"})
+
+
 def test_factory_record_refuses_symlinked_store(tmp_path: Path) -> None:
     home = tmp_path / "home"
     (home / "state").mkdir(parents=True)

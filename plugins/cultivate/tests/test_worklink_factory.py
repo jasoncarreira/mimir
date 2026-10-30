@@ -104,7 +104,10 @@ def test_provider_renders_default_work_order_without_override(tmp_path: Path) ->
         backend_name="feature_factory",
         test_command="uv run pytest -q",
     )
-    assert "Chainlink issue #1949" in rendered
+    assert rendered.startswith("You are executing this Worklink issue.\n")
+    assert "Title: Move coding" in rendered
+    assert "#1949" not in rendered and "chainlink 1949" not in rendered.lower()
+    assert "Parent:" not in rendered
     assert "Implement the factory" in rendered
     assert "uv run pytest -q" in rendered
 
@@ -132,7 +135,7 @@ def test_provider_runner_dry_run_uses_default_work_order(tmp_path: Path, capsys:
     ))
     assert result.dry_run
     output = capsys.readouterr().out
-    assert "Chainlink issue #1949" in output
+    assert "You are executing this Worklink issue." in output
     assert "Move the factory" in output
     assert "WORKLINK_BLOCKED:" in output
 

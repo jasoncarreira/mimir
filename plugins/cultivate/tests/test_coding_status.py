@@ -52,11 +52,11 @@ def _remediation_scope(number: int, *, event_type: str = "pr_ci_failure") -> Rep
 
 
 def _record(home: Path, issue: int, *, phase: str = "running", status: str = "running",
-            url: str | None = None) -> None:
+            url: str | None = None, attempt: int = 1) -> None:
     run_id = f"chainlink-{issue}"
     sandbox = home / ".factory-sandboxes" / run_id
     save_factory_record(home, FactoryRunRecord(
-        run_id=run_id, issue_id=issue, attempt=1, repository="owner/repo", base_ref="main",
+        run_id=run_id, issue_id=issue, attempt=attempt, repository="owner/repo", base_ref="main",
         branch=f"build-{issue}", launcher=str(home / "launcher"), sandbox=str(sandbox),
         session=None, handle=None, observed_at=None, controller_phase=phase,
         status=FactoryStatus(run_id=run_id, valid=True, sandbox_path=str(sandbox),
@@ -94,13 +94,28 @@ def test_selected_provider_renders_only_server_owned_in_flight_and_remediation(
     assert coding_status_applies(_operator(store), event)
     text, served = _render_plugin_prompt(provider, _operator(store), event, tmp_path)
     assert served == ()  # no agent-writable file was read through the prompt reader
-    assert "Worklink build #1949" in text
+    assert text.count("- Worklink build in flight (attempt 1)") == 2
+    assert "PR under remediation: https://github.com/owner/repo/pull/50" in text
+    assert "#1949" not in text and "chainlink 1949" not in text.lower()
+    assert "#1950" not in text and "chainlink 1950" not in text.lower()
     assert "https://github.com/owner/repo/pull/50" in text
     assert "#1951" not in text and "/pull/51" not in text
     assert "/pull/52" not in text and "evil.example" not in text
     assert "/pull/54" not in text and "/pull/55" not in text and "/pull/56" not in text
     prompt = build_turn_prompt(event, plugin_blocks={"self_state": (("coding_status", text),)})
     assert "## Plugin: coding_status\n\nCoding status" in prompt
+
+
+def test_running_record_without_title_stays_visible_without_tracker_identity(tmp_path: Path) -> None:
+    _record(tmp_path, 2064, attempt=3)
+    registry = PolicyRegistry()
+    register_prompt_provider(registry.registrar("cultivate"))
+    event = AgentEvent(trigger="user_message", channel_id="chat")
+    text, _ = _render_plugin_prompt(
+        registry.prompt_providers["coding_status"], _operator(), event, tmp_path,
+    )
+    assert text == "Coding status\n- Worklink build in flight (attempt 3)"
+    assert "2064" not in text and "chainlink" not in text.lower()
 
 
 @pytest.mark.parametrize("auth,event", [
@@ -127,12 +142,12 @@ def test_coding_status_uses_host_home_not_environment(tmp_path, monkeypatch):
     event = AgentEvent(trigger="user_message", channel_id="chat")
     _record(tmp_path, 1949)
     other = tmp_path / "other"
-    _record(other, 5555)
+    _record(other, 5555, attempt=9)
     monkeypatch.setenv("MIMIR_HOME", str(other))
     text, _ = _render_plugin_prompt(provider, _operator(), event, tmp_path)
-    assert "#1949" in text and "#5555" not in text
+    assert "Worklink build in flight (attempt 1)" in text and "attempt 9" not in text
     monkeypatch.delenv("MIMIR_HOME")
-    assert "#1949" in _render_plugin_prompt(provider, _operator(), event, tmp_path)[0]
+    assert "Worklink build in flight (attempt 1)" in _render_plugin_prompt(provider, _operator(), event, tmp_path)[0]
     assert _render_plugin_prompt(provider, _operator(), event, tmp_path / "absent") == ("", ())
 
 
@@ -198,7 +213,8 @@ async def test_selected_agent_assembly_labels_status_and_excludes_non_operator(t
         ordinary_prompt, _ = await agent._build_turn_prompt(ordinary, event, None)
 
     assert "## Plugin: coding_status\n\nCoding status" in prompt
-    assert "Worklink build #1949" in prompt
+    assert "Worklink build in flight (attempt 1)" in prompt
+    assert "#1949" not in prompt and "chainlink 1949" not in prompt.lower()
     sources = [source for source in operator.ifc_labels.sources if source.domain == "coding_status"]
     assert len(sources) == 1
     source = sources[0]

@@ -43,13 +43,13 @@ def render_coding_status(auth: AuthContext, event: object, reader: object) -> st
         if status is None or not status.valid:
             continue
         if record.controller_phase == "running" and status.status == "running":
-            lines.append(f"- Worklink build #{record.issue_id} (attempt {record.attempt}): in flight")
+            lines.append(f"- Worklink build in flight (attempt {record.attempt})")
         elif (record.controller_phase == "parked" and status.status == "needs-human"
               and status.pr_url and (match := _PR_URL.fullmatch(status.pr_url))
               and match.group("repo") == record.repository
               and _remediation_scope_matches(auth, record.repository, int(status.pr_url.rsplit("/", 1)[-1]))):
             lines.append(
-                f"- PR under remediation for Worklink #{record.issue_id}: "
+                "- PR under remediation: "
                 f"{sanitize_prompt_field(status.pr_url)}"
             )
     if not lines:
