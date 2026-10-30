@@ -125,7 +125,10 @@ def test_factory_ending_inventory_is_closed():
     source = inspect.getsource(WorklinkRunner._supervise_factory_070)
     assert source.count("return await park_for_reason(") == 5
     assert 'kind="factory_needs_human"' in source  # lock refusal
-    assert inspect.getsource(WorklinkRunner._finish_factory_070).count("_record_factory_milestone(") == 2
+    finish = inspect.getsource(WorklinkRunner._finish_factory_070)
+    # The third milestone is the publication notice on a completed epic, not an ending.
+    assert finish.count("_record_factory_milestone(") == 3
+    assert finish.count('kind="factory_publication_degraded"') == 1
 
 
 @pytest.mark.parametrize("ending", list(ENDING_NOTICES))

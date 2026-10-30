@@ -27,7 +27,11 @@ AUTO_RESUMABLE_FAILURE_KINDS = frozenset({"tests_failed", "quota_exhausted"})
 MAX_CONSECUTIVE_QUOTA_HOLDS = 4
 _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 FACTORY_STOP_KINDS = frozenset({"factory_needs_human", "factory_blocked", "factory_partial"})
-FACTORY_TRANSITION_KINDS = FACTORY_STOP_KINDS | {"factory_start", "factory_success"}
+#: The epic PR exists but the controller could not bring it under the publication contract.
+FACTORY_PUBLICATION_DEGRADED = "factory_publication_degraded"
+FACTORY_TRANSITION_KINDS = FACTORY_STOP_KINDS | {
+    "factory_start", "factory_success", FACTORY_PUBLICATION_DEGRADED,
+}
 LEAF_TRANSITION_KINDS = frozenset({
     "leaf_blocked", "leaf_attempts_exhausted", "leaf_template_invalid", "leaf_claim_reaped",
 })
@@ -574,7 +578,8 @@ def record_factory_transition(
     state_dir: Path,
     *,
     kind: Literal[
-        "factory_start", "factory_success", "factory_needs_human", "factory_blocked", "factory_partial"
+        "factory_start", "factory_success", "factory_needs_human", "factory_blocked",
+        "factory_partial", "factory_publication_degraded",
     ],
     issue_id: int,
     run_id: str,
@@ -609,6 +614,8 @@ def record_factory_transition(
         if kind in FACTORY_STOP_KINDS:
             payload.update(status=status, reason=reason, record_path=record_path,
                            park_snapshot=park_snapshot, sandbox=sandbox)
+        elif kind == FACTORY_PUBLICATION_DEGRADED:
+            payload["reason"] = (reason or "publication contract not applied")[:2000]
         entry = state.setdefault("factory_transitions", {}).setdefault(delivery_key, payload)
     return entry
 

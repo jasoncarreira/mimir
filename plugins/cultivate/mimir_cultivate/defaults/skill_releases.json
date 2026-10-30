@@ -388,5 +388,21 @@
       "tests/test_tracker_poller_gates.py": "659f9af81b36f00220a1f61307a5aa7fb9f1e699ebd0f34fcbe606401ea79bfe",
       "tests/tracker_poller_test_support.py": "453047e9f0be74fc7f52b2eb759a97dee145be81e99eb2b67618a71cd2d541fb"
     }
+  },
+  "2507-epic-publication": {
+    "chainlink-orchestrator": {
+      "SKILL.md": "a328b7a5717a2843339c863ec4c5680ab4260d2f9af1c7161eb80a4d140c170b",
+      "pollers.json": "7771c3d953de5a4a299053d523a34695205888a5bb83e7e9f7fc250125ba407d",
+      "scripts/poller.py": "9278aad23be23b693fac71a759b74a155a1f4fab9f40ba2c7135803f11470f34"
+    },
+    "tracker-poller": {
+      "SKILL.md": "5ceccc457262b8969aa9e8dd114f8fac596aeed310568ad1b43940e782e955f9",
+      "pollers.json": "302a6f52658c593083ae6c78a13ed04f3fe39b0e5500713a43b17bbe2e6de403",
+      "scripts/poller.py": "f177d08fd7ab954e44f03b67aa279d317d0e272342f63bbdaec2027c4ed43c8e",
+      "tests/conftest.py": "5963113dc49b4b9df59427b3bf845254ed7275a8a10cb6bb77da1842aa23d6a4",
+      "tests/test_tracker_poller_cursor.py": "2c89eafaac1fe4197cd7ffe24125bac9d1fe47d1453fa687700cf831b1925bc1",
+      "tests/test_tracker_poller_gates.py": "659f9af81b36f00220a1f61307a5aa7fb9f1e699ebd0f34fcbe606401ea79bfe",
+      "tests/tracker_poller_test_support.py": "453047e9f0be74fc7f52b2eb759a97dee145be81e99eb2b67618a71cd2d541fb"
+    }
   }
 }

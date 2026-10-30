@@ -432,6 +432,18 @@ def _deliver_factory_transitions(state_dir: Path, tick_budget: TickBudget) -> No
                     "with the issue, run, attempt, the exact decision requested, and the preserved-work "
                     "pointers. Do not resume, re-arm, steal locks, start fresh work, or edit the issue yourself."
                 )
+            elif entry["kind"] == "factory_publication_degraded":
+                prompt = (
+                    f"Worklink could not finish publishing the epic PR for issue {entry['issue_id']}: "
+                    f"{entry.get('issue_title') or '(title unavailable)'}\n"
+                    f"Kind: {entry['kind']}\nRun: {entry['run_id']}\n"
+                    f"Attempt: {entry['attempt']}\nPR: {entry['pr_url'] or '(none)'}\n"
+                    f"Reason: {entry.get('reason') or '(reason unavailable)'}\n\n"
+                    "The epic is in review, but its PR may still lack the tracker closing line and may "
+                    "still name the Chainlink issue. Call operator_alert with the issue, the PR and the "
+                    "reason so an operator can fix the PR title and body. Do not edit the PR, re-arm, "
+                    "or start work yourself."
+                )
             else:
                 milestone = "started" if entry["kind"] == "factory_start" else "succeeded"
                 detail = (
