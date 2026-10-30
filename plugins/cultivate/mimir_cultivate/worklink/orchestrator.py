@@ -4383,6 +4383,15 @@ class WorklinkRunner:
             started_at=started_at,
             runner=runner,
         )
+        publication_error = _enforce_factory_pr_publication(
+            issue, status.issue_key, factory_record.repository, pr_url, runner=runner
+        )
+        if publication_error is not None:
+            _record_factory_milestone(
+                self.home, kind="factory_publication_degraded", issue=issue,
+                run_id=factory_record.run_id, attempt=factory_record.attempt,
+                pr_url=pr_url, reason=publication_error,
+            )
         claims.transition_issue(
             issue.issue_id,
             status="review",
@@ -4399,6 +4408,10 @@ class WorklinkRunner:
             evidence_path=evidence_path,
             checkout=Path(factory_record.sandbox),
             branch=factory_record.branch,
+            reason=(
+                f"epic PR publication contract not applied: {publication_error}"
+                if publication_error is not None else None
+            ),
             next=status.next,
         )
         _log_event(
@@ -6381,6 +6394,89 @@ def _open_pr(
     return result.stdout.strip().splitlines()[-1]
 
 
+#: GitHub rejects a PR body longer than this many characters.
+_PR_BODY_MAX_CHARS = 65536
+_PR_BODY_TRUNCATED = "\n\n[Pull request body truncated by Worklink.]"
+
+
+def _factory_pr_publication(
+    issue: IssueContext, issue_key: str | None, repo_slug: str, title: str, body: str
+) -> tuple[str, str] | None:
+    """Return the epic PR title and body under the leaf publication contract, or None if untracked.
+
+    The factory decorates both with its issue key (``<key> :``), which for an epic names the
+    Chainlink issue, so that decoration goes first. Unlike a leaf PR, whose evidence block is
+    written by the controller, every byte of a factory PR body is model-written, so the whole
+    body is scrubbed: a Chainlink id must never publish, even inside a quoted command or count.
+    The result is a fixed point, so enforcing the contract again leaves the PR unchanged.
+    """
+    record = _tracker_record(issue)
+    if record is None:
+        return None
+    title = title.replace("\r\n", "\n").strip()
+    body = body.replace("\r\n", "\n").strip()
+    if issue_key:
+        decoration = re.escape(issue_key)
+        title = re.sub(rf"^{decoration} : ", "", title)
+        body = re.sub(rf"^{decoration} :(?:\n\n|$)", "", body)
+    prefix = title_prefix(record)
+    if prefix and title.startswith(prefix):
+        title = title[len(prefix):]
+    tag = tagging_line(record, repo_slug)
+    if body == tag or body.startswith(f"{tag}\n\n"):
+        body = body[len(tag):].lstrip("\n")
+    title = prefix + _publishable_text(title, issue.issue_id).strip()
+    text = _publishable_text(body, issue.issue_id).rstrip()
+    room = _PR_BODY_MAX_CHARS - len(tag) - 2
+    if len(text) > room:
+        # Cut on whitespace so no number is split into the id, then scrub what is kept again.
+        limit = room - len(_PR_BODY_TRUNCATED)
+        cut = max(text.rfind(char, 0, limit) for char in " \n\t")
+        kept = _publishable_text(text[: cut if cut > 0 else limit], issue.issue_id).rstrip()
+        text = kept[:limit].rstrip() + _PR_BODY_TRUNCATED
+    return title, f"{tag}\n\n{text}".rstrip()
+
+
+def _enforce_factory_pr_publication(
+    issue: IssueContext, issue_key: str | None, repository: str, pr_url: str, *, runner: Runner
+) -> str | None:
+    """Bring the factory-written epic PR under the leaf contract.
+
+    The factory child publishes epic PRs itself, so the controller applies the tagging line,
+    the Chainlink-id scrub and the closing-keyword defang after the PR exists. Any failure is
+    returned as a reason for an operator notice; it never stops the run.
+    """
+    match = _CANONICAL_PR_URL.fullmatch(pr_url)
+    if match is None or _tracker_record(issue) is None:
+        return None
+    endpoint = f"repos/{repository}/pulls/{match.group(3)}"
+    try:
+        view = _fixed_command(runner, ["gh", "api", endpoint], error="cannot read the epic PR")
+        payload = json.loads(view.stdout)
+        title = payload.get("title") if isinstance(payload, dict) else None
+        if not isinstance(title, str):
+            raise WorklinkError("the epic PR read returned no title")
+        raw_body = payload.get("body")
+        body = raw_body if isinstance(raw_body, str) else ""
+        published = _factory_pr_publication(issue, issue_key, repository, title, body)
+        current = (title.replace("\r\n", "\n").strip(), body.replace("\r\n", "\n").strip())
+        if published is None or published == current:
+            return None
+        # The body travels in a file: an argv string is capped well below GitHub's body limit.
+        with tempfile.TemporaryDirectory(prefix="worklink-epic-pr-") as scratch:
+            patch = Path(scratch) / "pull.json"
+            patch.write_text(json.dumps({"title": published[0], "body": published[1]}), "utf-8")
+            _fixed_command(
+                runner,
+                ["gh", "api", "-X", "PATCH", endpoint, "--input", str(patch)],
+                error="cannot update the epic PR",
+            )
+    except Exception as exc:  # publication housekeeping must not fail a verified completion
+        return _factory_controller_error(exc)
+    _log_event("worklink_factory_pr_tracker_tagged", issue_id=issue.issue_id, pr_url=pr_url)
+    return None
+
+
 def _update_ci_pr_body(
     runner: Runner, pr_url: str, checks: tuple[tuple[str, str], ...], rounds: int, sha: str,
 ) -> None:
@@ -6701,13 +6797,15 @@ def _record_factory_milestone(
     home: Path,
     *,
     kind: Literal[
-        "factory_start", "factory_success", "factory_needs_human", "factory_blocked", "factory_partial"
+        "factory_start", "factory_success", "factory_needs_human", "factory_blocked",
+        "factory_partial", "factory_publication_degraded",
     ],
     issue: IssueContext,
     run_id: str,
     attempt: int,
     pr_url: str | None = None,
     factory_record: FactoryRunRecord | None = None,
+    reason: str | None = None,
 ) -> None:
     """Informational delivery must not cancel work or replace its result."""
     from .dispatch_failures import dispatch_failure_state_dir, record_factory_transition, terminal_error
@@ -6740,6 +6838,8 @@ def _record_factory_milestone(
                 "park_snapshot": status.park_snapshot if status is not None else None,
                 "sandbox": (factory_record.sandbox or "") if factory_record is not None else "",
             }
+        elif reason is not None:
+            stop_fields = {"reason": reason}
         record_factory_transition(
             dispatch_failure_state_dir(home), kind=kind,
             issue_id=issue.issue_id, issue_title=issue.title,

@@ -77,6 +77,13 @@ needed (ask with `tracker_comment`), one leaf, or one epic (`tracker_file_work`)
 whose work is already filed receives later activity as an `update`, which never files new
 work. A triaged issue that gets no reply is offered to the agent once more after 24 hours.
 
+Worklink links the resulting pull request to the issue. A leaf pull request starts with the
+tracker line: `Closes #N`, `Fixes ENG-123` or `Fixes PROJ-45`, and a Jira key also prefixes the
+title. An epic pull request is written by the feature factory, and Worklink adds the same line
+after the factory finishes; if that edit fails, the operator gets a notice. The tracker closes
+the issue on a merge to the default branch; for work that targets another branch, set
+`close_on_merge` so the backstop closes it.
+
 ## The trust rule
 
 The agent only sees a thread whose latest activity by anyone other than the bot is a trusted

@@ -6297,7 +6297,7 @@ def worklink_receipt_consumer(monkeypatch):
     return consumer
 
 
-@pytest.mark.parametrize("kind", ["factory_start", "factory_success"])
+@pytest.mark.parametrize("kind", ["factory_start", "factory_success", "factory_publication_degraded"])
 def test_factory_transition_receipt_pruning_waits_for_acknowledgement(
     home, worklink_receipts, worklink_receipt_consumer, monkeypatch, kind,
 ):
@@ -6329,7 +6329,7 @@ def test_factory_transition_receipt_pruning_waits_for_acknowledgement(
     emitted.assert_not_called()
 
 
-@pytest.mark.parametrize("kind", ["factory_start", "factory_success"])
+@pytest.mark.parametrize("kind", ["factory_start", "factory_success", "factory_publication_degraded"])
 @pytest.mark.parametrize("broken", [
     "mapping-null", "mapping-list", "entry-null", "entry-list",
     "kind-missing", "kind-unknown", "kind-list",
@@ -6384,6 +6384,55 @@ def test_factory_transition_receipt_pruning_fails_closed(
     _prune_delivery_receipts(cfg, home)
     assert obsolete.exists(), "malformed transitions must abort the entire sweep"
     assert failures.delivery_receipt_exists(state, key)
+
+
+@pytest.mark.parametrize("reason", ["missing", 7, None])
+def test_publication_degraded_receipt_pruning_requires_a_reason(
+    home, worklink_receipts, reason,
+):
+    failures, state, cfg, record = worklink_receipts
+    incident, _, obsolete = record()
+    failures.mark_failure_notified(state, 42, incident["signature"], incident["occurrence_id"])
+    entry = failures.record_factory_transition(
+        state, kind="factory_publication_degraded", issue_id=42, run_id="run-42", attempt=1,
+        pr_url="https://github.com/example/repo/pull/7", reason="cannot update the epic PR",
+    )
+    key = entry["delivery_key"]
+    _write_delivery_receipt(state, key)
+    with failures.failure_state_transaction(state) as ledger:
+        malformed = dict(entry, notified=True)
+        if reason == "missing":
+            malformed.pop("reason")
+        else:
+            malformed["reason"] = reason
+        ledger["factory_transitions"] = {key: malformed}
+    _prune_delivery_receipts(cfg, home)
+    assert obsolete.exists(), "a degraded notice without a reason must abort the sweep"
+
+
+def test_publication_degraded_notice_tells_the_agent_to_alert_the_operator(
+    worklink_receipts, worklink_receipt_consumer, monkeypatch,
+):
+    failures, state, _, _ = worklink_receipts
+    entry = failures.record_factory_transition(
+        state, kind="factory_publication_degraded", issue_id=42, issue_title="Parser epic",
+        run_id="run-42", attempt=1, pr_url="https://github.com/example/repo/pull/7",
+        reason="HTTP 422 body too long",
+    )
+    assert entry["delivery_key"] == "worklink-factory_publication_degraded:42:run-42:1"
+    emitted = Mock()
+    monkeypatch.setattr(worklink_receipt_consumer, "_emit", emitted)
+    worklink_receipt_consumer._deliver_factory_transitions(
+        state, SimpleNamespace(hard_exhausted=lambda: False),
+    )
+    [payload] = [call.args[0] for call in emitted.call_args_list]
+    assert payload["kind"] == "factory_publication_degraded"
+    assert payload["delivery_key"] == entry["delivery_key"]
+    prompt = payload["prompt"]
+    for expected in ("Parser epic", "https://github.com/example/repo/pull/7",
+                     "HTTP 422 body too long", "operator_alert", "Do not edit the PR"):
+        assert expected in prompt
+    assert "Informational status update only" not in prompt
 
 
 @pytest.mark.parametrize("changed", ["kind", "issue_id", "run_id", "attempt"])

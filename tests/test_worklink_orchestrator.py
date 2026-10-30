@@ -8239,6 +8239,234 @@ def test_factory_terminal_result_preserves_next(
     assert transitions[0]["review_ready"] is completed
 
 
+_EPIC_GOAL = "Goal: x\n\nAcceptance criteria:\n- [ ] do it\n\nWorklink notes:\n- Scope: s\n- Out of scope: o\n"
+_EPIC_PR = "https://github.com/owner/repo/pull/42"
+_EPIC_LINEAR = f"{_EPIC_GOAL}\nExternal: linear:ENG-123 https://linear.app/t/issue/ENG-123"
+
+
+def _finish_epic_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    description: str,
+    title: str,
+    body: str | None,
+    respond: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
+    verify_error: Exception | None = None,
+) -> tuple[Any, list[list[str]], list[dict[str, str]]]:
+    """Run the real factory completion step; the PR read and write go through ``gh``."""
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    record = _factory_lifecycle_record(
+        sandbox, LaunchHandle("local_subprocess", "123", 456)
+    ).observed(
+        replace(_factory_lifecycle_status(sandbox, status="completed"), issue_key="chainlink-700"),
+        datetime.now(UTC).isoformat(),
+    )
+    calls: list[list[str]] = []
+    patches: list[dict[str, str]] = []
+
+    async def verify(**kwargs: object) -> tuple[Path, str]:
+        calls.append(["verify"])
+        if verify_error is not None:
+            raise verify_error
+        return tmp_path / "evidence.json", _EPIC_PR
+
+    class Claims:
+        def transition_issue(self, *args: object, **kwargs: object) -> None:
+            calls.append(["transition", str(kwargs.get("status"))])
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess:
+        calls.append(list(args))
+        if respond is not None:
+            return respond(args)
+        if args == ["gh", "api", "repos/owner/repo/pulls/42"]:
+            return cp(args, stdout=json.dumps({"title": title, "body": body}))
+        if args[:4] == ["gh", "api", "-X", "PATCH"]:
+            patches.append(json.loads(Path(args[args.index("--input") + 1]).read_text()))
+        return cp(args)
+
+    monkeypatch.setattr(orchestrator, "_verify_factory_completion", verify)
+    finish = WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+        issue=IssueContext(700, "Epic", description, {"worklink:epic"}),
+        claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+        claims=Claims(),
+        backend=object(),
+        compute=object(),
+        factory_record=record,
+        test_cmd="pytest -q",
+        runner=runner,
+        started_at=datetime.now(UTC),
+    )
+    if verify_error is not None:
+        with pytest.raises(type(verify_error)):
+            asyncio.run(finish)
+        return None, calls, patches
+    return asyncio.run(finish), calls, patches
+
+
+def _epic_milestones(home: Path) -> list[dict[str, object]]:
+    from mimir_cultivate.worklink.dispatch_failures import dispatch_failure_state_dir
+
+    path = dispatch_failure_state_dir(home) / "dispatch_failures.json"
+    if not path.exists():
+        return []
+    return list(json.loads(path.read_text()).get("factory_transitions", {}).values())
+
+
+@pytest.mark.parametrize(("external", "tag", "prefix"), [
+    ("External: github_issues:owner/repo#5 https://github.com/owner/repo/issues/5", "Closes #5", ""),
+    ("External: github_issues:other/repo#5 https://github.com/other/repo/issues/5",
+     "Closes other/repo#5", ""),
+    ("External: linear:ENG-123 https://linear.app/t/issue/ENG-123", "Fixes ENG-123", ""),
+    ("External: jira:PROJ-45 https://example.atlassian.net/browse/PROJ-45",
+     "Fixes PROJ-45", "PROJ-45: "),
+])
+def test_factory_epic_pr_gets_the_leaf_publication_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, external: str, tag: str, prefix: str
+) -> None:
+    result, calls, patches = _finish_epic_completion(
+        tmp_path, monkeypatch,
+        description=f"{_EPIC_GOAL}\n{external}",
+        title="chainlink-700 : Build the parser for chainlink 700",
+        body="chainlink-700 :\n\n## Summary\n\nFixes #12 and resolves the epic 700 parser.\n",
+    )
+    assert result.status == "review_ready" and result.reason is None
+    assert patches == [{
+        "title": f"{prefix}Build the parser for",
+        "body": f"{tag}\n\n## Summary\n\nRefs #12 and resolves the the source issue parser.",
+    }]
+    order = [call[0] if call[0] != "gh" else " ".join(call[:4]) for call in calls]
+    assert order.index("verify") < order.index("gh api -X PATCH") < order.index("transition")
+    assert _epic_milestones(tmp_path) == []
+
+
+@pytest.mark.parametrize("external", [
+    "External: github_issues:owner/repo#5 https://github.com/owner/repo/issues/5",
+    "External: github_issues:other/repo#5 https://github.com/other/repo/issues/5",
+    "External: linear:ENG-123 https://linear.app/t/issue/ENG-123",
+    "External: jira:PROJ-45 https://example.atlassian.net/browse/PROJ-45",
+])
+@pytest.mark.parametrize("crlf", [False, True])
+def test_factory_epic_pr_contract_is_a_fixed_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, external: str, crlf: bool
+) -> None:
+    first, _, patches = _finish_epic_completion(
+        tmp_path / "first", monkeypatch, description=f"{_EPIC_GOAL}\n{external}",
+        title="chainlink-700 : Build", body="chainlink-700 :\n\nFixes #12\n\nDone.\n",
+    )
+    published = patches[0]
+    # GitHub hands back CRLF line endings after a web edit; that must not count as a change.
+    body = published["body"].replace("\n", "\r\n") + "\r\n" if crlf else published["body"]
+    _, calls, again = _finish_epic_completion(
+        tmp_path / "second", monkeypatch, description=f"{_EPIC_GOAL}\n{external}",
+        title=published["title"], body=body,
+    )
+    assert again == [] and not [call for call in calls if call[:4] == ["gh", "api", "-X", "PATCH"]]
+
+
+def test_factory_epic_with_an_empty_body_still_gets_the_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, patches = _finish_epic_completion(
+        tmp_path, monkeypatch, description=_EPIC_LINEAR, title="Build", body=None,
+    )
+    assert patches == [{"title": "Build", "body": "Fixes ENG-123"}]
+
+
+def test_factory_epic_pr_body_is_capped_at_the_github_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    _, calls, patches = _finish_epic_completion(
+        tmp_path, monkeypatch, description=_EPIC_LINEAR, title="Build",
+        body="é" * (orchestrator._PR_BODY_MAX_CHARS + 10),
+    )
+    body = patches[0]["body"]
+    assert len(body) == orchestrator._PR_BODY_MAX_CHARS
+    assert body.startswith("Fixes ENG-123\n\n") and body.endswith(orchestrator._PR_BODY_TRUNCATED)
+    assert all(len(arg) < 4096 for call in calls for arg in call)
+
+
+def test_factory_epic_pr_truncation_never_cuts_a_number_into_the_issue_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    tag = "Fixes ENG-123"
+    limit = orchestrator._PR_BODY_MAX_CHARS - len(tag) - 2 - len(orchestrator._PR_BODY_TRUNCATED)
+    # A fixed cut at ``limit`` would leave ``#700``, the epic's own Chainlink id.
+    body = "a" * (limit - 5) + " #7005 " + "z" * 200
+    _, _, patches = _finish_epic_completion(
+        tmp_path, monkeypatch, description=_EPIC_LINEAR, title="Build", body=body,
+    )
+    published = patches[0]["body"]
+    assert len(published) <= orchestrator._PR_BODY_MAX_CHARS
+    assert published.endswith(orchestrator._PR_BODY_TRUNCATED)
+    assert "#700" not in published
+
+
+def test_factory_epic_without_a_tracker_record_is_left_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, calls, _ = _finish_epic_completion(
+        tmp_path, monkeypatch, description=_EPIC_GOAL,
+        title="chainlink-700 : Build", body="Fixes #12\n",
+    )
+    assert result.status == "review_ready"
+    assert not [call for call in calls if call[:2] == ["gh", "api"]]
+
+
+def test_factory_epic_verification_failure_never_edits_the_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mimir_cultivate.worklink.orchestrator import WorklinkError
+
+    _, calls, _ = _finish_epic_completion(
+        tmp_path, monkeypatch, description=_EPIC_LINEAR, title="Build", body="x",
+        verify_error=WorklinkError("GitHub PR head SHA mismatch"),
+    )
+    assert calls == [["verify"]]
+
+
+def _raises(exc: BaseException) -> Callable[[list[str]], subprocess.CompletedProcess]:
+    def respond(args: list[str]) -> subprocess.CompletedProcess:
+        raise exc
+
+    return respond
+
+
+@pytest.mark.parametrize("respond", [
+    lambda args: cp(args, returncode=1, stderr="HTTP 404"),
+    lambda args: cp(args, stdout="not json"),
+    lambda args: cp(args, stdout=json.dumps({"body": "no title"})),
+    lambda args: (
+        cp(args, stdout=json.dumps({"title": "Build", "body": "x"}))
+        if "PATCH" not in args else cp(args, returncode=1, stderr="HTTP 422 body too long")
+    ),
+    _raises(OSError(7, "Argument list too long")),
+    _raises(subprocess.TimeoutExpired(["gh"], 1800)),
+], ids=["read-fails", "read-invalid-json", "read-no-title", "write-fails", "oserror", "timeout"])
+def test_factory_epic_publication_failure_notifies_and_never_wedges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, respond: Any
+) -> None:
+    result, calls, _ = _finish_epic_completion(
+        tmp_path, monkeypatch, description=_EPIC_LINEAR, title="Build", body="x", respond=respond,
+    )
+    assert result.status == "review_ready" and result.review_ready
+    assert ["transition", "review"] in calls
+    assert result.reason is not None and result.reason.startswith(
+        "epic PR publication contract not applied: "
+    )
+    [milestone] = _epic_milestones(tmp_path)
+    assert milestone["kind"] == "factory_publication_degraded"
+    assert milestone["pr_url"] == _EPIC_PR and milestone["notified"] is False
+    assert milestone["delivery_key"] == "worklink-factory_publication_degraded:700:700:1"
+    assert isinstance(milestone["reason"], str) and milestone["reason"]
+
+
 def test_factory_partial_survives_leaf_ledger_boundary_without_clearing_attention(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

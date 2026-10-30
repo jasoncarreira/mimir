@@ -55,7 +55,7 @@ def test_current_repository_skill_release_hash(name):
     version = {
         "github-poller": "2060-requested-comments",
         "review": "2049-review-tests",
-        "tracker-poller": "tracker-poller-initial",
+        "tracker-poller": "2507-epic-publication",
     }.get(name, "0.9.10-2025")
     expected = releases[version][name]["SKILL.md"]
     actual = hashlib.sha256((SKILLS / name / "SKILL.md").read_bytes()).hexdigest()
@@ -92,8 +92,16 @@ def test_current_tracker_poller_release_inventory_is_complete():
     [skill] = [item for item in skills_for_candidates((candidate,))
                if item.name == "tracker-poller"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    assert skill_inventory(skill) == releases["tracker-poller-initial"]["tracker-poller"]
-    assert list(releases)[-1] == "tracker-poller-initial"
+    assert skill_inventory(skill) == releases["2507-epic-publication"]["tracker-poller"]
+
+
+def test_current_chainlink_orchestrator_release_inventory_is_complete():
+    [candidate] = enabled_plugins(enable="cultivate")
+    [skill] = [item for item in skills_for_candidates((candidate,))
+               if item.name == "chainlink-orchestrator"]
+    releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
+    assert skill_inventory(skill) == releases["2507-epic-publication"]["chainlink-orchestrator"]
+    assert list(releases)[-1] == "2507-epic-publication"
 
 
 # The guard scans the shipped defaults, not test fixtures or cache files.

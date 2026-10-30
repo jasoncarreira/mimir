@@ -16,6 +16,7 @@ from typing import Callable, Collection
 from mimir.models import AgentEvent
 from .dispatch_failures import (
     FACTORY_STOP_KINDS,
+    FACTORY_PUBLICATION_DEGRADED,
     FACTORY_TRANSITION_KINDS,
     LEAF_TRANSITION_KINDS,
     STATE_FILE,
@@ -127,7 +128,10 @@ def report_live_delivery_receipts(
                         )
                     else:
                         valid_key = key == f"worklink-{kind}:{issue}:{run}:{attempt}"
-                        valid_fields = True
+                        valid_fields = (
+                            kind != FACTORY_PUBLICATION_DEGRADED
+                            or isinstance(entry.get("reason"), str)
+                        )
                     if (kind not in FACTORY_TRANSITION_KINDS | LEAF_TRANSITION_KINDS
                             or type(issue) is not int
                             or not isinstance(run, str) or not run
