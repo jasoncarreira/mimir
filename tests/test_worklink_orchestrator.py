@@ -5651,6 +5651,8 @@ def _run_factory_preflight_case(
             if args[:5] == ["git", "-C", str(checkout), "config", "--get"]:
                 result = configured_results[args[-1]]
                 return cp(args, result.returncode, result.stdout, result.stderr)
+            if args == ["gh", "api", "repos/owner/repo/pulls/42"]:
+                return cp(args, stdout=json.dumps({"title": "Build", "body": "Done."}))
         return cp(args)
 
     monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
@@ -8157,7 +8159,10 @@ def test_factory_terminal_outcomes_emit_transition_payload(
             compute=object(),
             factory_record=record,
             test_cmd="pytest -q",
-            runner=lambda args: cp(args),
+            runner=lambda args: (
+                cp(args, stdout=json.dumps({"title": "Build", "body": "Done."}))
+                if args == ["gh", "api", "repos/owner/repo/pulls/42"] else cp(args)
+            ),
             started_at=datetime.now(UTC),
         )
     )
@@ -8408,15 +8413,71 @@ def test_factory_epic_pr_truncation_never_cuts_a_number_into_the_issue_id(
     assert "#700" not in published
 
 
-def test_factory_epic_without_a_tracker_record_is_left_untouched(
+def test_factory_epic_without_a_tracker_record_gets_the_leaf_publication_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    result, calls, _ = _finish_epic_completion(
+    result, calls, patches = _finish_epic_completion(
         tmp_path, monkeypatch, description=_EPIC_GOAL,
-        title="chainlink-700 : Build", body="Fixes #12\n",
+        title="chainlink-700 : Build for chainlink 700 and #700",
+        body="chainlink-700 :\n\n## Summary\n\nchainlink 700 and #700. Fixes #12.\n",
     )
-    assert result.status == "review_ready"
-    assert not [call for call in calls if call[:2] == ["gh", "api"]]
+    assert result.status == "review_ready" and result.reason is None
+    assert patches == [{
+        "title": "Build for  and the source issue",
+        "body": "## Summary\n\n and the source issue. Refs #12.",
+    }]
+    order = [call[0] if call[0] != "gh" else " ".join(call[:4]) for call in calls]
+    assert order.index("verify") < order.index("gh api -X PATCH") < order.index("transition")
+    assert _epic_milestones(tmp_path) == []
+
+
+@pytest.mark.parametrize("crlf", [False, True])
+def test_factory_epic_without_a_tracker_record_is_a_fixed_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crlf: bool
+) -> None:
+    _, _, patches = _finish_epic_completion(
+        tmp_path / "first", monkeypatch, description=_EPIC_GOAL,
+        title="chainlink-700 : Build", body="chainlink-700 :\n\nFixes #12\n\nDone.\n",
+    )
+    published = patches[0]
+    body = published["body"].replace("\n", "\r\n") + "\r\n" if crlf else published["body"]
+    result, calls, again = _finish_epic_completion(
+        tmp_path / "second", monkeypatch, description=_EPIC_GOAL,
+        title=published["title"], body=body,
+    )
+    assert result.status == "review_ready" and result.reason is None
+    assert again == [] and not [call for call in calls if call[:4] == ["gh", "api", "-X", "PATCH"]]
+
+
+def test_factory_epic_without_a_tracker_record_already_clean_makes_no_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, calls, patches = _finish_epic_completion(
+        tmp_path, monkeypatch, description=_EPIC_GOAL,
+        title="Build", body="## Summary\n\nRefs #12 and the source issue.",
+    )
+    assert result.status == "review_ready" and result.reason is None
+    assert ["gh", "api", "repos/owner/repo/pulls/42"] in calls
+    assert patches == [] and not [call for call in calls if call[:4] == ["gh", "api", "-X", "PATCH"]]
+
+
+@pytest.mark.parametrize("description", [_EPIC_LINEAR, _EPIC_GOAL])
+def test_factory_epic_pr_truncation_is_safe_with_or_without_a_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, description: str
+) -> None:
+    import mimir_cultivate.worklink.orchestrator as orchestrator
+
+    tag = "Fixes ENG-123\n\n" if description == _EPIC_LINEAR else ""
+    limit = orchestrator._PR_BODY_MAX_CHARS - len(tag) - len(orchestrator._PR_BODY_TRUNCATED)
+    body = "a" * (limit - 5) + " #7005 " + "z" * 200
+    _, calls, patches = _finish_epic_completion(
+        tmp_path, monkeypatch, description=description, title="Build", body=body,
+    )
+    published = patches[0]["body"]
+    assert len(published) <= orchestrator._PR_BODY_MAX_CHARS
+    assert published.startswith(tag) and published.endswith(orchestrator._PR_BODY_TRUNCATED)
+    assert "#700" not in published
+    assert all(len(arg) < 4096 for call in calls for arg in call)
 
 
 def test_factory_epic_verification_failure_never_edits_the_pr(
@@ -8443,17 +8504,19 @@ def _raises(exc: BaseException) -> Callable[[list[str]], subprocess.CompletedPro
     lambda args: cp(args, stdout="not json"),
     lambda args: cp(args, stdout=json.dumps({"body": "no title"})),
     lambda args: (
-        cp(args, stdout=json.dumps({"title": "Build", "body": "x"}))
+        cp(args, stdout=json.dumps({"title": "chainlink-700 : Build", "body": "x"}))
         if "PATCH" not in args else cp(args, returncode=1, stderr="HTTP 422 body too long")
     ),
     _raises(OSError(7, "Argument list too long")),
     _raises(subprocess.TimeoutExpired(["gh"], 1800)),
 ], ids=["read-fails", "read-invalid-json", "read-no-title", "write-fails", "oserror", "timeout"])
+@pytest.mark.parametrize("description", [_EPIC_LINEAR, _EPIC_GOAL])
 def test_factory_epic_publication_failure_notifies_and_never_wedges(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, respond: Any
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, respond: Any, description: str
 ) -> None:
     result, calls, _ = _finish_epic_completion(
-        tmp_path, monkeypatch, description=_EPIC_LINEAR, title="Build", body="x", respond=respond,
+        tmp_path, monkeypatch, description=description, title="chainlink-700 : Build", body="x",
+        respond=respond,
     )
     assert result.status == "review_ready" and result.review_ready
     assert ["transition", "review"] in calls
