@@ -330,6 +330,10 @@ _HOST_ONLY_ENV = frozenset(
         "MIMIR_GITHUB_TRUSTED_BOT_LOGINS",
         "MIMIR_FILE_TOOL_ROOTS",
         "OPENCODE_CONFIG",
+        "LINEAR_API_KEY",
+        "JIRA_SITE",
+        "JIRA_EMAIL",
+        "JIRA_API_TOKEN",
         "PYTEST_ADDOPTS",
     }
 )

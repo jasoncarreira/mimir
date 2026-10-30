@@ -1,0 +1,4 @@
+{
+  "source": "Jira Cloud platform REST API v3, Issues: GET/POST /rest/api/3/issue/{issueIdOrKey}/transitions; GET issue (fields=status) (no merged state configured: no requests)",
+  "exchanges": []
+}

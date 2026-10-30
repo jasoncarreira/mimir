@@ -57,12 +57,17 @@ def test_workspace_metadata_and_manifest() -> None:
         "defaults/skills/chainlink-orchestrator", "defaults/skills/worklink-tool-pins",
     }
     optional = manifest["optional"]["skills"]
-    assert len(optional) == 4
+    assert len(optional) == 5
     assert {entry["path"] for entry in optional} == {
         f"defaults/skills/{name}"
-        for name in ("github-poller", "github-ci-watch", "github", "review")
+        for name in ("github-poller", "github-ci-watch", "github", "review", "tracker-poller")
     }
-    assert all(set(entry) == {"path", "forge"} and entry["forge"] == "github" for entry in optional)
+    by_name = {Path(entry["path"]).name: entry for entry in optional}
+    assert set(by_name["tracker-poller"]) == {"path"}
+    assert all(
+        set(entry) == {"path", "forge"} and entry["forge"] == "github"
+        for name, entry in by_name.items() if name != "tracker-poller"
+    )
     assert (PLUGIN / "brand/LICENSE").read_bytes() == (ROOT / "brand/LICENSE").read_bytes()
 
 
@@ -87,7 +92,7 @@ def test_built_distribution_boundaries(built_packages: dict[str, Path]) -> None:
                     assert archive.read(packaged) == (PLUGIN / source).read_bytes()
                 assert "mimir_cultivate/registration.py" in members
                 for skill in ("github-poller", "github-ci-watch", "chainlink-orchestrator",
-                              "worklink-tool-pins", "github", "review"):
+                              "worklink-tool-pins", "github", "review", "tracker-poller"):
                     resource = f"mimir_cultivate/defaults/skills/{skill}/SKILL.md"
                     assert archive.read(resource) == (
                         PLUGIN / resource
@@ -119,6 +124,7 @@ def test_selected_provider_registers_its_coding_resources() -> None:
     from mimir.plugins.manager import load_plugins
     from mimir.plugins.core import core_policy_registry, core_runtime_names
     from mimir_cultivate.forge import FORGE_TOOLS
+    from mimir_cultivate.policy import TRACKER_TOOL_NAMES
     from mimir_cultivate.repository import REPO_TOOLS
 
     manager = load_plugins(enable="cultivate")
@@ -132,9 +138,11 @@ def test_selected_provider_registers_its_coding_resources() -> None:
         core_runtime_names("coding")
     coding = {"spawn_open_code", "worklink_run", "worklink_resume"} | repository | forge
     assert len(coding) == 40
-    assert {name for name, tool in manager.policy.tools.items() if tool.owner == "cultivate"} == coding
-    assert coding.isdisjoint(core_policy_registry().tools)
-    assert all(manager.policy.tools[name].factory is not None for name in coding)
+    owned = coding | TRACKER_TOOL_NAMES
+    assert len(TRACKER_TOOL_NAMES) == 3
+    assert {name for name, tool in manager.policy.tools.items() if tool.owner == "cultivate"} == owned
+    assert owned.isdisjoint(core_policy_registry().tools)
+    assert all(manager.policy.tools[name].factory is not None for name in owned)
 
 
 @pytest.mark.asyncio

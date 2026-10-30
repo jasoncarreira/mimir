@@ -148,6 +148,27 @@ def test_build_dashboard_payload_includes_agent_feedback_signals(tmp_path: Path)
     assert "Positive (last 24h):" in signals["block"]
 
 
+def test_dashboard_lists_tracker_notice_without_title(tmp_path: Path):
+    log = tmp_path / "events.jsonl"
+    _write_events(log, [
+        {
+            "timestamp": _ts(0.1), "type": "tracker_issue_withheld",
+            "adapter": "github_issues", "ref": "acme/widget#7",
+            "url": "https://github.com/acme/widget/issues/7",
+            "reason": "untrusted_latest_activity", "title": "LEAKED-TITLE",
+        },
+    ])
+
+    block = build_dashboard_payload(log, days=1)["algedonic_signals"]["block"]
+
+    assert "Owner-only tracker issue notices:" in block
+    assert (
+        "- github_issues acme/widget#7 (untrusted_latest_activity) "
+        "https://github.com/acme/widget/issues/7"
+    ) in block
+    assert "LEAKED-TITLE" not in block
+
+
 def test_build_dashboard_payload_respects_cutoff(tmp_path: Path):
     """Events older than the cutoff are dropped. File ordering is
     chronological (oldest first) per production reality verified by

@@ -2947,6 +2947,36 @@ async def test_fire_poller_passes_scheduler_home_to_run_poller(
 
 
 @pytest.mark.asyncio
+async def test_fire_poller_passes_operator_live_notice_to_run_poller(
+    tmp_path: Path, monkeypatch,
+):
+    async def noop(_e):
+        return True
+
+    async def live(_live: str, _free: str) -> None:
+        return None
+
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, home=tmp_path / "h",
+        operator_live_notice=live,
+    )
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)
+
+    captured = {}
+
+    async def fake_run_poller(poller, enqueue, home=None, timeout=None, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("mimir.scheduler.run_poller", fake_run_poller)
+
+    await sched._fire_poller(poller_name="p1")
+
+    assert captured == {"operator_live_notice": live}
+
+
+@pytest.mark.asyncio
 async def test_fire_poller_resheds_after_acquiring_semaphore(
     tmp_path: Path, monkeypatch,
 ):

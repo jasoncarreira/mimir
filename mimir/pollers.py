@@ -118,11 +118,29 @@ from .models import AgentEvent, InformationFlowLabels, SourceLabel
 from .redaction import redact_text
 from . import poller_recovery
 from .poller_hooks import (
+    ItemAttestation,
     PollerHooks,
     github_recovery_relevance_check as _github_recovery_relevance_check,
     reserved_hook_profile_for_name,
     reserved_skill_for_name,
     resolve_poller_hooks,
+)
+from .poller_tracker import (
+    LIFECYCLE_EVENTS,
+    NOTICE_REASONS,
+    TRACKER_EXTRA_KEYS,
+    TRACKER_KINDS,
+    TRACKER_SIGNALS,
+    TRACKER_STDERR_CODE_RE,
+    WITHHELD_REASONS,
+    safe_actor,
+    safe_adapter,
+    safe_delivery_key,
+    safe_event_id,
+    safe_ref,
+    safe_url,
+    transition_line,
+    withheld_lines,
 )
 from .poller_budget import (
     PollerBudgetConfig,
@@ -177,6 +195,8 @@ POLLER_TIMEOUT_SECONDS = 120
 # "a later event re-resolves", bounded so a same-author batch cannot turn an
 # unresolved attestation into O(items) network calls in an unbounded loop.
 GITHUB_TRUST_ATTEMPTS_PER_FIRE = 2
+TRACKER_ATTESTATIONS_PER_FIRE = 10
+TRACKER_ATTESTATION_SECONDS_PER_FIRE = 60.0
 # Shared phase-3 network budget, including actor lookup and both trust endpoints.
 # 6 x 10s = 60s nominal attestation wait, chosen to avoid multi-minute slot
 # starvation. This is not a hard wall-clock deadline: urlopen's timeout bounds
@@ -218,7 +238,7 @@ POLLER_REJECTION_PREVIEW_CHARS = 200
 # heavy publish hours) opt into ``batch_size > 1`` to coalesce items
 # into fewer turns.
 POLLER_BATCH_SIZE_DEFAULT = 1
-_POLLER_TRUST_SOURCES = frozenset({"external", "github", "trusted_system"})
+_POLLER_TRUST_SOURCES = frozenset({"external", "github", "trusted_system", "tracker"})
 _GITHUB_ACTOR_EVENT_TYPES = {
     "issue_opened": "issue author",
     "pr_opened": "pull request author",
@@ -384,13 +404,14 @@ _NON_SECRET_FORWARDED_ENV_KEYS = frozenset({
     "MIMIR_PLUGINS",
     "MIMIR_GITHUB_PRELOAD_REVIEW_SKILL",
     "MIMIR_GITHUB_REVIEW_SKILL_PATH",
+    "JIRA_SITE",
 })
 """Forwarded configuration values that poller payload redaction must preserve.
 
 The GitHub login is identity used by authorization and review reconciliation;
 the two home/source values are filesystem locations; the repository values are
-public repository selectors; plugin selection; and the remaining values are
-feature flags or a review-skill path. None is a credential. This is deliberately closed: every
+public repository selectors; plugin selection; the Jira site host is a public
+tenant selector; and the remaining values are feature flags or a review-skill path. None is a credential. This is deliberately closed: every
 other value forwarded through ``pass_env`` or manifest ``env`` remains redacted.
 """
 
@@ -894,6 +915,105 @@ def _github_framework_trigger_is_trusted(
         and extras.get("base_sha") == base.get("sha")
         and extras.get("url") == pull_request.get("html_url")
     )
+
+
+@dataclass
+class _TrackerAttestationBudget:
+    """Attestor calls and wall-clock seconds one fire may spend on tracker items."""
+
+    calls: int
+    seconds: float
+
+
+def _validated_tracker_extras(extras: dict[str, Any]) -> dict[str, Any] | None:
+    """Reduce an item's extras to the attestable keys, or None when any is invalid."""
+    reduced = {key: extras[key] for key in TRACKER_EXTRA_KEYS if key in extras}
+    adapter = safe_adapter(reduced.get("adapter"))
+    ref = safe_ref(reduced.get("ref"))
+    if (
+        adapter is None
+        or ref is None
+        or safe_url(reduced.get("url"), ref) is None
+        or safe_delivery_key(reduced.get("delivery_key")) is None
+        or reduced.get("kind") not in TRACKER_KINDS
+        or ("attested_event_id" in reduced
+            and safe_event_id(reduced["attested_event_id"]) is None)
+    ):
+        return None
+    return reduced
+
+
+async def _attest_tracker_batch(
+    poller: PollerConfig,
+    batch: list[dict[str, Any]],
+    env: dict[str, str],
+    *,
+    redact: Callable[[str], str],
+    attest_in_fire: Callable[..., Any],
+    budget: _TrackerAttestationBudget,
+) -> list[dict[str, Any]]:
+    """Return ``batch`` only when the server-side attestor vouches for its one item.
+
+    Poller-written extras are never authority: they are reduced to the allowlisted
+    keys, validated, and replaced by the attestor's verdict. Anything else is
+    dropped with a log naming validated identifiers only; the poller re-emits it.
+    """
+    item = batch[0] if batch else {"extras": {}}
+    adapter = safe_adapter(item["extras"].get("adapter"))
+    ref = safe_ref(item["extras"].get("ref"))
+
+    async def withhold(reason: str) -> list[dict[str, Any]]:
+        await log_event(
+            "poller_item_withheld",
+            poller=poller.name, adapter=adapter, ref=ref, reason=reason,
+        )
+        return []
+
+    if len(batch) != 1 or item.get("batch_context") is not None:
+        return await withhold("invalid_item")
+    extras = _validated_tracker_extras(item["extras"])
+    if extras is None:
+        return await withhold("invalid_item")
+    attestor = poller.hooks.trust_attestor if poller.hooks is not None else None
+    attestation: ItemAttestation | None = None
+    if attestor is not None and budget.calls > 0 and budget.seconds > 0:
+        budget.calls -= 1
+        started = time.monotonic()
+        try:
+            attestation = await asyncio.wait_for(
+                run_in_pool(_ATTESTATION_POOL, attest_in_fire, attestor, dict(extras), env),
+                timeout=budget.seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - attestation fails closed
+            log.warning("poller %r: tracker attestation failed (%s)", poller.name,
+                        type(exc).__name__)
+        budget.seconds -= time.monotonic() - started
+    reason: str | None = None
+    actor: str | None = None
+    try:
+        if attestation is None or attestation.trusted is None:
+            reason = "attestation_unavailable"
+        elif attestation.trusted is not True:
+            reason = "attestation_refused"
+        elif (
+            attestation.prompt is None
+            or redact(attestation.prompt.strip()) != item["prompt"]
+        ):
+            reason = "prompt_mismatch"
+        else:
+            actor = safe_actor(attestation.actor)
+    except Exception as exc:  # noqa: BLE001 - a malformed verdict fails closed
+        log.warning("poller %r: tracker attestation malformed (%s)", poller.name,
+                    type(exc).__name__)
+        reason = "attestation_refused"
+    if reason is not None:
+        return await withhold(reason)
+    item["extras"] = extras | {
+        "actor": actor or None,
+        "author_is_trusted": True,
+        "tracker_attested": True,
+    }
+    return batch
 
 
 def _drop_superseded_github_framework_items(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2469,6 +2589,16 @@ def discover_pollers(
                         f"trust_source {raw_trust_source!r} is invalid; using 'external'",
                     ))
                 trust_source = "external"
+            if trust_source == "tracker" and (
+                hooks is None or hooks.trust_attestor is None or batch_size != 1
+            ):
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        pollers_file,
+                        name,
+                        "trust_source 'tracker' requires a trust-attestor hooks "
+                        "profile and batch_size 1; items fail closed",
+                    ))
             seen_names[name] = pollers_file
             if state_root is not None:
                 home = state_root.parent.parent
@@ -2646,6 +2776,7 @@ async def run_poller(
     timeout: float = POLLER_TIMEOUT_SECONDS,
     home: Path | None = None,
     operator_notice: Callable[[str], Awaitable[None]] | None = None,
+    operator_live_notice: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> int:
     """Run one poller subprocess; parse its stdout JSONL; enqueue
     each emitted event. Returns the count of events successfully
@@ -2892,6 +3023,11 @@ async def run_poller(
                 trust_source=poller.trust_source,
                 github_token=env.get("GITHUB_TOKEN", ""),
                 github_self_login=env.get("MIMIR_GITHUB_SELF_LOGIN", ""),
+                trust_attestor=poller.hooks.trust_attestor if poller.hooks else None,
+                attestor_env=env,
+                attestation_redact=lambda text: _redact_poller_env_values(
+                    text, env, explicit_env_redact_keys,
+                ),
                 recover_failed_turns=poller.recover_failed_turns,
                 relevance_check=relevance_check,
             )
@@ -2965,6 +3101,11 @@ async def run_poller(
             or len(delivery_key) > 512
             or delivery_key in delivery_barriers_accepted
         ):
+            return
+        # Tracker output never takes the mid-run path: the post-exit path
+        # rewrites tracker signals to fixed fields, and an early write here
+        # would persist the raw payload.
+        if poller.trust_source == "tracker" or signal_name.strip() in TRACKER_SIGNALS:
             return
         payload = {
             k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
@@ -3151,7 +3292,13 @@ async def run_poller(
                 pass
 
     stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-    if stderr_text:
+    tracker_non_code_lines: int | None = None
+    if stderr_text and poller.trust_source == "tracker":
+        stderr_lines = [ln.strip() for ln in stderr_text.splitlines() if ln.strip()]
+        code_lines = [ln for ln in stderr_lines if TRACKER_STDERR_CODE_RE.fullmatch(ln)]
+        tracker_non_code_lines = len(stderr_lines) - len(code_lines)
+        stderr_text = "\n".join(code_lines)
+    if stderr_text or tracker_non_code_lines:
         # Include the subprocess exit code so downstream readers can
         # distinguish diagnostic progress noise (exit_code=0, e.g. ``gh``
         # writing auth progress to stderr on a successful run) from actual
@@ -3167,6 +3314,10 @@ async def run_poller(
                 explicit_env_redact_keys,
             ))[:POLLER_STDERR_LOG_CHARS],
             exit_code=proc.returncode if proc is not None else None,
+            **(
+                {"non_code_lines": tracker_non_code_lines}
+                if tracker_non_code_lines is not None else {}
+            ),
         )
 
     if not timed_out and (proc is None or proc.returncode != 0):
@@ -3216,6 +3367,7 @@ async def run_poller(
         per_item_cap = None
     signals_emitted = len(delivery_barriers_accepted)
     outsider_notices: list[str] = []
+    tracker_live_notices: list[tuple[str, str]] = []
     for line in stdout_text.splitlines():
         line = line.strip()
         if not line:
@@ -3223,6 +3375,11 @@ async def run_poller(
         try:
             parsed = json.loads(line)
         except json.JSONDecodeError:
+            if poller.trust_source == "tracker":
+                await log_event(
+                    "poller_invalid_line", poller=poller.name, chars=len(line),
+                )
+                continue
             await log_event(
                 "poller_invalid_line",
                 poller=poller.name,
@@ -3268,6 +3425,17 @@ async def run_poller(
         signal_type = parsed.get("signal")
         if isinstance(signal_type, str) and signal_type.strip():
             signal_name = signal_type.strip()
+            if (
+                poller.trust_source == "tracker"
+                and signal_name not in TRACKER_SIGNALS
+                and signal_name != "poller_usage"
+            ):
+                await log_event(
+                    "poller_signal_refused",
+                    poller=poller.name,
+                    signal=signal_name if re.fullmatch(r"[a-z_]{1,64}", signal_name) else "invalid",
+                )
+                continue
             if signal_name == "poller_usage":
                 payload, invalid_reason = validate_poller_usage_signal(
                     parsed,
@@ -3285,6 +3453,11 @@ async def run_poller(
                     if isinstance(v, str) else v
                     for k, v in payload.items()
                 }
+                if poller.trust_source == "tracker" and not (
+                    isinstance(payload.get("source"), str)
+                    and TRACKER_STDERR_CODE_RE.fullmatch(payload["source"])
+                ):
+                    payload.pop("source", None)
             else:
                 payload = {
                     k: _redact_poller_env_values(v, env, explicit_env_redact_keys)
@@ -3294,6 +3467,44 @@ async def run_poller(
                         "signal", "poller", "prompt", "event_type", "delivery_barrier",
                     )
                 }
+            tracker_title: str | None = None
+            tracker_fields: dict[str, str | None] | None = None
+            if signal_name in TRACKER_SIGNALS:
+                tracker_adapter = safe_adapter(payload.get("adapter"))
+                tracker_ref = safe_ref(payload.get("ref"))
+                tracker_url = safe_url(payload.get("url"), tracker_ref)
+                raw_reason = payload.get("reason")
+                if signal_name == "tracker_issue_withheld":
+                    raw_title = payload.get("title")
+                    tracker_title = raw_title if isinstance(raw_title, str) else None
+                    payload = {
+                        "adapter": tracker_adapter,
+                        "ref": tracker_ref,
+                        "url": tracker_url,
+                        "reason": (
+                            raw_reason
+                            if isinstance(raw_reason, str) and raw_reason in WITHHELD_REASONS
+                            else "withheld"
+                        ),
+                    }
+                else:
+                    lifecycle = payload.get("lifecycle_event")
+                    payload = {
+                        "adapter": tracker_adapter,
+                        "ref": tracker_ref,
+                        "url": tracker_url,
+                        "lifecycle_event": (
+                            lifecycle
+                            if isinstance(lifecycle, str) and lifecycle in LIFECYCLE_EVENTS
+                            else None
+                        ),
+                        "reason": (
+                            raw_reason
+                            if isinstance(raw_reason, str) and raw_reason in NOTICE_REASONS
+                            else "failed"
+                        ),
+                    }
+                tracker_fields = payload
             if signal_name in {
                 "github_outsider_issue_withheld",
                 "pr_auto_review_skipped_untrusted_author",
@@ -3330,6 +3541,26 @@ async def run_poller(
                     _write_delivery_receipt, persist_dir, parsed.get("delivery_key"),
                 )
                 signals_emitted += 1
+                if (
+                    tracker_fields is not None
+                    and poller.trust_source == "tracker"
+                    and tracker_fields["adapter"]
+                    and tracker_fields["ref"]
+                    and tracker_fields["url"]
+                ):
+                    if signal_name == "tracker_issue_withheld":
+                        tracker_live_notices.append(withheld_lines(
+                            tracker_fields["adapter"], tracker_fields["ref"],
+                            tracker_fields["url"], tracker_fields["reason"],
+                            tracker_title,
+                        ))
+                    else:
+                        outsider_notices.append(transition_line(
+                            tracker_fields["adapter"], tracker_fields["ref"],
+                            tracker_fields["url"],
+                            tracker_fields["lifecycle_event"] or "unknown",
+                            tracker_fields["reason"],
+                        ))
                 if poller.name in {"github-activity", "github-ci-watch"} and signal_name in {
                     "github_outsider_issue_withheld",
                     "pr_auto_review_skipped_untrusted_author",
@@ -3456,7 +3687,23 @@ async def run_poller(
     # One immutable principal serves every batch of this fire.
     authority = poller.resolved_authority()
     service_principal = f"service:{authority.canonical}"
+    tracker_budget = _TrackerAttestationBudget(
+        TRACKER_ATTESTATIONS_PER_FIRE, TRACKER_ATTESTATION_SECONDS_PER_FIRE,
+    )
     for batch_idx, batch in enumerate(batches):
+        if poller.trust_source == "tracker":
+            batch = await _attest_tracker_batch(
+                poller,
+                batch,
+                env,
+                redact=lambda text: _redact_poller_env_values(
+                    text, env, explicit_env_redact_keys,
+                ),
+                attest_in_fire=attest_in_fire,
+                budget=tracker_budget,
+            )
+            if not batch:
+                continue
         if poller.name == "github-activity":
             batch = _drop_superseded_github_framework_items(batch)
             if not batch:
@@ -3495,6 +3742,8 @@ async def run_poller(
         for item in batch:
             item_extras = item["extras"]
             trusted = poller.trust_source == "trusted_system"
+            if poller.trust_source == "tracker":
+                trusted = item_extras.get("tracker_attested") is True
             if poller.trust_source == "github":
                 repo = item_extras.get("repo")
                 event_type = item_extras.get("event_type")
@@ -3618,16 +3867,24 @@ async def run_poller(
             # it so the events_emitted vs events_rejected gap on
             # poller_complete is grep-able. Truncated preview keeps
             # events.jsonl small for chatty pollers.
-            await log_event(
-                "poller_event_rejected",
-                poller=poller.name,
-                prompt_preview=_redact_poller_env_values(
-                    content,
-                    env,
-                    explicit_env_redact_keys,
-                )[:POLLER_REJECTION_PREVIEW_CHARS],
-                batch_index=batch_idx,
-            )
+            if poller.trust_source == "tracker":
+                await log_event(
+                    "poller_event_rejected",
+                    poller=poller.name,
+                    prompt_chars=len(content),
+                    batch_index=batch_idx,
+                )
+            else:
+                await log_event(
+                    "poller_event_rejected",
+                    poller=poller.name,
+                    prompt_preview=_redact_poller_env_values(
+                        content,
+                        env,
+                        explicit_env_redact_keys,
+                    )[:POLLER_REJECTION_PREVIEW_CHARS],
+                    batch_index=batch_idx,
+                )
 
     # ``events_emitted`` counts AgentEvents enqueued (= batches that
     # the dispatcher accepted). Pre-batching it counted parsed JSONL
@@ -3638,6 +3895,19 @@ async def run_poller(
     # Operator queries reading ``events_emitted`` for "how many items
     # came in?" should switch to ``items_collected``; queries asking
     # "how many turns will this fire?" stay on ``events_emitted``.
+    if tracker_live_notices and not timed_out:
+        if operator_live_notice is not None:
+            try:
+                await operator_live_notice(
+                    "\n".join(live for live, _ in tracker_live_notices),
+                    "\n".join(free for _, free in tracker_live_notices),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "poller tracker live notice delivery failed (%s)", type(exc).__name__,
+                )
+        else:
+            outsider_notices.extend(free for _, free in tracker_live_notices)
     if outsider_notices and operator_notice is not None and not timed_out:
         try:
             await operator_notice("\n".join(outsider_notices))

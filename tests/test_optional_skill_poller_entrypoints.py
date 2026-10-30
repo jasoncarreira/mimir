@@ -52,6 +52,7 @@ _CULTIVATE_SKILLS = _ROOT / "plugins/cultivate/mimir_cultivate/defaults/skills"
 _IMPORT_REPAIR_POLLERS = (
     _CULTIVATE_SKILLS / "chainlink-orchestrator" / "scripts" / "poller.py",
     _CULTIVATE_SKILLS / "github-poller" / "scripts" / "poller.py",
+    _CULTIVATE_SKILLS / "tracker-poller" / "scripts" / "poller.py",
 )
 
 

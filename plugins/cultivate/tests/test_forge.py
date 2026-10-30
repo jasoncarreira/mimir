@@ -635,3 +635,36 @@ def test_unsupported_operation_escalates_once_and_persists(tmp_path, monkeypatch
     with pytest.raises(ToolPolicyRefusal, match="outside this turn's scope"):
         forge.unsupported_operation.func(**{**arguments, "pull_request": 18})
     assert len(events) == 1
+
+
+def test_pr_spec_strips_external_record(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    evidence = tmp_path / "state" / "worklink" / "evidence"
+    evidence.mkdir(parents=True)
+    (evidence / "1949-run.json").write_text(json.dumps({
+        "pr_url": "https://github.com/owner/repo/pull/17",
+    }), encoding="utf-8")
+    plain = "Goal: x\n\nAcceptance criteria:\n- [ ] y"
+
+    def spec(description: str):
+        payload = {
+            "id": 1949, "title": "Build safely", "status": "open",
+            "labels": ["worklink:armed"], "description": description,
+        }
+
+        def show_issue(args, *, cwd, stdout, **kwargs):
+            stdout.write(json.dumps(payload).encode())
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(forge.subprocess, "run", show_issue)
+        return forge.pr_spec.func("owner/repo", 17, runtime=_runtime())
+
+    record = "External: linear:ENG-1 https://linear.app/a/issue/ENG-1"
+    stripped = spec(f"{plain}\n\n{record}")
+    assert "External:" not in stripped["description"]
+    assert stripped == {
+        "id": 1949, "title": "Build safely", "status": "open",
+        "labels": ["worklink:armed"], "description": plain,
+    }
+    assert spec(plain)["description"] == plain

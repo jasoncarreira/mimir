@@ -342,6 +342,62 @@ def test_selected_ci_ingress_checks_exact_server_issued_target(
         object.__setattr__(auth, "plugin_slots", original_slots)
 
 
+@pytest.mark.parametrize("enforce", [False, True])
+def test_selected_tracker_ingress_binds_the_attested_issue(
+    tmp_path, monkeypatch, enforce: bool,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    selected = load_plugins(enable="cultivate").policy
+    target = ("jira", "PROJ-45", "https://example.atlassian.net/browse/PROJ-45")
+    with policy_scope(selected):
+        service = build_trigger_service_principal(
+            canonical="poller:tracker-poller", trigger="poller", profile="github",
+            tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+            capabilities=tuple(sorted(policy.TRACKER_TOOL_NAMES)), creation_path="test",
+            policy=selected, poller_owner="cultivate",
+        )
+        event = models.AgentEvent(
+            trigger="poller", source="poller", channel_id=service.canonical,
+            service_principal=service.canonical, service_authority=service,
+            extra={"poller_name": "tracker-poller", "items": [
+                {"adapter": target[0], "ref": target[1], "url": target[2],
+                 "tracker_attested": True},
+            ]},
+        )
+        clean = models.InformationFlowLabels()
+        auth = create_auth_context(event, policy=selected, enforce=enforce, ifc_labels=clean)
+        assert auth.plugin_state("cultivate").tracker_issue_targets == frozenset({target})
+        registry = ToolRegistry()
+
+        def check(context, external_ref, tool="tracker_comment"):
+            return registry.authorize_tool(
+                tool, context, enforce=enforce,
+                arguments={"external_ref": external_ref, "body": "hi", "state": "Done",
+                           "description": "d"},
+            )
+
+        for tool in sorted(policy.TRACKER_TOOL_NAMES):
+            assert check(auth, "jira:PROJ-45", tool).allowed, tool
+            assert not check(auth, "jira:PROJ-45", tool).would_block, tool
+            assert check(auth, "jira:PROJ-46", tool).would_block, tool
+        refused = create_auth_context(
+            event, policy=selected, enforce=enforce, ifc_labels=clean, event_ingress="http_event",
+        )
+        assert refused.plugin_state("cultivate") is None or (
+            refused.plugin_state("cultivate").tracker_issue_targets == frozenset()
+        )
+        assert check(refused, "jira:PROJ-45").would_block
+
+        empty = create_auth_context(
+            replace(event, extra={"poller_name": "tracker-poller", "items": []}),
+            policy=selected, enforce=enforce, ifc_labels=clean,
+        )
+        object.__setattr__(empty, "plugin_slots", (
+            ("cultivate", policy.CultivateState(tracker_issue_targets=frozenset({target}))),
+        ))
+        assert check(empty, "jira:PROJ-45").would_block
+
+
 @pytest.mark.asyncio
 async def test_selected_retained_ingress_and_ifc_reader(tmp_path, monkeypatch) -> None:
     with policy_scope(load_plugins(enable="cultivate").policy):

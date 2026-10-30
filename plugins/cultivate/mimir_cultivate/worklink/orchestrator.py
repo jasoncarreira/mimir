@@ -106,6 +106,15 @@ from .factory_state import (
     save_factory_record,
 )
 from .detached_dispatch import FactoryRecoveryIdentity
+from ..tracker.lifecycle import request_transition
+from ..tracker.record import (
+    ExternalRecord,
+    ExternalRecordError,
+    parse_external_record,
+    strip_external_record,
+    tagging_line,
+    title_prefix,
+)
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 _CLAIM_HEARTBEAT_INTERVAL_S = 60.0
@@ -126,6 +135,59 @@ _EVIDENCE_HEADING_RE = re.compile(r"(?im)^Worklink evidence:\s*$")
 def _public_text(text: str) -> str:
     """Remove internal tracker references before publishing build-authored text."""
     return _INTERNAL_REFERENCE_RE.sub("", text)
+
+
+_SOURCE_ISSUE = "the source issue"
+#: Below this id a bare numeral is not a recognizable reference; scrubbing it
+#: would corrupt ordinary counts in builder prose.
+_BARE_ID_SCRUB_MIN = 1000
+_CLOSING_REFERENCE_RE = re.compile(
+    r"\b(?i:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
+    r"(?=\s*:?\s+(?:(?:[\w.-]+/[\w.-]+)?#\d+|[A-Z][A-Z0-9_]+-\d+\b|https?://))"
+)
+
+
+def _scrub_issue_id(text: str, issue_id: int) -> str:
+    """Replace every recognizable reference to Chainlink issue ``issue_id``."""
+    n = re.escape(str(issue_id))
+    text = re.sub(rf"(?i)\bchainlink\s+issue\s*#?\s*{n}(?!\d)", _SOURCE_ISSUE, text)
+    text = re.sub(rf"(?i)\bissue/{n}-a\d+\b", "the work branch", text)
+    text = re.sub(rf"(?i)\b(?:issue|task|leaf|epic)\s*#?\s*{n}(?!\d)", _SOURCE_ISSUE, text)
+    text = re.sub(rf"(?<![\w/])#\s*{n}(?!\d)", _SOURCE_ISSUE, text)
+    if issue_id >= _BARE_ID_SCRUB_MIN:
+        text = re.sub(rf"(?<![\w.#/-]){n}(?![\w-])", _SOURCE_ISSUE, text)
+    return text
+
+
+def _defang_closing_keywords(text: str) -> str:
+    """Turn ``Fixes #N``-style keywords into ``Refs`` so builder prose cannot close issues."""
+    return _CLOSING_REFERENCE_RE.sub("Refs", text)
+
+
+def _publishable_text(text: str, issue_id: int) -> str:
+    """Scrub runs before defang so ``Fixes #<id>`` cannot survive as ``Refs #<id>``."""
+    return _defang_closing_keywords(_scrub_issue_id(_public_text(text), issue_id))
+
+
+def _tracker_record(issue: "IssueContext") -> ExternalRecord | None:
+    try:
+        return parse_external_record(issue.description)
+    except ExternalRecordError:
+        _log_event("worklink_external_record_invalid", issue_id=issue.issue_id)
+        return None
+
+
+def _request_tracker_transition(home: Path, issue: "IssueContext", event: str) -> None:
+    """Ask the tracker lifecycle to record ``event``; a failure never stops the run."""
+    try:
+        request_transition(home, issue.description, event)
+    except Exception as exc:
+        _log_event(
+            "tracker_transition_request_failed",
+            issue_id=issue.issue_id,
+            event=event,
+            error=type(exc).__name__,
+        )
 #: Seconds the controller waits for the factory to publish its first status.
 #: The window must cover OpenCode's boot, config and plugin loading, one model
 #: round trip, and `factory init`. Measured on chainlink #1783 attempt 4: 74s
@@ -361,7 +423,7 @@ def _autonomous_leaf_block_reason(home: Path, issue_id: int) -> str | None:
 
 def _epic_prompt(issue: "IssueContext") -> str:
     header = f"Build chainlink #{issue.issue_id}: {issue.title}".strip()
-    body = _render_chainlink_text(issue.description.strip())
+    body = _render_chainlink_text(strip_external_record(issue.description).strip())
     base = f"{header}\n\n{body}".strip() if body else header
     return base
 
@@ -713,7 +775,7 @@ def render_work_item(issue: IssueContext) -> str:
     if _WORK_ITEM_RUN_ID_RE.fullmatch(run_id) is None:
         raise WorklinkError(f"chainlink issue {issue.issue_id} produced an invalid run_id")
     return json.dumps(
-        {"run_id": run_id, "title": issue.title, "body": issue.description},
+        {"run_id": run_id, "title": issue.title, "body": strip_external_record(issue.description)},
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -885,7 +947,7 @@ def render_work_order(
     return template.format(
         issue_id=issue.issue_id,
         title=issue.title,
-        description=_render_chainlink_text(issue.description.strip()),
+        description=_render_chainlink_text(strip_external_record(issue.description).strip()),
         labels=", ".join(sorted(issue.labels)) or "(none)",
         parent_id=issue.parent_id if issue.parent_id is not None else "(none)",
         backend=backend_name,
@@ -1153,6 +1215,7 @@ class WorklinkRunner:
             attempt=record.attempt,
             backend=selected_name,
         )
+        _request_tracker_transition(self.home, issue, "build_started")
 
         lease: CheckoutLease | None = None
         publication: ControllerGitPublication | None = None
@@ -1576,7 +1639,7 @@ class WorklinkRunner:
                 attempt=attempt,
             )
         pr_body_section = _read_pr_body_section(lease.path)
-        commit_subject = _read_commit_subject(lease.path, issue.title)
+        commit_subject = _read_commit_subject(lease.path, issue.title, issue_id=issue.issue_id)
         invocation_model = spec.backend_config.get("model")
         executor_failed = raw.exit_code != 0
         # A backend may report failure without the executor process exiting
@@ -1778,6 +1841,7 @@ class WorklinkRunner:
                         ),
                         **({"draft": True} if gate_mode == "ci" else {}),
                     )
+                    _request_tracker_transition(self.home, issue, "pr_opened")
                     validation = _with_pr_url(validation, pr_url)
                     step = "completed evidence"
                     evidence_path = _write_evidence(self.home, validation.evidence)
@@ -2897,6 +2961,7 @@ class WorklinkRunner:
             attempt=claim_record.attempt,
             backend=selected.name,
         )
+        _request_tracker_transition(self.home, issue, "build_started")
         lease: CheckoutLease | None = None
         release_permitted = True
         try:
@@ -4324,6 +4389,7 @@ class WorklinkRunner:
             review_ready=True,
             attempt=claim_record.budget_attempt or claim_record.attempt,
         )
+        _request_tracker_transition(self.home, issue, "pr_opened")
         result = WorklinkRunResult(
             issue.issue_id,
             factory_record.attempt,
@@ -6022,7 +6088,7 @@ def _commit_checkout_changes(
         return runner(["git", "-C", str(checkout), *args])
 
     if subject is None:
-        subject = _read_commit_subject(checkout, issue.title)
+        subject = _read_commit_subject(checkout, issue.title, issue_id=issue.issue_id)
     if attribution is None:
         attribution = _publication_attribution(WorklinkPublication(), "unknown", None)
     unstaged = run_git("reset", "--quiet", "--", _COMMIT_SUBJECT_FILE, _PR_BODY_SECTION_FILE)
@@ -6258,7 +6324,7 @@ def _open_pr(
     draft: bool = False,
 ) -> str:
     if subject is None:
-        subject = _fallback_commit_subject(issue.title)
+        subject = _fallback_commit_subject(issue.title, issue_id=issue.issue_id)
     if attribution is None:
         attribution = _publication_attribution(WorklinkPublication(), evidence.backend, evidence.model)
     gate_run_id = evidence.tests.gate_run_id if evidence.tests else None
@@ -6291,7 +6357,8 @@ def _open_pr(
             )
     # Scrub build-authored prose, not the evidence: commands must be published
     # exactly as executed, even when they mention the tracker or an id form.
-    body = (f"Build summary:\n\n{_public_text(pr_body_section)}\n\n" if pr_body_section else "") + evidence_block
+    section = _publishable_text(pr_body_section, issue.issue_id) if pr_body_section else ""
+    body = (f"Build summary:\n\n{section}\n\n" if section else "") + evidence_block
     body += f"\n{_public_text(attribution[1])}\n"
     command = ["gh", "pr", "create", "--base", base, "--head", branch]
     if draft:
@@ -6299,8 +6366,13 @@ def _open_pr(
     repo_slug = _repo_slug(repo, runner=runner)
     if repo_slug:
         command.extend(["--repo", repo_slug])
+    title = _publishable_text(subject, issue.issue_id).strip()
+    record = _tracker_record(issue)
+    if record is not None:
+        title = title_prefix(record) + title
+        body = f"{tagging_line(record, repo_slug)}\n\n{body}"
     command.extend([
-        "--title", _public_text(subject).strip(),
+        "--title", title,
         "--body", body,
     ])
     result = runner(command)
@@ -6335,17 +6407,19 @@ def _update_ci_pr_body(
         raise WorklinkError("cannot update draft PR CI evidence")
 
 
-def _fallback_commit_subject(title: str) -> str:
+def _fallback_commit_subject(title: str, *, issue_id: int | None = None) -> str:
     clean = _PUBLICATION_REFERENCE_RE.sub("", _public_text(title))
     clean = _HOST_PATH_RE.sub("", clean)
     clean = " ".join(clean.split())
     clean = "".join(char for char in clean if char.isprintable())
+    if issue_id is not None:
+        clean = _publishable_text(clean, issue_id)
     return clean[:72].rstrip() or "Worklink change"
 
 
-def _read_commit_subject(checkout: Path, title: str) -> str:
+def _read_commit_subject(checkout: Path, title: str, *, issue_id: int | None = None) -> str:
     """Consume a bounded, regular, untrusted build-supplied subject."""
-    fallback = _fallback_commit_subject(title)
+    fallback = _fallback_commit_subject(title, issue_id=issue_id)
     path = checkout / _COMMIT_SUBJECT_FILE
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
@@ -6374,7 +6448,10 @@ def _read_commit_subject(checkout: Path, title: str) -> str:
         or subject != subject.strip()
     ):
         return fallback
-    return _public_text(subject).strip() or fallback
+    clean = _public_text(subject).strip()
+    if issue_id is not None:
+        clean = _publishable_text(clean, issue_id)[:72].rstrip()
+    return clean or fallback
 
 
 def _publication_attribution(

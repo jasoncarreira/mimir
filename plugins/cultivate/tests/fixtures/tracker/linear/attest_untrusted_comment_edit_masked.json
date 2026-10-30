@@ -1,0 +1,161 @@
+{
+  "source": "Linear GraphQL API reference https://linear.app/developers/graphql and schema https://studio.apollographql.com/public/Linear-API/variant/current/schema/reference: Query.issue(id:), Issue.id/identifier/url/title/description/createdAt/creator/delegate/state.type/team.key, Issue.history(IssueHistoryConnection) with IssueHistory.id/createdAt/actor/toDelegate/fromTitle/toTitle/updatedDescription, Issue.comments with Comment.id/createdAt/editedAt/body/user, Connection.pageInfo.hasNextPage plus Query.user(id:) with User.id/active/guest/app (an untrusted comment created before the cutoff and edited after it, then a trusted description edit)",
+  "exchanges": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.linear.app/graphql",
+        "json": {
+          "query": "query Viewer { viewer { id } }",
+          "variables": {}
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "data": {
+            "viewer": {
+              "id": "usr-bot"
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.linear.app/graphql",
+        "json": {
+          "query": "query ReadIssue($id: String!) { issue(id: $id) { id identifier url title description createdAt creator { id } delegate { id } state { type } team { key } history(first: 100) { pageInfo { hasNextPage } nodes { id createdAt actor { id } toDelegate { id } fromTitle toTitle updatedDescription } } comments(first: 100) { pageInfo { hasNextPage } nodes { id createdAt editedAt body user { id } } } } }",
+          "variables": {
+            "id": "ENG-123"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "data": {
+            "issue": {
+              "id": "iss-123",
+              "identifier": "ENG-123",
+              "url": "https://linear.app/acme/issue/ENG-123/fix-login-crash",
+              "title": "Fix login crash",
+              "description": "Login crashes on submit.",
+              "createdAt": "2026-10-20T09:00:00.000Z",
+              "creator": {
+                "id": "usr-alice"
+              },
+              "delegate": {
+                "id": "usr-bot"
+              },
+              "state": {
+                "type": "started"
+              },
+              "team": {
+                "key": "ENG"
+              },
+              "history": {
+                "pageInfo": {
+                  "hasNextPage": false
+                },
+                "nodes": [
+                  {
+                    "id": "h1",
+                    "createdAt": "2026-10-20T10:00:00.000Z",
+                    "actor": {
+                      "id": "usr-alice"
+                    },
+                    "toDelegate": {
+                      "id": "usr-bot"
+                    },
+                    "fromTitle": null,
+                    "toTitle": null,
+                    "updatedDescription": false
+                  },
+                  {
+                    "id": "h2",
+                    "createdAt": "2026-10-20T13:00:00.000Z",
+                    "actor": {
+                      "id": "usr-alice"
+                    },
+                    "toDelegate": null,
+                    "fromTitle": null,
+                    "toTitle": null,
+                    "updatedDescription": true
+                  }
+                ]
+              },
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false
+                },
+                "nodes": [
+                  {
+                    "id": "c1",
+                    "createdAt": "2026-10-20T09:30:00.000Z",
+                    "editedAt": "2026-10-20T12:00:00.000Z",
+                    "body": "comment 1",
+                    "user": {
+                      "id": "usr-mallory"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.linear.app/graphql",
+        "json": {
+          "query": "query TrustedUser($id: String!) { user(id: $id) { id active guest app } }",
+          "variables": {
+            "id": "usr-alice"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "data": {
+            "user": {
+              "id": "usr-alice",
+              "active": true,
+              "guest": false,
+              "app": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://api.linear.app/graphql",
+        "json": {
+          "query": "query TrustedUser($id: String!) { user(id: $id) { id active guest app } }",
+          "variables": {
+            "id": "usr-mallory"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "data": {
+            "user": {
+              "id": "usr-mallory",
+              "active": true,
+              "guest": true,
+              "app": false
+            }
+          }
+        }
+      }
+    }
+  ]
+}

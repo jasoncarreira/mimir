@@ -6,7 +6,7 @@ import os
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Collection
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping
 
 from .background_io import run_in_pool
 from .models import AgentEvent
@@ -23,11 +23,29 @@ ReceiptLivenessHook = Callable[[Path, Path | None, PruneStaleReceipts], None]
 
 
 @dataclass(frozen=True)
+class ItemAttestation:
+    """A trust attestor's verdict on one poller item.
+
+    ``trusted`` is ``None`` when the verdict is unavailable; ``prompt`` is the
+    attestor's own re-render of the item, which the host compares against the
+    prompt the poller emitted before accepting it.
+    """
+
+    trusted: bool | None
+    actor: str | None = None
+    prompt: str | None = None
+
+
+TrustAttestor = Callable[[Mapping[str, Any], Mapping[str, str]], ItemAttestation]
+
+
+@dataclass(frozen=True)
 class PollerHooks:
     """Resolved, server-trusted hooks for one poller declaration."""
 
     recovery_relevance: RecoveryRelevanceFactory | None = None
     receipt_liveness: ReceiptLivenessHook | None = None
+    trust_attestor: TrustAttestor | None = None
 
 
 @dataclass(frozen=True)

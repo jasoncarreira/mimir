@@ -1,0 +1,108 @@
+{
+  "source": "Jira Cloud platform REST API v3, Issues: GET /rest/api/3/issue/{issueIdOrKey} (expand=changelog, fields) (comment.updateAuthor)",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "url": "https://acme.atlassian.net/rest/api/3/issue/PROJ-45?expand=changelog&fields=summary,description,status,assignee,project,creator,comment,updated"
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "id": "10045",
+          "key": "PROJ-45",
+          "fields": {
+            "summary": "Login crashes",
+            "description": {
+              "type": "doc",
+              "version": 1,
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Steps to reproduce"
+                    }
+                  ]
+                }
+              ]
+            },
+            "status": {
+              "name": "In Progress",
+              "statusCategory": {
+                "key": "indeterminate"
+              }
+            },
+            "assignee": {
+              "accountId": "acct-bot"
+            },
+            "project": {
+              "key": "PROJ"
+            },
+            "creator": {
+              "accountId": "acct-alice"
+            },
+            "updated": "2026-10-01T12:00:00.000+0000",
+            "comment": {
+              "comments": [
+                {
+                  "id": "100",
+                  "author": {
+                    "accountId": "acct-alice"
+                  },
+                  "body": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                      {
+                        "type": "paragraph",
+                        "content": [
+                          {
+                            "type": "text",
+                            "text": "hello"
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  "created": "2026-10-01T10:00:00.000+0000",
+                  "updated": "2026-10-01T11:00:00.000+0000",
+                  "updateAuthor": {
+                    "accountId": "acct-mallory"
+                  }
+                }
+              ],
+              "total": 1,
+              "startAt": 0,
+              "maxResults": 100
+            }
+          },
+          "changelog": {
+            "histories": [
+              {
+                "id": "1",
+                "author": {
+                  "accountId": "acct-alice"
+                },
+                "created": "2026-10-01T09:00:00.000+0000",
+                "items": [
+                  {
+                    "field": "assignee",
+                    "fieldtype": "jira",
+                    "from": null,
+                    "to": "acct-bot",
+                    "toString": "acct-bot"
+                  }
+                ]
+              }
+            ],
+            "total": 1,
+            "startAt": 0,
+            "maxResults": 100
+          }
+        }
+      }
+    }
+  ]
+}

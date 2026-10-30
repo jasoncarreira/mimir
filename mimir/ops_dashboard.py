@@ -553,6 +553,17 @@ def _build_algedonic_signals(events_log: Path, turns_log: Path) -> dict[str, Any
             )
             lines.append(f"- {repo}#{number}: {title} (by @{author}) {url}")
         block = "\n\n".join(part for part in (block, "\n".join(lines)) if part)
+    tracker_notices = [event for event in _load_events(events_log, 1)
+                       if event.get("type") == "tracker_issue_withheld"][-30:]
+    if tracker_notices:
+        lines = ["Owner-only tracker issue notices:"]
+        for event in tracker_notices:
+            adapter, ref, reason, url = (
+                sanitize_prompt_field(event.get(key) or "")
+                for key in ("adapter", "ref", "reason", "url")
+            )
+            lines.append(f"- {adapter} {ref} ({reason}) {url}")
+        block = "\n\n".join(part for part in (block, "\n".join(lines)) if part)
     return {
         "title": "Recent feedback signals",
         "window_hours": window_hours,
