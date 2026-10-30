@@ -2139,6 +2139,107 @@ def test_provision_upgrades_recorded_poller_and_backs_up_tree(provisioned_skills
     assert len(list((home / '.mimir/plugin-skill-backups').iterdir())) == 1
 
 
+@pytest.mark.parametrize('name', ['chainlink-orchestrator', 'worklink-tool-pins'])
+def test_provision_upgrades_installed_default_skill(provisioned_skills, monkeypatch, capsys, name):
+    from mimir.plugins import skills
+    from mimir.skill_install import _file_hashes
+
+    home, _, _, run = provisioned_skills
+    skill = next(s for s in skills.selected_skills() if s.label == 'cultivate:' + name)
+    assert skill.default
+    skills.install_skill(home, skill)
+    path = home / 'skills' / skill.dirname / 'SKILL.md'
+    path.write_text('previous packaged skill\n')
+    old_tree = _file_hashes(path.parent)
+    recorded = skills.previous_skill_inventories
+
+    def inventories(candidate):
+        return ({'fixture-older-release': old_tree, **recorded(candidate)}
+                if candidate == skill else recorded(candidate))
+
+    monkeypatch.setattr(skills, 'previous_skill_inventories', inventories)
+    assert skills.skill_state(home, skill) == 'upgrade available'
+    run()
+    output = capsys.readouterr().out
+    assert re.search(r'Upgraded skill cultivate:' + name +
+                     r' \(fixture-older-release -> [^)]+\)', output)
+    assert output.count('Upgraded skill ') == 1
+    assert skills.skill_state(home, skill) == 'installed'
+    backups = list((home / '.mimir/plugin-skill-backups').glob(skill.dirname + '-*'))
+    assert len(backups) == 1
+    assert _file_hashes(backups[0]) == old_tree
+    other = 'worklink-tool-pins' if name == 'chainlink-orchestrator' else 'chainlink-orchestrator'
+    assert not (home / 'skills' / ('cultivate-' + other)).exists()
+    assert not (home / 'skills/cultivate-tracker-poller').exists()
+    run()
+    assert capsys.readouterr().out == 'SETUP_CHANGED=0\n'
+    assert len(list((home / '.mimir/plugin-skill-backups').iterdir())) == 1
+
+
+@pytest.mark.parametrize('name', ['chainlink-orchestrator', 'worklink-tool-pins'])
+def test_provision_refuses_modified_default_before_any_skill_change(provisioned_skills, capsys, name):
+    from mimir.plugins import skills
+
+    home, manifest, _, run = provisioned_skills
+    skill = next(s for s in skills.selected_skills() if s.label == 'cultivate:' + name)
+    skills.install_skill(home, skill)
+    path = home / 'skills' / skill.dirname / 'SKILL.md'
+    path.write_text(path.read_text() + '\noperator edit\n')
+    with pytest.raises(RuntimeError, match=r'modified Cultivate skill cultivate:' + name +
+                       r'.*mimir skills install cultivate:' + name + r' --restore'):
+        run()
+    assert 'CULTIVATE_SKILL_MODIFIED:' + name in capsys.readouterr().out
+    assert skills.skill_state(home, skill) == 'modified'
+    assert 'operator edit' in path.read_text()
+    assert not (home / 'skills/cultivate-github-poller').exists()
+    assert not (home / '.mimir/plugin-skill-backups').exists()
+
+    data = json.loads(manifest.read_text())
+    data['force'] = True
+    manifest.write_text(json.dumps(data))
+    run()
+    assert 'Upgraded skill cultivate:' + name + ' (modified -> ' in capsys.readouterr().out
+    assert skills.skill_state(home, skill) == 'installed'
+    backups = list((home / '.mimir/plugin-skill-backups').glob(skill.dirname + '-*'))
+    assert len(backups) == 1
+    assert 'operator edit' in (backups[0] / 'SKILL.md').read_text()
+
+
+@pytest.mark.parametrize('name', ['chainlink-orchestrator', 'worklink-tool-pins'])
+def test_provision_leaves_current_default_skill_untouched(provisioned_skills, capsys, name):
+    from mimir.plugins import skills
+
+    home, _, _, run = provisioned_skills
+    skill = next(s for s in skills.selected_skills() if s.label == 'cultivate:' + name)
+    skills.install_skill(home, skill)
+    path = home / 'skills' / skill.dirname / 'SKILL.md'
+    before = path.stat().st_mtime_ns
+    run()
+    assert capsys.readouterr().out == 'SETUP_CHANGED=1\n'  # optional skills were missing
+    assert path.stat().st_mtime_ns == before
+    assert skills.skill_state(home, skill) == 'installed'
+    assert not (home / '.mimir/plugin-skill-backups').exists()
+    run()
+    assert capsys.readouterr().out == 'SETUP_CHANGED=0\n'
+    assert path.stat().st_mtime_ns == before
+
+
+def test_provision_only_reconciles_cultivate_defaults(provisioned_skills, monkeypatch, capsys):
+    from mimir.plugins import skills
+
+    home, _, _, run = provisioned_skills
+    foreign = SimpleNamespace(candidate=SimpleNamespace(name='other'), name='unrelated',
+                              label='other:unrelated', dirname='other-unrelated', default=True)
+    selected = skills.selected_skills
+    state = skills.skill_state
+    monkeypatch.setattr(skills, 'selected_skills', lambda: [*selected(), foreign])
+    monkeypatch.setattr(skills, 'skill_state', lambda home, skill: (
+        'modified' if skill is foreign else state(home, skill)))
+    run()
+    assert capsys.readouterr().out == 'SETUP_CHANGED=1\n'
+    assert not (home / '.mimir/plugin-skill-backups').exists()
+
+
 @pytest.mark.parametrize('metadata_failure', [False, True])
 def test_provision_resolves_release_metadata_before_mutation(
         provisioned_skills, monkeypatch, capsys, metadata_failure):
