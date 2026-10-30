@@ -3010,7 +3010,6 @@ class WorklinkRunner:
                 factory_record = FactoryRunRecord(
                     run_id=run_id,
                     issue_id=issue_id,
-                    issue_title=issue.title,
                     attempt=claim_record.attempt,
                     repository=repo_slug,
                     base_ref=base,
