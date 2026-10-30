@@ -31,7 +31,7 @@ jobs:
     # Exercise the same source-distribution-first build used for releases. A
     # second, direct wheel catches file-selection differences between the two
     # paths before a tag reaches publish.yml.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -79,7 +79,7 @@ jobs:
     # ``allowed-tools`` drift gap that pre-beta review flagged
     # (chainlink #82 sub #88). Runs first so the slower pytest matrix
     # below can fail-fast on conformance breaks via ``needs:``.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -243,7 +243,7 @@ jobs:
     # dedicated gate keeps upstream command drift executable without compiling
     # the Rust CLI three times across the Python/enforcement matrix.
     needs: skill-conformance
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -373,7 +373,7 @@ jobs:
     # frontmatter, instead of waiting for the slower full matrix to
     # come back red on the same root cause.
     needs: skill-conformance
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -491,7 +491,7 @@ jobs:
     # nothing. A version of this job that only switches user passes immediately and
     # proves nothing.
     needs: skill-conformance
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -725,7 +725,7 @@ jobs:
   # decide deliberately; it is a canary, not a gate.
   pytest-fresh-resolve:
     needs: skill-conformance
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     continue-on-error: true
     timeout-minutes: 20
     steps:
@@ -806,7 +806,7 @@ jobs:
     # is what keeps those two the same claim, by failing if anyone silences an
     # enforced failure with a skipif on the flag.
     needs: skill-conformance
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -865,7 +865,7 @@ jobs:
           path: ${{ steps.stage-pytest-evidence.outputs.path }}
 
   worklink-image-identity:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       WORKLINK_REPO: /workspace/worklink-base
@@ -888,7 +888,7 @@ jobs:
     # The claude-code extra is the permanent install path for Anthropic Max
     # subprocess deployments. Keep a focused CI smoke so a dependency/metadata
     # regression cannot hide behind the default dev-only sync.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -920,7 +920,7 @@ jobs:
           uv run --extra dev --extra claude-code pytest -q -n 0 tests/test_langchain_claude_code_patches.py::test_bridged_structured_tool_executes
 
   frontend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
