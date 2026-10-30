@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
+import yaml
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
@@ -99,7 +100,7 @@ def _tracker_config(home: Path) -> TrackerConfig | None:
 
     try:
         return WorklinkConfig.load(home / "worklink.yaml").tracker
-    except (OSError, ValueError):
+    except (OSError, ValueError, yaml.YAMLError):
         return None
 
 
