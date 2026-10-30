@@ -1,0 +1,1 @@
+- Isolate service-shell pin validation tests from host executable layout while retaining checks for unsafe production paths, symlinks, missing or non-executable files, and writable-root pins.
