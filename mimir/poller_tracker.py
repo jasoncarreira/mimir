@@ -98,5 +98,6 @@ def withheld_lines(adapter: str, ref: str, url: str, reason: str, title: str | N
 
 def transition_line(adapter: str, ref: str, url: str, lifecycle_event: str, reason: str) -> str:
     return (
-        f"Tracker transition unavailable: {adapter} {ref} {lifecycle_event} ({reason}) {url}"
+        f"Tracker transition unavailable: {adapter} {ref} {lifecycle_event} ({reason}) "
+        f"{url or '(no URL)'}"
     )
