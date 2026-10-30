@@ -52,11 +52,11 @@ def _remediation_scope(number: int, *, event_type: str = "pr_ci_failure") -> Rep
 
 
 def _record(home: Path, issue: int, *, phase: str = "running", status: str = "running",
-            url: str | None = None) -> None:
+            url: str | None = None, title: str | None = "Move coding") -> None:
     run_id = f"chainlink-{issue}"
     sandbox = home / ".factory-sandboxes" / run_id
     save_factory_record(home, FactoryRunRecord(
-        run_id=run_id, issue_id=issue, attempt=1, repository="owner/repo", base_ref="main",
+        run_id=run_id, issue_id=issue, issue_title=title, attempt=1, repository="owner/repo", base_ref="main",
         branch=f"build-{issue}", launcher=str(home / "launcher"), sandbox=str(sandbox),
         session=None, handle=None, observed_at=None, controller_phase=phase,
         status=FactoryStatus(run_id=run_id, valid=True, sandbox_path=str(sandbox),
@@ -68,7 +68,7 @@ def test_selected_provider_renders_only_server_owned_in_flight_and_remediation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "wrong-home"))
-    _record(tmp_path, 1949)
+    _record(tmp_path, 1949, title="Move [coding]\nSafely")
     _record(tmp_path, 1950, phase="parked", status="needs-human",
             url="https://github.com/owner/repo/pull/50")
     _record(tmp_path, 1951, phase="terminal", status="completed",
@@ -94,7 +94,10 @@ def test_selected_provider_renders_only_server_owned_in_flight_and_remediation(
     assert coding_status_applies(_operator(store), event)
     text, served = _render_plugin_prompt(provider, _operator(store), event, tmp_path)
     assert served == ()  # no agent-writable file was read through the prompt reader
-    assert "Worklink build #1949" in text
+    assert "Worklink build Move \\u005bcoding\\u005d Safely (attempt 1): in flight" in text
+    assert "PR under remediation: https://github.com/owner/repo/pull/50" in text
+    assert "#1949" not in text and "chainlink 1949" not in text.lower()
+    assert "#1950" not in text and "chainlink 1950" not in text.lower()
     assert "https://github.com/owner/repo/pull/50" in text
     assert "#1951" not in text and "/pull/51" not in text
     assert "/pull/52" not in text and "evil.example" not in text
@@ -127,12 +130,12 @@ def test_coding_status_uses_host_home_not_environment(tmp_path, monkeypatch):
     event = AgentEvent(trigger="user_message", channel_id="chat")
     _record(tmp_path, 1949)
     other = tmp_path / "other"
-    _record(other, 5555)
+    _record(other, 5555, title="Other checkout")
     monkeypatch.setenv("MIMIR_HOME", str(other))
     text, _ = _render_plugin_prompt(provider, _operator(), event, tmp_path)
-    assert "#1949" in text and "#5555" not in text
+    assert "Worklink build Move coding" in text and "Other checkout" not in text
     monkeypatch.delenv("MIMIR_HOME")
-    assert "#1949" in _render_plugin_prompt(provider, _operator(), event, tmp_path)[0]
+    assert "Worklink build Move coding" in _render_plugin_prompt(provider, _operator(), event, tmp_path)[0]
     assert _render_plugin_prompt(provider, _operator(), event, tmp_path / "absent") == ("", ())
 
 
@@ -198,7 +201,8 @@ async def test_selected_agent_assembly_labels_status_and_excludes_non_operator(t
         ordinary_prompt, _ = await agent._build_turn_prompt(ordinary, event, None)
 
     assert "## Plugin: coding_status\n\nCoding status" in prompt
-    assert "Worklink build #1949" in prompt
+    assert "Worklink build Move coding" in prompt
+    assert "#1949" not in prompt and "chainlink 1949" not in prompt.lower()
     sources = [source for source in operator.ifc_labels.sources if source.domain == "coding_status"]
     assert len(sources) == 1
     source = sources[0]

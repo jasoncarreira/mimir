@@ -269,6 +269,7 @@ class FactoryRunRecord:
     status: FactoryStatus | None
     observed_at: str | None
     controller_phase: str
+    issue_title: str | None = None
     controller_error: str | None = None
     transcript: str | None = None
     # Set only after the executor's successful subreaper terminal acknowledgement.
@@ -298,6 +299,11 @@ class FactoryRunRecord:
                 raise FactoryRecordError(f"factory record {name} is invalid")
         if self.session is not None and (not self.session.strip() or "\x00" in self.session):
             raise FactoryRecordError("factory record session is invalid")
+        if self.issue_title is not None and (
+            not isinstance(self.issue_title, str) or not self.issue_title.strip()
+            or "\x00" in self.issue_title or len(self.issue_title.encode("utf-8")) > 16384
+        ):
+            raise FactoryRecordError("factory record issue title is invalid")
         if self.status is not None:
             if self.status.run_id != self.run_id:
                 raise FactoryRecordError("factory record status identity mismatch")
@@ -322,6 +328,7 @@ class FactoryRunRecord:
             "version": self.version,
             "run_id": self.run_id,
             "issue_id": self.issue_id,
+            **({"issue_title": self.issue_title} if self.issue_title is not None else {}),
             "attempt": self.attempt,
             "repository": self.repository,
             "base_ref": self.base_ref,
@@ -362,6 +369,7 @@ class FactoryRunRecord:
         }
         data = dict(data)
         children_reaped = data.pop("children_reaped", False)
+        issue_title = data.pop("issue_title", None)
         if type(children_reaped) is not bool:
             raise FactoryRecordError("factory record children_reaped is invalid")
         version = data.get("version")
@@ -411,6 +419,7 @@ class FactoryRunRecord:
             version=FACTORY_RECORD_VERSION,
             run_id=str(data["run_id"]),
             issue_id=int(data["issue_id"]),
+            issue_title=issue_title,
             attempt=int(data["attempt"]),
             repository=str(data["repository"]),
             base_ref=str(data["base_ref"]),

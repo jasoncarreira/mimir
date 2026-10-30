@@ -422,7 +422,7 @@ def _autonomous_leaf_block_reason(home: Path, issue_id: int) -> str | None:
 
 
 def _epic_prompt(issue: "IssueContext") -> str:
-    header = f"Build chainlink #{issue.issue_id}: {issue.title}".strip()
+    header = issue.title.strip()
     body = _render_chainlink_text(strip_external_record(issue.description).strip())
     base = f"{header}\n\n{body}".strip() if body else header
     return base
@@ -3010,6 +3010,7 @@ class WorklinkRunner:
                 factory_record = FactoryRunRecord(
                     run_id=run_id,
                     issue_id=issue_id,
+                    issue_title=issue.title,
                     attempt=claim_record.attempt,
                     repository=repo_slug,
                     base_ref=base,

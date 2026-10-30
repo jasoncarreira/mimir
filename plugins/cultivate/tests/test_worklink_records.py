@@ -60,6 +60,18 @@ def test_factory_record_round_trips_v2_and_reads_v1(tmp_path: Path) -> None:
     assert path.is_file()
 
 
+def test_factory_record_preserves_optional_title_and_reads_older_records(tmp_path: Path) -> None:
+    record = replace(_factory_record(tmp_path), issue_title="Improve builder prompts")
+    assert load_factory_record(tmp_path, record.run_id) is None
+    save_factory_record(tmp_path, record)
+    assert load_factory_record(tmp_path, record.run_id) == record
+    old = record.to_json()
+    del old["issue_title"]
+    assert FactoryRunRecord.from_json(old).issue_title is None
+    with pytest.raises(FactoryRecordError, match="issue title is invalid"):
+        FactoryRunRecord.from_json({**old, "issue_title": 1949})
+
+
 def test_factory_record_refuses_symlinked_store(tmp_path: Path) -> None:
     home = tmp_path / "home"
     (home / "state").mkdir(parents=True)

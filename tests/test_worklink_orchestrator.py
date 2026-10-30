@@ -1324,6 +1324,31 @@ def test_bundled_work_order_requires_discriminating_fail_closed_mutation_test() 
     assert "explain why the mutation cannot discriminate instead of inventing a fixture" in prompt
 
 
+def test_default_work_order_and_epic_prompt_omit_tracker_identity() -> None:
+    issue = IssueContext(2064, "Improve builder prompts", "Build the feature", {"worklink:ready"}, parent_id=1912)
+    template = Path(__file__).parent.parent / "plugins/cultivate/mimir_cultivate/prompt_templates/worklink-order.md"
+    order = render_work_order(
+        issue, template_path=template, backend_name="opencode", test_command="uv run pytest -q",
+    )
+    epic = _epic_prompt(issue)
+
+    assert order.startswith("You are executing this Worklink issue.\n")
+    assert "Title: Improve builder prompts" in order
+    assert "Parent:" not in order
+    assert epic == "Improve builder prompts\n\nBuild the feature"
+    for prompt in (order, epic):
+        assert "#2064" not in prompt and "chainlink 2064" not in prompt.lower()
+
+
+def test_custom_work_order_can_still_use_issue_and_parent_ids(tmp_path: Path) -> None:
+    template = tmp_path / "custom-order.md"
+    template.write_text("Issue #{issue_id}; Parent: {parent_id}", encoding="utf-8")
+    issue = IssueContext(2064, "Custom", "", set(), parent_id=1912)
+    assert render_work_order(
+        issue, template_path=template, backend_name="opencode", test_command="pytest",
+    ) == "Issue #2064; Parent: 1912"
+
+
 def _orchestrator_runner(
     repo: Path,
     worktree: Path,
@@ -4485,6 +4510,7 @@ def test_planner_prompt_renders_single_leaf_template_constant() -> None:
     assert "{leaf_template}" in prompt
     assert LEAF_TEMPLATE_MARKDOWN not in prompt
     assert LEAF_TEMPLATE_MARKDOWN in rendered
+    assert "chainlink issue subissue 380" in rendered
     assert "decompose.md" not in bundled_defaults()
     assert "worklink-order.md" not in bundled_defaults()
 

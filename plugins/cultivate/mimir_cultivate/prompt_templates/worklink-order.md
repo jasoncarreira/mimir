@@ -1,8 +1,7 @@
-You are executing Chainlink issue #{issue_id} via Worklink.
+You are executing this Worklink issue.
 
 Title: {title}
 Labels: {labels}
-Parent: {parent_id}
 Backend: {backend}
 
 Issue description:
