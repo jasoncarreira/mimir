@@ -1723,8 +1723,8 @@ import uuid
 import yaml
 from mimir.identities_populator import add_identity_alias, issue_web_key
 from mimir.identities import hash_web_key
-from mimir.plugins.skills import (resolve_skill, install_skill, skill_state, skill_inventory,
-                                  previous_skill_inventories, upgrade_command)
+from mimir.plugins.skills import (resolve_skill, selected_skills, install_skill, skill_state, skill_inventory,
+                                   previous_skill_inventories, upgrade_command)
 from mimir.skill_install import _file_hashes
 from mimir_cultivate.setup import _provision_saga, _provision_worklink
 
@@ -1815,6 +1815,13 @@ for name in ('github-poller', 'github-ci-watch', 'github', 'review') + (('tracke
     if skill is None:
         raise RuntimeError('missing optional Cultivate skill: ' + name)
     skills.append((skill, skill_state(home, skill)))
+# Default skills are seeded by the selected plugin, not by setup. Only reconcile
+# trees already present in this deployment; never install an unselected default.
+for skill in selected_skills():
+    if skill.candidate.name == 'cultivate' and skill.default:
+        state = skill_state(home, skill)
+        if state != 'not installed':
+            skills.append((skill, state))
 # Refuse before changing any skill, so a modified tree cannot leave a partial upgrade.
 for skill, state in skills:
     if state == 'modified' and not m.get('force', False):
