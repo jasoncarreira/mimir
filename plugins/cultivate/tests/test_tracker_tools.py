@@ -333,6 +333,20 @@ def test_comment_without_adapter_config_is_an_error(home, monkeypatch) -> None:
     assert result == {"status": "error", "reason": "adapter_unavailable"}
 
 
+@pytest.mark.parametrize(("call", "reason"), [
+    (lambda rt: tools.tracker_comment.func(
+        external_ref=LINEAR.external_ref(), body="hi", runtime=rt,
+    ), "adapter_unavailable"),
+    (lambda rt: tools.tracker_set_state.func(
+        external_ref=LINEAR.external_ref(), state="Done", runtime=rt,
+    ), "config_unavailable"),
+])
+def test_malformed_worklink_config_returns_fixed_error(call, reason, home, adapter) -> None:
+    (home / "worklink.yaml").write_text("tracker: [unclosed", encoding="utf-8")
+    assert call(_runtime(LINEAR)) == {"status": "error", "reason": reason}
+    assert adapter.calls == []
+
+
 def test_set_state_applies_a_configured_state(home, adapter) -> None:
     adapter.result = ActionResult("applied")
     result = tools.tracker_set_state.func(
