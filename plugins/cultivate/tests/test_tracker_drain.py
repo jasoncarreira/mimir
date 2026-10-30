@@ -515,9 +515,9 @@ def test_unreadable_url_never_extends_a_transition(tmp_path: Path, adapter: Fake
     adapter.transition_result = ActionResult("unavailable", "state_not_found")
     adapter.read_raises = True
     config = _config(transitions={"build_started": "In Progress"})
-    for _ in range(drain_module.MAX_ATTEMPTS + 2):
+    for fire in range(drain_module.MAX_ATTEMPTS + 2):
         _, emitted = _run(tmp_path, config)
-        assert emitted == []
+        assert [notice["url"] for notice in emitted] == ([] if fire == 0 else [""])
     data = _evidence(tmp_path)
     entry = data["items"][EXT]["transitions"]["build_started"]
     assert entry["stage"] == "done" and entry["result"] == "unavailable"
@@ -613,25 +613,69 @@ def test_stuck_entries_do_not_starve_a_later_closure(
     assert _evidence(tmp_path)["items"][EXT]["closure"]["stage"] == "done"
 
 
-def test_empty_url_notice_is_emitted_only_once_resolvable(
+def test_empty_url_notice_uses_later_resolution_before_receipt(
     tmp_path: Path, adapter: FakeAdapter
 ) -> None:
     _transition(tmp_path)
     adapter.transition_result = ActionResult("unavailable", "state_not_found")
     adapter.read_raises = True
     config = _config(transitions={"build_started": "In Progress"})
-    emitted_all: list[dict] = []
-    for _ in range(3):
-        emitted_all += _run(tmp_path, config)[1]
-    assert emitted_all == []
+    assert _run(tmp_path, config)[1] == []
+    _, unresolved = _run(tmp_path, config)
+    assert [notice["url"] for notice in unresolved] == [""]
     assert [n["url"] for n in _evidence(tmp_path)["notices"]] == [""]
     adapter.read_raises = False
     _, emitted = _run(tmp_path, config)
     assert [e["url"] for e in emitted] == [LINEAR_URL]
+    assert emitted[0]["delivery_key"] == unresolved[0]["delivery_key"]
     assert [n["url"] for n in _evidence(tmp_path)["notices"]] == [LINEAR_URL]
     calls = len(adapter.calls)
     _, again = _run(tmp_path, config)
     assert len(again) == 1 and len(adapter.calls) == calls
+
+
+@pytest.mark.parametrize(
+    ("name", "ext", "build_fails"),
+    [
+        ("linear", EXT, True),
+        ("jira", "jira:PROJ-12", False),
+    ],
+)
+def test_unresolvable_notice_emits_until_receipt_then_marks_notified(
+    tmp_path: Path, adapter: FakeAdapter, monkeypatch: pytest.MonkeyPatch,
+    name: str, ext: str, build_fails: bool,
+) -> None:
+    if build_fails:
+        def unavailable(*args: Any, **kwargs: Any) -> Any:
+            raise ValueError("missing credentials")
+
+        monkeypatch.setattr(drain_module, "build_adapter", unavailable)
+    else:
+        adapter.transition_result = ActionResult("unavailable", "state_not_found")
+    _transition(tmp_path, ext=ext)
+    config = TrackerConfig(
+        close_on_merge=False,
+        adapters={name: TrackerAdapterConfig(name=name, transitions={"build_started": "X"})},
+    )
+    assert _run(tmp_path, config)[1] == []
+    (notice,) = _evidence(tmp_path)["notices"]
+    assert notice["url"] == "" and notice["notified"] is False
+    key = notice["delivery_key"]
+    expected = {
+        "kind": "tracker_transition_unavailable", "delivery_key": key,
+        "adapter": name, "ref": ext.partition(":")[2], "url": "",
+        "lifecycle_event": "build_started",
+        "reason": "adapter_unavailable" if build_fails else "state_not_found",
+    }
+    assert _run(tmp_path, config)[1] == [expected]
+    assert _run(tmp_path, config)[1] == [expected]
+    assert len(_evidence(tmp_path)["notices"]) == 1
+    receipts = poller_state_dir(tmp_path) / ".delivery-receipts"
+    receipts.mkdir(parents=True)
+    (receipts / hashlib.sha256(key.encode()).hexdigest()).write_text("")
+    assert _run(tmp_path, config)[1] == []
+    assert _evidence(tmp_path)["notices"][0]["notified"] is True
+    assert _run(tmp_path, config)[1] == []
 
 
 def test_url_resolution_does_not_spend_the_action_budget(

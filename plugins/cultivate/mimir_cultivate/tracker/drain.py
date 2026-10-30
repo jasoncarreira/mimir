@@ -141,7 +141,7 @@ class _Drain:
             return ""
 
     def _adapter_missing(self, ext_ref: str, event: str) -> None:
-        """Record one notice; a missing Linear adapter or Jira without JIRA_SITE yields no deliverable notice."""
+        """Record one notice even when the issue URL cannot be built statically."""
 
         url = self.static_url(ext_ref)
         with evidence_transaction(self.home) as data:
@@ -173,7 +173,7 @@ class _Drain:
         )
 
     def notices(self) -> None:
-        """Emit deliverable notices, resolving empty URLs lazily.
+        """Emit pending notices, resolving empty URLs lazily before delivery.
 
         Resolution is one read-only call per unresolved Linear notice per fire. It is outside
         the evidence lock and never touches the action budget, so it cannot starve actions.
@@ -195,8 +195,6 @@ class _Drain:
             url = notice["url"] or resolved.get(key, "")
             if delivery_receipt_exists(state_dir, key):
                 delivered.add(key)
-                continue
-            if not url:
                 continue
             self.emit(
                 {
