@@ -2828,12 +2828,35 @@ def selected_repo_inventory():
     ("python", (), "python"),
     (None, (), "python"),
 ])
+@pytest.mark.parametrize("runner_layout", ["regular", "symlink"])
 async def test_project_suite_selection_and_snapshot_argv(
-    repo_tools, tmp_path, monkeypatch, suite, selectors, expected,
+    repo_tools, tmp_path, monkeypatch, suite, selectors, expected, runner_layout,
 ):
+    from mimir_cultivate import repository as project_tests
+
     state = repo_tools[-2]
     home = tmp_path / "home"
-    _configure_test_suites(home, state)
+    executable = tmp_path / "fixture-runner"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    runner_path = executable
+    if runner_layout == "symlink":
+        runner_path = tmp_path / "runner-link"
+        runner_path.symlink_to(executable.name)
+    _configure_test_suites(home, state, test_suites=[
+        {"name": "python", "command": f"{shlex.quote(str(runner_path))} -q", "default": True,
+         "selector_prefixes": ["tests/"], "selector_suffixes": [".py"]},
+        {"name": "frontend", "command": "npm run test:ci",
+         "selector_prefixes": ["frontend/"], "selector_suffixes": [".test.ts", ".test.tsx"]},
+    ])
+    original_which = project_tests.shutil.which
+
+    def resolve_runner(command, *args, **kwargs):
+        if command == "npm":
+            return str(runner_path)
+        return original_which(command, *args, **kwargs)
+
+    monkeypatch.setattr(project_tests.shutil, "which", resolve_runner)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("NPM_CONFIG_CACHE", str(home / "shared-cache"))
@@ -2844,8 +2867,8 @@ async def test_project_suite_selection_and_snapshot_argv(
         target = root / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("// fixture\n")
-    # Resolve npm independently of the host's installation and symlink layout.
-    monkeypatch.setattr("mimir_cultivate.repository.shutil.which", lambda *a, **k: "/usr/bin/true")
+    # Keep real executable canonicalization: both absolute Python commands and
+    # PATH-resolved npm commands must use the fixture target, not a host tool.
     issued = []
     calls = []
 
@@ -2860,7 +2883,7 @@ async def test_project_suite_selection_and_snapshot_argv(
     result = await RepoProjectTests(
         state, runner=runner, checkout_factory=_snapshot_checkout_factory(tmp_path, issued),
     ).execute(selectors, suite=suite)
-    expected_command = ("/usr/bin/true", "run", "test:ci") if expected == "frontend" else ("/usr/bin/true", "-q")
+    expected_command = (str(executable), "run", "test:ci") if expected == "frontend" else (str(executable), "-q")
     if expected == "frontend" and selectors:
         expected_command += ("--",)
     assert calls == [(*expected_command, *selectors)]
