@@ -1,9 +1,13 @@
 # Worklink merge reconciliation
 
-Worklink's existing reaper sweep reconciles completed leaf pull requests when
-`MIMIR_WORKLINK_REAPER_CRON` is enabled. It does not depend on GitHub webhook
-delivery: every sweep reads current Chainlink and GitHub state, including
-durable work left by an earlier interrupted sweep.
+Worklink's scheduled reaper sweep both recovers stale claims and reconciles
+completed leaf pull requests. On a Cultivate home with `worklink.yaml`, it runs
+every 30 minutes by default, including on existing setups that omit
+`MIMIR_WORKLINK_REAPER_CRON`. Set that variable to another cron schedule to
+override the default, or explicitly set it to empty to disable the job. Homes
+without `worklink.yaml` do not register it. Merge closure does not depend on
+GitHub webhook delivery: every sweep reads current Chainlink and GitHub state,
+including durable work left by an earlier interrupted sweep.
 
 ## Qualification
 

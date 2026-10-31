@@ -2143,6 +2143,7 @@ async def test_runtime_and_server_wire_worklink_arbiter_and_reaper(
         return True
 
     scheduler = Scheduler(tmp_path / "scheduler.yaml", enqueue)
+    (tmp_path / "worklink.yaml").write_text("repository: org/repo\n")
     monkeypatch.setenv("MIMIR_WORKLINK_REAPER_CRON", "*/7 * * * *")
     monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
 

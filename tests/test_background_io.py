@@ -57,6 +57,7 @@ def test_jobs_complete_with_saturated_default_pool(tmp_path, monkeypatch, operat
         monkeypatch.setattr(cultivate_scheduler, "log_event", logger.log)
         monkeypatch.setattr(provider_autonomy, "prune_stale_attempt_checkouts_for_home", lambda *a: [])
         monkeypatch.setattr(provider_autonomy, "close_merged_chainlinks_for_home", lambda *a: [])
+        (tmp_path / "worklink.yaml").write_text("repository: org/repo\n")
         monkeypatch.setenv("MIMIR_WORKLINK_REAPER_CRON", "* * * * *")
         monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
         hook = load_plugins(enable="cultivate").policy.server_hooks["cultivate", "configure_jobs"]

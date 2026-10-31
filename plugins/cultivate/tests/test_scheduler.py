@@ -29,7 +29,7 @@ def test_park_alert_is_provider_owned_and_fires_every_five_minutes(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_server_registers_provider_jobs_with_opt_in_reaper_and_lease(
+async def test_fresh_worklink_home_registers_reaper_and_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sched = Scheduler(tmp_path / "scheduler.yaml", _enqueue)
@@ -38,11 +38,15 @@ async def test_server_registers_provider_jobs_with_opt_in_reaper_and_lease(
     async def record(kind: str, **fields: object) -> None:
         events.append((kind, fields))
 
+    # Cultivate setup provisions worklink.yaml, but does not write the cron env.
+    (tmp_path / "worklink.yaml").write_text("repository: org/repo\n")
     monkeypatch.delenv("MIMIR_WORKLINK_REAPER_CRON", raising=False)
     monkeypatch.delenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", raising=False)
     await server.configure_worklink(sched, tmp_path, "operator", object(), record)
     assert sched._scheduler.get_job("worklink-factory-park-alert") is not None
-    assert sched._scheduler.get_job("worklink-reaper") is None
+    reaper = sched._scheduler.get_job("worklink-reaper")
+    assert reaper is not None
+    assert "minute='*/30'" in str(reaper.trigger)
     assert "worklink-reaper" in sched.registered_callables()
     assert sched._scheduler.get_job("pr-checkout-lease-reaper") is None
     assert events == []
@@ -52,9 +56,43 @@ async def test_server_registers_provider_jobs_with_opt_in_reaper_and_lease(
     monkeypatch.setenv("MIMIR_WORKLINK_REAPER_CRON", "0 * * * *")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
     await server.configure_worklink(sched, tmp_path, "operator", object(), record)
-    assert sched._scheduler.get_job("worklink-reaper") is not None
+    reaper = sched._scheduler.get_job("worklink-reaper")
+    assert reaper is not None
+    assert "minute='0'" in str(reaper.trigger)
     assert sched._scheduler.get_job("pr-checkout-lease-reaper") is not None
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_reaper_cron_disables_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "worklink.yaml").write_text("repository: org/repo\n")
+    monkeypatch.setenv("MIMIR_WORKLINK_REAPER_CRON", "")
+    sched = Scheduler(tmp_path / "scheduler.yaml", _enqueue)
+
+    async def record(kind: str, **fields: object) -> None:
+        pytest.fail(f"unexpected event: {kind} {fields}")
+
+    await server.configure_worklink(sched, tmp_path, None, object(), record)
+    assert sched._scheduler.get_job("worklink-reaper") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cron", [None, "*/7 * * * *"])
+async def test_non_worklink_home_has_no_reaper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cron: str | None,
+) -> None:
+    if cron is None:
+        monkeypatch.delenv("MIMIR_WORKLINK_REAPER_CRON", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_WORKLINK_REAPER_CRON", cron)
+    sched = Scheduler(tmp_path / "scheduler.yaml", _enqueue)
+
+    async def record(kind: str, **fields: object) -> None:
+        pytest.fail(f"unexpected event: {kind} {fields}")
+
+    await server.configure_worklink(sched, tmp_path, None, object(), record)
+    assert sched._scheduler.get_job("worklink-reaper") is None
+    assert "worklink-reaper" not in sched.registered_callables()
 
 
 def test_selected_worklink_hooks_are_provider_hooks(tmp_path: Path) -> None:

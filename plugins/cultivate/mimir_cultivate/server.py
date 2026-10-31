@@ -98,10 +98,12 @@ async def configure_worklink(scheduler: Any, home: Path, alert_channel: str | No
 
     for job, install in (
         ("worklink-reaper", lambda: jobs.add_reaper_job(
-            scheduler, home, cron_expr=os.environ.get("MIMIR_WORKLINK_REAPER_CRON", ""))),
+            scheduler, home, cron_expr=os.environ.get("MIMIR_WORKLINK_REAPER_CRON", "*/30 * * * *"))),
         ("worklink-factory-park-alert", lambda: jobs.add_factory_park_alert_job(
             scheduler, home, alert_channel, channels)),
     ):
+        if job == "worklink-reaper" and not (home / "worklink.yaml").is_file():
+            continue
         try:
             install()
         except ValueError as exc:
