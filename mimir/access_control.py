@@ -11940,6 +11940,70 @@ def _shell_reads_home_content(arguments: dict[str, Any], *, tool_name: str = "sh
     return False
 
 
+def _bound_tracker_status_result(
+    tool_name: str, arguments: dict[str, Any], auth_context: Any,
+    authorization: ToolAuthorization, registered: Any, result: Any,
+    provenance: ProtectedResultProvenance | None, failed: bool,
+) -> bool:
+    """Recognize the selected tracker writer's bounded, host-produced status only."""
+    from langchain_core.messages import ToolMessage
+
+    if not (
+        registered.owner == "cultivate"
+        and tool_name in {"tracker_file_work", "tracker_comment", "tracker_set_state"}
+        and registered.result_domain == "tracker_status"
+        and registered.resource_scope == "tracker_issue"
+        and registered.flow == "sink"
+        and registered.descriptor is not None
+        and registered.descriptor.result_origin == ResultOriginKind.NON_INGESTING
+        and registered.descriptor.sink_destination == "bound_tracker_issue"
+        and authorization.allowed and not authorization.would_block
+        and authorization.decision == OperationDecision.RESOURCE_SCOPED
+        and not failed and (provenance is None or not provenance.sources)
+    ):
+        return False
+    external_ref = arguments.get("external_ref")
+    if not isinstance(external_ref, str) or not any(
+        external_ref == f"{adapter}:{ref}"
+        for adapter, ref, _url in getattr(auth_context, "tracker_issue_targets", ())
+    ):
+        return False
+    if isinstance(result, ToolMessage):
+        if result.status != "success" or not isinstance(result.content, str):
+            return False
+        try:
+            result = json.loads(result.content)
+        except ValueError:
+            return False
+    if not isinstance(result, dict):
+        return False
+    statuses = {
+        "tracker_file_work": {"created", "exists", "refused", "error"},
+        "tracker_comment": {"posted", "refused", "error"},
+        "tracker_set_state": {"applied", "already", "unavailable", "unsupported", "refused", "error"},
+    }
+    if (type(result.get("status")) is not str
+            or result["status"] not in statuses[tool_name]
+            or type(result.get("reason")) is not str
+            or len(result["reason"]) > 40
+            or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789_" for char in result["reason"])):
+        return False
+    if tool_name != "tracker_file_work":
+        return set(result) == {"status", "reason"}
+    return (
+        set(result) == {"status", "reason", "kind", "missing"}
+        and type(result["kind"]) is str
+        and result["kind"] == arguments.get("kind")
+        and result["kind"] in {"leaf", "epic"}
+        and type(result["missing"]) is list
+        and all(type(part) is str and part in {
+            "Goal", "Acceptance criteria", "Review criteria", "Worklink notes",
+            "- Scope", "- Out of scope", "- Suggested test command",
+            "acceptance checklist item",
+        } for part in result["missing"])
+    )
+
+
 @scoped_policy_call(lambda bound: getattr(bound.arguments["authorization"], "policy", None))
 def classify_protected_result(
     tool_name: str,
@@ -12003,6 +12067,11 @@ def classify_protected_result(
             tool_name, arguments or {}, auth_context, authorization, registered,
         )
         if not retained_verified and not pr_lease_verified:
+            if _bound_tracker_status_result(
+                tool_name, arguments or {}, auth_context, authorization,
+                registered, result, provenance, failed,
+            ):
+                return None
             return _incomplete_protected_result(
                 registered.result_domain or "unknown", arguments or {},
                 tool_name=tool_name, auth_context=auth_context,
@@ -12761,7 +12830,8 @@ def assert_model_tool_inventory_cataloged(
     overlapping_result_policies = sorted(
         tool_name
         for tool_name in _PROTECTED_RESULT_DOMAINS
-        if (descriptor := get_tool_descriptor(tool_name))
+        if tool_name in core_names
+        and (descriptor := get_tool_descriptor(tool_name))
         and descriptor.result_origin & ResultOriginKind.NON_INGESTING
     )
     errors: list[str] = []

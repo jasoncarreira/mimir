@@ -22,9 +22,14 @@ from typing import Any
 
 import pytest
 import yaml
+from langchain_core.messages import ToolMessage
 
 from mimir import models, pollers
-from mimir.access_control import create_auth_context
+from mimir.access_control import ToolRegistry, classify_protected_result, create_auth_context
+from mimir.agent import _effective_persisted_integrity
+from mimir.models import TurnRecord
+from mimir.runtime import dispatch_session_synthesis
+from mimir.turn_logger import TurnLogger
 from mimir.event_logger import init_logger
 from mimir.plugins.core import policy_scope
 from mimir.plugins.defaults import seed_plugin_defaults
@@ -336,6 +341,232 @@ def test_linear_outage_does_not_withhold_the_github_items(
 
 def _leaf_description() -> str:
     return LEAF_TEMPLATE_MARKDOWN
+
+
+@pytest.mark.asyncio
+async def test_attested_filing_preserves_turn_integrity_and_dispatches_synthesis(
+    capsys_rig, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rig = capsys_rig("github_issues")
+    read = exchanges("github_issues", "attest_trusted")
+    rig.queue(listing("github_issues"), read)
+    rig.queue(read)
+    [event] = await rig.deliver(rig.poll(capsys))
+    with policy_scope(rig.selected.policy):
+        auth = create_auth_context(
+            event, policy=rig.selected.policy, enforce=True, ifc_labels=event.ifc_labels,
+        )
+    args = {"external_ref": f"github_issues:{GITHUB_REF}", "kind": "leaf",
+            "title": "Fix login crash", "description": _leaf_description()}
+    with policy_scope(rig.selected.policy):
+        decision = ToolRegistry().authorize_tool(
+            "tracker_file_work", auth, arguments=args, enforce=True, policy=rig.selected.policy,
+        )
+        assert decision.allowed and not decision.would_block
+        result = tools.tracker_file_work.func(**args, runtime=SimpleNamespace(context=auth))
+        assert result["status"] == "created"
+        labels = classify_protected_result(
+            "tracker_file_work", args, auth, decision,
+            result=ToolMessage(content=json.dumps(result), tool_call_id="filing"),
+        )
+        assert labels is None, labels
+    current = auth.ifc_state.current(auth.ifc_labels)
+    turns_path = rig.home / "logs" / "turns.jsonl"
+    turn = TurnRecord(
+        ts="2026-10-30T12:00:00+00:00", turn_id="trusted-tracker-filing",
+        session_id="tracker-session", saga_session_id="tracker-session",
+        trigger=event.trigger, channel_id=event.channel_id, input=event.content,
+        output="Filed work", tool_call_count=1,
+        integrity=_effective_persisted_integrity(current, auth),
+        integrity_source_counts={
+            f"{source.integrity}/{source.integrity_effect}": sum(
+                item.integrity == source.integrity and item.integrity_effect == source.integrity_effect
+                for item in current.sources
+            ) for source in current.sources
+        },
+        untrusted_active_ingest_domains=sorted({
+            source.domain for source in current.sources if source.has_untrusted_active_ingest
+            and source.domain is not None
+        }),
+    )
+    await TurnLogger(turns_path).write(turn)
+    [record] = [json.loads(line) for line in turns_path.read_text().splitlines()]
+    assert record["integrity"] == "trusted"
+    assert record["untrusted_active_ingest_domains"] == []
+    assert "untrusted/active_ingest" not in record["integrity_source_counts"]
+    queued = []
+
+    class Dispatcher:
+        async def enqueue(self, item):
+            queued.append(item)
+            return True
+
+    async def log_event(_name, **_fields):
+        pass
+
+    assert await dispatch_session_synthesis(
+        SimpleNamespace(saga_session_id="tracker-session", channel_id=event.channel_id,
+                        source_acl=None),
+        config=SimpleNamespace(turns_log=turns_path, saga_session_idle_minutes=10,
+                               plugin_manager=rig.selected),
+        dispatcher=Dispatcher(), log_event_fn=log_event,
+    ) is True
+    assert len(queued) == 1
+    rig.finish()
+
+
+@pytest.mark.asyncio
+async def test_filing_then_comment_in_one_trusted_turn_and_real_taint_refuses_writes(
+    capsys_rig, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rig = capsys_rig("github_issues")
+    read = exchanges("github_issues", "attest_trusted")
+    rig.queue(listing("github_issues"), read)
+    rig.queue(read)
+    [event] = await rig.deliver(rig.poll(capsys))
+    with policy_scope(rig.selected.policy):
+        auth = create_auth_context(
+            event, policy=rig.selected.policy, enforce=True, ifc_labels=event.ifc_labels,
+        )
+        ref = f"github_issues:{GITHUB_REF}"
+        args = {"external_ref": ref, "kind": "leaf", "title": "Fix login crash",
+                "description": _leaf_description()}
+        decision = ToolRegistry().authorize_tool(
+            "tracker_file_work", auth, arguments=args, enforce=True, policy=rig.selected.policy,
+        )
+        runtime = SimpleNamespace(context=auth)
+        filed = tools.tracker_file_work.func(**args, runtime=runtime)
+        assert filed["status"] == "created"
+        assert classify_protected_result("tracker_file_work", args, auth, decision, result=filed) is None
+        rig.queue(exchanges("github_issues", "comment"))
+        comment_args = {"external_ref": ref, "body": "Thanks, filed."}
+        comment_decision = ToolRegistry().authorize_tool(
+            "tracker_comment", auth, arguments=comment_args, enforce=True, policy=rig.selected.policy,
+        )
+        assert comment_decision.allowed
+        posted = tools.tracker_comment.func(**comment_args, runtime=runtime)
+        assert posted == {"status": "posted", "reason": ""}
+        assert classify_protected_result(
+            "tracker_comment", comment_args, auth, comment_decision, result=posted,
+        ) is None
+        state_args = {"external_ref": ref, "state": "closed"}
+        state_decision = ToolRegistry().authorize_tool(
+            "tracker_set_state", auth, arguments=state_args, enforce=True, policy=rig.selected.policy,
+        )
+        unsupported = tools.tracker_set_state.func(**state_args, runtime=runtime)
+        assert unsupported == {"status": "unsupported", "reason": "github_issues"}
+        assert classify_protected_result(
+            "tracker_set_state", state_args, auth, state_decision, result=unsupported,
+        ) is None
+        # A valid-looking status cannot clear actual untrusted active ingest.
+        source = next(iter(event.ifc_labels.sources))
+        auth.ifc_state.merge(models.InformationFlowLabels().with_source(
+            replace(source, integrity="untrusted", resource_id="withheld-activity"),
+        ))
+        assert _effective_persisted_integrity(auth.ifc_state.current(), auth) == "untrusted"
+        assert tools.tracker_comment.func(**comment_args, runtime=runtime)["reason"] == "tainted_turn"
+        assert tools.tracker_file_work.func(**args, runtime=runtime)["reason"] == "tainted_turn"
+        assert tools.tracker_set_state.func(**state_args, runtime=runtime)["reason"] == "tainted_turn"
+    rig.finish()
+
+
+@pytest.mark.asyncio
+async def test_tracker_status_exemption_fails_closed_for_scope_shape_and_undeclared_plugin(
+    capsys_rig, capsys: pytest.CaptureFixture[str],
+) -> None:
+    rig = capsys_rig("github_issues")
+    read = exchanges("github_issues", "attest_trusted")
+    rig.queue(listing("github_issues"), read)
+    rig.queue(read)
+    [event] = await rig.deliver(rig.poll(capsys))
+    with policy_scope(rig.selected.policy):
+        auth = create_auth_context(
+            event, policy=rig.selected.policy, enforce=True, ifc_labels=event.ifc_labels,
+        )
+        args = {"external_ref": f"github_issues:{GITHUB_REF}", "kind": "leaf"}
+        decision = ToolRegistry().authorize_tool(
+            "tracker_file_work", auth, arguments=args, enforce=True, policy=rig.selected.policy,
+        )
+        result = {"status": "created", "reason": "", "kind": "leaf", "missing": []}
+        for invalid_args, invalid_result in (
+            ({**args, "external_ref": "github_issues:acme/widgets#43"}, result),
+            (args, {**result, "tracker_text": "injected"}),
+            (args, {**result, "reason": "injected prose!"}),
+            (args, {**result, "status": "unexpected"}),
+            (args, {**result, "missing": ["tracker supplied prose"]}),
+        ):
+            labels = classify_protected_result(
+                "tracker_file_work", invalid_args, auth, decision, result=invalid_result,
+            )
+            assert labels is not None
+            assert any(source.has_untrusted_active_ingest for source in labels.sources)
+        denied = classify_protected_result(
+            "tracker_file_work", args, auth, replace(decision, would_block=True), result=result,
+        )
+        assert denied is not None and any(source.has_untrusted_active_ingest for source in denied.sources)
+        failed = classify_protected_result(
+            "tracker_file_work", args, auth, decision, result=result, failed=True,
+        )
+        assert failed is not None and any(source.has_untrusted_active_ingest for source in failed.sources)
+        undeclared = classify_protected_result(
+            "unsupported_operation", args, auth, decision, result=result,
+        )
+        assert undeclared is not None
+        assert any(source.domain == "unknown" and source.has_untrusted_active_ingest
+                   for source in undeclared.sources)
+    rig.finish()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name,args_extra,result", [
+    ("tracker_comment", {"body": "Thanks, filed."}, {"status": "posted", "reason": ""}),
+    ("tracker_set_state", {"state": "closed"}, {"status": "applied", "reason": ""}),
+    ("tracker_file_work", {"kind": "leaf"},
+     {"status": "created", "reason": "", "kind": "leaf", "missing": []}),
+])
+@pytest.mark.parametrize("invalid_guard", ["extra_key", "non_cultivate_owner"])
+async def test_tracker_status_exact_shape_and_owner_guards_taint_turn(
+    tool_name: str, args_extra: dict, result: dict, invalid_guard: str,
+    capsys_rig, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = capsys_rig("github_issues")
+    read = exchanges("github_issues", "attest_trusted")
+    rig.queue(listing("github_issues"), read)
+    rig.queue(read)
+    [event] = await rig.deliver(rig.poll(capsys))
+    with policy_scope(rig.selected.policy):
+        auth = create_auth_context(
+            event, policy=rig.selected.policy, enforce=True, ifc_labels=event.ifc_labels,
+        )
+        args = {"external_ref": f"github_issues:{GITHUB_REF}", **args_extra}
+        decision = ToolRegistry().authorize_tool(
+            tool_name, auth, arguments=args, enforce=True, policy=rig.selected.policy,
+        )
+        assert decision.allowed and not decision.would_block
+        assert _effective_persisted_integrity(auth.ifc_state.current(auth.ifc_labels), auth) == "trusted"
+        # Prove every other precondition admits the otherwise identical result.
+        assert classify_protected_result(tool_name, args, auth, decision, result=result) is None
+        if invalid_guard == "extra_key":
+            result = {**result, "tracker_text": "untrusted tracker-supplied message"}
+        else:
+            registered = rig.selected.policy.tools[tool_name]
+            assert registered.owner == "cultivate" and registered.result_domain == "tracker_status"
+            monkeypatch.setitem(
+                rig.selected.policy._tools, tool_name,
+                replace(registered, owner="other_tracker_plugin"),
+            )
+        # Both raw results and the production ToolMessage form must fail closed.
+        for payload in (result, ToolMessage(content=json.dumps(result), tool_call_id="status")):
+            labels = classify_protected_result(tool_name, args, auth, decision, result=payload)
+            assert labels is not None
+            assert any(source.domain == "tracker_status" and source.principal is None
+                       and source.has_untrusted_active_ingest for source in labels.sources)
+            auth.ifc_state.merge(labels)
+            assert _effective_persisted_integrity(auth.ifc_state.current(), auth) == "untrusted"
+        assert tools.tracker_comment.func(
+            external_ref=args["external_ref"], body="Follow-up", runtime=SimpleNamespace(context=auth),
+        )["reason"] == "tainted_turn"
+    rig.finish()
 
 
 @pytest.mark.asyncio

@@ -1736,9 +1736,9 @@ def test_plugin_ci_results_do_not_reach_retained_receipt_guard(monkeypatch, tool
     import inspect
 
     source = inspect.getsource(access_control_module.classify_protected_result)
-    guard = '        if not retained_verified and not pr_lease_verified:\n            return _incomplete_protected_result('
+    guard = '        if not retained_verified and not pr_lease_verified:'
     assert source.count(guard) == 1
-    source = source.replace(guard, '        if False:\n            return _incomplete_protected_result(')
+    source = source.replace(guard, '        if False:')
     namespace = dict(vars(access_control_module))
     exec(compile(source, "<retained-receipt-mutant>", "exec"), namespace)
     monkeypatch.setitem(globals(), "classify_protected_result", namespace["classify_protected_result"])
