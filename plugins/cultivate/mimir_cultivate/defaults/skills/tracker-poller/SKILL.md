@@ -77,6 +77,12 @@ needed (ask with `tracker_comment`), one leaf, or one epic (`tracker_file_work`)
 whose work is already filed receives later activity as an `update`, which never files new
 work. A triaged issue that gets no reply is offered to the agent once more after 24 hours.
 
+When filing a leaf or epic, write acceptance criteria for the change and its tests,
+never for publication. Worklink commits, pushes and opens the PR after its gate, and
+adds the tracker closing line (`Closes #N` / `Fixes KEY`) itself. Put reviewer and
+PR-description requests from the tracker issue in Worklink notes, or describe the
+content to write to `.worklink-pr-body.md`; do not make them checklist items.
+
 Worklink links the resulting pull request to the issue. A leaf pull request starts with the
 tracker line: `Closes #N`, `Fixes ENG-123` or `Fixes PROJ-45`, and a Jira key also prefixes the
 title. An epic pull request is written by the feature factory, and Worklink adds the same line

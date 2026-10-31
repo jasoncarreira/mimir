@@ -35,7 +35,7 @@ permissions:
 jobs:
   build:
     name: Build sdist + wheel
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # The React app (mimir/react_app/dist/) is gitignored and force-included
@@ -80,7 +80,7 @@ jobs:
   publish:
     name: Publish to PyPI
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: pypi
       url: https://pypi.org/p/mimir-agent
@@ -115,7 +115,7 @@ jobs:
     # (e.g. ``main``), which would make ``gh release create main --verify-tag``
     # fail (or target the wrong ref). Only run this job on a ``v*`` tag push.
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write  # the only job that needs write; build/publish stay read
     steps:

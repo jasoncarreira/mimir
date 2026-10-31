@@ -404,5 +404,16 @@
       "tests/test_tracker_poller_gates.py": "659f9af81b36f00220a1f61307a5aa7fb9f1e699ebd0f34fcbe606401ea79bfe",
       "tests/tracker_poller_test_support.py": "453047e9f0be74fc7f52b2eb759a97dee145be81e99eb2b67618a71cd2d541fb"
     }
+  },
+  "2066-pr-publication": {
+    "tracker-poller": {
+      "SKILL.md": "85280a3ae701c3f9dc730ca671b24f6f0a2c320302f210038e50eea2e96b3578",
+      "pollers.json": "302a6f52658c593083ae6c78a13ed04f3fe39b0e5500713a43b17bbe2e6de403",
+      "scripts/poller.py": "f177d08fd7ab954e44f03b67aa279d317d0e272342f63bbdaec2027c4ed43c8e",
+      "tests/conftest.py": "5963113dc49b4b9df59427b3bf845254ed7275a8a10cb6bb77da1842aa23d6a4",
+      "tests/test_tracker_poller_cursor.py": "2c89eafaac1fe4197cd7ffe24125bac9d1fe47d1453fa687700cf831b1925bc1",
+      "tests/test_tracker_poller_gates.py": "659f9af81b36f00220a1f61307a5aa7fb9f1e699ebd0f34fcbe606401ea79bfe",
+      "tests/tracker_poller_test_support.py": "453047e9f0be74fc7f52b2eb759a97dee145be81e99eb2b67618a71cd2d541fb"
+    }
   }
 }

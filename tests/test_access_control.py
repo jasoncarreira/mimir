@@ -14330,6 +14330,7 @@ def test_every_project_test_configuration_refusal_is_named(
 def test_every_production_service_shell_pin_targets_outside_write_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
 ) -> None:
     home = tmp_path / "home"
     repo = tmp_path / "repo"
@@ -14338,11 +14339,10 @@ def test_every_production_service_shell_pin_targets_outside_write_roots(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
 
-    monkeypatch.setattr(
-        access_control,
-        "_MAINTENANCE_PINNED_EXECUTABLES",
-        access_control._MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS,
-    )
+    # These are deployment paths, not a promise about the host running pytest.
+    # Check the declaration independently of optional tools, symlinks, and
+    # executable permissions on that host; runtime validation is exercised below
+    # against executable files owned by the test fixture.
     write_roots = access_control._static_service_write_roots()
     assert home / "scratch" in write_roots
     assert Path("/tmp").resolve() in write_roots
@@ -14352,11 +14352,58 @@ def test_every_production_service_shell_pin_targets_outside_write_roots(
             resolved != root and not resolved.is_relative_to(root)
             for root in write_roots
         ), command
-        # Optional tools such as npm and gh are not installed in every test
-        # environment. When a production pin is present, also exercise the
-        # runtime validator; absent pins fail closed when the command is used.
-        if expected.exists():
-            assert access_control._maintenance_resolved_pin(command) == expected
+        assert access_control._maintenance_resolved_pin(command) == (
+            maintenance_pinned_executables[command]
+        )
+
+
+@pytest.mark.parametrize(
+    ("layout", "error"),
+    [
+        ("canonical", None),
+        ("missing", "maintenance_pinned_executable_missing"),
+        ("symlink", "expected a non-symlink executable"),
+        ("non_executable", "expected an executable regular file"),
+        ("directory", "expected an executable regular file"),
+        ("writable", "pin resolves within a configured service-writable root"),
+    ],
+)
+def test_service_shell_pin_validation_owns_executable_layout(
+    layout: str,
+    error: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    home.mkdir()
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    trusted = maintenance_pinned_executables["ls"]
+    expected = repo / "ls"
+    if layout == "canonical":
+        expected = trusted
+    elif layout == "symlink":
+        expected.symlink_to(trusted)
+    elif layout == "directory":
+        expected.mkdir()
+    elif layout in {"non_executable", "writable"}:
+        expected.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        expected.chmod(0o644 if layout == "non_executable" else 0o755)
+    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "ls", expected)
+
+    with caplog.at_level("ERROR", logger="mimir.access_control"):
+        actual = access_control._maintenance_resolved_pin("ls")
+
+    if error is None:
+        assert actual == trusted
+        assert "maintenance_pinned_executable_missing" not in caplog.text
+    else:
+        assert actual is None
+        assert error in caplog.text
 
 
 def test_service_shell_pin_inside_configured_write_root_fails_closed(

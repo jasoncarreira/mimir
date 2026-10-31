@@ -110,6 +110,35 @@ def test_provider_renders_default_work_order_without_override(tmp_path: Path) ->
     assert "Parent:" not in rendered
     assert "Implement the factory" in rendered
     assert "uv run pytest -q" in rendered
+    _assert_publication_rule(rendered)
+
+
+def _assert_publication_rule(order: str) -> None:
+    rule = next((line for line in order.splitlines() if line.startswith("- Worklink commits,")), "")
+    for phrase in (
+        "pushes the branch and opens the pull request after its gate passes",
+        "builder never pushes, calls `gh` or opens a PR itself",
+        "opening, titling or describing the PR",
+        "`.worklink-pr-body.md` / `.worklink-commit-subject`",
+        "PR publication criteria are never a reason for `WORKLINK_BLOCKED`",
+    ):
+        assert phrase in rule
+
+
+def test_default_work_order_publication_rule_mutation_is_detected(tmp_path: Path) -> None:
+    issue = orchestrator.IssueContext(1949, "Move coding", "Open a PR for review", {"worklink:ready"})
+    template = orchestrator._template_path(tmp_path)
+    original = template.read_text(encoding="utf-8")
+    lines = original.splitlines(keepends=True)
+    removed = [line for line in lines if line.startswith("- Worklink commits,")]
+    assert len(removed) == 1
+    mutated = tmp_path / "mutated-order.md"
+    mutated.write_text("".join(line for line in lines if line not in removed), encoding="utf-8")
+    rendered = orchestrator.render_work_order(
+        issue, template_path=mutated, backend_name="opencode", test_command="uv run pytest -q",
+    )
+    with pytest.raises(AssertionError):
+        _assert_publication_rule(rendered)
 
 
 def test_provider_runner_dry_run_uses_default_work_order(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
