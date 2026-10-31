@@ -55,7 +55,7 @@ def test_current_repository_skill_release_hash(name):
     version = {
         "github-poller": "2060-requested-comments",
         "review": "2049-review-tests",
-        "tracker-poller": "2507-epic-publication",
+        "tracker-poller": "2066-pr-publication",
     }.get(name, "0.9.10-2025")
     expected = releases[version][name]["SKILL.md"]
     actual = hashlib.sha256((SKILLS / name / "SKILL.md").read_bytes()).hexdigest()
@@ -92,7 +92,17 @@ def test_current_tracker_poller_release_inventory_is_complete():
     [skill] = [item for item in skills_for_candidates((candidate,))
                if item.name == "tracker-poller"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    assert skill_inventory(skill) == releases["2507-epic-publication"]["tracker-poller"]
+    assert skill_inventory(skill) == releases["2066-pr-publication"]["tracker-poller"]
+
+
+def test_tracker_poller_skill_publication_guidance() -> None:
+    text = (SKILLS / "tracker-poller/SKILL.md").read_text(encoding="utf-8")
+    assert "acceptance criteria for the change and its tests" in text
+    assert "never for publication" in text
+    assert "Worklink commits, pushes and opens the PR after its gate" in text
+    assert "adds the tracker closing line" in text
+    assert "Worklink notes" in text and "`.worklink-pr-body.md`" in text
+    assert "do not make them checklist items" in text
 
 
 def test_current_chainlink_orchestrator_release_inventory_is_complete():
@@ -101,7 +111,7 @@ def test_current_chainlink_orchestrator_release_inventory_is_complete():
                if item.name == "chainlink-orchestrator"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     assert skill_inventory(skill) == releases["2507-epic-publication"]["chainlink-orchestrator"]
-    assert list(releases)[-1] == "2507-epic-publication"
+    assert list(releases)[-1] == "2066-pr-publication"
 
 
 # The guard scans the shipped defaults, not test fixtures or cache files.
