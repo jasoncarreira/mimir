@@ -6,18 +6,21 @@ import asyncio
 from dataclasses import dataclass
 from io import BytesIO
 import json
+import os
 import re
 import subprocess
 import time
 from typing import Callable, Mapping
 
 from mimir.redaction import redact_text
+from mimir.pollers import _github_author_is_trusted
 from mimir_cultivate.ci import capture_job_log, clean_log_tail
 from mimir_cultivate.review_checks import approval_blocker
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 _SHA = re.compile(r"[0-9a-fA-F]{40}")
 _SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 
 
 @dataclass(frozen=True)
@@ -36,11 +39,54 @@ def _json(run: Runner, args: list[str]) -> object:
     return json.loads(result.stdout)
 
 
-def _head(run: Runner, pr_url: str) -> str:
+def _ready_actor(run: Runner, pr_url: str) -> str:
+    match = _PR.fullmatch(pr_url)
+    if match is None:
+        raise RuntimeError("ready PR identity is invalid")
+    repo, number = match.groups()
+    pages = _json(run, ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/issues/{number}/timeline?per_page=100"])
+    if not isinstance(pages, list) or not pages or any(not isinstance(page, list) for page in pages):
+        raise RuntimeError("ready PR actor timeline unavailable")
+    transitions = [event for page in pages for event in page
+                   if isinstance(event, Mapping) and event.get("event") in {"ready_for_review", "convert_to_draft"}]
+    if not transitions or transitions[-1].get("event") != "ready_for_review":
+        raise RuntimeError("ready PR actor could not be established")
+    actor = transitions[-1].get("actor")
+    login = actor.get("login") if isinstance(actor, Mapping) else None
+    if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,39}(?:\[bot\])?", login):
+        raise RuntimeError("ready PR actor could not be established")
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        auth = run(["gh", "auth", "token"], timeout=30)
+        token = auth.stdout.strip() if auth.returncode == 0 else ""
+    if _github_author_is_trusted(repo, login, token) is not True:
+        raise RuntimeError(f"ready PR actor {login} is not trusted or attestation unavailable")
+    return login
+
+
+def _pr_state(run: Runner, pr_url: str) -> tuple[str, bool]:
     data = _json(run, ["gh", "pr", "view", pr_url, "--json", "headRefOid,state,isDraft"])
-    if not isinstance(data, dict) or data.get("state") != "OPEN" or data.get("isDraft") is not True:
-        raise RuntimeError("draft PR is no longer open and draft")
-    return str(data.get("headRefOid", ""))
+    if not isinstance(data, dict) or data.get("state") != "OPEN":
+        raise RuntimeError("CI PR is closed or merged")
+    draft = data.get("isDraft")
+    if not isinstance(draft, bool):
+        raise RuntimeError("CI PR draft state is unavailable")
+    sha = data.get("headRefOid")
+    if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+        raise RuntimeError("CI PR head is unavailable")
+    if not draft:
+        _ready_actor(run, pr_url)
+        # The attestation and the head must describe the same live PR state.
+        live = _json(run, ["gh", "pr", "view", pr_url, "--json", "headRefOid,state,isDraft"])
+        if not isinstance(live, dict) or live.get("state") != "OPEN" or live.get("isDraft") is not False:
+            raise RuntimeError("CI PR state changed during ready handoff")
+        if live.get("headRefOid") != sha:
+            raise RuntimeError("PR head moved by another actor")
+    return sha, draft
+
+
+def _head(run: Runner, pr_url: str) -> str:
+    return _pr_state(run, pr_url)[0]
 
 
 def _actions_job(run: Runner, repo: str, sha: str, check: Mapping) -> int:
@@ -74,6 +120,9 @@ def _actions_job(run: Runner, repo: str, sha: str, check: Mapping) -> int:
 def _snapshot(run: Runner, repo: str, pr_url: str, sha: str) -> CIResult:
     if not _SHA.fullmatch(sha) or not _SLUG.fullmatch(repo):
         raise RuntimeError("invalid CI repository or pushed head")
+    match = _PR.fullmatch(pr_url)
+    if match is None or match[1].casefold() != repo.casefold():
+        raise RuntimeError("CI PR repository does not match pushed head repository")
     if _head(run, pr_url) != sha:
         return CIResult("moved", "PR head moved by another actor")
     pages = _json(run, ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/commits/{sha}/check-runs?per_page=100"])
@@ -189,13 +238,15 @@ async def rerun_infrastructure(run: Runner, repo: str, pr_url: str, sha: str, id
 
 
 async def ready_pr(run: Runner, pr_url: str, sha: str) -> None:
-    if await asyncio.to_thread(_head, run, pr_url) != sha:
+    live_head, draft = await asyncio.to_thread(_pr_state, run, pr_url)
+    if live_head != sha:
         raise RuntimeError("PR head moved before ready for review")
+    if not draft:
+        return  # A trusted reviewer already handed off this head.
     result = await asyncio.to_thread(run, ["gh", "pr", "ready", pr_url], timeout=30)
     if result.returncode != 0:
         raise RuntimeError("could not mark PR ready for review: " + redact_text((result.stderr or result.stdout)[:500]))
     live = await asyncio.to_thread(_json, run, ["gh", "pr", "view", pr_url, "--json", "headRefOid,state,isDraft"])
     if (not isinstance(live, Mapping) or live.get("headRefOid") != sha
             or live.get("state") != "OPEN" or live.get("isDraft") is not False):
-        await asyncio.to_thread(run, ["gh", "pr", "ready", "--undo", pr_url], timeout=30)
         raise RuntimeError("PR head moved while marking ready for review")
