@@ -137,6 +137,7 @@ def forge(issue_id: int, *, body: str | None = None, state: str = "closed", merg
         "merged_at": MERGED_AT if merged else None,
         "merge_commit_sha": MERGE_SHA if merged else merge_sha,
         "base": {"repo": {"full_name": slug}, "ref": base},
+        "head": {"sha": "a" * 40},
     }
 
     def run(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -499,6 +500,57 @@ def test_unready_latest_attempt_cannot_close(
     tracker = Tracker(1295)
     assert closure.reconcile_merged_leaves(
         home, chainlink_runner=tracker, gh_runner=forge(1295, body=""), git_runner=git_runner(repo),
+    ) == []
+    assert tracker.status == "open"
+
+
+@pytest.mark.parametrize(("status", "label", "reason"), [
+    ("completed", "worklink:in-progress", None),
+    ("blocked", "worklink:blocked", "ready PR actor reviewer is not trusted or attestation unavailable"),
+    ("blocked", "worklink:blocked", "CI PR is closed or merged"),
+])
+def test_merged_ci_phase_leaf_closes_and_clears_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str, label: str, reason: str | None,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 2069, status=status, review_ready=False if status == "blocked" else None)
+    payload = json.loads(path.read_text())
+    payload.update(gate_mode="ci", head_sha="a" * 40)
+    if reason:
+        payload["blocked_reason"] = reason
+    path.write_text(json.dumps(payload))
+    tracker = Tracker(2069, labels={label})
+    assert [outcome.issue_id for outcome in closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(2069), git_runner=git_runner(repo),
+    )] == [2069]
+    assert tracker.status == "closed"
+    assert label not in tracker.labels
+    assert unresolved_reasons(home) == []
+
+
+@pytest.mark.parametrize("defect", ["not_merged", "head", "reason", "gate", "other_label", "competing_label"])
+def test_ci_phase_merge_refuses_unqualified_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 2069, status="blocked", review_ready=False)
+    payload = json.loads(path.read_text())
+    payload.update(gate_mode="ci", head_sha="a" * 40,
+                   blocked_reason="ready PR actor reviewer is not trusted or attestation unavailable")
+    if defect == "head":
+        payload["head_sha"] = "b" * 40
+    if defect == "reason":
+        payload["blocked_reason"] = "different failure"
+    if defect == "gate":
+        payload["gate_mode"] = "local"
+    path.write_text(json.dumps(payload))
+    labels = ({"worklink:ready"} if defect == "other_label" else
+              {"worklink:blocked", "worklink:ready"} if defect == "competing_label" else
+              {"worklink:blocked"})
+    tracker = Tracker(2069, labels=labels)
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(2069, state="open", merged=False) if defect == "not_merged" else forge(2069),
+        git_runner=git_runner(repo),
     ) == []
     assert tracker.status == "open"
 

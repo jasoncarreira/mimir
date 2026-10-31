@@ -26,7 +26,7 @@ A, B, PR = "a" * 40, "b" * 40, "https://github.com/acme/widget/pull/1"
 
 
 class Forge:
-    def __init__(self, heads: dict[str, list[dict]], *, change_head: bool = False):
+    def __init__(self, heads: dict[str, list[dict]], *, change_head: bool = False, ready_at: int | None = None):
         self.heads = heads
         self.head = A
         self.current = {sha: 0 for sha in heads}
@@ -36,15 +36,20 @@ class Forge:
         self.reruns = 0
         self.change_head = change_head
         self.reads = 0
+        self.ready_at = ready_at
+        self.state = "OPEN"
+        self.actor = "reviewer"
 
     def __call__(self, args, **kw):
         result: object = ""
         if args[:3] == ["gh", "pr", "view"]:
             if "headRefOid" in args[-1]:
                 self.reads += 1
+                if self.ready_at is not None and self.reads >= self.ready_at:
+                    self.ready = True
                 if self.change_head and self.reads >= 2:
                     self.head = B
-                result = {"headRefOid": self.head, "state": "OPEN", "isDraft": not self.ready}
+                result = {"headRefOid": self.head, "state": self.state, "isDraft": not self.ready}
             else:
                 result = {"body": self.body}
         elif args[:2] == ["gh", "api"]:
@@ -56,6 +61,8 @@ class Forge:
                 check = rows[index]
                 # A pair of reads (check-runs and statuses) constitutes one poll.
                 result = [{"total_count": 1, "check_runs": [check]}]
+            elif "/timeline?" in path:
+                result = [[{"event": "ready_for_review", "actor": {"login": self.actor}}]]
             elif "/statuses?" in path:
                 sha = path.split("/commits/")[1].split("/")[0]
                 self.current[sha] += 1
@@ -81,6 +88,8 @@ class Forge:
         elif args[:3] == ["gh", "pr", "ready"]:
             self.ready_calls += 1
             self.ready = "--undo" not in args
+        elif args[:3] == ["gh", "auth", "token"]:
+            result = "test-token"
         elif args[:2] == ["git", "-C"]:
             if "status" in args:
                 result = ""
@@ -103,7 +112,7 @@ def fake_job_logs(monkeypatch):
     monkeypatch.setattr(ci_gate, "capture_job_log", lambda *a, **kw: (b"test failed in job log", ""))
 
 
-@pytest.mark.parametrize("scenario", ["green", "repair", "exhausted", "infrastructure", "registry", "timeout", "moved", "stopped", "quick_failure", "local"])
+@pytest.mark.parametrize("scenario", ["green", "repair", "exhausted", "infrastructure", "registry", "timeout", "moved", "stopped", "quick_failure", "local", "trusted_handoff", "trusted_repair", "untrusted_handoff", "closed", "merged"])
 @pytest.mark.asyncio
 async def test_ci_publication_scenarios(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str) -> None:
     started = datetime.now(UTC)
@@ -112,15 +121,19 @@ async def test_ci_publication_scenarios(tmp_path: Path, monkeypatch: pytest.Monk
     elif scenario == "registry":
         heads = {A: [check("failure"), check("failure")]}
         monkeypatch.setattr(ci_gate, "capture_job_log", lambda *a, **kw: (b"toomanyrequests", ""))
-    elif scenario == "green":
+    elif scenario in ("green", "trusted_handoff", "untrusted_handoff", "closed", "merged"):
         heads = {A: [check("success")]}
-    elif scenario in ("repair", "exhausted"):
-        heads = {A: [check("failure", output="test failed"), check("failure")], B: [check("success" if scenario == "repair" else "failure")]}
+    elif scenario in ("repair", "exhausted", "trusted_repair"):
+        heads = {A: [check("failure", output="test failed"), check("failure")], B: [check("success" if scenario != "exhausted" else "failure")]}
     elif scenario == "timeout":
         heads = {A: [{**check("failure"), "status": "in_progress", "conclusion": None}]}
     else:
         heads = {A: [check("success")], B: [check("success")]}
-    forge = Forge(heads, change_head=scenario == "moved")
+    forge = Forge(heads, change_head=scenario == "moved", ready_at=2 if scenario in ("trusted_handoff", "trusted_repair", "untrusted_handoff") else None)
+    if scenario in ("closed", "merged"):
+        forge.state = "CLOSED" if scenario == "closed" else "MERGED"
+    if scenario in ("trusted_handoff", "trusted_repair", "untrusted_handoff"):
+        monkeypatch.setattr(ci_gate, "_github_author_is_trusted", lambda repo, actor, token: scenario != "untrusted_handoff")
     claim = ClaimRecord(2050, 1, "agent", started)
     claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=forge)
     worker = orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path)
@@ -183,7 +196,7 @@ async def test_ci_publication_scenarios(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr(orchestrator, "_with_head_sha", lambda value, *a, **kw: replace(value, evidence=replace(value.evidence, head_sha=B if len(pushed) > 1 else A)))
     monkeypatch.setattr(orchestrator, "_open_pr", lambda *a, **kw: opened.append(kw.get("draft", False)) or PR)
     monkeypatch.setattr(orchestrator, "_cleanup_checkout_after_transition", lambda *a, **kw: None)
-    if scenario in ("repair", "exhausted"):
+    if scenario in ("repair", "exhausted", "trusted_repair"):
         monkeypatch.setattr(orchestrator, "_persist_run_state", lambda *a, **kw: None)
         def push(*a, **kw):
             pushed.append(forge.head)
@@ -203,16 +216,16 @@ async def test_ci_publication_scenarios(tmp_path: Path, monkeypatch: pytest.Monk
         terminal_release=orchestrator._TerminalClaimRelease(claims, home=tmp_path, issue_id=2050, attempt=1),
         gate_mode="local" if scenario == "local" else "ci",
     )
-    expected = {"green": "completed", "repair": "completed", "local": "completed", "quick_failure": "failed",
+    expected = {"green": "completed", "repair": "completed", "trusted_handoff": "completed", "trusted_repair": "completed", "local": "completed", "quick_failure": "failed",
                 "stopped": "stopped"}.get(scenario, "blocked")
     assert result.status == expected, result.reason
     assert result.review_ready is (expected == "completed")
     assert opened == ([] if scenario == "quick_failure" else [scenario != "local"])
-    assert forge.ready is (expected == "completed" and scenario != "local")
+    assert forge.ready is ((expected == "completed" and scenario != "local") or scenario == "untrusted_handoff")
     evidence = json.loads(result.evidence_path.read_text())
     if scenario not in ("local", "quick_failure"):
         assert evidence["gate_mode"] == "ci"
-    if scenario in ("repair", "exhausted"):
+    if scenario in ("repair", "exhausted", "trusted_repair"):
         assert evidence["ci_repair_rounds"] == 1
         assert len(repair_prompts) == 1
         assert "candidate (linux)" in repair_prompts[0]
@@ -224,6 +237,12 @@ async def test_ci_publication_scenarios(tmp_path: Path, monkeypatch: pytest.Monk
         assert not repair_prompts
     if scenario == "moved":
         assert "moved" in result.reason
+    if scenario in ("trusted_handoff", "trusted_repair", "untrusted_handoff"):
+        assert forge.ready_calls == 0
+    if scenario == "untrusted_handoff":
+        assert "reviewer" in result.reason and "not trusted" in result.reason
+    if scenario in ("closed", "merged"):
+        assert "closed or merged" in result.reason
 
 
 def test_ci_gate_inventory_and_defaults(tmp_path: Path) -> None:
@@ -303,7 +322,55 @@ async def test_ready_does_not_accept_changed_head_after_transition() -> None:
     forge = Forge({A: [check("success")], B: [check("failure")]}, change_head=True)
     with pytest.raises(RuntimeError, match="head moved"):
         await ci_gate.ready_pr(forge, PR, A)
-    assert not forge.ready
+    assert forge.ready  # Do not undo a ready transition on a head we no longer own.
+
+
+@pytest.mark.parametrize(("events", "trust", "reason"), [
+    ([{"event": "ready_for_review", "actor": {}}], True, "could not be established"),
+    ([{"event": "ready_for_review", "actor": {"login": "reviewer"}},
+                  {"event": "convert_to_draft", "actor": {"login": "reviewer"}}], True, "could not be established"),
+    ([{"event": "ready_for_review", "actor": {"login": "reviewer"}}], None, "attestation unavailable"),
+])
+@pytest.mark.asyncio
+async def test_ready_actor_requires_current_attested_transition(
+    monkeypatch: pytest.MonkeyPatch, events: list[dict], trust: bool | None, reason: str,
+) -> None:
+    forge = Forge({A: [check("success")]}, ready_at=1)
+    monkeypatch.setattr(ci_gate, "_github_author_is_trusted", lambda repo, login, token: trust)
+
+    def run(args, **kwargs):
+        if args[:2] == ["gh", "api"] and "/timeline?" in args[-1]:
+            return subprocess.CompletedProcess(args, 0, json.dumps([events]), "")
+        return forge(args, **kwargs)
+
+    result = await ci_gate.wait_for_ci(run, "acme/widget", PR, A, timeout_s=1, stopped=lambda: False)
+    assert result.outcome == "error" and reason in result.reason
+    assert forge.ready_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_ready_head_change_during_attestation_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    forge = Forge({A: [check("success")], B: [check("success")]}, ready_at=1)
+    monkeypatch.setattr(ci_gate, "_github_author_is_trusted", lambda repo, login, token: True)
+
+    def run(args, **kwargs):
+        if args[:2] == ["gh", "api"] and "/timeline?" in args[-1]:
+            forge.head = B
+        return forge(args, **kwargs)
+
+    result = await ci_gate.wait_for_ci(run, "acme/widget", PR, A, timeout_s=1, stopped=lambda: False)
+    assert result.outcome == "error" and "head moved" in result.reason
+
+
+@pytest.mark.asyncio
+async def test_ci_watch_refuses_pr_from_other_repository() -> None:
+    forge = Forge({A: [check("success")]})
+    result = await ci_gate.wait_for_ci(
+        forge, "acme/widget", "https://github.com/other/widget/pull/1", A,
+        timeout_s=1, stopped=lambda: False,
+    )
+    assert result.outcome == "error" and "repository does not match" in result.reason
+    assert forge.reads == 0
 
 
 @pytest.mark.parametrize("verified", [True, False])

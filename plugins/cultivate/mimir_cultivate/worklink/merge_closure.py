@@ -75,6 +75,7 @@ class PrSnapshot:
     merge_commit_sha: str | None
     base_slug: str
     base_ref: str
+    head_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,8 @@ class AssociationDecision:
     completed_evidence_paths: tuple[Path, ...]
     active_base_refs: tuple[str, ...] = ()
     reason: str | None = None
+    ci_handoff_head: str | None = None
+    ci_handoff_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -313,6 +316,7 @@ def read_pr_snapshot(pr_url: str, *, gh_bin: str, runner: Runner) -> PrSnapshot:
         canonical_url, slug, number, body if isinstance(body, str) else "", state, merged, merged_at,
         merge_sha.lower() if isinstance(merge_sha, str) else None,
         base_slug.lower(), base_ref,
+        (payload.get("head") or {}).get("sha") if isinstance(payload.get("head"), dict) else None,
     )
 
 
@@ -325,6 +329,8 @@ def discover_associations(home: Path, issue: IssueSnapshot) -> AssociationDecisi
     latest_attempt = 0
     latest_url: str | None = None
     latest_ready = False
+    ci_handoff_head: str | None = None
+    ci_handoff_url: str | None = None
     if evidence_dir.exists():
         if not evidence_dir.is_dir():
             raise ClosureReadError("evidence path is not a directory")
@@ -375,11 +381,23 @@ def discover_associations(home: Path, issue: IssueSnapshot) -> AssociationDecisi
                 latest_attempt = attempt
                 latest_url = url
                 latest_ready = qualifies
+                # Only a published CI head, waiting for review or blocked by
+                # this ready/merge race, can bypass the review lifecycle on merge.
+                head = payload.get("head_sha")
+                blocked_reason = payload.get("blocked_reason")
+                ci_handoff_head = head if (
+                    url is not None and payload.get("gate_mode") == "ci"
+                    and isinstance(head, str) and re.fullmatch(r"[0-9a-fA-F]{40}", head)
+                    and (status == "completed" and ready is not False or
+                         status == "blocked" and ready is False and isinstance(blocked_reason, str)
+                         and blocked_reason.startswith(("ready PR actor", "CI PR is closed or merged")))
+                ) else None
+                ci_handoff_url = url if ci_handoff_head is not None else None
     return AssociationDecision(
         latest_url if latest_ready else None, tuple(paths), tuple(digests), tuple(completed),
         tuple(base_refs), None if latest_ready else (
             "missing_review_ready_publication" if latest_attempt else "missing_pr_association"
-        ),
+        ), ci_handoff_head, ci_handoff_url,
     )
 
 
@@ -493,11 +511,16 @@ def _validate_qualification(
     *, issue: IssueSnapshot, pr: PrSnapshot, repository: RepositoryConfig,
     association: AssociationDecision,
 ) -> str | None:
-    if reason := _lifecycle_reason(issue):
+    ci_merged = (pr.merged and association.ci_handoff_head is not None
+                 and pr.head_sha == association.ci_handoff_head
+                 and issue.is_open and "worklink:epic" not in issue.labels
+                 and bool(issue.labels & {"worklink:blocked", "worklink:in-progress"})
+                 and "worklink:ready" not in issue.labels)
+    if not ci_merged and (reason := _lifecycle_reason(issue)):
         return reason
-    if association.reason:
+    if association.reason and not ci_merged:
         return association.reason
-    if association.pr_url != pr.url:
+    if (association.pr_url if not ci_merged else association.ci_handoff_url) != pr.url:
         return "association_changed"
     if pr.slug != repository.slug or pr.base_slug != repository.slug:
         return "repository_identity_mismatch"
@@ -752,9 +775,12 @@ def _process_intent(
                 reason="cleanup_refused_reopened", detail="verified-closed issue was reopened; review label retained",
             )
             return None
-        if "worklink:review" in issue.labels:
+        cleanup_label = ("worklink:review" if "worklink:review" in issue.labels else
+                         "worklink:blocked" if association.ci_handoff_head and "worklink:blocked" in issue.labels else
+                         "worklink:in-progress" if association.ci_handoff_head and "worklink:in-progress" in issue.labels else None)
+        if cleanup_label is not None:
             _update_intent(state_dir, key, stage="cleanup_pending")
-            result = _run_tracker(chainlink_runner, "unlabel", str(issue_id), "worklink:review")
+            result = _run_tracker(chainlink_runner, "unlabel", str(issue_id), cleanup_label)
             if result.returncode != 0:
                 _notice(
                     state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
@@ -769,7 +795,7 @@ def _process_intent(
                     reason="cleanup_read_failed", detail=str(verify_exc),
                 )
                 return None
-            if issue.is_open or "worklink:review" in issue.labels:
+            if issue.is_open or cleanup_label in issue.labels:
                 _notice(
                     state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
                     reason="cleanup_verification_failed", detail="review label absence was not verified",
@@ -864,14 +890,17 @@ def reconcile_merged_leaves(
                 issue = _read_issue(issue_id, chainlink_runner)
                 if "worklink:review" not in issue.labels:
                     association = discover_associations(home, issue)
-                    if association.pr_url is None and association.reason == "missing_pr_association":
+                    ci_candidate = (association.ci_handoff_head is not None and
+                                    bool(issue.labels & {"worklink:blocked", "worklink:in-progress"}))
+                    if association.pr_url is None and not ci_candidate and association.reason == "missing_pr_association":
                         if not dry_run:
                             resolve_merge_reconciliation_notices(
                                 state_dir, issue_id=issue_id, pr_url=None,
                             )
                         continue
-                    raise ClosureReadError("review_lifecycle_required")
-                if lifecycle_reason := _lifecycle_reason(issue):
+                    if not ci_candidate:
+                        raise ClosureReadError("review_lifecycle_required")
+                if "worklink:review" in issue.labels and (lifecycle_reason := _lifecycle_reason(issue)):
                     if lifecycle_reason == "epic_not_leaf" and not dry_run:
                         _request_epic_closure(
                             home, issue, repository=repository,
@@ -885,10 +914,11 @@ def reconcile_merged_leaves(
                             state_dir, issue_id=issue_id, pr_url=None,
                         )
                     continue
-                if association.reason:
+                if association.reason and association.ci_handoff_head is None:
                     raise ClosureReadError(association.reason)
-                assert association.pr_url is not None
-                pr = read_pr_snapshot(association.pr_url, gh_bin=gh_bin, runner=gh_runner)
+                pr_url = association.pr_url or association.ci_handoff_url
+                assert pr_url is not None
+                pr = read_pr_snapshot(pr_url, gh_bin=gh_bin, runner=gh_runner)
                 reason = _validate_qualification(
                     issue=issue, pr=pr, repository=repository, association=association,
                 )
