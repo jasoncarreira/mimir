@@ -2778,7 +2778,7 @@ def test_worker_attempt_removes_private_basetemp_via_worker_command(
         original_remove(path)
 
     monkeypatch.setattr(orch, "rmtree_missing_ok", controller_remove)
-    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setenv("MIMIR_PLUGINS", "cultivate")
     monkeypatch.setattr(orch, "get_identities", lambda: SimpleNamespace(worklink_uid=4242))
     monkeypatch.setattr(orch, "_create_backend_checkout", lambda *a, **kw: CheckoutLease(
         441, 1, repo, checkout, "issue/441-a1", "main", isolated_checkout=True,
@@ -2792,6 +2792,11 @@ def test_worker_attempt_removes_private_basetemp_via_worker_command(
             if spec.local_argv and spec.local_argv[0] == "/bin/sh":
                 worker_commands.append(spec)
             return await super().launch(spec)
+
+        async def _launch_contained(self, spec: WorkSpec, argv: tuple[str, ...]) -> LaunchHandle:
+            # Cultivate runs gate commands through the contained launcher.
+            assert argv == tuple(spec.local_argv)
+            return await self.launch(spec)
 
         async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
             spec = self.specs[-1]
