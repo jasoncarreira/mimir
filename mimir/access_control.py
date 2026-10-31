@@ -3258,6 +3258,12 @@ _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS = {
     "date": Path("/usr/bin/date"),
 }
 _MAINTENANCE_PINNED_EXECUTABLES = _MAINTENANCE_PINNED_EXECUTABLE_DEFAULTS.copy()
+# Ubuntu 26.04 uutils installs these applets as links to its multi-call binary.
+# Only this exact binary location and these read-only applets may use that form.
+_MAINTENANCE_COREUTILS_APPLETS = frozenset({
+    "ls", "grep", "wc", "pwd", "cat", "head", "tail", "stat", "date",
+})
+_MAINTENANCE_COREUTILS_MULTICALL_TARGETS = frozenset({Path("/usr/bin/coreutils")})
 _MAINTENANCE_PINNED_SCRIPT_INTERPRETERS = {
     "npm": "node",
 }
@@ -3577,6 +3583,53 @@ def _maintenance_pin_is_service_writable(expected: Path) -> bool:
         return True
 
 
+def _maintenance_trusted_multicall_link(command: str, expected: Path, resolved: Path) -> bool:
+    """Allow only a root-controlled applet link to the known uutils binary.
+
+    Reject intermediate links (including in the target path) and writable
+    directories: exec uses the *real target*, not a second traversal through
+    the applet link. Thus neither the link nor its target can be redirected by
+    the service between authorization and execution. Root is the trust anchor.
+    """
+    if (
+        command not in _MAINTENANCE_COREUTILS_APPLETS
+        or expected.name != command
+        or resolved not in _MAINTENANCE_COREUTILS_MULTICALL_TARGETS
+        or not expected.is_absolute()
+    ):
+        return False
+    link_target = Path(os.readlink(expected))
+    if (expected.parent / link_target if not link_target.is_absolute() else link_target) != resolved:
+        return False
+    roots = _static_service_write_roots()
+    for path, terminal_link in ((expected, True), (resolved, False)):
+        component = Path("/")
+        for part in ("", *path.parts[1:]):
+            if part:
+                component /= part
+            metadata = component.lstat()
+            if any(component == root or component.is_relative_to(root) for root in roots):
+                return False
+            if metadata.st_uid != 0:
+                return False
+            if component == path:
+                if terminal_link:
+                    if not stat.S_ISLNK(metadata.st_mode):
+                        return False
+                elif (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or not os.access(component, os.X_OK)
+                ):
+                    return False
+            elif (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                return False
+    return True
+
+
 def _maintenance_resolved_pin(command: str) -> Path | None:
     """Validate one pin as a trusted executable outside service-writable roots."""
     expected = _MAINTENANCE_PINNED_EXECUTABLES.get(command)
@@ -3592,8 +3645,10 @@ def _maintenance_resolved_pin(command: str) -> Path | None:
         return None
     try:
         resolved = expected.resolve(strict=True)
-        if resolved != expected:
-            raise OSError("expected a non-symlink executable")
+        if resolved != expected and not _maintenance_trusted_multicall_link(
+            command, expected, resolved,
+        ):
+            raise OSError("expected a non-symlink executable or trusted coreutils applet link")
         if not resolved.is_file() or not os.access(resolved, os.X_OK):
             raise OSError("expected an executable regular file")
         if _maintenance_pin_is_service_writable(resolved):
@@ -3622,8 +3677,10 @@ def _maintenance_pinned_execution_argv_with_reason(
 
     Service commands execute with ``shell=False``, but a bare ``argv[0]``
     would still be selected through PATH. Bind every admitted executable to a
-    fixed regular file outside every configured service-writable root. Script
-    pins also name their pinned interpreter explicitly, so their shebang cannot
+    fixed regular file outside every configured service-writable root. A trusted
+    uutils applet link executes the validated real binary with the applet name
+    as its first argument; the symlink is never followed again at exec time.
+    Script pins also name their pinned interpreter explicitly, so their shebang cannot
     reintroduce PATH resolution below the authorized argv.
 
     Returns the pinned argv and ``""``, or ``None`` and why pinning refused.
@@ -3636,8 +3693,8 @@ def _maintenance_pinned_execution_argv_with_reason(
     if expected is None:
         return None, (
             f"the executable {command!r} has no trusted pinned path for service "
-            "execution. A pin must resolve to a regular file that is not a "
-            "symlink and lies outside every service-writable root, so the "
+            "execution. A pin must resolve to a regular file (or a trusted "
+            "coreutils applet link) outside every service-writable root, so the "
             "program cannot be swapped between authorization and execution."
         )
     interpreter_command = _MAINTENANCE_PINNED_SCRIPT_INTERPRETERS.get(command)
@@ -3649,6 +3706,8 @@ def _maintenance_pinned_execution_argv_with_reason(
                 f"the script {command!r} could not be resolved to a trusted path."
             )
         return [str(interpreter), str(expected), *argv[1:]], ""
+    if expected != _MAINTENANCE_PINNED_EXECUTABLES[command]:
+        return [str(expected), command, *argv[1:]], ""
     return [str(expected), *argv[1:]], ""
 
 
