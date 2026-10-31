@@ -852,7 +852,7 @@ _MEMBERSHIPS = MappingProxyType({
 _ACTIONS = MappingProxyType({
     **{name: RepoPRAction.INSPECT for name in _names("""pr_metadata pr_spec pr_files
         pr_diff pr_file_content pr_checks pr_job_log pr_reviews pr_comments pr_review_requests
-         repo_status repo_diff repo_file_at_revision repo_unmerged""")},
+        repo_status repo_diff repo_file_at_revision repo_unmerged""")},
     **{name: RepoPRAction.CHECKOUT for name in _names("repo_checkout repo_cleanup repo_fetch")},
     "repo_test": RepoPRAction.TEST,
     **{name: RepoPRAction.WRITE for name in _names("repo_restore_file repo_stage repo_merge_abort repo_rebase_abort repo_revert_abort")},
