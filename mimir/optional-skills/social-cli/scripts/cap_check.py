@@ -52,6 +52,7 @@ the two scripts independently (cap check vs. divergence audit).
 
 from __future__ import annotations
 
+import argparse
 import datetime
 import glob
 import os
@@ -158,6 +159,7 @@ def count_ledger(home: Path, today: str) -> int | None:
                 "--platform", "bsky",
                 "--action", "post",
                 "--since", today,
+                "--until", (datetime.date.fromisoformat(today) + datetime.timedelta(days=1)).isoformat(),
             ],
             capture_output=True,
             text=True,
@@ -182,9 +184,13 @@ LEDGER_UNAVAILABLE = 3
 ARCHIVE_UNREADABLE = 4
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Cross-check today's social post cap")
+    parser.add_argument("--today", type=datetime.date.fromisoformat,
+                        help="UTC day supplied by the dispatcher (YYYY-MM-DD)")
+    args = parser.parse_args(argv)
     home = _home()
-    today = _today_str()
+    today = args.today.isoformat() if args.today else _today_str()
     archive_count, archive_unreadable = count_archive(home, today)
     ledger_count = count_ledger(home, today)
 

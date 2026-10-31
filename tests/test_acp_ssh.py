@@ -16,6 +16,17 @@ from mimir.acp.proxy import ProxyRouter
 from mimir.acp.ssh import SSH_PATH, SshError, build_ssh_argv, child_environment, run_ssh_proxy, stop_child
 
 
+@pytest.fixture(autouse=True)
+def _child_exit_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give a fake ``ssh`` child a loose hang guard to exit after its stdin closes.
+
+    The fake is a real Python process, and interpreter startup alone can exceed the production
+    1s grace on a loaded host, which surfaced as ``SSH child did not exit``. Tests that exercise
+    the grace itself, or whose child ignores EOF, set their own short value after this.
+    """
+    monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 30.0)
+
+
 def remote_profile(tmp_path: Path) -> tuple[Profile, Path]:
     ssh = tmp_path / "ssh"
     ssh.write_text("")
@@ -614,6 +625,8 @@ async def test_actual_subprocess_cancellation_terminates_child(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, feed_auth: bool,
 ) -> None:
     profile, _ = remote_profile(tmp_path)
+    # The child ignores EOF, so the grace before SIGTERM only delays the path under test.
+    monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
     marker = tmp_path / "terminated"
     ssh = _fake_ssh(tmp_path, f"MARKER = {str(marker)!r}\n" + """
 import os,signal,sys,time

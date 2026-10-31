@@ -52,7 +52,7 @@ jobs:
           npm run build
           test -f mimir/react_app/dist/index.html
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
       - name: Set up Python
         run: uv python install 3.11
       - name: Build distributions
@@ -96,7 +96,7 @@ jobs:
           name: dist
           path: dist/
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # release/v1
         # Trusted publishing — no ``password`` / ``username`` /
         # ``api_token`` needed. PyPI verifies the OIDC claim against
         # the pending-publisher config registered for this project.
