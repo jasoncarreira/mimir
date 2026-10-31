@@ -84,7 +84,18 @@ def test_current_github_poller_release_inventory_is_complete():
     [skill] = [item for item in skills_for_candidates((candidate,))
                if item.name == "github-poller"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    assert skill_inventory(skill) == releases["2060-requested-comments"]["github-poller"]
+    assert skill_inventory(skill) == releases["2072-history-files"]["github-poller"]
+
+
+def test_history_file_defaults_are_released_for_both_pollers():
+    releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
+    skills = skills_for_candidates(enabled_plugins(enable="cultivate"))
+    for skill in skills:
+        if skill.name not in {"github-poller", "github-ci-watch"}:
+            continue
+        assert skill_inventory(skill) == releases["2072-history-files"][skill.name]
+        capabilities = json.loads((SKILLS / skill.name / "pollers.json").read_text())["pollers"][0]["authority"]["capabilities"]
+        assert {"repo_restore_file", "repo_file_at_revision"} <= set(capabilities)
 
 
 def test_current_tracker_poller_release_inventory_is_complete():
@@ -111,7 +122,7 @@ def test_current_chainlink_orchestrator_release_inventory_is_complete():
                if item.name == "chainlink-orchestrator"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
     assert skill_inventory(skill) == releases["2070-reaper-default"]["chainlink-orchestrator"]
-    assert list(releases)[-1] == "2070-reaper-default"
+    assert list(releases)[-1] == "2072-history-files"
 
 
 # The guard scans the shipped defaults, not test fixtures or cache files.

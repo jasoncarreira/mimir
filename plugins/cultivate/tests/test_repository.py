@@ -39,7 +39,7 @@ def test_repository_implementation_is_owned_by_provider() -> None:
         assert not (root / retired).exists()
     assert {tool.name for tool in repository.REPO_TOOLS} == {
         "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
-        "repo_diff", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge",
+        "repo_diff", "repo_file_at_revision", "repo_restore_file", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge",
         "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
         "repo_revert_abort", "repo_push",
     }
