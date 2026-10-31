@@ -34,7 +34,7 @@ def test_registered_descriptor_shape(name, selected) -> None:
     assert tool.owner == "cultivate"
     assert tool.flow == "sink" and tool.tier == "scoped-with-provenance"
     assert tool.operation_class == "resource_scoped" and tool.resource_scope == "tracker_issue"
-    assert tool.typed_action is None and tool.result_domain is None
+    assert tool.typed_action is None and tool.result_domain == "tracker_status"
     assert tool.writes_code_or_state is True
     assert tool.descriptor.sink_category == SinkCategory.FORGE
     assert tool.descriptor.sink_destination == "bound_tracker_issue"
@@ -72,7 +72,7 @@ def test_custom_and_heartbeat_profiles_exclude_tracker_tools(selected) -> None:
 
 def test_tracker_tools_are_in_no_other_table() -> None:
     for name in TRACKER:
-        assert name not in policy._ACTIONS and name not in policy._RESULT_DOMAIN
+        assert name not in policy._ACTIONS and name in policy._RESULT_DOMAIN["tracker_status"]
         assert name not in policy._HEARTBEAT
         assert all(name not in names for names in policy._MEMBERSHIPS.values())
         assert name in policy._WRITES

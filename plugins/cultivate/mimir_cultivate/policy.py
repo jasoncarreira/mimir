@@ -810,6 +810,8 @@ _TIER = MappingProxyType({
 })
 _RESULT_DOMAIN = MappingProxyType({
     "worklink": frozenset(_BUILDS), "coding_worker": _names("spawn_open_code"),
+    # Only the three bound, fixed-shape tracker status writers have this label.
+    "tracker_status": TRACKER_TOOL_NAMES,
     "repository": _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks
         pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests
         pr_submit_review pr_inline_review_comment pr_comment pr_edit_body issue_comment
