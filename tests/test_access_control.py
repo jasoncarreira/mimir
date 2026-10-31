@@ -9,6 +9,7 @@ import sys
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta
@@ -14404,6 +14405,126 @@ def test_service_shell_pin_validation_owns_executable_layout(
     else:
         assert actual is None
         assert error in caplog.text
+
+
+@pytest.fixture
+def coreutils_pin_layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Model root-owned /usr paths with fixture-owned files, independent of uid/host."""
+    bin_dir = tmp_path / "bin"
+    lib_dir = tmp_path / "lib"
+    writable = tmp_path / "writable"
+    for directory in (bin_dir, lib_dir, writable):
+        directory.mkdir()
+    target = lib_dir / "coreutils"
+    target.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\"\n", encoding="utf-8")
+    target.chmod(0o755)
+    link = bin_dir / "ls"
+    link.symlink_to(target)
+    overrides: dict[Path, tuple[int, int | None]] = {}
+    original_lstat = Path.lstat
+
+    def simulated_lstat(path: Path, *args, **kwargs):
+        observed = original_lstat(path, *args, **kwargs)
+        if path == tmp_path or path.is_relative_to(tmp_path) or tmp_path.is_relative_to(path):
+            mode = observed.st_mode
+            if stat.S_ISDIR(mode):
+                mode &= ~(stat.S_IWGRP | stat.S_IWOTH)
+            uid, mode_override = overrides.get(path, (0, None))
+            values = list(observed)
+            values[0] = mode if mode_override is None else mode_override
+            values[4] = uid
+            return os.stat_result(values)
+        return observed
+
+    monkeypatch.setattr(Path, "lstat", simulated_lstat)
+    monkeypatch.setattr(access_control, "_static_service_write_roots", lambda: [writable])
+    monkeypatch.setattr(
+        access_control, "_MAINTENANCE_COREUTILS_MULTICALL_TARGETS", frozenset({target}),
+    )
+    monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "ls", link)
+    return link, target, bin_dir, writable, overrides
+
+
+def test_maintenance_shell_pin_accepts_trusted_coreutils_applet(coreutils_pin_layout) -> None:
+    link, target, _, _, _ = coreutils_pin_layout
+    assert access_control._maintenance_trusted_multicall_link("ls", link, target)
+    assert access_control._maintenance_resolved_pin("ls") == target
+    assert access_control._maintenance_pinned_execution_argv(["ls", "-l"]) == [
+        str(target), "ls", "-l",
+    ]
+    execution = subprocess.run(
+        access_control._maintenance_pinned_execution_argv(["ls", "-l"]),
+        check=True, capture_output=True, text=True,
+    )
+    assert execution.stdout == "ls\n"
+    assert parse_service_shell_argv("ls", "maintenance") == [str(target), "ls"]
+    assert link != target
+
+
+@pytest.mark.parametrize("failure", [
+    "unknown_target", "unknown_applet", "wrong_link_name", "relative_link",
+    "link_in_write_root", "target_in_write_root", "link_owner", "parent_owner",
+    "parent_writable", "target_owner", "target_writable", "target_non_executable",
+    "target_directory", "intermediate_link", "target_intermediate_link",
+])
+def test_maintenance_shell_pin_refuses_untrusted_coreutils_layout(
+    coreutils_pin_layout, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    link, target, bin_dir, writable, overrides = coreutils_pin_layout
+    if failure == "unknown_target":
+        other = target.parent / "arbitrary"
+        other.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        other.chmod(0o755)
+        link.unlink()
+        link.symlink_to(other)
+    elif failure == "unknown_applet":
+        monkeypatch.setattr(access_control, "_MAINTENANCE_COREUTILS_APPLETS", frozenset())
+    elif failure == "wrong_link_name":
+        other = bin_dir / "other"
+        other.symlink_to(target)
+        monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "ls", other)
+    elif failure == "relative_link":
+        monkeypatch.chdir(bin_dir.parent)
+        monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "ls", Path("bin/ls"))
+    elif failure == "link_in_write_root":
+        other = writable / "ls"
+        other.symlink_to(target)
+        monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "ls", other)
+    elif failure == "target_in_write_root":
+        other = writable / "coreutils"
+        other.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        other.chmod(0o755)
+        link.unlink()
+        link.symlink_to(other)
+        monkeypatch.setattr(
+            access_control, "_MAINTENANCE_COREUTILS_MULTICALL_TARGETS", frozenset({other}),
+        )
+    elif failure == "link_owner":
+        overrides[link] = (1234, None)
+    elif failure == "parent_owner":
+        overrides[bin_dir] = (1234, None)
+    elif failure == "parent_writable":
+        overrides[bin_dir] = (0, bin_dir.stat().st_mode | stat.S_IWOTH)
+    elif failure == "target_owner":
+        overrides[target] = (1234, None)
+    elif failure == "target_writable":
+        overrides[target] = (0, target.stat().st_mode | stat.S_IWGRP)
+    elif failure == "target_non_executable":
+        target.chmod(0o644)
+    elif failure == "target_directory":
+        target.unlink()
+        target.mkdir()
+    elif failure == "intermediate_link":
+        alias = bin_dir.parent / "alias"
+        alias.symlink_to(bin_dir)
+        monkeypatch.setitem(access_control._MAINTENANCE_PINNED_EXECUTABLES, "ls", alias / "ls")
+    elif failure == "target_intermediate_link":
+        alias = bin_dir.parent / "alias"
+        alias.symlink_to(target.parent)
+        link.unlink()
+        link.symlink_to(alias / target.name)
+    assert access_control._maintenance_resolved_pin("ls") is None, failure
+    assert access_control._maintenance_pinned_execution_argv(["ls"]) is None, failure
 
 
 def test_service_shell_pin_inside_configured_write_root_fails_closed(
