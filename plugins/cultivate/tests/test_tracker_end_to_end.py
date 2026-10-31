@@ -518,6 +518,58 @@ async def test_tracker_status_exemption_fails_closed_for_scope_shape_and_undecla
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name,args_extra,result", [
+    ("tracker_comment", {"body": "Thanks, filed."}, {"status": "posted", "reason": ""}),
+    ("tracker_set_state", {"state": "closed"}, {"status": "applied", "reason": ""}),
+    ("tracker_file_work", {"kind": "leaf"},
+     {"status": "created", "reason": "", "kind": "leaf", "missing": []}),
+])
+@pytest.mark.parametrize("invalid_guard", ["extra_key", "non_cultivate_owner"])
+async def test_tracker_status_exact_shape_and_owner_guards_taint_turn(
+    tool_name: str, args_extra: dict, result: dict, invalid_guard: str,
+    capsys_rig, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = capsys_rig("github_issues")
+    read = exchanges("github_issues", "attest_trusted")
+    rig.queue(listing("github_issues"), read)
+    rig.queue(read)
+    [event] = await rig.deliver(rig.poll(capsys))
+    with policy_scope(rig.selected.policy):
+        auth = create_auth_context(
+            event, policy=rig.selected.policy, enforce=True, ifc_labels=event.ifc_labels,
+        )
+        args = {"external_ref": f"github_issues:{GITHUB_REF}", **args_extra}
+        decision = ToolRegistry().authorize_tool(
+            tool_name, auth, arguments=args, enforce=True, policy=rig.selected.policy,
+        )
+        assert decision.allowed and not decision.would_block
+        assert _effective_persisted_integrity(auth.ifc_state.current(auth.ifc_labels), auth) == "trusted"
+        # Prove every other precondition admits the otherwise identical result.
+        assert classify_protected_result(tool_name, args, auth, decision, result=result) is None
+        if invalid_guard == "extra_key":
+            result = {**result, "tracker_text": "untrusted tracker-supplied message"}
+        else:
+            registered = rig.selected.policy.tools[tool_name]
+            assert registered.owner == "cultivate" and registered.result_domain == "tracker_status"
+            monkeypatch.setitem(
+                rig.selected.policy._tools, tool_name,
+                replace(registered, owner="other_tracker_plugin"),
+            )
+        # Both raw results and the production ToolMessage form must fail closed.
+        for payload in (result, ToolMessage(content=json.dumps(result), tool_call_id="status")):
+            labels = classify_protected_result(tool_name, args, auth, decision, result=payload)
+            assert labels is not None
+            assert any(source.domain == "tracker_status" and source.principal is None
+                       and source.has_untrusted_active_ingest for source in labels.sources)
+            auth.ifc_state.merge(labels)
+            assert _effective_persisted_integrity(auth.ifc_state.current(), auth) == "untrusted"
+        assert tools.tracker_comment.func(
+            external_ref=args["external_ref"], body="Follow-up", runtime=SimpleNamespace(context=auth),
+        )["reason"] == "tainted_turn"
+    rig.finish()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("close_on_merge", [False, True])
 async def test_assigned_issue_is_triaged_filed_published_and_closed(
     close_on_merge: bool, capsys_rig, capsys: pytest.CaptureFixture[str],
