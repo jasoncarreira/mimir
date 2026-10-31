@@ -201,6 +201,8 @@ def test_history_tool_descriptions_and_redirect_refusal() -> None:
 
     assert "byte-exact fixtures or restores" in repo_restore_file.description
     assert "Read old versions" in repo_file_at_revision.description
+    assert "never silently truncated" in repo_file_at_revision.description
+    assert "Decode each page according to encoding to recover exact bytes." in repo_file_at_revision.description
     command = "git show 0123456789abcdef:fixture.bin > copy.bin"
     argv, reason, _ = parse_service_shell_argv_with_diagnostics(command, "repo_review")
     assert argv is None and "repo_restore_file" in reason
@@ -469,6 +471,71 @@ def test_historical_restore_and_binary_paging(tmp_path: Path) -> None:
         assert page["next_offset"] > offset
         offset = page["next_offset"]
     assert bytes(pages) == data
+
+
+def test_historical_review_scope_enforced_when_runtime_enforcement_is_off(tmp_path: Path) -> None:
+    from mimir_cultivate.repository import repo_file_at_revision, repo_restore_file
+
+    _, _, scope, state = _repo_scope_and_state(
+        tmp_path, allowed_operations=frozenset({RepoPRAction.INSPECT.value, RepoPRAction.CHECKOUT.value}),
+    )
+    runtime = _history_runtime(scope, state)
+    runtime.context = replace(runtime.context, enforcement_enabled=False)
+    page = repo_file_at_revision.func(
+        "owner/repo", 7, scope.observed_base_sha, "tracked.txt", runtime=runtime,
+    )
+    assert page["encoding"] == "utf-8" and page["content"] == "base\n"
+    target = state.checkout_lease.path / "copy.txt"
+    with pytest.raises(ToolException, match="scope_action_denied"):
+        repo_restore_file.func(
+            "owner/repo", 7, scope.observed_base_sha, "tracked.txt", "copy.txt", runtime=runtime,
+        )
+    assert not target.exists()
+    assert not list(state.checkout_lease.path.rglob(".repo-restore-*"))
+
+
+@pytest.mark.parametrize("destination_still_valid", [True, False])
+def test_historical_restore_rechecks_destination_before_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, destination_still_valid: bool,
+) -> None:
+    from mimir import access_control
+    from mimir_cultivate.repository import repo_restore_file
+
+    _, _, scope, state = _repo_scope_and_state(tmp_path)
+    runtime = _history_runtime(scope, state)
+    root = state.checkout_lease.path
+    target = root / "copy.txt"
+    original = b"unchanged destination\n"
+    target.write_bytes(original)
+    real_check = access_control._target_within_active_pr_checkout_lease
+    checks = []
+
+    def check_destination(path, active_state):
+        assert path == str(target) and active_state is state
+        assert real_check(path, active_state)
+        checks.append(path)
+        if len(checks) == 1:
+            return True
+        assert len(checks) == 2
+        assert len(list(root.glob(".repo-restore-*"))) == 1
+        return destination_still_valid
+
+    monkeypatch.setattr(access_control, "_target_within_active_pr_checkout_lease", check_destination)
+
+    def restore():
+        return repo_restore_file.func(
+            "owner/repo", 7, scope.observed_base_sha, "tracked.txt", "copy.txt", runtime=runtime,
+        )
+
+    if destination_still_valid:
+        assert restore()["destination"] == "copy.txt"
+        assert target.read_bytes() == b"base\n"
+    else:
+        with pytest.raises(ToolException, match="destination changed"):
+            restore()
+        assert target.read_bytes() == original
+    assert checks == [str(target), str(target)]
+    assert not list(root.rglob(".repo-restore-*"))
 
 
 @pytest.mark.parametrize("mode", [0o644, 0o755])

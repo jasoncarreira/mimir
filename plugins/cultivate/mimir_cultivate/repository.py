@@ -5559,10 +5559,7 @@ def _history_file(
     try:
         with hold_pr_checkout_lease(state.checkout_lease):
             context = getattr(runtime, "context", None)
-            git = RepoGitTools(
-                state, auth_context=context,
-                enforce=_enforcement_enabled(runtime, repository=repository, pull_request=pull_request),
-            )
+            git = RepoGitTools(state, auth_context=context, enforce=True)
             git.validated_checkout_root()
             git._require("repo_restore_file" if write else "repo_file_at_revision",
                          RepoPRAction.WRITE if write else RepoPRAction.INSPECT)
@@ -5589,6 +5586,8 @@ def _restore_bytes(state: RepoReviewState, destination_path: str, content: bytes
     relative = target.relative_to(root)
     if not relative.parts:
         raise ToolPolicyRefusal("repository restore rejected: destination must be a file")
+    # Walk from the checkout using no-follow directory descriptors so a symlink
+    # cannot redirect parent traversal outside the writable lease.
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     temporary: str | None = None
     try:
@@ -5611,7 +5610,9 @@ def _restore_bytes(state: RepoReviewState, destination_path: str, content: bytes
         out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
         with os.fdopen(out, "wb") as stream:
             stream.write(content)
+            # Set the committed mode explicitly: creation modes are filtered by umask.
             os.fchmod(stream.fileno(), 0o755 if mode == "100755" else 0o644)
+        # Re-check the writable lease and destination immediately before replacement.
         if not _target_within_active_pr_checkout_lease(str(target), state):
             raise ToolPolicyRefusal("repository restore rejected: destination changed")
         try:
@@ -5662,7 +5663,8 @@ def repo_file_at_revision(
 
     Use byte offset/limit to inspect long files. content is readable UTF-8 when
     the whole window decodes, otherwise base64 (including split characters).
-    encoding identifies the format; next_offset is null at EOF.
+    encoding identifies the format; next_offset is null at EOF. Pages are
+    never silently truncated. Decode each page according to encoding to recover exact bytes.
     """
     if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= _HISTORY_PAGE_CAP:
         raise ToolPolicyRefusal("repository history rejected: invalid page window")

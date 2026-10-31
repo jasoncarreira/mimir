@@ -111,6 +111,9 @@ def test_history_tools_have_exact_provider_policy() -> None:
     assert read.descriptor.result_origin == ResultOriginKind.REPOSITORY
     assert write.descriptor.sink_category == SinkCategory.FORGE
     assert write.descriptor.sink_destination == "bound_pull_request"
+    from mimir_cultivate.policy import _repo_pr_target
+
+    assert write.descriptor.sink_target_extractor is _repo_pr_target
     assert write.descriptor.result_origin == ResultOriginKind.NON_INGESTING
     assert write.writes_code_or_state
 
