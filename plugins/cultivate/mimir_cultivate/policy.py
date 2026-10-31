@@ -682,7 +682,7 @@ _FORGE = _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content
 # Provider declaration for PR-lease result classification (with the registered
 # result_origin); the host additionally verifies the exact live checkout lease.
 _REPO = _names("""repo_checkout repo_cleanup repo_fetch repo_status repo_test
-    repo_diff repo_unmerged repo_stage repo_commit repo_merge repo_merge_abort
+    repo_diff repo_file_at_revision repo_restore_file repo_unmerged repo_stage repo_commit repo_merge repo_merge_abort
     repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push""")
 CODING_TOOLS = _FORGE | _REPO | frozenset(_BUILDS) | {"spawn_open_code"}
 TRACKER_TOOL_NAMES = _names("tracker_file_work tracker_comment tracker_set_state")
@@ -767,6 +767,8 @@ _DESCRIPTORS = MappingProxyType({
     "repo_cleanup": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
     "repo_commit": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=_argument_payload("message")),
     "repo_diff": _D(result_origin=_R, git_operation_result=True),
+    "repo_file_at_revision": _D(result_origin=_R, git_operation_result=True),
+    "repo_restore_file": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
     "repo_fetch": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
     "repo_merge": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
     "repo_merge_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
@@ -791,21 +793,21 @@ _DESCRIPTORS = MappingProxyType({
 _FLOW = MappingProxyType({
     "source": _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks
         pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests
-        repo_status repo_diff repo_unmerged"""),
+        repo_status repo_diff repo_file_at_revision repo_unmerged"""),
     "both": _names("worklink_run worklink_resume spawn_open_code repo_checkout repo_fetch repo_test"),
     "sink": _names("""pr_submit_review pr_inline_review_comment pr_comment pr_edit_body issue_comment
-        pr_rerequest_review unsupported_operation repo_cleanup repo_stage repo_commit repo_merge
+        pr_rerequest_review unsupported_operation repo_cleanup repo_restore_file repo_stage repo_commit repo_merge
         repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push
         tracker_file_work tracker_comment tracker_set_state"""),
 })
 _TIER = MappingProxyType({
     "scope-contained": _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content
         pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments
-        pr_review_requests repo_status repo_diff repo_unmerged"""),
+        pr_review_requests repo_status repo_diff repo_file_at_revision repo_unmerged"""),
     "code-execution": _names("worklink_run worklink_resume spawn_open_code repo_test"),
     "scoped-with-provenance": _names("""pr_submit_review pr_inline_review_comment pr_comment
         pr_edit_body issue_comment pr_rerequest_review unsupported_operation repo_checkout repo_cleanup
-        repo_fetch repo_stage repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort
+        repo_fetch repo_restore_file repo_stage repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort
         repo_revert repo_revert_abort repo_push tracker_file_work tracker_comment tracker_set_state"""),
 })
 _RESULT_DOMAIN = MappingProxyType({
@@ -815,32 +817,32 @@ _RESULT_DOMAIN = MappingProxyType({
     "repository": _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks
         pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests
         pr_submit_review pr_inline_review_comment pr_comment pr_edit_body issue_comment
-        repo_checkout repo_fetch repo_status repo_test repo_diff repo_unmerged repo_commit
+        repo_checkout repo_fetch repo_status repo_test repo_diff repo_file_at_revision repo_unmerged repo_commit
         repo_merge repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push"""),
 })
 _READABLE_REPOSITORY = _names("""pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content
     pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments
-    pr_review_requests repo_checkout repo_fetch repo_status repo_test repo_diff repo_unmerged""")
+    pr_review_requests repo_checkout repo_fetch repo_status repo_test repo_diff repo_file_at_revision repo_unmerged""")
 _READ_BACKEND = _names("""pr_metadata pr_spec pr_list pr_files pr_diff pr_file_content pr_checks
     pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests
-    repo_checkout repo_fetch repo_status repo_test repo_diff repo_unmerged""")
+    repo_checkout repo_fetch repo_status repo_test repo_diff repo_file_at_revision repo_unmerged""")
 _HEARTBEAT = _names("""worklink_run pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content
     pr_checks pr_reviews pr_comments pr_review_requests pr_submit_review pr_inline_review_comment
     pr_comment pr_edit_body pr_rerequest_review unsupported_operation repo_checkout repo_cleanup
-    repo_fetch repo_status repo_test repo_diff repo_unmerged repo_stage repo_commit repo_merge
+    repo_fetch repo_status repo_test repo_diff repo_file_at_revision repo_restore_file repo_unmerged repo_stage repo_commit repo_merge
     repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push""")
 _WRITES = _names("""spawn_open_code worklink_run worklink_resume repo_checkout repo_cleanup
-    repo_fetch repo_test repo_stage repo_commit repo_merge repo_merge_abort repo_rebase
+    repo_fetch repo_test repo_restore_file repo_stage repo_commit repo_merge repo_merge_abort repo_rebase
     repo_rebase_abort repo_revert repo_revert_abort repo_push pr_submit_review
     pr_inline_review_comment pr_comment pr_edit_body issue_comment pr_rerequest_review
     tracker_file_work tracker_comment tracker_set_state""")
 _MEMBERSHIPS = MappingProxyType({
     "write_resource_operations": frozenset(_BUILDS),
-    "tainted_writes": _names("repo_stage repo_commit repo_merge repo_rebase repo_revert repo_push repo_test"),
+    "tainted_writes": _names("repo_restore_file repo_stage repo_commit repo_merge repo_rebase repo_revert repo_push repo_test"),
     "standing_review": _names("""pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks
         pr_reviews pr_comments pr_review_requests pr_submit_review pr_inline_review_comment
         pr_comment pr_edit_body pr_rerequest_review repo_checkout repo_cleanup repo_fetch
-        repo_status repo_test repo_diff repo_unmerged"""),
+        repo_status repo_test repo_diff repo_file_at_revision repo_unmerged"""),
     "remediation_effect": _names("""repo_commit repo_push pr_comment pr_edit_body
         pr_inline_review_comment pr_rerequest_review worklink_resume"""),
     "typed_error_signal": _names("worklink_run"),
@@ -850,10 +852,10 @@ _MEMBERSHIPS = MappingProxyType({
 _ACTIONS = MappingProxyType({
     **{name: RepoPRAction.INSPECT for name in _names("""pr_metadata pr_spec pr_files
         pr_diff pr_file_content pr_checks pr_job_log pr_reviews pr_comments pr_review_requests
-        repo_status repo_diff repo_unmerged""")},
+         repo_status repo_diff repo_file_at_revision repo_unmerged""")},
     **{name: RepoPRAction.CHECKOUT for name in _names("repo_checkout repo_cleanup repo_fetch")},
     "repo_test": RepoPRAction.TEST,
-    **{name: RepoPRAction.WRITE for name in _names("repo_stage repo_merge_abort repo_rebase_abort repo_revert_abort")},
+    **{name: RepoPRAction.WRITE for name in _names("repo_restore_file repo_stage repo_merge_abort repo_rebase_abort repo_revert_abort")},
     **{name: RepoPRAction.COMMIT for name in _names("repo_commit repo_merge repo_rebase repo_revert")},
     "repo_push": RepoPRAction.PUSH,
     "pr_submit_review": RepoPRAction.PR_REVIEW,

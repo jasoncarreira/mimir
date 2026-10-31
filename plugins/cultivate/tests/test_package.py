@@ -131,13 +131,13 @@ def test_selected_provider_registers_its_coding_resources() -> None:
     assert [plugin.candidate.name for plugin in manager.plugins] == ["cultivate"]
     repository = {tool.name for tool in REPO_TOOLS}
     forge = {tool.name for tool in FORGE_TOOLS}
-    assert len(repository) == 16
+    assert len(repository) == 18
     assert len(forge) == 21
     assert repository.isdisjoint(forge)
     with pytest.raises(KeyError):
         core_runtime_names("coding")
     coding = {"spawn_open_code", "worklink_run", "worklink_resume"} | repository | forge
-    assert len(coding) == 40
+    assert len(coding) == 42
     owned = coding | TRACKER_TOOL_NAMES
     assert len(TRACKER_TOOL_NAMES) == 3
     assert {name for name, tool in manager.policy.tools.items() if tool.owner == "cultivate"} == owned

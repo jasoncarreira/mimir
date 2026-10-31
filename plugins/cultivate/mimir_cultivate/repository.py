@@ -362,11 +362,13 @@ _HEAD_SHA = re.compile(r"[0-9a-f]{40}")
 _WRITE_OPERATIONS = frozenset({
     "pr_submit_review", "pr_comment", "pr_rerequest_review",
     "pr_edit_body",
-    "repo_stage", "repo_commit", "repo_push", "unsupported_operation",
+    "repo_restore_file", "repo_stage", "repo_commit", "repo_push", "unsupported_operation",
 })
 _OPERATION_ACTION = {
     "pr_metadata": RepoPRAction.INSPECT.value,
     "repo_status": RepoPRAction.INSPECT.value,
+    "repo_file_at_revision": RepoPRAction.INSPECT.value,
+    "repo_restore_file": RepoPRAction.WRITE.value,
     "repo_test": RepoPRAction.TEST.value,
     "pr_submit_review": RepoPRAction.PR_REVIEW.value,
     "pr_comment": RepoPRAction.PR_COMMENT.value,
@@ -457,6 +459,7 @@ def _effect_result(operation: str) -> str:
         "pr_edit_body": "body_updated",
         "pr_rerequest_review": "review_rerequested",
         "repo_stage": "staged",
+        "repo_restore_file": "restored",
         "repo_commit": "committed",
         "repo_push": "pushed",
     }.get(operation, "ok")
@@ -622,12 +625,20 @@ def offline_canary_probes() -> tuple[ParityProbe, ...]:
     return (
         ParityProbe("ordinary_review", "pr_metadata", "review", _scope("ordinary_review"), head,
                     LegacyObservation("allow", "ok")),
+        ParityProbe("ordinary_review", "repo_file_at_revision", "review", _scope("ordinary_review"), head,
+                    LegacyObservation("allow", "ok")),
+        ParityProbe("ordinary_review", "repo_restore_file", "review", _scope("ordinary_review"), head,
+                    LegacyObservation("refuse", "scope_action_denied")),
         ParityProbe("ordinary_review", "pr_submit_review", "review", _scope("ordinary_review"), head,
                     LegacyObservation("allow", "review_submitted", effect("ordinary_review", "pr_submit_review"), audit("ordinary_review", "pr_submit_review"))),
         ParityProbe("ordinary_review", "pr_edit_body", "review", _scope("ordinary_review"), head,
                     LegacyObservation("refuse", "scope_action_denied")),
         ParityProbe("own_pr_remediation", "pr_comment", "remediation", _scope("own_pr_remediation"), head,
                     LegacyObservation("allow", "comment_created", effect("own_pr_remediation", "pr_comment"), audit("own_pr_remediation", "pr_comment"))),
+        ParityProbe("own_pr_remediation", "repo_file_at_revision", "remediation", _scope("own_pr_remediation"), head,
+                    LegacyObservation("allow", "ok")),
+        ParityProbe("own_pr_remediation", "repo_restore_file", "remediation", _scope("own_pr_remediation"), head,
+                    LegacyObservation("allow", "restored", effect("own_pr_remediation", "repo_restore_file"), audit("own_pr_remediation", "repo_restore_file"))),
         ParityProbe("own_pr_remediation", "pr_edit_body", "remediation", _scope("own_pr_remediation"), head,
                     LegacyObservation("allow", "body_updated", effect("own_pr_remediation", "pr_edit_body"), audit("own_pr_remediation", "pr_edit_body"))),
         ParityProbe("own_pr_remediation", "pr_rerequest_review", "remediation", _scope("own_pr_remediation"), head,
@@ -4826,10 +4837,12 @@ class RepoProjectTests:
 
 # Model-facing repository tools
 import logging
+import base64
 from contextlib import ExitStack, nullcontext
 from dataclasses import asdict
 import os
 import re
+import stat
 from pathlib import Path
 from typing import Any, Literal
 
@@ -5482,6 +5495,198 @@ def repo_unmerged(
     return _execute(runtime, repository, pull_request, GitUnmerged())
 
 
+_HISTORY_FILE_CAP = 2 * 1024 * 1024
+_HISTORY_PAGE_CAP = 8192
+_HISTORY_REVISION = re.compile(r"[0-9a-fA-F]{7,40}")
+
+
+def _historical_blob(git: RepoGitTools, revision: str, path: str) -> tuple[str, int, str]:
+    """Resolve only a regular blob in the immutable base/head ancestry."""
+    if not isinstance(revision, str) or _HISTORY_REVISION.fullmatch(revision) is None:
+        raise ToolPolicyRefusal("repository history rejected: revision must be a commit SHA")
+    if not isinstance(path, str):
+        raise ToolPolicyRefusal("repository history rejected: invalid path")
+    _validate_path(path)
+    scope = git._scope
+    commit = git._checked(("rev-parse", "--verify", f"{revision}^{{commit}}")).stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise ToolPolicyRefusal("repository history rejected: invalid commit")
+    # Object presence alone grants no authority: the commit must belong to a
+    # lineage bound by this PR scope, even if another branch was fetched.
+    if not any(
+        result.returncode == 0 and not result.timed_out and not result.output_limited
+        for bound in (scope.observed_base_sha, scope.observed_head_sha)
+        for result in (git._raw(("merge-base", "--is-ancestor", commit, bound)),)
+    ):
+        raise ToolPolicyRefusal("repository history rejected: revision is outside base and head history")
+    entry = git._checked(("ls-tree", "-z", commit, "--", f":(literal){path}")).stdout
+    match = re.fullmatch(r"(100644|100755) blob ([0-9a-f]{40})\t([^\x00]+)\x00", entry)
+    if match is None or match.group(3) != path:
+        raise ToolPolicyRefusal("repository history rejected: source is not a regular file")
+    blob = match.group(2)
+    size_text = git._checked(("cat-file", "-s", blob)).stdout.strip()
+    if not size_text.isascii() or not size_text.isdecimal():
+        raise ToolPolicyRefusal("repository history rejected: invalid blob size")
+    size = int(size_text)
+    if size > _HISTORY_FILE_CAP:
+        raise ToolPolicyRefusal("repository history rejected: file exceeds 2 MiB")
+    return blob, size, match.group(1)
+
+
+def _historical_bytes(git: RepoGitTools, blob: str, size: int) -> bytes:
+    """Read binary object data directly, never via a model-visible Git result."""
+    try:
+        result = subprocess.run(
+            (git._git, "-C", str(git._root), *_BASE_CONFIG,
+             "--no-pager", "--no-optional-locks", "cat-file", "blob", blob),
+            env=git.environment, capture_output=True, timeout=20, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ToolException("repository history rejected: Git object read failed") from exc
+    if result.returncode or len(result.stdout) != size:
+        raise ToolException("repository history rejected: Git object read failed")
+    return result.stdout
+
+
+@contextmanager
+def _history_file(
+    runtime: ToolRuntime[AuthContext] | None, repository: str, pull_request: int,
+    revision: str, path: str, *, write: bool,
+) -> Iterator[tuple[RepoReviewState, bytes, str]]:
+    if _retained_scope(runtime, repository, pull_request) is not None:
+        raise _retained_refusal("repository history")
+    state = _state(runtime, repository, pull_request)
+    try:
+        with hold_pr_checkout_lease(state.checkout_lease):
+            context = getattr(runtime, "context", None)
+            git = RepoGitTools(state, auth_context=context, enforce=True)
+            git.validated_checkout_root()
+            git._require("repo_restore_file" if write else "repo_file_at_revision",
+                         RepoPRAction.WRITE if write else RepoPRAction.INSPECT)
+            if write and getattr(getattr(context, "ifc_state", None), "has_untrusted_active_ingest", lambda: False)():
+                raise ToolPolicyRefusal("repository history rejected: write blocked by untrusted ingest")
+            blob, size, mode = _historical_blob(git, revision, path)
+            yield state, _historical_bytes(git, blob, size), mode
+    except GitRefusal as exc:
+        raise ToolPolicyRefusal(f"repository history rejected: {exc.code}") from exc
+    except RuntimeError as exc:
+        raise ToolPolicyRefusal("repository history rejected: inactive checkout lease") from exc
+
+
+def _restore_bytes(state: RepoReviewState, destination_path: str, content: bytes, mode: str) -> str:
+    from mimir.access_control import _target_within_active_pr_checkout_lease
+
+    root = Path(state.checkout_lease.path)
+    if not isinstance(destination_path, str) or not destination_path or "\x00" in destination_path:
+        raise ToolPolicyRefusal("repository restore rejected: invalid destination")
+    requested = Path(destination_path)
+    target = requested if requested.is_absolute() else root / requested
+    if not _target_within_active_pr_checkout_lease(str(target), state):
+        raise ToolPolicyRefusal("repository restore rejected: destination is outside writable checkout")
+    relative = target.relative_to(root)
+    if not relative.parts:
+        raise ToolPolicyRefusal("repository restore rejected: destination must be a file")
+    # Walk from the checkout using no-follow directory descriptors so a symlink
+    # cannot redirect parent traversal outside the writable lease.
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary: str | None = None
+    try:
+        for part in relative.parts[:-1]:
+            try:
+                os.mkdir(part, dir_fd=fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        name = relative.name
+        try:
+            existing = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise ToolPolicyRefusal("repository restore rejected: destination is not a regular file")
+        temporary = f".repo-restore-{uuid.uuid4().hex}"
+        out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        with os.fdopen(out, "wb") as stream:
+            stream.write(content)
+            # Set the committed mode explicitly: creation modes are filtered by umask.
+            os.fchmod(stream.fileno(), 0o755 if mode == "100755" else 0o644)
+        # Re-check the writable lease and destination immediately before replacement.
+        if not _target_within_active_pr_checkout_lease(str(target), state):
+            raise ToolPolicyRefusal("repository restore rejected: destination changed")
+        try:
+            current = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and not stat.S_ISREG(current.st_mode):
+            raise ToolPolicyRefusal("repository restore rejected: destination changed")
+        os.replace(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
+        temporary = None
+    except OSError as exc:
+        raise ToolPolicyRefusal("repository restore rejected: unsafe destination") from exc
+    finally:
+        if temporary is not None:
+            os.unlink(temporary, dir_fd=fd)
+        os.close(fd)
+    return relative.as_posix()
+
+
+@tool
+def repo_restore_file(
+    repository: str, pull_request: int, revision: str, source_path: str,
+    destination_path: str, runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Use for byte-exact fixtures or restores from repository history into the scoped PR checkout.
+
+    Copies a regular file from a base/head ancestor (up to 2 MiB) without
+    sending its bytes through the model. Returns only destination, byte count,
+    sha256, and Git mode (100644 or 100755). Preserves the committed executable
+    bit. Not available in review or after untrusted active ingest.
+    """
+    with _history_file(runtime, repository, pull_request, revision, source_path, write=True) as (state, content, mode):
+        destination = _restore_bytes(state, destination_path, content, mode)
+        _publish_attested_lease_result(runtime, state)
+        return {
+            "destination": destination, "bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(), "mode": mode,
+        }
+
+
+@tool
+def repo_file_at_revision(
+    repository: str, pull_request: int, revision: str, path: str,
+    offset: int = 0, limit: int = 4096,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Read old versions from repository history in bounded, byte-exact pages.
+
+    Use byte offset/limit to inspect long files. content is readable UTF-8 when
+    the whole window decodes, otherwise base64 (including split characters).
+    encoding identifies the format; next_offset is null at EOF. Pages are
+    never silently truncated. Decode each page according to encoding to recover exact bytes.
+    """
+    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= _HISTORY_PAGE_CAP:
+        raise ToolPolicyRefusal("repository history rejected: invalid page window")
+    with _history_file(runtime, repository, pull_request, revision, path, write=False) as (state, content, _mode):
+        if offset > len(content):
+            raise ToolPolicyRefusal("repository history rejected: offset exceeds file size")
+        end = min(len(content), offset + limit)
+        window = content[offset:end]
+        try:
+            page_content = window.decode("utf-8")
+            encoding = "utf-8"
+        except UnicodeDecodeError:
+            page_content = base64.b64encode(window).decode("ascii")
+            encoding = "base64"
+        _publish_attested_lease_result(runtime, state)
+        return {
+            "encoding": encoding, "content": page_content,
+            "offset": offset, "total_bytes": len(content),
+            "next_offset": end if end < len(content) else None,
+        }
+
+
 @tool
 def repo_stage(
     repository: str,
@@ -5617,6 +5822,8 @@ REPO_TOOLS = tuple(_bind_injected_runtime(repo_tool) for repo_tool in (
     repo_status,
     repo_test,
     repo_diff,
+    repo_file_at_revision,
+    repo_restore_file,
     repo_unmerged,
     repo_stage,
     repo_commit,

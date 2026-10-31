@@ -176,7 +176,7 @@ from mimir_cultivate.repository import offline_canary_probes, run_parity
 assert 'mimir.repo_pr_parity' not in sys.modules
 result = run_parity(offline_canary_probes())
 assert result['cutover_blocked'] is False
-assert result['counts']['operations_matched'] == 14
+assert result['counts']['operations_matched'] == 18
 assert 'mimir.repo_pr_parity' not in sys.modules
 """
     result = subprocess.run(

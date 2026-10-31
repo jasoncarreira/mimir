@@ -4639,6 +4639,11 @@ def parse_service_shell_argv_with_diagnostics(
         except ValueError:
             refused_argv = []
         guidance = _service_shell_typed_tool_guidance(refused_argv, destination)
+        if destination == "repo_review" and refused_argv[:2] == ["git", "show"] and ">" in found:
+            from .plugins.core import selected_policy_registry
+
+            if "repo_restore_file" in selected_policy_registry().tools:
+                guidance += " Use repo_restore_file for byte-exact historical files in the scoped checkout."
         return None, (
             f"the command contains shell metacharacters ({rendered}), which the "
             f"{destination!r} trusted-service shell profile never admits. "

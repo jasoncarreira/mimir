@@ -25,8 +25,8 @@ def test_selected_cultivate_matches_frozen_pre_extraction_policy(monkeypatch, tm
     oracle = json.loads((Path(__file__).parents[3] / "tests/fixtures/plugin_core_policy_baseline.json").read_text())
     tables = oracle["tables"]
     selected = load_plugins(enable="cultivate").policy
-    assert len(CODING_TOOLS) == 40
-    for name in CODING_TOOLS:
+    assert len(CODING_TOOLS) == 42
+    for name in CODING_TOOLS - {"repo_restore_file", "repo_file_at_revision"}:
         after = selected.tools[name]
         before = oracle["descriptors"][name]
         assert after.owner == "cultivate"
@@ -78,8 +78,44 @@ def test_selected_cultivate_matches_frozen_pre_extraction_policy(monkeypatch, tm
     _prepare_inputs(home, monkeypatch)
     with policy_scope(selected):
         extracted = _extractor_results(home)
-    for name in CODING_TOOLS:
+    for name in CODING_TOOLS - {"repo_restore_file", "repo_file_at_revision"}:
         assert json.loads(_canonical(extracted[name], home)) == oracle["extractor_results"][name], name
+
+
+def test_history_tools_have_exact_provider_policy() -> None:
+    from mimir.plugins.core import CapabilityTier
+    from mimir.access_control import ToolFlowDirection
+    from mimir.tool_descriptors import ResultOriginKind, SinkCategory
+    from mimir_cultivate.policy import RepoPRAction
+
+    selected = load_plugins(enable="cultivate").policy
+    read = selected.tools["repo_file_at_revision"]
+    write = selected.tools["repo_restore_file"]
+    assert {tool.name for tool in (read.factory(), write.factory())} == {
+        "repo_file_at_revision", "repo_restore_file",
+    }
+    assert read.flow == ToolFlowDirection.SOURCE
+    assert write.flow == ToolFlowDirection.SINK
+    assert read.tier == CapabilityTier.SCOPE_CONTAINED
+    assert write.tier == CapabilityTier.SCOPED_WITH_PROVENANCE
+    assert read.profiles == selected.tools["repo_diff"].profiles
+    assert write.profiles == selected.tools["repo_stage"].profiles
+    assert read.typed_action == RepoPRAction.INSPECT
+    assert write.typed_action == RepoPRAction.WRITE
+    assert "repo_actions" in read.memberships & write.memberships
+    assert "tainted_writes" in write.memberships
+    assert "retained_repo_tools" not in read.memberships | write.memberships
+    assert read.result_domain == read.readable_domain == "repository"
+    assert read.read_backend and not write.read_backend
+    assert read.descriptor.git_operation_result
+    assert read.descriptor.result_origin == ResultOriginKind.REPOSITORY
+    assert write.descriptor.sink_category == SinkCategory.FORGE
+    assert write.descriptor.sink_destination == "bound_pull_request"
+    from mimir_cultivate.policy import _repo_pr_target
+
+    assert write.descriptor.sink_target_extractor is _repo_pr_target
+    assert write.descriptor.result_origin == ResultOriginKind.NON_INGESTING
+    assert write.writes_code_or_state
 
 
 def test_selected_registration_uses_immutable_provider_metadata_not_core_inventory(monkeypatch):
