@@ -110,8 +110,8 @@ def test_current_chainlink_orchestrator_release_inventory_is_complete():
     [skill] = [item for item in skills_for_candidates((candidate,))
                if item.name == "chainlink-orchestrator"]
     releases = json.loads((SKILLS.parent / "skill_releases.json").read_text())
-    assert skill_inventory(skill) == releases["2507-epic-publication"]["chainlink-orchestrator"]
-    assert list(releases)[-1] == "2066-pr-publication"
+    assert skill_inventory(skill) == releases["2070-reaper-default"]["chainlink-orchestrator"]
+    assert list(releases)[-1] == "2070-reaper-default"
 
 
 # The guard scans the shipped defaults, not test fixtures or cache files.

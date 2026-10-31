@@ -415,5 +415,12 @@
       "tests/test_tracker_poller_gates.py": "659f9af81b36f00220a1f61307a5aa7fb9f1e699ebd0f34fcbe606401ea79bfe",
       "tests/tracker_poller_test_support.py": "453047e9f0be74fc7f52b2eb759a97dee145be81e99eb2b67618a71cd2d541fb"
     }
+  },
+  "2070-reaper-default": {
+    "chainlink-orchestrator": {
+      "SKILL.md": "509a58615d64519121142372b7e38af6cb802241d4aaa16982ed10fc2233973e",
+      "pollers.json": "7771c3d953de5a4a299053d523a34695205888a5bb83e7e9f7fc250125ba407d",
+      "scripts/poller.py": "9278aad23be23b693fac71a759b74a155a1f4fab9f40ba2c7135803f11470f34"
+    }
   }
 }

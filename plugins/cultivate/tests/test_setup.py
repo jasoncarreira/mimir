@@ -853,6 +853,16 @@ def test_upgrade_rewrites_owned_files_preserves_state_and_prints_rollback(upgrad
     assert all(hashes[name] == hashlib.sha256((deploy / name).read_bytes()).hexdigest() for name in hashes)
 
 
+@pytest.mark.parametrize("cron", ["", "0 * * * *"])
+def test_upgrade_preserves_operator_reaper_cron(upgrade_setup, cron):
+    deploy, args, state, calls, invoke = upgrade_setup
+    path = deploy / 'compose.env'
+    original = path.read_text() + f'MIMIR_WORKLINK_REAPER_CRON={cron}\n'
+    path.write_text(original)
+    invoke()
+    assert path.read_text() == original
+
+
 def test_setup_stops_agent_for_provision_and_reports_skill_upgrade(upgrade_setup, capsys):
     deploy, args, state, calls, invoke = upgrade_setup
     state['provision_output'] = ('Upgraded skill cultivate:github-poller '

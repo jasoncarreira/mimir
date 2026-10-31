@@ -14,7 +14,7 @@ env:
       description: "Legacy fallback for total concurrent Worklink claims when worklink.yaml defaults.max_concurrent is absent. Default 2."
       example: "2"
     - name: MIMIR_WORKLINK_REAPER_CRON
-      description: "Cron for the Cultivate TTL reaper that recovers stale claims (set in the agent env, not here). Empty = reaper disabled."
+      description: "Cron for Cultivate's scheduled stale-claim reaper and merged-leaf closure (set in the agent env, not here). Defaults to every 30 minutes on homes with worklink.yaml, including upgrades; explicitly empty disables the job. Non-Worklink homes register no job."
       example: "*/30 * * * *"
 ---
 
