@@ -32,6 +32,7 @@ SITES = {
     ("checkout.py", "_clone_attempt_checkout", "shutil.rmtree"): (1, "failed checkout construction before launch"),
     ("checkout.py", "create_isolated_checkout", "shutil.rmtree"): (3, "failed checkout construction before launch"),
     ("orchestrator.py", "_remove_executor_report_dir_best_effort", "rmtree_missing_ok"): (1, "temporary test report, not attempt checkout"),
+    ("orchestrator.py", "_remove_executor_basetemp_best_effort", "rmtree_missing_ok"): (1, "derived pytest temp tree under trusted /tmp, only after leaf directory check; not attempt checkout"),
     ("orchestrator.py", "_make_executor_report_dir", "rmtree_missing_ok"): (1, "temporary test report, not attempt checkout"),
     ("orchestrator.py", "_create_observation_worktree", "shutil.rmtree"): (1, "temporary observation worktree, not attempt checkout"),
     ("orchestrator.py", "_remove_observation_worktree", "shutil.rmtree"): (1, "temporary observation worktree, not attempt checkout"),

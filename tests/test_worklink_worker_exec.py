@@ -34,6 +34,7 @@ from mimir_cultivate.worklink.worker_client import (
 )
 import mimir_cultivate.worklink.worker_exec as worker_exec
 from mimir_cultivate.worklink import identities
+from tests.stat_helpers import stat_with
 
 
 def _issued(tmp_path: Path) -> Path:
@@ -1917,9 +1918,7 @@ def test_factory_replace_fail_closed_guards(tmp_path: Path, monkeypatch, guard: 
 
         def foreign_owner(fd):
             observed = real_fstat(fd)
-            values = {name: getattr(observed, name) for name in ("st_mode", "st_nlink", "st_uid")}
-            values["st_uid"] = os.geteuid() + 1
-            return SimpleNamespace(**values)
+            return stat_with(observed, st_uid=os.geteuid() + 1)
 
         monkeypatch.setattr(os, "fstat", foreign_owner)
     elif guard == "size":
@@ -1930,9 +1929,8 @@ def test_factory_replace_fail_closed_guards(tmp_path: Path, monkeypatch, guard: 
         def changed_target(path, *args, **kwargs):
             observed = real_stat(path, *args, **kwargs)
             if path == "fix.py" and kwargs.get("dir_fd") is not None:
-                values = {name: getattr(observed, name) for name in ("st_mode", "st_ino", "st_dev", "st_nlink")}
-                values[{"inode": "st_ino", "device": "st_dev", "changed_nlink": "st_nlink"}[guard]] += 1
-                return SimpleNamespace(**values)
+                name = {"inode": "st_ino", "device": "st_dev", "changed_nlink": "st_nlink"}[guard]
+                return stat_with(observed, **{name: getattr(observed, name) + 1})
             return observed
 
         monkeypatch.setattr(os, "stat", changed_target)
