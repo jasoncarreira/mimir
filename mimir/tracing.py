@@ -105,10 +105,34 @@ class TraceController:
             from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
             from opentelemetry.sdk.resources import Resource
             from opentelemetry.sdk.trace import TracerProvider
-            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter, SpanExportResult
+
+            class SafeExporter(SpanExporter):
+                def __init__(self, delegate: SpanExporter) -> None:
+                    self.delegate = delegate
+
+                def export(self, spans: Any) -> SpanExportResult:
+                    try:
+                        return self.delegate.export(spans)
+                    except Exception:
+                        log.warning("Tracing export failed.")
+                        return SpanExportResult.FAILURE
+
+                def shutdown(self) -> None:
+                    try:
+                        self.delegate.shutdown()
+                    except Exception:
+                        log.warning("Tracing exporter shutdown failed.")
+
+                def force_flush(self, timeout_millis: int = 30000) -> bool:
+                    try:
+                        return self.delegate.force_flush(timeout_millis=timeout_millis)
+                    except Exception:
+                        log.warning("Tracing exporter flush failed.")
+                        return False
 
             provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
-            exporter = OTLPSpanExporter(endpoint=target, timeout=5)
+            exporter = SafeExporter(OTLPSpanExporter(endpoint=target, timeout=5))
             provider.add_span_processor(BatchSpanProcessor(
                 exporter, max_queue_size=2048, max_export_batch_size=256,
                 schedule_delay_millis=5000, export_timeout_millis=5000,
