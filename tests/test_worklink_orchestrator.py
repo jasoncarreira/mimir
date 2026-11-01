@@ -9406,6 +9406,19 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
         assert "control-plane snapshot:" not in report
 
     if not snapshot_published and not snapshot_fails and not idle and not contended:
+        # The compute double above has no OS process. Its synthetic shim PID
+        # can exist on a host (and macOS has no /proc birth marker), so recovery
+        # must observe the same owned lifecycle state as the compute double.
+        def driver_alive(record: FactoryRunRecord) -> bool:
+            assert record.handle == handle
+            return not stopped.is_set()
+
+        def driver_verified_dead(record: FactoryRunRecord) -> bool:
+            assert record.handle == handle
+            return stopped.is_set()
+
+        monkeypatch.setattr(orchestrator, "factory_process_is_alive", driver_alive)
+        monkeypatch.setattr(orchestrator, "factory_process_is_verified_dead", driver_verified_dead)
         _stub_factory_launch_identity(monkeypatch)
         _configure_opencode_oauth(tmp_path, monkeypatch)
         recovery_events: list[str] = []
