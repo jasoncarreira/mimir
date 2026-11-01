@@ -553,14 +553,28 @@ def _live_scoped_pr_lease(scope: object, review_state: object) -> object | None:
     except (OSError, KeyError, ValueError, TypeError, AttributeError):
         return None
     if (attached.scope_id != scope.scope_id or attached.owner != scope.principal
-            or attached.head_sha.lower() != scope.observed_head_sha.lower()
             or attached.canonical_repo.lower() != scope.canonical_repo.lower()
+            or attached.pr_number != scope.pr_number
+            or attached.destination_ref != scope.destination_ref
             or getattr(review_state, "action_scope", None) is not scope):
         return None
     if _observed_checkout_state(path) != (
         scope.head_ref, getattr(review_state, "git_expected_head", None)
     ):
         return None
+    if attached.head_sha.lower() != scope.observed_head_sha.lower():
+        from mimir.access_control import _lease_has_clean_lineage
+        from .repository import hardened_git_command
+
+        ancestry = hardened_git_command(
+            path, ("merge-base", "--is-ancestor", scope.observed_head_sha, attached.head_sha),
+            timeout=10,
+        )
+        if (ancestry.returncode != 0 or ancestry.timed_out or ancestry.output_limited
+                or not _lease_has_clean_lineage(
+                    path, attached, scope, scope.observed_head_sha.lower(), attached.head_sha.lower(),
+                )):
+            return None
     return attached
 
 
