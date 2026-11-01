@@ -27,6 +27,54 @@ import pytest
 
 from mimir.config import _load_home_dotenv
 
+
+def test_default_import_does_not_load_otel_sdk_from_mimir():
+    """Mimir must not require its optional exporter during server import."""
+    root = Path(__file__).resolve().parents[1]
+    code = """
+import builtins
+import inspect
+original = builtins.__import__
+owned_imports = []
+def guarded(name, *args, **kwargs):
+    caller = inspect.currentframe().f_back.f_globals.get('__name__', '')
+    if name.startswith(('opentelemetry.sdk', 'opentelemetry.exporter')):
+        if caller.startswith('mimir.'):
+            owned_imports.append(name)
+        raise ImportError('optional SDK unavailable')
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+import mimir.server
+import mimir.runtime
+assert not owned_imports, owned_imports
+"""
+    result = subprocess.run([sys.executable, "-c", code], cwd=root,
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def test_missing_otel_extra_disables_tracing_in_fresh_process():
+    root = Path(__file__).resolve().parents[1]
+    code = """
+import builtins
+import logging
+original = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name.startswith(('opentelemetry.sdk', 'opentelemetry.exporter')):
+        raise ImportError('missing optional SDK')
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+from mimir.tracing import TraceController
+records = []
+class Log:
+    def warning(self, message): records.append(message)
+assert TraceController.create(enabled=True, endpoint='http://localhost:4318/', logger=Log()) is None
+assert len(records) == 1 and 'localhost' not in records[0]
+"""
+    result = subprocess.run([sys.executable, "-c", code], cwd=root,
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
 _CANARY = "MIMIR_TEST_DOTENV_LEAK_CANARY"
 _ENFORCEMENT_FLAG = "MIMIR_ACCESS_CONTROL_ENFORCED"
 _LONGMEMEVAL_SMOKE = "tests/test_longmemeval_via_memory_smoke.py"

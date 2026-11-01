@@ -166,6 +166,7 @@ class AgentRuntimeBundle:
     _owned_closers: list[tuple[str, Callable[[], Awaitable[None]]]]
     _runtime_background_tasks: set[asyncio.Task[Any]]
     _close_task: asyncio.Task[None] | None
+    trace_controller: Any | None = None
 
     def install_mcp_tools(self, tools: list[Any]) -> None:
         from .tools import set_mcp_tools
@@ -226,6 +227,22 @@ async def create_agent_runtime(
     try:
         manager = getattr(config, "plugin_manager", None)
         _clear_runtime_globals(manager.policy if manager is not None else None)
+
+        trace_controller = None
+        if getattr(config, "tracing_enabled", False):
+            from .tracing import TraceController
+
+            trace_controller = TraceController.create(
+                enabled=True,
+                endpoint=getattr(config, "otlp_endpoint", None),
+                service_name=getattr(config, "otel_service_name", "mimir"),
+                capture_content=getattr(config, "tracing_capture_content", False),
+            )
+            if trace_controller is not None:
+                async def close_tracing() -> None:
+                    await asyncio.to_thread(trace_controller.shutdown)
+
+                owned_closers.append(("tracing", close_tracing))
 
         from .tools import all_mimir_tools
 
@@ -397,6 +414,7 @@ async def create_agent_runtime(
             commitments_store=commitments_store,
             turn_event_bus=turn_event_bus,
             chat_skill_registry=core.chat_skill_registry,
+            trace_controller=trace_controller,
         )
 
         bundle = AgentRuntimeBundle(
@@ -417,6 +435,7 @@ async def create_agent_runtime(
             _owned_closers=owned_closers,
             _runtime_background_tasks=runtime_background_tasks,
             _close_task=None,
+            trace_controller=trace_controller,
         )
 
         def on_channel_idle(channel_id: str) -> bool:
