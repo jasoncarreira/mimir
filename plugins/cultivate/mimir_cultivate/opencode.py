@@ -391,8 +391,11 @@ def _atomic_auth_write(path: Path, document: dict[str, object]) -> None:
 def reconcile_codex_auth(
     env: Mapping[str, str] | None = None, *, scrubber: SensitiveMaterialScrubber | None = None,
     refreshed_path: Path | None = None,
+    refreshed_document: bytes | None = None,
 ) -> None:
     """Keep Codex and OpenCode on one refresh-token family (newer JWT exp wins)."""
+    if refreshed_path is not None and refreshed_document is not None:
+        raise ValueError("choose one refreshed auth source")
     values = os.environ if env is None else env
     home = _home(values)
     codex_home = Path(values.get("CODEX_HOME") or home / ".codex").expanduser()
@@ -415,6 +418,8 @@ def reconcile_codex_auth(
             _add_sensitive_scalars(scrubber, codex_document)
         entries = _read_object(opencode_path, kind="auth")[0] if opencode_path.exists() else {}
         refreshed = (
+            _parse_object(refreshed_document, kind="auth").get("openai")
+            if refreshed_document is not None else
             _read_object(refreshed_path, kind="auth")[0].get("openai")
             if refreshed_path is not None and refreshed_path.exists() else None
         )
@@ -458,8 +463,6 @@ def reconcile_codex_auth(
 
 
 def _read_object(path: Path, *, kind: str) -> tuple[dict[str, object], bytes]:
-    oversize_code = "config_oversize" if kind == "config" else "auth_oversize"
-    malformed_code = "config_malformed" if kind == "config" else "auth_malformed"
     unreadable_code = "config_unreadable" if kind == "config" else "auth_unreadable"
     error_type = OpenCodeConfigError if kind == "config" else OpenCodeAuthError
     try:
@@ -467,6 +470,13 @@ def _read_object(path: Path, *, kind: str) -> tuple[dict[str, object], bytes]:
             document = source.read(_MAX_DOCUMENT_BYTES + 1)
     except OSError as exc:
         raise error_type(unreadable_code) from exc
+    return _parse_object(document, kind=kind), document
+
+
+def _parse_object(document: bytes, *, kind: str) -> dict[str, object]:
+    oversize_code = "config_oversize" if kind == "config" else "auth_oversize"
+    malformed_code = "config_malformed" if kind == "config" else "auth_malformed"
+    error_type = OpenCodeConfigError if kind == "config" else OpenCodeAuthError
     if len(document) > _MAX_DOCUMENT_BYTES:
         raise error_type(oversize_code)
     try:
@@ -475,7 +485,7 @@ def _read_object(path: Path, *, kind: str) -> tuple[dict[str, object], bytes]:
         raise error_type(malformed_code) from exc
     if not isinstance(parsed, dict):
         raise error_type(malformed_code)
-    return parsed, document
+    return parsed
 
 
 _ENV_REFERENCE = re.compile(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}")

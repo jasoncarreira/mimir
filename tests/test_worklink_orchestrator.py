@@ -5847,6 +5847,7 @@ def _run_factory_preflight_case(
     claim_calls: list[int] | None = None,
     launch_calls: list[WorkSpec] | None = None,
     sync_entrypoint: bool = False,
+    compute_launch: Any = None,
 ) -> tuple[object, list[WorkSpec], list[str], list[list[str]]]:
     import mimir_cultivate.worklink.orchestrator as orchestrator
 
@@ -5919,6 +5920,8 @@ def _run_factory_preflight_case(
         launched.append(spec)
         if launch_calls is not None:
             launch_calls.append(spec)
+        if compute_launch is not None:
+            return await compute_launch(self, spec)
         if outcome is None:
             raise RuntimeError("launch reached")
         return LaunchHandle("local_subprocess", "123", 456)
@@ -8206,6 +8209,98 @@ def _factory_lifecycle_record(sandbox: Path, handle: LaunchHandle) -> FactoryRun
 class _FactoryLifecycleClaims:
     def transition_issue(self, *args: object, **kwargs: object) -> None:
         return None
+
+
+@pytest.mark.parametrize("outcome", ["needs-human", "completed"])
+def test_factory_auth_read_failure_preserves_worklink_outcome(tmp_path, monkeypatch, outcome):
+    """Real compute collection feeds real supervision, persistence and label transitions."""
+    from mimir import event_logger
+    from mimir_cultivate.worklink import compute, dispatch_failures, orchestrator, worker_client
+
+    original_launch = compute.LocalSubprocessComputeBackend.launch
+    original_wait = compute.LocalSubprocessComputeBackend.wait
+    original_supervise = WorklinkRunner._supervise_factory_070
+    collected = threading.Event()
+    original_transition = ChainlinkClaims.transition_issue
+    events = []
+    reason = "human approval required for factory decision"
+    status = None
+
+    def control(*args, **kwargs):
+        raise PermissionError("worker-owned auth")
+
+    async def execute(command, capability, environment, projections, **kwargs):
+        capability._contained_started(SimpleNamespace(pid=None))
+        return compute.CollectedExecutionResult(0, b"driver exited", b"", False, False, 0, 0)
+
+    async def log_event(name, **kwargs):
+        events.append((name, kwargs))
+
+    async def launch(backend, spec):
+        nonlocal status
+        backend._worker_client = object()
+        handle = await original_launch(backend, spec)
+        sandbox = spec.local_checkout / ".factory-sandboxes/chainlink-700"
+        sandbox.mkdir(parents=True)
+        snapshot = spec.local_checkout / ".factory/.parked/chainlink-700"
+        snapshot.mkdir(parents=True)
+        status = replace(
+            _factory_lifecycle_status(sandbox, status=outcome, lock="absent",
+                                      park_snapshot=str(snapshot) if outcome == "needs-human" else None),
+            run_id="chainlink-700", branch="feature/chainlink-700", next=reason,
+        )
+        return handle
+
+    async def wait(backend, handle, timeout_s):
+        try:
+            return await original_wait(backend, handle, timeout_s)
+        finally:
+            collected.set()
+
+    def read_status(*args, **kwargs):
+        # Let real supervision drain compute first: the raising mutation must
+        # propagate through its wait task, not fail artificially at launch.
+        assert collected.wait(10)
+        return status
+
+    async def supervise(_supervisor, **kwargs):
+        monkeypatch.setattr(ChainlinkClaims, "transition_issue", original_transition)
+        return await original_supervise(_supervisor, **kwargs)
+
+    async def verify(**kwargs):
+        assert kwargs["record"].status.status == "completed"
+        return tmp_path / "evidence.json", "https://github.com/owner/repo/pull/42"
+
+    async def cancel(*args):
+        pass  # The fake driver has already exited; there is no OS child to cancel.
+
+    monkeypatch.setattr(compute, "execute_contained", execute)
+    monkeypatch.setattr(worker_client, "run_factory_control", control)
+    monkeypatch.setattr(event_logger, "safe_log_event", log_event)
+    monkeypatch.setattr(compute.LocalSubprocessComputeBackend, "cancel", cancel)
+    monkeypatch.setattr(compute.LocalSubprocessComputeBackend, "wait", wait)
+    monkeypatch.setattr(orchestrator, "_verify_factory_completion", verify)
+    monkeypatch.setattr(FeatureFactoryBackend, "status", read_status)
+    result, launched, _, commands = _run_factory_preflight_case(
+        tmp_path, monkeypatch, credentials={"GITHUB_TOKEN": "github-token"},
+        outcome=outcome, terminal=supervise, compute_launch=launch,
+    )
+    assert len(launched) == 1
+    assert result.status == ("needs-human" if outcome == "needs-human" else "review_ready"), result.reason
+    assert result.next == reason
+    label = "worklink:blocked" if outcome == "needs-human" else "worklink:review"
+    assert ["chainlink", "issue", "label", "700", label] in commands
+    assert ["chainlink", "issue", "label", "700", "worklink:ready"] not in commands
+    retained = load_factory_record(tmp_path, "chainlink-700")
+    assert retained.status.status == outcome
+    assert retained.status.next == reason
+    assert retained.controller_phase == ("parked" if outcome == "needs-human" else "terminal")
+    assert retained.controller_error is None
+    failures = dispatch_failures.load_failure_state(dispatch_failures.dispatch_failure_state_dir(tmp_path))
+    assert not failures.get("issues", {})
+    assert events == [("worklink_factory_auth_reconcile_failed", {
+        "issue_id": 700, "attempt": 1, "reason_code": "auth_unreadable",
+    })]
 
 
 @pytest.mark.parametrize("failure", [None, "transition", "milestone"])
