@@ -6,6 +6,7 @@ import ast
 import asyncio
 import logging
 import threading
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -65,6 +66,52 @@ def test_invalid_endpoint_warns_once_without_secret(caplog):
         assert TraceController.create(enabled=True, endpoint="https://user:canary@host/?key=canary") is None
     assert len(caplog.records) == 1
     assert "canary" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_batch_export_exception_does_not_log_credentials_or_fail_turn(
+    tmp_path, monkeypatch, caplog,
+):
+    from langchain_core.messages import AIMessage
+    from mimir.models import AgentEvent
+    from opentelemetry.exporter.otlp.proto.http import trace_exporter
+    from tests.test_agent import _FakeAgent, _build_agent
+
+    secret = "ghp_" + "S" * 36
+    exported = threading.Event()
+    attributes = []
+
+    class FailingExporter:
+        def export(self, spans):
+            attributes.extend(dict(span.attributes) for span in spans)
+            exported.set()
+            raise RuntimeError(secret)
+
+        def shutdown(self, timeout_millis=30000):
+            pass
+
+        def force_flush(self, timeout_millis=30000):
+            return True
+
+    monkeypatch.setattr(trace_exporter, "OTLPSpanExporter", lambda **kwargs: FailingExporter())
+    controller = TraceController.create(enabled=True, endpoint="http://localhost:4318")
+    assert controller is not None
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([AIMessage(content="expected reply")]))
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+    try:
+        with caplog.at_level(logging.WARNING):
+            record = await agent.run_turn(AgentEvent(
+                trigger="user_message", channel_id="trace-channel", content="ordinary prompt",
+            ))
+            assert record.output == "expected reply" and record.error is None
+            assert controller.provider.force_flush(timeout_millis=3000)
+            assert exported.wait(3)
+        assert secret not in caplog.text
+        assert "Tracing export failed." in caplog.text
+        assert attributes and secret not in str(attributes)
+    finally:
+        controller.provider.shutdown()
 
 
 def test_turn_hierarchy_usage_and_direct_helper(traces):
