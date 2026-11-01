@@ -162,6 +162,23 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 
 ## Model & providers
 
+### Optional OpenTelemetry tracing
+
+Install `mimir-agent[otel]` to enable OTLP HTTP trace export. Tracing is off
+unless explicitly enabled; installing the extra alone does not activate it.
+`MIMIR_OTLP_ENDPOINT` is an HTTP(S) base URL (for example,
+`https://collector.example.com`), not a URL ending in `/v1/traces`;
+Mimir appends that path. Do not put credentials in this URL. Content capture
+can include prompts, model responses, tool arguments and results; leave it off
+unless your collector and retention policy are approved for that data.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_TRACING_ENABLED` | bool | `false` | Enable optional OTLP GenAI tracing when the extra and endpoint are configured. |
+| `MIMIR_OTLP_ENDPOINT` | HTTP(S) base URL | unset | OTLP HTTP collector base URL; do not append `/v1/traces` or embed credentials. |
+| `MIMIR_OTEL_SERVICE_NAME` | str | `mimir` | Service name reported to the collector. |
+| `MIMIR_TRACING_CAPTURE_CONTENT` | bool | `false` | Include redacted prompt/response/tool content in spans; sensitive even after redaction. |
+
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `MIMIR_MODEL_SPEC` | str | `codex-plus:gpt-5.6-luna` | Active model selector, `provider:model`. `codex-plus:*` = Codex subscription OAuth; `claude-code:*` = Max-OAuth subprocess; `anthropic:*` / `openai:*` = langchain `init_chat_model`. Anthropic-compat gateways (Minimax/Kimi) use `anthropic:` + `ANTHROPIC_BASE_URL`. Each provider needs its extra installed (`pip install 'mimir-agent[codex-plus]'` for the default). |

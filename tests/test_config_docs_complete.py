@@ -200,6 +200,15 @@ def test_every_core_mimir_name_has_a_reference_entry():
     )
 
 
+def test_tracing_config_names_have_reference_rows():
+    names = {
+        "MIMIR_TRACING_ENABLED", "MIMIR_OTLP_ENDPOINT",
+        "MIMIR_OTEL_SERVICE_NAME", "MIMIR_TRACING_CAPTURE_CONTENT",
+    }
+    assert names <= _scan_core_mimir_names()
+    assert names <= _documented_names()
+
+
 def test_plugin_enable_list_reference_contract():
     assert "MIMIR_PLUGINS" in _scan_core()
     assert "MIMIR_PLUGINS" in _documented_names()

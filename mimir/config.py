@@ -1374,6 +1374,10 @@ class Config:
     # Per-process cap for concurrent web-chat SSE subscribers.
     chat_stream_max_subscribers: int = 8
     plugin_manager: PluginManager = field(default_factory=_core_plugin_manager, repr=False, compare=False)
+    tracing_enabled: bool = False
+    otlp_endpoint: str | None = None
+    otel_service_name: str = "mimir"
+    tracing_capture_content: bool = False
 
     def __post_init__(self) -> None:
         if not self.plugin_manager.policy.frozen:
@@ -1437,6 +1441,10 @@ class Config:
             agent_id=_env("MIMIR_AGENT_ID", "mimir"),
             model=_env("MIMIR_MODEL", "claude-opus-4-7"),
             model_spec=model_spec,
+            tracing_enabled=_env_bool("MIMIR_TRACING_ENABLED", False),
+            otlp_endpoint=_env("MIMIR_OTLP_ENDPOINT") or None,
+            otel_service_name=_env("MIMIR_OTEL_SERVICE_NAME", "mimir"),
+            tracing_capture_content=_env_bool("MIMIR_TRACING_CAPTURE_CONTENT", False),
             model_max_retries=_env_int("MIMIR_MODEL_MAX_RETRIES", 6),
             model_max_tokens=_env_int("MIMIR_MODEL_MAX_TOKENS", 0),
             model_reasoning_effort=_env("MIMIR_MODEL_REASONING_EFFORT", ""),
