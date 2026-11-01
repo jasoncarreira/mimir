@@ -21,8 +21,20 @@ def test_always_sensitive_carriers(prefix: str, suffix: str) -> None:
 ])
 def test_sensitive_endpoints(value: str) -> None:
     assert sensitive_otlp_endpoint(value)
-    for name in ("MIMIR_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"):
+    for name in ("MIMIR_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"):
         assert is_sensitive_otlp_env(name.lower(), value)
+
+
+@pytest.mark.parametrize("name", [
+    "MIMIR_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+])
+def test_ordinary_endpoints(name: str) -> None:
+    value = "https://collector.example.test:4318/v1/traces"
+    assert not sensitive_otlp_endpoint(value)
+    assert not is_sensitive_otlp_env(name.lower(), value)
+    assert filter_otlp_env({name: value}) == {name: value}
 
 
 def test_filter_preserves_ordinary_endpoints_and_unrelated_settings() -> None:

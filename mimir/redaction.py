@@ -27,8 +27,8 @@ from mimir.otel_credentials import is_sensitive_otlp_env, sensitive_otlp_endpoin
 
 _OTLP_ASSIGNMENT = re.compile(
     r"(?i)(?<![A-Za-z0-9_.-])(?P<key>" + OTLP_ENV_NAME_PATTERN + r")"
-    r"['\"]?[ \t]*[:=][ \t]*"
-    r"(?:(?P<quote>['\"])(?P<quoted>(?:\\.|[^\n\\])*?)(?P=quote)|(?P<bare>[^\s}\]]+))"
+    r"\\?['\"]?[ \t]*[:=][ \t]*"
+    r"(?:(?P<quote>\\?['\"])(?P<quoted>(?:\\.|[^\n\\])*?)(?P=quote)|(?P<bare>[^\s}\]]+))"
 )
 _EMBEDDED_HTTP_URL = re.compile(r"(?i)https?://[^\s<>\"'`]+")
 
@@ -49,7 +49,11 @@ def _mask_embedded_otlp_urls(text: str) -> str:
     def replace(match: re.Match[str]) -> str:
         candidate = match.group()
         url = candidate.rstrip(".,;!)}")
-        if not url or not sensitive_otlp_endpoint(url):
+        # Only OTLP signal paths identify an unkeyed URL as an exporter URL.
+        # Generic OTLP endpoints are handled by the keyed assignment pass.
+        if not re.search(r"(?i)^https?://[^/?#]+/v1/(?:traces|metrics|logs)(?:[/?#]|$)", url):
+            return candidate
+        if not sensitive_otlp_endpoint(url):
             return candidate
         return "[REDACTED]" + candidate[len(url):]
 

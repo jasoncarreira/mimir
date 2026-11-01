@@ -19,6 +19,9 @@ from mimir.turn_logger import TurnLogger
     ("OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE", "plain-location-canary"),
     ("MIMIR_OTLP_ENDPOINT", "not-a-url-canary"),
     ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://example.test/?plain-query-canary"),
+    ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://user:plain-traces@example.test/v1/traces"),
+    ("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "https://example.test/v1/metrics?plain-metrics"),
+    ("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://example.test/v1/logs#plain-logs"),
 ])
 def test_keyed_payload_and_text(name: str, value: str) -> None:
     assert redact_payload({name: value, "ordinary": "keep-ordinary"}) == {
@@ -29,14 +32,20 @@ def test_keyed_payload_and_text(name: str, value: str) -> None:
 
 def test_embedded_url_and_nonsecret_endpoint() -> None:
     text = (
-        "connect https://user:plain-userinfo@example.test/v1 then "
-        "https://example.test/base?plain-query and "
-        "https://example.test/base#plain-fragment; keep https://example.test/base/"
+        "connect https://user:plain-userinfo@example.test/v1/traces then "
+        "https://example.test/v1/metrics?plain-query and "
+        "https://example.test/v1/logs#plain-fragment; keep https://example.test/base/"
     )
     safe = redact_text(text)
     for secret in ("plain-userinfo", "plain-query", "plain-fragment"):
         assert secret not in safe
     assert "keep https://example.test/base/" in safe
+    assert "https://user:plain-git@github.com/org/repo?view=1" in redact_text(
+        "https://user:plain-git@github.com/org/repo?view=1"
+    )
+    assert redact_text("https://github.com/org/repo?next=/v1/traces") == (
+        "https://github.com/org/repo?next=/v1/traces"
+    )
     assert redact_payload({"OTEL_EXPORTER_OTLP_ENDPOINT": "https://example.test/base/"}) == {
         "OTEL_EXPORTER_OTLP_ENDPOINT": "https://example.test/base/",
     }
@@ -48,8 +57,9 @@ async def test_event_and_turn_durable_sinks(tmp_path) -> None:
         "otel_exporter_otlp_traces_headers": "plain-header-canary",
         "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE": "plain-cert-canary",
         "MIMIR_OTLP_ENDPOINT": "https://user:plain-userinfo@example.test",
-        "text": "visit https://example.test/base?plain-query; keep https://example.test/base/",
+        "text": "visit https://example.test/v1/traces?plain-query; keep https://example.test/base/",
         "OTEL_EXPORTER_OTLP_ENDPOINT": "https://example.test/base/",
+        "nested": json.dumps({"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "https://user:plain-nested@example.test/base"}),
     }
     events_path = tmp_path / "events.jsonl"
     await EventLogger(events_path, "session").log("otel_test", details=payload)
@@ -62,9 +72,21 @@ async def test_event_and_turn_durable_sinks(tmp_path) -> None:
     await TurnLogger(turns_path).write(turn)
     for path in (events_path, turns_path):
         raw = path.read_text()
-        for secret in ("plain-header-canary", "plain-cert-canary", "plain-userinfo", "plain-query"):
+        for secret in ("plain-header-canary", "plain-cert-canary", "plain-userinfo", "plain-query", "plain-nested"):
             assert secret not in raw
         persisted = json.loads(raw)
         details = persisted["details"] if path == events_path else persisted["events"][0]["content"]
         assert details["otel_exporter_otlp_traces_headers"] == "[REDACTED]"
         assert details["OTEL_EXPORTER_OTLP_ENDPOINT"] == "https://example.test/base/"
+        assert "plain-nested" not in details["nested"]
+
+
+@pytest.mark.parametrize("name", [
+    "MIMIR_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+])
+def test_ordinary_endpoint_remains_readable(name: str) -> None:
+    endpoint = "https://collector.example.test:4318/v1/traces"
+    assert redact_payload({name: endpoint}) == {name: endpoint}
+    assert redact_text(f'{name}="{endpoint}"') == f'{name}="{endpoint}"'
