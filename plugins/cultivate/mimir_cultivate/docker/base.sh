@@ -10,6 +10,7 @@ apt-get install -y --no-install-recommends nodejs
 if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then
     npm install --global --prefix /opt/mimir-opencode \
         opencode-ai@1.19.4 \
+        @openai/codex@0.139.0 \
         "feature-factory@${FACTORY_VERSION}" \
         "opencode-feature-factory@${FACTORY_VERSION}" \
         opencode-project-memory@0.1.0 \

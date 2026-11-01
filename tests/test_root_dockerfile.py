@@ -148,7 +148,9 @@ def test_trusted_fragment_preserves_pre_extraction_instruction_contract() -> Non
             old = "xz-utils poppler-utils"
             new = "xz-utils lsof file unzip less make netcat-openbsd iproute2 psmisc poppler-utils"
             expected_steps = [step.replace(old, new) for step in expected_steps]
-            expected_steps = [step.replace("opencode-ai@1.18.21", "opencode-ai@1.19.4")
+            # The container-owned Codex login uses a pinned CLI in the image.
+            expected_steps = [step.replace("opencode-ai@1.18.21",
+                                           "opencode-ai@1.19.4 @openai/codex@0.139.0")
                               for step in expected_steps]
         if name == "executor.sh":
             # Intentional post-extraction changes, each pinned exactly:
