@@ -272,6 +272,7 @@ addopts = "-n auto --dist worksteal"
 markers = [
     "allow_empty_parametrize: permit an intentionally empty parameter set to skip",
     "real_worklink_identities: use provisioned mimir/worklink accounts instead of synthetic IDs",
+    "real_coding_cli(name): opt in to a host coding CLI via the real_coding_cli fixture",
 ]
 # Fail stalled tests individually, preserving their node ids and the session.
 # The thread method exits the worker instead of reporting a normal failure.

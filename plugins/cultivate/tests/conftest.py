@@ -25,6 +25,9 @@ from tests.isolation_fixtures import (  # noqa: F401  (autouse fixtures)
     _isolate_process_env,
     maintenance_pinned_executables,
     synthetic_worklink_identities,
+    _hide_host_coding_clis,
+    real_coding_cli,
+    stub_opencode,
 )
 
 

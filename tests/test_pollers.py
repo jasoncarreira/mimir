@@ -8625,7 +8625,7 @@ def test_worklink_ready_queue_manifest_forwards_model_and_reasoning_effort() -> 
 )
 @pytest.mark.usefixtures("selected_cultivate_policy")
 async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_spec(
-    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch, stub_opencode: Path,
     agent_effort: str, override: str | None, source: str,
 ) -> None:
     """Real env scrub -> queue dispatch -> child -> leaf argv; no dotenv fallback."""
