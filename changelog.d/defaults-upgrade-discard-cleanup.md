@@ -1,1 +1,0 @@
-- Defaults upgrade: when a three-way merge fails part way, the upgrade lane now discards its own half-merged proposal worktree and reports the error, instead of raising from `abandon_proposal` (which refuses uncommitted changes since #2384).
