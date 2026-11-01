@@ -185,6 +185,47 @@ def test_remediation_grants_survive_two_commits_and_pushes(tmp_path, monkeypatch
         assert not auth.ifc_state.has_untrusted_active_ingest()
 
 
+@pytest.mark.parametrize("invalid", [
+    None, "different_lease", "different_grant_head", "different_lease_head", "expired",
+])
+def test_observe_push_advances_only_matching_live_grants(tmp_path, monkeypatch, invalid):
+    from mimir import access_control
+
+    _, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch)
+    previous_head = scope.observed_head_sha
+    head = _commit_remediation(state, invoke, "publishable fix")
+    lease = state.checkout_lease
+    grants = auth.scoped_pr_grants
+    key = ("cultivate", scope.scope_id)
+    # GitPush updates the existing scope only after verified own publication.
+    # Isolate observe_push here so another admission guard cannot mask it.
+    object.__setattr__(scope, "observed_head_sha", head)
+    if invalid == "different_lease":
+        lease = replace(lease, recovery_id=lease.recovery_id + "-other")
+    elif invalid == "different_grant_head":
+        action = next(iter(grants._follow[key]))
+        grants._follow[key][action] = replace(grants._follow[key][action], head="f" * 40)
+    elif invalid == "different_lease_head":
+        lease = replace(lease, head_sha=previous_head)
+    elif invalid == "expired":
+        monkeypatch.setattr(access_control, "time", SimpleNamespace(
+            monotonic=lambda: grants.expires_at,
+        ))
+    before = dict(grants._follow[key])
+    assert before
+    assert all(grant.lease_identity == (str(state.checkout_lease.path),
+                                       state.checkout_lease.recovery_id)
+               for grant in before.values())
+    assert grants.observe_push("cultivate", scope, lease, previous_head) is (invalid is None)
+    if invalid is None:
+        assert grants._follow[key] == {
+            action: replace(grant, head=head) for action, grant in before.items()
+        }
+    else:
+        assert grants._follow[key] == before
+        assert all(grants._follow[key][action] is grant for action, grant in before.items())
+
+
 def test_unsupported_escalation_preserves_trusted_turn_for_pr_comment(tmp_path, monkeypatch):
     from mimir import event_logger
     from mimir.access_control import (
@@ -234,7 +275,10 @@ def test_unsupported_escalation_preserves_trusted_turn_for_pr_comment(tmp_path, 
     ).reason != "write_blocked_by_untrusted_ingest"
 
 
-@pytest.mark.parametrize("invalid", ["extra_content", "failed", "wrong_pr", "untrusted_provenance"])
+@pytest.mark.parametrize("invalid", [
+    "extra_content", "failed", "wrong_pr", "untrusted_provenance", "other_owner",
+    "result_repository", "result_pr", "result_status", "disallowed", "would_block",
+])
 def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypatch, invalid):
     from mimir.access_control import (
         ProtectedResultProvenance, ToolAuthorization, classify_protected_result,
@@ -247,7 +291,31 @@ def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypat
               "repository": scope.canonical_repo, "pull_request": scope.pr_number}
     provenance = None
     failed = False
-    if invalid == "extra_content":
+    policy = auth._plugin_slot_policy
+    authorization = ToolAuthorization(
+        tool_name="unsupported_operation", decision="resource_scoped", allowed=True,
+        repo_pr_action_scope=scope, policy=policy,
+    )
+    if invalid == "other_owner":
+        # Copy the selected registry: never mutate the shared plugin policy.
+        from copy import copy
+        policy = copy(policy)
+        policy._tools = dict(policy.tools)
+        policy._tools["unsupported_operation"] = replace(
+            policy.tools["unsupported_operation"], owner="other_plugin",
+        )
+        authorization = replace(authorization, policy=policy)
+    elif invalid == "result_repository":
+        result["repository"] = "other/repo"
+    elif invalid == "result_pr":
+        result["pull_request"] += 1
+    elif invalid == "result_status":
+        result["status"] = "another_status"
+    elif invalid == "disallowed":
+        authorization = replace(authorization, allowed=False)
+    elif invalid == "would_block":
+        authorization = replace(authorization, would_block=True)
+    elif invalid == "extra_content":
         result["description"] = "externally sourced text"
     elif invalid == "failed":
         failed = True
@@ -259,20 +327,18 @@ def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypat
             bridge_instance="web", sensitivity="public", source_kind="protected_tool",
             integrity="untrusted", integrity_effect="active_ingest",
         ),))
-    with policy_scope(auth._plugin_slot_policy):
+    with policy_scope(policy):
         labels = classify_protected_result(
-            "unsupported_operation", arguments, auth,
-            ToolAuthorization(tool_name="unsupported_operation", decision="resource_scoped",
-                              allowed=True, repo_pr_action_scope=scope,
-                              policy=auth._plugin_slot_policy),
+            "unsupported_operation", arguments, auth, authorization,
             result=result, provenance=provenance, failed=failed,
         )
+    assert labels is not None
     assert labels.has_untrusted_active_ingest
 
 
 @pytest.mark.parametrize("invalid", [
     "remote_moved", "foreign_lease", "expired_lease", "reclaiming", "changed_branch",
-    "other_pr", "unrecorded_commit", "false_lineage", "non_descendant",
+    "other_pr", "other_destination", "unrecorded_commit", "false_lineage", "non_descendant",
 ])
 def test_remediation_push_refuses_unbound_head(tmp_path, monkeypatch, invalid):
     origin, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch)
@@ -302,6 +368,12 @@ def test_remediation_push_refuses_unbound_head(tmp_path, monkeypatch, invalid):
         metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
         raw = json.loads(metadata.read_text())
         raw["pr_number"] = lease.pr_number
+        metadata.write_text(json.dumps(raw))
+    elif invalid == "other_destination":
+        object.__setattr__(lease, "destination_ref", "refs/heads/other-destination")
+        metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(metadata.read_text())
+        raw["destination_ref"] = lease.destination_ref
         metadata.write_text(json.dumps(raw))
     elif invalid == "unrecorded_commit":
         _git(lease.path, "-c", "user.name=foreign", "-c", "user.email=foreign@example.test",
