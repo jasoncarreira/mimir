@@ -24,6 +24,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 from mimir.redaction import redact_text
+from mimir.otel_credentials import filter_otlp_env
 from .backends.base import (
     ComputeBackend,
     ComputeLaunchError,
@@ -985,6 +986,7 @@ async def _run_compute_gate(
                 basetemp=_gate_tmp_directory(report_dir),
             ),
         )
+    gate_spec = replace(gate_spec, env=filter_otlp_env(gate_spec.env))
     if work_spec.backend == "feature_factory":
         from .compute import _local_child_env
         from .worker_client import run_factory_control
@@ -995,7 +997,7 @@ async def _run_compute_gate(
         try:
             observed = await asyncio.to_thread(
                 run_factory_control, checkout, ("/bin/sh", "-c", command_in_sandbox),
-                env={**_local_child_env(), **gate_spec.env},
+                env=filter_otlp_env({**_local_child_env(), **gate_spec.env}),
                 timeout=gate_spec.timeout_s, output_limit=20_000_000,
             )
         except subprocess.TimeoutExpired:
@@ -1314,7 +1316,7 @@ def _run(
     args: Sequence[str] | str, *, cwd: Path | None = None, timeout: float = 1800,
     text: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
+    env = filter_otlp_env(os.environ)
     env.pop("MIMIR_MODEL_SPEC", None)
     if isinstance(args, str):
         # Shell syntax supports configured commands and the report env prefix.
