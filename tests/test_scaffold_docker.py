@@ -756,6 +756,7 @@ def test_selected_cultivate_scaffold_executes_gated_pinned_install(tmp_path, mon
             assert log.read_text().splitlines() == [
                 "install", "--global", "--prefix", "/opt/mimir-opencode",
                 f"opencode-ai@{OPENCODE_VERSION}",
+                "@openai/codex@0.139.0",
                 f"feature-factory@{FACTORY_VERSION}",
                 f"opencode-feature-factory@{FACTORY_VERSION}",
                 "opencode-project-memory@0.1.0", "opencode-openai-codex-auth@4.4.0",

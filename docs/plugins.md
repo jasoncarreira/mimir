@@ -44,7 +44,8 @@ license SHA-256, installed version and UTC timestamp; a changed license
 requires acceptance again. Unattended first runs require `--accept-license`.
 
 The installer asks for a GitHub repository and base branch, a bot login and
-commit email, an owner name and email, a model spec and API key, and a local
+commit email, an owner name and email, a model spec (and an API key only for
+API-backed models), and a local
 deployment directory and loopback port. It shows the required fine-grained PAT
 permissions and verifies the bot's identity, Write invitation, PR read and
 Actions read before building. The source is fetched from a pushed ref and its
@@ -66,6 +67,29 @@ fresh install, but does not retrieve the owner's web key or verify the live
 deployment. After starting, re-run `mimir cultivate setup` with the same
 deployment and settings **without `--no-start`** to retrieve `owner-web-key`
 and run verification.
+
+For a ChatGPT/Codex subscription, choose `--model-spec codex-plus:gpt-5.6-luna`
+or enter that spec at the interactive prompt. The recommended Saga model is
+`codex-plus:gpt-5.6-luna:low`; neither requires a model API key. You may
+instead choose an `openai:` or `anthropic:` Saga model, which requires its own
+API key. `--embedding local` is keyless; API embeddings require their usual
+key. The image includes the `codex-plus` extra and the agent receives the
+subscription spec as `MIMIR_MODEL_SPEC`; setup removes an obsolete
+`OPENAI_API_KEY` from `compose.env` when no selected model or embedding uses it.
+
+Setup creates a private `<deploy>/codex` directory and mounts it at
+`/home/mimir/.codex` in the agent. From the deployment directory, run the
+**exact one-line login command printed by setup**:
+`docker compose run --rm --no-deps --user 1001:1001 --entrypoint codex agent login --device-auth`.
+The image includes the Codex CLI; it writes the login as the container user
+directly into this deployment's private mount, even if the host operator has a
+different UID. Login before rerunning setup to start the agent; without a valid
+`auth.json`, setup refuses to start it and repeats the command. `--no-start`
+still builds and provisions before login. Do not copy or mount the host's `~/.codex`: refresh
+tokens are single-use, and sharing one login across deployments can revoke
+the entire token family. Log in separately for **each** deployment. OpenCode
+reconciles its OAuth store from this deployment's Codex login and projects
+OAuth into coding workers without passing an OpenAI API key.
 
 Setup also asks **Where should operator alerts go? [web/discord/slack/none]**.
 `web` delivers to the owner's authenticated `web-<owner>` chat and persists
@@ -152,7 +176,7 @@ For unattended runs, use `--help` to see the corresponding flags or set
 `MIMIR_CULTIVATE_DISPLAY_NAME`, `MIMIR_CULTIVATE_OWNER_EMAIL`,
 `MIMIR_CULTIVATE_MODEL_SPEC`, `MIMIR_CULTIVATE_DEPLOY`, and
 `MIMIR_CULTIVATE_PORT`. Pass secrets via `--github-token-file` and
-`--model-key-file` (private mode-600 files), their `-stdin` counterparts, or
+`--model-key-file` for API-backed models (private mode-600 files), their `-stdin` counterparts, or
 `MIMIR_CULTIVATE_GITHUB_TOKEN` / `MIMIR_CULTIVATE_MODEL_KEY`. Never put a key
 in a command-line argument. The installer writes `compose.env` and the owner's
 web key as separate mode-600 files and does not print either key.
