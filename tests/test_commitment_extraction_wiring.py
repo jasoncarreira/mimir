@@ -25,6 +25,7 @@ Plus the negative guards:
 from __future__ import annotations
 
 import os
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -191,6 +192,73 @@ async def test_tainted_synthesis_turn_skips_commitment_writes(
             "source_turn_id": "turn-extract-test",
         },
     )]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture_content", [False, True])
+async def test_trusted_finalize_extraction_traces_direct_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture_content: bool,
+) -> None:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from mimir.tracing import MODEL, OPERATION, TraceController
+
+    agent = _make_agent(tmp_path)
+    monkeypatch.setattr(
+        "mimir.saga._config_io.resolve_llm_config",
+        lambda section: {"model": "extraction-fake"},
+    )
+    calls = []
+
+    async def fake_call(cfg, *, prompt, system, **kwargs):
+        calls.append((cfg, prompt, system))
+        return json.dumps({"commitments": [{
+            "text": "Review safe PR", "kind": "open_loop", "confidence": 0.9,
+            "suggested_reminder": "safe reminder token=private-canary",
+        }]})
+
+    async def ignore_event(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr("mimir.saga._llm.call_llm", fake_call)
+    monkeypatch.setattr("mimir.turn_hooks.log_event", ignore_event)
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    controller = TraceController(provider, capture_content=capture_content)
+    event = AgentEvent(trigger="saga_session_end", channel_id="ch-1")
+    ctx = _make_ctx(event, saga_session_id="sess-1")
+    record = _make_record("safe synthesis token=private-canary " * 5)
+    try:
+        with controller.turn(conversation_id="finalize-turn", agent_name="mimir", model="fake"):
+            await _fire_extraction(agent, ctx, event, record)
+        assert len(calls) == 1
+        assert calls[0][0] == {"model": "extraction-fake"}
+        assert "safe synthesis" in calls[0][1]
+        assert "You extract commitments" in calls[0][2]
+        assert len(agent._commitments.current_state()) == 1
+        spans = exporter.get_finished_spans()
+        chat = next(span for span in spans if span.name == "chat")
+        root = next(span for span in spans if span.name == "invoke_agent")
+        assert chat.parent.span_id == root.context.span_id
+        assert chat.attributes[OPERATION] == "chat"
+        assert chat.attributes[MODEL] == "extraction-fake"
+        content = {key: value for key, value in chat.attributes.items() if "messages" in key}
+        if capture_content:
+            assert "safe synthesis" in content["gen_ai.input.messages"]
+            assert "safe reminder" in content["gen_ai.output.messages"]
+            assert "private-canary" not in str([dict(span.attributes) for span in spans])
+        else:
+            assert content == {}
+
+        exporter.clear()
+        await _fire_extraction(agent, ctx, event, record)
+        assert len(calls) == 2
+        assert not exporter.get_finished_spans()
+    finally:
+        provider.shutdown()
 
 
 # ─── The four outcome events ───────────────────────────────────────
