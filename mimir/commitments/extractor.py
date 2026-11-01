@@ -39,6 +39,8 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from mimir.tracing import capture_chat_output, in_turn_chat
+
 from .models import (
     DEFAULT_SNOOZE_WINDOW_SECS,
     CommitmentKind,
@@ -431,17 +433,22 @@ async def extract_commitments(
             # comes from saga config, model name from the override.
             cfg["model"] = model.split(":", 1)[-1]
 
-        raw_text = await call_llm(
-            cfg,
-            prompt=user_msg,
-            system=EXTRACTION_SYSTEM,
-            # Extraction is JSON; deterministic output wanted.
-            temperature=0.0,
-            # Multiple commitments per session = a few hundred tokens
-            # of JSON. 2000 leaves headroom for long sessions without
-            # blowing the budget.
-            max_tokens=2000,
-        )
+        with in_turn_chat(
+            model=str(cfg.get("model") or "unknown"),
+            input_content={"prompt": user_msg, "system": EXTRACTION_SYSTEM},
+        ) as span:
+            raw_text = await call_llm(
+                cfg,
+                prompt=user_msg,
+                system=EXTRACTION_SYSTEM,
+                # Extraction is JSON; deterministic output wanted.
+                temperature=0.0,
+                # Multiple commitments per session = a few hundred tokens
+                # of JSON. 2000 leaves headroom for long sessions without
+                # blowing the budget.
+                max_tokens=2000,
+            )
+            capture_chat_output(span, raw_text)
     except Exception:  # noqa: BLE001
         log.exception("commitments extractor: LLM call failed")
         return []

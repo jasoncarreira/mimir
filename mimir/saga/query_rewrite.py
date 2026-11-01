@@ -27,6 +27,8 @@ import logging
 import re
 from typing import Any
 
+from mimir.tracing import capture_chat_output, in_turn_chat
+
 
 logger = logging.getLogger("mimir.saga.query_rewrite")
 
@@ -166,13 +168,15 @@ async def rewrite_query(
     cfg = llm_config or resolve_llm_config("retrieval_v2")
     prompt = REWRITE_PROMPT.format(context=rendered, question=query)
     try:
-        raw = await call_llm(
-            cfg,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=None,
-        )
+        with in_turn_chat(model=str(cfg.get("model") or "unknown"), input_content=prompt) as span:
+            raw = await call_llm(
+                cfg,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=None,
+            )
+            capture_chat_output(span, raw)
     except Exception as exc:
         logger.warning("contextual rewrite LLM call failed: %s", exc)
         return query
