@@ -8767,8 +8767,9 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
         json.dumps({"openai": {"type": "oauth", "refresh": "synthetic"}}),
         encoding="utf-8",
     )
-    from tests.opencode_fixtures import seed_codex_subscription
+    from tests.opencode_fixtures import seed_codex_subscription, seed_opencode_binary
     seed_codex_subscription(tmp_path, "synthetic")
+    binary = seed_opencode_binary(tmp_path)
     parent_env = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": str(tmp_path),
@@ -8808,7 +8809,7 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
         "assert 'MIMIR_CODING_ENABLED' not in os.environ\n"
         f"order = WorkOrder(1844, Path({str(repo)!r}), 'prompt', None, 30, "
         "{'MIMIR_HOME': os.environ['MIMIR_HOME']})\n"
-        "spec = OpenCodeBackend().work_spec(order, attempt=1, repo_url='u', "
+        f"spec = OpenCodeBackend(bin={str(binary)!r}).work_spec(order, attempt=1, repo_url='u', "
         "base_ref='main', branch='issue/1844-a1', test_command='true')\n"
         f"Path({str(result_path)!r}).write_text(json.dumps({{"
         "'argv': spec.local_argv, 'variant': spec.backend_config['variant'], "
