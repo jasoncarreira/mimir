@@ -1,0 +1,1 @@
+- Add opt-in OpenTelemetry GenAI tracing configuration and an OTLP HTTP extra.
