@@ -160,6 +160,68 @@ SYNTHETIC_WORKLINK_UID = 42002
 SYNTHETIC_WORKLINK_GID = 42003
 
 
+_HOST_CODING_CLIS = frozenset({
+    "opencode", "codex", "factory.js", "feature-factory", "chainlink", "gh",
+})
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _hide_host_coding_clis(tmp_path_factory):
+    """Keep inherited coding tools off PATH without losing git and other tools.
+
+    A CLI can share /usr/bin with git, so dropping the entire directory is not
+    viable. Mirror only the affected PATH entries with symlinks to every other
+    entry. Subprocesses inherit this PATH too. Explicit test-owned executables
+    can still be put on PATH by the test that needs them.
+    """
+    original = os.environ.get("PATH", os.defpath)
+    directories = original.split(os.pathsep)
+    hidden = tmp_path_factory.mktemp("path-without-coding-clis")
+    sanitized = []
+    for index, directory in enumerate(directories):
+        source = Path(directory or os.curdir)
+        if not any((source / name).is_file() and os.access(source / name, os.X_OK)
+                   for name in _HOST_CODING_CLIS):
+            sanitized.append(directory)
+            continue
+        mirror = hidden / str(index)
+        mirror.mkdir()
+        for entry in source.iterdir():
+            if entry.name not in _HOST_CODING_CLIS:
+                (mirror / entry.name).symlink_to(entry.absolute())
+        sanitized.append(str(mirror))
+    os.environ["PATH"] = os.pathsep.join(sanitized)
+    try:
+        yield original
+    finally:
+        os.environ["PATH"] = original
+
+
+@pytest.fixture
+def real_coding_cli(request, _hide_host_coding_clis):
+    """Opt in to an inherited CLI by absolute path, skipping if unavailable."""
+    marker = request.node.get_closest_marker("real_coding_cli")
+    if marker is None or len(marker.args) != 1 or marker.args[0] not in _HOST_CODING_CLIS:
+        pytest.fail("real_coding_cli fixture requires @pytest.mark.real_coding_cli(<name>)")
+    name = marker.args[0]
+    executable = shutil.which(name, path=_hide_host_coding_clis)
+    if executable is None:
+        pytest.skip(f"{name} CLI is not installed")
+    return executable
+
+
+@pytest.fixture
+def stub_opencode(tmp_path, monkeypatch):
+    """Provide an executable owned by the test for admission-only scenarios."""
+    bin_dir = tmp_path / "coding-cli-bin"
+    bin_dir.mkdir()
+    executable = bin_dir / "opencode"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    return executable
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _disable_git_auto_maintenance():
     """Keep every test-created repository free of background maintenance."""

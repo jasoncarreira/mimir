@@ -44,6 +44,9 @@ from tests.isolation_fixtures import (  # noqa: F401  (autouse fixtures)
     _POLLER_INJECTED_ENV,
     _clear_host_mimir_environment,
     _isolate_process_env,
+    _hide_host_coding_clis,
+    real_coding_cli,
+    stub_opencode,
 )
 
 

@@ -15337,10 +15337,7 @@ def _chainlink_service(profile: str, authority_profile: str) -> ServicePrincipal
     )
 
 
-def _chainlink_help_commands(*arguments: str) -> set[str]:
-    executable = shutil.which("chainlink")
-    if executable is None:
-        pytest.skip("chainlink CLI is not installed")
+def _chainlink_help_commands(*arguments: str, executable: str) -> set[str]:
     result = subprocess.run(
         [executable, *arguments, "--help"],
         check=True,
@@ -15364,12 +15361,14 @@ def _chainlink_help_commands(*arguments: str) -> set[str]:
 def _assert_chainlink_commands_audited(
     *arguments: str,
     audited: set[str] | frozenset[str],
+    executable: str,
 ) -> None:
-    unknown = _chainlink_help_commands(*arguments) - audited
+    unknown = _chainlink_help_commands(*arguments, executable=executable) - audited
     assert not unknown, f"unaudited Chainlink commands: {sorted(unknown)}"
 
 
-def test_chainlink_issue_help_has_an_explicit_read_or_mutation_decision() -> None:
+@pytest.mark.real_coding_cli("chainlink")
+def test_chainlink_issue_help_has_an_explicit_read_or_mutation_decision(real_coding_cli: str) -> None:
     audited = (
         access_control._CHAINLINK_QUERY_SUBCOMMANDS
         | access_control._CHAINLINK_MUTATION_SUBCOMMANDS
@@ -15380,7 +15379,7 @@ def test_chainlink_issue_help_has_an_explicit_read_or_mutation_decision() -> Non
     # CLI (``cascade``/``falsify`` arrived later). Every command exposed by the
     # installed pin must still have an explicit decision; extra source-side
     # decisions keep rolling deployments safe without making the older pin fail.
-    _assert_chainlink_commands_audited("issue", audited=audited)
+    _assert_chainlink_commands_audited("issue", audited=audited, executable=real_coding_cli)
     assert access_control._CHAINLINK_QUERY_SUBCOMMANDS == {
         "blocked", "cascade", "list", "next", "ready", "related", "search",
         "show", "tree",
@@ -15392,7 +15391,7 @@ def test_chainlink_issue_audit_rejects_an_unknown_live_command(
 ) -> None:
     monkeypatch.setattr(
         __name__ + "._chainlink_help_commands",
-        lambda *arguments: {"show", "new-upstream-command"},
+        lambda *arguments, **kwargs: {"show", "new-upstream-command"},
     )
     audited = (
         access_control._CHAINLINK_QUERY_SUBCOMMANDS
@@ -15401,7 +15400,7 @@ def test_chainlink_issue_audit_rejects_an_unknown_live_command(
     )
 
     with pytest.raises(AssertionError, match="new-upstream-command"):
-        _assert_chainlink_commands_audited("issue", audited=audited)
+        _assert_chainlink_commands_audited("issue", audited=audited, executable="fixture")
 
 
 def test_chainlink_query_and_mutation_subcommands_are_disjoint() -> None:
@@ -15420,12 +15419,13 @@ def test_every_declared_chainlink_mutation_classifies_as_mutation(
     assert access_control._chainlink_command_is_mutation(argv)
 
 
-def test_chainlink_top_level_help_has_an_explicit_scope_decision() -> None:
+@pytest.mark.real_coding_cli("chainlink")
+def test_chainlink_top_level_help_has_an_explicit_scope_decision(real_coding_cli: str) -> None:
     audited = {"issue", "session"} | set(
         access_control._CHAINLINK_REFUSED_TOP_LEVEL_COMMANDS
     )
 
-    _assert_chainlink_commands_audited(audited=audited)
+    _assert_chainlink_commands_audited(audited=audited, executable=real_coding_cli)
     assert all(access_control._CHAINLINK_REFUSED_TOP_LEVEL_COMMANDS.values())
 
 
@@ -15434,14 +15434,14 @@ def test_chainlink_top_level_audit_rejects_an_unknown_live_command(
 ) -> None:
     monkeypatch.setattr(
         __name__ + "._chainlink_help_commands",
-        lambda *arguments: {"issue", "new-upstream-command"},
+        lambda *arguments, **kwargs: {"issue", "new-upstream-command"},
     )
     audited = {"issue", "session"} | set(
         access_control._CHAINLINK_REFUSED_TOP_LEVEL_COMMANDS
     )
 
     with pytest.raises(AssertionError, match="new-upstream-command"):
-        _assert_chainlink_commands_audited(audited=audited)
+        _assert_chainlink_commands_audited(audited=audited, executable="fixture")
 
 
 def _chainlink_ifc_labels(*, tainted: bool) -> InformationFlowLabels:

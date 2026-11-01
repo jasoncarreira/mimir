@@ -599,13 +599,12 @@ async def test_cancellation_drains_store_thread_before_return(tmp_path, monkeypa
         assert acquired
 
 
-def test_opencode_task_id_resume_after_prune(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.real_coding_cli("opencode")
+def test_opencode_task_id_resume_after_prune(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_coding_cli: str,
+) -> None:
     """Use the real OpenCode CLI/schema and a local deterministic model endpoint."""
-    binary = shutil.which("opencode")
-    if binary is None:
-        if os.environ.get("MIMIR_REQUIRE_OPENCODE_RESUME") == "1":
-            pytest.fail("required OpenCode resume prerequisite is unavailable")
-        pytest.skip("OpenCode executable is unavailable")
+    binary = real_coding_cli
     requests: list[dict] = []
     events: list[tuple[str, dict]] = []
     monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda name, **fields: events.append((name, fields)))
