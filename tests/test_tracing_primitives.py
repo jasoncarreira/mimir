@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import logging
+import threading
 from pathlib import Path
 from uuid import uuid4
 
@@ -148,6 +150,74 @@ def test_callback_failure_does_not_change_turn(traces, monkeypatch, caplog):
         turn.callback.on_tool_start({"name": "search"}, "input", run_id=uuid4())
     assert [span.name for span in exporter.get_finished_spans()] == ["invoke_agent"]
     assert "private-canary" not in caplog.text
+
+
+def test_root_start_failure_preserves_turn_outcome(traces, monkeypatch, caplog):
+    controller, exporter = traces
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("private-canary")
+
+    monkeypatch.setattr(controller.tracer, "start_span", fail)
+    with controller.turn(conversation_id="safe", agent_name="mimir", model="fake") as turn:
+        turn.callback.on_tool_start({"name": "search"}, "input", run_id=uuid4())
+        with in_turn_chat(model="rewrite") as span:
+            assert span is None
+    with pytest.raises(ValueError, match="original failure"):
+        with controller.turn(conversation_id="safe", agent_name="mimir", model="fake"):
+            raise ValueError("original failure")
+    assert exporter.get_finished_spans() == ()
+    assert "private-canary" not in caplog.text
+
+
+def test_direct_start_failure_preserves_turn_outcome(traces, monkeypatch, caplog):
+    controller, exporter = traces
+    with controller.turn(conversation_id="safe", agent_name="mimir", model="fake") as turn:
+        def fail(*args, **kwargs):
+            raise RuntimeError("private-canary")
+
+        monkeypatch.setattr(turn, "_start", fail)
+        with in_turn_chat(model="rewrite") as span:
+            assert span is None
+        with pytest.raises(ValueError, match="original failure"):
+            with in_turn_chat(model="rewrite"):
+                raise ValueError("original failure")
+    assert [span.name for span in exporter.get_finished_spans()] == ["invoke_agent"]
+    assert "private-canary" not in caplog.text
+
+
+def test_callback_delayed_after_cancelled_turn_does_not_start_span(traces):
+    controller, exporter = traces
+    ready = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+    failures = []
+    with pytest.raises(asyncio.CancelledError):
+        with controller.turn(conversation_id="safe", agent_name="mimir", model="fake") as turn:
+            callback = turn.callback
+            run_id = uuid4()
+
+            def delayed_start():
+                ready.set()
+                if not release.wait(5):
+                    failures.append("callback was not released")
+                else:
+                    try:
+                        callback.on_tool_start({"name": "search"}, "input", run_id=run_id)
+                    except Exception as exc:
+                        failures.append(exc)
+                done.set()
+
+            worker = threading.Thread(target=delayed_start)
+            worker.start()
+            assert ready.wait(5)
+            raise asyncio.CancelledError()
+    release.set()
+    assert done.wait(5)
+    worker.join(timeout=5)
+    assert not failures
+    assert not turn._spans
+    assert [span.name for span in exporter.get_finished_spans()] == ["invoke_agent"]
 
 
 def test_shutdown_contains_exporter_failure(caplog):

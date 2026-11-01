@@ -125,18 +125,23 @@ class TraceController:
     ) -> Iterator[TurnTrace]:
         from opentelemetry.trace import Status, StatusCode
 
-        span = self.tracer.start_span("invoke_agent", attributes={
-            OPERATION: "invoke_agent", CONVERSATION: conversation_id,
-            AGENT: agent_name, MODEL: model,
-        })
+        try:
+            span = self.tracer.start_span("invoke_agent", attributes={
+                OPERATION: "invoke_agent", CONVERSATION: conversation_id,
+                AGENT: agent_name, MODEL: model,
+            })
+        except Exception:
+            _log.warning("Tracing root span creation failed.")
+            span = None
         turn = TurnTrace(self, span)
-        if self.capture_content and input_content is not None:
+        if span is not None and self.capture_content and input_content is not None:
             turn._set_content(span, "gen_ai.input.messages", input_content)
         token = _active_turn.set(turn)
         try:
             yield turn
         except BaseException:
-            turn._safe(lambda: span.set_status(Status(StatusCode.ERROR)))
+            if span is not None:
+                turn._safe(lambda: span.set_status(Status(StatusCode.ERROR)))
             raise
         finally:
             _active_turn.reset(token)
@@ -195,20 +200,22 @@ class TurnTrace:
         self._safe(lambda: self.span.set_status(Status(StatusCode.ERROR)))
 
     def finish(self, *, output_content: Any = None, error: bool = False) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        if error:
-            self.mark_error()
-        if self.controller.capture_content and output_content is not None:
-            self._set_content(self.span, "gen_ai.output.messages", output_content)
         with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+            if self.span is None:
+                return
+            if error:
+                self.mark_error()
+            if self.controller.capture_content and output_content is not None:
+                self._set_content(self.span, "gen_ai.output.messages", output_content)
             for child in self._spans.values():
                 self._safe(child.end)
             self._spans.clear()
             for key, count in self._totals.items():
                 self._safe(lambda k=key, n=count: self.span.set_attribute(k, n))
-        self._safe(self.span.end)
+            self._safe(self.span.end)
 
     def _start(self, name: str, attributes: Mapping[str, Any], parent: Any = None) -> Any:
         from opentelemetry.trace import set_span_in_context
@@ -219,18 +226,25 @@ class TurnTrace:
     @contextlib.contextmanager
     def chat(self, *, model: str, input_content: Any = None) -> Iterator[Any]:
         """Caller-owned span for direct in-turn model calls outside LangGraph."""
-        span = self._start("chat", {OPERATION: "chat", MODEL: model})
-        if self.controller.capture_content and input_content is not None:
+        span = None
+        if self.span is not None and not self._finished:
+            try:
+                span = self._start("chat", {OPERATION: "chat", MODEL: model})
+            except Exception:
+                _log.warning("Tracing direct span creation failed.")
+        if span is not None and self.controller.capture_content and input_content is not None:
             self._set_content(span, "gen_ai.input.messages", input_content)
         try:
             yield span
         except BaseException:
-            from opentelemetry.trace import Status, StatusCode
+            if span is not None:
+                from opentelemetry.trace import Status, StatusCode
 
-            self._safe(lambda: span.set_status(Status(StatusCode.ERROR)))
+                self._safe(lambda: span.set_status(Status(StatusCode.ERROR)))
             raise
         finally:
-            self._safe(span.end)
+            if span is not None:
+                self._safe(span.end)
 
     @property
     def callback(self) -> Any:
@@ -243,6 +257,8 @@ class TurnTrace:
                        attributes: dict[str, Any], content: Any = None) -> None:
                 def start() -> None:
                     with turn._lock:
+                        if turn._finished or turn.span is None:
+                            return
                         parent = turn._spans.get(parent_run_id, turn.span)
                         span = turn._start(operation, {OPERATION: operation, **attributes}, parent)
                         turn._spans[run_id] = span
