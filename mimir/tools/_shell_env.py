@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..otel_credentials import filter_otlp_env, is_sensitive_otlp_env
+
 if TYPE_CHECKING:
     from ..access_control import DeclaredShellCommand
 
@@ -186,14 +188,14 @@ def interactive_shell_env() -> dict[str, str]:
         name.strip() for name in os.environ.get("MIMIR_SHELL_PASS_ENV", "").split(",")
     )
     passed = [name for name in names if name != "PATH" and _ENV_NAME.fullmatch(name)
-              and name in os.environ]
+              and name in os.environ and not is_sensitive_otlp_env(name, os.environ[name])]
     for name in passed:
         env[name] = os.environ[name]
     if passed:
         from ..event_logger import log_event_sync
 
         log_event_sync("interactive_shell_env_passthrough", pass_env=passed)
-    return env
+    return filter_otlp_env(env)
 
 
 def interactive_shell_env_overlay() -> dict[str, str | None]:
@@ -202,6 +204,20 @@ def interactive_shell_env_overlay() -> dict[str, str | None]:
     for key in (*os.environ, "PYTHONUNBUFFERED"):
         if key not in overlay:
             overlay[key] = None
+    return filter_shell_env_overlay(overlay)
+
+
+def filter_shell_env_overlay(overlay: dict[str, str | None]) -> dict[str, str | None]:
+    """Deny credential carriers after merging the async registry's inherited env."""
+    merged = os.environ.copy()
+    for name, value in overlay.items():
+        if value is None:
+            merged.pop(name, None)
+        else:
+            merged[name] = value
+    for name, value in merged.items():
+        if is_sensitive_otlp_env(name, value):
+            overlay[name] = None
     return overlay
 
 
@@ -304,11 +320,13 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
         for name in os.environ.get("MIMIR_SHELL_PASS_ENV", "").split(","):
             name = name.strip()
             if (name != "PATH" and _ENV_NAME.fullmatch(name) and name in os.environ
+                    and not is_sensitive_otlp_env(name, os.environ[name])
                     and not (argv and Path(argv[0]).name == "gh"
                              and (name == "GITHUB_TOKEN" or name.startswith("GH_")))):
                 env[name] = os.environ[name]
     names = direct_exec_pass_env(argv)
-    passed = [key for key in names if key in os.environ]
+    passed = [key for key in names if key in os.environ
+              and not is_sensitive_otlp_env(key, os.environ[key])]
     for key in passed:
         env[key] = os.environ[key]
     if names:
@@ -334,7 +352,7 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
             from ..github_identity import confirm_gh_cli_identity
 
             confirm_gh_cli_identity(env.get("GITHUB_TOKEN", ""))
-    return env
+    return filter_otlp_env(env)
 
 
 def _is_isolated_gh_config_dir(value: str | None) -> bool:
@@ -381,7 +399,7 @@ def direct_exec_env_overlay(argv: list[str] | None = None) -> dict[str, str | No
     for key in (*os.environ, "PYTHONUNBUFFERED"):
         if key not in overlay:
             overlay[key] = None
-    return overlay
+    return filter_shell_env_overlay(overlay)
 
 
 __all__ = [
