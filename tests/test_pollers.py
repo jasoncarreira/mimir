@@ -2593,7 +2593,7 @@ def test_discover_required_env_honors_allowlist_and_process_control_deny(
     assert [p.name for p in out] == ["custom"]
 
 
-@pytest.mark.parametrize("source", ["allowlist", "pass_env", "manifest", "override"])
+@pytest.mark.parametrize("source", ["allowlist", "pass_env", "manifest", "override", "override-pass-env"])
 @pytest.mark.parametrize(("key", "value", "forwarded"), [
     ("OTEL_EXPORTER_OTLP_HEADERS", "plain-canary-header", False),
     ("otel_exporter_otlp_traces_headers", "plain-canary-trace", False),
@@ -2602,6 +2602,7 @@ def test_discover_required_env_honors_allowlist_and_process_control_deny(
     ("OTEL_EXPORTER_OTLP_CERTIFICATE", "plain-canary-cert", False),
     ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://user:plain-canary@collector.example", False),
     ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://collector.example/?key=plain-canary", False),
+    ("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://collector.example/#plain-canary", False),
     ("MIMIR_OTLP_ENDPOINT", "not-a-url-plain-canary", False),
     ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example/v1/traces", True),
     ("MIMIR_OTLP_ENDPOINT", "https://collector.example/", True),
@@ -2636,12 +2637,28 @@ print(os.environ.get(key, '<absent>'), file=sys.stderr)
         entry["pass_env"] = [key]
     elif source == "manifest":
         entry["env"] = {key: value}
+    elif source == "override":
+        # Exercise the operator file parsed by discovery, rather than constructing
+        # a replacement PollerConfig that bypasses override validation and wiring.
+        if key.endswith("_ENDPOINT"):
+            monkeypatch.setenv(key, "https://collector.example/")
+            entry["pass_env"] = [key]
+        (home / "pollers-overrides.yaml").write_text(yaml.safe_dump({
+            "otlp-test": {"env": {key: value}},
+        }))
+    else:
+        monkeypatch.setenv(key, value)
+        (home / "pollers-overrides.yaml").write_text(yaml.safe_dump({
+            "otlp-test": {"pass_env": [key]},
+        }))
     _write_pollers_json(skill, [entry])
-    [poller] = discover_pollers(home / "skills")
+    [poller] = discover_pollers(
+        home / "skills", overrides_path=home / "pollers-overrides.yaml",
+    )
     if source == "override":
-        # The runtime receives the post-override configuration, not just the
-        # manifest's initial value.
-        poller = replace(poller, env={key: value})
+        assert poller.env == {key: value}
+    if source == "override-pass-env":
+        assert poller.pass_env == (key,)
     await run_poller(poller, enqueue=_CapturingEnqueue())
     child = json.loads((poller.resolved_persist_dir() / "child-env.json").read_text())
     expected = value if forwarded and (source != "allowlist" or not key.startswith("MIMIR_")) else None
@@ -2652,25 +2669,55 @@ print(os.environ.get(key, '<absent>'), file=sys.stderr)
         assert any(event["type"] == "poller_stderr" for event in _read_events(home))
 
 
-@pytest.mark.parametrize("source", ["allowlist", "pass_env", "manifest"])
+@pytest.mark.parametrize("source", ["allowlist", "pass_env", "manifest", "override-env", "override-pass-env"])
+@pytest.mark.parametrize(("key", "sensitive", "safe"), [
+    ("OTEL_EXPORTER_OTLP_HEADERS", "plain-canary-header", None),
+    ("OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY", "plain-canary-key", None),
+    ("OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE", "plain-canary-cert", None),
+    ("OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE", "plain-canary-ca", None),
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://user:plain-canary@collector.example", "https://collector.example/"),
+    ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://collector.example/?token=plain-canary", "https://collector.example/v1/traces"),
+    ("MIMIR_OTLP_ENDPOINT", "not-a-url-plain-canary", "https://collector.example/"),
+])
 def test_otlp_required_env_discovery_matches_child_filter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str,
+    key: str, sensitive: str, safe: str | None,
 ) -> None:
-    key = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
-    monkeypatch.setenv(key, "https://collector.example/?credential=plain-canary")
+    monkeypatch.setenv(key, sensitive)
     monkeypatch.setenv("MIMIR_POLLER_ENV_ALLOWLIST", key if source == "allowlist" else "")
     skills = tmp_path / "skills"
     entry = {"name": "required", "command": "true", "cron": "*/15 * * * *",
              "env_required": [key], "pass_env": [key] if source == "pass_env" else [],
-             "env": {key: "https://collector.example/?credential=plain-canary"}
-             if source == "manifest" else {}}
+             "env": {key: sensitive} if source == "manifest" else {}}
+    overrides_path = tmp_path / "pollers-overrides.yaml"
+    if source == "override-env":
+        # A safe ambient endpoint must not satisfy env_required after a
+        # sensitive literal override replaces it.
+        if safe is not None:
+            monkeypatch.setenv(key, safe)
+            entry["pass_env"] = [key]
+        overrides_path.write_text(yaml.safe_dump({"required": {"env": {key: sensitive}}}))
+    elif source == "override-pass-env":
+        overrides_path.write_text(yaml.safe_dump({"required": {"pass_env": [key]}}))
     _write_pollers_json(skills / "required", [entry])
-    assert discover_pollers(skills) == []
-    monkeypatch.setenv(key, "https://collector.example/")
-    if source == "manifest":
-        entry["env"][key] = "https://collector.example/"
-        _write_pollers_json(skills / "required", [entry])
-    assert len(discover_pollers(skills)) == 1
+    invalid = []
+    assert discover_pollers(skills, overrides_path=overrides_path, invalid_entries=invalid) == []
+    assert invalid == [(skills / "required" / "pollers.json", "required",
+                        f"required environment unset: {key}")]
+    if safe is not None and not (source == "allowlist" and key.startswith("MIMIR_")):
+        monkeypatch.setenv(key, safe)
+        if source in {"manifest", "override-env"}:
+            if source == "manifest":
+                entry["env"][key] = safe
+            else:
+                overrides_path.write_text(yaml.safe_dump({"required": {"env": {key: safe}}}))
+    else:
+        # Credential carriers are denied regardless of their value. Removing
+        # env_required (or explicitly passing a safe MIMIR_ key) is the only
+        # way to schedule the poller.
+        entry.pop("env_required")
+    _write_pollers_json(skills / "required", [entry])
+    assert len(discover_pollers(skills, overrides_path=overrides_path)) == 1
 
 def test_discover_handles_top_level_array_instead_of_object(tmp_path: Path):
     """The contract requires ``{"pollers": [...]}`` not a bare array.
