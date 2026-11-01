@@ -47,6 +47,13 @@ def _codex(tmp_path: Path, exp: int = 300) -> dict[str, object]:
     return document
 
 
+def test_reconcile_codex_auth_rejects_two_refreshed_sources(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="choose one refreshed auth source"):
+        reconcile_codex_auth(
+            _env(tmp_path), refreshed_path=tmp_path / "auth.json", refreshed_document=b"{}",
+        )
+
+
 def test_native_jsonc_model_wins_over_live_agent_model(tmp_path: Path) -> None:
     config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
     config.parent.mkdir(parents=True)
