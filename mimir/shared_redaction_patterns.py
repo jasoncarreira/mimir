@@ -5,6 +5,13 @@ from __future__ import annotations
 import re
 
 
+OTLP_ENV_NAME_PATTERN = (
+    r"(?:MIMIR_OTLP_ENDPOINT|OTEL_EXPORTER_OTLP_"
+    r"(?:(?:TRACES|METRICS|LOGS)_)?"
+    r"(?:HEADERS|CLIENT_KEY|CLIENT_CERTIFICATE|CERTIFICATE|ENDPOINT))"
+)
+
+
 CREDENTIAL_WORD_LITERALS = (
     "token", "apikey", "api_key", "api-key", "password", "passwd", "secret",
     "authorization", "credential", "key",
