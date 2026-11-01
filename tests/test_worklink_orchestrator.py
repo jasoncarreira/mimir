@@ -9194,8 +9194,8 @@ def test_factory_supervision_records_and_reports_park_snapshot(
 
 
 @pytest.mark.parametrize(
-    ("snapshot_published", "cancellation_stops_driver"),
-    [(True, True), (False, True), (True, False)],
+    ("snapshot_published", "cancellation_stops_driver", "snapshot_fails"),
+    [(True, True, False), (False, True, False), (False, True, True), (True, False, False)],
 )
 @pytest.mark.parametrize("idle", [False, True])
 @pytest.mark.parametrize("contended", [False, True], ids=["uncontended", "contended"])
@@ -9205,14 +9205,15 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     factory_clock: SimpleNamespace,
     snapshot_published: bool,
     cancellation_stops_driver: bool,
+    snapshot_fails: bool,
     idle: bool,
     contended: bool,
 ) -> None:
     import mimir_cultivate.worklink.orchestrator as orchestrator
     from mimir_cultivate.worklink.backends.feature_factory import FactoryRunLockContended
 
-    sandbox = tmp_path / "sandbox"
-    sandbox.mkdir()
+    sandbox = tmp_path / ".factory-sandboxes" / "700"
+    sandbox.mkdir(parents=True)
     handle = LaunchHandle("local_subprocess", "123", 456)
     stopped = asyncio.Event()
     cancel_called = asyncio.Event()
@@ -9223,7 +9224,8 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     parked = False
     parked_status_reads = 0
     running_status_reads = 0
-    snapshot = str(sandbox / ".factory" / ".parked" / "700")
+    snapshot = str(tmp_path / ".factory" / ".parked" / "700")
+    snapshot_calls: list[tuple[str, Path, str]] = []
     slices = tuple(
         {
             "id": f"slice-{index}", "status": value, "attempts": 1,
@@ -9254,6 +9256,9 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
 
         def transition_issue(self, *args: object, **kwargs: object) -> None:
             transitions.append(kwargs)
+
+        def _issue_comments(self, issue_id: int, *, strict: bool = False) -> list[str]:
+            return []
 
     class Compute:
         async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -9298,7 +9303,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
                 status="needs-human",
                 park_snapshot=(
                     snapshot
-                    if snapshot_published and parked_status_reads >= 2
+                    if snapshot_published or (snapshot_calls and not snapshot_fails)
                     else None
                 ),
             )
@@ -9315,6 +9320,14 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
             terminal_reasons.append(reason)
             terminal_times.append(factory_clock.now)
             parked = True
+
+        def snapshot(self, run_id: str, *, sandbox: Path, launcher: str) -> None:
+            assert stopped.is_set() and parked
+            lifecycle.append("snapshot")
+            snapshot_calls.append((run_id, sandbox, launcher))
+            if snapshot_fails:
+                raise FactoryContractError("snapshot refused by factory")
+            Path(snapshot).mkdir(parents=True)
 
     async def advance(delay: float) -> None:
         factory_clock.now += delay
@@ -9352,7 +9365,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
 
     result = run()
     assert result.status == "needs-human"
-    assert lifecycle == ["cancel", "terminal", "cleanup"]
+    assert lifecycle == ["cancel", "terminal", *([] if snapshot_published else ["snapshot"]), "cleanup"]
     reason = terminal_reasons[0]
     if idle:
         assert terminal_times == [7200.0]
@@ -9378,16 +9391,70 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     assert len(notices) == 1 and notices[0]["kind"] == "factory_needs_human"
     assert reason in notices[0]["reason"]
     report = str(transitions[0]["reason"])
-    if snapshot_published:
+    if not snapshot_fails:
         assert retained.status.park_snapshot == snapshot
         assert f"control-plane snapshot: {snapshot}" in report
+        if not snapshot_published:
+            assert snapshot_calls == [("700", sandbox, "/opt/factory/bin/factory.js")]
+            assert Path(snapshot).is_dir()
+            assert not (sandbox / ".factory" / ".parked" / "700").exists()
+        else:
+            assert snapshot_calls == []
     else:
         assert retained.status.park_snapshot is None
-        assert (
-            "snapshot publication failed: factory status reports park_snapshot null"
-            in report
-        )
+        assert "snapshot publication failed: snapshot refused by factory" in report
         assert "control-plane snapshot:" not in report
+
+    if not snapshot_published and not snapshot_fails and not idle and not contended:
+        _stub_factory_launch_identity(monkeypatch)
+        _configure_opencode_oauth(tmp_path, monkeypatch)
+        recovery_events: list[str] = []
+        lock = {"value": "absent"}
+
+        class RecoveryBackend(FeatureFactoryBackend):
+            def status(self, *args: object, **kwargs: object) -> FactoryStatus:
+                return _factory_lifecycle_status(
+                    sandbox, status="running" if "resume" in recovery_events else "needs-human",
+                    lock=lock["value"],
+                    session=retained.session if lock["value"] == "fresh" else None,
+                    park_snapshot=snapshot,
+                )
+
+            def lock(self, run_id: str, action: str, **kwargs: object) -> None:
+                recovery_events.append(action)
+                lock["value"] = "fresh" if action == "claim" else "absent"
+
+            def resume(self, run_id: str, **kwargs: object) -> FactoryStatus:
+                assert Path(snapshot).is_dir()
+                recovery_events.append("resume")
+                return self.status(run_id, **kwargs)
+
+        class RecoveryCompute:
+            async def launch(self, spec: WorkSpec) -> LaunchHandle:
+                recovery_events.append("launch")
+                return LaunchHandle("local_subprocess", "999999998", 2)
+
+        async def supervise(self: WorklinkRunner, **kw: Any) -> WorklinkRunResult:
+            recovery_events.append("supervise")
+            return WorklinkRunResult(700, 1, "needs-human")
+
+        monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kw: sandbox)
+        monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *args, **kw: "https://github.com/owner/repo.git")
+        monkeypatch.setattr(orchestrator, "_factory_checkout_repository", lambda *args: "owner/repo")
+        monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
+        recovered = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 2, "agent", datetime.now(UTC)),
+            claims=Claims(), backend=RecoveryBackend(entrypoint=retained.launcher),
+            compute=RecoveryCompute(), retained=retained, launcher=Path(retained.launcher),
+            repo_slug="owner/repo", base="main", test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            work_item_json=orchestrator.render_work_item(
+                IssueContext(700, "epic", "build", {"worklink:epic"}),
+            ),
+        ))
+        assert recovered.status == "needs-human"
+        assert recovery_events == ["claim", "resume", "release", "launch", "supervise"]
 
 
 def test_factory_supervision_waits_for_manifest_then_proceeds(tmp_path: Path) -> None:
