@@ -103,10 +103,8 @@ jobs:
         run: uv python install 3.11
 
       - name: Sync dependencies (with dev and bench extras)
-        # ``--extra dev`` is required — plain ``uv sync`` skips
-        # pytest-aiohttp (declared under [project.optional-dependencies].dev
-        # in pyproject.toml) and other dev-only deps, which produces
-        # cascading ``fixture 'aiohttp_server' not found`` errors.
+        # uv sync installs the default dev dependency group (including the
+        # workspace saga bench shell); --extra dev supplies published test deps.
         run: uv sync --extra dev --extra bench
 
       - name: Prepare pytest evidence directory
@@ -399,8 +397,8 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Sync dependencies (with dev and bench extras)
-        # ``--extra dev`` is required — see skill-conformance job's
-        # comment for the rationale.
+        # The default dev dependency group installs the workspace saga shell;
+        # published extras do not include workspace-only dependencies.
         run: uv sync --extra dev --extra bench
 
       - name: Verify selected Python
