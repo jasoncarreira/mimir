@@ -5209,15 +5209,16 @@ def test_unsupported_operation_is_durable_and_deduped(
     assert first["status"] == "unsupported_operation"
     assert first["escalated"] is True
     assert second["escalated"] is False
-    assert first["description"] == "Resolve an inline review thread"
-    assert first["attempted_operations"] == ["pr_comments", "pr_inline_review_comment"]
-    assert first["operation"].startswith("resolve_an_inline_review_thread:")
+    assert set(first) == {"status", "escalated", "repository", "pull_request"}
+    from mimir_cultivate.forge import _operation_key
+    operation = _operation_key("Resolve an inline review thread")
+    assert operation.startswith("resolve_an_inline_review_thread:")
     records = [json.loads(line) for line in events.read_text().splitlines()]
     assert len(records) == 1
     assert records[0] | {
         "repository": "owner/repo",
         "pull_request": 17,
-        "operation": first["operation"],
+        "operation": operation,
         "description": "Resolve an inline review thread",
         "attempted_operations": ["pr_comments", "pr_inline_review_comment"],
         "operator_visible": True,
@@ -5241,10 +5242,11 @@ def test_malformed_escalation_is_normalized_bounded_and_non_fatal(
     )
 
     assert result["escalated"] is True
-    assert result["description"].startswith("The caller did not provide")
-    assert "\n" not in result["attempted_operations"][0]
-    assert "ghp_" not in result["attempted_operations"][0]
+    assert set(result) == {"status", "escalated", "repository", "pull_request"}
     record = json.loads(events.read_text())
+    assert record["description"].startswith("The caller did not provide")
+    assert "\n" not in record["attempted_operations"][0]
+    assert "ghp_" not in record["attempted_operations"][0]
     assert len(record["description"].encode()) <= 4_096
     assert len(record["attempted_operations"][0].encode()) <= 512
 
@@ -5270,7 +5272,8 @@ def test_distinct_escalations_with_same_slug_words_are_not_deduplicated(
 
     assert first["escalated"] is True
     assert second["escalated"] is True
-    assert first["operation"] != second["operation"]
+    records = [json.loads(line) for line in (home / "events.jsonl").read_text().splitlines()]
+    assert records[0]["operation"] != records[1]["operation"]
 
 
 def test_issue_comment_posts_to_a_server_resolved_configured_issue(
@@ -5628,7 +5631,7 @@ def test_repeated_poller_escalation_suppressed_by_reason_and_head(tmp_path, monk
     # A new poller invocation can carry a different scope_id for the same PR head.
     from mimir_cultivate import forge
     same_head = replace(scope, event_type="pr_poller_tick")
-    again = forge._emit_unsupported(same_head, first["operation"], first["description"], [])
+    again = forge._emit_unsupported(same_head, forge._operation_key("Need thread resolution"), "Need thread resolution", [])
     assert again is False
     changed_reason = forge._emit_unsupported(same_head, "different-reason", "Different", [])
     assert changed_reason is True

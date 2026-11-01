@@ -616,10 +616,11 @@ def test_unsupported_operation_escalates_once_and_persists(tmp_path, monkeypatch
     result = forge.unsupported_operation.func(**arguments)
     assert result["status"] == "unsupported_operation"
     assert result["escalated"] is True
-    assert result["attempted_operations"] == ["Checked review"]
+    assert set(result) == {"status", "escalated", "repository", "pull_request"}
+    operation = forge._operation_key("Need a new operation")
     assert events == [(('unsupported_operation',), {
         "repository": "owner/repo", "pull_request": 17,
-        "operation": result["operation"], "description": "Need a new operation",
+        "operation": operation, "description": "Need a new operation",
         "attempted_operations": ["Checked review"],
         "scope_id": runtime.context.repo_pr_action_scope.scope_id,
         "operator_visible": True,
@@ -627,7 +628,7 @@ def test_unsupported_operation_escalates_once_and_persists(tmp_path, monkeypatch
     persisted = tmp_path / "state" / "unsupported_operations.json"
     assert json.loads(persisted.read_text(encoding="utf-8")) == {
         "owner/repo#17": (
-            runtime.context.repo_pr_action_scope.observed_head_sha + ":" + result["operation"]
+            runtime.context.repo_pr_action_scope.observed_head_sha + ":" + operation
         ),
     }
     assert forge.unsupported_operation.func(**arguments)["escalated"] is False

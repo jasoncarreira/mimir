@@ -3119,9 +3119,6 @@ def unsupported_operation(
         "escalated": emitted,
         "repository": scope.canonical_repo,
         "pull_request": scope.pr_number,
-        "operation": operation,
-        "description": safe_description,
-        "attempted_operations": safe_attempts,
     }
 
 

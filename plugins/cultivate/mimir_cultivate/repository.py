@@ -5146,6 +5146,9 @@ def _execute(
             and state.action_scope.observed_head_sha != previous_head
         ):
             context = getattr(runtime, "context", None) if runtime is not None else None
+            grants = getattr(context, "scoped_pr_grants", None)
+            if grants is not None:
+                grants.observe_push("cultivate", state.action_scope, state.checkout_lease, previous_head)
             if context is not None and context.ifc_state is not None:
                 context.ifc_state.record_own_push(
                     state.action_scope.canonical_repo, state.action_scope.pr_number,

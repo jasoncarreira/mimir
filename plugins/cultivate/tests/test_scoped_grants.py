@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 from enum import StrEnum
 import hashlib
 import json
@@ -37,6 +38,7 @@ from mimir_cultivate.policy import (
 )
 from tests.test_pr_checkout_lease import _repo_and_scope
 from tests.test_access_control import _github_scope_test_setup
+from tests.test_repo_tools import _git, _repo_scope_and_state
 
 
 def _tool(repository: str, pull_request: int) -> str:
@@ -83,6 +85,269 @@ def _auth(policy, state, enforce, *, discovered=False):
         enforcement_enabled=enforce, scoped_pr_grants=grants,
         repo_pr_scope_registry=None if discovered else RepoPRScopeRegistry((state,)),
         server_discovered_pr_states=cache if discovered else None,
+    )
+
+
+def _remediation_turn(tmp_path, monkeypatch):
+    from mimir import access_control
+    from mimir.plugins.manager import load_plugins
+    from mimir.plugins.core import policy_scope
+    from mimir_cultivate import repository
+
+    origin, _, scope, state = _repo_scope_and_state(tmp_path)
+    # This test's forge remote is a local bare Git repository.
+    monkeypatch.setattr(access_control, "_github_repo_from_remote", lambda _: scope.canonical_repo)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(state.checkout_lease.lease_root))
+    policy = load_plugins(enable="cultivate").policy
+    labels = InformationFlowLabels()
+    auth = replace(
+        _auth(policy, state, True),
+        ifc_labels=labels, ifc_state=InformationFlowState(labels=labels),
+        _plugin_slot_policy=policy,
+    )
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    from mimir.access_control import pr_checkout_lease_attestation
+    with policy_scope(policy):
+        assert pr_checkout_lease_attestation(auth, scope, state.checkout_lease).ok, pr_checkout_lease_attestation(auth, scope, state.checkout_lease)
+    gate = BudgetGateMiddleware(policy)
+    args = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+
+    def invoke(name, **extra):
+        request = ToolCallRequest(
+            tool_call={"name": name, "args": {**args, **extra}, "id": name,
+                       "type": "tool_call"},
+            tool=policy.tools[name].factory(), state={}, runtime=Runtime(context=auth),
+        )
+
+        def handler(call):
+            if name == "repo_checkout":
+                from mimir_cultivate.repository import _publish_attested_lease_result
+                _publish_attested_lease_result(SimpleNamespace(context=auth), state)
+                result = {"status": "checked_out", "head_sha": scope.observed_head_sha}
+            else:
+                tool = getattr(repository, name) if name.startswith("repo_") else getattr(
+                    __import__("mimir_cultivate.forge", fromlist=[name]), name,
+                )
+                from langchain.tools import ToolRuntime
+                runtime = ToolRuntime(
+                    state={}, context=auth, config={}, stream_writer=lambda _: None,
+                    tool_call_id=name, store=None,
+                )
+                result = tool.func(**call.tool_call["args"], runtime=runtime)
+            return ToolMessage(content=json.dumps(result), tool_call_id=name)
+
+        with policy_scope(policy):
+            return gate.wrap_tool_call(request, handler)
+
+    checked_out = invoke("repo_checkout")
+    assert checked_out.status != "error", checked_out.content
+    assert not auth.ifc_state.has_untrusted_active_ingest(), auth.ifc_state.labels.sources
+    return origin, scope, state, auth, invoke
+
+
+def _commit_remediation(state, invoke, message):
+    target = state.checkout_lease.path / "tracked.txt"
+    target.write_text(message + "\n", encoding="utf-8")
+    for name, extra in (
+        ("repo_stage", {"paths": ("tracked.txt",)}),
+        ("repo_commit", {"paths": ("tracked.txt",), "message": message}),
+    ):
+        outcome = invoke(name, **extra)
+        assert outcome.status != "error", outcome.content
+        assert json.loads(outcome.content)["ok"] is True
+    return _git(state.checkout_lease.path, "rev-parse", "HEAD")
+
+
+def test_remediation_grants_survive_two_commits_and_pushes(tmp_path, monkeypatch):
+    origin, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch)
+    for number in (1, 2):
+        head = _commit_remediation(state, invoke, f"remediation {number}")
+        assert head != scope.observed_head_sha
+        for name, extra in (("pr_comment", {"body": "Progress"}),
+                            ("pr_rerequest_review", {"reviewer": "reviewer"})):
+            # Exercise the real grant/lease checks for the forge actions, without
+            # contacting GitHub; their provider writes have separate coverage.
+            from mimir.plugins.core import policy_scope
+            with policy_scope(auth._plugin_slot_policy):
+                decision = authorize_repo_pr_tool(
+                    name, scope, service_principal=None, enforce=True,
+                    flow_direction=ToolFlowDirection.SINK, required_actions=(
+                        RepoPRAction.PR_COMMENT.value if name == "pr_comment" else RepoPRAction.PR_REREQUEST.value,
+                    ), registered_plugin=True, auth_context=auth, owner="cultivate",
+                    action=RepoPRAction.PR_COMMENT if name == "pr_comment" else RepoPRAction.PR_REREQUEST,
+                    protocol=auth.scoped_pr_grants._protocols["cultivate"], review_state=state,
+                )
+            assert decision.allowed, (name, decision.reason)
+        pushed = invoke("repo_push")
+        assert pushed.status != "error", pushed.content
+        assert json.loads(pushed.content)["ok"] is True
+        assert _git(origin, "rev-parse", scope.destination_ref) == head
+        assert not auth.ifc_state.has_untrusted_active_ingest()
+
+
+def test_unsupported_escalation_preserves_trusted_turn_for_pr_comment(tmp_path, monkeypatch):
+    from mimir import event_logger
+    from mimir.access_control import (
+        SinkGate, ToolAuthorization, begin_protected_result_capture,
+        classify_protected_result, end_protected_result_capture,
+    )
+    from mimir.plugins.core import policy_scope
+    from mimir_cultivate import forge
+
+    _, scope, state, auth, _ = _remediation_turn(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(event_logger, "log_durable_event_sync", lambda *_args, **_kw: None)
+    arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number,
+                 "description": "Need an unavailable operation",
+                 "attempted_operations": ["checked available tools"]}
+    token = begin_protected_result_capture()
+    try:
+        escalated = forge.unsupported_operation.func(
+            **arguments, runtime=Runtime(context=auth),
+        )
+    finally:
+        provenance = end_protected_result_capture(token)
+    assert set(escalated) == {
+        "status", "escalated", "repository", "pull_request",
+    }
+    with policy_scope(auth._plugin_slot_policy):
+        labels = classify_protected_result(
+            "unsupported_operation", arguments, auth,
+            ToolAuthorization(tool_name="unsupported_operation", decision="resource_scoped",
+                              allowed=True, repo_pr_action_scope=scope,
+                              policy=auth._plugin_slot_policy),
+            result=escalated, provenance=provenance,
+        )
+        assert labels is None
+        assert authorize_repo_pr_tool(
+            "pr_comment", scope, service_principal=None, enforce=True,
+            flow_direction=ToolFlowDirection.SINK,
+            required_actions=(RepoPRAction.PR_COMMENT.value,), registered_plugin=True,
+            auth_context=auth, owner="cultivate", action=RepoPRAction.PR_COMMENT,
+            protocol=auth.scoped_pr_grants._protocols["cultivate"], review_state=state,
+        ).allowed
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+    destination = f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}:{scope.scope_id}"
+    assert SinkGate.check_sink_flow(
+        "pr_comment", destination, auth.ifc_labels, auth, enforce=True,
+        repo_pr_action_scope=scope,
+    ).reason != "write_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.parametrize("invalid", ["extra_content", "failed", "wrong_pr", "untrusted_provenance"])
+def test_unsupported_status_only_exempts_exact_server_result(tmp_path, monkeypatch, invalid):
+    from mimir.access_control import (
+        ProtectedResultProvenance, ToolAuthorization, classify_protected_result,
+    )
+    from mimir.plugins.core import policy_scope
+
+    _, scope, _, auth, _ = _remediation_turn(tmp_path, monkeypatch)
+    arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    result = {"status": "unsupported_operation", "escalated": True,
+              "repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    provenance = None
+    failed = False
+    if invalid == "extra_content":
+        result["description"] = "externally sourced text"
+    elif invalid == "failed":
+        failed = True
+    elif invalid == "wrong_pr":
+        arguments["pull_request"] += 1
+    else:
+        provenance = ProtectedResultProvenance((SourceLabel(
+            principal="attacker", domain="web", resource_id="external",
+            bridge_instance="web", sensitivity="public", source_kind="protected_tool",
+            integrity="untrusted", integrity_effect="active_ingest",
+        ),))
+    with policy_scope(auth._plugin_slot_policy):
+        labels = classify_protected_result(
+            "unsupported_operation", arguments, auth,
+            ToolAuthorization(tool_name="unsupported_operation", decision="resource_scoped",
+                              allowed=True, repo_pr_action_scope=scope,
+                              policy=auth._plugin_slot_policy),
+            result=result, provenance=provenance, failed=failed,
+        )
+    assert labels.has_untrusted_active_ingest
+
+
+@pytest.mark.parametrize("invalid", [
+    "remote_moved", "foreign_lease", "expired_lease", "reclaiming", "changed_branch",
+    "other_pr", "unrecorded_commit", "false_lineage", "non_descendant",
+])
+def test_remediation_push_refuses_unbound_head(tmp_path, monkeypatch, invalid):
+    origin, scope, state, auth, invoke = _remediation_turn(tmp_path, monkeypatch)
+    _commit_remediation(state, invoke, "first fix")
+    lease = state.checkout_lease
+    if invalid == "remote_moved":
+        # A different writer advances the remote while the local lease remains sound.
+        _git(lease.path, "push", "-q", "origin", "HEAD:worklink/7")
+    elif invalid == "foreign_lease":
+        object.__setattr__(lease, "owner", "another-owner")
+        metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(metadata.read_text())
+        raw["owner"] = lease.owner
+        metadata.write_text(json.dumps(raw))
+    elif invalid == "expired_lease":
+        object.__setattr__(lease, "expires_at", datetime.min.replace(tzinfo=UTC))
+        metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(metadata.read_text())
+        raw["expires_at"] = lease.expires_at.isoformat()
+        metadata.write_text(json.dumps(raw))
+    elif invalid == "reclaiming":
+        (lease.path / ".git/mimir-pr-checkout-lease-reclamation.json").write_text("{}")
+    elif invalid == "changed_branch":
+        _git(lease.path, "checkout", "-qb", "foreign")
+    elif invalid == "other_pr":
+        object.__setattr__(lease, "pr_number", scope.pr_number + 1)
+        metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(metadata.read_text())
+        raw["pr_number"] = lease.pr_number
+        metadata.write_text(json.dumps(raw))
+    elif invalid == "unrecorded_commit":
+        _git(lease.path, "-c", "user.name=foreign", "-c", "user.email=foreign@example.test",
+             "commit", "--allow-empty", "-qm", "foreign")
+    elif invalid == "false_lineage":
+        metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(metadata.read_text())
+        raw["lineage"][lease.head_sha] = False
+        metadata.write_text(json.dumps(raw))
+    elif invalid == "non_descendant":
+        _git(lease.path, "reset", "--hard", "HEAD~2")
+        _git(lease.path, "-c", "user.name=foreign", "-c", "user.email=foreign@example.test",
+             "commit", "--allow-empty", "-qm", "other history")
+        head = _git(lease.path, "rev-parse", "HEAD")
+        state.record_git_head(scope.scope_id, head)
+        object.__setattr__(lease, "head_sha", head)
+        raw_path = lease.path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(raw_path.read_text())
+        raw["head_sha"] = head
+        raw["lineage"][head] = True
+        raw_path.write_text(json.dumps(raw))
+    if invalid in {"unrecorded_commit", "non_descendant"}:
+        head = _git(lease.path, "rev-parse", "HEAD")
+        state.record_git_head(scope.scope_id, head)
+        object.__setattr__(lease, "head_sha", head)
+        metadata = lease.path / ".git/mimir-pr-checkout-lease.json"
+        raw = json.loads(metadata.read_text())
+        raw["head_sha"] = head
+        metadata.write_text(json.dumps(raw))
+    from mimir.plugins.core import policy_scope
+    with policy_scope(auth._plugin_slot_policy):
+        decision = authorize_repo_pr_tool(
+            "repo_push", scope, service_principal=None, enforce=True,
+            flow_direction=ToolFlowDirection.SINK, required_actions=(RepoPRAction.PUSH.value,),
+            registered_plugin=True, auth_context=auth, owner="cultivate",
+            action=RepoPRAction.PUSH, protocol=auth.scoped_pr_grants._protocols["cultivate"],
+            review_state=state,
+        )
+    if invalid == "remote_moved":
+        assert decision.allowed  # The remote is checked again by GitPush.
+    else:
+        assert not decision.allowed and decision.reason == "repo_pr_grant_denied"
+    denied = invoke("repo_push")
+    assert denied.status == "error" or not json.loads(denied.content)["ok"]
+    assert _git(origin, "rev-parse", scope.destination_ref) == (
+        lease.head_sha if invalid == "remote_moved" else scope.observed_head_sha
     )
 
 

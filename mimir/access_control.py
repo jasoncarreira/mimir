@@ -9247,6 +9247,25 @@ class ScopedPRGrants:
             }
             return True
 
+    def observe_push(self, owner: str, scope: Any, lease: Any, previous_head: str) -> bool:
+        """Advance existing grants only for this lease's verified own publication."""
+        with self._lock:
+            key = (owner, scope.scope_id)
+            follow = self._follow.get(key)
+            if (not follow or time.monotonic() >= self.expires_at
+                    or lease.scope_id != scope.scope_id or lease.owner != scope.principal
+                    or lease.head_sha.lower() != scope.observed_head_sha.lower()
+                    or previous_head.lower() == scope.observed_head_sha.lower()
+                    or any(grant.head.lower() != previous_head.lower()
+                           or grant.lease_identity != (str(lease.path), lease.recovery_id)
+                           for grant in follow.values())):
+                return False
+            self._follow[key] = {
+                action: replace(grant, head=scope.observed_head_sha)
+                for action, grant in follow.items()
+            }
+            return True
+
 
 def _valid_scoped_pr_grant(
     auth_context: AuthContext | None, owner: str | None, action: Any,
@@ -12068,6 +12087,59 @@ def _bound_tracker_status_result(
     )
 
 
+def _bound_unsupported_operation_result(
+    tool_name: str, arguments: dict[str, Any], auth_context: Any,
+    authorization: ToolAuthorization, registered: Any, result: Any,
+    provenance: ProtectedResultProvenance | None, failed: bool,
+) -> bool:
+    """Accept only the bound escalation tool's content-free server status."""
+    from langchain_core.messages import ToolMessage
+
+    repository = arguments.get("repository")
+    number = arguments.get("pull_request")
+    if not isinstance(repository, str) or type(number) is not int:
+        return False
+    registry = getattr(auth_context, "repo_pr_scope_registry", None)
+    discovered = getattr(auth_context, "server_discovered_pr_states", None)
+    state = registry.resolve(repository, number) if registry is not None else None
+    if state is None and discovered is not None:
+        state = discovered.resolve_for_tool(tool_name, repository, number)
+    scope = getattr(state, "action_scope", None)
+    if not (
+        registered.owner == "cultivate" and tool_name == "unsupported_operation"
+        and registered.resource_scope == "channel" and registered.flow == "sink"
+        and registered.descriptor is not None
+        and registered.descriptor.result_origin == ResultOriginKind.NON_INGESTING
+        and registered.descriptor.sink_destination == "bound_pull_request"
+        and authorization.allowed and not authorization.would_block
+        and authorization.decision == OperationDecision.RESOURCE_SCOPED
+        and not failed and (provenance is None or not provenance.sources)
+        and scope is not None
+        and repository.lower() == scope.canonical_repo.lower()
+        and number == scope.pr_number
+        and (authorization.repo_pr_action_scope is None
+             or authorization.repo_pr_action_scope is scope)
+    ):
+        return False
+    if isinstance(result, ToolMessage):
+        if result.status != "success" or not isinstance(result.content, str):
+            return False
+        try:
+            result = json.loads(result.content)
+        except ValueError:
+            return False
+    return (
+        type(result) is dict and set(result) == {
+            "status", "escalated", "repository", "pull_request",
+        }
+        and result["status"] == "unsupported_operation"
+        and type(result["escalated"]) is bool
+        and result["repository"] == scope.canonical_repo
+        and type(result["pull_request"]) is int
+        and result["pull_request"] == scope.pr_number
+    )
+
+
 @scoped_policy_call(lambda bound: getattr(bound.arguments["authorization"], "policy", None))
 def classify_protected_result(
     tool_name: str,
@@ -12132,6 +12204,11 @@ def classify_protected_result(
         )
         if not retained_verified and not pr_lease_verified:
             if _bound_tracker_status_result(
+                tool_name, arguments or {}, auth_context, authorization,
+                registered, result, provenance, failed,
+            ):
+                return None
+            if _bound_unsupported_operation_result(
                 tool_name, arguments or {}, auth_context, authorization,
                 registered, result, provenance, failed,
             ):
