@@ -401,9 +401,11 @@ def _kill_shell_process_group(proc: subprocess.Popen[bytes]) -> str:
 def _run_shell_command(
     argv: list[str], *, cwd: Path | None, timeout: float, env: dict[str, str],
 ) -> subprocess.CompletedProcess[bytes]:
+    from ..otel_credentials import filter_otlp_env
+
     proc = subprocess.Popen(  # noqa: S603 - trusted shell wrapper or server-authorized argv
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, cwd=cwd, env=env,
+        stderr=subprocess.PIPE, cwd=cwd, env=filter_otlp_env(env),
         start_new_session=os.name != "nt",
     )
     try:
@@ -457,13 +459,15 @@ def _run_bounded_project_test(
     argv: list[str], *, cwd: Path | None, timeout: float, env: dict[str, str],
 ) -> subprocess.CompletedProcess[bytes]:
     """Run configured tests with bounded capture and kill their process group on timeout."""
+    from ..otel_credentials import filter_otlp_env
+
     proc = subprocess.Popen(  # noqa: S603 - argv is server-authorized
         argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=cwd,
-        env=env,
+        env=filter_otlp_env(env),
         start_new_session=os.name != "nt",
     )
     captured = {"stdout": bytearray(), "stderr": bytearray()}

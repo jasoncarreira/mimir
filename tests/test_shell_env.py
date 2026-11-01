@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import shlex
 import shutil
@@ -18,6 +19,102 @@ from mimir import github_identity as core_identity
 
 from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["interactive", "declared", "operator"])
+@pytest.mark.parametrize("async_job", [False, True], ids=["sync", "async"])
+async def test_otlp_credentials_never_reach_shell_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, async_job: bool,
+) -> None:
+    from mimir.event_logger import EventLogger
+    from mimir.shell_jobs import ShellJobRegistry
+    from mimir.tools import shell_async
+    from mimir.tools.extra import shell_exec
+
+    sensitive = {
+        "OTEL_EXPORTER_OTLP_HEADERS": "plain-header-canary",
+        "otel_exporter_otlp_traces_headers": "plain-trace-header-canary",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY": "plain-key-canary",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE": "plain-client-cert-canary",
+        "OTEL_EXPORTER_OTLP_CERTIFICATE": "plain-cert-canary",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://user:plain-user-canary@collector.test/v1/traces",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "https://collector.test/v1/metrics?token=plain-query-canary",
+        "MIMIR_OTLP_ENDPOINT": "not-an-http-url",
+    }
+    allowed = {
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "https://collector.test/base",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+        "SHELL_EGRESS_CONTROL": "ordinary-child-value",
+    }
+    for name, value in (sensitive | allowed).items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("MIMIR_SHELL_PASS_ENV", ",".join(sensitive | allowed))
+    logger = EventLogger(tmp_path / "events.jsonl", "shell-egress")
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", logger.log_sync)
+    output_path = tmp_path / "child-env.json"
+    script = tmp_path / "dump-env.py"
+    script.write_text(
+        "import json, os, sys\n"
+        "with open(sys.argv[1], 'w') as output:\n"
+        "    json.dump(dict(os.environ), output)\n"
+    )
+    argv = [sys.executable, str(script), str(output_path)]
+    token = None
+    if mode != "interactive":
+        token = _shell_env._DIRECT_EXEC_ARGV.set(_shell_env._DirectExecBinding(
+            tuple(argv), tuple(sensitive | allowed) if mode == "declared" else (),
+            operator_declared=mode == "operator",
+        ))
+    try:
+        if async_job:
+            registry = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
+            completed = threading.Event()
+            jobs = []
+
+            def on_complete(job):
+                jobs.append(job)
+                completed.set()
+
+            shell_async.set_shell_job_registry(registry, on_complete=on_complete)
+            try:
+                result = await shell_async.bash_async.coroutine(command="env")
+                assert "Spawned job" in result
+                assert await asyncio.to_thread(completed.wait, 10)
+                assert jobs[0].exit_code == 0
+                child_text = jobs[0].stdout_path.read_text()
+            finally:
+                shell_async.set_shell_job_registry(None)
+        else:
+            result = shell_exec.invoke({"command": "env"})
+            assert "exit=0" in result
+            child_text = (result.split("stdout:\n", 1)[1].split("\nstderr:", 1)[0]
+                          if mode == "interactive" else result)
+    finally:
+        if token is not None:
+            _shell_env._DIRECT_EXEC_ARGV.reset(token)
+
+    child = (json.loads(output_path.read_text()) if mode != "interactive" else
+             dict(line.split("=", 1) for line in child_text.splitlines() if "=" in line))
+    assert not sensitive.keys() & child.keys()
+    assert {name: child[name] for name in allowed} == allowed
+    logger.log_sync("shell_egress_check")
+    audit = (tmp_path / "events.jsonl").read_text()
+    for value in sensitive.values():
+        assert value not in child_text
+        assert value not in repr(child)
+        assert value not in audit
+
+
+def test_otlp_filter_applies_again_at_sync_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir.tools.extra import _run_shell_command
+
+    result = _run_shell_command(
+        ["/usr/bin/env"], cwd=None, timeout=5,
+        env={"OTEL_EXPORTER_OTLP_HEADERS": "plain-header-canary", "KEEP": "untouched"},
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == b"KEEP=untouched"
 
 
 @pytest.fixture
