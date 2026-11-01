@@ -42,10 +42,13 @@ _OTLP_SAFE = {
     "OPENAI_API_KEY": "provider-canary",
 }
 _SENSITIVE_ENDPOINTS = (
-    "https://user:plain-canary@collector.test/base",
-    "https://collector.test/base?token=plain-canary",
-    "https://collector.test/base#plain-canary",
-    "not-a-url-plain-canary",
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://user:plain-canary@collector.test/base"),
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.test/base?token=plain-canary"),
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.test/base#plain-canary"),
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "not-a-url-plain-canary"),
+    ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://user:plain-canary@collector.test/traces"),
+    ("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "https://collector.test/metrics?token=plain-canary"),
+    ("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://collector.test/logs#plain-canary"),
 )
 _ENV_PROBE = (
     sys.executable, "-c",
@@ -81,19 +84,19 @@ def test_detached_launch_filters_ambient_and_overrides_in_child_and_log(
     assert "plain-canary" not in output
 
 
-@pytest.mark.parametrize("endpoint", _SENSITIVE_ENDPOINTS)
+@pytest.mark.parametrize(("name", "endpoint"), _SENSITIVE_ENDPOINTS)
 def test_detached_launch_drops_sensitive_endpoint_without_safe_override(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, endpoint: str,
 ) -> None:
-    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
+    monkeypatch.setenv(name, endpoint)
     launched = detached_dispatch.launch_detached_worklink(
         command="run", issue_id=1949, home=tmp_path, repo=tmp_path,
         state_dir=tmp_path, run_bin=(sys.executable,), argv=_ENV_PROBE,
-        env_overrides={key: value for key, value in _OTLP_SAFE.items() if key != "OTEL_EXPORTER_OTLP_ENDPOINT"},
+        env_overrides={key: value for key, value in _OTLP_SAFE.items() if key != name},
     )
     os.waitpid(launched.pid, 0)
     observed = json.loads(launched.log_path.read_text())
-    assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in observed
+    assert name not in observed
     assert observed["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
     assert "plain-canary" not in launched.log_path.read_text()
 
@@ -138,14 +141,14 @@ async def test_local_compute_filters_spec_env_in_child_and_logs(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint", _SENSITIVE_ENDPOINTS)
+@pytest.mark.parametrize(("name", "endpoint"), _SENSITIVE_ENDPOINTS)
 async def test_local_compute_drops_sensitive_endpoint_without_safe_override(
-    tmp_path: Path, endpoint: str,
+    tmp_path: Path, name: str, endpoint: str,
 ) -> None:
     backend = compute.LocalSubprocessComputeBackend()
     spec = compute.WorkSpec(
         1949, 1, "repo", "main", "issue/1949", "prompt", None, "true", "local", 30,
-        env={**_OTLP_SAFE, "OTEL_EXPORTER_OTLP_ENDPOINT": endpoint},
+        env={**_OTLP_SAFE, name: endpoint},
         local_checkout=tmp_path, local_argv=_ENV_PROBE, output_root=tmp_path,
     )
     handle = await backend.launch(spec)
@@ -153,7 +156,7 @@ async def test_local_compute_drops_sensitive_endpoint_without_safe_override(
         result = await backend.wait(handle, timeout_s=10)
         assert result.exit_code == 0, result.stderr
         observed = json.loads(result.stdout)
-        assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in observed
+        assert name not in observed
         assert observed["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
         assert "plain-canary" not in result.stdout_path.read_text()
         assert "plain-canary" not in result.stderr_path.read_text()
@@ -203,17 +206,20 @@ def test_contained_environment_and_worker_request_filter_carriers() -> None:
     )
 
 
-@pytest.mark.parametrize("endpoint", _SENSITIVE_ENDPOINTS)
-def test_contained_ingress_drops_sensitive_endpoint_without_safe_override(endpoint: str) -> None:
-    env = {**_OTLP_SAFE, "OTEL_EXPORTER_OTLP_ENDPOINT": endpoint}
+@pytest.mark.parametrize(("name", "endpoint"), _SENSITIVE_ENDPOINTS)
+def test_contained_ingress_drops_sensitive_endpoint_without_safe_override(name: str, endpoint: str) -> None:
+    env = {**_OTLP_SAFE, name: endpoint}
     spec = compute.WorkSpec(
         1949, 1, "repo", "main", "issue/1949", "prompt", None, "true", "opencode", 30,
         env=env, backend_config={"pass_env": tuple(env)},
     )
     built = compute._enabled_child_env(spec, "00000000-0000-4000-8000-000000000002")
-    assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in built
+    assert name not in built
     assert built["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
-    assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in worker_exec._validate_environment(env)
+    assert name not in worker_exec._validate_environment(env)
+    injected = compute.with_worker_environment(spec, {name: endpoint})
+    assert name not in injected.env
+    assert name not in injected.backend_config["pass_env"]
 
 
 def test_worker_protocol_matches_executor_image_contract() -> None:
@@ -778,8 +784,8 @@ async def test_provider_worker_wire_fd_identity_launch_wait_cancel(
             assert "plain-canary" not in result.stderr_path.read_text()
         finally:
             await backend.cleanup(handle)
-        for endpoint in _SENSITIVE_ENDPOINTS:
-            unsafe_env = {**_OTLP_SAFE, "OTEL_EXPORTER_OTLP_ENDPOINT": endpoint}
+        for name, endpoint in _SENSITIVE_ENDPOINTS:
+            unsafe_env = {**_OTLP_SAFE, name: endpoint}
             unsafe_spec = compute.WorkSpec(
                 1949, 1, "repo", "main", "issue/1949", "prompt", None, "true", "opencode", 30,
                 env=unsafe_env, backend_config={"pass_env": tuple(unsafe_env)},
@@ -789,29 +795,59 @@ async def test_provider_worker_wire_fd_identity_launch_wait_cancel(
             try:
                 result = await backend.wait(handle, timeout_s=10)
                 assert result.exit_code == 0, result.stderr
-                assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in sent_requests[-1]["env"]
+                assert name not in sent_requests[-1]["env"]
                 assert sent_requests[-1]["env"]["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
-                assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in json.loads(result.stdout)
+                assert name not in json.loads(result.stdout)
                 assert "plain-canary" not in result.stdout_path.read_text()
                 assert "plain-canary" not in result.stderr_path.read_text()
             finally:
                 await backend.cleanup(handle)
+        # The client must filter raw input itself, even when no compute backend
+        # prepared the request. Inspect both the wire payload and the real child.
+        for index, (name, endpoint) in enumerate(_SENSITIVE_ENDPOINTS, start=10):
+            stdout, stderr = open_output_pair(None, 4096, None, 4096)
+            try:
+                process = await client.launch(
+                    local_checkout=checkout, argv=_ENV_PROBE,
+                    env={**_OTLP_SAFE, name: endpoint},
+                    identifier=f"00000000-0000-4000-8000-{index:012x}", timeout_s=10,
+                    stdout_sink=stdout, stderr_sink=stderr,
+                )
+                assert await process.wait() == 0
+                assert name not in sent_requests[-1]["env"]
+                assert sent_requests[-1]["env"]["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+                observed = json.loads(stdout.read_bounded()[0])
+                assert name not in observed
+                assert "plain-canary" not in json.dumps(observed)
+                assert observed["OPENAI_API_KEY"] == "provider-canary"
+                assert observed["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+                assert "plain-canary" not in stderr.read_bounded()[0].decode()
+            finally:
+                stdout.close()
+                stderr.close()
         # Simulate a crafted client request that bypasses controller filtering.
         monkeypatch.setattr(worker_client, "filter_otlp_env", dict)
-        stdout, stderr = open_output_pair(None, 4096, None, 4096)
-        try:
-            process = await client.launch(
-                local_checkout=checkout, argv=_ENV_PROBE,
-                env={**_OTLP_CARRIERS, **_OTLP_SAFE},
-                identifier="00000000-0000-4000-8000-000000000004", timeout_s=10,
-                stdout_sink=stdout, stderr_sink=stderr,
-            )
-            assert await process.wait() == 0
-            _assert_safe_env(stdout.read_bounded()[0].decode())
-            assert "plain-canary" not in stderr.read_bounded()[0].decode()
-        finally:
-            stdout.close()
-            stderr.close()
+        for index, (name, endpoint) in enumerate(_SENSITIVE_ENDPOINTS, start=30):
+            stdout, stderr = open_output_pair(None, 4096, None, 4096)
+            try:
+                process = await client.launch(
+                    local_checkout=checkout, argv=_ENV_PROBE,
+                    env={**_OTLP_SAFE, **_OTLP_CARRIERS, name: endpoint},
+                    identifier=f"00000000-0000-4000-8000-{index:012x}", timeout_s=10,
+                    stdout_sink=stdout, stderr_sink=stderr,
+                )
+                assert await process.wait() == 0
+                assert sent_requests[-1]["env"][name] == endpoint
+                observed = json.loads(stdout.read_bounded()[0])
+                assert name not in observed
+                assert not set(observed).intersection(_OTLP_CARRIERS)
+                assert "plain-canary" not in json.dumps(observed)
+                assert observed["OPENAI_API_KEY"] == "provider-canary"
+                assert observed["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+                assert "plain-canary" not in stderr.read_bounded()[0].decode()
+            finally:
+                stdout.close()
+                stderr.close()
         cancel_id = "00000000-0000-4000-8000-000000000003"
         cancelled = []
         monkeypatch.setattr(worker_exec, "_terminate_process_group", lambda proc: cancelled.append(proc))
