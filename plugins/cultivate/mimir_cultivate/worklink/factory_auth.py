@@ -8,6 +8,7 @@ import sys
 
 
 MAX_AUTH_BYTES = 1024 * 1024
+AUTH_MISSING_EXIT = 3  # No runtime auth was written; nothing to reconcile.
 
 
 def read_factory_auth() -> bytes:
@@ -41,6 +42,8 @@ if __name__ == "__main__":
         if len(sys.argv) != 1:
             raise ValueError("invalid factory auth request")
         sys.stdout.buffer.write(read_factory_auth())
+    except FileNotFoundError:
+        raise SystemExit(AUTH_MISSING_EXIT) from None
     except (OSError, ValueError):
         # Neither the path nor credential material may enter the control stderr.
         raise SystemExit(1) from None

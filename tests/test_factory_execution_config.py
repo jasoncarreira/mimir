@@ -148,6 +148,26 @@ def test_factory_auth_helper_reads_only_private_regular_attempt_file(tmp_path, m
         factory_auth.read_factory_auth()
 
 
+def test_factory_auth_helper_rejects_oversize_without_returning_document(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import factory_auth
+
+    checkout = tmp_path / "41-2/checkout"
+    checkout.mkdir(parents=True)
+    auth = checkout.parent / ".factory-runtime/data/opencode/auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_bytes(b"x" * (factory_auth.MAX_AUTH_BYTES + 1))
+    auth.chmod(0o600)
+    monkeypatch.chdir(checkout)
+    with pytest.raises(ValueError, match="oversize factory auth file"):
+        factory_auth.read_factory_auth()
+    result = subprocess.run(
+        [sys.executable, "-I", factory_auth.__file__], cwd=checkout,
+        env={}, capture_output=True, check=False,
+    )
+    assert result.returncode == 1
+    assert result.stdout == result.stderr == b""
+
+
 def test_factory_auth_helper_rejects_symlinked_runtime(tmp_path, monkeypatch):
     from mimir_cultivate.worklink import factory_auth
 
@@ -165,9 +185,11 @@ def test_factory_auth_helper_rejects_symlinked_runtime(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_factory_worker_rotated_auth_reaches_both_controller_stores(tmp_path, monkeypatch):
+@pytest.mark.parametrize("missing", [None, "auth-file", "runtime-directory"])
+async def test_factory_worker_rotated_auth_reaches_both_controller_stores(tmp_path, monkeypatch, missing):
     from mimir import event_logger
-    from mimir_cultivate.worklink import worker_client
+    from mimir_cultivate import opencode
+    from mimir_cultivate.worklink import factory_auth, worker_client
 
     def jwt(exp):
         payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
@@ -190,6 +212,21 @@ async def test_factory_worker_rotated_auth_reaches_both_controller_stores(tmp_pa
         "openai": {"type": "oauth", "access": jwt(500), "refresh": "rotated"},
     }))
     refreshed.chmod(0o600)
+    if missing is not None:
+        refreshed.unlink()
+        if missing == "runtime-directory":
+            refreshed.parent.rmdir()
+    reconcile = opencode.reconcile_codex_auth
+    reconcile_calls = []
+
+    def record_reconcile(*args, **kwargs):
+        # Invocation resolution also reconciles pre-launch; only count the
+        # post-run delivery (the path whose absence must remain a no-op).
+        if "refreshed_document" in kwargs or "refreshed_path" in kwargs:
+            reconcile_calls.append(kwargs)
+        return reconcile(*args, **kwargs)
+
+    monkeypatch.setattr(opencode, "reconcile_codex_auth", record_reconcile)
     original_open = Path.open
 
     def controller_open(path, *args, **kwargs):
@@ -202,7 +239,11 @@ async def test_factory_worker_rotated_auth_reaches_both_controller_stores(tmp_pa
     def control(path, argv, **kwargs):
         assert path == checkout and kwargs["env"] == {}
         assert argv[0] == sys.executable and argv[1] == "-I"
-        return subprocess.run(argv, cwd=path, env={}, capture_output=True, check=False)
+        result = subprocess.run(argv, cwd=path, env={}, capture_output=True, check=False)
+        assert result.returncode == (factory_auth.AUTH_MISSING_EXIT if missing else 0)
+        if missing:
+            assert result.stdout == result.stderr == b""
+        return result
 
     async def execute(command, capability, environment, projections, **kwargs):
         capability._contained_started(SimpleNamespace(pid=None))
@@ -224,8 +265,10 @@ async def test_factory_worker_rotated_auth_reaches_both_controller_stores(tmp_pa
     handle = await backend.launch(spec)
     try:
         assert (await backend.wait(handle, 10)).exit_code == 0
-        assert json.loads(codex.read_text())["tokens"]["refresh_token"] == "rotated"
-        assert json.loads((controller / ".local/share/opencode/auth.json").read_text())["openai"]["refresh"] == "rotated"
+        expected = "old" if missing else "rotated"
+        assert json.loads(codex.read_text())["tokens"]["refresh_token"] == expected
+        assert json.loads((controller / ".local/share/opencode/auth.json").read_text())["openai"]["refresh"] == expected
+        assert len(reconcile_calls) == (0 if missing else 1)
         assert not events
     finally:
         await backend.cleanup(handle)

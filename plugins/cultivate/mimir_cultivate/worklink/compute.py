@@ -697,12 +697,13 @@ class LocalSubprocessComputeBackend:
                                 (sys.executable, "-I", str(Path(factory_auth.__file__).resolve())),
                                 env={}, output_limit=factory_auth.MAX_AUTH_BYTES + 1,
                             )
-                            if read.returncode != 0:
+                            if read.returncode == 0:
+                                reconcile_codex_auth(
+                                    resolution.env,
+                                    refreshed_document=read.stdout,
+                                )
+                            elif read.returncode != factory_auth.AUTH_MISSING_EXIT:
                                 raise OpenCodeAuthError("auth_unreadable")
-                            reconcile_codex_auth(
-                                resolution.env,
-                                refreshed_document=read.stdout,
-                            )
                         except Exception as exc:
                             reason = exc.reason_code if isinstance(exc, OpenCodeAuthError) else "auth_unreadable"
                             await safe_log_event(
