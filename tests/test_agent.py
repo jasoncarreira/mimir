@@ -1283,6 +1283,51 @@ async def test_traced_turn_usage_and_callback_scope(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("usage", [5, {
+    "input_tokens": 12, "output_tokens": 4, "total_tokens": 16,
+    "input_token_details": {"cache_read": 3, "cache_creation": 2},
+}])
+async def test_traced_turn_provider_usage_does_not_change_outcome(tmp_path: Path, usage):
+    from langchain_core.outputs import ChatGeneration, LLMResult
+    from uuid import uuid4
+
+    class UsageGraph(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            if "callbacks" in config:
+                callback = config["callbacks"][0]
+                run_id = uuid4()
+                callback.on_chat_model_start({"name": "fake"}, [[HumanMessage(content="hi")]], run_id=run_id)
+                callback.on_llm_end(LLMResult(generations=[[
+                    ChatGeneration(message=self._response_messages[0]),
+                ]]), run_id=run_id)
+            async for item in super().astream(state, config=config, context=context, stream_mode=stream_mode):
+                yield item
+
+    message = (AIMessage(content="done", response_metadata={"usage": usage})
+               if isinstance(usage, int) else AIMessage(content="done", usage_metadata=usage))
+    event = AgentEvent(trigger="user_message", channel_id="ch-usage", content="hello")
+    plain = _build_agent(tmp_path / "plain", fake_agent=UsageGraph([message]))
+    traced = _build_agent(tmp_path / "traced", fake_agent=UsageGraph([message]))
+    controller, exporter = _turn_exporter()
+    traced._config = replace(traced._config, tracing_enabled=True)
+    traced._trace_controller = controller
+
+    untraced_record = await plain.run_turn(event)
+    traced_record = await traced.run_turn(event)
+
+    assert untraced_record.error is None and traced_record.error is None
+    assert untraced_record.result_is_error is False and traced_record.result_is_error is False
+    assert traced_record.output == untraced_record.output == "done"
+    assert traced_record.usage == untraced_record.usage
+    if isinstance(usage, int):
+        assert traced_record.usage == 5
+    [root] = [span for span in exporter.get_finished_spans() if span.name == "invoke_agent"]
+    assert root.end_time is not None
+    expected = (0, 0, 0, 0) if isinstance(usage, int) else (12, 4, 3, 2)
+    assert tuple(root.attributes[key] for key in (INPUT, OUTPUT, CACHE_READ, CACHE_CREATION)) == expected
+
+
+@pytest.mark.asyncio
 async def test_traced_turn_effective_model_override(tmp_path: Path, monkeypatch):
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 

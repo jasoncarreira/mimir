@@ -1422,6 +1422,17 @@ def _trace_turn(body: Callable[..., Any]) -> Callable[..., Any]:
     return wrapped
 
 
+def _trace_usage(message: AIMessage) -> dict[str, int] | None:
+    """Provider usage is optional telemetry, not a condition for turn success."""
+    from .tracing import _usage
+
+    try:
+        return _usage(message)
+    except Exception:  # noqa: BLE001 — provider metadata can have arbitrary shapes
+        log.warning("Tracing usage metadata unavailable.")
+        return None
+
+
 class Agent:
     """Deepagents-backed mimir Agent.
 
@@ -3408,18 +3419,21 @@ class Agent:
                     active_trace = _active_turn.get()
                     if active_trace is not None:
                         try:
-                            from .tracing import _usage
-
                             record_callback_usage = active_trace.record_usage
 
                             def count_callback(message: Any, *, span: Any = None) -> None:
+                                values = _trace_usage(message)
+                                if values is None:
+                                    return
                                 identity = message.id or id(message)
-                                values = _usage(message)
                                 with active_trace._lock:
                                     previous = callback_usage.setdefault(identity, {})
                                     for key, value in values.items():
                                         previous[key] = previous.get(key, 0) + value
-                                record_callback_usage(message, span=span)
+                                try:
+                                    record_callback_usage(message, span=span)
+                                except Exception:  # noqa: BLE001 — tracing cannot fail the graph
+                                    log.warning("Tracing usage metadata unavailable.")
 
                             active_trace.record_usage = count_callback
                             invoke_config["callbacks"] = [active_trace.callback]
@@ -3449,10 +3463,11 @@ class Agent:
                     if mode == "values" and isinstance(payload, dict):
                         messages = list(payload.get("messages", []))
                         if active_trace is not None:
-                            from .tracing import _usage
                             for message in messages:
                                 if isinstance(message, AIMessage):
-                                    state_usage[message.id or id(message)] = _usage(message)
+                                    values = _trace_usage(message)
+                                    if values is not None:
+                                        state_usage[message.id or id(message)] = values
                         # Block-level brackets (slice 1): animate mid-turn,
                         # no-op when the bus is unwired; never raises.
                         emitter.blocks_from_messages(messages)
@@ -3472,10 +3487,11 @@ class Agent:
                     messages=messages, events=events, output=output,
                 )
                 if active_trace is not None:
-                    from .tracing import _usage
                     for message in messages:
                         if isinstance(message, AIMessage):
-                            state_usage[message.id or id(message)] = _usage(message)
+                            values = _trace_usage(message)
+                            if values is not None:
+                                state_usage[message.id or id(message)] = values
         except asyncio.TimeoutError:
             error = f"TurnTimeout: turn exceeded {timeout}s wall-clock limit"
             log.error(
