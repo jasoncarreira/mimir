@@ -102,7 +102,7 @@ def test_license_uses_installed_resource_not_cwd(tmp_path, monkeypatch):
 def test_validation_and_github_permissions():
     for name, value in (("repo", "../escape"), ("repo", "o/."),
                         ("branch", "../main"), ("bot_email", "bad\nname@example.com"),
-                        ("model_spec", "codex-plus:model"), ("saga_model_spec", "voyage:m"),
+                        ("model_spec", "voyage:model"), ("saga_model_spec", "voyage:m"),
                         ("embedding", "local;bad"), ("port", "65536")):
         with pytest.raises(installer.SetupError):
             installer.validate(name, value)
@@ -134,6 +134,18 @@ def test_validation_and_github_permissions():
 
     with pytest.raises(installer.SetupError, match="Actions"):
         installer.validate_token("secret", "bot", "org/repo", no_actions)
+
+
+def test_codex_spec_interactive_and_flag(monkeypatch, capsys):
+    assert installer.validate("model_spec", "codex-plus:gpt-5.6-luna") == "codex-plus:gpt-5.6-luna"
+    parser = argparse.ArgumentParser()
+    installer.add_argparse(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(["cultivate", "setup", "--model-spec", "codex-plus:gpt-5.6-luna"])
+    assert installer._field(args, "model_spec", "subscription option") == "codex-plus:gpt-5.6-luna"
+    monkeypatch.setattr(installer.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _: "codex-plus:gpt-5.6-luna")
+    assert installer._field(argparse.Namespace(), "model_spec", "subscription option") == "codex-plus:gpt-5.6-luna"
+    assert "subscription option" in capsys.readouterr().out
 
 
 def test_worklink_gate_flags_validate_before_license_or_deployment(tmp_path, monkeypatch):
@@ -759,6 +771,8 @@ def setup_environment(tmp_path, monkeypatch):
     def run(argv, *, cwd):
         assert cwd == deploy
         calls.append(argv)
+        if argv[-1] == installer._CODEX_LOGIN_PROBE:
+            return 'ok' if installer._codex_auth_valid(deploy / 'codex' / 'auth.json') else 'missing'
         if argv[-3:] == ['ps', '-q', 'agent']:
             return 'b' * 64 if state['running'] else ''
         if argv[-3:] == ['mimir', 'worklink', 'status']:
@@ -1303,6 +1317,249 @@ def test_fresh_no_start_explains_web_key_and_verification_follow_up(setup_enviro
     assert state['running']
     assert (deploy / 'owner-web-key').read_text() == 'owner-key\n'
     assert len(state['verified']) == 1
+
+
+@pytest.mark.parametrize('provider,other_provider', [('openai', 'anthropic'), ('anthropic', 'openai')])
+@pytest.mark.parametrize('upgrade', [False, True], ids=['rerun', 'upgrade'])
+def test_api_setup_preserves_operator_key(setup_environment, provider, other_provider, upgrade):
+    deploy, args, state, calls, invoke = setup_environment
+    args.model_spec = f'{provider}:model'
+    args.saga_model_spec = f'{provider}:model'
+    args.embedding = 'local'
+    invoke()
+    path = deploy / 'compose.env'
+    other_key = other_provider.upper() + '_API_KEY'
+    with path.open('a') as output:
+        output.write(f'{other_key}=operator-added-key\n')
+    before = path.read_bytes()
+    if upgrade:
+        state['sha'] = 'c' * 40
+    invoke()
+    assert path.read_bytes() == before
+    assert f'{other_key}=operator-added-key' in path.read_text()
+    assert f'MIMIR_MODEL_SPEC={provider}:model' in path.read_text()
+    assert state['verified'] and state['running']
+    assert json.loads((deploy / 'manifest.json').read_text())['source_sha'] == state['sha']
+
+
+@pytest.mark.parametrize('provider,target', [('openai', 'anthropic'), ('anthropic', 'openai')])
+def test_api_setup_rejects_provider_switch(setup_environment, provider, target):
+    deploy, args, state, calls, invoke = setup_environment
+    args.model_spec = f'{provider}:model'
+    args.saga_model_spec = f'{provider}:model'
+    args.embedding = 'local'
+    invoke()
+    path = deploy / 'compose.env'
+    before = path.read_bytes()
+    args.model_spec = f'{target}:model'
+    with pytest.raises(installer.SetupError, match='Existing compose.env conflicts on MIMIR_MODEL_SPEC'):
+        invoke()
+    assert path.read_bytes() == before
+
+
+def test_codex_cli_install_has_drift_pin():
+    from mimir_cultivate.worklink.tool_pins import default_tool_pins
+
+    pin = next(pin for pin in default_tool_pins() if pin.name == 'codex')
+    assert pin.source == 'npm'
+    assert pin.package == '@openai/codex'
+    assert pin.pin == '0.139.0'
+    assert pin.smoke == 'codex --version'
+    script = (Path(installer.__file__).parent / 'docker/base.sh').read_text()
+    assert f'{pin.package}@{pin.pin}' in script
+
+
+def _fixture_codex_login(deploy):
+    from tests.opencode_fixtures import seed_codex_subscription
+
+    # Only copy the synthetic document created in this test's temporary tree.
+    fixture = deploy.parent / 'fixture-home'
+    seed_codex_subscription(fixture)
+    auth = deploy / 'codex' / 'auth.json'
+    auth.write_bytes((fixture / '.codex' / 'auth.json').read_bytes())
+    auth.chmod(0o600)
+
+
+def test_subscription_fresh_setup_requires_login_before_start(setup_environment, monkeypatch, capsys, tmp_path):
+    from mimir_cultivate import opencode
+
+    deploy, args, state, calls, invoke = setup_environment
+    args.model_spec = 'codex-plus:gpt-5.6-luna'
+    args.saga_model_spec = None  # setup fixture defaults to openai; exercise the actual recommended default below
+    args.embedding = 'local'
+    original_field = installer._field
+    def field(a, name, description, *, default=None):
+        if name == 'saga_model_spec':
+            assert default == 'codex-plus:gpt-5.6-luna:low'
+            return default
+        return original_field(a, name, description, default=default)
+    monkeypatch.setattr(installer, '_field', field)
+    original_secret = installer._secret
+    def secret(a, name, *p, **kw):
+        assert name == 'github_token', 'subscription setup requested a model API key'
+        return original_secret(a, name, *p, **kw)
+    monkeypatch.setattr(installer, '_secret', secret)
+    args.no_start = True
+    invoke()
+    command = installer._codex_login_command(deploy)
+    assert command == f'From {deploy} run: docker compose run --rm --no-deps --user 1001:1001 --entrypoint codex agent login --device-auth'
+    assert command in capsys.readouterr().out
+    assert (deploy / 'codex').stat().st_mode & 0o777 == 0o700
+    env_text = (deploy / 'compose.env').read_text()
+    assert 'MIMIR_MODEL_SPEC=codex-plus:gpt-5.6-luna' in env_text
+    assert 'OPENAI_API_KEY=' not in env_text
+    assert 'ANTHROPIC_API_KEY=' not in env_text
+    manifest = json.loads((deploy / 'manifest.json').read_text())
+    assert manifest['saga_model_spec'] == 'codex-plus:gpt-5.6-luna:low'
+    assert 'codex-plus' in (deploy / 'build.sh').read_text()
+    assert '@openai/codex@0.139.0' in (Path(installer.__file__).parent / 'docker/base.sh').read_text()
+    assert any('MIMIR_EXTRAS=codex-plus,local-embeddings,mcp' in ' '.join(c) for c in calls)
+    compose = yaml.safe_load((deploy / 'compose.yml').read_text())
+    agent = compose['services']['agent']
+    assert agent['volumes'].count('./codex:/home/mimir/.codex') == 1
+    assert compose['services']['init']['volumes'].count('./codex:/home/mimir/.codex') == 1
+    assert agent['environment']['CODEX_HOME'] == '/home/mimir/.codex'
+    assert 'chown -R 1001:1001 /home/mimir/.codex && chmod 0700 /home/mimir/.codex' in compose['services']['init']['command'][0]
+    assert '/.codex' not in ' '.join(agent['volumes']).replace('/home/mimir/.codex', '')
+    args.no_start = False
+    calls.clear()
+    with pytest.raises(installer.SetupError, match=re.escape(command)):
+        invoke()
+    assert not any(c[-3:] == ['up', '-d', 'agent'] for c in calls)
+    assert not state['running']
+    (deploy / 'codex' / 'auth.json').write_text('{"auth_mode":"apikey"}')
+    with pytest.raises(installer.SetupError, match=re.escape(command)):
+        invoke()
+    _fixture_codex_login(deploy)
+    with subprocess.Popen([sys.executable, '-c', installer._CODEX_LOGIN_PROBE],
+                          env={**os.environ, 'CODEX_HOME': str(deploy / 'codex')},
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as probe:
+        output, errors = probe.communicate(timeout=10)
+    assert probe.returncode == 0 and output.strip() == 'ok', errors
+    invoke()
+    assert state['running'] and state['verified']
+    assert 'OPENAI_API_KEY=' not in (deploy / 'compose.env').read_text()
+    # Simulate the container's dedicated mount, with its actual process model spec.
+    home = tmp_path / 'container-home'
+    home.mkdir()
+    values = dict(line.split('=', 1) for line in (deploy / 'compose.env').read_text().splitlines())
+    values.update(agent['environment'])
+    values.update({'HOME': str(home), 'CODEX_HOME': str(deploy / 'codex')})
+    selected = opencode.resolve_opencode_invocation(env=values)
+    assert selected.auth_type == 'oauth' and selected.auth_path == opencode.opencode_auth_path(values)
+    assert selected.model == 'openai/gpt-5.6-luna'
+    assert json.loads(opencode.opencode_worker_documents(selected, values).auth_document)['openai']['type'] == 'oauth'
+    assert 'OPENAI_API_KEY' not in values and 'OPENAI_API_KEY' not in selected.pass_env
+    from mimir_cultivate.worklink import compute
+    from mimir_cultivate.worklink.backends import opencode as backend_module
+    from mimir_cultivate.worklink.backends.base import WorkOrder
+    monkeypatch.setattr(backend_module, '_coding_enabled', lambda: True)
+    monkeypatch.setattr(backend_module, 'resolve_opencode_binary', lambda _: '/usr/bin/opencode')
+    order = WorkOrder(2075, tmp_path, 'prompt', None, 30, {**values, 'MIMIR_HOME': str(home)})
+    work = backend_module.OpenCodeBackend().work_spec(
+        order, attempt=1, repo_url='repo', base_ref='main', branch='issue/2075', test_command='true')
+    worker = compute._enabled_child_env(work, 'test-worker')
+    assert 'OPENAI_API_KEY' not in work.env and 'OPENAI_API_KEY' not in worker
+    assert 'OPENAI_API_KEY' not in json.dumps(work.backend_config['worker_projections'], default=str)
+
+
+def test_subscription_upgrade_drops_stale_openai_key(upgrade_setup, monkeypatch):
+    deploy, args, state, calls, invoke = upgrade_setup
+    assert 'OPENAI_API_KEY=secret' in (deploy / 'compose.env').read_text()
+    with (deploy / 'compose.env').open('a') as output:
+        output.write('OPENAI_API_KEY=another-stale-key\n')
+    args.model_spec = 'codex-plus:gpt-5.6-luna'
+    args.saga_model_spec = 'codex-plus:gpt-5.6-luna:low'
+    args.embedding = 'local'
+    args.no_start = True
+    original_secret = installer._secret
+    monkeypatch.setattr(installer, '_secret', lambda a, name, *p, **kw: (
+        original_secret(a, name, *p, **kw) if name == 'github_token' else pytest.fail('model key prompted')))
+    invoke()
+    text = (deploy / 'compose.env').read_text()
+    assert 'OPENAI_API_KEY=' not in text
+    assert 'MIMIR_MODEL_SPEC=codex-plus:gpt-5.6-luna' in text
+    assert 'codex-plus' in (deploy / 'build.sh').read_text()
+    assert './codex:/home/mimir/.codex' in yaml.safe_load((deploy / 'compose.yml').read_text())['services']['agent']['volumes']
+    _fixture_codex_login(deploy)
+    args.no_start = False
+    invoke()
+    assert 'OPENAI_API_KEY=' not in (deploy / 'compose.env').read_text()
+
+
+@pytest.mark.parametrize('document', [
+    '{"auth_mode":"chatgpt","tokens":{"access_token":"not-a-jwt","refresh_token":"fixture"}}',
+    '{"auth_mode":"apikey","tokens":{"access_token":"not-a-jwt","refresh_token":"fixture"}}',
+    '{not json',
+])
+def test_subscription_refuses_invalid_login_without_leaking_document(tmp_path, document):
+    deploy = tmp_path / 'deploy'
+    deploy.mkdir()
+    directory = installer._codex_directory(deploy)
+    auth = directory / 'auth.json'
+    auth.write_text(document)
+    def probe(argv, *, cwd):
+        assert argv[-1] == installer._CODEX_LOGIN_PROBE and cwd == deploy
+        return 'ok' if installer._codex_auth_valid(auth) else 'missing'
+    with pytest.raises(installer.SetupError, match='codex agent login --device-auth') as raised:
+        installer._require_codex_login(deploy, probe)
+    assert document not in str(raised.value)
+    auth.unlink()
+    from tests.opencode_fixtures import seed_codex_subscription
+    seed_codex_subscription(tmp_path)
+    auth.symlink_to(tmp_path / '.codex' / 'auth.json')
+    with pytest.raises(installer.SetupError, match='codex agent login --device-auth'):
+        installer._require_codex_login(deploy, probe)
+
+
+def test_subscription_directory_rejects_symlink(tmp_path):
+    deploy = tmp_path / 'deploy'
+    deploy.mkdir()
+    (deploy / 'codex').symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(installer.SetupError, match='real directory'):
+        installer._codex_directory(deploy)
+
+
+def test_subscription_directory_requires_owner_only_permissions(tmp_path):
+    deploy = tmp_path / 'deploy'
+    deploy.mkdir()
+    directory = installer._codex_directory(deploy)
+    directory.chmod(0o755)
+    with pytest.raises(installer.SetupError, match='owner-only'):
+        installer._codex_directory(deploy)
+
+
+def test_subscription_rejects_api_mode_even_with_oauth_tokens(tmp_path):
+    deploy = tmp_path / 'deploy'
+    deploy.mkdir()
+    installer._codex_directory(deploy)
+    _fixture_codex_login(deploy)
+    path = deploy / 'codex' / 'auth.json'
+    document = json.loads(path.read_text())
+    document['auth_mode'] = 'apikey'
+    path.write_text(json.dumps(document))
+    probe = lambda argv, *, cwd: 'ok' if installer._codex_auth_valid(path) else 'missing'
+    with pytest.raises(installer.SetupError, match='codex agent login --device-auth'):
+        installer._require_codex_login(deploy, probe)
+    document['auth_mode'] = 'chatgpt'
+    document['tokens']['refresh_token'] = ''
+    path.write_text(json.dumps(document))
+    with pytest.raises(installer.SetupError, match='codex agent login --device-auth'):
+        installer._require_codex_login(deploy, probe)
+
+
+def test_subscription_saga_does_not_require_model_key_but_api_saga_does(setup_environment, monkeypatch):
+    deploy, args, state, calls, invoke = setup_environment
+    args.model_spec = 'codex-plus:gpt-5.6-luna'
+    args.saga_model_spec = 'anthropic:claude-haiku-5-5'
+    args.embedding = 'local'
+    args.no_start = True
+    prompts = []
+    monkeypatch.setattr(installer, '_secret', lambda a, name, *p, **kw: prompts.append(name) or 'secret')
+    invoke()
+    assert prompts == ['github_token', 'saga_model_key']
+    assert 'ANTHROPIC_API_KEY=secret' in (deploy / 'compose.env').read_text()
+    assert 'OPENAI_API_KEY=' not in (deploy / 'compose.env').read_text()
 
 
 def test_default_setup_still_starts_agent(upgrade_setup):
@@ -2909,6 +3166,7 @@ def test_worklink_base_field_requires_absolute_path(tmp_path, value):
     ("openai:gpt-5.4-nano", "local", "openai_compat", "local", 1024, None),
     ("anthropic:claude-haiku-5-5", "openai:text-embedding-3-small", "anthropic", "openai", 1536, "OPENAI_API_KEY"),
     ("openai:gpt-5.4-nano", "voyage:voyage-4-lite", "openai_compat", "voyage", 1024, "VOYAGE_API_KEY"),
+    ("codex-plus:gpt-5.6-luna", "local", "codex_plus", "local", 1024, None),
 ])
 def test_saga_provisioning(tmp_path, spec, embedding, llm, provider, dim, key):
     fetched = []
@@ -2916,7 +3174,7 @@ def test_saga_provisioning(tmp_path, spec, embedding, llm, provider, dim, key):
     text = (tmp_path / "saga.toml").read_text()
     parsed = tomllib.loads(text)
     assert parsed["llm"]["provider"] == llm
-    assert parsed["llm"]["api_key_env"] == spec.split(":")[0].upper() + "_API_KEY"
+    assert parsed["llm"].get("api_key_env") == (None if spec.startswith("codex-plus:") else spec.split(":")[0].upper() + "_API_KEY")
     assert parsed["llm"]["sampling"] == "default"
     if parsed["llm"]["model"] == installer.DEFAULT_SAGA_MODELS[spec.split(":")[0]]:
         assert parsed["llm"]["reasoning_effort"] == "low"
@@ -3035,6 +3293,21 @@ def test_operator_embedding_edit_is_never_replaced_even_with_reembed(tmp_path):
         installer._provision_saga(tmp_path, "openai:gpt-5.4-nano", "voyage:voyage-4-lite",
                                 reembed=True)
     assert path.read_bytes() == original
+
+
+def test_subscription_upgrade_reconciles_only_previous_managed_saga_llm(tmp_path):
+    old = 'openai:gpt-6-luna:low'
+    new = 'codex-plus:gpt-5.6-luna:low'
+    installer._provision_saga(tmp_path, old, 'local', prefetch=lambda: None)
+    assert installer._provision_saga(tmp_path, new, 'local', previous_spec=old, prefetch=lambda: None)
+    llm = tomllib.loads((tmp_path / 'saga.toml').read_text())['llm']
+    assert llm == installer._saga_settings(new, 'local')['llm']
+    assert 'api_key_env' not in llm and llm['provider'] == 'codex_plus'
+    assert not installer._provision_saga(tmp_path, new, 'local', previous_spec=new, prefetch=lambda: None)
+    path = tmp_path / 'saga.toml'
+    path.write_text(path.read_text().replace('gpt-5.6-luna', 'operator-model'))
+    with pytest.raises(RuntimeError, match='conflicts'):
+        installer._provision_saga(tmp_path, old, 'local', previous_spec=new, prefetch=lambda: None)
 
 
 def test_existing_database_without_embedding_config_requires_reembed(tmp_path):

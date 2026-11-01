@@ -24,7 +24,7 @@ def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -
 
     expected = {
         "chainlink", "mermaid-cli", "osv-scanner", "gogcli",
-        "opencode", "feature-factory", "opencode-feature-factory", "opencode-project-memory",
+        "opencode", "codex", "feature-factory", "opencode-feature-factory", "opencode-project-memory",
         "opencode-openai-codex-auth", "opencode-anthropic-auth",
     }
     assert set(pins) == expected
@@ -63,15 +63,15 @@ def test_worklink_docs_describe_current_tool_pin_inventory() -> None:
         "OpenCode CLI and plugins",
     ):
         assert expected in inventory_summary
-    assert "Codex CLI" not in inventory_summary
+    assert "Codex CLI" in inventory_summary
 
     tool_pins_example = docs.split("```yaml\ntool_pins:", 1)[1].split("```", 1)[0]
     assert "name: opencode" in tool_pins_example
     assert 'smoke: "opencode --version"' in tool_pins_example
     assert 'package: "opencode-ai"' in tool_pins_example
-    assert "name: codex" not in tool_pins_example
-    assert 'smoke: "codex --version"' not in tool_pins_example
-    assert 'package: "@openai/codex"' not in tool_pins_example
+    assert "name: codex" in tool_pins_example
+    assert 'smoke: "codex --version"' in tool_pins_example
+    assert 'package: "@openai/codex"' in tool_pins_example
 
 
 def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
@@ -96,6 +96,9 @@ def test_default_tool_pin_inventory_matches_shipped_installs() -> None:
     assert f"github.com/steipete/gogcli/cmd/gog@{pins['gogcli'].pin}" in install_text
     assert pins["osv-scanner"].pin in install_text
     assert f"opencode-ai@{pins['opencode'].pin}" in install_text
+    assert pins["codex"].source == "npm"
+    assert pins["codex"].package == "@openai/codex"
+    assert f"{pins['codex'].package}@{pins['codex'].pin}" in install_text
     assert pins["feature-factory"].pin == pins["opencode-feature-factory"].pin
     dockerfile = install_sources["Dockerfile"]
     factory_arg = re.search(r"(?m)^ARG FACTORY_VERSION=([^\s]+)$", dockerfile)

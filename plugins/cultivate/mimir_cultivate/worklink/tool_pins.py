@@ -76,6 +76,16 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
         risk="High: Worklink coding backend; changes can affect prompt execution, plugin loading, and auth flow.",
     ),
     ToolPin(
+        name="codex",
+        category="coding-cli",
+        pin="0.139.0",
+        smoke="codex --version",
+        source="npm",
+        package="@openai/codex",
+        install="Cultivate docker/base.sh only when MIMIR_ENABLE_OPENCODE=1; deployment-owned subscription login",
+        risk="High: Codex subscription login CLI; changes can affect device authentication and credential format.",
+    ),
+    ToolPin(
         name="feature-factory",
         category="coding-cli",
         pin="0.12.1",

@@ -38,7 +38,8 @@ from .repository import valid_repository_slug
 DEFAULT_SOURCE_REPO = "jasoncarreira/mimir"
 DEFAULT_NEXTEST_VERSION = "0.9.148"
 DEFAULT_UV_VERSION = "0.11.0"
-DEFAULT_SAGA_MODELS = {"openai": "gpt-6-luna", "anthropic": "claude-haiku-5-5"}
+DEFAULT_SAGA_MODELS = {"openai": "gpt-6-luna", "anthropic": "claude-haiku-5-5",
+                       "codex-plus": "gpt-5.6-luna"}
 DEFAULT_SAGA_EFFORT = "low"
 LOCAL_MODEL = "voyageai/voyage-4-nano"
 EMBEDDING_MODELS = {"local": ("local", LOCAL_MODEL, 1024, None),
@@ -173,9 +174,9 @@ def validate(name: str, value: str) -> str:
     elif name == "branch":
         ok = bool(_BRANCH.fullmatch(value)) and ".." not in value and "//" not in value and not value.endswith("/")
     elif name == "model_spec":
-        ok = bool(re.fullmatch(r"(openai|anthropic):[A-Za-z0-9_.-]+", value))
+        ok = bool(re.fullmatch(r"(openai|anthropic|codex-plus):[A-Za-z0-9_.-]+", value))
     elif name == "saga_model_spec":
-        ok = bool(re.fullmatch(r"(openai|anthropic):[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?", value))
+        ok = bool(re.fullmatch(r"(openai|anthropic|codex-plus):[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?", value))
         if ok and value.count(":") == 2:
             provider, _, effort = value.split(":")
             try:
@@ -501,7 +502,7 @@ def render_layer(kind: str, version: str, root_image: str, *,
     return f"FROM {root_image}\nUSER root\n{extra}{install}RUN set -eu; mkdir -p /workspace /workspace/pr-leases /workspace/worklink && chown -R 1001:1001 /workspace\nUSER root\n"
 
 
-def render_compose(template: str, layer_tag: str, kind: str, repo_name: str) -> str:
+def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, codex: bool = False) -> str:
     """Modify the scaffold structurally; fail closed on incompatible shapes."""
     try:
         # Scaffold's prose header contains a shell printf example with a literal
@@ -525,13 +526,17 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str) -> 
         environment["WORKLINK_REPO"] = "/workspace/worklink/base/" + repo_name
         volumes = ["home:/home/mimir/agent", "cache:/home/mimir/.cache", "workspace:/workspace",
                    "pr-leases:/workspace/pr-leases", "worklink:/workspace/worklink"]
+        if codex:
+            volumes.append("./codex:/home/mimir/.codex")
+            environment["CODEX_HOME"] = "/home/mimir/.codex"
         agent["volumes"] = volumes
         agent.setdefault("depends_on", {})["init"] = {"condition": "service_completed_successfully"}
         doc["services"]["init"] = {
             "image": layer_tag, "user": "root", "entrypoint": ["/bin/sh", "-c"],
             "command": ["mkdir -p /workspace/pr-leases /workspace/worklink /workspace/.worklink /home/mimir/agent /home/mimir/.cache "
                         "&& chown -R 1001:1001 /workspace /home/mimir/agent /home/mimir/.cache "
-                        "&& chmod 0755 /workspace/.worklink"],
+                        "&& chmod 0755 /workspace/.worklink" +
+                        (" && chown -R 1001:1001 /home/mimir/.codex && chmod 0700 /home/mimir/.codex" if codex else "")],
             "volumes": volumes,
         }
         doc["volumes"] = {name: None for name in ("home", "cache", "workspace", "pr-leases", "worklink")}
@@ -874,22 +879,82 @@ def _provision_worklink(home: Path, entry: dict, *, base: Path, checkout: Path,
     return created
 
 
-def _env(deploy: Path, updates: dict[str, str], *, manage_alerts: bool = False) -> str:
+def _env(deploy: Path, updates: dict[str, str], *, manage_alerts: bool = False,
+         managed_model: bool = False) -> str:
     path = deploy / "compose.env"
     existing = path.read_text() if path.exists() else ""
     lines = existing.splitlines()
     current = dict(line.split("=", 1) for line in lines if re.match(r"^[A-Z_][A-Z0-9_]*=", line))
     if manage_alerts:
         lines = [line for line in lines if line.split("=", 1)[0] not in _ALERT_ENV_KEYS]
+    if managed_model:
+        # Model selection is installer-owned. Drop obsolete paid-provider keys
+        # when migrating to a subscription, including duplicate stale lines.
+        lines = [line for line in lines if line.split("=", 1)[0] not in
+                 ({"MIMIR_MODEL_SPEC", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"} - set(updates))]
+        current = {k: v for k, v in current.items() if k in updates or k not in
+                   {"MIMIR_MODEL_SPEC", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"}}
     for key, value in updates.items():
         if key in _ALERT_ENV_KEYS and manage_alerts:
             lines.append(f"{key}={value}")
         elif key not in current:
             lines.append(f"{key}={value}")
+        elif current[key] != value and key == "MIMIR_MODEL_SPEC" and managed_model:
+            lines = [f"{key}={value}" if line.startswith(key + "=") else line for line in lines]
         elif current[key] != value and key != "MIMIR_API_KEY":
             raise SetupError(f"Existing compose.env conflicts on {key}; resolve the operator setting before retrying.")
     _write(path, "\n".join(lines) + "\n", mode=0o600, replace=True)
     return current.get("MIMIR_API_KEY") or updates["MIMIR_API_KEY"]
+
+
+_CODEX_LOGIN_COMMAND = "docker compose run --rm --no-deps --user 1001:1001 --entrypoint codex agent login --device-auth"
+
+
+def _codex_login_command(deploy: Path) -> str:
+    return "From " + str(deploy) + " run: " + _CODEX_LOGIN_COMMAND
+
+
+def _codex_directory(deploy: Path) -> Path:
+    directory = deploy / "codex"
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise SetupError("Deployment Codex directory must be a real directory; move it aside and retry.")
+    if not directory.exists():
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+    elif directory.stat().st_mode & 0o077:
+        raise SetupError("Deployment Codex directory must have owner-only permissions (chmod 700); retry after fixing it.")
+    return directory
+
+
+def _codex_auth_valid(path: Path) -> bool:
+    from mimir.codex_auth import load_codex_auth
+    from .opencode import _jwt_exp
+
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        auth = load_codex_auth(path)
+        if (auth is None or auth.auth_mode != "chatgpt" or not auth.refresh_token
+                or _jwt_exp(auth.access_token) <= 0):
+            return False
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    return True
+
+
+_CODEX_LOGIN_PROBE = ("import os\nfrom pathlib import Path\n"
+                      "from mimir_cultivate.setup import _codex_auth_valid\n"
+                      "print('ok' if _codex_auth_valid(Path(os.environ['CODEX_HOME']) / 'auth.json') else 'missing')")
+
+
+def _require_codex_login(deploy: Path, run) -> None:
+    try:
+        result = run(["docker", "compose", "run", "--rm", "--no-deps", "--user", "1001:1001",
+                      "--entrypoint", "python", "agent", "-c", _CODEX_LOGIN_PROBE], cwd=deploy)
+    except (SetupError, OSError, subprocess.TimeoutExpired):
+        result = "missing"
+    if result != "ok":
+        raise SetupError("Codex subscription login missing or invalid. " + _codex_login_command(deploy))
 
 
 def _saga_settings(spec: str, embedding: str) -> dict[str, dict[str, object]]:
@@ -897,8 +962,10 @@ def _saga_settings(spec: str, embedding: str) -> dict[str, dict[str, object]]:
     effort = suffix[0] if suffix else (DEFAULT_SAGA_EFFORT if model == DEFAULT_SAGA_MODELS[provider] else None)
     kind, _, dim, key_env = EMBEDDING_MODELS[embedding.split(":", 1)[0]]
     embed_model = LOCAL_MODEL if embedding == "local" else embedding.split(":", 1)[1]
-    llm: dict[str, object] = {"provider": "anthropic" if provider == "anthropic" else "openai_compat",
-                              "model": model, "api_key_env": provider.upper() + "_API_KEY"}
+    llm: dict[str, object] = {"provider": "codex_plus" if provider == "codex-plus" else
+                              "anthropic" if provider == "anthropic" else "openai_compat", "model": model}
+    if provider != "codex-plus":
+        llm["api_key_env"] = provider.upper() + "_API_KEY"
     # Fresh installs must omit temperature regardless of model or effort.
     # Custom sampling is retained only for existing operator configurations.
     llm["sampling"] = "default"
@@ -916,7 +983,7 @@ def _saga_settings(spec: str, embedding: str) -> dict[str, dict[str, object]]:
 
 
 def _provision_saga(home: Path, spec: str, embedding: str, reembed: bool = False,
-                    *, prefetch=None, repair=None) -> bool:
+                    *, previous_spec: str | None = None, prefetch=None, repair=None) -> bool:
     """Reconcile only installer-owned sections; leave all other TOML bytes intact."""
     from mimir.saga._config_io import install_saga_config
     from mimir.saga.embeddings import LocalProvider
@@ -933,6 +1000,10 @@ def _provision_saga(home: Path, spec: str, embedding: str, reembed: bool = False
     from mimir.commands.setup import _default_saga_toml
     core_scaffold = bool(original) and original == _default_saga_toml(home)
     marker = "# Cultivate-managed saga models\n"
+    # Older installs had no LLM digest. Only replace their exact, previously
+    # generated section when the saved manifest identifies that old spec.
+    previous_llm = (_saga_settings(previous_spec, embedding)["llm"]
+                    if previous_spec and marker in original else None)
     embedding_signature = re.search(r"(?m)^# Cultivate embedding sha256:([0-9a-f]{64})$", original)
     signed_embedding = (embedding_signature is not None and
                         embedding_signature.group(1) == hashlib.sha256(
@@ -943,7 +1014,9 @@ def _provision_saga(home: Path, spec: str, embedding: str, reembed: bool = False
         if old and (not isinstance(old, dict) or any(k in old and old[k] != v for k, v in fields.items())):
             if section == "embedding" and (signed_embedding or core_scaffold and db.exists()) and not reembed:
                 raise RuntimeError("Changing embedding provider requires --reembed (stop the agent first), or run mimir saga-reembed offline")
-            if not core_scaffold and (section != "embedding" or not reembed or not signed_embedding):
+            if not core_scaffold and (section != "embedding" or not reembed or not signed_embedding) and not (
+                section == "llm" and old == previous_llm
+            ):
                 raise RuntimeError(f"existing saga.toml [{section}] conflicts; reconcile the operator setting manually")
     old_embedding = existing.get("embedding", {})
     changed_embedding = bool(old_embedding and any(old_embedding.get(k) != v for k, v in settings["embedding"].items()))
@@ -954,9 +1027,12 @@ def _provision_saga(home: Path, spec: str, embedding: str, reembed: bool = False
 
     text = original
     for section, fields in settings.items():
-        if existing.get(section) == fields or (existing.get(section) and not (core_scaffold or section == "embedding" and changed_embedding)):
+        replace_llm = section == "llm" and existing.get(section) == previous_llm and previous_llm != fields
+        if existing.get(section) == fields or (existing.get(section) and not (
+            core_scaffold or section == "embedding" and changed_embedding or replace_llm
+        )):
             continue
-        if existing.get(section) and (core_scaffold or section == "embedding" and changed_embedding):
+        if existing.get(section) and (core_scaffold or section == "embedding" and changed_embedding or replace_llm):
             # Only a previously Cultivate-managed section can be replaced.
             text = re.sub(r"(?ms)^\[" + section + r"\]\n.*?(?=^\[|\Z)", "", text)
             if section == "embedding":
@@ -1371,8 +1447,8 @@ def add_argparse(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> ar
         ("owner", "Canonical owner identity for authorized web chat."),
         ("display-name", "Owner's human-readable name."),
         ("owner-email", "Owner's email identity."),
-        ("model-spec", "provider:model (openai:... or anthropic:...)."),
-        ("saga-model-spec", "Fast/cheap memory model (openai:model[:effort] or anthropic:model[:effort])."),
+        ("model-spec", "provider:model (codex-plus:... subscription, openai:... or anthropic:...)."),
+        ("saga-model-spec", "Memory model (codex-plus:model[:effort], openai:model[:effort] or anthropic:model[:effort])."),
         ("embedding", "local, openai:model, or voyage:model (default: local)."),
         ("deploy", "Absolute deployment directory (default: ./cultivate-agent)."),
         ("port", "Free loopback port (default: next free from 8090)."),
@@ -1517,24 +1593,25 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         tracker_env["JIRA_EMAIL"] = email
         tracker_env["JIRA_API_TOKEN"] = _secret(args, "jira_api_token", "Jira service account API token (input hidden).",
                                                 previous=prior.get("JIRA_API_TOKEN"))
-    spec = _field(args, "model_spec", "Model spec: choose an API-backed openai:model or anthropic:model; used for agent turns.")
+    spec = _field(args, "model_spec", "Model spec: choose codex-plus:model for a ChatGPT/Codex subscription, or API-backed openai:model or anthropic:model; used for agent turns.")
     provider = spec.split(":", 1)[0]
-    key_name = provider.upper() + "_API_KEY"
-    model_key = _secret(args, "model_key", f"Model key: obtain it in your {provider} API console; input is hidden.", previous=prior.get(key_name))
+    key_name = provider.upper() + "_API_KEY" if provider != "codex-plus" else None
+    model_key = (_secret(args, "model_key", f"Model key: obtain it in your {provider} API console; input is hidden.",
+                         previous=prior.get(key_name)) if key_name else None)
     saga_spec = _field(args, "saga_model_spec",
-                        "Saga makes frequent, short, latency-sensitive memory calls; a faster, cheaper model is recommended. "
+                        "Saga makes frequent, short, latency-sensitive memory calls; a faster, cheaper model is recommended for API providers. "
                         f"Recommended: {provider}:{DEFAULT_SAGA_MODELS[provider]}:{DEFAULT_SAGA_EFFORT}. "
                         f"Your agent's {spec} is also available if you prefer it.",
                         default=provider + ":" + DEFAULT_SAGA_MODELS[provider] + ":" + DEFAULT_SAGA_EFFORT)
     saga_provider = saga_spec.split(":", 1)[0]
-    saga_key_env = saga_provider.upper() + "_API_KEY"
+    saga_key_env = saga_provider.upper() + "_API_KEY" if saga_provider != "codex-plus" else None
     extra_keys = {}
-    if saga_key_env != key_name:
+    if saga_key_env and saga_key_env != key_name:
         extra_keys[saga_key_env] = _secret(args, "saga_model_key", "Saga model API key (input hidden).", previous=prior.get(saga_key_env))
     embedding = _field(args, "embedding", "Embedding model: local voyage-4-nano runs on CPU without a key "
                        "and shares Voyage 4's embedding space; API providers are also available.", default="local")
     embedding_key_env = EMBEDDING_MODELS[embedding.split(":", 1)[0]][3]
-    if embedding_key_env == key_name:
+    if embedding_key_env and embedding_key_env == key_name:
         print(f"Reusing {key_name} for embeddings.")
     elif embedding_key_env and embedding_key_env not in extra_keys:
         extra_keys[embedding_key_env] = _secret(args, "embedding_key", "Embedding API key (input hidden).",
@@ -1590,7 +1667,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     # Start from the existing loopback-only compose renderer; use root-image
     # service/volumes rather than its pypi installation build path.
     compose = render_compose_yml(service_name="agent", web_port=port, mode="pypi")
-    compose = render_compose(compose, layer_tag, kind, repo.lower().split('/')[1])
+    codex = provider == "codex-plus" or saga_provider == "codex-plus"
+    compose = render_compose(compose, layer_tag, kind, repo.lower().split('/')[1], codex=codex)
     generated = {"compose.yml": compose, ".gitignore": "*\n",
                  "provision.py": _PROVISION, "compose.provision.yml": _PROVISION_COMPOSE}
     _check_generated(deploy, generated, previous, old_image, force=bool(getattr(args, "force", False)),
@@ -1603,6 +1681,9 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         print(f"Upgrading {old_image[0]} -> {sha}")
     deploy.mkdir(parents=True, exist_ok=True)
     deploy.chmod(0o700)
+    if codex:
+        _codex_directory(deploy)
+        print("Codex subscription login (use this deployment only): " + _codex_login_command(deploy))
     # The layer and build script are wholly generated from setup inputs.
     _write(deploy / "Dockerfile.toolchain", render_layer(kind, version, tag,
            nextest_version=nextest_version, uv_version=uv_version, system_packages=system_packages), replace=True)
@@ -1612,12 +1693,17 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
     # The toolchain layer has no COPY instructions. Docker still sends the
     # context to the daemon: exclude compose.env and the web key by default.
     _write(deploy / ".dockerignore", "*\n!Dockerfile.toolchain\n")
-    api_key = _env(deploy, {
+    env_updates = {
         "MIMIR_API_KEY": secrets.token_urlsafe(32), "GITHUB_TOKEN": token, "GH_TOKEN": token,
         "GH_USER_NAME": bot, "GH_USER_EMAIL": bot_email, "MIMIR_GITHUB_SELF_LOGIN": bot,
-        "GITHUB_REPOS": repo, "MIMIR_MODEL_SPEC": spec, key_name: model_key,
+        "GITHUB_REPOS": repo, "MIMIR_MODEL_SPEC": spec,
           "MIMIR_WEB_HOST": "0.0.0.0", **extra_keys, **alert_env, **tracker_env,
-    }, manage_alerts=alert_adapter != "none" or "operator_alert_adapter" in previous)
+    }
+    if key_name:
+        env_updates[key_name] = model_key
+    api_key = _env(deploy, env_updates,
+                   manage_alerts=alert_adapter != "none" or "operator_alert_adapter" in previous,
+                   managed_model=provider == "codex-plus")
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
     manifest = {"slug": repo.lower(), "branch": branch, "toolchain": kind, "owner": owner, "display": display,
@@ -1630,6 +1716,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                    "rotate": bool(args.rotate_web_key),
                   "force": bool(getattr(args, "force", False)),
                   "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
+                   "previous_saga_model_spec": previous.get("saga_model_spec"),
                    "system_packages": system_packages,
                    "operator_alert_adapter": alert_adapter, "operator_alert_channel_id": alert_channel_id,
                    "source_sha": sha, "layer_tag": layer_tag,
@@ -1676,6 +1763,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         if line.startswith("Upgraded skill cultivate:"):
             print(line)
     if not no_start:
+        if codex:
+            _require_codex_login(deploy, run)
         docker_step("up", ["docker", "compose", "up", "-d", "agent"])
     if old_image and old_image[1] != layer_tag:
         print("Previous agent image retained: " + old_image[1])
@@ -1683,6 +1772,8 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
               + old_image[1] + "\\n') up -d --force-recreate --no-deps agent")
     if no_start:
         print(f"Build and provisioning complete. To start the agent later, from {deploy} run: docker compose up -d agent")
+        if codex:
+            print("First log in for this deployment: " + _codex_login_command(deploy))
         print("Then re-run mimir cultivate setup with the same deployment and settings, without --no-start, "
               "to retrieve the owner web key and verify the deployment. Live verification has not run.")
         return
@@ -1733,7 +1824,8 @@ changed = False
 home = Path('/home/mimir/agent')
 os.environ['HOME'] = '/home/mimir'
 os.environ['XDG_CACHE_HOME'] = '/home/mimir/.cache'
-changed = _provision_saga(home, m['saga_model_spec'], m['embedding'], m['reembed'])
+changed = _provision_saga(home, m['saga_model_spec'], m['embedding'], m['reembed'],
+                          previous_spec=m.get('previous_saga_model_spec'))
 repo = Path('/workspace') / m['slug'].split('/')[1]
 origin = 'https://github.com/' + m['slug'] + '.git'
 # Persist only the helper program, never the token. Git runs it for future
