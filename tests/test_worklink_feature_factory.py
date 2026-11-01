@@ -97,6 +97,50 @@ def package_entrypoint(tmp_path: Path) -> Path:
     return entrypoint
 
 
+def test_snapshot_uses_attempt_bound_control_and_operator_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir_cultivate.worklink import worker_client
+
+    sandbox = tmp_path / "operator" / ".factory-sandboxes" / "chainlink-700"
+    sandbox.mkdir(parents=True)
+    launcher = package_entrypoint(tmp_path)
+    calls: list[tuple[Path, list[str]]] = []
+    monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: (sandbox.parent.parent, 700, 1))
+
+    def control(path: Path, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append((path, argv))
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(worker_client, "run_factory_control", control)
+    backend = FeatureFactoryBackend(entrypoint=str(launcher))
+    backend.snapshot("chainlink-700", sandbox=sandbox, launcher=launcher)
+    assert calls == [(
+        sandbox,
+        ["node", str(launcher), "snapshot", "chainlink-700", "--repo", str(tmp_path / "operator")],
+    )]
+    assert str(sandbox) not in calls[0][1]
+
+
+@pytest.mark.parametrize("sandbox_name", ["other-run", "sandbox"])
+def test_snapshot_refuses_unbound_sandbox(
+    tmp_path: Path, sandbox_name: str,
+) -> None:
+    sandbox = tmp_path / ".factory-sandboxes" / sandbox_name
+    backend = FeatureFactoryBackend(runner=lambda *args, **kw: pytest.fail("snapshot launched"))
+    with pytest.raises(FactoryContractError, match="requires this run's sandbox path"):
+        backend.snapshot("chainlink-700", sandbox=sandbox, launcher="/unused")
+
+
+def test_snapshot_refuses_wrong_sandbox_parent(tmp_path: Path) -> None:
+    backend = FeatureFactoryBackend(runner=lambda *args, **kw: pytest.fail("snapshot launched"))
+    with pytest.raises(FactoryContractError, match="requires this run's sandbox path"):
+        backend.snapshot(
+            "chainlink-700", sandbox=tmp_path / "other-dir" / "chainlink-700",
+            launcher="/unused",
+        )
+
+
 def structured_status_payload() -> dict[str, Any]:
     # Release shape including Gate 3's commit binding, not a live probe.
     return status_payload(
@@ -733,7 +777,7 @@ def test_admit_rejects_either_package_version_mismatch(
     assert calls == []
 
 
-def test_capability_probe_matrix_uses_exact_sixteen_nonmutating_commands(
+def test_capability_probe_matrix_uses_exact_seventeen_nonmutating_commands(
     tmp_path: Path,
 ) -> None:
     entrypoint = package_entrypoint(tmp_path)
@@ -750,7 +794,7 @@ def test_capability_probe_matrix_uses_exact_sixteen_nonmutating_commands(
 
     backend = FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner)
     assert backend.admit() == entrypoint.resolve()
-    assert len(FACTORY_COMMANDS) == 16
+    assert len(FACTORY_COMMANDS) == 17
     assert [call[2:] for call in calls[1:]] == [argv for _, argv in FACTORY_COMMANDS]
     assert calls[0][2:] == ("__mimir_unknown_command_probe__",)
 
@@ -794,7 +838,7 @@ def test_capability_probe_isolated_execution_contract(tmp_path: Path) -> None:
 
     probe_factory_capabilities(entrypoint, runner=runner)
     forbidden = {"--version", "--help", "help", "cancel", "factory", "feature-factory"}
-    assert len(observed) == 17
+    assert len(observed) == 18
     for call in observed:
         assert call["args"][:2] == ("node", str(entrypoint))
         assert not forbidden.intersection(call["args"][2:])

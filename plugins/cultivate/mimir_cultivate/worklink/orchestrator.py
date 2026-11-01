@@ -3704,6 +3704,7 @@ class WorklinkRunner:
             )
 
             snapshot_failure = "factory status reports park_snapshot null"
+            snapshot_attempted = False
             verification_deadline = max(deadline, loop.time() + startup_timeout) if startup_failure else deadline
             while True:
                 remaining = verification_deadline - loop.time()
@@ -3733,6 +3734,23 @@ class WorklinkRunner:
                     snapshot_failure = "factory status reports park_snapshot null"
                     if parked.park_snapshot is not None:
                         break
+                    if not snapshot_attempted:
+                        snapshot_attempted = True
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    backend.snapshot, factory_record.run_id,
+                                    sandbox=Path(factory_record.sandbox),
+                                    launcher=factory_record.launcher,
+                                ),
+                                timeout=max(0.01, verification_deadline - loop.time()),
+                            )
+                        except Exception as exc:
+                            snapshot_failure = _factory_controller_error(exc)
+                            break
+                        # Read status again: a successful CLI exit alone is not a
+                        # published snapshot until factory status reports it.
+                        continue
                 except FactoryRunLockContended:
                     snapshot_failure = "factory run state stayed locked"
                 except TimeoutError:
