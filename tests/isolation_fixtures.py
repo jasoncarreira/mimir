@@ -16,6 +16,7 @@ import shlex
 import shutil
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -165,36 +166,47 @@ _HOST_CODING_CLIS = frozenset({
 })
 
 
-@pytest.fixture(autouse=True, scope="session")
-def _hide_host_coding_clis(tmp_path_factory):
-    """Keep inherited coding tools off PATH without losing git and other tools.
+@contextmanager
+def _coding_cli_path(original: str):
+    """Mirror affected PATH entries in a session-owned, uid-traversable tree.
 
-    A CLI can share /usr/bin with git, so dropping the entire directory is not
-    viable. Mirror only the affected PATH entries with symlinks to every other
-    entry. Subprocesses inherit this PATH too. Explicit test-owned executables
-    can still be put on PATH by the test that needs them.
+    pytest's basetemp ancestors are private (0700). A PATH below them stops
+    working after a subprocess drops uid, even for ordinary tools such as git.
+    Keep only public symlinks here, never test data, and leave target permissions
+    unchanged. Explicit chmod also covers a restrictive invoking umask.
     """
+    # TMPDIR itself may be private to the invoking uid too.
+    parent = "/tmp" if os.name == "posix" else None
+    with tempfile.TemporaryDirectory(prefix="mimir-cli-path-", dir=parent) as temporary:
+        hidden = Path(temporary)
+        hidden.chmod(0o755)
+        sanitized = []
+        for index, directory in enumerate(original.split(os.pathsep)):
+            source = Path(directory or os.curdir)
+            if not any((source / name).is_file() and os.access(source / name, os.X_OK)
+                       for name in _HOST_CODING_CLIS):
+                sanitized.append(directory)
+                continue
+            mirror = hidden / str(index)
+            mirror.mkdir()
+            mirror.chmod(0o755)
+            for entry in source.iterdir():
+                if entry.name not in _HOST_CODING_CLIS:
+                    (mirror / entry.name).symlink_to(entry.absolute())
+            sanitized.append(str(mirror))
+        yield os.pathsep.join(sanitized)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _hide_host_coding_clis():
+    """Hide inherited coding tools without losing tools shared with other uids."""
     original = os.environ.get("PATH", os.defpath)
-    directories = original.split(os.pathsep)
-    hidden = tmp_path_factory.mktemp("path-without-coding-clis")
-    sanitized = []
-    for index, directory in enumerate(directories):
-        source = Path(directory or os.curdir)
-        if not any((source / name).is_file() and os.access(source / name, os.X_OK)
-                   for name in _HOST_CODING_CLIS):
-            sanitized.append(directory)
-            continue
-        mirror = hidden / str(index)
-        mirror.mkdir()
-        for entry in source.iterdir():
-            if entry.name not in _HOST_CODING_CLIS:
-                (mirror / entry.name).symlink_to(entry.absolute())
-        sanitized.append(str(mirror))
-    os.environ["PATH"] = os.pathsep.join(sanitized)
-    try:
-        yield original
-    finally:
-        os.environ["PATH"] = original
+    with _coding_cli_path(original) as sanitized:
+        os.environ["PATH"] = sanitized
+        try:
+            yield original
+        finally:
+            os.environ["PATH"] = original
 
 
 @pytest.fixture

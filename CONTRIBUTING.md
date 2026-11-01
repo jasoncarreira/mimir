@@ -99,7 +99,11 @@ The shared autouse session fixture in `tests/isolation_fixtures.py` filters
 inherited `PATH` entries containing `opencode`, `codex`, `factory.js`,
 `feature-factory`, `chainlink`, or `gh` for both core and Cultivate tests. It
 mirrors affected directories without those CLIs so `git` and other utilities
-remain available. The Worklink pytest gate uses these same conftests (including
+remain available. On POSIX the session-owned mirror lives directly under `/tmp`,
+with traversable directories, rather than pytest's private basetemp or an inherited
+private `TMPDIR`. This preserves ordinary tool lookup in uid-dropping subprocesses
+without opening pytest data or changing executable-target permissions. The mirror
+is cleaned up at session teardown. The Worklink pytest gate uses these same conftests (including
 when Cultivate is selected). Tests that need a command create a fixture-owned
 executable and put its directory on `PATH`. Tests of a real installed CLI use
 `@pytest.mark.real_coding_cli("name")` and request `real_coding_cli` to obtain
