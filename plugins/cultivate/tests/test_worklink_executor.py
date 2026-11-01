@@ -24,7 +24,95 @@ from mimir_cultivate.worklink import (
 )
 from mimir_cultivate.worklink.backends import opencode
 from mimir_cultivate.worklink.backends.base import WorkOrder
+from mimir.output_capture import open_output_pair
 from tests.opencode_fixtures import seed_codex_subscription
+
+
+_OTLP_CARRIERS = {
+    "OTEL_EXPORTER_OTLP_HEADERS": "plain-canary",
+    "otel_exporter_otlp_traces_client_key": "/tmp/plain-canary",
+    "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE": "/tmp/plain-canary",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE": "/tmp/plain-canary",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://user:plain-canary@collector.test/base",
+    "MIMIR_OTLP_ENDPOINT": "https://collector.test/base?token=plain-canary",
+}
+_OTLP_SAFE = {
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://collector.test/base",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+    "OPENAI_API_KEY": "provider-canary",
+}
+_ENV_PROBE = (
+    sys.executable, "-c",
+    "import json, os; print(json.dumps({k: v for k, v in os.environ.items() "
+    "if k in ('OPENAI_API_KEY', 'OTEL_EXPORTER_OTLP_ENDPOINT', "
+    "'OTEL_EXPORTER_OTLP_PROTOCOL') or 'OTLP' in k.upper()}))",
+)
+
+
+def _assert_safe_env(output: str) -> None:
+    observed = json.loads(output)
+    assert not set(observed).intersection(set(_OTLP_CARRIERS) - set(_OTLP_SAFE))
+    assert "plain-canary" not in output
+    assert observed["OTEL_EXPORTER_OTLP_ENDPOINT"] == _OTLP_SAFE["OTEL_EXPORTER_OTLP_ENDPOINT"]
+    assert observed["OPENAI_API_KEY"] == "provider-canary"
+
+
+def test_detached_launch_filters_ambient_and_overrides_in_child_and_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name, value in _OTLP_CARRIERS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", _OTLP_CARRIERS["OTEL_EXPORTER_OTLP_ENDPOINT"])
+    launched = detached_dispatch.launch_detached_worklink(
+        command="run", issue_id=1949, home=tmp_path, repo=tmp_path,
+        state_dir=tmp_path, run_bin=(sys.executable,), argv=_ENV_PROBE,
+        env_overrides={**_OTLP_CARRIERS, **_OTLP_SAFE},
+    )
+    os.waitpid(launched.pid, 0)
+    output = launched.log_path.read_text()
+    _assert_safe_env(output)
+    assert "plain-canary" not in output
+
+
+@pytest.mark.asyncio
+async def test_local_compute_filters_spec_env_in_child_and_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "plain-canary")
+    backend = compute.LocalSubprocessComputeBackend()
+    spec = compute.WorkSpec(
+        1949, 1, "repo", "main", "issue/1949", "prompt", None, "true", "local", 30,
+        env={**_OTLP_CARRIERS, **_OTLP_SAFE}, local_checkout=tmp_path,
+        local_argv=_ENV_PROBE, output_root=tmp_path,
+    )
+    handle = await backend.launch(spec)
+    try:
+        result = await backend.wait(handle, timeout_s=10)
+        assert result.exit_code == 0, result.stderr
+        _assert_safe_env(result.stdout)
+        assert "plain-canary" not in result.stderr
+        assert "plain-canary" not in result.stdout_path.read_text()
+        assert "plain-canary" not in result.stderr_path.read_text()
+    finally:
+        await backend.cleanup(handle)
+
+
+def test_contained_environment_and_worker_request_filter_carriers() -> None:
+    spec = compute.WorkSpec(
+        1949, 1, "repo", "main", "issue/1949", "prompt", None, "true", "opencode", 30,
+        env={**_OTLP_CARRIERS, **_OTLP_SAFE},
+        backend_config={"pass_env": tuple({**_OTLP_CARRIERS, **_OTLP_SAFE})},
+    )
+    env = compute._enabled_child_env(spec, "00000000-0000-4000-8000-000000000002")
+    assert not set(env).intersection(set(_OTLP_CARRIERS) - set(_OTLP_SAFE))
+    assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == _OTLP_SAFE["OTEL_EXPORTER_OTLP_ENDPOINT"]
+    assert env["OPENAI_API_KEY"] == "provider-canary"
+    injected = compute.with_worker_environment(spec, _OTLP_CARRIERS)
+    assert not set(injected.env).intersection(set(_OTLP_CARRIERS) - set(_OTLP_SAFE))
+    assert not set(injected.backend_config["pass_env"]).intersection(set(_OTLP_CARRIERS) - set(_OTLP_SAFE))
+    assert not set(worker_exec._validate_environment({**_OTLP_CARRIERS, **_OTLP_SAFE})).intersection(
+        set(_OTLP_CARRIERS) - set(_OTLP_SAFE)
+    )
 
 
 def test_worker_protocol_matches_executor_image_contract() -> None:
@@ -552,6 +640,22 @@ async def test_provider_worker_wire_fd_identity_launch_wait_cancel(
             env={}, identifier=identifier, timeout_s=10,
         )
         assert await process.wait() == 0
+        # Simulate a crafted client request that bypasses controller filtering.
+        monkeypatch.setattr(worker_client, "filter_otlp_env", dict)
+        stdout, stderr = open_output_pair(None, 4096, None, 4096)
+        try:
+            process = await client.launch(
+                local_checkout=checkout, argv=_ENV_PROBE,
+                env={**_OTLP_CARRIERS, **_OTLP_SAFE},
+                identifier="00000000-0000-4000-8000-000000000004", timeout_s=10,
+                stdout_sink=stdout, stderr_sink=stderr,
+            )
+            assert await process.wait() == 0
+            _assert_safe_env(stdout.read_bounded()[0].decode())
+            assert "plain-canary" not in stderr.read_bounded()[0].decode()
+        finally:
+            stdout.close()
+            stderr.close()
         cancel_id = "00000000-0000-4000-8000-000000000003"
         cancelled = []
         monkeypatch.setattr(worker_exec, "_terminate_process_group", lambda proc: cancelled.append(proc))

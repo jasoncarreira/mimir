@@ -22,6 +22,7 @@ import uuid
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from mimir.output_capture import OutputSink, open_output_pair
+from mimir.otel_credentials import filter_otlp_env, is_sensitive_otlp_env
 from ..contained_execution import (
     CollectedExecutionResult,
     base_worker_environment,
@@ -82,13 +83,17 @@ def with_worker_environment(
     """
     if not additions:
         return spec
-    env = {**spec.env, **additions}
+    merged = {**spec.env, **additions}
+    env = filter_otlp_env(merged)
     if "pass_env" not in spec.backend_config:
         return replace(spec, env=env)
     requested = spec.backend_config["pass_env"]
     if isinstance(requested, (str, bytes)) or not isinstance(requested, Sequence):
         raise ComputeLaunchError("worker pass_env must be a sequence")
-    pass_env = tuple(dict.fromkeys((*requested, *additions)))
+    pass_env = tuple(dict.fromkeys(
+        name for name in (*requested, *additions)
+        if not is_sensitive_otlp_env(name, merged.get(name))
+    ))
     return replace(
         spec,
         env=env,
@@ -322,18 +327,23 @@ def _enabled_child_env(spec: WorkSpec, identifier: str) -> dict[str, str]:
         raise ComputeLaunchError("worker pass_env must be a sequence")
     seen: set[str] = set()
     for raw_name in permitted:
+        if isinstance(raw_name, str) and is_sensitive_otlp_env(raw_name, spec.env.get(raw_name)):
+            seen.add(raw_name)
+            continue
         name = _validate_dynamic_worker_name(raw_name)
         if name in seen:
             raise ComputeLaunchError(f"worker environment {name} is duplicated")
         seen.add(name)
         if name not in spec.env:
             raise ComputeLaunchError(f"worker environment {name} is missing")
-        env[name] = _validate_worker_value(name, spec.env[name])
+        if not is_sensitive_otlp_env(name, spec.env[name]):
+            env[name] = _validate_worker_value(name, spec.env[name])
     unknown = set(spec.env) - seen - {"OPENCODE_PERMISSION"}
+    unknown = {name for name in unknown if not is_sensitive_otlp_env(name, spec.env[name])}
     if unknown:
         name = sorted(str(item) for item in unknown)[0]
         raise ComputeLaunchError(f"worker environment {name} was not requested")
-    return env
+    return filter_otlp_env(env)
 
 
 def _fd_anchored_opencode_argv(
@@ -460,6 +470,7 @@ class LocalSubprocessComputeBackend:
         # orchestrator's per-run vars, e.g. MIMIR_HOME) wins over the passthrough.
         env = _local_child_env()
         env.update(spec.env)
+        env = filter_otlp_env(env)
         output_identifier = str(uuid.uuid4())
         stdout_path, stderr_path = _output_paths(spec, output_identifier)
         stdout_limit, stderr_limit = _worklink_output_limits()
@@ -665,11 +676,11 @@ class LocalSubprocessComputeBackend:
                     return await execute_contained(
                         command,
                         capability,
-                        {
+                        filter_otlp_env({
                             key: value
                             for key, value in environment.items()
                             if key != "HOME"
-                        },
+                        }),
                         projections,
                         identifier=identifier,
                         timeout_s=spec.timeout_s,

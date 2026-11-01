@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 from typing import Callable, Mapping, Sequence
 
+from mimir.otel_credentials import filter_otlp_env
+
 
 @dataclass(frozen=True)
 class FactoryRecoveryIdentity:
@@ -60,11 +62,11 @@ def launch_detached_worklink(
         process = popen(
             child_argv,
             cwd=str(repo),
-            env={
+            env=filter_otlp_env({
                 **os.environ,
                 **(env_overrides or {}),
                 "WORKLINK_RUN_LOG": str(log_path),
-            },
+            }),
             stdin=subprocess.DEVNULL,
             stdout=log_fh,
             stderr=log_fh,
