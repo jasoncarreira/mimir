@@ -1284,22 +1284,44 @@ async def test_traced_turn_usage_and_callback_scope(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_traced_turn_effective_model_override(tmp_path: Path, monkeypatch):
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:override-model")
     agent = _build_agent(tmp_path, fake_agent=_FakeAgent([AIMessage(content="done")]))
+    agent._agent = None
+    resolved = []
+    graphs = []
+    monkeypatch.setattr("langchain.chat_models.init_chat_model", lambda spec, **kw: resolved.append(spec) or
+                        GenericFakeChatModel(messages=iter([])))
+    monkeypatch.setattr("deepagents.create_deep_agent", lambda **kw: graphs.append(kw) or
+                        _FakeAgent([AIMessage(content="done")]))
+    monkeypatch.setattr("mimir.tools.all_mimir_tools", lambda **kw: [])
+    monkeypatch.setattr("mimir.tools.mcp.get_mcp_tools", lambda: [])
+    monkeypatch.setattr("mimir.subagents.build_mimir_subagents", lambda **kw: [])
+    monkeypatch.setattr(agent, "_current_system_prompt", lambda **kw: "stable prompt")
+    monkeypatch.setattr(agent, "_current_skill_sources", lambda: ())
+    monkeypatch.setattr(agent, "_skill_catalog_fingerprint", lambda sources: asyncio.sleep(0, result="stable"))
     controller, exporter = _turn_exporter()
     agent._config = replace(agent._config, tracing_enabled=True)
     agent._trace_controller = controller
 
     await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-override", content="hi"))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:not-invoked")
+    await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-override", content="again"))
 
-    [root] = [span for span in exporter.get_finished_spans() if span.name == "invoke_agent"]
-    assert root.attributes["gen_ai.request.model"] == "openai:override-model"
+    roots = [span for span in exporter.get_finished_spans() if span.name == "invoke_agent"]
+    assert len(roots) == 2
+    assert resolved == ["openai:override-model"]
+    assert len(graphs) == 1
+    assert all(root.attributes["gen_ai.request.model"] == "openai:override-model" for root in roots)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("capture", [False, True])
-async def test_traced_early_reply_content_policy(tmp_path: Path, monkeypatch, capture: bool):
+@pytest.mark.parametrize("reply", ["closure", "approval"])
+async def test_traced_early_reply_content_policy(tmp_path: Path, monkeypatch, capture: bool, reply: str):
     from mimir import commitment_proposals
+    from mimir import approval_requests, operator_approval
 
     secret = "ghp_" + "B" * 36
     benign = "early-visible-sentinel"
@@ -1307,7 +1329,15 @@ async def test_traced_early_reply_content_policy(tmp_path: Path, monkeypatch, ca
     async def closure(*args):
         return f"{benign} {secret}"
 
-    monkeypatch.setattr(commitment_proposals, "handle_reply", closure)
+    if reply == "closure":
+        monkeypatch.setattr(commitment_proposals, "handle_reply", closure)
+    else:
+        monkeypatch.setattr(commitment_proposals, "handle_reply", lambda *args: asyncio.sleep(0, result=None))
+        monkeypatch.setattr(approval_requests, "is_non_turn_bound_reply", lambda event: True)
+        monkeypatch.setattr(approval_requests, "resolve", lambda *args: SimpleNamespace(
+            entry=None, status="approved", message=f"{benign} {secret}",
+        ))
+        monkeypatch.setattr(operator_approval, "_is_authenticated_operator", lambda *args, **kw: True)
     agent = _build_agent(tmp_path, fake_agent=_FakeAgent([]))
     controller, exporter = _turn_exporter()
     controller.capture_content = capture
@@ -1328,11 +1358,14 @@ async def test_traced_early_reply_content_policy(tmp_path: Path, monkeypatch, ca
         assert benign in root.attributes["gen_ai.input.messages"]
         assert benign in root.attributes["gen_ai.output.messages"]
         assert "[REDACTED]" in root.attributes["gen_ai.output.messages"]
+        assert "[REDACTED]" in root.attributes["gen_ai.input.messages"]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("capture", [False, True])
-async def test_traced_real_graph_tool_child_and_nudge(tmp_path: Path, capture: bool):
+@pytest.mark.parametrize("missing_parent_callback", [False, True])
+async def test_traced_real_graph_tool_child_and_nudge(tmp_path: Path, capture: bool,
+                                                      missing_parent_callback: bool, monkeypatch):
     from deepagents import create_deep_agent
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
     from langchain_core.tools import tool
@@ -1386,6 +1419,20 @@ async def test_traced_real_graph_tool_child_and_nudge(tmp_path: Path, capture: b
     controller, exporter = _turn_exporter()
     controller.capture_content = capture
     agent._trace_controller = controller
+    if missing_parent_callback:
+        import inspect
+        from mimir import tracing
+
+        original_usage = tracing._usage
+
+        def callback_usage(message):
+            if "child" not in str(message.content) and any(
+                frame.function == "count_callback" for frame in inspect.stack()
+            ):
+                return {key: 0 for key in (INPUT, OUTPUT, CACHE_READ, CACHE_CREATION)}
+            return original_usage(message)
+
+        monkeypatch.setattr(tracing, "_usage", callback_usage)
 
     record = await agent.run_turn(AgentEvent(
         trigger="user_message", channel_id="ch-graph-trace",
@@ -1414,14 +1461,18 @@ async def test_traced_real_graph_tool_child_and_nudge(tmp_path: Path, capture: b
     assert all(span.context.trace_id == root.context.trace_id for span in chats + tools)
     for key, index in ((INPUT, 0), (OUTPUT, 1), (CACHE_READ, 2), (CACHE_CREATION, 3)):
         assert root.attributes[key] == sum(row[index] for row in usage)
-    content = {key: value for span in spans for key, value in span.attributes.items()
-               if key in {"gen_ai.input.messages", "gen_ai.output.messages",
-                          "gen_ai.tool.call.arguments", "gen_ai.tool.call.result"}}
-    assert bool(content) is capture
-    assert secret not in str([span.attributes for span in spans])
-    if capture:
-        assert benign in str(content)
-        assert "[REDACTED]" in str(content)
+    for span, keys in [(root, ("gen_ai.input.messages", "gen_ai.output.messages")),
+                       *((chat, ("gen_ai.input.messages", "gen_ai.output.messages")) for chat in chats),
+                       (tools[0], ("gen_ai.tool.call.arguments", "gen_ai.tool.call.result"))]:
+        assert span.end_time is not None
+        assert secret not in str(span.attributes)
+        for key in keys:
+            assert (key in span.attributes) is capture, (span.name, key)
+            if capture:
+                if not (span.name == "chat" and key == "gen_ai.input.messages"
+                        and "You produced a reply" in span.attributes[key]):
+                    assert benign in span.attributes[key], (span.name, key)
+                    assert "[REDACTED]" in span.attributes[key], (span.name, key)
 
 
 @pytest.mark.asyncio
