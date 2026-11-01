@@ -28,6 +28,120 @@ from mimir_cultivate.worklink.evidence import (
 )
 
 
+_OTLP_CARRIERS = {
+    "OTEL_EXPORTER_OTLP_HEADERS": "plain-header-canary",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "plain-trace-canary",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY": "plain-key-canary",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE": "plain-client-cert-canary",
+    "OTEL_EXPORTER_OTLP_CERTIFICATE": "plain-cert-canary",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://user:password@example.test/v1",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://example.test/v1?key=plain-query-canary",
+    "MIMIR_OTLP_ENDPOINT": "not-an-http-endpoint",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["contained", "factory"])
+async def test_gate_child_denies_otlp_carriers_after_spec_and_ambient_merge(
+    tmp_path, monkeypatch, route,
+):
+    from mimir_cultivate.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
+    from mimir_cultivate.worklink import worker_client
+    from mimir.otel_credentials import filter_otlp_env
+
+    for name, value in _OTLP_CARRIERS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://example.test/normal")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+    child = (
+        "import json,os; print(json.dumps({k:v for k,v in os.environ.items() "
+        "if k.startswith(('OTEL_EXPORTER_OTLP_', 'MIMIR_OTLP_'))}))"
+    )
+    class ChildCompute:
+        async def _launch_contained(self, spec, command):
+            self.process = await asyncio.create_subprocess_exec(
+                *command, cwd=tmp_path, env=filter_otlp_env({**os.environ, **spec.env}),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            return LaunchHandle("local_subprocess", str(self.process.pid))
+
+        async def wait(self, handle, timeout_s):
+            stdout, stderr = await self.process.communicate()
+            return ComputeResult(self.process.returncode, stdout.decode(), stderr.decode())
+
+        async def cleanup(self, handle):
+            pass
+
+    compute = ChildCompute()
+    if route == "factory":
+        def factory_child(checkout, argv, *, env, timeout, output_limit):
+            return subprocess.run(argv, cwd=checkout, env=env, capture_output=True)
+        monkeypatch.setattr(worker_client, "run_factory_control", factory_child)
+    spec = WorkSpec(
+        845, 1, "repo", "main", "issue/845-a1", "", None, "python3", "feature_factory" if route == "factory" else "opencode", 30,
+        env={**_OTLP_CARRIERS, "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "https://example.test/normal", "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf"},
+        local_checkout=tmp_path,
+    )
+    result = await ev._run_compute_gate(
+        shlex.join([sys.executable, "-c", child]), checkout=tmp_path,
+        work_spec=spec, compute=compute,
+    )
+    assert result.exit_code == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert not _OTLP_CARRIERS.keys() & observed.keys()
+    assert observed["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://example.test/normal"
+    assert observed["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+    assert not any(value in result.stdout + result.stderr for value in _OTLP_CARRIERS.values())
+
+
+def test_direct_argv_gate_filters_otlp_ambient_env(monkeypatch):
+    for name, value in _OTLP_CARRIERS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.test/ordinary")
+    result = ev._run([sys.executable, "-c", "import os,json;print(json.dumps(dict(os.environ)))"])
+    assert result.returncode == 0
+    observed = json.loads(result.stdout)
+    assert observed["OTEL_EXPORTER_OTLP_ENDPOINT"] == "https://collector.test/ordinary"
+    assert not (_OTLP_CARRIERS.keys() - {"OTEL_EXPORTER_OTLP_ENDPOINT"}) & observed.keys()
+
+
+def test_opencode_resolver_filters_otlp_carriers_before_projection(monkeypatch, tmp_path):
+    from mimir_cultivate.worklink.backends import opencode
+    from mimir_cultivate.worklink.compute import WorkSpec
+
+    for name, value in _OTLP_CARRIERS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.test/ordinary")
+    seen = {}
+    invocation = type("Invocation", (), {"model": "openai/model"})()
+
+    def resolve(*, env):
+        seen["resolver"] = dict(env)
+        return invocation
+
+    def documents(selected, env):
+        assert selected is invocation
+        seen["projection"] = dict(env)
+        return type("Documents", (), {"config_document": b"{}", "auth_document": None})()
+
+    monkeypatch.setattr(opencode, "resolve_opencode_invocation", resolve)
+    monkeypatch.setattr(opencode, "opencode_worker_documents", documents)
+    monkeypatch.setattr(opencode, "opencode_model_from_agent_spec", lambda value: "openai/model")
+    monkeypatch.setattr(opencode, "model_spec_at_call_time", lambda home: "codex-plus:model")
+    resolution = opencode.resolve_worklink_opencode_invocation({"MIMIR_HOME": str(tmp_path)})
+    assert resolution.invocation is invocation
+    spec = WorkSpec(
+        845, 1, "repo", "main", "issue/845-a1", "", None, "pytest", "opencode", 30,
+        env=dict(_OTLP_CARRIERS), backend_config={"codex": True, "model": invocation.model, "worker_projections": ()},
+    )
+    refreshed = opencode.OpenCodeBackend().refresh_codex_projections(spec, {"MIMIR_HOME": str(tmp_path), **_OTLP_CARRIERS})
+    for observed in (seen["resolver"], seen["projection"], resolution.env, refreshed.env):
+        assert not (_OTLP_CARRIERS.keys() - {"OTEL_EXPORTER_OTLP_ENDPOINT"}) & observed.keys()
+        assert not any(value in repr(observed) for value in _OTLP_CARRIERS.values())
+    assert resolution.env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "https://collector.test/ordinary"
+    assert json.loads(refreshed.backend_config["worker_projections"][0].document) == {}
+
+
 @pytest.fixture(autouse=True)
 def clean_gate_tmp(monkeypatch):
     helper = ev._gate_tmp_directory
