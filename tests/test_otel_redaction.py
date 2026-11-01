@@ -51,6 +51,20 @@ def test_embedded_url_and_nonsecret_endpoint() -> None:
     }
 
 
+def test_contextual_generic_endpoint_without_blanket_url_redaction() -> None:
+    text = (
+        "OTEL_EXPORTER_OTLP_ENDPOINT -> https://user:plain-base@example.test/custom/base; "
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT -> https://example.test/custom?plain-base-query; "
+        "unrelated https://user:plain-git@github.com/org/repo?view=1 "
+        "and https://example.test/search?plain-other-query"
+    )
+    safe = redact_text(text)
+    assert "plain-base" not in safe
+    assert "plain-base-query" not in safe
+    assert "https://user:plain-git@github.com/org/repo?view=1" in safe
+    assert "https://example.test/search?plain-other-query" in safe
+
+
 @pytest.mark.asyncio
 async def test_event_and_turn_durable_sinks(tmp_path) -> None:
     payload = {
@@ -60,6 +74,12 @@ async def test_event_and_turn_durable_sinks(tmp_path) -> None:
         "text": "visit https://example.test/v1/traces?plain-query; keep https://example.test/base/",
         "OTEL_EXPORTER_OTLP_ENDPOINT": "https://example.test/base/",
         "nested": json.dumps({"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "https://user:plain-nested@example.test/base"}),
+        "diagnostic": (
+            "OTEL_EXPORTER_OTLP_ENDPOINT -> https://user:plain-generic@example.test/custom/base; "
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT -> https://example.test/custom?plain-generic-query; "
+            "unrelated https://user:plain-git@github.com/org/repo?view=1 "
+            "and https://example.test/search?plain-other-query"
+        ),
     }
     events_path = tmp_path / "events.jsonl"
     await EventLogger(events_path, "session").log("otel_test", details=payload)
@@ -72,13 +92,17 @@ async def test_event_and_turn_durable_sinks(tmp_path) -> None:
     await TurnLogger(turns_path).write(turn)
     for path in (events_path, turns_path):
         raw = path.read_text()
-        for secret in ("plain-header-canary", "plain-cert-canary", "plain-userinfo", "plain-query", "plain-nested"):
+        for secret in ("plain-header-canary", "plain-cert-canary", "plain-userinfo", "plain-query", "plain-nested", "plain-generic", "plain-generic-query"):
             assert secret not in raw
         persisted = json.loads(raw)
         details = persisted["details"] if path == events_path else persisted["events"][0]["content"]
         assert details["otel_exporter_otlp_traces_headers"] == "[REDACTED]"
         assert details["OTEL_EXPORTER_OTLP_ENDPOINT"] == "https://example.test/base/"
         assert "plain-nested" not in details["nested"]
+        assert "https://user:plain-git@github.com/org/repo?view=1" in details["diagnostic"]
+        assert "https://example.test/search?plain-other-query" in details["diagnostic"]
+        if path == turns_path:
+            assert "plain-generic" not in persisted["input"]
 
 
 @pytest.mark.parametrize("name", [

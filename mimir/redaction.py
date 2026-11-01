@@ -31,6 +31,13 @@ _OTLP_ASSIGNMENT = re.compile(
     r"(?:(?P<quote>\\?['\"])(?P<quoted>(?:\\.|[^\n\\])*?)(?P=quote)|(?P<bare>[^\s}\]]+))"
 )
 _EMBEDDED_HTTP_URL = re.compile(r"(?i)https?://[^\s<>\"'`]+")
+_OTLP_URL_CONTEXT = re.compile(
+    r"(?i)(?<![A-Za-z0-9_.-])" + OTLP_ENV_NAME_PATTERN +
+    r"(?:\\?['\"]|[ \t:=,>\-]){1,32}$"
+)
+_OTLP_SIGNAL_URL = re.compile(
+    r"(?i)^https?://[^/?#]+/v1/(?:traces|metrics|logs)(?:[/?#]|$)"
+)
 
 
 def _mask_otlp_assignments(text: str) -> str:
@@ -49,9 +56,11 @@ def _mask_embedded_otlp_urls(text: str) -> str:
     def replace(match: re.Match[str]) -> str:
         candidate = match.group()
         url = candidate.rstrip(".,;!)}")
-        # Only OTLP signal paths identify an unkeyed URL as an exporter URL.
-        # Generic OTLP endpoints are handled by the keyed assignment pass.
-        if not re.search(r"(?i)^https?://[^/?#]+/v1/(?:traces|metrics|logs)(?:[/?#]|$)", url):
+        # An OTLP signal path identifies an exporter without a label. Generic
+        # base paths require an adjacent carrier name; unrelated Git and query
+        # URLs must remain readable even elsewhere in an OTLP log message.
+        context = text[max(0, match.start() - 128):match.start()]
+        if not _OTLP_SIGNAL_URL.search(url) and not _OTLP_URL_CONTEXT.search(context):
             return candidate
         if not sensitive_otlp_endpoint(url):
             return candidate
