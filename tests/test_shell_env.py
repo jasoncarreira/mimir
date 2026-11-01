@@ -117,6 +117,64 @@ def test_otlp_filter_applies_again_at_sync_launch(monkeypatch: pytest.MonkeyPatc
     assert result.stdout.strip() == b"KEEP=untouched"
 
 
+def test_configured_project_test_filters_otlp_carriers_at_child_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import access_control
+    from mimir.tools import extra
+
+    executable = Path(shutil.which("printenv") or "").resolve(strict=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{project}:rw")
+    argv = [str(executable)]
+    monkeypatch.setenv("MIMIR_PROJECT_TEST_COMMAND", json.dumps({
+        "argv": argv, "cwd": str(project),
+    }))
+    assert access_control.configured_project_test_cwd(argv) == str(project.resolve())
+
+    sensitive = {
+        "OTEL_EXPORTER_OTLP_HEADERS": "bounded-header-canary",
+        "otel_exporter_otlp_traces_headers": "bounded-trace-canary",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY": "bounded-key-canary",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE": "bounded-cert-canary",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":
+            "https://user:bounded-user-canary@collector.test/v1/traces",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT":
+            "https://collector.test/v1/metrics?token=bounded-query-canary",
+        "MIMIR_OTLP_ENDPOINT": "not-an-http-url",
+    }
+    allowed = {
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "https://collector.test/v1/traces",
+        "SHELL_EGRESS_CONTROL": "ordinary-child-value",
+    }
+    original_env = _shell_env.direct_exec_env
+
+    def late_env(child_argv: list[str]) -> dict[str, str]:
+        return original_env(child_argv) | sensitive | allowed
+
+    monkeypatch.setattr(_shell_env, "direct_exec_env", late_env)
+    monkeypatch.setattr(extra, "_run_shell_command", lambda *args, **kwargs: pytest.fail(
+        "configured project test did not use bounded runner",
+    ))
+    token = _shell_env.bind_direct_exec_argv(argv)
+    try:
+        result = extra.shell_exec.invoke({"command": shlex.join(argv), "cwd": str(project)})
+    finally:
+        _shell_env.reset_direct_exec_argv(token)
+
+    assert "exit=0" in result
+    child = dict(line.split("=", 1) for line in result.split("stdout:\n", 1)[1].splitlines()
+                 if "=" in line)
+    assert not sensitive.keys() & child.keys()
+    assert {name: child[name] for name in allowed} == allowed
+    for value in sensitive.values():
+        assert value not in result
+
+
 @pytest.fixture
 def selected_shell_policy():
     pytest.importorskip("mimir_cultivate")
