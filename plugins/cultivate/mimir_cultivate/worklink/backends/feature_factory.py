@@ -30,6 +30,7 @@ FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("gate", ("gate",)),
     ("step", ("step",)),
     ("terminal", ("terminal",)),
+    ("snapshot", ("snapshot",)),
     ("slices-seed", ("slices-seed",)),
     ("slice", ("slice",)),
     ("observe", ("observe",)),
@@ -897,6 +898,18 @@ class FeatureFactoryBackend:
         self._control(
             launcher,
             ("terminal", run_id, status, "--reason", reason, "--repo", str(sandbox)),
+            sandbox=sandbox,
+        )
+
+    def snapshot(self, run_id: str, *, sandbox: Path, launcher: str | Path) -> None:
+        # Status/terminal use the sandbox as --repo, but snapshot writes under
+        # the operator root. Binding the path to this run prevents publishing
+        # into the sandbox (where factory status cannot find the snapshot).
+        if sandbox.parent.name != ".factory-sandboxes" or sandbox.name != run_id:
+            raise FactoryContractError("factory snapshot requires this run's sandbox path")
+        self._control(
+            launcher,
+            ("snapshot", run_id, "--repo", str(sandbox.parent.parent)),
             sandbox=sandbox,
         )
 
