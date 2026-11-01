@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -1412,6 +1413,14 @@ Then give the final answer on its own line. Be concise."""
 # ────────────────────────────────────────────────────────────────────
 
 
+def _trace_turn(body: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(body)
+    async def wrapped(self: Agent, event: AgentEvent, **kwargs: Any) -> TurnRecord:
+        return await self._trace_run_turn(event, body=body, **kwargs)
+
+    return wrapped
+
+
 class Agent:
     """Deepagents-backed mimir Agent.
 
@@ -1437,8 +1446,10 @@ class Agent:
         turn_hooks: list[Any] | None = None,
         turn_event_bus: Any = None,
         chat_skill_registry: ChatSkillRegistry | None = None,
+        trace_controller: Any = None,
     ) -> None:
         self._config = config
+        self._trace_controller = trace_controller
         self._turn_logger = turn_logger
         self._buffer = message_buffer
         self._identity_resolver = getattr(message_buffer, "resolver", None)
@@ -2099,7 +2110,50 @@ class Agent:
             self._cached_unready_tool_owners = unready_tool_owners
             return self._agent
 
+    async def _trace_run_turn(
+        self,
+        event: AgentEvent,
+        *,
+        turn_id: str | None = None,
+        session_id: str | None = None,
+        saga_session_id: str | None = None,
+        body: Callable[..., Any],
+    ) -> TurnRecord:
+        """Bracket the complete turn, including approval replies and finalization."""
+        controller = self._trace_controller if getattr(self._config, "tracing_enabled", False) else None
+        if controller is None:
+            return await body(
+                self, event, turn_id=turn_id, session_id=session_id, saga_session_id=saga_session_id,
+            )
+        scope = controller.turn(
+            conversation_id=session_id or event.channel_id or "default",
+            agent_name=self._config.agent_id,
+            model=str(getattr(self._config, "model_spec", None) or "unknown"),
+            input_content=event.content,
+        )
+        with scope as trace:
+            record = await body(
+                self, event, turn_id=turn_id, session_id=session_id, saga_session_id=saga_session_id,
+            )
+            usage = record.usage or {}
+            # The record is derived from the final graph state and includes
+            # nudge responses; callback totals are only a partial fallback.
+            if usage:
+                from .tracing import INPUT, OUTPUT, CACHE_READ, CACHE_CREATION
+                with trace._lock:
+                    for key, source in ((INPUT, "input_tokens"), (OUTPUT, "output_tokens"),
+                                        (CACHE_READ, "cache_read_input_tokens"),
+                                        (CACHE_CREATION, "cache_creation_input_tokens")):
+                        value = usage.get(source, 0)
+                        trace._totals[key] = value if isinstance(value, int) and value >= 0 else 0
+            if record.error or record.result_is_error:
+                trace.mark_error()
+            if controller.capture_content:
+                trace.finish(output_content=record.output)
+            return record
+
     @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
+    @_trace_turn
     async def run_turn(
         self,
         event: AgentEvent,
@@ -3346,6 +3400,14 @@ class Agent:
                         "channel_id": event.channel_id,
                     },
                 }
+                if getattr(self._config, "tracing_enabled", False) and self._trace_controller is not None:
+                    from .tracing import _active_turn
+                    active_trace = _active_turn.get()
+                    if active_trace is not None:
+                        try:
+                            invoke_config["callbacks"] = [active_trace.callback]
+                        except Exception:
+                            log.warning("Tracing callback unavailable.")
                 # chainlink #583 slice 2: request both stream modes. "values"
                 # gives the full-state snapshots the turn record is built from
                 # (block-level brackets, slice 1); "messages" gives token-level

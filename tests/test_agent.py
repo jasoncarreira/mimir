@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from uuid import uuid4
 from dataclasses import asdict, replace
 from pathlib import Path
 from textwrap import dedent
@@ -68,6 +69,7 @@ from mimir.skill_defs import home_builtin_skills_dir
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.turn_logger import TurnLogger
 from mimir.turn_event_bus import TurnEventBus
+from mimir.tracing import TraceController, INPUT, OUTPUT, CACHE_READ, CACHE_CREATION
 from mimir.plugins.registry import PolicyRegistry
 from mimir.tool_descriptors import ResultOriginKind
 from mimir.http_ingress import (
@@ -1242,6 +1244,191 @@ def _build_agent(tmp_path: Path, *,
     # whenever Agent goes to build/fetch the graph.
     a._agent = fake_agent  # type: ignore[attr-defined]
     return a
+
+
+def _turn_exporter():
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return TraceController(provider), exporter
+
+
+@pytest.mark.asyncio
+async def test_traced_turn_usage_and_callback_scope(tmp_path: Path):
+    model = _FakeAgent([AIMessage(content="done", usage_metadata={
+        "input_tokens": 12, "output_tokens": 4,
+        "total_tokens": 16,
+        "input_token_details": {"cache_read": 3, "cache_creation": 2},
+    })])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    controller, exporter = _turn_exporter()
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+    record = await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-trace", content="hello"))
+    assert record.output == "done"
+    assert len(model.invocations[0]["config"]["callbacks"]) == 1
+    spans = exporter.get_finished_spans()
+    assert len([span for span in spans if span.name == "invoke_agent"]) == 1
+    root = next(span for span in spans if span.name == "invoke_agent")
+    assert root.attributes[INPUT] == 12
+    assert root.attributes[OUTPUT] == 4
+    assert root.attributes[CACHE_READ] == 3
+    assert root.attributes[CACHE_CREATION] == 2
+    assert root.attributes["gen_ai.conversation.id"] == "ch-trace"
+    assert not any("messages" in key for key in root.attributes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture", [False, True])
+async def test_traced_graph_children_and_content(tmp_path: Path, capture: bool):
+    from langchain_core.outputs import ChatGeneration, LLMResult
+
+    class CallbackGraph(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            callback = config["callbacks"][0]
+            chat_id, tool_id, nested_id = uuid4(), uuid4(), uuid4()
+            callback.on_chat_model_start({"name": "fake"}, [[HumanMessage(content="hello")]], run_id=chat_id)
+            callback.on_tool_start({"name": "search"}, "safe argument", run_id=tool_id, parent_run_id=chat_id)
+            callback.on_chat_model_start({"name": "subagent"}, [[HumanMessage(content="sub")]], run_id=nested_id, parent_run_id=tool_id)
+            callback.on_llm_end(LLMResult(generations=[[ChatGeneration(message=AIMessage(content="sub done"))]]), run_id=nested_id)
+            callback.on_tool_end("safe result", run_id=tool_id)
+            callback.on_llm_end(LLMResult(generations=[[ChatGeneration(message=AIMessage(content="done"))]]), run_id=chat_id)
+            async for item in super().astream(state, config=config, context=context, stream_mode=stream_mode):
+                yield item
+
+    graph = CallbackGraph([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=graph)
+    controller, exporter = _turn_exporter()
+    controller.capture_content = capture
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+    await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-one", content="hello"))
+    spans = {span.name: span for span in exporter.get_finished_spans() if span.name != "chat"}
+    chats = [span for span in exporter.get_finished_spans() if span.name == "chat"]
+    assert len(chats) == 2
+    assert chats[0].parent.span_id == spans["execute_tool"].context.span_id
+    assert spans["execute_tool"].parent.span_id == chats[1].context.span_id
+    assert chats[1].parent.span_id == spans["invoke_agent"].context.span_id
+    content_keys = [key for span in exporter.get_finished_spans() for key in span.attributes
+                    if key in {"gen_ai.input.messages", "gen_ai.output.messages",
+                               "gen_ai.tool.call.arguments", "gen_ai.tool.call.result"}]
+    assert bool(content_keys) is capture
+
+
+@pytest.mark.asyncio
+async def test_traced_concurrent_channels_keep_separate_parents(tmp_path: Path):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    count = 0
+
+    class OverlappingGraph(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            nonlocal count
+            count += 1
+            if count == 2:
+                entered.set()
+            await entered.wait()
+            callback = config["callbacks"][0]
+            run_id = uuid4()
+            callback.on_tool_start({"name": "lookup"}, "query", run_id=run_id)
+            await release.wait()
+            callback.on_tool_end("result", run_id=run_id)
+            async for item in super().astream(state, config=config, context=context, stream_mode=stream_mode):
+                yield item
+
+    graph = OverlappingGraph([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=graph)
+    controller, exporter = _turn_exporter()
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+    async def run(channel):
+        return await agent.run_turn(AgentEvent(trigger="user_message", channel_id=channel, content="hi"))
+
+    tasks = [asyncio.create_task(run(channel)) for channel in ("ch-a", "ch-b")]
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=HANG_GUARD_SECONDS)
+    finally:
+        release.set()
+    await asyncio.gather(*tasks)
+    spans = exporter.get_finished_spans()
+    roots = {span.context.span_id for span in spans if span.name == "invoke_agent"}
+    parents = {span.parent.span_id for span in spans if span.name == "execute_tool"}
+    assert len(roots) == len(parents) == 2
+    assert parents == roots
+
+
+@pytest.mark.asyncio
+async def test_tracing_disabled_does_not_attach_callback(tmp_path: Path):
+    graph = _FakeAgent([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=graph)
+    controller, exporter = _turn_exporter()
+    agent._trace_controller = controller
+    await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-disabled", content="hi"))
+    assert "callbacks" not in graph.invocations[0]["config"]
+    assert not exporter.get_finished_spans()
+
+
+@pytest.mark.asyncio
+async def test_tracing_callback_failure_does_not_fail_turn(tmp_path: Path, monkeypatch):
+    from mimir.tracing import TurnTrace
+
+    class CallbackGraph(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            run_id = uuid4()
+            handler = config["callbacks"][0]
+            handler.on_tool_start({"name": "lookup"}, "query", run_id=run_id)
+            handler.on_tool_end("result", run_id=run_id)
+            async for item in super().astream(state, config=config, context=context, stream_mode=stream_mode):
+                yield item
+
+    graph = CallbackGraph([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=graph)
+    controller, exporter = _turn_exporter()
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+    def broken_span(*args, **kwargs):
+        raise RuntimeError("exporter unavailable")
+    monkeypatch.setattr(TurnTrace, "_start", broken_span)
+    record = await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-fail", content="hi"))
+    assert record.output == "done"
+    assert [span.name for span in exporter.get_finished_spans()] == ["invoke_agent"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["early", "failure", "cancel"])
+async def test_traced_turn_ends_on_all_exit_paths(tmp_path: Path, monkeypatch, outcome: str):
+    from opentelemetry.trace import StatusCode
+    from mimir import commitment_proposals
+
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([AIMessage(content="done")]))
+    controller, exporter = _turn_exporter()
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+    if outcome == "early":
+        async def closure(*args):
+            return "approved"
+        monkeypatch.setattr(commitment_proposals, "handle_reply", closure)
+    else:
+        async def failing(*args, **kwargs):
+            if outcome == "cancel":
+                raise asyncio.CancelledError()
+            raise ValueError("private failure")
+        monkeypatch.setattr(commitment_proposals, "handle_reply", failing)
+    event = AgentEvent(trigger="user_message", channel_id="ch-trace", content="secret")
+    if outcome == "early":
+        assert (await agent.run_turn(event)).output == "approved"
+    else:
+        with pytest.raises(asyncio.CancelledError if outcome == "cancel" else ValueError):
+            await agent.run_turn(event)
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].name == "invoke_agent"
+    assert spans[0].status.status_code == (StatusCode.UNSET if outcome == "early" else StatusCode.ERROR)
+    assert "secret" not in str(spans[0].attributes)
 
 
 def _seed_live_turn_stores(home: Path) -> list[Path]:
