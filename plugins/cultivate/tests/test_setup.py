@@ -1319,6 +1319,56 @@ def test_fresh_no_start_explains_web_key_and_verification_follow_up(setup_enviro
     assert len(state['verified']) == 1
 
 
+@pytest.mark.parametrize('provider,other_provider', [('openai', 'anthropic'), ('anthropic', 'openai')])
+@pytest.mark.parametrize('upgrade', [False, True], ids=['rerun', 'upgrade'])
+def test_api_setup_preserves_operator_key(setup_environment, provider, other_provider, upgrade):
+    deploy, args, state, calls, invoke = setup_environment
+    args.model_spec = f'{provider}:model'
+    args.saga_model_spec = f'{provider}:model'
+    args.embedding = 'local'
+    invoke()
+    path = deploy / 'compose.env'
+    other_key = other_provider.upper() + '_API_KEY'
+    with path.open('a') as output:
+        output.write(f'{other_key}=operator-added-key\n')
+    before = path.read_bytes()
+    if upgrade:
+        state['sha'] = 'c' * 40
+    invoke()
+    assert path.read_bytes() == before
+    assert f'{other_key}=operator-added-key' in path.read_text()
+    assert f'MIMIR_MODEL_SPEC={provider}:model' in path.read_text()
+    assert state['verified'] and state['running']
+    assert json.loads((deploy / 'manifest.json').read_text())['source_sha'] == state['sha']
+
+
+@pytest.mark.parametrize('provider,target', [('openai', 'anthropic'), ('anthropic', 'openai')])
+def test_api_setup_rejects_provider_switch(setup_environment, provider, target):
+    deploy, args, state, calls, invoke = setup_environment
+    args.model_spec = f'{provider}:model'
+    args.saga_model_spec = f'{provider}:model'
+    args.embedding = 'local'
+    invoke()
+    path = deploy / 'compose.env'
+    before = path.read_bytes()
+    args.model_spec = f'{target}:model'
+    with pytest.raises(installer.SetupError, match='Existing compose.env conflicts on MIMIR_MODEL_SPEC'):
+        invoke()
+    assert path.read_bytes() == before
+
+
+def test_codex_cli_install_has_drift_pin():
+    from mimir_cultivate.worklink.tool_pins import default_tool_pins
+
+    pin = next(pin for pin in default_tool_pins() if pin.name == 'codex')
+    assert pin.source == 'npm'
+    assert pin.package == '@openai/codex'
+    assert pin.pin == '0.139.0'
+    assert pin.smoke == 'codex --version'
+    script = (Path(installer.__file__).parent / 'docker/base.sh').read_text()
+    assert f'{pin.package}@{pin.pin}' in script
+
+
 def _fixture_codex_login(deploy):
     from tests.opencode_fixtures import seed_codex_subscription
 

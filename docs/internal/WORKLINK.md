@@ -798,7 +798,8 @@ content verbatim into acceptance criteria.
   seed inventory lives in `mimir_cultivate.worklink.tool_pins.DEFAULT_TOOL_PINS`.
   The seed covers pinned external executables that affect agent/worklink
   operation: chainlink, mermaid-cli, osv-scanner, gmail-poller's gogcli
-  helper, and the OpenCode CLI and plugins. Each entry records category,
+  helper, the Codex CLI for deployment-owned subscription login, and the
+  OpenCode CLI and plugins. Each entry records category,
   upstream lookup source, current pin, install surface, smoke command, and risk
   notes; guard tests compare those pins against Dockerfile/scaffold/
   skill-fragment literals so the inventory cannot silently drift from
@@ -1429,6 +1430,12 @@ tool_pins:
     smoke: "opencode --version"   # required: command used as bump evidence
     source: npm                  # optional lookup strategy for drift checks
     package: "opencode-ai"       # optional upstream package/repo identifier
+  - name: codex
+    category: coding-cli
+    pin: "0.139.0"
+    smoke: "codex --version"
+    source: npm
+    package: "@openai/codex"
   - name: chainlink
     category: tracker
     pin: "git+dollspace-gay/chainlink@<sha>"

@@ -525,7 +525,7 @@ def render_compose(template: str, layer_tag: str, kind: str, repo_name: str, *, 
                             "MIMIR_WORKLINK_AGENT_ID": "cultivate-worklink"})
         environment["WORKLINK_REPO"] = "/workspace/worklink/base/" + repo_name
         volumes = ["home:/home/mimir/agent", "cache:/home/mimir/.cache", "workspace:/workspace",
-                    "pr-leases:/workspace/pr-leases", "worklink:/workspace/worklink"]
+                   "pr-leases:/workspace/pr-leases", "worklink:/workspace/worklink"]
         if codex:
             volumes.append("./codex:/home/mimir/.codex")
             environment["CODEX_HOME"] = "/home/mimir/.codex"
@@ -1703,7 +1703,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
         env_updates[key_name] = model_key
     api_key = _env(deploy, env_updates,
                    manage_alerts=alert_adapter != "none" or "operator_alert_adapter" in previous,
-                   managed_model=True)
+                   managed_model=provider == "codex-plus")
     # Provisioning code is a static, non-secret program read from the selected
     # pinned image; values are passed through compose.env or a non-secret manifest.
     manifest = {"slug": repo.lower(), "branch": branch, "toolchain": kind, "owner": owner, "display": display,
@@ -1715,7 +1715,7 @@ def setup(args: argparse.Namespace, *, request=_request, run=_run, verify=_verif
                    "previous_tracker_config": previous.get("tracker_config"),
                    "rotate": bool(args.rotate_web_key),
                   "force": bool(getattr(args, "force", False)),
-                   "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
+                  "saga_model_spec": saga_spec, "embedding": embedding, "reembed": bool(args.reembed),
                    "previous_saga_model_spec": previous.get("saga_model_spec"),
                    "system_packages": system_packages,
                    "operator_alert_adapter": alert_adapter, "operator_alert_channel_id": alert_channel_id,
