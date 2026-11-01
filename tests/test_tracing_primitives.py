@@ -43,6 +43,7 @@ def traces():
     ("https://collector.example/?token=abc", None),
     ("https://collector.example/#secret", None),
     ("https://collector.example:bad", None),
+    ("https://collector.example:", None),
     ("file:///tmp/socket", None),
     (None, None),
 ])
@@ -66,6 +67,20 @@ def test_invalid_endpoint_warns_once_without_secret(caplog):
         assert TraceController.create(enabled=True, endpoint="https://user:canary@host/?key=canary") is None
     assert len(caplog.records) == 1
     assert "canary" not in caplog.text
+
+
+def test_empty_port_disables_tracing_without_constructing_exporter(monkeypatch, caplog):
+    from opentelemetry.exporter.otlp.proto.http import trace_exporter
+
+    constructed = []
+    monkeypatch.setattr(trace_exporter, "OTLPSpanExporter", lambda **kwargs: constructed.append(kwargs))
+    with caplog.at_level(logging.WARNING):
+        controller = TraceController.create(enabled=True, endpoint="https://collector.example:")
+    assert controller is None
+    assert constructed == []
+    assert [record.message for record in caplog.records] == [
+        "Tracing disabled: configure a valid OTLP base endpoint without credentials or /v1/traces."
+    ]
 
 
 @pytest.mark.asyncio

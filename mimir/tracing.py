@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from mimir.otel_credentials import sensitive_otlp_endpoint
 from mimir.redaction import redact_payload
 
 
@@ -34,30 +35,12 @@ _log = logging.getLogger(__name__)
 
 def trace_endpoint(base: str | None) -> str | None:
     """Accept only an HTTP(S) base URL without credential-bearing components."""
-    if not base or base != base.strip():
+    if sensitive_otlp_endpoint(base):
         return None
-    try:
-        url = urlsplit(base)
-        if (
-            url.scheme not in ("http", "https")
-            or not url.hostname
-            or url.username is not None
-            or url.password is not None
-            or "@" in url.netloc
-            or "?" in base
-            or "#" in base
-            or "\\" in base
-            or url.port is not None and not 0 < url.port < 65536
-            or url.path.rstrip("/").endswith("/v1/traces")
-            or any(char.isspace() for char in base)
-        ):
-            return None
-        # Reject malformed netlocs rather than passing their value to an exporter.
-        if url.netloc != url.netloc.strip() or url.hostname is None:
-            return None
-        return base.rstrip("/") + "/v1/traces"
-    except ValueError:
+    assert base is not None
+    if urlsplit(base).path.rstrip("/").endswith("/v1/traces"):
         return None
+    return base.rstrip("/") + "/v1/traces"
 
 
 def _content(value: Any) -> str | None:
