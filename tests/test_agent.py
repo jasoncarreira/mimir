@@ -1283,6 +1283,148 @@ async def test_traced_turn_usage_and_callback_scope(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_traced_turn_effective_model_override(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:override-model")
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([AIMessage(content="done")]))
+    controller, exporter = _turn_exporter()
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+
+    await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-override", content="hi"))
+
+    [root] = [span for span in exporter.get_finished_spans() if span.name == "invoke_agent"]
+    assert root.attributes["gen_ai.request.model"] == "openai:override-model"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture", [False, True])
+async def test_traced_early_reply_content_policy(tmp_path: Path, monkeypatch, capture: bool):
+    from mimir import commitment_proposals
+
+    secret = "ghp_" + "B" * 36
+    benign = "early-visible-sentinel"
+
+    async def closure(*args):
+        return f"{benign} {secret}"
+
+    monkeypatch.setattr(commitment_proposals, "handle_reply", closure)
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([]))
+    controller, exporter = _turn_exporter()
+    controller.capture_content = capture
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id="ch-early", content=f"{benign} {secret}",
+    ))
+
+    [root] = exporter.get_finished_spans()
+    assert record.output == f"{benign} {secret}"
+    assert root.name == "invoke_agent" and root.end_time is not None
+    assert secret not in str(root.attributes)
+    assert ("gen_ai.input.messages" in root.attributes) is capture
+    assert ("gen_ai.output.messages" in root.attributes) is capture
+    if capture:
+        assert benign in root.attributes["gen_ai.input.messages"]
+        assert benign in root.attributes["gen_ai.output.messages"]
+        assert "[REDACTED]" in root.attributes["gen_ai.output.messages"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture", [False, True])
+async def test_traced_real_graph_tool_child_and_nudge(tmp_path: Path, capture: bool):
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.tools import tool
+
+    secret = "ghp_" + "A" * 36
+    benign = "visible-sentinel"
+    usage = [
+        (11, 2, 3, 1), (17, 4, 5, 2), (23, 6, 7, 3), (29, 8, 9, 4),
+    ]
+
+    def reply(content, tokens, *, call=None):
+        input_tokens, output_tokens, cache_read, cache_creation = tokens
+        return AIMessage(
+            content=content,
+            tool_calls=([{"name": "lookup_trace", "args": {"query": f"{benign} {secret}"},
+                         "id": call, "type": "tool_call"}] if call else []),
+            usage_metadata={
+                "input_tokens": input_tokens, "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "input_token_details": {"cache_read": cache_read, "cache_creation": cache_creation},
+            },
+        )
+
+    class Model(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    child = Model(messages=iter([reply(f"{benign} {secret} child", usage[1])]), disable_streaming=True)
+
+    @tool
+    async def lookup_trace(query: str) -> str:
+        """Return an observed lookup result."""
+        result = await child.ainvoke([HumanMessage(content=query)])
+        return f"{benign} {secret} {result.content}"
+
+    parent = Model(messages=iter([
+        reply("", usage[0], call="trace-tool-call"),
+        reply(f"{benign} {secret} first", usage[2]),
+        reply(f"{benign} {secret} nudge", usage[3]),
+    ]), disable_streaming=True)
+    graph = create_deep_agent(model=parent, tools=[lookup_trace], system_prompt="trace test",
+                              context_schema=AuthContext)
+    registry = ChannelRegistry()
+    registry.register(_BridgeStub())
+    agent = _build_agent(tmp_path, fake_agent=graph, channel_registry=registry)
+    agent._config = replace(agent._config, tracing_enabled=True, resend_nudge_channels=("ch-",))
+    agent._identity_resolver = _resolver(
+        agent._config.home,
+        "people:\n  - canonical: trace-user\n    access: {roles: [user]}\n",
+    )
+    controller, exporter = _turn_exporter()
+    controller.capture_content = capture
+    agent._trace_controller = controller
+
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id="ch-graph-trace",
+        content=f"{benign} {secret}", source="discord", author="trace-user",
+    ))
+
+    spans = exporter.get_finished_spans()
+    [root] = [span for span in spans if span.name == "invoke_agent"]
+    chats = [span for span in spans if span.name == "chat"]
+    tools = [span for span in spans if span.name == "execute_tool" and
+             span.attributes.get("gen_ai.tool.name") == "lookup_trace"]
+    assert record.error is None
+    assert any(event["type"] == "resend_nudge_issued" for event in _read_events(tmp_path))
+    assert record.output == f"{benign} {secret} nudge"
+    assert record.usage == {
+        "input_tokens": 29, "output_tokens": 8,
+        "cache_read_input_tokens": 9, "cache_creation_input_tokens": 4,
+    }
+    assert len(chats) == 4
+    assert len(tools) == 1
+    assert tools[0].attributes["gen_ai.tool.call.id"] == "trace-tool-call"
+    assert tools[0].parent.span_id == root.context.span_id or tools[0].parent.span_id in {
+        chat.context.span_id for chat in chats
+    }
+    assert any(chat.parent.span_id == tools[0].context.span_id for chat in chats)
+    assert all(span.context.trace_id == root.context.trace_id for span in chats + tools)
+    for key, index in ((INPUT, 0), (OUTPUT, 1), (CACHE_READ, 2), (CACHE_CREATION, 3)):
+        assert root.attributes[key] == sum(row[index] for row in usage)
+    content = {key: value for span in spans for key, value in span.attributes.items()
+               if key in {"gen_ai.input.messages", "gen_ai.output.messages",
+                          "gen_ai.tool.call.arguments", "gen_ai.tool.call.result"}}
+    assert bool(content) is capture
+    assert secret not in str([span.attributes for span in spans])
+    if capture:
+        assert benign in str(content)
+        assert "[REDACTED]" in str(content)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("capture", [False, True])
 async def test_traced_graph_children_and_content(tmp_path: Path, capture: bool):
     from langchain_core.outputs import ChatGeneration, LLMResult
@@ -1399,36 +1541,78 @@ async def test_tracing_callback_failure_does_not_fail_turn(tmp_path: Path, monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["early", "failure", "cancel"])
+@pytest.mark.parametrize("outcome", [
+    "closure", "approval", "preflight", "success", "returned_error", "timeout", "cancel",
+])
 async def test_traced_turn_ends_on_all_exit_paths(tmp_path: Path, monkeypatch, outcome: str):
     from opentelemetry.trace import StatusCode
-    from mimir import commitment_proposals
+    from mimir import commitment_proposals, operator_approval, approval_requests
 
     agent = _build_agent(tmp_path, fake_agent=_FakeAgent([AIMessage(content="done")]))
     controller, exporter = _turn_exporter()
-    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._config = replace(agent._config, tracing_enabled=True,
+                            turn_timeout_seconds=0.05 if outcome == "timeout" else 0)
     agent._trace_controller = controller
-    if outcome == "early":
+    if outcome == "closure":
         async def closure(*args):
             return "approved"
         monkeypatch.setattr(commitment_proposals, "handle_reply", closure)
-    else:
-        async def failing(*args, **kwargs):
-            if outcome == "cancel":
-                raise asyncio.CancelledError()
-            raise ValueError("private failure")
-        monkeypatch.setattr(commitment_proposals, "handle_reply", failing)
-    event = AgentEvent(trigger="user_message", channel_id="ch-trace", content="secret")
-    if outcome == "early":
-        assert (await agent.run_turn(event)).output == "approved"
-    else:
-        with pytest.raises(asyncio.CancelledError if outcome == "cancel" else ValueError):
+    if outcome == "approval":
+        monkeypatch.setattr(operator_approval, "_is_authenticated_operator", lambda *a, **kw: True)
+        monkeypatch.setattr(approval_requests, "resolve", lambda *a: SimpleNamespace(
+            entry=None, status="approved", message="approval notice",
+        ))
+    if outcome == "preflight":
+        async def reject(*args):
+            raise ValueError("preflight refused")
+        manager = agent._config.plugin_manager
+        agent._config = replace(agent._config, plugin_manager=SimpleNamespace(
+            policy=manager.policy, plugins=(SimpleNamespace(contributor=object()),),
+            turn_preflight=reject,
+        ))
+    if outcome == "returned_error":
+        agent._agent = _FakeAgent([AIMessage(content="failed", response_metadata={"is_error": True})])
+    entered = asyncio.Event()
+    if outcome in {"timeout", "cancel"}:
+        class WaitingGraph(_FakeAgent):
+            async def astream(self, state, *, config, context=None, stream_mode="values"):
+                entered.set()
+                await asyncio.Event().wait()
+                yield {"messages": []}
+        agent._agent = WaitingGraph([])
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-trace", content="safe request")
+    if outcome == "approval":
+        event = replace(event, content="approve test-abcd")
+    if outcome == "cancel":
+        task = asyncio.create_task(agent.run_turn(event))
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif outcome == "preflight":
+        with pytest.raises(ValueError, match="preflight refused"):
             await agent.run_turn(event)
+    else:
+        record = await agent.run_turn(event)
+        if outcome == "closure":
+            assert (record.kind, record.output) == ("commitment_proposal_approval", "approved")
+        elif outcome == "approval":
+            assert (record.kind, record.output) == ("operator_approval", "approval notice")
+        elif outcome == "timeout":
+            assert record.error.startswith("TurnTimeout:")
+        elif outcome == "returned_error":
+            assert record.result_is_error is True
+        else:
+            assert record.output == "done" and record.error is None
     spans = exporter.get_finished_spans()
     assert len(spans) == 1
     assert spans[0].name == "invoke_agent"
-    assert spans[0].status.status_code == (StatusCode.UNSET if outcome == "early" else StatusCode.ERROR)
-    assert "secret" not in str(spans[0].attributes)
+    assert spans[0].end_time is not None
+    assert spans[0].status.status_code == (
+        StatusCode.ERROR if outcome in {"preflight", "returned_error", "timeout", "cancel"}
+        else StatusCode.UNSET
+    )
 
 
 def _seed_live_turn_stores(home: Path) -> list[Path]:

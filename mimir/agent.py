@@ -2128,7 +2128,7 @@ class Agent:
         scope = controller.turn(
             conversation_id=session_id or event.channel_id or "default",
             agent_name=self._config.agent_id,
-            model=str(getattr(self._config, "model_spec", None) or "unknown"),
+            model=str(os.environ.get("MIMIR_MODEL_SPEC", getattr(self._config, "model_spec", None)) or "unknown"),
             input_content=event.content,
         )
         with scope as trace:
@@ -2136,8 +2136,11 @@ class Agent:
                 self, event, turn_id=turn_id, session_id=session_id, saga_session_id=saga_session_id,
             )
             usage = record.usage or {}
-            # The record is derived from the final graph state and includes
-            # nudge responses; callback totals are only a partial fallback.
+            # The graph state contains parent responses (including the nudge),
+            # but excludes delegated model calls. Callback totals contain both
+            # when the provider emits usage; never replace them with the record.
+            # A provider that omits callback usage can still report usage in
+            # the final state, so use that as a per-category lower bound.
             if usage:
                 from .tracing import INPUT, OUTPUT, CACHE_READ, CACHE_CREATION
                 with trace._lock:
@@ -2145,7 +2148,8 @@ class Agent:
                                         (CACHE_READ, "cache_read_input_tokens"),
                                         (CACHE_CREATION, "cache_creation_input_tokens")):
                         value = usage.get(source, 0)
-                        trace._totals[key] = value if isinstance(value, int) and value >= 0 else 0
+                        if isinstance(value, int) and value >= 0:
+                            trace._totals[key] = max(trace._totals[key], value)
             if record.error or record.result_is_error:
                 trace.mark_error()
             if controller.capture_content:
