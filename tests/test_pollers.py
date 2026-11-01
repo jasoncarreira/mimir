@@ -2592,6 +2592,86 @@ def test_discover_required_env_honors_allowlist_and_process_control_deny(
 
     assert [p.name for p in out] == ["custom"]
 
+
+@pytest.mark.parametrize("source", ["allowlist", "pass_env", "manifest", "override"])
+@pytest.mark.parametrize(("key", "value", "forwarded"), [
+    ("OTEL_EXPORTER_OTLP_HEADERS", "plain-canary-header", False),
+    ("otel_exporter_otlp_traces_headers", "plain-canary-trace", False),
+    ("OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY", "plain-canary-key", False),
+    ("OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE", "plain-canary-client", False),
+    ("OTEL_EXPORTER_OTLP_CERTIFICATE", "plain-canary-cert", False),
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://user:plain-canary@collector.example", False),
+    ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://collector.example/?key=plain-canary", False),
+    ("MIMIR_OTLP_ENDPOINT", "not-a-url-plain-canary", False),
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example/v1/traces", True),
+    ("MIMIR_OTLP_ENDPOINT", "https://collector.example/", True),
+    ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf", True),
+], ids=lambda value: str(value)[:42])
+@pytest.mark.asyncio
+async def test_otlp_carriers_do_not_reach_poller_child(
+    home: Path, monkeypatch: pytest.MonkeyPatch, source: str,
+    key: str, value: str, forwarded: bool,
+) -> None:
+    skill = home / "skills" / "otlp-test"
+    _install_script(skill, "poller.py", """
+import json, os, sys
+from pathlib import Path
+key = os.environ['TEST_KEY']
+Path(os.environ['STATE_DIR'], 'child-env.json').write_text(json.dumps({
+    'carrier': os.environ.get(key), 'ordinary': os.environ.get('ORDINARY_POLLER_VALUE'),
+}))
+print(os.environ.get(key, '<absent>'), file=sys.stderr)
+""")
+    monkeypatch.setenv("ORDINARY_POLLER_VALUE", "ordinary-value")
+    monkeypatch.setenv("TEST_KEY", key)
+    monkeypatch.setenv("MIMIR_POLLER_ENV_ALLOWLIST", "ORDINARY_POLLER_VALUE,TEST_KEY")
+    entry = {"name": "otlp-test", "command": f"{sys.executable} poller.py",
+             "cron": "*/15 * * * *", "env": {}}
+    if source == "allowlist":
+        monkeypatch.setenv(key, value)
+        monkeypatch.setenv("MIMIR_POLLER_ENV_ALLOWLIST",
+                           f"ORDINARY_POLLER_VALUE,TEST_KEY,{key}")
+    elif source == "pass_env":
+        monkeypatch.setenv(key, value)
+        entry["pass_env"] = [key]
+    elif source == "manifest":
+        entry["env"] = {key: value}
+    _write_pollers_json(skill, [entry])
+    [poller] = discover_pollers(home / "skills")
+    if source == "override":
+        # The runtime receives the post-override configuration, not just the
+        # manifest's initial value.
+        poller = replace(poller, env={key: value})
+    await run_poller(poller, enqueue=_CapturingEnqueue())
+    child = json.loads((poller.resolved_persist_dir() / "child-env.json").read_text())
+    expected = value if forwarded and (source != "allowlist" or not key.startswith("MIMIR_")) else None
+    assert child == {"carrier": expected, "ordinary": "ordinary-value"}
+    durable = json.dumps(_read_events(home))
+    if not forwarded:
+        assert value not in durable
+        assert any(event["type"] == "poller_stderr" for event in _read_events(home))
+
+
+@pytest.mark.parametrize("source", ["allowlist", "pass_env", "manifest"])
+def test_otlp_required_env_discovery_matches_child_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str,
+) -> None:
+    key = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+    monkeypatch.setenv(key, "https://collector.example/?credential=plain-canary")
+    monkeypatch.setenv("MIMIR_POLLER_ENV_ALLOWLIST", key if source == "allowlist" else "")
+    skills = tmp_path / "skills"
+    entry = {"name": "required", "command": "true", "cron": "*/15 * * * *",
+             "env_required": [key], "pass_env": [key] if source == "pass_env" else [],
+             "env": {key: "https://collector.example/?credential=plain-canary"}
+             if source == "manifest" else {}}
+    _write_pollers_json(skills / "required", [entry])
+    assert discover_pollers(skills) == []
+    monkeypatch.setenv(key, "https://collector.example/")
+    if source == "manifest":
+        entry["env"][key] = "https://collector.example/"
+        _write_pollers_json(skills / "required", [entry])
+    assert len(discover_pollers(skills)) == 1
+
 def test_discover_handles_top_level_array_instead_of_object(tmp_path: Path):
     """The contract requires ``{"pollers": [...]}`` not a bare array.
     Bare arrays log a warning and skip — no silent acceptance."""
