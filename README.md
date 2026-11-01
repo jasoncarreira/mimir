@@ -13,6 +13,9 @@ ticks for autonomous work, message bridges (Discord / Slack / web /
 benchmark stdout), and a feedback-loop / homeostat layer that keeps the
 agent regulated as it accumulates state.
 
+> **Note:** 0.9.11 is the last release with Worklink and the feature factory
+> bundled. Later releases move coding work into the separate Cultivate plugin.
+
 The name is from Norse myth — Mímir, the keeper of memory and counsel.
 
 ## What it gives you
