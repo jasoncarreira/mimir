@@ -19,7 +19,12 @@ _PATCH_MARKER = "_mimir_auth_context_patched"
 
 
 class _AuthContextRunnable(Runnable):
-    """Invoke a child graph with the exact carrier captured by its task call."""
+    """Invoke a child with task-scoped auth and the caller's RunnableConfig.
+
+    DeepAgents/LangGraph already inherit the parent's callbacks through their
+    ambient config. Do not copy callbacks from ToolRuntime or bind them here:
+    that would run the turn's tracing handler twice for each child call.
+    """
 
     def __init__(self, runnable: Runnable) -> None:
         self._runnable = runnable
@@ -32,7 +37,7 @@ class _AuthContextRunnable(Runnable):
     ) -> Any:
         return self._runnable.invoke(
             input,
-            config,
+            config=config,
             context=_subagent_auth_context.get(),
             **kwargs,
         )
@@ -45,7 +50,7 @@ class _AuthContextRunnable(Runnable):
     ) -> Any:
         return await self._runnable.ainvoke(
             input,
-            config,
+            config=config,
             context=_subagent_auth_context.get(),
             **kwargs,
         )

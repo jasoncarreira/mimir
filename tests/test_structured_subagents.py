@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Annotated, NotRequired
 
@@ -116,6 +117,81 @@ def test_declarative_subagent_graph_uses_auth_context_schema() -> None:
 
     assert isinstance(wrapped, _AuthContextRunnable)
     assert seen_kwargs["context_schema"] is AuthContext
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.asyncio
+async def test_auth_wrapper_passes_child_config_without_rebinding_callbacks(
+    asynchronous: bool,
+) -> None:
+    class ConfigProbe(Runnable):
+        def __init__(self) -> None:
+            self.configs = []
+            self.contexts = []
+
+        def invoke(self, input, config=None, *, context=None, **kwargs):
+            self.configs.append(config)
+            self.contexts.append(context)
+            return {"messages": [AIMessage(content="done")]}
+
+        async def ainvoke(self, input, config=None, *, context=None, **kwargs):
+            return self.invoke(input, config, context=context, **kwargs)
+
+    probe = ConfigProbe()
+    tool = _auth_task_tool(probe)
+    auth = _auth_context(roles=("admin",), enforce=True)
+    callback = object()
+    runtime = _task_runtime(auth)
+    runtime.config["callbacks"] = [callback]
+    if asynchronous:
+        await tool.coroutine(description="probe", subagent_type="general-purpose", runtime=runtime)
+    else:
+        tool.func(description="probe", subagent_type="general-purpose", runtime=runtime)
+
+    assert probe.contexts == [auth]
+    # DeepAgents forwards only its subagent stamp explicitly; LangGraph inherits
+    # the callback from the ambient parent at graph execution, not by copying it.
+    assert len(probe.configs) == 1
+    assert probe.configs[0] is not None
+    assert probe.configs[0]["configurable"] == {"ls_agent_type": "subagent"}
+    assert probe.configs[0].get("callbacks") is None
+    assert probe.configs[0]["metadata"]["lc_agent_name"] == "general-purpose"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tasks_keep_each_child_authorization_carrier() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    seen = []
+
+    class ConcurrentChild(Runnable):
+        def invoke(self, input, config=None, *, context=None, **kwargs):
+            raise AssertionError("async child must not use sync invocation")
+
+        async def ainvoke(self, input, config=None, *, context=None, **kwargs):
+            seen.append(context)
+            if len(seen) == 2:
+                entered.set()
+            await release.wait()
+            seen.append(context)
+            return {"messages": [AIMessage(content="done")]}
+
+    tool = _auth_task_tool(ConcurrentChild())
+    admin = _auth_context(roles=("admin",), enforce=True)
+    user = _auth_context(roles=("user",), enforce=True)
+    tasks = [asyncio.create_task(tool.coroutine(
+        description="probe", subagent_type="general-purpose", runtime=_task_runtime(auth),
+    )) for auth in (admin, user)]
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        release.set()
+        await asyncio.gather(*tasks)
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert sum(context is admin for context in seen) == 2
+    assert sum(context is user for context in seen) == 2
 
 
 def test_build_mimir_subagents_registers_structured_critic_without_replacing_gp() -> None:
@@ -909,3 +985,99 @@ async def test_critic_preserves_auth_context_while_private_state_is_stripped() -
     assert "private_probe" not in child_inputs[0]
     assert child_contexts == [parent_auth]
     assert child_contexts[0] is parent_auth
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_name", ["general-purpose", "critic-structured"])
+@pytest.mark.parametrize("capture_content", [False, True])
+async def test_delegated_model_and_tool_share_turn_trace_without_leaking_content(
+    monkeypatch: pytest.MonkeyPatch, child_name: str, capture_content: bool,
+) -> None:
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.tools import tool
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+    from mimir.tools import budget_gate
+    from mimir.tracing import TraceController
+
+    class ToolCallingModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            return self
+
+    @tool
+    def add_schedule(name: str) -> str:
+        """Add a named schedule."""
+        return f"schedule created: {name}"
+
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *args, **kwargs: None)
+    secret = "api_key=child-secret-canary"
+    messages = [
+        AIMessage(content="", tool_calls=[{
+            "name": "task", "id": "delegate", "type": "tool_call",
+            "args": {"description": f"schedule {secret}", "subagent_type": child_name},
+        }]),
+        AIMessage(content="", tool_calls=[{
+            "name": "add_schedule", "id": "schedule", "type": "tool_call",
+            "args": {"name": secret},
+        }]),
+    ]
+    if child_name == "critic-structured":
+        messages.append(AIMessage(content="", tool_calls=[{
+            "name": "CriticFindings", "id": "critic-response", "type": "tool_call",
+            "args": {"verdict": "no_concerns", "summary": "safe review", "findings": [], "open_questions": []},
+        }]))
+    else:
+        messages.append(AIMessage(content="child done"))
+    messages.append(AIMessage(content="parent done"))
+
+    specs = build_mimir_subagents()
+    for spec in specs:
+        spec["tools"] = [add_schedule]
+    install_subagent_auth_context_patch()
+    install_deepagents_grep_context_tool()
+    agent = create_deep_agent(
+        model=ToolCallingModel(messages=iter(messages)), tools=[], subagents=specs,
+        context_schema=AuthContext,
+    )
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    controller = TraceController(provider, capture_content=capture_content)
+    with controller.turn(conversation_id="ch-1", agent_name="mimir", model="fake") as turn:
+        await agent.ainvoke(
+            {"messages": [HumanMessage(content="parent sentinel")]},
+            config={"callbacks": [turn.callback]},
+            context=_auth_context(roles=("admin",), enforce=True),
+        )
+
+    spans = exporter.get_finished_spans()
+    root = next(span for span in spans if span.name == "invoke_agent")
+    models = [span for span in spans if span.name == "chat"]
+    tools = [span for span in spans if span.name == "execute_tool"]
+    assert len(models) == len(messages)  # no duplicate callback on either child
+    assert sum(span.attributes.get("gen_ai.tool.name") == "add_schedule" for span in tools) == 1
+    task_span = next(span for span in tools if span.attributes.get("gen_ai.tool.name") == "task")
+    child_tool = next(span for span in tools if span.attributes.get("gen_ai.tool.name") == "add_schedule")
+    assert task_span.parent.span_id == root.context.span_id or task_span.parent.span_id in {
+        span.context.span_id for span in models
+    }
+    assert child_tool.context.trace_id == root.context.trace_id
+    assert child_tool.attributes["gen_ai.tool.call.id"] == "schedule"
+    assert all(span.context.trace_id == root.context.trace_id for span in spans)
+    serialized = json.dumps([dict(span.attributes) for span in spans])
+    assert "child-secret-canary" not in serialized
+    if capture_content:
+        assert "parent sentinel" in serialized
+        expected_output = "safe review" if child_name == "critic-structured" else "child done"
+        assert expected_output in serialized
+    else:
+        assert "parent sentinel" not in serialized
+        assert not any(
+            key in span.attributes for span in spans
+            for key in ("gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.tool.call.arguments", "gen_ai.tool.call.result")
+        )
+    provider.shutdown()
