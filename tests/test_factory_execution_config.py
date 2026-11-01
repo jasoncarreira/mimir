@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import stat
 import struct
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +20,215 @@ if "cultivate" not in os.environ.get("MIMIR_PLUGINS", "").split(","):
 from mimir_cultivate.worklink import compute, worker_exec
 from mimir_cultivate.worklink.backends.feature_factory import FACTORY_VERSION
 from mimir_cultivate.worklink.safe_git import _git_credential_settings
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["needs-human", "completed"])
+@pytest.mark.parametrize("read_failure", ["permission", "nonzero"])
+async def test_factory_auth_read_failure_preserves_driver_outcome(
+    tmp_path, monkeypatch, outcome, read_failure,
+):
+    """A 0600 worker file is unreadable to the controller after driver exit."""
+    from mimir import event_logger
+    from mimir_cultivate.worklink import worker_client
+
+    controller = tmp_path / "controller"
+    controller.mkdir()
+    token = "header." + base64.urlsafe_b64encode(b'{"exp": 300}').decode().rstrip("=") + ".signature"
+    codex = controller / ".codex/auth.json"
+    codex.parent.mkdir()
+    codex.write_text(json.dumps({
+        "auth_mode": "chatgpt", "tokens": {"access_token": token, "refresh_token": "original"},
+    }))
+    config = controller / ".config/opencode/opencode.json"
+    config.parent.mkdir(parents=True)
+    config.write_text("{}")
+    checkout = tmp_path / "41-2" / "checkout"
+    checkout.mkdir(parents=True)
+    refreshed = checkout.parent / ".factory-runtime/data/opencode/auth.json"
+    refreshed.parent.mkdir(parents=True)
+    refreshed.write_text('{"openai": {"type": "oauth"}}')
+    refreshed.chmod(0o600)
+    env = {"HOME": str(controller), "CODEX_HOME": str(codex.parent),
+           "OPENCODE_CONFIG": str(config), "XDG_DATA_HOME": str(controller / ".local/share"),
+           "MIMIR_MODEL_SPEC": "codex-plus:gpt"}
+    reason = "human approval required" if outcome == "needs-human" else "finished"
+    events = []
+
+    original_open = Path.open
+
+    def controller_open(path, *args, **kwargs):
+        if path == refreshed:
+            raise PermissionError("worker-owned auth")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", controller_open)
+
+    def control(path, argv, **kwargs):
+        assert path == checkout
+        assert argv[1] == "-I" and argv[2].endswith("factory_auth.py")
+        assert kwargs["env"] == {}
+        if read_failure == "permission":
+            raise PermissionError("worker-owned auth")
+        # A failed control command must not be allowed to supply credential data.
+        return subprocess.CompletedProcess(argv, 1, b'{"openai": {"type": "oauth", "refresh": "untrusted"}}', b"")
+
+    async def execute(command, capability, environment, projections, **kwargs):
+        capability._contained_started(SimpleNamespace(pid=None))
+        assert environment["XDG_DATA_HOME"] == str(checkout.parent / ".factory-runtime/data")
+        assert projections[1].path == ".local/share/opencode/auth.json"
+        # The driver already recorded its authoritative factory snapshot.
+        (checkout / "factory-status.json").write_text(json.dumps({"status": outcome, "reason": reason}))
+        return compute.CollectedExecutionResult(0, b"driver exited", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(compute, "execute_contained", execute)
+    monkeypatch.setattr(worker_client, "run_factory_control", control)
+    monkeypatch.setattr(event_logger, "safe_log_event", lambda *args, **kwargs: _record_event(events, args, kwargs))
+    backend = compute.LocalSubprocessComputeBackend(_worker_client=object())
+    spec = compute.WorkSpec(
+        issue_id=41, attempt=2, repo_url="", base_ref="", branch="", prompt="",
+        rules=None, test_command="", backend="feature_factory", timeout_s=10,
+        local_checkout=checkout, local_argv=("opencode", "run"), env=env,
+    )
+    handle = await backend.launch(spec)
+    try:
+        result = await backend.wait(handle, 10)
+        assert result.exit_code == 0 and result.stdout == "driver exited"
+        snapshot = json.loads((checkout / "factory-status.json").read_text())
+        assert snapshot == {"status": outcome, "reason": reason}
+        assert events == [("worklink_factory_auth_reconcile_failed", {
+            "issue_id": 41, "attempt": 2, "reason_code": "auth_unreadable",
+        })]
+        assert "operator_required" not in str(events)
+    finally:
+        await backend.cleanup(handle)
+
+
+async def _record_event(events, args, kwargs):
+    events.append((args[0], kwargs))
+
+
+def test_factory_auth_helper_reads_only_private_regular_attempt_file(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import factory_auth
+
+    checkout = tmp_path / "41-2/checkout"
+    checkout.mkdir(parents=True)
+    auth = checkout.parent / ".factory-runtime/data/opencode/auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_bytes(b'{"openai": {"type": "oauth"}}')
+    auth.chmod(0o600)
+    monkeypatch.chdir(checkout)
+    assert factory_auth.read_factory_auth() == auth.read_bytes()
+    auth.chmod(0o644)
+    with pytest.raises(ValueError, match="invalid factory auth file"):
+        factory_auth.read_factory_auth()
+    auth.unlink()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"{}")
+    outside.chmod(0o600)
+    auth.symlink_to(outside)
+    with pytest.raises(OSError):
+        factory_auth.read_factory_auth()
+    auth.unlink()
+    with pytest.raises(FileNotFoundError):
+        factory_auth.read_factory_auth()
+    os.mkfifo(auth, 0o600)
+    with pytest.raises(ValueError, match="invalid factory auth file"):
+        factory_auth.read_factory_auth()
+    auth.unlink()
+    auth.write_bytes(b"{}")
+    auth.chmod(0o600)
+    linked = tmp_path / "other-auth.json"
+    os.link(auth, linked)
+    with pytest.raises(ValueError, match="invalid factory auth file"):
+        factory_auth.read_factory_auth()
+    linked.unlink()
+    monkeypatch.setattr(factory_auth.os, "geteuid", lambda: os.getuid() + 1)
+    with pytest.raises(ValueError, match="invalid factory auth file"):
+        factory_auth.read_factory_auth()
+
+
+def test_factory_auth_helper_rejects_symlinked_runtime(tmp_path, monkeypatch):
+    from mimir_cultivate.worklink import factory_auth
+
+    checkout = tmp_path / "41-2/checkout"
+    checkout.mkdir(parents=True)
+    outside = tmp_path / "other-runtime"
+    auth = outside / "data/opencode/auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_bytes(b"{}")
+    auth.chmod(0o600)
+    (checkout.parent / ".factory-runtime").symlink_to(outside, target_is_directory=True)
+    monkeypatch.chdir(checkout)
+    with pytest.raises(OSError):
+        factory_auth.read_factory_auth()
+
+
+@pytest.mark.asyncio
+async def test_factory_worker_rotated_auth_reaches_both_controller_stores(tmp_path, monkeypatch):
+    from mimir import event_logger
+    from mimir_cultivate.worklink import worker_client
+
+    def jwt(exp):
+        payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
+        return f"header.{payload}.signature"
+
+    controller = tmp_path / "controller"
+    codex = controller / ".codex/auth.json"
+    codex.parent.mkdir(parents=True)
+    codex.write_text(json.dumps({
+        "auth_mode": "chatgpt", "tokens": {"access_token": jwt(200), "refresh_token": "old"},
+    }))
+    config = controller / ".config/opencode/opencode.json"
+    config.parent.mkdir(parents=True)
+    config.write_text("{}")
+    checkout = tmp_path / "41-2/checkout"
+    checkout.mkdir(parents=True)
+    refreshed = checkout.parent / ".factory-runtime/data/opencode/auth.json"
+    refreshed.parent.mkdir(parents=True)
+    refreshed.write_text(json.dumps({
+        "openai": {"type": "oauth", "access": jwt(500), "refresh": "rotated"},
+    }))
+    refreshed.chmod(0o600)
+    original_open = Path.open
+
+    def controller_open(path, *args, **kwargs):
+        if path == refreshed:
+            raise PermissionError("worker-only file")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", controller_open)
+
+    def control(path, argv, **kwargs):
+        assert path == checkout and kwargs["env"] == {}
+        assert argv[0] == sys.executable and argv[1] == "-I"
+        return subprocess.run(argv, cwd=path, env={}, capture_output=True, check=False)
+
+    async def execute(command, capability, environment, projections, **kwargs):
+        capability._contained_started(SimpleNamespace(pid=None))
+        return compute.CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    events = []
+    monkeypatch.setattr(event_logger, "safe_log_event", lambda *args, **kwargs: _record_event(events, args, kwargs))
+    monkeypatch.setattr(worker_client, "run_factory_control", control)
+    monkeypatch.setattr(compute, "execute_contained", execute)
+    backend = compute.LocalSubprocessComputeBackend(_worker_client=object())
+    spec = compute.WorkSpec(
+        issue_id=41, attempt=2, repo_url="", base_ref="", branch="", prompt="",
+        rules=None, test_command="", backend="feature_factory", timeout_s=10,
+        local_checkout=checkout, local_argv=("opencode", "run"),
+        env={"HOME": str(controller), "CODEX_HOME": str(codex.parent),
+             "OPENCODE_CONFIG": str(config), "XDG_DATA_HOME": str(controller / ".local/share"),
+             "MIMIR_MODEL_SPEC": "codex-plus:gpt"},
+    )
+    handle = await backend.launch(spec)
+    try:
+        assert (await backend.wait(handle, 10)).exit_code == 0
+        assert json.loads(codex.read_text())["tokens"]["refresh_token"] == "rotated"
+        assert json.loads((controller / ".local/share/opencode/auth.json").read_text())["openai"]["refresh"] == "rotated"
+        assert not events
+    finally:
+        await backend.cleanup(handle)
 
 
 @pytest.mark.asyncio

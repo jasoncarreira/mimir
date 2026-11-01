@@ -683,12 +683,32 @@ class LocalSubprocessComputeBackend:
                         resolution.invocation.provider == "openai"
                         and resolution.env.get("MIMIR_MODEL_SPEC", "").startswith("codex-plus:")
                     ):
-                        from mimir_cultivate.opencode import reconcile_codex_auth
+                        from mimir.event_logger import safe_log_event
+                        from mimir_cultivate.opencode import OpenCodeAuthError, reconcile_codex_auth
+                        from .worker_client import run_factory_control
+                        from . import factory_auth
 
-                        reconcile_codex_auth(
-                            resolution.env,
-                            refreshed_path=spec.local_checkout.parent / ".factory-runtime/data/opencode/auth.json",
-                        )
+                        try:
+                            # The controller cannot open worklink's 0600 runtime
+                            # auth. Factory control revalidates the exact attempt
+                            # boundary and reads it as the checkout owner.
+                            read = await asyncio.to_thread(
+                                run_factory_control, spec.local_checkout,
+                                (sys.executable, "-I", str(Path(factory_auth.__file__).resolve())),
+                                env={}, output_limit=factory_auth.MAX_AUTH_BYTES + 1,
+                            )
+                            if read.returncode != 0:
+                                raise OpenCodeAuthError("auth_unreadable")
+                            reconcile_codex_auth(
+                                resolution.env,
+                                refreshed_document=read.stdout,
+                            )
+                        except Exception as exc:
+                            reason = exc.reason_code if isinstance(exc, OpenCodeAuthError) else "auth_unreadable"
+                            await safe_log_event(
+                                "worklink_factory_auth_reconcile_failed",
+                                issue_id=spec.issue_id, attempt=spec.attempt, reason_code=reason,
+                            )
             except asyncio.CancelledError:
                 if not started.done():
                     started.cancel()
