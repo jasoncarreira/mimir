@@ -318,6 +318,38 @@ async def test_cancelled_turn_sets_error_and_ends_span(traces):
         await asyncio.gather(task, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_cancelled_direct_chat_sets_error_and_ends_both_spans(traces):
+    controller, exporter = traces
+    entered = asyncio.Event()
+
+    async def run():
+        with controller.turn(conversation_id="safe", agent_name="mimir", model="fake") as turn:
+            with turn.chat(model="direct"):
+                entered.set()
+                await asyncio.Event().wait()
+
+    task = asyncio.create_task(run())
+    try:
+        # Cancel only after the task is blocked inside the direct chat context.
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        spans = exporter.get_finished_spans()
+        assert [span.name for span in spans] == ["chat", "invoke_agent"]
+        chat, parent = spans
+        assert chat.parent.span_id == parent.context.span_id
+        assert chat.context.trace_id == parent.context.trace_id
+        assert chat.status.status_code == StatusCode.ERROR
+        assert chat.end_time is not None
+        assert parent.status.status_code == StatusCode.ERROR
+        assert parent.end_time is not None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.parametrize("broken", [False, True])
 def test_usage_observer_preserves_accounting_and_is_turn_local(traces, broken):
     from types import SimpleNamespace
