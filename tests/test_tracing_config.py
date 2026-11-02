@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
 
@@ -29,6 +30,8 @@ def test_tracing_defaults_and_host_isolation(tmp_path, monkeypatch):
 
 
 def test_tracing_home_dotenv_and_process_precedence(tmp_path, monkeypatch):
+    # Own dotenv's direct environment writes as well as monkeypatch.setenv calls.
+    monkeypatch.setattr(os, "environ", dict(os.environ))
     (tmp_path / ".env").write_text(
         "MIMIR_TRACING_ENABLED=true\nMIMIR_OTLP_ENDPOINT=https://home.example\n"
         "MIMIR_OTEL_SERVICE_NAME=home-service\n"
@@ -48,6 +51,17 @@ def test_tracing_home_dotenv_and_process_precedence(tmp_path, monkeypatch):
     assert (cfg.tracing_enabled, cfg.otlp_endpoint, cfg.tracing_capture_content) == (
         False, "https://process.example", False,
     )
+
+
+def test_tracing_dotenv_precedence_test_restores_environment(tmp_path, monkeypatch):
+    # dotenv writes directly to os.environ, outside monkeypatch's per-key undo.
+    # Exercise the test's teardown so xdist ordering cannot hide leaked defaults.
+    for name in SETTINGS:
+        monkeypatch.delenv(name, raising=False)
+    before = dict(os.environ)
+    with monkeypatch.context() as scoped:
+        test_tracing_home_dotenv_and_process_precedence(tmp_path, scoped)
+    assert dict(os.environ) == before
 
 
 def test_tracing_extras_and_dev_install_contract():
