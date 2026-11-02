@@ -5,6 +5,10 @@ This is the current LongMemEval bench runner for the in-repo
 per-question SQLite DB, runs retrieval, writes hypotheses and metrics JSONL,
 and can optionally exercise the corrected session-boundary treatment.
 
+From a workspace checkout, run `uv sync --all-packages --extra dev` before
+benchmarks that import the `saga` bench shell. It comes from the default dev
+dependency group, not the published `dev` or `bench` extras.
+
 Session-boundary RRF is now the default treatment. Keep the flags below for
 ablation and weighting sweeps when running a more comprehensive benchmark.
 

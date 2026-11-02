@@ -1,1 +1,0 @@
-- Make two timing-sensitive tests robust under parallel load: the ACP blocked-main matrix stops its journal's periodic faulthandler dump before the watchdog exit (a dump racing the exit crashed the child with SIGSEGV), and both it and the event-logger spawn test use hang guards instead of tight latency ceilings.
