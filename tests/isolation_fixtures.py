@@ -16,6 +16,7 @@ import shlex
 import shutil
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -158,6 +159,79 @@ def _event_log_read_barrier(monkeypatch, request):
 SYNTHETIC_MIMIR_UID = 42001
 SYNTHETIC_WORKLINK_UID = 42002
 SYNTHETIC_WORKLINK_GID = 42003
+
+
+_HOST_CODING_CLIS = frozenset({
+    "opencode", "codex", "factory.js", "feature-factory", "chainlink", "gh",
+})
+
+
+@contextmanager
+def _coding_cli_path(original: str):
+    """Mirror affected PATH entries in a session-owned, uid-traversable tree.
+
+    pytest's basetemp ancestors are private (0700). A PATH below them stops
+    working after a subprocess drops uid, even for ordinary tools such as git.
+    Keep only public symlinks here, never test data, and leave target permissions
+    unchanged. Explicit chmod also covers a restrictive invoking umask.
+    """
+    # TMPDIR itself may be private to the invoking uid too.
+    parent = "/tmp" if os.name == "posix" else None
+    with tempfile.TemporaryDirectory(prefix="mimir-cli-path-", dir=parent) as temporary:
+        hidden = Path(temporary)
+        hidden.chmod(0o755)
+        sanitized = []
+        for index, directory in enumerate(original.split(os.pathsep)):
+            source = Path(directory or os.curdir)
+            if not any((source / name).is_file() and os.access(source / name, os.X_OK)
+                       for name in _HOST_CODING_CLIS):
+                sanitized.append(directory)
+                continue
+            mirror = hidden / str(index)
+            mirror.mkdir()
+            mirror.chmod(0o755)
+            for entry in source.iterdir():
+                if entry.name not in _HOST_CODING_CLIS:
+                    (mirror / entry.name).symlink_to(entry.absolute())
+            sanitized.append(str(mirror))
+        yield os.pathsep.join(sanitized)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _hide_host_coding_clis():
+    """Hide inherited coding tools without losing tools shared with other uids."""
+    original = os.environ.get("PATH", os.defpath)
+    with _coding_cli_path(original) as sanitized:
+        os.environ["PATH"] = sanitized
+        try:
+            yield original
+        finally:
+            os.environ["PATH"] = original
+
+
+@pytest.fixture
+def real_coding_cli(request, _hide_host_coding_clis):
+    """Opt in to an inherited CLI by absolute path, skipping if unavailable."""
+    marker = request.node.get_closest_marker("real_coding_cli")
+    if marker is None or len(marker.args) != 1 or marker.args[0] not in _HOST_CODING_CLIS:
+        pytest.fail("real_coding_cli fixture requires @pytest.mark.real_coding_cli(<name>)")
+    name = marker.args[0]
+    executable = shutil.which(name, path=_hide_host_coding_clis)
+    if executable is None:
+        pytest.skip(f"{name} CLI is not installed")
+    return executable
+
+
+@pytest.fixture
+def stub_opencode(tmp_path, monkeypatch):
+    """Provide an executable owned by the test for admission-only scenarios."""
+    bin_dir = tmp_path / "coding-cli-bin"
+    bin_dir.mkdir()
+    executable = bin_dir / "opencode"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    return executable
 
 
 @pytest.fixture(autouse=True, scope="session")

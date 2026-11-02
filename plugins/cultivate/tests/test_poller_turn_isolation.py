@@ -39,6 +39,7 @@ def cultivate_policy(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("channel", ["github-activity"])
 @pytest.mark.parametrize("external_ingest", [False, True])
+@pytest.mark.usefixtures("stub_opencode")
 async def test_real_poller_review_sequence(tmp_path, monkeypatch, channel, external_ingest):
     """No fake graph/checkpointer: only external forge/HTTP adapters are stubbed."""
     from mimir import event_logger
@@ -216,6 +217,7 @@ async def test_real_poller_review_sequence(tmp_path, monkeypatch, channel, exter
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("stub_opencode")
 async def test_real_review_sequence_detects_case_binding_regression(tmp_path, monkeypatch):
     from mimir import access_control
 

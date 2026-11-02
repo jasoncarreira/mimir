@@ -1748,9 +1748,6 @@ dependencies = [
 anthropic = [
     { name = "langchain-anthropic" },
 ]
-bench = [
-    { name = "saga" },
-]
 claude-code = [
     { name = "langchain-claude-code-mimir" },
 ]
@@ -1767,7 +1764,6 @@ dev = [
     { name = "langchain-codex-plus" },
     { name = "langchain-openai" },
     { name = "mcp" },
-    { name = "mimir-cultivate" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
     { name = "pytest" },
@@ -1775,7 +1771,6 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
-    { name = "saga" },
     { name = "slack-bolt" },
 ]
 discord = [
@@ -1815,7 +1810,6 @@ dev = [
     { name = "langchain-codex-plus" },
     { name = "langchain-openai" },
     { name = "mcp" },
-    { name = "mimir-cultivate" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
     { name = "pytest" },
@@ -1852,7 +1846,6 @@ requires-dist = [
     { name = "langchain-openai", marker = "extra == 'openai'", specifier = ">=1.2.1" },
     { name = "mcp", marker = "extra == 'dev'", specifier = ">=2.3,<3" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.3,<3" },
-    { name = "mimir-cultivate", marker = "extra == 'dev'", editable = "plugins/cultivate" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = "==1.45.1" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'dev'", specifier = "==1.45.1" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = "==1.45.1" },
@@ -1869,8 +1862,6 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.33.1" },
     { name = "ruamel-yaml", specifier = ">=0.18,<0.20" },
-    { name = "saga", marker = "extra == 'bench'", editable = "benchmarks/saga" },
-    { name = "saga", marker = "extra == 'dev'", editable = "benchmarks/saga" },
     { name = "sentence-transformers", marker = "extra == 'local-embeddings'", specifier = ">=5.1" },
     { name = "slack-bolt", marker = "extra == 'dev'", specifier = ">=1.18" },
     { name = "slack-bolt", marker = "extra == 'slack'", specifier = ">=1.18" },
@@ -1890,7 +1881,6 @@ dev = [
     { name = "langchain-codex-plus", specifier = ">=0.0.12,<0.1" },
     { name = "langchain-openai", specifier = ">=1.2.1" },
     { name = "mcp", specifier = ">=2.3,<3" },
-    { name = "mimir-cultivate", editable = "plugins/cultivate" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = "==1.45.1" },
     { name = "opentelemetry-sdk", specifier = "==1.45.1" },
     { name = "pytest", specifier = ">=9.0.3" },

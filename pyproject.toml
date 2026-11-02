@@ -23,7 +23,7 @@ dependencies = [
     # package) — it ships with the wheel and needs no external dep.
     # The ``saga`` workspace package at ``benchmarks/saga/`` is the
     # bench harness shell only; needed by ``benchmarks/longmemeval_via_*/``
-    # not by the runtime. See the ``[bench]`` optional extra below.
+    # not by the runtime. It is installed from the dev dependency group below.
     "aiohttp>=3.12",
     "apscheduler>=3.11",
     "python-dotenv>=1.0",
@@ -98,16 +98,10 @@ local-embeddings = [
     "torch>=2.2",
 ]
 acp = []
-# LongMemEval bench harness — pulls the workspace ``saga`` package
-# (the bench shell, not the runtime memory backend). Only meaningful
-# when running ``benchmarks/longmemeval_via_*/`` from a workspace
-# checkout; ``saga`` is not published to PyPI separately, so this
-# extra resolves only against the workspace via ``[tool.uv.sources]``.
-# ``pip install mimir-agent[bench]`` from a fresh PyPI install will
-# fail to resolve ``saga`` and is not the intended path.
-bench = [
-    "saga",
-]
+# Retain the bench extra for existing install commands. The LongMemEval
+# workspace harness lives in the dev dependency group, not in wheel metadata:
+# the name ``saga`` belongs to an unrelated distribution on PyPI.
+bench = []
 # Bridge extras — install if you want that bridge.
 discord = [
     "discord-py>=2.6",
@@ -130,14 +124,11 @@ slack = [
 gepa = [
     "gepa>=0.1.1,<0.2",
 ]
-# ``pip install -e ".[dev]"`` — full test toolchain. Claude Code
-# adapter import coverage lives in the dedicated CI smoke job that installs
-# ``--extra claude-code``. The LongMemEval collection guard requires the local
-# workspace bench harness, so dev includes ``saga`` as well as the explicit
-# ``bench`` extra above.
+# ``pip install -e ".[dev]"`` — published test toolchain. Claude Code adapter
+# import coverage lives in the dedicated CI smoke job that installs
+# ``--extra claude-code``. The workspace-only LongMemEval harness is in the
+# dev dependency group below, not this published extra.
 dev = [
-    "saga",
-    "mimir-cultivate",
     "opentelemetry-sdk==1.45.1",
     "opentelemetry-exporter-otlp-proto-http==1.45.1",
     "jsonschema==4.26.0",
@@ -288,6 +279,7 @@ addopts = "-n auto --dist worksteal"
 markers = [
     "allow_empty_parametrize: permit an intentionally empty parameter set to skip",
     "real_worklink_identities: use provisioned mimir/worklink accounts instead of synthetic IDs",
+    "real_coding_cli(name): opt in to a host coding CLI via the real_coding_cli fixture",
 ]
 # Fail stalled tests individually, preserving their node ids and the session.
 # The thread method exits the worker instead of reporting a normal failure.
@@ -303,12 +295,10 @@ faulthandler_exit_on_timeout = false
 [tool.uv.workspace]
 members = ["benchmarks/saga", "plugins/cultivate"]
 
-# Resolve the ``saga`` dependency declared in [project.dependencies]
-# from the workspace member rather than PyPI. uv installs it editable so
-# saga.core / saga.benchmarks are importable from anywhere in the workspace.
+# Resolve the dev dependency group's ``saga`` from the workspace member
+# rather than PyPI. uv installs it editable for local tests and benchmarks.
 [tool.uv.sources]
 saga = { workspace = true }
-mimir-cultivate = { workspace = true }
 torch = { index = "pytorch-cpu", marker = "sys_platform == 'linux'" }
 
 [[tool.uv.index]]
@@ -317,14 +307,13 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [dependency-groups]
-# uv-native dependency group (PEP 735). Mirrors
-# ``[project.optional-dependencies].dev`` so ``uv sync`` and
-# ``pip install -e ".[dev]"`` both pull the same test toolchain.
+# uv-native dependency group (PEP 735). Includes the workspace-only bench
+# harness, which must never appear in published wheel metadata. uv sync
+# installs this group by default, including when --extra dev is requested.
 # Claude Code remains opt-in via ``--extra claude-code``; CI has a
 # dedicated smoke job for that adapter path.
 dev = [
     "saga",
-    "mimir-cultivate",
     "opentelemetry-sdk==1.45.1",
     "opentelemetry-exporter-otlp-proto-http==1.45.1",
     "jsonschema==4.26.0",

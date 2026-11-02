@@ -62,5 +62,21 @@ def test_tracing_extras_and_dev_install_contract():
     assert pins.isdisjoint(project["project"]["dependencies"])
     for dev in (extras["dev"], project["dependency-groups"]["dev"]):
         assert pins - {"opentelemetry-api==1.45.1"} <= set(dev)
-        assert "mimir-cultivate" in dev
-    assert project["tool"]["uv"]["sources"]["mimir-cultivate"] == {"workspace": True}
+        assert "mimir-cultivate" not in dev
+    assert "mimir-cultivate" not in project["tool"]["uv"]["sources"]
+    assert "plugins/cultivate" in project["tool"]["uv"]["workspace"]["members"]
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    core = next(package for package in lock["package"] if package["name"] == "mimir-agent")
+    assert all(dep["name"] != "mimir-cultivate" for dep in core["optional-dependencies"]["dev"])
+    assert all(dep["name"] != "mimir-cultivate" for dep in core["dev-dependencies"]["dev"])
+
+
+def test_tracing_lock_is_current(tmp_path):
+    import subprocess
+    from tests.uv_subprocess import isolated_uv_env
+
+    result = subprocess.run(
+        ["uv", "lock", "--check", "--offline"], cwd=ROOT,
+        env=isolated_uv_env(tmp_path), capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr

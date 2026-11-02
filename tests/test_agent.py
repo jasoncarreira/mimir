@@ -1472,7 +1472,7 @@ async def test_traced_real_graph_tool_child_and_nudge(tmp_path: Path, capture: b
 
         def callback_usage(message):
             if "child" not in str(message.content) and any(
-                frame.function == "count_callback" for frame in inspect.stack()
+                frame.function == "record_usage" for frame in inspect.stack()
             ):
                 return {key: 0 for key in (INPUT, OUTPUT, CACHE_READ, CACHE_CREATION)}
             return original_usage(message)

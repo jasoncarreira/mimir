@@ -3036,9 +3036,12 @@ def test_worklink_store_init_precedes_agent_and_refuses_bad_store(tmp_path, monk
         assert len(calls) == (2 if store_state == 'fresh' else 1)
 
 
-def test_worklink_provisions_fresh_home_with_real_chainlink(tmp_path):
-    if not shutil.which('chainlink'):
-        pytest.skip('chainlink CLI is not on PATH')
+@pytest.mark.real_coding_cli("chainlink")
+def test_worklink_provisions_fresh_home_with_real_chainlink(tmp_path, monkeypatch, real_coding_cli):
+    chainlink_dir = tmp_path / 'bin'
+    chainlink_dir.mkdir()
+    (chainlink_dir / 'chainlink').symlink_to(real_coding_cli)
+    monkeypatch.setenv('PATH', str(chainlink_dir) + os.pathsep + os.environ['PATH'])
     origin = tmp_path / 'origin.git'
     seed = tmp_path / 'seed'
     subprocess.run(['git', 'init', '--bare', str(origin)], check=True, capture_output=True)

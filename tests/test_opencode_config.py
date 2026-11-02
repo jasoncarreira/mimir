@@ -510,7 +510,8 @@ def test_stale_worker_refresh_does_not_overwrite_newer_codex(tmp_path: Path) -> 
     assert path.stat().st_mtime_ns == before
 
 
-def test_worklink_refreshes_projected_auth_immediately_before_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opencode_binary: Path) -> None:
+@pytest.mark.usefixtures("stub_opencode")
+def test_worklink_refreshes_projected_auth_immediately_before_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from mimir_cultivate.worklink.backends import opencode as backend_module
     from mimir_cultivate.worklink.backends.base import WorkOrder
 
@@ -553,7 +554,8 @@ def test_codex_native_oauth_needs_no_plugin_and_projects_none(tmp_path: Path, pl
 
 
 @pytest.mark.parametrize("coding_enabled", [False, True])
-def test_codex_worklink_never_passes_ambient_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coding_enabled: bool, opencode_binary: Path) -> None:
+@pytest.mark.usefixtures("stub_opencode")
+def test_codex_worklink_never_passes_ambient_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coding_enabled: bool) -> None:
     from mimir_cultivate.worklink.backends import opencode as backend_module
     from mimir_cultivate.worklink.backends.base import WorkOrder
 

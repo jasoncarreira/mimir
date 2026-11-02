@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import ipaddress
 import json
 import logging
+import os
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -38,8 +40,20 @@ def trace_endpoint(base: str | None) -> str | None:
     if sensitive_otlp_endpoint(base):
         return None
     assert base is not None
-    if urlsplit(base).path.rstrip("/").endswith("/v1/traces"):
+    url = urlsplit(base)
+    if url.path.rstrip("/").endswith("/v1/traces"):
         return None
+    if url.scheme == "http" and any(os.environ.get(key) for key in (
+        "OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    )):
+        host = url.hostname
+        if host != "localhost":
+            try:
+                loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback = False
+            if not loopback:
+                return None
     return base.rstrip("/") + "/v1/traces"
 
 
@@ -180,6 +194,15 @@ class TurnTrace:
         self._lock = threading.RLock()
         self._totals = {INPUT: 0, OUTPUT: 0, CACHE_READ: 0, CACHE_CREATION: 0}
         self._finished = False
+        self._usage_observer: Callable[[Any], None] | None = None
+
+    def set_usage_observer(self, observer: Callable[[Any], None]) -> None:
+        """Observe model usage for this turn without replacing tracing methods.
+
+        The observer runs under the turn lock; failures cannot interrupt tracing.
+        """
+        with self._lock:
+            self._usage_observer = observer
 
     def _safe(self, action: Any) -> None:
         try:
@@ -200,6 +223,8 @@ class TurnTrace:
                     self._totals[key] += count
                     if span is not None:
                         self._safe(lambda k=key, n=count: span.set_attribute(k, n))
+            if self._usage_observer is not None:
+                self._safe(lambda: self._usage_observer(message))
 
     def mark_error(self) -> None:
         from opentelemetry.trace import Status, StatusCode

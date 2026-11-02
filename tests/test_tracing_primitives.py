@@ -47,8 +47,53 @@ def traces():
     ("file:///tmp/socket", None),
     (None, None),
 ])
-def test_base_endpoint(base, expected):
+def test_base_endpoint(base, expected, monkeypatch):
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_HEADERS", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", raising=False)
     assert trace_endpoint(base) == expected
+
+
+@pytest.mark.parametrize("carrier", [
+    "OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+])
+@pytest.mark.parametrize("endpoint,allowed", [
+    ("http://collector.example:4318", False),
+    ("http://192.0.2.1:4318", False),
+    ("http://[2001:db8::1]:4318", False),
+    ("http://localhost.attacker.example:4318", False),
+    ("http://127.0.0.1.attacker.example:4318", False),
+    ("http://localhost:4318", True),
+    ("http://LOCALHOST:4318", True),
+    ("http://127.0.0.1:4318", True),
+    ("http://127.23.45.67:4318", True),
+    ("http://[::1]:4318", True),
+    ("https://collector.example:4318", True),
+])
+def test_header_transport_policy(endpoint, allowed, carrier, monkeypatch, caplog):
+    from opentelemetry.exporter.otlp.proto.http import trace_exporter
+
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_HEADERS", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", raising=False)
+    monkeypatch.setenv(carrier, "x-honeycomb-team=private-canary")
+    expected = endpoint + "/v1/traces" if allowed else None
+    assert trace_endpoint(endpoint) == expected
+    if not allowed:
+        constructed = []
+        monkeypatch.setattr(trace_exporter, "OTLPSpanExporter", lambda **kwargs: constructed.append(kwargs))
+        with caplog.at_level(logging.WARNING, logger="mimir.tracing"):
+            assert TraceController.create(enabled=True, endpoint=endpoint) is None
+        assert constructed == []
+        assert [r.message for r in caplog.records if r.name == "mimir.tracing"] == [
+            "Tracing disabled: configure a valid OTLP base endpoint without credentials or /v1/traces."
+        ]
+        assert "private-canary" not in caplog.text
+        assert endpoint not in caplog.text
+
+
+def test_headerless_remote_http_collector_is_allowed(monkeypatch):
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_HEADERS", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", raising=False)
+    assert trace_endpoint("http://collector.example:4318") == "http://collector.example:4318/v1/traces"
 
 
 def test_disabled_never_imports_sdk_or_constructs_exporter(monkeypatch):
@@ -246,6 +291,56 @@ def test_direct_start_failure_preserves_turn_outcome(traces, monkeypatch, caplog
                 raise ValueError("original failure")
     assert [span.name for span in exporter.get_finished_spans()] == ["invoke_agent"]
     assert "private-canary" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_sets_error_and_ends_span(traces):
+    controller, exporter = traces
+    entered = asyncio.Event()
+
+    async def run():
+        with controller.turn(conversation_id="safe", agent_name="mimir", model="fake"):
+            entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        [span] = exporter.get_finished_spans()
+        assert span.name == "invoke_agent"
+        assert span.status.status_code == StatusCode.ERROR
+        assert span.end_time is not None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_usage_observer_preserves_accounting_and_is_turn_local(traces, broken):
+    from types import SimpleNamespace
+
+    controller, exporter = traces
+    observed = []
+    message = SimpleNamespace(usage_metadata={"input_tokens": 12, "output_tokens": 3})
+
+    def observe(value):
+        observed.append(value)
+        if broken:
+            raise RuntimeError("observer failure")
+
+    with controller.turn(conversation_id="first", agent_name="mimir", model="fake") as turn:
+        turn.set_usage_observer(observe)
+        turn.record_usage(message)
+        assert "record_usage" not in vars(turn)
+    with controller.turn(conversation_id="second", agent_name="mimir", model="fake") as turn:
+        turn.record_usage(message)
+    assert observed == [message]
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 2
+    assert all(span.attributes[INPUT] == 12 and span.attributes[OUTPUT] == 3 for span in spans)
 
 
 def test_callback_delayed_after_cancelled_turn_does_not_start_span(traces):

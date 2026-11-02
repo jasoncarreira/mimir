@@ -3419,23 +3419,16 @@ class Agent:
                     active_trace = _active_turn.get()
                     if active_trace is not None:
                         try:
-                            record_callback_usage = active_trace.record_usage
-
-                            def count_callback(message: Any, *, span: Any = None) -> None:
+                            def count_callback(message: Any) -> None:
                                 values = _trace_usage(message)
                                 if values is None:
                                     return
                                 identity = message.id or id(message)
-                                with active_trace._lock:
-                                    previous = callback_usage.setdefault(identity, {})
-                                    for key, value in values.items():
-                                        previous[key] = previous.get(key, 0) + value
-                                try:
-                                    record_callback_usage(message, span=span)
-                                except Exception:  # noqa: BLE001 — tracing cannot fail the graph
-                                    log.warning("Tracing usage metadata unavailable.")
+                                previous = callback_usage.setdefault(identity, {})
+                                for key, value in values.items():
+                                    previous[key] = previous.get(key, 0) + value
 
-                            active_trace.record_usage = count_callback
+                            active_trace.set_usage_observer(count_callback)
                             invoke_config["callbacks"] = [active_trace.callback]
                         except Exception:
                             log.warning("Tracing callback unavailable.")

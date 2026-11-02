@@ -40,6 +40,7 @@ def _write_native_files(home: Path) -> None:
     }), encoding="utf-8")
 
 
+@pytest.mark.usefixtures("stub_opencode")
 def test_enabled_opencode_spec_contains_worker_local_selected_projections(
     monkeypatch, tmp_path: Path, opencode_binary: Path
 ) -> None:
@@ -107,6 +108,7 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
     assert str(order.checkout) not in spec.local_argv
 
 
+@pytest.mark.usefixtures("stub_opencode")
 def test_disabled_opencode_spec_preserves_direct_environment(
     monkeypatch, tmp_path: Path, opencode_binary: Path
 ) -> None:
@@ -147,6 +149,7 @@ def test_disabled_opencode_spec_preserves_direct_environment(
     assert spec.local_argv[dir_index + 1] == str(order.checkout)
 
 
+@pytest.mark.usefixtures("stub_opencode")
 def test_enabled_opencode_projects_conventional_ambient_key(
     monkeypatch, tmp_path: Path, opencode_binary: Path
 ) -> None:
