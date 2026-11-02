@@ -387,6 +387,7 @@ async def bash_async(
             bound_direct_exec_argv,
             direct_exec_env_overlay,
             direct_exec_redact_names,
+            filter_shell_env_overlay,
             interactive_shell_env_overlay,
             login_shell_command,
             refuse_protected_shell_operands,
@@ -421,6 +422,7 @@ async def bash_async(
                 )
         else:
             spawn_kwargs["env_overlay"] = interactive_shell_env_overlay()
+        spawn_kwargs["env_overlay"] = filter_shell_env_overlay(spawn_kwargs["env_overlay"])
         job = _REGISTRY.spawn(
             command,  # original (clean) command recorded for display
             **spawn_kwargs,

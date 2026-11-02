@@ -87,6 +87,11 @@ codex-plus = [
 mcp = [
     "mcp>=2.3,<3",
 ]
+otel = [
+    "opentelemetry-api==1.45.1",
+    "opentelemetry-sdk==1.45.1",
+    "opentelemetry-exporter-otlp-proto-http==1.45.1",
+]
 local-embeddings = [
     "sentence-transformers>=5.1",
     "transformers>=4.56,<5",
@@ -124,6 +129,8 @@ gepa = [
 # ``--extra claude-code``. The workspace-only LongMemEval harness is in the
 # dev dependency group below, not this published extra.
 dev = [
+    "opentelemetry-sdk==1.45.1",
+    "opentelemetry-exporter-otlp-proto-http==1.45.1",
     "jsonschema==4.26.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
@@ -307,6 +314,8 @@ explicit = true
 # dedicated smoke job for that adapter path.
 dev = [
     "saga",
+    "opentelemetry-sdk==1.45.1",
+    "opentelemetry-exporter-otlp-proto-http==1.45.1",
     "jsonschema==4.26.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",

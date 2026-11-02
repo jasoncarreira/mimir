@@ -527,6 +527,7 @@ def test_runtime_public_two_phase_api() -> None:
         "_owned_closers",
         "_runtime_background_tasks",
         "_close_task",
+        "trace_controller",
     ]
     assert runtime.CoreServices.__dataclass_params__.frozen is True
     assert runtime.RuntimeAdapters.__dataclass_params__.frozen is True
@@ -916,6 +917,7 @@ async def test_agent_collaborator_parity_and_final_commit(
         "commitments_store": bundle.commitments_store,
         "turn_event_bus": bundle.turn_event_bus,
         "chat_skill_registry": core.chat_skill_registry,
+        "trace_controller": None,
     }
     assert [value for kind, value in events if kind == "construct"] == [
         "turn_logger",

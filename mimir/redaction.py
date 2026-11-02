@@ -20,7 +20,53 @@ from mimir.shared_redaction_patterns import (
     CREDENTIAL_WORD_PATTERN,
     JWT_PATTERN,
     LOG_SECRET_PATTERNS,
+    OTLP_ENV_NAME_PATTERN,
 )
+from mimir.otel_credentials import is_sensitive_otlp_env, sensitive_otlp_endpoint
+
+
+_OTLP_ASSIGNMENT = re.compile(
+    r"(?i)(?<![A-Za-z0-9_.-])(?P<key>" + OTLP_ENV_NAME_PATTERN + r")"
+    r"\\?['\"]?[ \t]*[:=][ \t]*"
+    r"(?:(?P<quote>\\?['\"])(?P<quoted>(?:\\.|[^\n\\])*?)(?P=quote)|(?P<bare>[^\s}\]]+))"
+)
+_EMBEDDED_HTTP_URL = re.compile(r"(?i)https?://[^\s<>\"'`]+")
+_OTLP_URL_CONTEXT = re.compile(
+    r"(?i)(?<![A-Za-z0-9_.-])" + OTLP_ENV_NAME_PATTERN +
+    r"(?:\\?['\"]|[ \t:=,>\-]){1,32}$"
+)
+_OTLP_SIGNAL_URL = re.compile(
+    r"(?i)^https?://[^/?#]+/v1/(?:traces|metrics|logs)(?:[/?#]|$)"
+)
+
+
+def _mask_otlp_assignments(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        value = match.group("quoted") if match.group("quote") else match.group("bare")
+        if not is_sensitive_otlp_env(match.group("key"), value):
+            return match.group()
+        start = match.start("quoted" if match.group("quote") else "bare") - match.start()
+        end = match.end("quoted" if match.group("quote") else "bare") - match.start()
+        return match.group()[:start] + "[REDACTED]" + match.group()[end:]
+
+    return _OTLP_ASSIGNMENT.sub(replace, text)
+
+
+def _mask_embedded_otlp_urls(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        candidate = match.group()
+        url = candidate.rstrip(".,;!)}")
+        # An OTLP signal path identifies an exporter without a label. Generic
+        # base paths require an adjacent carrier name; unrelated Git and query
+        # URLs must remain readable even elsewhere in an OTLP log message.
+        context = text[max(0, match.start() - 128):match.start()]
+        if not _OTLP_SIGNAL_URL.search(url) and not _OTLP_URL_CONTEXT.search(context):
+            return candidate
+        if not sensitive_otlp_endpoint(url):
+            return candidate
+        return "[REDACTED]" + candidate[len(url):]
+
+    return _EMBEDDED_HTTP_URL.sub(replace, text)
 
 
 _CREDENTIAL_KEY = re.compile(
@@ -516,7 +562,7 @@ def redact_text(text: str) -> str:
     """
     if not text:
         return text
-    out = _mask_block_scalar_lines(text)
+    out = _mask_embedded_otlp_urls(_mask_otlp_assignments(_mask_block_scalar_lines(text)))
     for pat in _TOKEN_PATTERNS:
         if pat is _COLON_CREDENTIAL_PATTERNS[0]:
             out = _mask_colon_credentials(out)
@@ -549,7 +595,7 @@ def redact_payload(value: Any) -> Any:
         return redact_text(value)
     if isinstance(value, Mapping):
         return {
-            key: "[REDACTED]" if _credential_key(key) else redact_payload(item)
+            key: "[REDACTED]" if _credential_key(key) or is_sensitive_otlp_env(key, item) else redact_payload(item)
             for key, item in value.items()
         }
     if isinstance(value, tuple):

@@ -15,6 +15,7 @@ import pytest
 pytest.importorskip("mimir_cultivate", reason="Worklink backends belong to Cultivate")
 
 from tests.nested_pytest import pytest_command
+from tests.opencode_fixtures import opencode_binary
 
 from mimir_cultivate.opencode import OpenCodeInvocation
 from mimir_cultivate.worklink.backends.base import RawResult, WorkOrder, blocked_reason_from_output
@@ -1255,7 +1256,7 @@ def test_opencode_backend_rejects_direct_duplicate_model_flag() -> None:
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.usefixtures("stub_opencode")
 def test_opencode_test_env_reaches_pytest_through_bash(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, enabled: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, enabled: bool, opencode_binary: Path
 ) -> None:
     monkeypatch.setattr(opencode_module, "_coding_enabled", lambda: enabled)
     monkeypatch.setattr(
@@ -1342,7 +1343,8 @@ def test_opencode_test_env_requires_mapping(tmp_path: Path, value: object) -> No
 
 @pytest.mark.usefixtures("stub_opencode")
 def test_opencode_backend_logs_native_model_divergence_from_home_default(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    opencode_binary: Path,
 ) -> None:
     (tmp_path / ".env").write_text(
         "MIMIR_MODEL_SPEC=codex-plus:gpt-agent\n", encoding="utf-8"
@@ -1591,7 +1593,7 @@ def test_opencode_unknown_error_scrubs_diagnostic_and_ref() -> None:
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("stub_opencode")
 async def test_opencode_backend_transcript_filename_contract(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, opencode_binary: Path
 ) -> None:
     """chainlink #831: regression test that opencode transcript filenames use
     the 'opencode-' prefix (not 'codex-') and embed the issue id, so mixed
@@ -1761,7 +1763,8 @@ def test_registry_keeps_and_logs_python_default_bash_allowlist(
 )
 @pytest.mark.usefixtures("stub_opencode")
 def test_registry_derives_only_configured_non_python_runner(
-    monkeypatch: pytest.MonkeyPatch, test_command: str, runner_pattern: str
+    monkeypatch: pytest.MonkeyPatch, test_command: str, runner_pattern: str,
+    opencode_binary: Path,
 ) -> None:
     monkeypatch.setattr(
         "mimir_cultivate.worklink.backends.opencode.resolve_opencode_invocation",
@@ -2112,7 +2115,7 @@ def _write_opencode_auth(tmp_path: Path, payload: object) -> None:
 @pytest.mark.usefixtures("stub_opencode")
 def test_opencode_leaf_reasoning_variant(
     tmp_path: Path, agent: str | None, override: str | None,
-    expected: str | None, source: str,
+    expected: str | None, source: str, opencode_binary: Path,
 ) -> None:
     env = _provider_env(tmp_path, "codex-plus:gpt-agent")
     _write_opencode_auth(tmp_path, {"openai": {"type": "oauth", "refresh": "subscription"}})
@@ -2161,7 +2164,7 @@ def test_opencode_leaf_reasoning_from_home_dotenv_and_native_model(tmp_path: Pat
 @pytest.mark.parametrize("name", ["MIMIR_MODEL_REASONING_EFFORT", "MIMIR_WORKLINK_REASONING_EFFORT"])
 @pytest.mark.usefixtures("stub_opencode")
 def test_opencode_leaf_invalid_openai_effort_fails_before_invocation(
-    tmp_path: Path, name: str,
+    tmp_path: Path, name: str, opencode_binary: Path,
 ) -> None:
     env = _provider_env(tmp_path, "codex-plus:gpt-agent", **{name: "turbo"})
     _write_opencode_auth(tmp_path, {"openai": {"type": "oauth", "refresh": "subscription"}})

@@ -84,6 +84,7 @@ from .run_state import (
 from .checkout import CheckoutLease, cleanup_checkout, _cultivate_selected, create_isolated_checkout
 from .worker_client import worklink_checkout_root
 from mimir.redaction import redact_text
+from mimir.otel_credentials import filter_otlp_env
 from ..repository import RepositoryInventory
 from mimir.secret_scan import secret_matches
 from .safe_git import ControllerGitPublication, _git_credential_settings
@@ -1314,6 +1315,7 @@ class WorklinkRunner:
             )
             if report_env:
                 spec = with_worker_environment(spec, report_env)
+            spec = replace(spec, env=filter_otlp_env(spec.env))
             invocation_model = spec.backend_config.get("model")
             _log_event(
                 "worklink_backend_invocation",
@@ -1386,7 +1388,7 @@ class WorklinkRunner:
                     checkout_snapshot=lambda: _checkout_snapshot(lease.path, runner=runner, publication=publication),
                     event_logger=_log_event,
                     codex=bool(spec.backend_config.get("codex")),
-                    env={**os.environ, **order.env},
+                    env=filter_otlp_env({**os.environ, **order.env}),
                     refreshed_path=(lease.path.parent / ".factory-runtime/data/opencode/auth.json"
                                     if worker_uid_drop else None),
                 )

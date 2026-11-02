@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from uuid import uuid4
 from dataclasses import asdict, replace
 from pathlib import Path
 from textwrap import dedent
@@ -68,6 +69,7 @@ from mimir.skill_defs import home_builtin_skills_dir
 from mimir.tools.budget_gate import BudgetGateMiddleware
 from mimir.turn_logger import TurnLogger
 from mimir.turn_event_bus import TurnEventBus
+from mimir.tracing import TraceController, INPUT, OUTPUT, CACHE_READ, CACHE_CREATION
 from mimir.plugins.registry import PolicyRegistry
 from mimir.tool_descriptors import ResultOriginKind
 from mimir.http_ingress import (
@@ -1242,6 +1244,471 @@ def _build_agent(tmp_path: Path, *,
     # whenever Agent goes to build/fetch the graph.
     a._agent = fake_agent  # type: ignore[attr-defined]
     return a
+
+
+def _turn_exporter():
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return TraceController(provider), exporter
+
+
+@pytest.mark.asyncio
+async def test_traced_turn_usage_and_callback_scope(tmp_path: Path):
+    model = _FakeAgent([AIMessage(content="done", usage_metadata={
+        "input_tokens": 12, "output_tokens": 4,
+        "total_tokens": 16,
+        "input_token_details": {"cache_read": 3, "cache_creation": 2},
+    })])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    controller, exporter = _turn_exporter()
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+    record = await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-trace", content="hello"))
+    assert record.output == "done"
+    assert len(model.invocations[0]["config"]["callbacks"]) == 1
+    spans = exporter.get_finished_spans()
+    assert len([span for span in spans if span.name == "invoke_agent"]) == 1
+    root = next(span for span in spans if span.name == "invoke_agent")
+    assert root.attributes[INPUT] == 12
+    assert root.attributes[OUTPUT] == 4
+    assert root.attributes[CACHE_READ] == 3
+    assert root.attributes[CACHE_CREATION] == 2
+    assert root.attributes["gen_ai.conversation.id"] == "ch-trace"
+    assert not any("messages" in key for key in root.attributes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("usage", [5, {
+    "input_tokens": 12, "output_tokens": 4, "total_tokens": 16,
+    "input_token_details": {"cache_read": 3, "cache_creation": 2},
+}])
+async def test_traced_turn_provider_usage_does_not_change_outcome(tmp_path: Path, usage):
+    from langchain_core.outputs import ChatGeneration, LLMResult
+    from uuid import uuid4
+
+    class UsageGraph(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            if "callbacks" in config:
+                callback = config["callbacks"][0]
+                run_id = uuid4()
+                callback.on_chat_model_start({"name": "fake"}, [[HumanMessage(content="hi")]], run_id=run_id)
+                callback.on_llm_end(LLMResult(generations=[[
+                    ChatGeneration(message=self._response_messages[0]),
+                ]]), run_id=run_id)
+            async for item in super().astream(state, config=config, context=context, stream_mode=stream_mode):
+                yield item
+
+    message = (AIMessage(content="done", response_metadata={"usage": usage})
+               if isinstance(usage, int) else AIMessage(content="done", usage_metadata=usage))
+    event = AgentEvent(trigger="user_message", channel_id="ch-usage", content="hello")
+    plain = _build_agent(tmp_path / "plain", fake_agent=UsageGraph([message]))
+    traced = _build_agent(tmp_path / "traced", fake_agent=UsageGraph([message]))
+    controller, exporter = _turn_exporter()
+    traced._config = replace(traced._config, tracing_enabled=True)
+    traced._trace_controller = controller
+
+    untraced_record = await plain.run_turn(event)
+    traced_record = await traced.run_turn(event)
+
+    assert untraced_record.error is None and traced_record.error is None
+    assert untraced_record.result_is_error is False and traced_record.result_is_error is False
+    assert traced_record.output == untraced_record.output == "done"
+    assert traced_record.usage == untraced_record.usage
+    if isinstance(usage, int):
+        assert traced_record.usage == 5
+    [root] = [span for span in exporter.get_finished_spans() if span.name == "invoke_agent"]
+    assert root.end_time is not None
+    expected = (0, 0, 0, 0) if isinstance(usage, int) else (12, 4, 3, 2)
+    assert tuple(root.attributes[key] for key in (INPUT, OUTPUT, CACHE_READ, CACHE_CREATION)) == expected
+
+
+@pytest.mark.asyncio
+async def test_traced_turn_effective_model_override(tmp_path: Path, monkeypatch):
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:override-model")
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([AIMessage(content="done")]))
+    agent._agent = None
+    resolved = []
+    graphs = []
+    monkeypatch.setattr("langchain.chat_models.init_chat_model", lambda spec, **kw: resolved.append(spec) or
+                        GenericFakeChatModel(messages=iter([])))
+    monkeypatch.setattr("deepagents.create_deep_agent", lambda **kw: graphs.append(kw) or
+                        _FakeAgent([AIMessage(content="done")]))
+    monkeypatch.setattr("mimir.tools.all_mimir_tools", lambda **kw: [])
+    monkeypatch.setattr("mimir.tools.mcp.get_mcp_tools", lambda: [])
+    monkeypatch.setattr("mimir.subagents.build_mimir_subagents", lambda **kw: [])
+    monkeypatch.setattr(agent, "_current_system_prompt", lambda **kw: "stable prompt")
+    monkeypatch.setattr(agent, "_current_skill_sources", lambda: ())
+    monkeypatch.setattr(agent, "_skill_catalog_fingerprint", lambda sources: asyncio.sleep(0, result="stable"))
+    controller, exporter = _turn_exporter()
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+
+    await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-override", content="hi"))
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:not-invoked")
+    await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-override", content="again"))
+
+    roots = [span for span in exporter.get_finished_spans() if span.name == "invoke_agent"]
+    assert len(roots) == 2
+    assert resolved == ["openai:override-model"]
+    assert len(graphs) == 1
+    assert all(root.attributes["gen_ai.request.model"] == "openai:override-model" for root in roots)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("reply", ["closure", "approval"])
+async def test_traced_early_reply_content_policy(tmp_path: Path, monkeypatch, capture: bool, reply: str):
+    from mimir import commitment_proposals
+    from mimir import approval_requests, operator_approval
+
+    secret = "ghp_" + "B" * 36
+    benign = "early-visible-sentinel"
+
+    async def closure(*args):
+        return f"{benign} {secret}"
+
+    if reply == "closure":
+        monkeypatch.setattr(commitment_proposals, "handle_reply", closure)
+    else:
+        monkeypatch.setattr(commitment_proposals, "handle_reply", lambda *args: asyncio.sleep(0, result=None))
+        monkeypatch.setattr(approval_requests, "is_non_turn_bound_reply", lambda event: True)
+        monkeypatch.setattr(approval_requests, "resolve", lambda *args: SimpleNamespace(
+            entry=None, status="approved", message=f"{benign} {secret}",
+        ))
+        monkeypatch.setattr(operator_approval, "_is_authenticated_operator", lambda *args, **kw: True)
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([]))
+    controller, exporter = _turn_exporter()
+    controller.capture_content = capture
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id="ch-early", content=f"{benign} {secret}",
+    ))
+
+    [root] = exporter.get_finished_spans()
+    assert record.output == f"{benign} {secret}"
+    assert root.name == "invoke_agent" and root.end_time is not None
+    assert secret not in str(root.attributes)
+    assert ("gen_ai.input.messages" in root.attributes) is capture
+    assert ("gen_ai.output.messages" in root.attributes) is capture
+    if capture:
+        assert benign in root.attributes["gen_ai.input.messages"]
+        assert benign in root.attributes["gen_ai.output.messages"]
+        assert "[REDACTED]" in root.attributes["gen_ai.output.messages"]
+        assert "[REDACTED]" in root.attributes["gen_ai.input.messages"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("missing_parent_callback", [False, True])
+async def test_traced_real_graph_tool_child_and_nudge(tmp_path: Path, capture: bool,
+                                                      missing_parent_callback: bool, monkeypatch):
+    from deepagents import create_deep_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.tools import tool
+
+    secret = "ghp_" + "A" * 36
+    benign = "visible-sentinel"
+    usage = [
+        (11, 2, 3, 1), (17, 4, 5, 2), (23, 6, 7, 3), (29, 8, 9, 4),
+    ]
+
+    def reply(content, tokens, *, call=None):
+        input_tokens, output_tokens, cache_read, cache_creation = tokens
+        return AIMessage(
+            content=content,
+            tool_calls=([{"name": "lookup_trace", "args": {"query": f"{benign} {secret}"},
+                         "id": call, "type": "tool_call"}] if call else []),
+            usage_metadata={
+                "input_tokens": input_tokens, "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "input_token_details": {"cache_read": cache_read, "cache_creation": cache_creation},
+            },
+        )
+
+    class Model(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    child = Model(messages=iter([reply(f"{benign} {secret} child", usage[1])]), disable_streaming=True)
+
+    @tool
+    async def lookup_trace(query: str) -> str:
+        """Return an observed lookup result."""
+        result = await child.ainvoke([HumanMessage(content=query)])
+        return f"{benign} {secret} {result.content}"
+
+    parent = Model(messages=iter([
+        reply("", usage[0], call="trace-tool-call"),
+        reply(f"{benign} {secret} first", usage[2]),
+        reply(f"{benign} {secret} nudge", usage[3]),
+    ]), disable_streaming=True)
+    graph = create_deep_agent(model=parent, tools=[lookup_trace], system_prompt="trace test",
+                              context_schema=AuthContext)
+    registry = ChannelRegistry()
+    registry.register(_BridgeStub())
+    agent = _build_agent(tmp_path, fake_agent=graph, channel_registry=registry)
+    agent._config = replace(agent._config, tracing_enabled=True, resend_nudge_channels=("ch-",))
+    agent._identity_resolver = _resolver(
+        agent._config.home,
+        "people:\n  - canonical: trace-user\n    access: {roles: [user]}\n",
+    )
+    controller, exporter = _turn_exporter()
+    controller.capture_content = capture
+    agent._trace_controller = controller
+    if missing_parent_callback:
+        import inspect
+        from mimir import tracing
+
+        original_usage = tracing._usage
+
+        def callback_usage(message):
+            if "child" not in str(message.content) and any(
+                frame.function == "record_usage" for frame in inspect.stack()
+            ):
+                return {key: 0 for key in (INPUT, OUTPUT, CACHE_READ, CACHE_CREATION)}
+            return original_usage(message)
+
+        monkeypatch.setattr(tracing, "_usage", callback_usage)
+
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id="ch-graph-trace",
+        content=f"{benign} {secret}", source="discord", author="trace-user",
+    ))
+
+    spans = exporter.get_finished_spans()
+    [root] = [span for span in spans if span.name == "invoke_agent"]
+    chats = [span for span in spans if span.name == "chat"]
+    tools = [span for span in spans if span.name == "execute_tool" and
+             span.attributes.get("gen_ai.tool.name") == "lookup_trace"]
+    assert record.error is None
+    assert any(event["type"] == "resend_nudge_issued" for event in _read_events(tmp_path))
+    assert record.output == f"{benign} {secret} nudge"
+    assert record.usage == {
+        "input_tokens": 29, "output_tokens": 8,
+        "cache_read_input_tokens": 9, "cache_creation_input_tokens": 4,
+    }
+    assert len(chats) == 4
+    assert len(tools) == 1
+    assert tools[0].attributes["gen_ai.tool.call.id"] == "trace-tool-call"
+    assert tools[0].parent.span_id == root.context.span_id or tools[0].parent.span_id in {
+        chat.context.span_id for chat in chats
+    }
+    assert any(chat.parent.span_id == tools[0].context.span_id for chat in chats)
+    assert all(span.context.trace_id == root.context.trace_id for span in chats + tools)
+    for key, index in ((INPUT, 0), (OUTPUT, 1), (CACHE_READ, 2), (CACHE_CREATION, 3)):
+        assert root.attributes[key] == sum(row[index] for row in usage)
+    for span, keys in [(root, ("gen_ai.input.messages", "gen_ai.output.messages")),
+                       *((chat, ("gen_ai.input.messages", "gen_ai.output.messages")) for chat in chats),
+                       (tools[0], ("gen_ai.tool.call.arguments", "gen_ai.tool.call.result"))]:
+        assert span.end_time is not None
+        assert secret not in str(span.attributes)
+        for key in keys:
+            assert (key in span.attributes) is capture, (span.name, key)
+            if capture:
+                if not (span.name == "chat" and key == "gen_ai.input.messages"
+                        and "You produced a reply" in span.attributes[key]):
+                    assert benign in span.attributes[key], (span.name, key)
+                    assert "[REDACTED]" in span.attributes[key], (span.name, key)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture", [False, True])
+async def test_traced_graph_children_and_content(tmp_path: Path, capture: bool):
+    from langchain_core.outputs import ChatGeneration, LLMResult
+
+    class CallbackGraph(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            callback = config["callbacks"][0]
+            chat_id, tool_id, nested_id = uuid4(), uuid4(), uuid4()
+            callback.on_chat_model_start({"name": "fake"}, [[HumanMessage(content="hello")]], run_id=chat_id)
+            callback.on_tool_start({"name": "search"}, "safe argument", run_id=tool_id, parent_run_id=chat_id)
+            callback.on_chat_model_start({"name": "subagent"}, [[HumanMessage(content="sub")]], run_id=nested_id, parent_run_id=tool_id)
+            callback.on_llm_end(LLMResult(generations=[[ChatGeneration(message=AIMessage(content="sub done"))]]), run_id=nested_id)
+            callback.on_tool_end("safe result", run_id=tool_id)
+            callback.on_llm_end(LLMResult(generations=[[ChatGeneration(message=AIMessage(content="done"))]]), run_id=chat_id)
+            async for item in super().astream(state, config=config, context=context, stream_mode=stream_mode):
+                yield item
+
+    graph = CallbackGraph([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=graph)
+    controller, exporter = _turn_exporter()
+    controller.capture_content = capture
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+    await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-one", content="hello"))
+    spans = {span.name: span for span in exporter.get_finished_spans() if span.name != "chat"}
+    chats = [span for span in exporter.get_finished_spans() if span.name == "chat"]
+    assert len(chats) == 2
+    assert chats[0].parent.span_id == spans["execute_tool"].context.span_id
+    assert spans["execute_tool"].parent.span_id == chats[1].context.span_id
+    assert chats[1].parent.span_id == spans["invoke_agent"].context.span_id
+    content_keys = [key for span in exporter.get_finished_spans() for key in span.attributes
+                    if key in {"gen_ai.input.messages", "gen_ai.output.messages",
+                               "gen_ai.tool.call.arguments", "gen_ai.tool.call.result"}]
+    assert bool(content_keys) is capture
+
+
+@pytest.mark.asyncio
+async def test_traced_concurrent_channels_keep_separate_parents(tmp_path: Path):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    count = 0
+
+    class OverlappingGraph(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            nonlocal count
+            count += 1
+            if count == 2:
+                entered.set()
+            await entered.wait()
+            callback = config["callbacks"][0]
+            run_id = uuid4()
+            callback.on_tool_start({"name": "lookup"}, "query", run_id=run_id)
+            await release.wait()
+            callback.on_tool_end("result", run_id=run_id)
+            async for item in super().astream(state, config=config, context=context, stream_mode=stream_mode):
+                yield item
+
+    graph = OverlappingGraph([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=graph)
+    controller, exporter = _turn_exporter()
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+    async def run(channel):
+        return await agent.run_turn(AgentEvent(trigger="user_message", channel_id=channel, content="hi"))
+
+    tasks = [asyncio.create_task(run(channel)) for channel in ("ch-a", "ch-b")]
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=HANG_GUARD_SECONDS)
+    finally:
+        release.set()
+    await asyncio.gather(*tasks)
+    spans = exporter.get_finished_spans()
+    roots = {span.context.span_id for span in spans if span.name == "invoke_agent"}
+    parents = {span.parent.span_id for span in spans if span.name == "execute_tool"}
+    assert len(roots) == len(parents) == 2
+    assert parents == roots
+
+
+@pytest.mark.asyncio
+async def test_tracing_disabled_does_not_attach_callback(tmp_path: Path):
+    graph = _FakeAgent([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=graph)
+    controller, exporter = _turn_exporter()
+    agent._trace_controller = controller
+    await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-disabled", content="hi"))
+    assert "callbacks" not in graph.invocations[0]["config"]
+    assert not exporter.get_finished_spans()
+
+
+@pytest.mark.asyncio
+async def test_tracing_callback_failure_does_not_fail_turn(tmp_path: Path, monkeypatch):
+    from mimir.tracing import TurnTrace
+
+    class CallbackGraph(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            run_id = uuid4()
+            handler = config["callbacks"][0]
+            handler.on_tool_start({"name": "lookup"}, "query", run_id=run_id)
+            handler.on_tool_end("result", run_id=run_id)
+            async for item in super().astream(state, config=config, context=context, stream_mode=stream_mode):
+                yield item
+
+    graph = CallbackGraph([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=graph)
+    controller, exporter = _turn_exporter()
+    agent._config = replace(agent._config, tracing_enabled=True)
+    agent._trace_controller = controller
+    def broken_span(*args, **kwargs):
+        raise RuntimeError("exporter unavailable")
+    monkeypatch.setattr(TurnTrace, "_start", broken_span)
+    record = await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-fail", content="hi"))
+    assert record.output == "done"
+    assert [span.name for span in exporter.get_finished_spans()] == ["invoke_agent"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [
+    "closure", "approval", "preflight", "success", "returned_error", "timeout", "cancel",
+])
+async def test_traced_turn_ends_on_all_exit_paths(tmp_path: Path, monkeypatch, outcome: str):
+    from opentelemetry.trace import StatusCode
+    from mimir import commitment_proposals, operator_approval, approval_requests
+
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([AIMessage(content="done")]))
+    controller, exporter = _turn_exporter()
+    agent._config = replace(agent._config, tracing_enabled=True,
+                            turn_timeout_seconds=0.05 if outcome == "timeout" else 0)
+    agent._trace_controller = controller
+    if outcome == "closure":
+        async def closure(*args):
+            return "approved"
+        monkeypatch.setattr(commitment_proposals, "handle_reply", closure)
+    if outcome == "approval":
+        monkeypatch.setattr(operator_approval, "_is_authenticated_operator", lambda *a, **kw: True)
+        monkeypatch.setattr(approval_requests, "resolve", lambda *a: SimpleNamespace(
+            entry=None, status="approved", message="approval notice",
+        ))
+    if outcome == "preflight":
+        async def reject(*args):
+            raise ValueError("preflight refused")
+        manager = agent._config.plugin_manager
+        agent._config = replace(agent._config, plugin_manager=SimpleNamespace(
+            policy=manager.policy, plugins=(SimpleNamespace(contributor=object()),),
+            turn_preflight=reject,
+        ))
+    if outcome == "returned_error":
+        agent._agent = _FakeAgent([AIMessage(content="failed", response_metadata={"is_error": True})])
+    entered = asyncio.Event()
+    if outcome in {"timeout", "cancel"}:
+        class WaitingGraph(_FakeAgent):
+            async def astream(self, state, *, config, context=None, stream_mode="values"):
+                entered.set()
+                await asyncio.Event().wait()
+                yield {"messages": []}
+        agent._agent = WaitingGraph([])
+
+    event = AgentEvent(trigger="user_message", channel_id="ch-trace", content="safe request")
+    if outcome == "approval":
+        event = replace(event, content="approve test-abcd")
+    if outcome == "cancel":
+        task = asyncio.create_task(agent.run_turn(event))
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif outcome == "preflight":
+        with pytest.raises(ValueError, match="preflight refused"):
+            await agent.run_turn(event)
+    else:
+        record = await agent.run_turn(event)
+        if outcome == "closure":
+            assert (record.kind, record.output) == ("commitment_proposal_approval", "approved")
+        elif outcome == "approval":
+            assert (record.kind, record.output) == ("operator_approval", "approval notice")
+        elif outcome == "timeout":
+            assert record.error.startswith("TurnTimeout:")
+        elif outcome == "returned_error":
+            assert record.result_is_error is True
+        else:
+            assert record.output == "done" and record.error is None
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].name == "invoke_agent"
+    assert spans[0].end_time is not None
+    assert spans[0].status.status_code == (
+        StatusCode.ERROR if outcome in {"preflight", "returned_error", "timeout", "cancel"}
+        else StatusCode.UNSET
+    )
 
 
 def _seed_live_turn_stores(home: Path) -> list[Path]:

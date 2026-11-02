@@ -1,0 +1,1 @@
+- Add opt-in OpenTelemetry GenAI tracing configuration and an OTLP HTTP extra; keep Cultivate out of core development dependencies, reject credential-bearing remote plain-HTTP export, and expose a turn-local usage observer with cancellation coverage.

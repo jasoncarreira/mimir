@@ -115,6 +115,7 @@ from .access_control import (
 )
 from .event_logger import log_event, log_event_sync, get_events_path, get_logger
 from .models import AgentEvent, InformationFlowLabels, SourceLabel
+from .otel_credentials import filter_otlp_env, is_sensitive_otlp_env
 from .redaction import redact_text
 from . import poller_recovery
 from .poller_hooks import (
@@ -461,6 +462,8 @@ def _allowed_poller_env_key(k: str, *, allowed: set[str] | frozenset[str] | None
         allowed = _BUILTIN_POLLER_ENV_ALLOWLIST | _extra_poller_env_allowlist()
     if k not in allowed:
         return False
+    if is_sensitive_otlp_env(k, os.environ.get(k)):
+        return False
     if any(k.endswith(s) for s in _DENY_ENV_SUFFIXES):
         return False
     if any(k.startswith(p) for p in _DENY_ENV_PREFIXES):
@@ -489,12 +492,21 @@ def _poller_env_available_at_discovery(
     available.update(
         k for k in pass_env
         if k not in _PROCESS_CONTROL_ENV_DENY and k in os.environ
+        and not is_sensitive_otlp_env(k, os.environ[k])
     )
     # Manifest ``env`` keys are also process-control-filtered at runtime
     # (chainlink #421) — mirror that here so an ``env_required`` name
     # that the runtime would strip doesn't count as available.
     available.update(
-        str(k) for k in env_raw if str(k) not in _PROCESS_CONTROL_ENV_DENY
+        str(k) for k, value in env_raw.items()
+        if str(k) not in _PROCESS_CONTROL_ENV_DENY
+        and not is_sensitive_otlp_env(str(k), value)
+    )
+    # Literal overrides win over host values, including when an override makes
+    # a previously safe endpoint unsafe.
+    available.difference_update(
+        str(k) for k, value in env_raw.items()
+        if is_sensitive_otlp_env(str(k), value)
     )
     available.update(injected_keys)
     return available
@@ -2936,6 +2948,8 @@ async def run_poller(
             continue
         if key not in os.environ:
             continue
+        if is_sensitive_otlp_env(key, os.environ[key]):
+            continue
         env[key] = os.environ[key]
         explicit_env_redact_keys.add(key)
         if any(key.endswith(s) for s in _DENY_ENV_SUFFIXES) or any(
@@ -2961,6 +2975,9 @@ async def run_poller(
                 poller=poller.name,
                 key=key,
             )
+            continue
+        if is_sensitive_otlp_env(key, value):
+            env.pop(key, None)
             continue
         env[key] = value
         explicit_env_redact_keys.add(key)
@@ -3002,6 +3019,7 @@ async def run_poller(
     env["MIMIR_HOME"] = str(
         home if home is not None else poller.skill_dir.parent.parent
     )
+    env = filter_otlp_env(env)
 
     # Framework recovery of prior lost/failed turns. Before this cycle's
     # subprocess poll, reconcile in-flight events against turn outcomes.
@@ -3153,7 +3171,7 @@ async def run_poller(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(poller.skill_dir),
-                env=env,
+                env=filter_otlp_env(env),
                 start_new_session=True,
             )
             # chainlink #258: drain stdout/stderr with hard byte ceilings

@@ -6,6 +6,27 @@ import base64
 import json
 from pathlib import Path
 
+import pytest
+
+
+@pytest.fixture
+def opencode_binary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Exercise real binary admission without requiring an installed CLI."""
+    from mimir_cultivate.worklink.backends import opencode
+
+    binary = seed_opencode_binary(tmp_path)
+    monkeypatch.setattr(opencode, "IMAGE_OPENCODE_BIN", binary)
+    return binary
+
+
+def seed_opencode_binary(root: Path) -> Path:
+    """Provide an executable owned by the fixture, not the developer image."""
+    binary = root / "controller-bin" / "opencode"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o755)
+    return binary
+
 
 def seed_codex_subscription(home: Path, refresh: str = "subscription") -> None:
     """Create a usable native OAuth bundle without plugins or literal tokens."""

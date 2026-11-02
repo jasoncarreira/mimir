@@ -740,6 +740,63 @@ async def test_query_explicit_kwarg_overrides_config_flag(client, monkeypatch):
     assert rewrite_calls == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture_content", [False, True])
+async def test_query_rewrite_direct_call_traces_only_active_turn(
+    client, monkeypatch, capture_content,
+):
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from mimir.tracing import MODEL, OPERATION, TraceController
+
+    _patch_provider_with_rewrite_flag(monkeypatch, rewrite_enabled=True)
+    monkeypatch.setattr(
+        "mimir.saga._config_io.resolve_llm_config",
+        lambda section: {"model": "rewrite-fake"},
+    )
+    calls = []
+
+    async def fake_call(cfg, *, prompt, **kwargs):
+        calls.append((cfg, prompt, kwargs))
+        return "safe anchor token=private-canary"
+
+    monkeypatch.setattr("mimir.saga._llm.call_llm", fake_call)
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    controller = TraceController(provider, capture_content=capture_content)
+    context = [{"role": "user", "content": "safe context token=private-canary"}]
+    try:
+        with controller.turn(conversation_id="rewrite-turn", agent_name="mimir", model="fake"):
+            payload = await client.query("what about it?", context=context)
+        assert payload["rewritten_query"] == "safe anchor token=private-canary"
+        assert len(calls) == 1
+        assert calls[0][0] == {"model": "rewrite-fake"}
+        spans = exporter.get_finished_spans()
+        chat = next(span for span in spans if span.name == "chat")
+        root = next(span for span in spans if span.name == "invoke_agent")
+        assert chat.parent.span_id == root.context.span_id
+        assert chat.attributes[OPERATION] == "chat"
+        assert chat.attributes[MODEL] == "rewrite-fake"
+        content = {key: value for key, value in chat.attributes.items() if "messages" in key}
+        if capture_content:
+            assert "safe context" in content["gen_ai.input.messages"]
+            assert "safe anchor" in content["gen_ai.output.messages"]
+            assert "private-canary" not in str([dict(span.attributes) for span in spans])
+        else:
+            assert content == {}
+
+        exporter.clear()
+        outside = await client.query("what about it?", context=context)
+        assert outside["rewritten_query"] == payload["rewritten_query"]
+        assert len(calls) == 2
+        assert not exporter.get_finished_spans()
+    finally:
+        provider.shutdown()
+
+
 # ─── PR #342 follow-up: warning when NYI forget params are passed ────
 
 

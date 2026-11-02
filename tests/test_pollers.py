@@ -2592,6 +2592,133 @@ def test_discover_required_env_honors_allowlist_and_process_control_deny(
 
     assert [p.name for p in out] == ["custom"]
 
+
+@pytest.mark.parametrize("source", ["allowlist", "pass_env", "manifest", "override", "override-pass-env"])
+@pytest.mark.parametrize(("key", "value", "forwarded"), [
+    ("OTEL_EXPORTER_OTLP_HEADERS", "plain-canary-header", False),
+    ("otel_exporter_otlp_traces_headers", "plain-canary-trace", False),
+    ("OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY", "plain-canary-key", False),
+    ("OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE", "plain-canary-client", False),
+    ("OTEL_EXPORTER_OTLP_CERTIFICATE", "plain-canary-cert", False),
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://user:plain-canary@collector.example", False),
+    ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://collector.example/?key=plain-canary", False),
+    ("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://collector.example/#plain-canary", False),
+    ("MIMIR_OTLP_ENDPOINT", "not-a-url-plain-canary", False),
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example/v1/traces", True),
+    ("MIMIR_OTLP_ENDPOINT", "https://collector.example/", True),
+    ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf", True),
+], ids=lambda value: str(value)[:42])
+@pytest.mark.asyncio
+async def test_otlp_carriers_do_not_reach_poller_child(
+    home: Path, monkeypatch: pytest.MonkeyPatch, source: str,
+    key: str, value: str, forwarded: bool,
+) -> None:
+    skill = home / "skills" / "otlp-test"
+    _install_script(skill, "poller.py", """
+import json, os, sys
+from pathlib import Path
+key = os.environ['TEST_KEY']
+Path(os.environ['STATE_DIR'], 'child-env.json').write_text(json.dumps({
+    'carrier': os.environ.get(key), 'ordinary': os.environ.get('ORDINARY_POLLER_VALUE'),
+}))
+print(os.environ.get(key, '<absent>'), file=sys.stderr)
+""")
+    monkeypatch.setenv("ORDINARY_POLLER_VALUE", "ordinary-value")
+    monkeypatch.setenv("TEST_KEY", key)
+    monkeypatch.setenv("MIMIR_POLLER_ENV_ALLOWLIST", "ORDINARY_POLLER_VALUE,TEST_KEY")
+    entry = {"name": "otlp-test", "command": f"{sys.executable} poller.py",
+             "cron": "*/15 * * * *", "env": {}}
+    if source == "allowlist":
+        monkeypatch.setenv(key, value)
+        monkeypatch.setenv("MIMIR_POLLER_ENV_ALLOWLIST",
+                           f"ORDINARY_POLLER_VALUE,TEST_KEY,{key}")
+    elif source == "pass_env":
+        monkeypatch.setenv(key, value)
+        entry["pass_env"] = [key]
+    elif source == "manifest":
+        entry["env"] = {key: value}
+    elif source == "override":
+        # Exercise the operator file parsed by discovery, rather than constructing
+        # a replacement PollerConfig that bypasses override validation and wiring.
+        if key.endswith("_ENDPOINT"):
+            monkeypatch.setenv(key, "https://collector.example/")
+            entry["pass_env"] = [key]
+        (home / "pollers-overrides.yaml").write_text(yaml.safe_dump({
+            "otlp-test": {"env": {key: value}},
+        }))
+    else:
+        monkeypatch.setenv(key, value)
+        (home / "pollers-overrides.yaml").write_text(yaml.safe_dump({
+            "otlp-test": {"pass_env": [key]},
+        }))
+    _write_pollers_json(skill, [entry])
+    [poller] = discover_pollers(
+        home / "skills", overrides_path=home / "pollers-overrides.yaml",
+    )
+    if source == "override":
+        assert poller.env == {key: value}
+    if source == "override-pass-env":
+        assert poller.pass_env == (key,)
+    await run_poller(poller, enqueue=_CapturingEnqueue())
+    child = json.loads((poller.resolved_persist_dir() / "child-env.json").read_text())
+    expected = value if forwarded and (source != "allowlist" or not key.startswith("MIMIR_")) else None
+    assert child == {"carrier": expected, "ordinary": "ordinary-value"}
+    durable = json.dumps(_read_events(home))
+    if not forwarded:
+        assert value not in durable
+        assert any(event["type"] == "poller_stderr" for event in _read_events(home))
+
+
+@pytest.mark.parametrize("source", ["allowlist", "pass_env", "manifest", "override-env", "override-pass-env"])
+@pytest.mark.parametrize(("key", "sensitive", "safe"), [
+    ("OTEL_EXPORTER_OTLP_HEADERS", "plain-canary-header", None),
+    ("OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY", "plain-canary-key", None),
+    ("OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE", "plain-canary-cert", None),
+    ("OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE", "plain-canary-ca", None),
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://user:plain-canary@collector.example", "https://collector.example/"),
+    ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://collector.example/?token=plain-canary", "https://collector.example/v1/traces"),
+    ("MIMIR_OTLP_ENDPOINT", "not-a-url-plain-canary", "https://collector.example/"),
+])
+def test_otlp_required_env_discovery_matches_child_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str,
+    key: str, sensitive: str, safe: str | None,
+) -> None:
+    monkeypatch.setenv(key, sensitive)
+    monkeypatch.setenv("MIMIR_POLLER_ENV_ALLOWLIST", key if source == "allowlist" else "")
+    skills = tmp_path / "skills"
+    entry = {"name": "required", "command": "true", "cron": "*/15 * * * *",
+             "env_required": [key], "pass_env": [key] if source == "pass_env" else [],
+             "env": {key: sensitive} if source == "manifest" else {}}
+    overrides_path = tmp_path / "pollers-overrides.yaml"
+    if source == "override-env":
+        # A safe ambient endpoint must not satisfy env_required after a
+        # sensitive literal override replaces it.
+        if safe is not None:
+            monkeypatch.setenv(key, safe)
+            entry["pass_env"] = [key]
+        overrides_path.write_text(yaml.safe_dump({"required": {"env": {key: sensitive}}}))
+    elif source == "override-pass-env":
+        overrides_path.write_text(yaml.safe_dump({"required": {"pass_env": [key]}}))
+    _write_pollers_json(skills / "required", [entry])
+    invalid = []
+    assert discover_pollers(skills, overrides_path=overrides_path, invalid_entries=invalid) == []
+    assert invalid == [(skills / "required" / "pollers.json", "required",
+                        f"required environment unset: {key}")]
+    if safe is not None and not (source == "allowlist" and key.startswith("MIMIR_")):
+        monkeypatch.setenv(key, safe)
+        if source in {"manifest", "override-env"}:
+            if source == "manifest":
+                entry["env"][key] = safe
+            else:
+                overrides_path.write_text(yaml.safe_dump({"required": {"env": {key: safe}}}))
+    else:
+        # Credential carriers are denied regardless of their value. Removing
+        # env_required (or explicitly passing a safe MIMIR_ key) is the only
+        # way to schedule the poller.
+        entry.pop("env_required")
+    _write_pollers_json(skills / "required", [entry])
+    assert len(discover_pollers(skills, overrides_path=overrides_path)) == 1
+
 def test_discover_handles_top_level_array_instead_of_object(tmp_path: Path):
     """The contract requires ``{"pollers": [...]}`` not a bare array.
     Bare arrays log a warning and skip — no silent acceptance."""
@@ -8640,8 +8767,9 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
         json.dumps({"openai": {"type": "oauth", "refresh": "synthetic"}}),
         encoding="utf-8",
     )
-    from tests.opencode_fixtures import seed_codex_subscription
+    from tests.opencode_fixtures import seed_codex_subscription, seed_opencode_binary
     seed_codex_subscription(tmp_path, "synthetic")
+    binary = seed_opencode_binary(tmp_path)
     parent_env = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": str(tmp_path),
@@ -8681,7 +8809,7 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
         "assert 'MIMIR_CODING_ENABLED' not in os.environ\n"
         f"order = WorkOrder(1844, Path({str(repo)!r}), 'prompt', None, 30, "
         "{'MIMIR_HOME': os.environ['MIMIR_HOME']})\n"
-        "spec = OpenCodeBackend().work_spec(order, attempt=1, repo_url='u', "
+        f"spec = OpenCodeBackend(bin={str(binary)!r}).work_spec(order, attempt=1, repo_url='u', "
         "base_ref='main', branch='issue/1844-a1', test_command='true')\n"
         f"Path({str(result_path)!r}).write_text(json.dumps({{"
         "'argv': spec.local_argv, 'variant': spec.backend_config['variant'], "

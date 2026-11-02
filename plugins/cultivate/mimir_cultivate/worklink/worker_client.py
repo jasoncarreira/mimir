@@ -16,6 +16,7 @@ from typing import Mapping, Protocol, Sequence
 import uuid
 
 from mimir.output_capture import OutputSink, open_output_pair
+from mimir.otel_credentials import filter_otlp_env
 from . import identities
 from .compute import LaunchHandle
 
@@ -97,7 +98,7 @@ def run_factory_control(
         try:
             process = await client.launch(
                 local_checkout=root, argv=argv,
-                env={key: value for key, value in env.items() if key != "HOME"},
+                env=filter_otlp_env({key: value for key, value in env.items() if key != "HOME"}),
                 identifier=str(uuid.uuid4()), timeout_s=timeout,
                 stdout_sink=stdout, stderr_sink=stderr,
             )
@@ -381,7 +382,7 @@ class WorkerClient:
             "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
             "id": identifier,
             "argv": list(argv),
-            "env": dict(env),
+            "env": filter_otlp_env(env),
             "projections": [
                 {"path": item.path, "document": item.document.decode("utf-8")}
                 for item in projections

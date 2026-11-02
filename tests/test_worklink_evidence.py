@@ -28,6 +28,259 @@ from mimir_cultivate.worklink.evidence import (
 )
 
 
+_OTLP_CARRIERS = {
+    "OTEL_EXPORTER_OTLP_HEADERS": "plain-header-canary",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "plain-trace-canary",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY": "plain-key-canary",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE": "plain-client-cert-canary",
+    "OTEL_EXPORTER_OTLP_CERTIFICATE": "plain-cert-canary",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://user:password@example.test/v1",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://example.test/v1?key=plain-query-canary",
+    "MIMIR_OTLP_ENDPOINT": "not-an-http-endpoint",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["contained", "factory"])
+async def test_gate_child_denies_otlp_carriers_after_spec_and_ambient_merge(
+    tmp_path, monkeypatch, route,
+):
+    from mimir_cultivate.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
+    from mimir_cultivate.worklink import worker_client
+    from mimir_cultivate.worklink.compute import _local_child_env
+
+    for name, value in _OTLP_CARRIERS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://example.test/normal")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+    child = (
+        "import json,os; print(json.dumps({k:v for k,v in os.environ.items() "
+        "if k.startswith(('OTEL_EXPORTER_OTLP_', 'MIMIR_OTLP_'))}))"
+    )
+    class ChildCompute:
+        async def _launch_contained(self, spec, command):
+            self.gate_env = dict(spec.env)
+            self.process = await asyncio.create_subprocess_exec(
+                *command, cwd=tmp_path, env={**_local_child_env(), **spec.env},
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            return LaunchHandle("local_subprocess", str(self.process.pid))
+
+        async def wait(self, handle, timeout_s):
+            stdout, stderr = await self.process.communicate()
+            return ComputeResult(self.process.returncode, stdout.decode(), stderr.decode())
+
+        async def cleanup(self, handle):
+            pass
+
+    compute = ChildCompute()
+    if route == "factory":
+        def factory_child(checkout, argv, *, env, timeout, output_limit):
+            compute.gate_env = dict(env)
+            return subprocess.run(argv, cwd=checkout, env=env, capture_output=True)
+        monkeypatch.setattr(worker_client, "run_factory_control", factory_child)
+    spec = WorkSpec(
+        845, 1, "repo", "main", "issue/845-a1", "", None, "python3", "feature_factory" if route == "factory" else "opencode", 30,
+        env={**_OTLP_CARRIERS, "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "https://example.test/normal", "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf"},
+        local_checkout=tmp_path,
+    )
+    result = await ev._run_compute_gate(
+        shlex.join([sys.executable, "-c", child]), checkout=tmp_path,
+        work_spec=spec, compute=compute,
+    )
+    assert result.exit_code == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert not _OTLP_CARRIERS.keys() & compute.gate_env.keys()
+    assert not _OTLP_CARRIERS.keys() & observed.keys()
+    assert observed["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://example.test/normal"
+    assert observed["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+    assert not any(value in result.stdout + result.stderr for value in _OTLP_CARRIERS.values())
+
+
+def test_direct_argv_gate_filters_otlp_ambient_env(monkeypatch):
+    for name, value in _OTLP_CARRIERS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://collector.test/ordinary")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+    result = ev._run([sys.executable, "-c", "import os,json;print(json.dumps(dict(os.environ)))"])
+    assert result.returncode == 0
+    observed = json.loads(result.stdout)
+    assert observed["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
+    assert observed["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+    assert not _OTLP_CARRIERS.keys() & observed.keys()
+
+
+def test_shell_string_gate_filters_otlp_ambient_env(monkeypatch, tmp_path):
+    for name, value in _OTLP_CARRIERS.items():
+        monkeypatch.setenv(name, value)
+    command = shlex.join([sys.executable, "-c", "import os,json;print(json.dumps(dict(os.environ)))"])
+    result = ev._run(command, cwd=tmp_path)
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert not _OTLP_CARRIERS.keys() & observed.keys()
+    assert observed["HOME"] != os.environ["HOME"]
+    assert observed["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+
+
+def test_opencode_resolver_filters_otlp_carriers_before_projection(monkeypatch, tmp_path):
+    from mimir_cultivate.worklink.backends import opencode
+    from mimir_cultivate.worklink.compute import WorkSpec
+
+    for name, value in _OTLP_CARRIERS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://collector.test/ordinary")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+    seen = {}
+    invocation = type("Invocation", (), {"model": "openai/model"})()
+
+    def resolve(*, env):
+        seen["resolver"] = dict(env)
+        return invocation
+
+    def documents(selected, env):
+        assert selected is invocation
+        seen["projection"] = dict(env)
+        return type("Documents", (), {"config_document": json.dumps(dict(env)).encode(), "auth_document": None})()
+
+    monkeypatch.setattr(opencode, "resolve_opencode_invocation", resolve)
+    monkeypatch.setattr(opencode, "opencode_worker_documents", documents)
+    monkeypatch.setattr(opencode, "opencode_model_from_agent_spec", lambda value: "openai/model")
+    monkeypatch.setattr(opencode, "model_spec_at_call_time", lambda home: "codex-plus:model")
+    resolution = opencode.resolve_worklink_opencode_invocation({"MIMIR_HOME": str(tmp_path)})
+    assert resolution.invocation is invocation
+    spec = WorkSpec(
+        845, 1, "repo", "main", "issue/845-a1", "", None, "pytest", "opencode", 30,
+        env=dict(_OTLP_CARRIERS), backend_config={"codex": True, "model": invocation.model, "worker_projections": (), "pass_env": ()},
+    )
+    refreshed = opencode.OpenCodeBackend().refresh_codex_projections(spec, {"MIMIR_HOME": str(tmp_path), **_OTLP_CARRIERS})
+    for observed in (seen["resolver"], seen["projection"], resolution.env, refreshed.env):
+        assert not _OTLP_CARRIERS.keys() & observed.keys()
+        assert not any(value in repr(observed) for value in _OTLP_CARRIERS.values())
+    assert resolution.env["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
+    assert resolution.env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+    projection = json.loads(refreshed.backend_config["worker_projections"][0].document)
+    assert not _OTLP_CARRIERS.keys() & projection.keys()
+    assert projection["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
+
+    # The bounded launcher consumes the projection returned by the production
+    # refresh path, rather than a separately constructed test document.
+    from mimir_cultivate.worklink.compute import _enabled_child_env
+
+    worker_home = tmp_path / "worker-home"
+    for item in refreshed.backend_config["worker_projections"]:
+        destination = worker_home / item.path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(item.document)
+    child_env = _enabled_child_env(refreshed, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    child_env["HOME"] = str(worker_home)
+    child = subprocess.run(
+        [sys.executable, "-c", "import json,os,pathlib; print(json.dumps({'env': dict(os.environ), 'config': json.loads((pathlib.Path.home()/'.config/opencode/opencode.json').read_text())}))"],
+        cwd=tmp_path, env=child_env, capture_output=True, text=True, check=True,
+    )
+    observed = json.loads(child.stdout)
+    assert not _OTLP_CARRIERS.keys() & observed["env"].keys()
+    assert not _OTLP_CARRIERS.keys() & observed["config"].keys()
+    assert observed["config"]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
+    assert observed["config"]["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+    assert not any(value in child.stdout + child.stderr + repr(refreshed.backend_config["worker_projections"]) for value in _OTLP_CARRIERS.values())
+
+
+@pytest.mark.asyncio
+async def test_worklink_runner_filters_retry_environment_after_order_merge(tmp_path, monkeypatch, caplog):
+    from mimir_cultivate.worklink import orchestrator as orch
+    from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+    from mimir_cultivate.worklink.backends.base import WorkOrder
+    from mimir_cultivate.worklink.checkout import CheckoutLease
+    from mimir_cultivate.worklink.claims import ClaimRecord, ClaimResult
+    from mimir_cultivate.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
+
+    for name, value in _OTLP_CARRIERS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://collector.test/ordinary")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    observed = []
+
+    def order_with_overrides(**kwargs):
+        kwargs["env"] = {
+            **kwargs["env"], **_OTLP_CARRIERS,
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "https://collector.test/ordinary",
+        }
+        return WorkOrder(**kwargs)
+
+    monkeypatch.setattr(orch, "WorkOrder", order_with_overrides)
+
+    class Backend(OpenCodeBackend):
+        def work_spec(self, order: WorkOrder, *, attempt, repo_url, base_ref, branch, test_command):
+            return WorkSpec(
+                order.issue_id, attempt, repo_url, base_ref, branch, order.prompt,
+                None, test_command, self.name, 10,
+                env={**order.env, **_OTLP_CARRIERS},
+                backend_config={"codex": False}, local_checkout=order.checkout,
+            )
+
+        async def invoke_with_startup_retry(self, invoke, **kwargs):
+            observed.append(dict(kwargs["env"]))
+            return await super().invoke_with_startup_retry(invoke, **kwargs)
+
+    class Compute:
+        name = "fake_compute"
+        shared_filesystem = True
+
+        async def launch(self, spec):
+            return LaunchHandle(self.name, "one")
+
+        async def wait(self, handle, timeout_s):
+            return ComputeResult(0, "ok", "")
+
+        async def cleanup(self, handle):
+            pass
+
+    backend = Backend()
+    compute = Compute()
+
+    class Registry:
+        def get(self, name):
+            return backend
+
+        def select_compute(self, **kwargs):
+            return compute
+
+    issue = json.dumps({"id": 845, "title": "Build", "description": "", "labels": []})
+
+    def runner(args, **kwargs):
+        if args[:3] == ["chainlink", "issue", "show"]:
+            return subprocess.CompletedProcess(args, 0, issue, "")
+        if args[:2] == ["git", "-C"] and "config" in args:
+            return subprocess.CompletedProcess(args, 0, "git@github.com:example/repo.git\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(orch, "_create_backend_checkout", lambda *args, **kwargs: CheckoutLease(
+        845, 1, repo, checkout, "issue/845-a1", "main", isolated_checkout=True,
+    ))
+    monkeypatch.setattr(orch, "_persist_run_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orch, "validate_leaf", lambda issue: None)
+    monkeypatch.setattr(orch.ChainlinkClaims, "claim_issue", lambda *args, **kwargs: ClaimResult(
+        True, ClaimRecord(845, 1, "test", datetime.now(UTC)),
+    ))
+    monkeypatch.setattr(orch.ChainlinkClaims, "release_issue", lambda *args, **kwargs: True)
+
+    async def finalize(self, **kwargs):
+        return orch.WorklinkRunResult(845, 1, "failed")
+
+    monkeypatch.setattr(orch.WorklinkRunner, "_finalize", finalize)
+    result = await orch.WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=Registry()).run(
+        845, backend_name="opencode", test_command="true",
+    )
+    assert result.status == "failed", result.reason
+    assert len(observed) == 1
+    assert not _OTLP_CARRIERS.keys() & observed[0].keys()
+    assert observed[0]["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"] == "https://collector.test/ordinary"
+    assert not any(value in caplog.text for value in _OTLP_CARRIERS.values())
+
+
 @pytest.fixture(autouse=True)
 def clean_gate_tmp(monkeypatch):
     helper = ev._gate_tmp_directory

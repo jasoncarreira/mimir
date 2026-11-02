@@ -750,6 +750,8 @@ def _execution_checkout_fd(
 
 
 def _validate_environment(value: object) -> dict[str, str]:
+    from mimir.otel_credentials import filter_otlp_env
+
     if not isinstance(value, dict):
         raise RuntimeError("worker environment must be string pairs")
     if "HOME" in value:
@@ -762,7 +764,7 @@ def _validate_environment(value: object) -> dict[str, str]:
         for key, item in value.items()
     ):
         raise RuntimeError("worker environment must be string pairs")
-    return dict(value)
+    return filter_otlp_env(value)
 
 
 def _leaf_git_environment(environment: dict[str, str], checkout: Path) -> None:

@@ -25,6 +25,7 @@ from mimir_cultivate.opencode import (
     resolve_opencode_invocation,
 )
 from mimir.redaction import redact_text
+from mimir.otel_credentials import filter_otlp_env
 from ..compute import ComputeResult, WorkSpec
 from .base import (
     Caps,
@@ -134,7 +135,7 @@ def resolve_worklink_opencode_invocation(
     model_home = Path(env["MIMIR_HOME"]) if env.get("MIMIR_HOME") else None
     dotenv_model_spec = model_spec_at_call_time(model_home)
     configured_model_spec = env.get("MIMIR_MODEL_SPEC", dotenv_model_spec)
-    resolution_env = {**os.environ, **env}
+    resolution_env = filter_otlp_env({**os.environ, **env})
     resolution_env.setdefault("MIMIR_MODEL_SPEC", configured_model_spec)
     invocation = resolve_opencode_invocation(env=resolution_env)
     configured_model = opencode_model_from_agent_spec(configured_model_spec)
@@ -181,11 +182,11 @@ class OpenCodeBackend:
         invocation = resolve_worklink_opencode_invocation(env).invocation
         if invocation.model != spec.backend_config["model"]:
             raise OpenCodeConfigError("config_provider_selection")
-        documents = opencode_worker_documents(invocation, {**os.environ, **env})
+        documents = opencode_worker_documents(invocation, filter_otlp_env({**os.environ, **env}))
         projections = [WorkerProjection(".config/opencode/opencode.json", documents.config_document)]
         if documents.auth_document is not None:
             projections.append(WorkerProjection(".local/share/opencode/auth.json", documents.auth_document))
-        return replace(spec, backend_config={**spec.backend_config, "worker_projections": projections})
+        return replace(spec, env=filter_otlp_env(spec.env), backend_config={**spec.backend_config, "worker_projections": projections})
 
     def capabilities(self) -> Caps:
         return Caps(
@@ -290,7 +291,7 @@ class OpenCodeBackend:
             test_command=test_command,
             backend=self.name,
             timeout_s=order.timeout_s,
-            env=env,
+            env=filter_otlp_env(env),
             backend_config=backend_config,
             local_checkout=order.checkout,
             local_argv=_local_argv(

@@ -8,6 +8,8 @@ import pytest
 
 pytest.importorskip("mimir_cultivate", reason="OpenCode configuration belongs to Cultivate")
 
+from tests.opencode_fixtures import opencode_binary
+
 from mimir_cultivate.opencode import (
     OpenCodeAuthError,
     OpenCodeConfigError,

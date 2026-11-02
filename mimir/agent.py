@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -934,6 +935,7 @@ def resolve_model_from_config(
     config: Any,
     *,
     rate_limit_callback: Callable[[Any], None] | None = None,
+    model_spec: str | None = None,
 ) -> BaseChatModel:
     """Resolve the chat model described by a mimir ``Config``-like object.
 
@@ -945,10 +947,10 @@ def resolve_model_from_config(
     ad-hoc bench/smoke override for callers whose Config was not built from
     the current environment.
     """
-    model_spec = os.environ.get(
-        "MIMIR_MODEL_SPEC",
-        getattr(config, "model_spec", DEFAULT_MODEL_SPEC),
-    )
+    if model_spec is None:
+        model_spec = os.environ.get(
+            "MIMIR_MODEL_SPEC", getattr(config, "model_spec", DEFAULT_MODEL_SPEC),
+        )
     return _resolve_model(
         model_spec,
         max_retries=getattr(config, "model_max_retries", 6),
@@ -1412,6 +1414,25 @@ Then give the final answer on its own line. Be concise."""
 # ────────────────────────────────────────────────────────────────────
 
 
+def _trace_turn(body: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(body)
+    async def wrapped(self: Agent, event: AgentEvent, **kwargs: Any) -> TurnRecord:
+        return await self._trace_run_turn(event, body=body, **kwargs)
+
+    return wrapped
+
+
+def _trace_usage(message: AIMessage) -> dict[str, int] | None:
+    """Provider usage is optional telemetry, not a condition for turn success."""
+    from .tracing import _usage
+
+    try:
+        return _usage(message)
+    except Exception:  # noqa: BLE001 — provider metadata can have arbitrary shapes
+        log.warning("Tracing usage metadata unavailable.")
+        return None
+
+
 class Agent:
     """Deepagents-backed mimir Agent.
 
@@ -1437,8 +1458,10 @@ class Agent:
         turn_hooks: list[Any] | None = None,
         turn_event_bus: Any = None,
         chat_skill_registry: ChatSkillRegistry | None = None,
+        trace_controller: Any = None,
     ) -> None:
         self._config = config
+        self._trace_controller = trace_controller
         self._turn_logger = turn_logger
         self._buffer = message_buffer
         self._identity_resolver = getattr(message_buffer, "resolver", None)
@@ -1997,10 +2020,15 @@ class Agent:
                 codex_plus_callback = make_codex_plus_rate_limit_callback(
                     self._rate_limits
                 )
+                resolved_spec = os.environ.get(
+                    "MIMIR_MODEL_SPEC", getattr(self._config, "model_spec", DEFAULT_MODEL_SPEC),
+                )
                 self._agent_model = resolve_model_from_config(
                     self._config,
                     rate_limit_callback=codex_plus_callback,
+                    model_spec=resolved_spec,
                 )
+                self._agent_model_spec = resolved_spec
 
             if (
                 self._agent_tools is None
@@ -2099,7 +2127,39 @@ class Agent:
             self._cached_unready_tool_owners = unready_tool_owners
             return self._agent
 
+    async def _trace_run_turn(
+        self,
+        event: AgentEvent,
+        *,
+        turn_id: str | None = None,
+        session_id: str | None = None,
+        saga_session_id: str | None = None,
+        body: Callable[..., Any],
+    ) -> TurnRecord:
+        """Bracket the complete turn, including approval replies and finalization."""
+        controller = self._trace_controller if getattr(self._config, "tracing_enabled", False) else None
+        if controller is None:
+            return await body(
+                self, event, turn_id=turn_id, session_id=session_id, saga_session_id=saga_session_id,
+            )
+        scope = controller.turn(
+            conversation_id=session_id or event.channel_id or "default",
+            agent_name=self._config.agent_id,
+            model=str(getattr(self, "_agent_model_spec", None) or getattr(self._config, "model_spec", None) or "unknown"),
+            input_content=event.content,
+        )
+        with scope as trace:
+            record = await body(
+                self, event, turn_id=turn_id, session_id=session_id, saga_session_id=saga_session_id,
+            )
+            if record.error or record.result_is_error:
+                trace.mark_error()
+            if controller.capture_content:
+                trace.finish(output_content=record.output)
+            return record
+
     @scoped_policy_call(lambda bound: bound.arguments["self"]._config.plugin_manager.policy)
+    @_trace_turn
     async def run_turn(
         self,
         event: AgentEvent,
@@ -3279,6 +3339,13 @@ class Agent:
 
         # Build / reuse the agent singleton.
         agent = await self._build_agent_if_needed()
+        from .tracing import _active_turn, MODEL
+        active_trace = _active_turn.get()
+        if active_trace is not None and active_trace.span is not None:
+            active_trace._safe(lambda: active_trace.span.set_attribute(
+                MODEL, str(getattr(self, "_agent_model_spec", None)
+                           or getattr(self._config, "model_spec", None) or "unknown"),
+            ))
 
         # 0.3.0: auto-dispatch removed. The model's final text is NOT shipped
         # to the channel — the agent must call the ``send_message`` tool to
@@ -3310,6 +3377,8 @@ class Agent:
         transient_reason: str | None = None
         retry_after_s: float | None = None
         messages: list[Any] = []
+        callback_usage: dict[str | int, dict[str, int]] = {}
+        state_usage: dict[str | int, dict[str, int]] = {}
         output = ""
         events_truncated = False
         # chainlink #376 (PR 3/4): (event, fold_monotonic) for each message
@@ -3346,6 +3415,23 @@ class Agent:
                         "channel_id": event.channel_id,
                     },
                 }
+                if getattr(self._config, "tracing_enabled", False) and self._trace_controller is not None:
+                    active_trace = _active_turn.get()
+                    if active_trace is not None:
+                        try:
+                            def count_callback(message: Any) -> None:
+                                values = _trace_usage(message)
+                                if values is None:
+                                    return
+                                identity = message.id or id(message)
+                                previous = callback_usage.setdefault(identity, {})
+                                for key, value in values.items():
+                                    previous[key] = previous.get(key, 0) + value
+
+                            active_trace.set_usage_observer(count_callback)
+                            invoke_config["callbacks"] = [active_trace.callback]
+                        except Exception:
+                            log.warning("Tracing callback unavailable.")
                 # chainlink #583 slice 2: request both stream modes. "values"
                 # gives the full-state snapshots the turn record is built from
                 # (block-level brackets, slice 1); "messages" gives token-level
@@ -3369,6 +3455,12 @@ class Agent:
                         mode, payload = "values", item
                     if mode == "values" and isinstance(payload, dict):
                         messages = list(payload.get("messages", []))
+                        if active_trace is not None:
+                            for message in messages:
+                                if isinstance(message, AIMessage):
+                                    values = _trace_usage(message)
+                                    if values is not None:
+                                        state_usage[message.id or id(message)] = values
                         # Block-level brackets (slice 1): animate mid-turn,
                         # no-op when the bus is unwired; never raises.
                         emitter.blocks_from_messages(messages)
@@ -3387,6 +3479,12 @@ class Agent:
                     turn_is_interactive=turn_is_interactive,
                     messages=messages, events=events, output=output,
                 )
+                if active_trace is not None:
+                    for message in messages:
+                        if isinstance(message, AIMessage):
+                            values = _trace_usage(message)
+                            if values is not None:
+                                state_usage[message.id or id(message)] = values
         except asyncio.TimeoutError:
             error = f"TurnTimeout: turn exceeded {timeout}s wall-clock limit"
             log.error(
@@ -3523,6 +3621,14 @@ class Agent:
 
         # Result fields drive both terminal events and the TurnRecord, so derive
         # them before finalization and reuse the exact classification.
+        if active_trace is not None:
+            with active_trace._lock:
+                for identity, values in state_usage.items():
+                    for key, value in values.items():
+                        if isinstance(value, int) and value >= 0:
+                            active_trace._totals[key] += max(
+                                0, value - callback_usage.get(identity, {}).get(key, 0),
+                            )
         result_fields = derive_result_fields(messages, context=ctx)
         if error is not None:
             # Partial model messages cannot certify a failed host turn as success.

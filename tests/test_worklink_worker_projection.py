@@ -10,6 +10,8 @@ pytest.importorskip("mimir_cultivate", reason="Worklink worker projections belon
 from mimir_cultivate.worklink import checkout as checkout_module
 from mimir_cultivate.worklink.backends.base import WorkOrder
 from mimir_cultivate.worklink.backends.opencode import OpenCodeBackend
+# Exercise real executable admission with a fixture-owned CLI, not a host install.
+from tests.opencode_fixtures import opencode_binary
 
 
 @pytest.fixture(autouse=True)
@@ -40,7 +42,7 @@ def _write_native_files(home: Path) -> None:
 
 @pytest.mark.usefixtures("stub_opencode")
 def test_enabled_opencode_spec_contains_worker_local_selected_projections(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, opencode_binary: Path
 ) -> None:
     _write_native_files(tmp_path)
     # ``y`` used to be accepted by Config but rejected by Worklink's copy.
@@ -100,6 +102,7 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
         "OPENCODE_PERMISSION": spec.env["OPENCODE_PERMISSION"],
     }
     assert spec.local_argv is not None
+    assert spec.local_argv[0] == str(opencode_binary)
     dir_index = spec.local_argv.index("--dir")
     assert spec.local_argv[dir_index + 1] == "."
     assert str(order.checkout) not in spec.local_argv
@@ -107,7 +110,7 @@ def test_enabled_opencode_spec_contains_worker_local_selected_projections(
 
 @pytest.mark.usefixtures("stub_opencode")
 def test_disabled_opencode_spec_preserves_direct_environment(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, opencode_binary: Path
 ) -> None:
     _write_native_files(tmp_path)
     monkeypatch.setenv("MIMIR_PLUGINS", "")
@@ -141,13 +144,14 @@ def test_disabled_opencode_spec_preserves_direct_environment(
     assert spec.env["PROXY_TOKEN"] == "direct"
     assert spec.env["MIMIR_HOME"] == str(tmp_path)
     assert spec.local_argv is not None
+    assert spec.local_argv[0] == str(opencode_binary)
     dir_index = spec.local_argv.index("--dir")
     assert spec.local_argv[dir_index + 1] == str(order.checkout)
 
 
 @pytest.mark.usefixtures("stub_opencode")
 def test_enabled_opencode_projects_conventional_ambient_key(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, opencode_binary: Path
 ) -> None:
     config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
     config.parent.mkdir(parents=True)
@@ -178,6 +182,8 @@ def test_enabled_opencode_projects_conventional_ambient_key(
         test_command="true",
     )
 
+    assert spec.local_argv is not None
+    assert spec.local_argv[0] == str(opencode_binary)
     projections = spec.backend_config["worker_projections"]
     assert json.loads(projections[1].document) == {
         "proxy": {"type": "api", "key": "ambient-projected-secret"}
