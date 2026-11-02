@@ -8,6 +8,58 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [0.9.11] — 2026-11-01
+
+- **0.9.11 is the last release with Worklink and the feature factory bundled.** From the next release, coding work (Worklink, the feature factory and the related skills) ships separately as the Cultivate plugin, and `mimir-agent` no longer includes it.
+
+- Remove `saga` from the published `dev` and `bench` extras. On PyPI that name belongs to an unrelated package, so `pip install 'mimir-agent[dev]'` installed it; `saga` now comes only from the workspace dependency groups, and a packaging test rejects any workspace-only name in published metadata (#2080).
+
+- Exclude nested factory worktrees and sandboxes from frontend test collection (#1981).
+
+- Bump feature-factory and opencode-feature-factory to 0.10.18 for merge proof and provider overload retry fixes (#1982).
+
+- Stop file-index sweeps between files and join their in-flight work before the server releases its agent home (#1992).
+
+- Add a read-only prompt cache-hit report for retained turn logs with daily, trigger and session-kind breakdowns.
+
+- Preserve conversation-history offload provenance on file-tool read-back across turns.
+
+- Keep PR lease reads author-attested after merging a verified unprotected base (#1995).
+
+- Scope untrusted tool offloads and fetches to turns, purge legacy bytes, and taint shell reads of persistent logs by name.
+
+- Preserve bounded GitHub PR author-attestation failure causes across poller and lease refusals, forward subprocess diagnostics, and resolve mixed-case repository URLs (#1997).
+
+- Reorder turn prompts to keep reusable context ahead of live context and mark its end for Anthropic API prompt caching (#1998).
+
+- Return bounded, content-free task errors to the parent agent when a subagent fails instead of aborting the turn (#2002).
+
+- Prevent content-free glob timeouts from falsely tainting attested PR checkout edits (#2003).
+
+- Set the matching home and user environment for non-root s6 services in the root image (#2004).
+
+- Right-size unfiltered GitHub forge pages to the requested limit, preserve filtered-query scan depth, and reuse smaller page sizes after oversized responses.
+
+- Make social-cli daily cap decisions use one UTC day and pin the midnight boundary in tests (#2031).
+
+- Allow Cultivate Worklink to publish after an operator-stopped attempt with no PR, while retaining the publication fence for unsafe evidence (#2037).
+
+- Remove executor pytest basetemp directories when Worklink attempts end (#2041).
+
+- Add byte-exact PR history restores and paged historical-file reads for remediation and review.
+
+- Keep pytest gate regression tests compatible with pytest 9.2 and third-party plugin deprecations.
+
+- Accept root-controlled uutils coreutils applet symlinks in the maintenance shell while executing their validated multi-call target.
+
+- Size test hang guards for parallel full-suite load: redaction cost-bound span, Vitest and Testing Library timeouts, the identities writer process guard, the ACP journal faulthandler period, and the github-poller tick deadline bound (carried from epic #1949).
+
+- Defaults upgrade: when a three-way merge fails part way, the upgrade lane now discards its own half-merged proposal worktree and reports the error, instead of raising from `abandon_proposal` (which refuses uncommitted changes since #2384).
+
+- Make two timing-sensitive tests robust under parallel load: the ACP blocked-main matrix stops its journal's periodic faulthandler dump before the watchdog exit (a dump racing the exit crashed the child with SIGSEGV), and both it and the event-logger spawn test use hang guards instead of tight latency ceilings.
+
+- Make the shell-timeout process-group test deterministic: it now mocks `os.getpgid` for its fabricated PID, so a real process that happens to own that PID can no longer change the result.
+
 ## [0.9.10] — 2026-10-15
 
 - Alert operators through the configured operator channel when a feature-factory epic parks for human input, once per park.
